@@ -1,0 +1,131 @@
+DIRECTION CONCEPT SEED (key: 7872f499; mode: operate; source: api; approved pool: c3b204a1eed6; 306/564 human-approved; rerun with --scope direction --mode operate --from 7872f499 --candidate-count 7 to reproduce this roll against this catalog revision)
+ASSIGNED INDEX: 6
+  After ordering the grounded directions by resonance, build candidate
+  6 of your own grounded list; the assignment never points at a
+  challenger. The assignment is the roll, not a suggestion: your top-ranked
+  direction is what every run would ship, so the script decides which grounded
+  direction gets built. Each direction joins a durable visual system to a
+  concrete expression for the requested first surface, decided as one. It must
+  survive the current task plus navigation, quiet and dense content,
+  interaction and state, and a substantially different future surface. In an
+  attended run, present the assigned direction fully committed and offer
+  re-roll. You may add ONE card for your top-ranked grounded candidate when
+  it is not the assigned direction, kicker IMPECCABLE’S PICK, with an honest risk line
+  naming its familiarity; one pick card, never a ranked lineup, and the pick
+  never takes the lead position. When the assignment IS your top candidate,
+  there is no pick card. Re-roll yourself only
+  on named factual grounds, when the assignment cannot carry the product's
+  truth or task; taste is never grounds.
+  The assignment exists to refuse the model's ranking rut, never to outrank
+  the user or the brief. Never expose assignment metadata in user-facing labels.
+CHALLENGERS:
+  1. a design annual's plate section on uncoated near-white stock, where registration crosshairs mark every plate corner, a letterpressed circular attribution stamp sits half off the image, hairline rules divide the credits row, and one grotesque carries display and caption alike
+     SOURCE ID: design-annual-s-plate-section
+     CREATIVE SPARK: The sheet is almost white but never neutral: it drifts warm at one corner and green at another, so the ink reads as printed rather than rendered. Everything else is registration furniture — crosses, dots, hairlines — and a single periwinkle stamp to prove a human signed it.
+     SYSTEM GRAMMAR:
+       - Palette/material: ground #F5F4F6, drifting to #FAF6F5 and #EEF3EF at edges; ink #16181A never pure black; single accent seal #DCDDF3; hairlines #C9C7C4 1px; photography untinted.
+       - Type/composition: one grotesque throughout — 400 weight, 92px display at -0.02em, 17px body; labels 11px mono uppercase at 0.14em; 12-col grid, 40px gutters, no italics.
+       - Topology/navigation: one continuous sheet; 72px sticky bar of mono tokens; crosshair plus marks register plate corners; 8px dot matrix fills voids; hairlines split the 4-up row.
+       - Controls/state: primary is a filled #16181A rect, 0 radius, mono caps 0.12em; secondary a 1px outline rect; nav arrows 44px circles; background inverts 0.1s ease.
+       - Responsive/motion: stamp's text ring turns 25s linear infinite and lifts 4px on hover 0.6s cubic-bezier(.19,1,.22,1); tiles step one column at that curve; no parallax.
+     WEB LEVERAGE: Sticky mono token bar, SVG textPath stamp on infinite linear rotation, pointer-local dot-matrix fades, and a whole grid built from 1px hairlines and CSS crosshairs.
+     QUALITY BAR: board https://impeccable.style/worlds/cards/design-annual-s-plate-section.webp · hero https://impeccable.style/worlds/cards/design-annual-s-plate-section-hero.webp
+  2. a mixtape's hand-lettered j-card, spine title, folded flap, and side a / side b tracklists ruled in ballpoint, timed to fill exactly forty-five minutes a side
+     SOURCE ID: vernacular-ephemera-cassette-j-card
+     CREATIVE SPARK: Someone timed every song with a wristwatch so side a ends clean at forty-four minutes, then inked the tracklist twice because the first pen smeared.
+     SYSTEM GRAMMAR:
+       - Palette/material: ballpoint blue on white lined inlay stock, pencil gray for tentative tracks, the brand stripe's TDK red or Maxell gold as the only printed accent
+       - Type/composition: handwritten block caps ruled by the inlay's printed lines, side a and side b as underlined heads, running times right-aligned tight against the margin
+       - Topology/navigation: the spine is the shelf identity, the front flap the cover, the inner fold the full listing; everything lives in one folded sheet you rotate
+       - Controls/state: side a and side b are hard halves with a physical flip between them; each track carries a running time, and the sides must not overflow the tape
+       - Responsive/motion: the card unfolds flat on wide screens and refolds to spine-only in a list; flipping sides is a y-axis turn, or an instant swap under
+     WEB LEVERAGE: the audio element drives a real-time position marker down the inked tracklist, flipping sides at the tape's midpoint
+     QUALITY BAR: board https://impeccable.style/worlds/cards/vernacular-ephemera-cassette-j-card.webp · hero https://impeccable.style/worlds/cards/vernacular-ephemera-cassette-j-card-hero.webp
+  3. a reference-setting page drawn by a ruling engine, two short-measure text columns twinned around a fixed centre rail of keys, the whole block held small inside a wide annotation margin where the apparatus hangs and overlaps the block's edge
+     SOURCE ID: rw-centre-rail-reference-setting
+     CREATIVE SPARK: A wide-margin edition open under a lamp: two dense columns of small roman, a hairline channel of vermilion letter-keys running down between them, and four inches of bare paper all around where a previous reader has ruled one note and bracketed it back into the line it belongs to.
+     SYSTEM GRAMMAR:
+       - Palette/material: iron-black ink and one rubric vermilion on unbleached bone, three values only. A ruling engine draws every rule, bracket and detent at one device pixel.
+       - Type/composition: Brevier body is Miller Text 17 to 19px on 1.5 leading, two columns of 34 to 40 characters round a 6 to 9 character rail. Pearl 11px small caps sets apparatus.
+       - Topology/navigation: the centre rail is the one moving part, carrying keys and square detents cut wherever the flow changes footing. Global nav is a keyed list in the margin.
+       - Controls/state: states are printed marks. A detent is hairline at rest, filled pressed, run through when disabled, bracketed on focus; spent is a struck bar. No radius anywhere.
+       - Responsive/motion: the block holds its measure and the annotation margin absorbs width; under two columns the rail goes outboard. Motion is a damped single axis, no overshoot.
+     WEB LEVERAGE: The ruling engine is real: a canvas or SVG layer reads live layout boxes and draws every hairline, detent and bracket at one device pixel, re-solving on resize and zoom. The lift relocates in-flow when the margin cannot hold it.
+     QUALITY BAR: board https://impeccable.style/worlds/cards/rw-centre-rail-reference-setting.webp · hero https://impeccable.style/worlds/cards/rw-centre-rail-reference-setting-hero.webp
+  4. an orienteering map and legend, iso-standard colors where white means runnable forest, contours rule the truth, and the course rides in purple over everything
+     SOURCE ID: notation-diagram-systems-orienteering-map
+     CREATIVE SPARK: Thumb on the map and breath ragged, a runner in wet birch forest gambles on the marsh crossing because two contour lines pinch, and the purple line does not care how.
+     SYSTEM GRAMMAR:
+       - Palette/material: isom inks, white runnable forest, olive thicket, yellow open land, brown contours, blue marsh, course purple reserved for the active leg
+       - Type/composition: condensed sans control numerals in purple beside their circles, the legend a ranked symbol table, contour line texture is the page's ground
+       - Topology/navigation: terrain is a fixed color language beneath and the numbered purple course rides above, you travel control to control choosing your own route
+       - Controls/state: each control pairs a circle on the map with a coded description row, punched controls check off, the course layer never edits the terrain
+       - Responsive/motion: the map keeps metric scale and clips to a window around your current leg; panning follows the compass bearing
+     WEB LEVERAGE: Geolocation tracks your position over the fixed-scale map with the course as an SVG overlay layer.
+     QUALITY BAR: board https://impeccable.style/worlds/cards/notation-diagram-systems-orienteering-map.webp · hero https://impeccable.style/worlds/cards/notation-diagram-systems-orienteering-map-hero.webp
+  5. a character goods catalog page, a cast of rounded mascots ranked by popularity across a pastel grid, each with a name plate, a birthday, and a one-line personality note printed beneath its portrait
+     SOURCE ID: pop-culture-shelf-character-goods-catalog
+     CREATIVE SPARK: forty-eight rounded characters ranked by how much people like them, each with a birthday and one line about what they enjoy, and one of them is a lump of butter.
+     SYSTEM GRAMMAR:
+       - Palette/material: soft pastel grounds with a white keyline around every mascot, flat fills, and one saturated ribbon color per character
+       - Type/composition: a rounded bubble face for name plates, mascots ranked in a grid, and a birthday with a one-line note ruled beneath each
+       - Topology/navigation: the roster is ranked and finite, so navigation moves between characters and their fixed personal furniture
+       - Controls/state: controls are mascot cells, the active one takes its ribbon color, and retired characters print in grayscale
+       - Responsive/motion: the roster reflows in whole cells, and motion is a small bounce as a character takes focus
+     WEB LEVERAGE: a whole-cell responsive roster, ranked ordering as live state, and a bounce animation on focus
+     QUALITY BAR: board https://impeccable.style/worlds/cards/pop-culture-shelf-character-goods-catalog.webp · hero https://impeccable.style/worlds/cards/pop-culture-shelf-character-goods-catalog-hero.webp
+  6. a rail concourse split-flap board at rush hour, where cascading letter flaps, platform columns, and departure rhythm hold a thousand travelers in one gaze
+     SOURCE ID: signals-instruments-split-flap-concourse
+     CREATIVE SPARK: A ripple of clacks runs the board, Milan becomes Marseille, and every head in the concourse lifts at the same half-second.
+     SYSTEM GRAMMAR:
+       - Palette/material: matte black flap faces with white paint letters, brushed steel board frame as ground, amber row lamps for delay; cancelled rows drop to dim red type
+       - Type/composition: one condensed white sans on every flap, characters in fixed cells, destinations in caps; the board's ruled rows and columns are the entire composition
+       - Topology/navigation: rows are live entities ranked by time; columns never move, only their flaps.
+       - Controls/state: changes cascade character by character; delayed and cancelled states restyle the row without breaking the grid.
+       - Responsive/motion: the board narrows column priority on phones; the cascade collapses to a single update under
+     WEB LEVERAGE: WebSocket-fed rows animate per-character flips while remaining a semantic, sortable table underneath.
+     QUALITY BAR: board https://impeccable.style/worlds/cards/signals-instruments-split-flap-concourse.webp · hero https://impeccable.style/worlds/cards/signals-instruments-split-flap-concourse-hero.webp
+Fuse each challenger before judging it: the challenger supplies the form
+  and its system grammar, the product supplies every fact, and clarity wins
+  conflicts. Weigh the fused result against the assigned direction on exactly
+  two axes, audience identification and product clarity. Losing to strong
+  grounded material is a valid outcome; beating a thin or tool-monoculture
+  list is the point. A fused challenger that wins both axes becomes the build.
+  Close the weighing with a verdict per challenger, decided before any
+  borrowing is considered: wins (beats the assigned direction on both axes),
+  competitive (holds one axis), or declined (loses both). A declined
+  challenger is not spent: name the one discipline of its system the assigned
+  direction lacks, and raise the assigned direction to match before
+  presenting it. A donation transfers ambition and system discipline, never
+  the challenger's clothes; one world owns the page. Write each raise as its
+  own named line on the presented direction, and carry every verdict, kept
+  line, and raise into the decision page payload.
+When you can view images, open the QUALITY BAR board and hero for any
+challenger you weigh seriously and for the world you build. They exist as a
+craft bar, the finish level and commitment the build is expected to reach,
+never as a mockup to copy; your surface serves this product, not that render.
+PRODUCT.md and explicit incumbent brand commitments constrain every direction.
+The seed never chooses exact colors, fonts, tokens, or a user preference, and
+it never permits the world and first surface to be selected independently.
+The CREATIVE SPARK is a complete visual system, not a theme or decorative
+reference. Translate every supplied system rule into the product: palette and
+material, type and composition, topology, controls and states, and adaptation.
+Keep the source's visible character, scale, rhythm, and interaction instead of
+reducing vivid grammar to generic nouns. When the source is already a credible
+interface language, a Persuade or Experience surface may commit to it across
+navigation, content, controls, and states; an Operate or Read surface takes its
+type, density, palette, material accents, and one signature move, and keeps the
+platform's standard navigation and controls. Otherwise keep a literal carrier only when it becomes functional.
+Ambitious motion, spatial media, or interaction is welcome when it strengthens
+the product without weakening semantics, performance, or fallback behavior.
+TELEMETRY: after the user's choice resolves, rerun this script once with
+  --kind <assigned|pick|challenger|canon> --from 7872f499 --scope direction --mode operate,
+  adding --chosen <challenger-id> when a dealt challenger won and keeping
+  --register <safer|bolder> when the resolved round came from a steered hand.
+  One ping per resolved attended round. The ping is anonymous, the card kind
+  plus the catalog id when one won; your grounded candidates' names never
+  leave the machine, and the ping is skipped automatically when DO_NOT_TRACK
+  or IMPECCABLE_NO_TELEMETRY is set.
+A user- or brief-pinned decision beats the roll, always.
+ASSIGNED INDEX (restated for truncated readers): 6. Build candidate
+6 of your own grounded list; seed key 7872f499.

@@ -1,0 +1,26 @@
+{
+  "deployment": {"mode": "single-tenant"},
+  "port": 4780,
+  "origin": "https://infinite.YOUR-TAILNET.ts.net",
+  "stateDir": "/srv/infinite-data/control",
+  "runDir": "/run/infinite",
+  "keyFile": "/run/infinite-key/vault.key",
+  "environment": "cloud",
+  "enableDemo": false,
+  "maxSessions": 24,
+  "tokens": [
+    {"id": "laptop", "label": "Laptop", "role": "owner", "hash": "REPLACE_WITH_GENERATED_OWNER_HASH"},
+    {"id": "phone", "label": "Phone", "role": "controller", "hash": "REPLACE_WITH_GENERATED_CONTROLLER_HASH"},
+    {"id": "viewer", "label": "Read-only", "role": "viewer", "hash": "REPLACE_WITH_GENERATED_VIEWER_HASH"}
+  ],
+  "projects": [
+    {"id": "project-a", "name": "Project A · first worktree", "path": "/srv/infinite-data/workspaces/project-a"},
+    {"id": "project-b", "name": "Project B · separate worktree", "path": "/srv/infinite-data/workspaces/project-b"}
+  ],
+  "agents": {
+    "claude": {"command": "/usr/bin/sudo", "args": ["-n", "-H", "-u", "infinite-agent", "--", "/usr/local/libexec/infinite/claude"]},
+    "codex": {"command": "/usr/bin/sudo", "args": ["-n", "-H", "-u", "infinite-agent", "--", "/usr/local/libexec/infinite/codex"]},
+    "grok": {"command": "/usr/bin/sudo", "args": ["-n", "-H", "-u", "infinite-agent", "--", "/usr/local/libexec/infinite/grok"]},
+    "opencode": {"command": "/usr/bin/sudo", "args": ["-n", "-H", "-u", "infinite-agent", "--", "/usr/local/libexec/infinite/opencode"]}
+  }
+}

@@ -1,0 +1,520 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-05T01:56:46.460046Z",
+  "title": "Design System: Infinite",
+  "extensions": {
+    "colorMeta": {
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Canvas",
+        "canonical": "#eeeee7",
+        "tonalRamp": [
+          "oklch(15% 0.0093 106.58)",
+          "oklch(26.4% 0.0093 106.58)",
+          "oklch(37.9% 0.0093 106.58)",
+          "oklch(49.3% 0.0093 106.58)",
+          "oklch(60.7% 0.0093 106.58)",
+          "oklch(72.1% 0.0093 106.58)",
+          "oklch(83.6% 0.0093 106.58)",
+          "oklch(95% 0.0093 106.58)"
+        ]
+      },
+      "paper": {
+        "role": "neutral",
+        "displayName": "Paper",
+        "canonical": "#fafaf6",
+        "tonalRamp": [
+          "oklch(15% 0.0053 106.50)",
+          "oklch(26.4% 0.0053 106.50)",
+          "oklch(37.9% 0.0053 106.50)",
+          "oklch(49.3% 0.0053 106.50)",
+          "oklch(60.7% 0.0053 106.50)",
+          "oklch(72.1% 0.0053 106.50)",
+          "oklch(83.6% 0.0053 106.50)",
+          "oklch(95% 0.0053 106.50)"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#222a27",
+        "tonalRamp": [
+          "oklch(15% 0.0125 170.70)",
+          "oklch(26.4% 0.0125 170.70)",
+          "oklch(37.9% 0.0125 170.70)",
+          "oklch(49.3% 0.0125 170.70)",
+          "oklch(60.7% 0.0125 170.70)",
+          "oklch(72.1% 0.0125 170.70)",
+          "oklch(83.6% 0.0125 170.70)",
+          "oklch(95% 0.0125 170.70)"
+        ]
+      },
+      "muted-ink": {
+        "role": "neutral",
+        "displayName": "Muted ink",
+        "canonical": "#59645e",
+        "tonalRamp": [
+          "oklch(15% 0.0165 161.98)",
+          "oklch(26.4% 0.0165 161.98)",
+          "oklch(37.9% 0.0165 161.98)",
+          "oklch(49.3% 0.0165 161.98)",
+          "oklch(60.7% 0.0165 161.98)",
+          "oklch(72.1% 0.0165 161.98)",
+          "oklch(83.6% 0.0165 161.98)",
+          "oklch(95% 0.0165 161.98)"
+        ]
+      },
+      "rule": {
+        "role": "neutral",
+        "displayName": "Rule",
+        "canonical": "#d5d9d1",
+        "tonalRamp": [
+          "oklch(15% 0.0116 128.61)",
+          "oklch(26.4% 0.0116 128.61)",
+          "oklch(37.9% 0.0116 128.61)",
+          "oklch(49.3% 0.0116 128.61)",
+          "oklch(60.7% 0.0116 128.61)",
+          "oklch(72.1% 0.0116 128.61)",
+          "oklch(83.6% 0.0116 128.61)",
+          "oklch(95% 0.0116 128.61)"
+        ]
+      },
+      "forest": {
+        "role": "primary",
+        "displayName": "Forest",
+        "canonical": "#23654e",
+        "tonalRamp": [
+          "oklch(15% 0.0770 166.65)",
+          "oklch(26.4% 0.0770 166.65)",
+          "oklch(37.9% 0.0770 166.65)",
+          "oklch(49.3% 0.0770 166.65)",
+          "oklch(60.7% 0.0770 166.65)",
+          "oklch(72.1% 0.0770 166.65)",
+          "oklch(83.6% 0.0770 166.65)",
+          "oklch(95% 0.0770 166.65)"
+        ]
+      },
+      "white": {
+        "role": "neutral",
+        "displayName": "White",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0.00)",
+          "oklch(26.4% 0.0000 0.00)",
+          "oklch(37.9% 0.0000 0.00)",
+          "oklch(49.3% 0.0000 0.00)",
+          "oklch(60.7% 0.0000 0.00)",
+          "oklch(72.1% 0.0000 0.00)",
+          "oklch(83.6% 0.0000 0.00)",
+          "oklch(95% 0.0000 0.00)"
+        ]
+      },
+      "field-rule": {
+        "role": "neutral",
+        "displayName": "Field rule",
+        "canonical": "#bcc6b9",
+        "tonalRamp": [
+          "oklch(15% 0.0210 138.44)",
+          "oklch(26.4% 0.0210 138.44)",
+          "oklch(37.9% 0.0210 138.44)",
+          "oklch(49.3% 0.0210 138.44)",
+          "oklch(60.7% 0.0210 138.44)",
+          "oklch(72.1% 0.0210 138.44)",
+          "oklch(83.6% 0.0210 138.44)",
+          "oklch(95% 0.0210 138.44)"
+        ]
+      },
+      "placeholder": {
+        "role": "neutral",
+        "displayName": "Placeholder",
+        "canonical": "#687469",
+        "tonalRamp": [
+          "oklch(15% 0.0222 147.63)",
+          "oklch(26.4% 0.0222 147.63)",
+          "oklch(37.9% 0.0222 147.63)",
+          "oklch(49.3% 0.0222 147.63)",
+          "oklch(60.7% 0.0222 147.63)",
+          "oklch(72.1% 0.0222 147.63)",
+          "oklch(83.6% 0.0222 147.63)",
+          "oklch(95% 0.0222 147.63)"
+        ]
+      },
+      "focus": {
+        "role": "primary",
+        "displayName": "Focus",
+        "canonical": "#518d75",
+        "tonalRamp": [
+          "oklch(15% 0.0734 166.33)",
+          "oklch(26.4% 0.0734 166.33)",
+          "oklch(37.9% 0.0734 166.33)",
+          "oklch(49.3% 0.0734 166.33)",
+          "oklch(60.7% 0.0734 166.33)",
+          "oklch(72.1% 0.0734 166.33)",
+          "oklch(83.6% 0.0734 166.33)",
+          "oklch(95% 0.0734 166.33)"
+        ]
+      },
+      "selected-row": {
+        "role": "neutral",
+        "displayName": "Selected row",
+        "canonical": "#dce3d5",
+        "tonalRamp": [
+          "oklch(15% 0.0202 128.71)",
+          "oklch(26.4% 0.0202 128.71)",
+          "oklch(37.9% 0.0202 128.71)",
+          "oklch(49.3% 0.0202 128.71)",
+          "oklch(60.7% 0.0202 128.71)",
+          "oklch(72.1% 0.0202 128.71)",
+          "oklch(83.6% 0.0202 128.71)",
+          "oklch(95% 0.0202 128.71)"
+        ]
+      },
+      "secondary-surface": {
+        "role": "neutral",
+        "displayName": "Secondary surface",
+        "canonical": "#edf0e7",
+        "tonalRamp": [
+          "oklch(15% 0.0123 121.70)",
+          "oklch(26.4% 0.0123 121.70)",
+          "oklch(37.9% 0.0123 121.70)",
+          "oklch(49.3% 0.0123 121.70)",
+          "oklch(60.7% 0.0123 121.70)",
+          "oklch(72.1% 0.0123 121.70)",
+          "oklch(83.6% 0.0123 121.70)",
+          "oklch(95% 0.0123 121.70)"
+        ]
+      },
+      "secondary-ink": {
+        "role": "neutral",
+        "displayName": "Secondary ink",
+        "canonical": "#35533c",
+        "tonalRamp": [
+          "oklch(15% 0.0525 150.91)",
+          "oklch(26.4% 0.0525 150.91)",
+          "oklch(37.9% 0.0525 150.91)",
+          "oklch(49.3% 0.0525 150.91)",
+          "oklch(60.7% 0.0525 150.91)",
+          "oklch(72.1% 0.0525 150.91)",
+          "oklch(83.6% 0.0525 150.91)",
+          "oklch(95% 0.0525 150.91)"
+        ]
+      },
+      "screen-surface": {
+        "role": "neutral",
+        "displayName": "Screen surface",
+        "canonical": "#eef1e9",
+        "tonalRamp": [
+          "oklch(15% 0.0111 123.46)",
+          "oklch(26.4% 0.0111 123.46)",
+          "oklch(37.9% 0.0111 123.46)",
+          "oklch(49.3% 0.0111 123.46)",
+          "oklch(60.7% 0.0111 123.46)",
+          "oklch(72.1% 0.0111 123.46)",
+          "oklch(83.6% 0.0111 123.46)",
+          "oklch(95% 0.0111 123.46)"
+        ]
+      },
+      "screen-ink": {
+        "role": "neutral",
+        "displayName": "Screen ink",
+        "canonical": "#334431",
+        "tonalRamp": [
+          "oklch(15% 0.0387 142.05)",
+          "oklch(26.4% 0.0387 142.05)",
+          "oklch(37.9% 0.0387 142.05)",
+          "oklch(49.3% 0.0387 142.05)",
+          "oklch(60.7% 0.0387 142.05)",
+          "oklch(72.1% 0.0387 142.05)",
+          "oklch(83.6% 0.0387 142.05)",
+          "oklch(95% 0.0387 142.05)"
+        ]
+      },
+      "running": {
+        "role": "primary",
+        "displayName": "Running",
+        "canonical": "#307d54",
+        "tonalRamp": [
+          "oklch(15% 0.1002 156.97)",
+          "oklch(26.4% 0.1002 156.97)",
+          "oklch(37.9% 0.1002 156.97)",
+          "oklch(49.3% 0.1002 156.97)",
+          "oklch(60.7% 0.1002 156.97)",
+          "oklch(72.1% 0.1002 156.97)",
+          "oklch(83.6% 0.1002 156.97)",
+          "oklch(95% 0.1002 156.97)"
+        ]
+      },
+      "warning-surface": {
+        "role": "secondary",
+        "displayName": "Warning surface",
+        "canonical": "#f7e8ce",
+        "tonalRamp": [
+          "oklch(15% 0.0380 81.51)",
+          "oklch(26.4% 0.0380 81.51)",
+          "oklch(37.9% 0.0380 81.51)",
+          "oklch(49.3% 0.0380 81.51)",
+          "oklch(60.7% 0.0380 81.51)",
+          "oklch(72.1% 0.0380 81.51)",
+          "oklch(83.6% 0.0380 81.51)",
+          "oklch(95% 0.0380 81.51)"
+        ]
+      },
+      "warning-ink": {
+        "role": "secondary",
+        "displayName": "Warning ink",
+        "canonical": "#724314",
+        "tonalRamp": [
+          "oklch(15% 0.0879 60.96)",
+          "oklch(26.4% 0.0879 60.96)",
+          "oklch(37.9% 0.0879 60.96)",
+          "oklch(49.3% 0.0879 60.96)",
+          "oklch(60.7% 0.0879 60.96)",
+          "oklch(72.1% 0.0879 60.96)",
+          "oklch(83.6% 0.0879 60.96)",
+          "oklch(95% 0.0879 60.96)"
+        ]
+      },
+      "error": {
+        "role": "secondary",
+        "displayName": "Error",
+        "canonical": "#9d382a",
+        "tonalRamp": [
+          "oklch(15% 0.1375 30.60)",
+          "oklch(26.4% 0.1375 30.60)",
+          "oklch(37.9% 0.1375 30.60)",
+          "oklch(49.3% 0.1375 30.60)",
+          "oklch(60.7% 0.1375 30.60)",
+          "oklch(72.1% 0.1375 30.60)",
+          "oklch(83.6% 0.1375 30.60)",
+          "oklch(95% 0.1375 30.60)"
+        ]
+      },
+      "terminal-surface": {
+        "role": "neutral",
+        "displayName": "Terminal surface",
+        "canonical": "#202923",
+        "tonalRamp": [
+          "oklch(15% 0.0168 155.93)",
+          "oklch(26.4% 0.0168 155.93)",
+          "oklch(37.9% 0.0168 155.93)",
+          "oklch(49.3% 0.0168 155.93)",
+          "oklch(60.7% 0.0168 155.93)",
+          "oklch(72.1% 0.0168 155.93)",
+          "oklch(83.6% 0.0168 155.93)",
+          "oklch(95% 0.0168 155.93)"
+        ]
+      },
+      "terminal-ink": {
+        "role": "neutral",
+        "displayName": "Terminal ink",
+        "canonical": "#e4e9de",
+        "tonalRamp": [
+          "oklch(15% 0.0156 126.83)",
+          "oklch(26.4% 0.0156 126.83)",
+          "oklch(37.9% 0.0156 126.83)",
+          "oklch(49.3% 0.0156 126.83)",
+          "oklch(60.7% 0.0156 126.83)",
+          "oklch(72.1% 0.0156 126.83)",
+          "oklch(83.6% 0.0156 126.83)",
+          "oklch(95% 0.0156 126.83)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Desktop overview heading."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Web form heading."
+      },
+      "session-title": {
+        "displayName": "Session title",
+        "purpose": "Desktop session detail title."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Web subsection heading."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Web base text and prose; native uses system typography."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Compact web view and section labels."
+      },
+      "metadata": {
+        "displayName": "Metadata",
+        "purpose": "Supporting web process and connection metadata."
+      },
+      "screen": {
+        "displayName": "Screen",
+        "purpose": "Preserved terminal snapshots; native uses platform monospace."
+      }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "button-background",
+        "value": "background-color 140ms ease-out",
+        "purpose": "Web control background transitions."
+      },
+      {
+        "name": "record-entry",
+        "value": "arrive 180ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Blur from 1px to 0 for web session, creation, and overview content, only under prefers-reduced-motion: no-preference."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "phone-max",
+        "value": "700px"
+      },
+      {
+        "name": "compact-desktop-max",
+        "value": "1000px"
+      },
+      {
+        "name": "wide-detail-min",
+        "value": "1500px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Web action with a filled forest surface and trailing SVG.",
+      "html": "<button class=\"ds-primary\">Connect to Infinite<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M7 17 17 7M7 7h10v10\"/></svg></button>",
+      "css": ".ds-primary{display:inline-flex;align-items:center;justify-content:space-between;gap:24px;border:0;border-radius:8px;padding:13px 18px;min-height:46px;background:var(--green,#23654e);color:#fff;font:500 15px \"Instrument Sans\",sans-serif;cursor:pointer;transition:background-color 140ms ease-out}.ds-primary:hover:not(:disabled){filter:brightness(.96)}.ds-primary:focus-visible{outline:3px solid #518d75;outline-offset:3px}.ds-primary:disabled{cursor:not-allowed;opacity:.5}"
+    },
+    {
+      "name": "Icon button",
+      "kind": "button",
+      "refersTo": "button-icon",
+      "description": "Transparent 44px web control with an accessible label.",
+      "html": "<button class=\"ds-icon\" aria-label=\"New session\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\"/></svg></button>",
+      "css": ".ds-icon{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border:0;background:transparent;color:var(--ink,#222a27);border-radius:8px;cursor:pointer;transition:background-color 140ms ease-out}.ds-icon:hover:not(:disabled){filter:brightness(.96)}.ds-icon:focus-visible{outline:3px solid #518d75;outline-offset:3px}.ds-icon:disabled{cursor:not-allowed;opacity:.5}"
+    },
+    {
+      "name": "Native secondary button",
+      "kind": "button",
+      "refersTo": "button-secondary-native",
+      "description": "HTML translation of the native secondary control; native pressed feedback maps to :active in this preview.",
+      "html": "<button class=\"ds-native-secondary\">Sessions</button>",
+      "css": ".ds-native-secondary{min-height:48px;min-width:48px;border:0;border-radius:8px;padding:13px 18px;background:#edf0e7;color:#35533c;font:600 14px system-ui,sans-serif;cursor:pointer}.ds-native-secondary:active,.ds-native-secondary:disabled{opacity:.45}.ds-native-secondary:focus-visible{outline:3px solid #518d75;outline-offset:3px}"
+    },
+    {
+      "name": "Labeled field",
+      "kind": "input",
+      "refersTo": "field",
+      "description": "Paper field with a persistent label, green caret, and visible keyboard focus.",
+      "html": "<label class=\"ds-field-label\" for=\"ds-device-key\">Device key</label><input class=\"ds-field\" id=\"ds-device-key\" type=\"password\" placeholder=\"Paste your private device key\" autocomplete=\"off\">",
+      "css": ".ds-field-label{display:block;font:500 15px \"Instrument Sans\",sans-serif;color:var(--ink,#222a27);margin-bottom:9px}.ds-field{width:100%;border:1px solid #bcc6b9;background:var(--paper,#fafaf6);border-radius:8px;padding:13px 14px;min-height:46px;font:400 15px \"Instrument Sans\",sans-serif;color:var(--ink,#222a27);caret-color:var(--green,#23654e)}.ds-field::placeholder{color:#687469}.ds-field:focus-visible{outline:3px solid #518d75;outline-offset:3px}"
+    },
+    {
+      "name": "Selected session row",
+      "kind": "nav",
+      "refersTo": "session-row-selected",
+      "description": "The rail record keeps title, provider, state, and a short stable ID together. Preview values are illustrative.",
+      "html": "<button class=\"ds-session\"><span class=\"ds-session-top\"><span class=\"ds-dot\"></span><strong>Review the workspace</strong></span><span class=\"ds-session-meta\"><span>Rehearsal</span><span>running</span></span><span class=\"ds-session-meta ds-session-id\">a12b34c5</span></button>",
+      "css": ".ds-session{width:100%;border:0;background:#dce3d5;padding:16px 14px;text-align:left;border-radius:8px;margin-bottom:5px;font-family:\"Instrument Sans\",sans-serif;color:var(--ink,#222a27);cursor:pointer;transition:background-color 140ms ease-out}.ds-session-top{display:flex;align-items:center;gap:9px}.ds-session-top strong{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:500}.ds-dot{width:7px;height:7px;flex-shrink:0;background:#307d54;border-radius:50%}.ds-session-meta{display:flex;justify-content:space-between;gap:6px;padding-left:16px;margin-top:9px;font-size:11px;color:var(--muted,#59645e)}.ds-session-id{font-family:ui-monospace,monospace;margin-top:5px}.ds-session:hover{filter:brightness(.96)}.ds-session:focus-visible{outline:3px solid #518d75;outline-offset:3px}"
+    },
+    {
+      "name": "Session views",
+      "kind": "nav",
+      "refersTo": "tab-selected",
+      "description": "Web view tabs use a green underline within the same session frame.",
+      "html": "<div class=\"ds-tabs\" role=\"tablist\" aria-label=\"Session views\"><button role=\"tab\" aria-selected=\"true\">Catch up</button><button role=\"tab\" aria-selected=\"false\">Full terminal</button><button role=\"tab\" aria-selected=\"false\">Context</button></div>",
+      "css": ".ds-tabs{display:flex;gap:28px;border-bottom:1px solid var(--rule,#d5d9d1);align-items:center}.ds-tabs button{border:0;border-bottom:2px solid transparent;padding:15px 0 16px;background:transparent;font:400 13px \"Instrument Sans\",sans-serif;color:var(--muted,#59645e);min-height:44px;min-width:44px;cursor:pointer;transition:background-color 140ms ease-out}.ds-tabs button[aria-selected=\"true\"]{border-bottom-color:var(--green,#23654e);color:var(--green,#23654e);font-weight:600}.ds-tabs button:hover{filter:brightness(.96)}.ds-tabs button:focus-visible{outline:3px solid #518d75;outline-offset:3px}"
+    },
+    {
+      "name": "Screen snapshot",
+      "kind": "card",
+      "refersTo": "screen-snapshot",
+      "description": "Pale inset for preserved terminal text; the specimen uses the actual empty-state wording.",
+      "html": "<pre class=\"ds-screen\">Waiting for output…</pre>",
+      "css": ".ds-screen{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;background:#eef1e9;padding:22px;border-radius:12px;max-height:360px;overflow:auto;color:#334431}"
+    },
+    {
+      "name": "Pairing sheet",
+      "kind": "card",
+      "refersTo": "pairing-sheet",
+      "description": "The standalone web sheet is flat, bounded, and more rounded than controls.",
+      "html": "<div class=\"ds-pair-sheet\"><h1>Pick up where<br>you left off.</h1><p>Your agents stay with the host.<br>Connect this device to see their progress.</p></div>",
+      "css": ".ds-pair-sheet{width:min(100%,470px);padding:48px;background:var(--paper,#fafaf6);border-radius:16px;color:var(--ink,#222a27);font:400 15px \"Instrument Sans\",sans-serif}.ds-pair-sheet h1{font-size:42px;line-height:1.1;letter-spacing:-.035em;font-weight:500;margin-top:0;text-wrap:balance}.ds-pair-sheet p{color:var(--muted,#59645e);margin-top:22px;line-height:1.6}"
+    },
+    {
+      "name": "Session composer",
+      "kind": "custom",
+      "refersTo": "composer",
+      "description": "One focus boundary combines the editable message with a 44px send control.",
+      "html": "<form class=\"ds-composer\"><textarea class=\"ds-message\" aria-label=\"Message to agent\" rows=\"2\" placeholder=\"Give this session a direction…\"></textarea><button class=\"ds-send\" aria-label=\"Send message\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"m22 2-7 20-4-9-9-4Z\"/><path d=\"M22 2 11 13\"/></svg></button></form>",
+      "css": ".ds-composer{border:1px solid #bac6b4;border-radius:12px;display:flex;align-items:flex-end;padding:8px;background:#fff}.ds-message{flex:1;min-width:0;border:0;min-height:52px;max-height:170px;background:transparent;font:400 13px/1.55 \"Instrument Sans\",sans-serif;color:var(--ink,#222a27);padding:7px;resize:vertical;caret-color:var(--green,#23654e)}.ds-message::placeholder{color:#687469}.ds-message:focus-visible{outline:0}.ds-composer:focus-within{outline:2px solid #518d75;outline-offset:2px}.ds-send{border:0;border-radius:8px;min-width:44px;height:44px;background:var(--green,#23654e);color:#fff;display:grid;place-items:center;cursor:pointer;transition:background-color 140ms ease-out}.ds-send:hover:not(:disabled){filter:brightness(.96)}.ds-send:focus-visible{outline:3px solid #518d75;outline-offset:3px}.ds-send:disabled{cursor:not-allowed;opacity:.5}"
+    },
+    {
+      "name": "Terminal replay surface",
+      "kind": "custom",
+      "refersTo": "terminal-panel",
+      "description": "The dark content panel is distinct from the fixed-light application theme; static sample does not emulate a terminal.",
+      "html": "<div class=\"ds-terminal\"><p class=\"ds-terminal-caption\">Recorded terminal · use the composer to send input</p><pre class=\"ds-terminal-output\">Waiting for the host. Recorded output will resume here.</pre></div>",
+      "css": ".ds-terminal{padding:18px;background:#202923;border-radius:12px;overflow:hidden}.ds-terminal-caption{font:400 11px \"Instrument Sans\",sans-serif;color:#bfccb9;margin:0 0 16px}.ds-terminal-output{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;color:#e4e9de;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}"
+    }
+  ],
+  "narrative": {
+    "northStar": "Working journal",
+    "overview": "Infinite presents persistent agent work as a readable record: a warm sheet, dark ink, ruled session rows, and forest-green controls. The visual density leaves room around titles while keeping process state, recorded output, and steering controls close together. The same restrained materials carry pairing, an empty workspace, a busy session list, and a long recording.\n\nThis is a code-led description of the local prototype, merged from the earlier design note. The working-journal direction is an implementation assumption, not a user-approved brand or attended visual choice. The reproduced concept-seed evidence is preserved verbatim in `.impeccable/concept-seed.txt` (seed `7872f499`, assigned grounded index `6`). That evidence does not establish an original candidate list, challenger evaluation, or visual approval; none is reconstructed here.",
+    "keyCharacteristics": [
+      "Warm sheet and canvas with ink-led hierarchy.",
+      "Ruled session records with provider, state, and a short stable ID.",
+      "Separate connection freshness, process state, and delivery receipts.",
+      "A persistent composer below interchangeable record views.",
+      "Instrument Sans on web and deliberate native system typography on Android."
+    ],
+    "rules": [
+      {
+        "name": "The State With Words Rule",
+        "body": "Pair operational color with a readable state label. A green indicator alone cannot establish freshness, successful execution, or task completion.",
+        "section": "colors"
+      },
+      {
+        "name": "The Title First Rule",
+        "body": "Put the session title before provider and status metadata. Keep process qualifiers subordinate without hiding them.",
+        "section": "typography"
+      },
+      {
+        "name": "The Record Type Rule",
+        "body": "Use monospace for captured output, code, and stable IDs. Ordinary navigation and prose retain the client’s body face; time labels use tabular figures where the web source specifies them.",
+        "section": "typography"
+      },
+      {
+        "name": "The Stable Frame Rule",
+        "body": "Keep the selected session and composer in place when switching between its record views. Let the record body scroll independently of the steering controls.",
+        "section": "layout"
+      },
+      {
+        "name": "The Tonal Depth Rule",
+        "body": "Use the existing sheet, inset panel, selection fill, and divider roles to separate content. Preserve their hierarchy before adding a new surface treatment.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do keep the warm sheet, ink hierarchy, and forest primary action consistent across pairing, lists, and detail.",
+      "Do place session titles before provider and status, and retain short stable IDs in list rows.",
+      "Do show connection freshness separately from process status and input delivery.",
+      "Do preserve minimum 44px web and 48-unit native control targets, visible focus, and wrapping native command keys.",
+      "Do use platform system typography on native while preserving the web hierarchy and Instrument Sans identity.",
+      "Do respect reduced motion: web view entry has no blur animation when reduced motion is requested."
+    ],
+    "donts": [
+      "Don't imply task completion from a running label, idle screen, connection indicator, or terminal delivery receipt.",
+      "Don't remove stale-view warnings while displaying cached session content.",
+      "Don't substitute provider-colored page themes for the shared palette.",
+      "Don't treat the terminal’s dark surface as a delivered dark app theme.",
+      "Don't describe the inferred working-journal direction or seed assignment as user-approved visual identity."
+    ]
+  }
+}

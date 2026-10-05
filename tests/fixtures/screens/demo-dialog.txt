@@ -1,0 +1,10 @@
+Infinite · local continuity rehearsal
+[2026-10-04T12:00:00.000Z] Checkpoint 1 · process still running
+
+Bash command
+  rm -rf build
+
+Do you want to proceed?
+❯ 1. Yes
+  2. Yes, and don't ask again for rm commands
+  3. No, and tell Claude what to do differently

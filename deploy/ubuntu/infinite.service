@@ -1,0 +1,41 @@
+[Unit]
+Description=Infinite single-tenant agent control API
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsMountPoint=/srv/infinite-data
+ConditionPathExists=/run/infinite-key/vault.key
+
+[Service]
+Type=simple
+User=infinite-host
+Group=infinite-host
+WorkingDirectory=/opt/infinite
+Environment=NODE_ENV=production
+Environment=INFINITE_CONFIG=/etc/infinite/config.json
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=TMPDIR=/srv/infinite-data/tmp/control
+ExecStart=/usr/local/bin/node /opt/infinite/packages/host/dist/cli.js serve
+Restart=on-failure
+RestartSec=3
+# Workers intentionally survive an API restart; stop sessions explicitly.
+KillMode=process
+RuntimeDirectory=infinite
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+LimitCORE=0
+LimitNOFILE=65536
+MemoryHigh=44G
+MemoryMax=48G
+TasksMax=4096
+CPUQuota=1400%
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+TemporaryFileSystem=/tmp:rw,nosuid,nodev,mode=1777 /var/tmp:rw,nosuid,nodev,mode=1777
+ReadWritePaths=/srv/infinite-data /run/infinite
+# sudo launches only the allowlisted native agents as infinite-agent.
+# NoNewPrivileges would prevent that identity transition.
+
+[Install]
+WantedBy=multi-user.target

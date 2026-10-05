@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.expo/
+.local/
+.env
+credentials.txt
+*.tsbuildinfo
+android/
+ios/
+.terraform/
+*.tfstate*
+*.tfvars
+!*.example.tfvars
+.impeccable/review/
+.impeccable/mocks/
+playwright-report/
+test-results/

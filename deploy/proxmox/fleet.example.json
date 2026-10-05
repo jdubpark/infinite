@@ -1,0 +1,34 @@
+{
+  "provider": "scaleway-pro-11-m-64g-proxmox-development",
+  "hostMemoryMiB": 65536,
+  "reserveMemoryMiB": 8192,
+  "guestVcpuBudget": 12,
+  "guestDiskBudgetGiB": 600,
+  "managementCidrs": ["192.0.2.10/32", "10.77.0.1/32"],
+  "tenants": [
+    {
+      "tenantId": "b057f435-6b57-427b-8369-15c4ae77b198",
+      "vmId": 201,
+      "ipv4": "10.77.0.11",
+      "memoryMiB": 16384,
+      "vcpus": 4,
+      "diskGiB": 160,
+      "diskReadMBps": 100,
+      "diskWriteMBps": 100,
+      "maxSessions": 10,
+      "dataClass": "synthetic"
+    },
+    {
+      "tenantId": "fdbfb1b0-0f25-41c7-a8db-454bbd9190f5",
+      "vmId": 202,
+      "ipv4": "10.77.0.12",
+      "memoryMiB": 16384,
+      "vcpus": 4,
+      "diskGiB": 160,
+      "diskReadMBps": 100,
+      "diskWriteMBps": 100,
+      "maxSessions": 10,
+      "dataClass": "synthetic"
+    }
+  ]
+}

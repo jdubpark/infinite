@@ -382,6 +382,65 @@ small,
 .connection.offline {
   color: #8b4c29;
 }
+.refresh-status,
+.control-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+  border: 0;
+  background: transparent;
+  color: var(--green);
+  padding: 8px;
+  font-size: 12px;
+}
+.control-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 0 42px 17px;
+}
+.control-bar > div:first-child {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 14px;
+  font-size: 12px;
+}
+.control-bar strong {
+  font-weight: 600;
+}
+.control-bar span,
+.control-bar small {
+  color: var(--muted);
+}
+.control-bar .primary {
+  min-height: 40px;
+  font-size: 12px;
+  padding: 10px 14px;
+}
+.control-message {
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+.attention-summary {
+  margin-bottom: 24px;
+  border-left: 2px solid var(--green);
+  padding-left: 14px;
+  font-size: 13px;
+}
+.attention-summary p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
 .back {
   display: none;
 }
@@ -914,6 +973,12 @@ small,
   .export {
     width: 44px;
     flex-shrink: 0;
+  }
+  .control-bar {
+    padding: 0 21px 14px;
+  }
+  .control-actions {
+    gap: 7px;
   }
   .tabs {
     margin: 0 21px;

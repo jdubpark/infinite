@@ -18,10 +18,11 @@
     "check": "npm run typecheck && npm test && npm run build"
   },
   "devDependencies": {
+    "@playwright/test": "^1.56.0",
     "@types/node": "^22.19.0",
+    "esbuild": "^0.28.2",
     "tsx": "^4.20.0",
-    "typescript": "^5.9.3",
-    "@playwright/test": "^1.56.0"
+    "typescript": "^5.9.3"
   },
   "engines": {
     "node": ">=22.14.0"

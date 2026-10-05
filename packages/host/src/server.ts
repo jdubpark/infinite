@@ -1,4 +1,6 @@
 import express from "express";
+import { createServer } from "node:http";
+import { connectTerminals, terminalPages } from "./terminal-stream.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -7,6 +9,7 @@ import { hashToken } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
 import { workerCall, type WorkerError } from "./ipc.js";
 import { PushStore, isExpoToken } from "./push.js";
+import { controlActor, type PairedDevice } from "./device-control.js";
 import type { Config, Role, Receipt } from "./types.js";
 
 const id = z.uuid();
@@ -17,6 +20,8 @@ const createSchema = z
     projectId: z.string().max(80),
     title: z.string().trim().min(1).max(100),
     prompt: z.string().max(24000).default(""),
+    nativeArgs: z.array(z.string().max(8192).refine((s) => !s.includes("\0")))
+      .max(256).refine((args) => args.join("").length <= 32000).optional(),
   })
   .strict();
 const ANSWER_REFUSALS = new Set([
@@ -57,7 +62,13 @@ export function createApp(config: Config, key: Buffer) {
   const app = express();
   const manager = new Manager(config, key);
   const pushStore = new PushStore(config.stateDir, key);
-  const cookies = new Map<string, { role: Role; id: string; expires: number }>();
+  async function inputAuthority(sessionId: string, res: express.Response) {
+    // Retained workers from earlier releases hash the entire request. Adding
+    // optional fields would make a pre-upgrade receipt impossible to retry.
+    return (await manager.state(sessionId)).capabilities?.inputControl
+      ? { actor: res.locals.actor, leaseId: res.locals.leaseId } : {};
+  }
+  const cookies = new Map<string, { device: PairedDevice; expires: number }>();
   const attempts = new Map<string, { start: number; count: number }>();
   const origin = new URL(config.origin);
   app.disable("x-powered-by");
@@ -104,16 +115,15 @@ export function createApp(config: Config, key: Buffer) {
         .status(403)
         .json({ error: "Browser sign-in requires the configured origin" });
     const token = z.string().min(32).max(200).parse(req.body?.token);
-    const entry = authenticate(token);
-    const role = entry?.role;
-    if (!entry || !role)
+    const device = authenticate(token);
+    if (!device)
       return res.status(401).json({ error: "Device key was not recognized" });
     for (const [value, session] of cookies)
       if (session.expires <= now) cookies.delete(value);
     if (cookies.size > 64)
       return res.status(429).json({ error: "Too many browser connections" });
     const value = randomBytes(32).toString("base64url");
-    cookies.set(hashToken(value), { role, id: entry.id, expires: now + 12 * 60 * 60 * 1000 });
+    cookies.set(hashToken(value), { device, expires: now + 12 * 60 * 60 * 1000 });
     res.cookie("infinite", value, {
       httpOnly: true,
       sameSite: "strict",
@@ -121,14 +131,13 @@ export function createApp(config: Config, key: Buffer) {
       maxAge: 12 * 60 * 60 * 1000,
       path: "/api",
     });
-    return res.json({ role });
+    return res.json({ role: device.role });
   });
   app.use("/api", (req, res, next) => {
     const bearer =
       req.headers.authorization?.match(/^Bearer (.{32,200})$/)?.[1];
-    const entry = bearer ? authenticate(bearer) : undefined;
-    let role = entry?.role;
-    let deviceId = entry?.id;
+    let device = bearer ? authenticate(bearer) : undefined;
+    let instance = "legacy";
     if (!bearer) {
       const value = req.headers.cookie
         ?.split(";")
@@ -137,18 +146,22 @@ export function createApp(config: Config, key: Buffer) {
         ?.slice(9);
       const session = value ? cookies.get(hashToken(value)) : undefined;
       if (session && session.expires > Date.now()) {
-        role = session.role;
-        deviceId = session.id;
+        device = session.device;
+        instance = hashToken(value!);
       }
       if (req.method !== "GET" && req.headers.origin !== origin.origin)
         return res
           .status(403)
           .json({ error: "Origin is required for browser changes" });
     }
-    if (!role)
+    if (!device)
       return res.status(401).json({ error: "Connect with a device key" });
-    res.locals.role = role;
-    res.locals.deviceId = deviceId;
+    res.locals.role = device.role;
+    res.locals.deviceId = device.id;
+    res.locals.bearer = Boolean(bearer);
+    const clientId = req.get("X-Infinite-Client");
+    res.locals.actor = controlActor(device, clientId ? id.parse(clientId) : instance);
+    res.locals.leaseId = id.optional().parse(req.get("X-Infinite-Control"));
     next();
   });
   const requireRole =
@@ -162,6 +175,7 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/me", (_req, res) =>
     res.json({
       role: res.locals.role,
+      terminal: { stream: true, duplex: true, snapshot: true, control: true, raw: res.locals.role === "owner" },
       environment: config.environment,
       security: runtimeSecurity(config.deployment),
       providers: Object.keys(config.agents).filter(
@@ -252,6 +266,50 @@ export function createApp(config: Config, key: Buffer) {
         : undefined;
     res.json(manager.events(id.parse(req.params.id), after, limit, types));
   });
+  app.post("/api/sessions/:id/control", requireRole(["owner", "controller"]), async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    manager.meta(sessionId);
+    const body = z.object({
+      action: z.enum(["claim", "renew", "release"]),
+      leaseId: id.optional(),
+      takeover: z.boolean().optional(),
+    }).strict().parse(req.body);
+    if (!(await manager.state(sessionId)).capabilities?.inputControl)
+      return void res.status(409).json({ error: "This session uses an older worker without input control", code: "unsupported" });
+    res.json({ control: await workerCall(config.runDir, sessionId, { op: "control", ...body, actor: res.locals.actor }) });
+  });
+  // Only a directly paired owner CLI can send terminal control bytes. Browser
+  // cookies and controller/viewer keys retain their existing narrower inputs.
+  app.post("/api/sessions/:id/raw", requireRole(["owner"]), async (req, res) => {
+    if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use native input" });
+    const sessionId = id.parse(req.params.id);
+    manager.meta(sessionId);
+    const body = z.object({ requestId: id, text: z.string().min(1).max(8192) }).strict().parse(req.body);
+    res.json(await workerCall<Receipt>(config.runDir, sessionId, { op: "raw", ...body, ...await inputAuthority(sessionId, res) }));
+  });
+  app.get("/api/sessions/:id/stream", async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    manager.meta(sessionId);
+    let cursor = z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0).parse(req.query.after);
+    res.set({ "Content-Type": "application/x-ndjson", "X-Accel-Buffering": "no" });
+    res.flushHeaders();
+    const abort = new AbortController();
+    res.on("close", () => abort.abort());
+    const send = async (value: unknown) => {
+      if (res.destroyed) return;
+      if (!res.write(JSON.stringify(value) + "\n")) {
+        await new Promise<void>((resolve) => {
+          const done = () => { res.off("drain", done); res.off("close", done); resolve(); };
+          res.once("drain", done); res.once("close", done);
+        });
+      }
+    };
+    try {
+      for await (const page of terminalPages(manager, sessionId, cursor, abort.signal, req.query.snapshot === "1")) await send(page);
+    } catch {
+      if (!res.destroyed) await send({ error: "Recording stream interrupted; reconnect to replay from the last cursor" });
+    } finally { res.end(); }
+  });
   app.post(
     "/api/sessions/:id/input",
     requireRole(["owner", "controller"]),
@@ -264,6 +322,7 @@ export function createApp(config: Config, key: Buffer) {
           await workerCall<Receipt>(config.runDir, sessionId, {
             op: "input",
             ...body,
+            ...await inputAuthority(sessionId, res),
           }),
         );
       } catch (error) {
@@ -290,7 +349,7 @@ export function createApp(config: Config, key: Buffer) {
           await workerCall(
             config.runDir,
             sessionId,
-            { op: "answer", ...body },
+            { op: "answer", ...body, ...await inputAuthority(sessionId, res) },
             12000,
           ),
         );
@@ -319,7 +378,7 @@ export function createApp(config: Config, key: Buffer) {
         .strict()
         .parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "key", ...body }),
+        await workerCall(config.runDir, sessionId, { op: "key", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -331,7 +390,7 @@ export function createApp(config: Config, key: Buffer) {
       manager.meta(sessionId);
       const body = z.object({ requestId: id }).strict().parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "stop", ...body }),
+        await workerCall(config.runDir, sessionId, { op: "stop", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -349,7 +408,7 @@ export function createApp(config: Config, key: Buffer) {
         .strict()
         .parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "resize", ...body }),
+        await workerCall(config.runDir, sessionId, { op: "resize", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -403,6 +462,13 @@ export function createApp(config: Config, key: Buffer) {
         return res.status(404).json({ error: "Session not found" });
       if (error instanceof SyntaxError)
         return res.status(400).json({ error: "Invalid JSON" });
+      if (["control-busy", "control-lost"].includes((error as WorkerError).code ?? ""))
+        return res.status(409).json({
+          code: (error as WorkerError).code,
+          error: (error as WorkerError).code === "control-busy"
+            ? "Another device controls this session. Take over explicitly to send input."
+            : "Control changed or expired. This input was not sent. Refresh and take control again.",
+        });
       // Never echo filesystem paths, prompts, tokens, or child process details.
       return res.status(409).json({
         error:
@@ -410,5 +476,8 @@ export function createApp(config: Config, key: Buffer) {
       });
     },
   );
-  return { app, manager, pushStore };
+  const server = createServer(app);
+  const closeTerminals = connectTerminals(server, manager, authenticate);
+  const closeConnections = () => { closeTerminals(); server.closeAllConnections(); };
+  return { app, manager, pushStore, server, closeConnections };
 }

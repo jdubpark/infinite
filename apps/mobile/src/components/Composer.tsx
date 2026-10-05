@@ -1,13 +1,15 @@
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { StyleSheet, Text, TextInput, View } from "react-native";
 import { theme } from "../theme";
 import { Button } from "./Button";
 
 /**
- * The docked text composer. `pending` means the last send is uncertain: the
- * text stays locked and the button reads "Retry", which resends the same
- * request. `blocked` disables text and Send (not Interrupt) and says why.
- * `children` render under the input row (the Terminal's key row).
+ * The docked text composer. The caller owns `text`, so a draft outlives the
+ * screen. `pending` means the last send is uncertain: the text stays locked
+ * and the button reads "Retry", which resends the same request. `blocked`
+ * disables text and Send (not Interrupt) and says why; `idleHint` replaces the
+ * placeholder while steering is unavailable. `children` render under the
+ * input row (the Terminal's key row).
  */
 export function Composer({
   canSteer,
@@ -16,6 +18,9 @@ export function Composer({
   receipt,
   error,
   blocked,
+  idleHint,
+  text,
+  onChangeText,
   onSend,
   onInterrupt,
   children,
@@ -26,15 +31,14 @@ export function Composer({
   receipt: string;
   error: string;
   blocked?: string;
-  onSend: (text: string) => Promise<boolean>;
+  idleHint?: string;
+  text: string;
+  onChangeText: (text: string) => void;
+  onSend: () => void;
   onInterrupt?: () => void;
   children?: ReactNode;
 }) {
-  const [text, setText] = useState("");
   const canType = canSteer && !blocked;
-  async function send() {
-    if (await onSend(text)) setText("");
-  }
   return (
     <View style={s.area}>
       {error ? (
@@ -44,16 +48,21 @@ export function Composer({
       ) : null}
       {receipt ? <Text style={s.receipt}>{receipt}</Text> : null}
       {blocked ? <Text style={s.hint}>{blocked}</Text> : null}
+      {pending ? (
+        <Text style={s.note}>
+          Unconfirmed delivery · Retry keeps the same request ID
+        </Text>
+      ) : null}
       <View style={s.row}>
         <TextInput
           accessibilityLabel="Message to agent"
           multiline
           value={text}
-          onChangeText={setText}
+          onChangeText={onChangeText}
           editable={canType && !busy && !pending}
           placeholder={
             !canSteer
-              ? "Waiting for a live connection"
+              ? (idleHint ?? "Waiting for a live connection")
               : blocked
                 ? "Paused while a prompt is open"
                 : "Give this session a direction…"
@@ -64,7 +73,7 @@ export function Composer({
         />
         <Button
           title={pending ? "Retry" : "Send"}
-          onPress={send}
+          onPress={onSend}
           disabled={!canType || busy || !text.trim()}
         />
       </View>
@@ -102,6 +111,12 @@ const s = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
     color: theme.colors.warningInk,
+    marginBottom: theme.space.compact,
+  },
+  note: {
+    fontSize: 11,
+    lineHeight: 17,
+    color: theme.colors.mutedInk,
     marginBottom: theme.space.compact,
   },
   receipt: {

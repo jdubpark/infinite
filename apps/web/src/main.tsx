@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -21,7 +21,7 @@ import {
   TerminalSquare,
   WifiOff,
 } from "lucide-react";
-import { api, names, type Me, type Session, type LogEvent } from "./api";
+import { api, isControlRefusal, names, type ControlLease, type Me, type Session, type LogEvent } from "./api";
 import "@fontsource/instrument-sans/400.css";
 import "@fontsource/instrument-sans/500.css";
 import "@fontsource/instrument-sans/600.css";
@@ -33,6 +33,171 @@ const time = (value: string) =>
     hour: "2-digit",
     minute: "2-digit",
   });
+type PendingInput = { requestId: string; text: string; submit: boolean; force: true };
+// Drafts and uncertain request IDs live only in this tab's memory.
+const drafts = new Map<string, { text: string; pending: PendingInput | null }>();
+const foreground = () => document.visibilityState !== "hidden" && navigator.onLine;
+const sessionStatus = (session: Session) => session.attention?.state === "needs-you"
+  ? "Needs you" : session.attention?.state === "turn-finished" ? "Turn finished" : session.status;
+
+function useLiveRefresh(
+  task: (current: () => boolean) => Promise<number | void>,
+  interval: number,
+  identity: unknown,
+  unavailable?: () => void,
+) {
+  const taskRef = useRef(task);
+  const unavailableRef = useRef(unavailable);
+  useEffect(() => {
+    taskRef.current = task;
+    unavailableRef.current = unavailable;
+  });
+  const refreshRef = useRef<() => void>(() => {});
+  const [fresh, setFresh] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [seen, setSeen] = useState("");
+  useEffect(() => {
+    let active = true, polling = false, queued = false, generation = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    setFresh(false);
+    const poll = async () => {
+      clearTimeout(timer);
+      if (!active || !identity || !foreground()) return;
+      if (polling) { queued = true; return; }
+      polling = true;
+      setRefreshing(true);
+      const started = generation;
+      const current = () => active && foreground() && started === generation;
+      let delay = interval;
+      try {
+        delay = await taskRef.current(current) ?? interval;
+        if (current()) { setFresh(true); setSeen(new Date().toISOString()); }
+      } catch {
+        if (current()) { setFresh(false); unavailableRef.current?.(); }
+      } finally {
+        polling = false;
+        if (active) {
+          setRefreshing(false);
+          if (foreground()) timer = setTimeout(poll, queued ? 0 : delay);
+          queued = false;
+        }
+      }
+    };
+    const resync = () => {
+      generation++;
+      setFresh(false);
+      clearTimeout(timer);
+      if (foreground()) void poll();
+      else unavailableRef.current?.();
+    };
+    refreshRef.current = () => { void poll(); };
+    document.addEventListener("visibilitychange", resync);
+    window.addEventListener("online", resync);
+    window.addEventListener("offline", resync);
+    window.addEventListener("focus", resync);
+    void poll();
+    return () => {
+      active = false;
+      clearTimeout(timer);
+      refreshRef.current = () => {};
+      document.removeEventListener("visibilitychange", resync);
+      window.removeEventListener("online", resync);
+      window.removeEventListener("offline", resync);
+      window.removeEventListener("focus", resync);
+    };
+  }, [identity, interval]);
+  return { fresh, refreshing, seen, refresh: useCallback(() => refreshRef.current(), []) };
+}
+
+function useSessionControl(id: string) {
+  const [lease, setLease] = useState<ControlLease | null>(null);
+  const [holder, setHolder] = useState<ControlLease | null>(null);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const owned = useRef<ControlLease | null>(null);
+  const claiming = useRef(false);
+  const generation = useRef(0);
+  const mounted = useRef(true);
+  const releaseRequest = (control: ControlLease) => api(`/sessions/${id}/control`, {
+    action: "release", leaseId: control.id,
+  }).catch(() => {});
+  const forget = (release = false) => {
+    generation.current++;
+    const previous = owned.current;
+    owned.current = null;
+    setLease(null);
+    if (previous) {
+      setMessage("Monitoring. Take control again when you are ready to send input.");
+      if (release) void releaseRequest(previous);
+    }
+  };
+  const observe = (session: Session, revision: number) => {
+    if (revision !== generation.current) return;
+    setHolder(session.control ?? null);
+    const previous = owned.current;
+    if (previous && (session.control?.id !== previous.id ||
+      session.control.expiresAt <= Date.now() || session.status !== "running")) forget();
+  };
+  const claim = async (takeover = false) => {
+    if (claiming.current) return;
+    claiming.current = true;
+    const revision = ++generation.current;
+    setBusy(true); setMessage("");
+    try {
+      const result = await api<{ control: ControlLease | null }>(`/sessions/${id}/control`, { action: "claim", takeover });
+      if (!mounted.current || !foreground() || revision !== generation.current) {
+        if (result.control) void releaseRequest(result.control);
+        return;
+      }
+      // A poll started while claim was pending still carries the old holder.
+      // Fence that response as well as polls begun before the request.
+      generation.current++;
+      owned.current = result.control;
+      setLease(result.control); setHolder(result.control);
+      setMessage(result.control ? "This device has control." : "Control was not granted. Refresh and try again.");
+    } catch (error) {
+      if (mounted.current && revision === generation.current) {
+        forget();
+        if (isControlRefusal(error) && error.control !== undefined) setHolder(error.control);
+        setMessage((error as Error).message);
+      }
+    } finally { claiming.current = false; if (mounted.current) setBusy(false); }
+  };
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      generation.current++;
+      const previous = owned.current;
+      owned.current = null;
+      if (previous) void api(`/sessions/${id}/control`, { action: "release", leaseId: previous.id }).catch(() => {});
+    };
+  }, [id]);
+  useEffect(() => {
+    if (!lease) return;
+    let renewing = false;
+    const expire = setTimeout(() => forget(), Math.max(0, lease.expiresAt - Date.now()));
+    const renew = setInterval(async () => {
+      if (renewing || !foreground() || owned.current?.id !== lease.id) return;
+      renewing = true;
+      const revision = generation.current;
+      try {
+        const result = await api<{ control: ControlLease | null }>(`/sessions/${id}/control`, { action: "renew", leaseId: lease.id });
+        if (mounted.current && revision === generation.current && owned.current?.id === lease.id) {
+          if (result.control?.id === lease.id && foreground()) {
+            generation.current++;
+            owned.current = result.control; setLease(result.control); setHolder(result.control);
+          } else forget();
+        }
+      } catch {
+        if (mounted.current && revision === generation.current) forget();
+      } finally { renewing = false; }
+    }, 10000);
+    return () => { clearTimeout(expire); clearInterval(renew); };
+  }, [id, lease]);
+  return { lease, holder, message, busy, claim, forget, observe, generation, owned };
+}
+
 function Mark() {
   return (
     <div className="brand">
@@ -49,8 +214,6 @@ function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-  const [connected, setConnected] = useState(false);
-  const [lastSeen, setLastSeen] = useState("");
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     api<Me>("/me")
@@ -58,33 +221,12 @@ function App() {
       .catch(() => {})
       .finally(() => setReady(true));
   }, []);
-  useEffect(() => {
-    if (!me) return;
-    let active = true;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      try {
-        const data = await api<{ sessions: Session[] }>("/sessions");
-        if (active) {
-          setSessions(
-            data.sessions.sort((a, b) =>
-              b.createdAt.localeCompare(a.createdAt),
-            ),
-          );
-          setConnected(true);
-          setLastSeen(new Date().toISOString());
-        }
-      } catch {
-        if (active) setConnected(false);
-      }
-      if (active) timer = setTimeout(poll, 1800);
-    };
-    void poll();
-    return () => {
-      active = false;
-      clearTimeout(timer);
-    };
-  }, [me]);
+  const host = useLiveRefresh(async (current) => {
+    const data = await api<{ sessions: Session[] }>("/sessions");
+    if (current()) setSessions(data.sessions.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  }, 1800, me);
+  const connected = host.fresh;
+  const lastSeen = host.seen;
   async function login(event: React.FormEvent) {
     event.preventDefault();
     setBusy(true);
@@ -195,7 +337,7 @@ function App() {
               </div>
               <div className="row-meta">
                 <span>{names[session.provider]}</span>
-                <span>{session.status}</span>
+                <span>{sessionStatus(session)}</span>
               </div>
               <div className="row-meta session-id">
                 {session.id.slice(0, 8)}
@@ -227,7 +369,7 @@ function App() {
             {connected ? (
               <>
                 <span className="dot running" />
-                {active} running · connected
+                {active} running · up to date
               </>
             ) : (
               <>
@@ -243,6 +385,7 @@ function App() {
             await api("/logout", {});
             setMe(null);
             setSelected(null);
+            drafts.clear();
           }}
         >
           <LogOut size={16} /> Disconnect this device
@@ -267,10 +410,15 @@ function App() {
               {creating ? "New session" : selected ? "Session" : "Overview"}
             </strong>
           </div>
+          <div className="refresh-status">
+          <button className="text-button" onClick={host.refresh} disabled={host.refreshing}>
+            <RefreshCw size={14} /> {host.refreshing ? "Refreshing…" : "Refresh"}
+          </button>
           <span className={`connection ${connected ? "" : "offline"}`}>
             <span className={`dot ${connected ? "running" : "unavailable"}`} />
-            {connected ? "Connected" : "Reconnecting"}
+            {connected ? "Up to date" : "Reconnecting"}
           </span>
+          </div>
         </header>
         {!connected && (
           <div className="connection-notice" role="status">
@@ -333,7 +481,7 @@ function App() {
                   </span>
                   <span className="session-status">
                     <span className={`dot ${session.status}`} />
-                    {session.status}
+                    {sessionStatus(session)}
                   </span>
                   <ArrowUpRight size={20} />
                 </button>
@@ -564,61 +712,53 @@ function SessionView({
 }) {
   const [session, setSession] = useState<Session | null>(null);
   const [tab, setTab] = useState<"screen" | "terminal" | "context">("screen");
-  const [text, setText] = useState("");
+  const [text, setText] = useState(() => drafts.get(id)?.text ?? "");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [events, setEvents] = useState<LogEvent[]>([]);
-  const [fresh, setFresh] = useState(false);
-  const pending = useRef<{
-    requestId: string;
-    text: string;
-    submit: boolean;
-    force: true;
-  } | null>(null);
-  const [pendingInput, setPendingInput] = useState(false);
-  useEffect(() => {
-    let active = true,
-      cursor = 0;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      try {
-        const [detail, page] = await Promise.all([
-          api<Session>(`/sessions/${id}`),
-          api<{ events: LogEvent[]; cursor: number; more: boolean }>(
-            `/sessions/${id}/events?after=${cursor}`,
-          ),
-        ]);
-        if (!active) return;
-        setSession(detail);
-        setFresh(true);
-        cursor = page.cursor;
-        setEvents((old) =>
-          [...old, ...page.events.filter((e) => e.type !== "output")].slice(
-            -100,
-          ),
-        );
-        timer = setTimeout(poll, page.more ? 0 : 1100);
-      } catch {
-        if (active) {
-          setFresh(false);
-          timer = setTimeout(poll, 2000);
-        }
-      }
-    };
-    void poll();
-    return () => {
-      active = false;
-      clearTimeout(timer);
-    };
-  }, [id]);
-  const canSteer =
-    connected && fresh && session?.status === "running" && me.role !== "viewer";
+  const pending = useRef<PendingInput | null>(drafts.get(id)?.pending ?? null);
+  const [pendingInput, setPendingInput] = useState(() => Boolean(drafts.get(id)?.pending));
+  const cursor = useRef(0);
+  const control = useSessionControl(id);
+  const view = useLiveRefresh(async (current) => {
+    const revision = control.generation.current;
+    const [detail, page] = await Promise.all([
+      api<Session>(`/sessions/${id}`),
+      api<{ events: LogEvent[]; cursor: number; more: boolean }>(`/sessions/${id}/events?after=${cursor.current}`),
+    ]);
+    if (current()) {
+      setSession(detail);
+      control.observe(detail, revision);
+      cursor.current = page.cursor;
+      setEvents((old) => [...old, ...page.events.filter((event) => event.type !== "output")].slice(-100));
+    }
+    return page.more ? 0 : 1100;
+  }, 1100, id, () => control.forget(true));
+  useEffect(() => { drafts.set(id, { text, pending: pending.current }); }, [id, text, pendingInput]);
+  const requiresControl = session?.capabilities?.inputControl === 1;
+  const canSteer = connected && view.fresh && session?.status === "running" &&
+    me.role !== "viewer" && (!requiresControl || Boolean(control.lease));
+  async function takeControl(takeover = false) {
+    if (!view.fresh || session?.status !== "running") return;
+    await control.claim(takeover);
+    view.refresh();
+  }
+  function handleInputError(error: unknown) {
+    if (isControlRefusal(error)) {
+      control.forget();
+      view.refresh();
+      return true;
+    }
+    return false;
+  }
   async function send(e: React.FormEvent) {
     e.preventDefault();
+    if (!canSteer || busy) return;
     setBusy(true);
     setError("");
     setNotice("");
+    const retrying = pending.current !== null;
     // The live screen is shown here, so text may go into an open dialog, as on a terminal.
     pending.current ??= { requestId: crypto.randomUUID(), text, submit: true, force: true };
     setPendingInput(true);
@@ -626,6 +766,8 @@ function SessionView({
       const receipt = await api<{ state: string }>(
         `/sessions/${id}/input`,
         pending.current,
+        undefined,
+        control.owned.current?.id,
       );
       if (receipt.state !== "delivered")
         throw new Error(
@@ -638,19 +780,31 @@ function SessionView({
         "Delivered to the terminal. Agent execution is not yet confirmed.",
       );
     } catch (e) {
-      setError((e as Error).message);
+      if (handleInputError(e)) {
+        if (!retrying) {
+          pending.current = null;
+          setPendingInput(false);
+        }
+        setError(retrying ? `${(e as Error).message} This retry was refused. Earlier delivery remains unconfirmed; its request ID is kept.` :
+          `${(e as Error).message} Your draft was not sent.`);
+      } else setError(`${(e as Error).message} Delivery may be uncertain. Check the recording before retrying the same request.`);
     } finally {
       setBusy(false);
     }
   }
   async function key(key: string) {
+    if (!canSteer || busy) return;
     setBusy(true);
     setError("");
+    setNotice("");
     try {
-      await api(`/sessions/${id}/key`, { requestId: crypto.randomUUID(), key });
+      const receipt = await api<{ state: string }>(`/sessions/${id}/key`,
+        { requestId: crypto.randomUUID(), key }, undefined, control.owned.current?.id);
+      if (receipt.state !== "delivered") throw new Error("Key delivery is uncertain.");
       setNotice(`${key} sent to the terminal.`);
     } catch (e) {
-      setError((e as Error).message);
+      setError(handleInputError(e) ? `${(e as Error).message} The key was not sent.` :
+        `${(e as Error).message} Check the recording before sending another key.`);
     } finally {
       setBusy(false);
     }
@@ -718,6 +872,22 @@ function SessionView({
           <Download size={19} />
         </button>
       </div>
+      <div className="control-bar" aria-live="polite">
+        <div>
+          <strong>{requiresControl ? control.lease ? "You have control" : "Monitoring" : me.role === "viewer" ? "Monitoring" : "Shared controls"}</strong>
+          <span>{view.fresh ? `Updated ${time(view.seen)}` : "Reconnecting · cached view"}</span>
+          {requiresControl && !control.lease && control.holder && <small>{control.holder.label} has control</small>}
+        </div>
+        <div className="control-actions">
+          <button className="text-button" onClick={view.refresh} disabled={view.refreshing} aria-label="Refresh this session"><RefreshCw size={16} /></button>
+          {requiresControl && me.role !== "viewer" && session.status === "running" && (
+            control.lease ? <button className="text-button" onClick={() => { control.forget(true); view.refresh(); }}>Stop controlling</button> :
+              <button className="primary" disabled={!view.fresh || control.busy} onClick={() => takeControl(Boolean(control.holder))}>
+                {control.busy ? "Requesting…" : control.holder ? "Take over" : "Take control"}
+              </button>
+          )}
+        </div>
+      </div>
       <div className="tabs" role="tablist" aria-label="Session views">
         {(["screen", "terminal", "context"] as const).map((t) => (
           <button
@@ -739,12 +909,13 @@ function SessionView({
         {tab === "terminal" ? (
           <TerminalView id={id} />
         ) : tab === "context" ? (
-          <Context session={session} me={me} connected={connected && fresh} />
+          <Context session={session} me={me} connected={connected && view.fresh} />
         ) : (
           <div className="catchup">
+            {session.attention?.now && <div className="attention-summary"><strong>{sessionStatus(session)}</strong><p>{session.attention.now}</p></div>}
             <div className="section-label">
               <h2>Current screen</h2>
-              <span>{fresh ? "Live snapshot" : "Last received · stale"}</span>
+              <span>{view.fresh ? `Updated ${time(view.seen)}` : "Last received · stale"}</span>
             </div>
             <pre className="screen">
               {session.screen ||
@@ -766,7 +937,7 @@ function SessionView({
                       {event.type === "input-intent"
                         ? "Input requested"
                         : event.type === "input-result"
-                          ? "Input delivered to terminal"
+                          ? event.data.state === "delivered" ? "Input delivered to terminal" : "Input delivery uncertain"
                           : event.type === "signal"
                             ? String(event.data.kind ?? "Signal")
                             : String(event.data.status ?? "Session updated")}
@@ -785,6 +956,7 @@ function SessionView({
         )}
       </div>
       <div className="composer-area">
+        {control.message && <p className="quiet control-message" role="status">{control.message}</p>}
         {error && (
           <p className="error" role="alert">
             {error}
@@ -810,11 +982,11 @@ function SessionView({
                 placeholder={
                   canSteer
                     ? "Give this session a direction…"
-                    : "Input is disabled until the session is connected and running"
+                    : "Draft here. Take control when you are ready to send…"
                 }
                 value={text}
                 onChange={(e) => setText(e.target.value)}
-                disabled={busy || !canSteer || pendingInput}
+                disabled={busy || pendingInput}
                 maxLength={32000}
               />
               <button
@@ -828,7 +1000,7 @@ function SessionView({
               </button>
             </form>
             <div className="composer-footer">
-              <span>Same session. Every device.</span>
+              <span>{pendingInput ? "Unconfirmed delivery · retry keeps the same request ID" : "Draft stays on this device until you send."}</span>
               <div>
                 <button
                   disabled={!canSteer || busy}

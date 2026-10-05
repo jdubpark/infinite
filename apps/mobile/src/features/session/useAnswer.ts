@@ -4,10 +4,12 @@ import type { Prompt } from "@infinite/attention";
 import {
   api,
   ApiError,
+  ControlRefusal,
   type AnswerReceipt,
   type Connection,
 } from "../../api/client";
 import type { DecisionStatus } from "../../components/DecisionCard";
+import type { SessionControlHandle } from "./useSessionControl";
 
 type AnswerBody = {
   requestId: string;
@@ -29,6 +31,10 @@ const NOTICE_TEXT = {
     "This prompt changed before the answer landed. Nothing was selected.",
   reloaded: "This prompt changed. Reloaded.",
   terminal: "This prompt must be answered in the terminal.",
+  "control-busy":
+    "Another device controls this session. Nothing was selected. Take over to answer here.",
+  "control-lost":
+    "This phone's control ended. Nothing was selected. Take control again to answer.",
 } as const;
 /** Refusals that no reload fixes: the dialog only takes keys typed in the terminal. */
 const TERMINAL_ONLY = new Set(["unsupported", "text-not-accepted"]);
@@ -45,13 +51,15 @@ const IDLE: CardState = { status: { kind: "idle" } };
  * after an uncertain delivery resends the same body with the same requestId.
  * `status` belongs to the card of the prompt it was set for and resets when a
  * different prompt appears. `notice` reports a refused or changed answer above
- * whatever is shown next, until the next tap or 30 seconds.
+ * whatever is shown next, until the next tap or 30 seconds. Every answer
+ * carries this phone's control lease.
  */
 export function useAnswer(
   connection: Connection,
   id: string,
   prompt: Prompt | undefined,
   refresh: () => void,
+  control: Pick<SessionControlHandle, "leaseId" | "refused">,
 ) {
   const [card, setCard] = useState<CardState>(IDLE);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -73,7 +81,7 @@ export function useAnswer(
     return () => clearTimeout(timer);
   }, [notice]);
 
-  async function deliver(body: AnswerBody) {
+  async function deliver(body: AnswerBody, retrying = false) {
     if (inFlight.current) return;
     inFlight.current = true;
     pendingAnswer.current = body;
@@ -83,7 +91,7 @@ export function useAnswer(
       const receipt = await api<AnswerReceipt>(
         connection,
         `/sessions/${id}/answer`,
-        { body },
+        { body, control: control.leaseId() },
       );
       if (receipt.state !== "delivered")
         throw new ApiError(
@@ -99,7 +107,24 @@ export function useAnswer(
       } else
         setCard({ promptId: body.promptId, status: { kind: "still-open" } });
     } catch (error) {
-      if (
+      if (error instanceof ControlRefusal) {
+        // Refused before any key was pressed. A refused retry says nothing about the first try.
+        control.refused();
+        if (retrying)
+          setCard({
+            promptId: body.promptId,
+            status: {
+              kind: "error",
+              message: `${error.message} This retry was refused. Earlier delivery remains unconfirmed; its request ID is kept.`,
+              retry: true,
+            },
+          });
+        else {
+          pendingAnswer.current = null;
+          setCard(IDLE);
+          setNotice({ kind: error.code, promptId: body.promptId });
+        }
+      } else if (
         error instanceof ApiError &&
         error.status === 409 &&
         error.attention &&
@@ -154,7 +179,7 @@ export function useAnswer(
   }
 
   function retry() {
-    if (pendingAnswer.current) void deliver(pendingAnswer.current);
+    if (pendingAnswer.current) void deliver(pendingAnswer.current, true);
   }
 
   return {

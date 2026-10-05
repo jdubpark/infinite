@@ -33,7 +33,7 @@ export function Inbox({
   pushNote?: string;
 }) {
   const router = useRouter();
-  const { data, online, seen } = usePoll(
+  const { data, online, seen, refresh } = usePoll(
     async () => {
       const [list, me] = await Promise.all([
         api<{ sessions: SessionRow[] }>(connection, "/sessions"),
@@ -56,7 +56,7 @@ export function Inbox({
         <Text style={s.brand}>infinite</Text>
         <View style={s.connection}>
           <View style={[s.dot, !online && s.offlineDot]} />
-          <Text style={s.small}>{online ? "Connected" : "Reconnecting"}</Text>
+          <Text style={s.small}>{online ? "Up to date" : "Reconnecting"}</Text>
         </View>
       </View>
       <ScrollView contentContainerStyle={s.list}>
@@ -75,10 +75,15 @@ export function Inbox({
             {sessions.filter((session) => session.status === "running").length}{" "}
             running
           </Text>
-          <Text style={s.small}>
-            {seen ? `Checked ${seen}` : "Connecting…"}
-          </Text>
+          <Button title="Refresh" secondary onPress={refresh} />
         </View>
+        <Text style={s.small}>
+          {online
+            ? `Last updated ${seen}`
+            : seen
+              ? `Cached view from ${seen}`
+              : "Waiting for a fresh response…"}
+        </Text>
         {groupSessions(sessions).map((group) => (
           <View key={group.title}>
             <Text style={s.groupHeading}>{group.title.toUpperCase()}</Text>
@@ -183,6 +188,7 @@ const s = StyleSheet.create({
   listHeading: {
     flexDirection: "row",
     justifyContent: "space-between",
+    alignItems: "center",
     borderBottomWidth: 1,
     borderBottomColor: theme.colors.rule,
     paddingVertical: 15,

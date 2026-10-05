@@ -1,4 +1,5 @@
 import type { Attention, Provider } from "@infinite/attention";
+import { loadClientId } from "../store/connection";
 
 export type Connection = { url: string; token: string };
 
@@ -13,10 +14,29 @@ export class ApiError extends Error {
   }
 }
 
+export type ControlCode = "control-busy" | "control-lost";
+/**
+ * The host refused input before anything was typed: another device holds control
+ * (`control-busy`), or this phone's lease changed or expired (`control-lost`).
+ */
+export class ControlRefusal extends ApiError {
+  constructor(
+    message: string,
+    readonly code: ControlCode,
+  ) {
+    super(message, 409, code);
+  }
+}
+
 export async function api<T>(
   connection: Connection,
   path: string,
-  init: { method?: "GET" | "POST" | "DELETE"; body?: unknown } = {},
+  init: {
+    method?: "GET" | "POST" | "DELETE";
+    body?: unknown;
+    /** The lease id this phone holds; the host refuses input without it. */
+    control?: string;
+  } = {},
 ): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12000);
@@ -25,19 +45,30 @@ export async function api<T>(
       method: init.method ?? (init.body ? "POST" : "GET"),
       headers: {
         Authorization: `Bearer ${connection.token}`,
+        "X-Infinite-Client": await loadClientId(),
+        ...(init.control ? { "X-Infinite-Control": init.control } : {}),
         ...(init.body ? { "Content-Type": "application/json" } : {}),
       },
       body: init.body ? JSON.stringify(init.body) : undefined,
       signal: controller.signal,
     });
     const value = await response.json();
-    if (!response.ok)
+    if (!response.ok) {
+      const message = value.error ?? "Host request failed";
+      // Control refusals carry `code` and a sentence; attention refusals carry the code as `error`.
+      if (value.code === "control-busy" || value.code === "control-lost")
+        throw new ControlRefusal(message, value.code);
       throw new ApiError(
-        value.error ?? "Host request failed",
+        message,
         response.status,
-        typeof value.error === "string" ? value.error : undefined,
+        typeof value.code === "string"
+          ? value.code
+          : typeof value.error === "string"
+            ? value.error
+            : undefined,
         value.attention,
       );
+    }
     return value as T;
   } catch (error) {
     if ((error as Error).name === "AbortError")
@@ -51,6 +82,8 @@ export async function api<T>(
   }
 }
 
+/** One device's input lease; the host refuses input from every other device while it lasts. */
+export type ControlLease = { id: string; label: string; expiresAt: number };
 export type SessionRow = {
   id: string;
   title: string;
@@ -61,6 +94,9 @@ export type SessionRow = {
   exitCode?: number;
   seq: number;
   attention: Attention;
+  /** Present on workers that enforce input control; older workers take shared input. */
+  capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };
+  control?: ControlLease | null;
 };
 export type SessionDetail = SessionRow & {
   screen?: string;

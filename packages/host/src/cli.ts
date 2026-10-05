@@ -25,6 +25,9 @@ import { parseDeployment } from "./deployment.js";
 import { planFleet } from "./fleet.js";
 import type { Config, Provider, Role } from "./types.js";
 
+import { handleClientCommand } from "./client.js";
+
+if (!await handleClientCommand(process.argv.slice(2))) {
 const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
@@ -213,6 +216,16 @@ async function attach(manager: Manager, sessionId: string) {
 if (command === "help")
   console.log(`Infinite — persistent agent sessions
 
+infinite pair https://HOST --token-file FILE  Pair this laptop
+infinite claude|codex|grok|opencode [FLAGS]    Launch the native CLI on the cloud
+infinite --project ID --title "Task" codex [FLAGS]
+infinite list [--json]                      List cloud sessions
+infinite resume [SESSION_ID]                Reattach to a live process
+infinite monitor [SESSION_ID]               Watch; Enter enables interaction
+
+Ctrl+] detaches. Ctrl+G returns to monitor mode. Flags after a provider
+name belong to that provider and use cloud paths.
+
 npm run dev                          Start a private local rehearsal
 infinite init --origin https://HOST   Create host configuration and device keys
 infinite init --deployment-mode single-tenant --origin https://HOST
@@ -259,8 +272,8 @@ else if (command === "plan-fleet") {
     const fd = openSync(lock, "wx", 0o600);
     writeFileSync(fd, String(process.pid));
     closeSync(fd);
-    const { app, manager, pushStore } = createApp(config, key);
-    const server = app.listen(config.port, "127.0.0.1", () =>
+    const { manager, pushStore, server, closeConnections } = createApp(config, key);
+    server.listen(config.port, "127.0.0.1", () =>
       console.log(
         `Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`,
       ),
@@ -296,7 +309,7 @@ else if (command === "plan-fleet") {
           unlock();
           process.exit(0);
         });
-        server.closeAllConnections();
+        closeConnections();
       });
   } else {
     const manager = new Manager(config, key);
@@ -370,4 +383,6 @@ else if (command === "plan-fleet") {
         );
     } else throw new Error(`Unknown command: ${command}`);
   }
+}
+
 }

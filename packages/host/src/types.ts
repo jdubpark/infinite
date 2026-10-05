@@ -7,6 +7,27 @@ export type Status =
   | "exited"
   | "unavailable"
   | "recording-error";
+export interface ControlActor {
+  id: string;
+  label: string;
+}
+export interface ControlLease {
+  id: string;
+  label: string;
+  expiresAt: number;
+}
+export interface TerminalSnapshot {
+  ansi: string;
+  seq: number;
+  cols: number;
+  rows: number;
+  capturedAt: string;
+}
+export interface SessionRuntime {
+  id: string;
+  location: "local" | "cloud";
+  transport: "pty";
+}
 export interface Session {
   id: string;
   provider: Provider;
@@ -20,6 +41,8 @@ export interface Session {
   contextVersion: number;
   context: string;
   initialPrompt: string;
+  nativeArgs?: string[];
+  runtime?: SessionRuntime;
 }
 export interface Event {
   seq: number;
@@ -73,32 +96,48 @@ export interface WorkerState {
   seq: number;
   screen: string;
   attention: Attention;
+  capabilities?: { terminalSnapshot: 1; inputControl: 1 };
+  control?: ControlLease | null;
+  runtime?: SessionRuntime;
+  nativeSession?: { id: string; source: "hook" };
+}
+export interface InputControl {
+  actor?: ControlActor;
+  leaseId?: string;
 }
 export type WorkerRequest =
   | { op: "state"; screen?: boolean }
+  | { op: "snapshot" }
   | {
+      op: "control";
+      action: "claim" | "renew" | "release";
+      actor: ControlActor;
+      leaseId?: string;
+      takeover?: boolean;
+    }
+  | ({
       op: "input";
       requestId: string;
       text: string;
       submit: boolean;
       /** Type even over an open dialog; only terminal surfaces send it. */
       force?: boolean;
-    }
-  | { op: "raw"; requestId: string; text: string }
-  | {
+    } & InputControl)
+  | ({ op: "raw"; requestId: string; text: string } & InputControl)
+  | ({
       op: "key";
       requestId: string;
       key: "interrupt" | "enter" | "escape" | "up" | "down" | "tab";
-    }
-  | {
+    } & InputControl)
+  | ({
       op: "answer";
       requestId: string;
       promptId: number;
       option?: number;
       text?: string;
-    }
-  | { op: "resize"; cols: number; rows: number }
-  | { op: "stop"; requestId: string };
+    } & InputControl)
+  | ({ op: "resize"; cols: number; rows: number } & InputControl)
+  | ({ op: "stop"; requestId: string } & InputControl);
 export interface Bootstrap {
   session: Session;
   profile: AgentProfile;

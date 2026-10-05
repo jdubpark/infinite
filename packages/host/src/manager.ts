@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   applyLifecycle,
   initialAttention,
@@ -32,6 +32,7 @@ export interface CreateSession {
   projectId: string;
   title: string;
   prompt: string;
+  nativeArgs?: string[];
 }
 interface StoredSession {
   session: Session;
@@ -52,22 +53,24 @@ export function publicAttention(att: Attention): Attention {
   };
 }
 /**
- * A worker started before attention existed answers `state` without it. Such a row gets the
- * default a fresh session would have, so list rows and the Notifier never meet a missing field.
+ * Older workers deliberately survive API upgrades and answer `state` without attention. Such a
+ * row gets an attention block so list rows, the Notifier and the phone never meet a missing
+ * field, but the block never invents an idle or finished state: a live old worker reads as
+ * `unavailable` (the host cannot tell what it is doing) and a stopped one keeps its lifecycle.
  */
 export function withDefaultAttention(
   state: Omit<WorkerState, "attention"> & { attention?: Attention },
   now = new Date().toISOString(),
 ): WorkerState {
   if (state.attention) return state as WorkerState;
-  const base = initialAttention(now, false);
-  const attention =
-    state.status === "exited" ||
-    state.status === "unavailable" ||
-    state.status === "recording-error"
-      ? applyLifecycle(base, state.status, now)
-      : base;
-  return { ...state, attention };
+  const status =
+    state.status === "exited" || state.status === "recording-error"
+      ? state.status
+      : "unavailable";
+  return {
+    ...state,
+    attention: applyLifecycle(initialAttention(now, false), status, now),
+  };
 }
 const unavailable = (now = new Date().toISOString()): WorkerState => ({
   status: "unavailable",
@@ -153,6 +156,7 @@ export class Manager {
         const {
           context: _context,
           initialPrompt: _prompt,
+          nativeArgs: _nativeArgs,
           cwd: _cwd,
           ...summary
         } = session;
@@ -239,8 +243,12 @@ export class Manager {
       contextVersion: context.version,
       context: context.text,
       initialPrompt: request.prompt,
+      runtime: { id: randomUUID(), location: this.config.environment, transport: "pty" },
+      ...(request.nativeArgs !== undefined ? { nativeArgs: request.nativeArgs } : {}),
     };
-    const prompt = [
+    // Native CLI arguments are exact: do not append a second positional prompt or
+    // provider settings. The context snapshot remains available in the record.
+    const prompt = request.nativeArgs !== undefined ? "" : [
       context.text
         ? `Shared project context (version ${context.version}, provided by the owner):\n${context.text}`
         : "",
@@ -272,13 +280,18 @@ export class Manager {
     child.stdin.end(
       JSON.stringify({
         session,
-        profile,
+        profile: request.nativeArgs === undefined ? profile : {
+          ...profile, args: [...profile.args, ...request.nativeArgs],
+        },
         stateDir: this.config.stateDir,
         runDir: this.config.runDir,
         key: this.key.toString("base64"),
         prompt,
         attention: {
-          hooks: this.config.attention?.hooks ?? DEFAULT_HOOKS,
+          // Native CLI launches keep their exact argv: no hook settings are injected.
+          hooks: request.nativeArgs !== undefined
+            ? { claude: false, codex: false }
+            : this.config.attention?.hooks ?? DEFAULT_HOOKS,
           idleAfterMs: this.config.attention?.idleAfterMs ?? 20000,
         },
       } satisfies Bootstrap),

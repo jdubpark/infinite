@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { hashToken } from "../packages/host/src/config.js";
 import { workerCall } from "../packages/host/src/ipc.js";
-import type { Config, Role } from "../packages/host/src/types.js";
+import type { Config, Role, ControlLease } from "../packages/host/src/types.js";
 
 export const waitFor = async <T>(
   fn: () => Promise<T>,
@@ -139,7 +139,11 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     }
     for (const id of ids)
       try {
-        await workerCall(config.runDir, id, { op: "stop", requestId: randomUUID() });
+        const actor = { id: "test-cleanup", label: "Test cleanup" };
+        const state = await workerCall<{ capabilities?: { inputControl?: number } }>(config.runDir, id, { op: "state" });
+        const lease = state.capabilities?.inputControl
+          ? await workerCall<ControlLease>(config.runDir, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
+        await workerCall(config.runDir, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
       } catch {
         /* already exited */
       }
@@ -156,4 +160,26 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     throw error;
   }
   return { origin, root, config, tokens, fetchApi, start, stopApi, stop };
+}
+
+/**
+ * Claims a session's input lease for `role` as one client instance. Input from that client must
+ * carry the returned headers; the worker refuses input from anyone else while the lease lasts.
+ */
+export async function claimControl(
+  host: Host,
+  sessionId: string,
+  role: Role,
+  options: { takeover?: boolean; clientId?: string } = {},
+) {
+  const clientId = options.clientId ?? randomUUID();
+  const claimed = await host.fetchApi(
+    `/sessions/${sessionId}/control`,
+    role,
+    { action: "claim", ...(options.takeover ? { takeover: true } : {}) },
+    { "X-Infinite-Client": clientId },
+  );
+  if (claimed.status !== 200) throw new Error(`Control claim failed: ${JSON.stringify(claimed.body)}`);
+  const lease = claimed.body.control as ControlLease;
+  return { lease, headers: { "X-Infinite-Client": clientId, "X-Infinite-Control": lease.id } };
 }

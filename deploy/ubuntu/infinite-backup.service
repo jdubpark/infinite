@@ -1,0 +1,17 @@
+[Unit]
+Description=Infinite encrypted workspace snapshot
+After=infinite.service
+ConditionPathIsMountPoint=/srv/infinite-data
+ConditionPathExists=/etc/infinite/backup.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/infinite-backup
+ExecStopPost=/usr/bin/systemctl thaw infinite.service
+TimeoutStartSec=15min
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryMax=1G
+LimitCORE=0

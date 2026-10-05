@@ -10,6 +10,8 @@ export XDG_DATA_HOME="$HOME/.local/share"
 export XDG_STATE_HOME="$HOME/.local/state"
 export XDG_CACHE_HOME="$HOME/.cache"
 export PATH=/usr/local/bin:/usr/bin:/bin
+# Service accounts keep a disabled login shell; native tool runners still need bash.
+export SHELL=/bin/bash
 
 provider=$(basename "$0")
 case "$provider" in

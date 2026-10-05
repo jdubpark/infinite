@@ -4,6 +4,8 @@
 
 See [managed tenants](multi-tenant.md) for backend selection and [Proxmox development](../deploy/proxmox/README.md) for the local capacity plan. The comparison below is retained as the earlier personal-server research, not the current recommendation to buy another ordinary host.
 
+The rented server now runs the owner's single-tenant pilot directly on Ubuntu, with private Tailscale access and an encrypted application volume. See [commissioning](../deploy/ubuntu/infinitebox.md) for live hardware and provider checks. This deployment does not establish the managed tenant confidentiality boundary.
+
 Recommendation checked on 2026-10-04: look for a **Hetzner AX102-1-LTD with 128 GB RAM, mirrored NVMe, and the standard 1 Gbit/s uplink**. If the intended workload is ten simultaneous builds or browser-heavy test runs, compare an **AX162-1-LTD** before ordering. Limited-stock prices are listed offers, not verified inventory reservations.
 
 The reference laptop is an Apple-silicon Mac with **14 CPU cores and 36 GiB unified memory**. An x86 server is not equivalent to its GPU, macOS applications, Keychain, Xcode, or unified memory architecture. The server comparison concerns Linux agent orchestration, compilation, tests, browsers, and storage. Native iPhone builds still need a Mac or a macOS build service.
@@ -29,7 +31,7 @@ AWS gives 100 GB of internet egress free per month across eligible services/regi
 
 The language models run at their providers unless local inference is explicitly added. GPU rental is unnecessary for ordinary Claude Code/Codex/Grok/OpenCode API use. Model subscription limits and charges remain separate from server capacity.
 
-128 GB gives about 3.6 times the Mac's nominal memory capacity, useful for separate worktrees, language servers, build caches, browsers, and test databases. Physical cores and SMT threads are not interchangeable. AX102 should be a good starting point by capacity; no benchmark on this owner's repositories has established that it beats the M3 Max in every task.
+128 GB gives about 3.6 times the Mac's nominal memory capacity, useful for separate worktrees, language servers, build caches, browsers, and test databases. Physical cores and SMT threads are not interchangeable. AX102 should be a good starting point by capacity; no benchmark on this owner's repositories has established that it beats the reference Mac in every task.
 
 Start with ten agent sessions and cap simultaneous heavy builds separately. Measure memory high-water mark, swap, disk I/O, build duration, browser count, and interaction latency during a representative hour. Choose AX162 if CPU-heavy jobs regularly queue while memory remains healthy. Choose more RAM when processes swap or fail from memory pressure. Do not infer sizing from idle terminal count.
 

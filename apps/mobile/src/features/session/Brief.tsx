@@ -18,6 +18,7 @@ import {
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { Composer } from "../../components/Composer";
+import { ControlBar } from "../../components/ControlBar";
 import { DecisionCard } from "../../components/DecisionCard";
 import { MomentRow } from "../../components/MomentRow";
 import { NowCard } from "../../components/NowCard";
@@ -26,6 +27,7 @@ import { SourceTag } from "../../components/SourceTag";
 import { StatePill } from "../../components/StatePill";
 import { theme } from "../../theme";
 import { useAnswer } from "./useAnswer";
+import { useControlSync, useSessionControl } from "./useSessionControl";
 import { useSignals } from "./useSignals";
 import { useSteering } from "./useSteering";
 
@@ -38,15 +40,24 @@ export function Brief({
   id: string;
 }) {
   const router = useRouter();
+  const control = useSessionControl(connection, id);
   const {
-    data: session,
+    data: poll,
     online,
     seen,
     refresh,
-  } = usePoll(() => api<SessionDetail>(connection, `/sessions/${id}`), 1500, [
-    connection,
-    id,
-  ]);
+  } = usePoll(
+    async () => {
+      // A poll that started before a local control change must not undo it.
+      const revision = control.generation();
+      const session = await api<SessionDetail>(connection, `/sessions/${id}`);
+      return { session, revision };
+    },
+    1500,
+    [connection, id],
+  );
+  const session = poll?.session ?? null;
+  useControlSync(control, poll, online);
   // `/me` is read once; a failed read is retried after the next good poll.
   const [me, setMe] = useState<Me | null>(null);
   const needMe = me === null && online;
@@ -66,23 +77,39 @@ export function Brief({
 
   const { events: signals } = useSignals(connection, id);
   const moments = useMemo(() => deriveMoments(signals), [signals]);
-  const steering = useSteering(connection, id, refresh);
+  const steering = useSteering(connection, id, refresh, control, {
+    draftKey: `${connection.url}/${id}/brief`,
+  });
   const prompt =
     session?.attention.state === "needs-you"
       ? session.attention.prompt
       : undefined;
-  const answering = useAnswer(connection, id, prompt, refresh);
+  const answering = useAnswer(connection, id, prompt, refresh, control);
 
   const running = session?.status === "running";
+  // Workers that enforce control take input only from the device holding the lease.
+  const requiresControl = session?.capabilities?.inputControl === 1;
+  const controlled = !requiresControl || control.lease !== null;
   const permitted =
     me !== null &&
     me.role !== "viewer" &&
     me.capabilities?.answer !== false &&
     !answering.forbidden;
   const readOnly = answering.forbidden || (me !== null && !permitted);
-  const canAnswer = permitted && online && running;
-  const canSteer = online && running && me !== null && me.role !== "viewer";
+  const canAnswer = permitted && online && running && controlled;
+  const canSteer =
+    online && running && me !== null && me.role !== "viewer" && controlled;
+  const controlGate =
+    online && running && !controlled
+      ? control.holder
+        ? `${control.holder.label} has control. Take over above to answer here.`
+        : "Take control above to answer from this phone."
+      : undefined;
 
+  async function takeControl(takeover: boolean) {
+    await control.claim(takeover);
+    refresh();
+  }
   function back() {
     if (router.canGoBack()) router.back();
     else router.replace("/");
@@ -97,7 +124,7 @@ export function Brief({
       <View style={s.header}>
         <Button title="Sessions" secondary onPress={back} />
         <Text style={[s.small, !online && s.offlineText]}>
-          {online ? "Connected" : "Reconnecting"}
+          {online ? "Up to date" : "Reconnecting"}
         </Text>
         <Button title="Terminal" secondary onPress={openTerminal} />
       </View>
@@ -118,12 +145,33 @@ export function Brief({
               <SourceTag hooks={session.attention.hooks} />
             </View>
             <Text style={s.small}>
-              {new URL(connection.url).host} · Checked {seen || "—"}
+              {new URL(connection.url).host} ·{" "}
+              {online
+                ? `Updated ${seen}`
+                : seen
+                  ? `Cached view from ${seen}`
+                  : "Waiting for a fresh response…"}
             </Text>
           </View>
           <OfflineBanner
             online={online}
             message="Last received view. Answers and input are paused until the host reconnects."
+          />
+          <ControlBar
+            role={me?.role}
+            requiresControl={requiresControl}
+            running={running}
+            online={online}
+            lease={control.lease}
+            holder={control.holder}
+            busy={control.busy}
+            message={control.message}
+            onTake={(takeover) => void takeControl(takeover)}
+            onRelease={() => {
+              control.forget(true);
+              refresh();
+            }}
+            onRefresh={refresh}
           />
           <ScrollView
             style={s.fill}
@@ -146,6 +194,7 @@ export function Brief({
                 status={answering.status}
                 canAnswer={canAnswer}
                 readOnly={readOnly}
+                gate={controlGate}
                 onAnswer={answering.answer}
                 onRetry={answering.retry}
                 onOpenTerminal={openTerminal}
@@ -193,11 +242,18 @@ export function Brief({
                   ? "Answer the prompt above, or reply instead."
                   : undefined
               }
+              idleHint={
+                online && running && !controlled
+                  ? "Take control to send from this phone"
+                  : undefined
+              }
               busy={steering.busy}
               pending={steering.pending}
               receipt={steering.receipt}
               error={steering.error}
-              onSend={steering.send}
+              text={steering.text}
+              onChangeText={steering.setText}
+              onSend={() => void steering.send()}
               onInterrupt={() => void steering.sendKey("interrupt")}
             />
           ) : null}

@@ -5,7 +5,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { publicAttention, withDefaultAttention } from "../packages/host/src/manager.js";
-import { startHost, waitFor, type Host } from "./helpers.js";
+import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
 
@@ -237,6 +237,62 @@ test("composer text over an open dialog is refused unless a terminal surface for
   }
 });
 
+test("input control gates answers and text before the dialog guards, and refusals journal nothing", { timeout: 60000 }, async () => {
+  const host = await startHost({ config: { attention } });
+  try {
+    const id = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Leased", prompt: "dialog hook" });
+    const open = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash && r.body.attention.prompt?.tool, 15000);
+    const promptId = open.body.attention.prompt.id;
+    const inputEvents = async () => (await host.fetchApi(`/sessions/${id}/events?types=input-intent,input-result`)).body.events as { seq: number; type: string; data: Record<string, unknown> }[];
+
+    // The laptop holds control: the phone's answer without a lease is refused with the lease code.
+    const laptop = await claimControl(host, id, "owner");
+    const busy = await host.fetchApi(`/sessions/${id}/answer`, "controller", { requestId: randomUUID(), promptId, option: 1 }, { "X-Infinite-Client": randomUUID() });
+    assert.equal(busy.status, 409);
+    assert.equal(busy.body.code, "control-busy");
+    assert.equal(typeof busy.body.error, "string");
+    assert.equal((await inputEvents()).length, 0);
+    assert.equal((await signalsOf(host, id)).filter((e) => e.data.kind === "answer").length, 0);
+
+    // The phone takes over explicitly. The laptop's old lease no longer answers anything.
+    const phone = await claimControl(host, id, "controller", { takeover: true });
+    assert.notEqual(phone.lease.id, laptop.lease.id);
+    const lost = await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId, option: 1 }, laptop.headers);
+    assert.equal(lost.status, 409);
+    assert.equal(lost.body.code, "control-lost");
+    assert.equal((await inputEvents()).length, 0);
+
+    // Holding control does not lift the dialog guard: unforced text is still `prompt-open`.
+    const guarded = await host.fetchApi(`/sessions/${id}/input`, "controller", { requestId: randomUUID(), text: "no, stop", submit: true }, phone.headers);
+    assert.equal(guarded.status, 409);
+    assert.equal(guarded.body.error, "prompt-open");
+    assert.equal(guarded.body.attention.prompt.id, promptId);
+    assert.equal((await inputEvents()).length, 0);
+
+    // With the lease, the answer path is unchanged: verified keys, `closed`, and its journal trail.
+    const requestId = randomUUID();
+    const answer = await host.fetchApi(`/sessions/${id}/answer`, "controller", { requestId, promptId, option: 1 }, phone.headers);
+    assert.equal(answer.status, 200);
+    assert.equal(answer.body.state, "delivered");
+    assert.equal(answer.body.result, "closed");
+    const events = await inputEvents();
+    const intent = events.find((e) => e.type === "input-intent");
+    const result = events.find((e) => e.type === "input-result");
+    assert.equal(events.length, 2);
+    assert.equal(intent?.data.op, "answer");
+    assert.equal(intent?.data.requestId, requestId);
+    assert.equal(result?.data.requestId, requestId);
+    assert.equal(result?.data.result, "closed");
+    const answered = (await signalsOf(host, id)).filter((e) => e.data.kind === "answer");
+    assert.equal(answered.length, 1);
+    assert.ok(intent!.seq < answered[0].seq && answered[0].seq < result!.seq);
+    assertClosedOnce(await signalsOf(host, id));
+  } finally {
+    await host.stop();
+  }
+});
+
 test("a dialog drawn before its hooks opens one prompt; rejecting it clears the running tool", { timeout: 60000 }, async () => {
   const host = await startHost({ config: { attention } });
   try {
@@ -275,10 +331,13 @@ test("a dialog drawn before its hooks opens one prompt; rejecting it clears the 
 
 test("a worker without attention reports a default instead of breaking the list", () => {
   const now = "2026-10-05T00:00:00.000Z";
+  // A live worker from before attention existed is not claimed to be idle or finished.
   const running = withDefaultAttention({ status: "running", seq: 4, screen: "" }, now);
-  assert.equal(running.attention.state, "idle");
+  assert.equal(running.attention.state, "unavailable");
+  assert.equal(running.attention.now, "");
   assert.equal(running.seq, 4);
-  assert.equal(publicAttention(running.attention).state, "idle");
+  assert.equal(publicAttention(running.attention).state, "unavailable");
+  assert.equal(withDefaultAttention({ status: "starting", seq: 0, screen: "" }, now).attention.state, "unavailable");
   for (const status of ["exited", "unavailable", "recording-error"] as const)
     assert.equal(withDefaultAttention({ status, seq: 0, screen: "" }, now).attention.state, status);
   const present = { status: "running" as const, seq: 1, screen: "", attention: { ...running.attention, state: "working" as const } };

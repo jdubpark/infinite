@@ -1,6 +1,6 @@
 # Confidentiality boundary
 
-The product now requires confidentiality from the service operator. The current implementation does not provide it. The [managed tenant contract](multi-tenant.md) defines the required confidential execution, attestation, client, keys, and recovery design. The rented Scaleway EPYC 4345P lacks SEV and is restricted to development/control-plane use for that target.
+Managed multi-tenant operation requires confidentiality from the service operator. The current implementation does not provide it. The [managed tenant contract](multi-tenant.md) defines the required confidential execution, attestation, client, keys, and recovery design. The rented Scaleway EPYC 4345P lacks SEV; it currently runs the owner's single-tenant pilot and cannot host operator-confidential tenants. The [commissioning record](../deploy/ubuntu/infinitebox.md) identifies the deployed controls and remaining checks.
 
 An unattended agent's execution environment must read the files, credentials, and model context it uses. On an ordinary VM, the host administrator can potentially access that environment. Disk encryption, a VPN, containers, and application encryption do not solve that boundary. A properly attested confidential runtime can move trust away from the host operator, but still trusts the measured guest software, hardware/attestation chain, and user device. It does not protect plaintext from a compromised agent or guest software already authorized to read it.
 
@@ -23,6 +23,8 @@ Put source repositories, native agent home directories, native history, caches, 
 Separate the API service Unix identity from native agent execution identities. The local default profiles intentionally run as the current user; **they are not a sandbox**. The Ubuntu template uses a distinct `infinite-agent` account and constrained sudo launch profiles so an ordinary agent command cannot directly read the API key, device credentials, or worker sockets. Agents sharing that account still share its trust boundary. Use separate users/containers per project if those projects need isolation, and do not mount Docker's host socket.
 
 Authenticate providers on the server in their own protected home, with only the credentials needed for approved projects. An SSH-agent forwarded from the laptop stops being useful when the laptop disappears. Copying the entire laptop home would import excessive credentials and platform-specific paths. Inventory skills, AGENTS.md, MCP services, environment variables, tool versions, Git identity, and project dependencies explicitly.
+
+The owner pilot now has an age-encrypted laptop backup with file, SQLite, and journal restore verification. Its daily server timer creates encrypted snapshots; automatic upload to independent storage is still pending. See [backup operations](../deploy/ubuntu/backups.md).
 
 Use encrypted off-host backups with restore testing. Keep the backup decryption key outside the rented host where feasible, and separate its repository credentials from keys that can delete prior backups. RAID is availability against a drive failure, not a backup. Monitor disk capacity and inode counts; the recording currently has no automatic retention cap.
 

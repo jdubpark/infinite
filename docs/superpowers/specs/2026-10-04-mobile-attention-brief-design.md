@@ -243,6 +243,7 @@ Every answer appends `input-intent` (the key sequence as one record with `op: "a
 | `GET /api/sessions/:id/events` | New optional `types` query, a comma list of event types; default remains all. The phone asks for `signal,lifecycle,input-intent,input-result`. |
 | `POST /api/sessions/:id/answer` | §6. |
 | `POST /api/sessions/:id/input` | Amended 2026-10-05: refused with `409 { error: "prompt-open", attention }` while the open prompt's block is on screen, unless the body has `force: true`. The Brief's composer never forces; the Terminal route does. |
+| Input control | Amended 2026-10-05: on workers that advertise `capabilities.inputControl`, `answer`, `input` and `key` need this device's lease (`POST /api/sessions/:id/control`, header `X-Infinite-Control`). Without it the worker refuses with `409 { code: "control-busy" \| "control-lost", error }` before any guard here runs, and journals nothing. See `docs/architecture.md`. |
 | `POST /api/devices/push` | `{ token: string, platform: "android" \| "ios" }`. Any paired role. Stored under the caller's device-key id; one list per key, deduplicated by token. |
 | `DELETE /api/devices/push` | `{ token }`. Called on disconnect. |
 | `GET /api/me` | Adds `capabilities: { signals: true, answer: boolean (role), push: boolean (host configured) }`. |
@@ -333,6 +334,8 @@ Top: title, provider, state pill, source tag ("hooks active" or "screen only"), 
 The timeline pages forward through `events?types=…` from the first signal; the phone keeps at most 2,000 signal events in memory.
 
 **Composer**: docked at the bottom as today, with Send and Interrupt. Receipts keep their wording. A "Terminal" link in the header opens the Terminal route, which is the current Catch up screen plus the raw key row, unchanged in function.
+
+**Control** (amended 2026-10-05): on a worker that enforces input control, the DecisionCard options, the reply field, the composer and the Terminal's keys stay disabled until this phone holds the session's lease. A control bar under the title shows who holds it and offers "Take control", or "Take over" when another device has it. Once held, an answer is one tap again. The Brief and Terminal routes share the lease; leaving both, backgrounding the app or losing the host releases it, and nothing reacquires it without a tap. Unsent text and an unconfirmed request stay in memory per route until the phone disconnects.
 
 ### 9.4 Visual
 

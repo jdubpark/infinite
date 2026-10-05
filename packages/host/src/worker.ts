@@ -2,7 +2,7 @@ import { createServer } from "node:net";
 import { chmodSync, mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node-pty";
 import headless from "@xterm/headless";
 import {
@@ -34,10 +34,15 @@ import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
 import { startHookServer, type HookRoute } from "./hooks.js";
 import { buildLaunch } from "./launch.js";
+import { TerminalSnapshots } from "./terminal-snapshot.js";
 import type {
   Bootstrap,
+  ControlActor,
+  ControlLease,
   Event,
+  InputControl,
   Receipt,
+  TerminalSnapshot,
   WorkerRequest,
   WorkerState,
 } from "./types.js";
@@ -65,7 +70,9 @@ const terminal = new headless.Terminal({
   scrollback: 5000,
   allowProposedApi: true,
 });
+const snapshots = new TerminalSnapshots(terminal);
 type AnswerRequest = Extract<WorkerRequest, { op: "answer" }>;
+type DeliveryRequest = Extract<WorkerRequest, { op: "input" | "raw" | "key" | "stop" }>;
 type StoredReceipt = Receipt & { digest: string; result?: AnswerResult };
 const receipts = new Map<string, StoredReceipt>();
 /** The receipt a client sees: the request digest stays inside the worker. */
@@ -76,7 +83,12 @@ const initial = initialAttention(
   Boolean(config.prompt),
 );
 let attention: Attention = { ...initial, now: describeNow(initial, provider) };
-let state: WorkerState = { status: "starting", seq: 0, screen: "", attention };
+let state: WorkerState = {
+  status: "starting", seq: 0, screen: "", attention,
+  capabilities: { terminalSnapshot: 1, inputControl: 1 },
+  control: null,
+  runtime: session.runtime ?? { id: randomUUID(), location: "local", transport: "pty" },
+};
 let child: ReturnType<typeof spawn> | undefined;
 // The host terminal must answer device/cursor queries even with no client attached.
 terminal.onData((data) => {
@@ -98,6 +110,9 @@ terminal.parser.registerOscHandler(9, (data) => {
 });
 let pending = "";
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
+let snapshotQueue: (() => void)[] | undefined;
+let snapshotBytes = 0;
+let abortSnapshot: ((error: Error) => void) | undefined;
 const persist = () =>
   writeSealed(join(dir, "status.sealed"), key, `${session.id}:status`, {
     ...state,
@@ -120,6 +135,40 @@ function flush() {
     const data = pending.slice(0, 8192);
     pending = pending.slice(8192);
     append("output", { text: data });
+  }
+}
+
+/** A short per-worker fence makes the ANSI frame and its journal cursor one atomic prefix. */
+async function snapshot(): Promise<TerminalSnapshot> {
+  if (state.status === "recording-error") throw new Refusal("snapshot-unavailable");
+  snapshotQueue = [];
+  snapshotBytes = 0;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    flush();
+    await new Promise<void>((resolve, reject) => {
+      abortSnapshot = reject;
+      deadline = setTimeout(() => reject(new Error("Terminal renderer is busy")), 1000);
+      // Empty writes are ordered behind every pending xterm write and invoke their callback.
+      terminal.write("", resolve);
+    });
+    // Parser callbacks can change the worker state while the write barrier is pending.
+    if ((state as WorkerState).status === "recording-error") throw new Error("Recording failed during snapshot");
+    return {
+      ansi: snapshots.capture(),
+      seq: journal.seq,
+      cols: terminal.cols,
+      rows: terminal.rows,
+      capturedAt: new Date().toISOString(),
+    };
+  } catch {
+    throw new Refusal("snapshot-unavailable");
+  } finally {
+    clearTimeout(deadline);
+    abortSnapshot = undefined;
+    const queued = snapshotQueue;
+    snapshotQueue = undefined;
+    for (const task of queued) task();
   }
 }
 /** Replace the attention snapshot, refresh its one-line summary and expose it in `state`. */
@@ -232,13 +281,28 @@ function onHook(route: HookRoute, body: unknown) {
         ? mapCodexHook(body)
         : mapCodexNotify(body);
   const agent = route === "claude" ? claudeAgent(body) : undefined;
-  const b = body as { hook_event_name?: unknown; type?: unknown };
+  const b = body as Record<string, unknown>;
   const event =
     typeof b.hook_event_name === "string"
       ? b.hook_event_name
       : typeof b.type === "string"
         ? b.type
         : route;
+  // Only the authenticated provider hook supplies its native identity. Subagent hooks do not
+  // replace the primary conversation, and terminal text / transcript filenames are never guessed.
+  const nativeId = !b.agent_id && (
+    ((provider === "claude" && route === "claude") || (provider === "codex" && route === "codex")) &&
+      typeof b.hook_event_name === "string"
+      ? b.session_id
+      : provider === "codex" && route === "codex-notify" && b.type === "agent-turn-complete"
+        ? b["thread-id"]
+        : undefined
+  );
+  if (typeof nativeId === "string" && nativeId.length >= 1 && nativeId.length <= 200 &&
+      !/[\x00-\x20\x7f]/.test(nativeId) && nativeId !== state.nativeSession?.id) {
+    state = { ...state, nativeSession: { id: nativeId, source: "hook" } };
+    persist();
+  }
   if (!hooksReady) {
     hooksReady = true;
     record({ kind: "hooks-ready", event: event.slice(0, 60) }, "hook");
@@ -374,18 +438,80 @@ function serialize<T>(task: () => T | Promise<T>): Promise<T> {
   return run;
 }
 
+const CONTROL_TTL_MS = 30_000;
+let controller: { actorId: string; lease: ControlLease } | null = null;
+function currentControl(): ControlLease | null {
+  if (controller && controller.lease.expiresAt <= Date.now()) {
+    controller = null;
+    state = { ...state, control: null };
+    persist();
+  }
+  return controller?.lease ?? null;
+}
+function validActor(actor: ControlActor | undefined): actor is ControlActor {
+  return Boolean(actor && typeof actor.id === "string" && actor.id.length >= 1 && actor.id.length <= 128 &&
+    typeof actor.label === "string" && actor.label.length >= 1 && actor.label.length <= 120 &&
+    !/[\x00-\x1f\x7f]/.test(actor.id + actor.label));
+}
+function validateControl(request: InputControl) {
+  if ((request.actor !== undefined && !validActor(request.actor)) ||
+    (request.leaseId !== undefined && (typeof request.leaseId !== "string" || request.leaseId.length > 80)))
+    throw new Error("Invalid session control");
+}
+function changeControl(request: Extract<WorkerRequest, { op: "control" }>): ControlLease | null {
+  if (!validActor(request.actor) || !["claim", "renew", "release"].includes(request.action) ||
+    (request.takeover !== undefined && typeof request.takeover !== "boolean"))
+    throw new Error("Invalid session control");
+  validateControl(request);
+  const active = currentControl();
+  const owns = active && controller?.actorId === request.actor.id && active.id === request.leaseId;
+  const reconnecting = active && controller?.actorId === request.actor.id && request.leaseId === undefined;
+  if (request.action === "claim") {
+    if (active && !owns && !reconnecting && !request.takeover) throw new Refusal("control-busy");
+    if (!active || reconnecting || request.takeover) {
+      controller = {
+        actorId: request.actor.id,
+        lease: { id: randomUUID(), label: request.actor.label, expiresAt: Date.now() + CONTROL_TTL_MS },
+      };
+    } else controller!.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
+  } else {
+    if (!owns) throw new Refusal("control-lost");
+    if (request.action === "release") controller = null;
+    else controller!.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
+  }
+  state = { ...state, control: controller?.lease ?? null };
+  persist();
+  return state.control!;
+}
+function checkControl(request: InputControl) {
+  validateControl(request);
+  const active = currentControl();
+  if (request.leaseId !== undefined) {
+    if (!request.actor || !active || active.id !== request.leaseId || controller?.actorId !== request.actor.id)
+      throw new Refusal("control-lost");
+  } else if (active) throw new Refusal("control-busy");
+}
+function refreshControl(request: InputControl) {
+  if (controller && request.leaseId === controller.lease.id && request.actor?.id === controller.actorId)
+    controller.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
+}
+/** A retry identifies the intended input, not the client which currently holds control. */
+function requestDigest(request: (DeliveryRequest | AnswerRequest)) {
+  const { actor: _actor, leaseId: _leaseId, ...input } = request;
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
+
 function deliver(
-  request: Exclude<WorkerRequest, { op: "state" | "resize" | "answer" }>,
+  request: DeliveryRequest,
 ): Receipt {
-  const digest = createHash("sha256")
-    .update(JSON.stringify(request))
-    .digest("hex");
+  const digest = requestDigest(request);
   const previous = receipts.get(request.requestId);
   if (previous) {
     if (previous.digest !== digest)
       throw new Error("Request ID already belongs to different input");
     return publicReceipt(previous);
   }
+  checkControl(request);
   if (state.status !== "running" || !child)
     throw new Error("Session is not running");
   // Text and Enter typed over an open dialog would pick its highlighted option. Only a
@@ -442,6 +568,7 @@ function deliver(
   });
   receipt.state = "delivered";
   receipt.seq = result.seq;
+  refreshControl(request);
   return publicReceipt(receipt);
 }
 
@@ -450,7 +577,10 @@ type RefusalCode =
   | "prompt-changed"
   | "unsupported"
   | "invalid-option"
-  | "text-not-accepted";
+  | "text-not-accepted"
+  | "control-busy"
+  | "control-lost"
+  | "snapshot-unavailable";
 /** A refusal the client can act on; its `code` travels to the API as a 409. */
 class Refusal extends Error {
   constructor(readonly code: RefusalCode) {
@@ -466,15 +596,14 @@ const arrow = (key: "up" | "down") =>
 async function answer(
   request: AnswerRequest,
 ): Promise<Receipt & { result?: AnswerResult }> {
-  const digest = createHash("sha256")
-    .update(JSON.stringify(request))
-    .digest("hex");
+  const digest = requestDigest(request);
   const previous = receipts.get(request.requestId);
   if (previous) {
     if (previous.digest !== digest || previous.result === undefined)
       throw new Error("Request ID already belongs to different input");
     return publicReceipt(previous);
   }
+  checkControl(request);
   const pty = child;
   if (state.status !== "running" || !pty)
     throw new Error("Session is not running");
@@ -618,6 +747,7 @@ async function answer(
     receipt.state = "delivered";
     receipt.seq = done.seq;
     receipt.result = result;
+    refreshControl(request);
     return publicReceipt(receipt);
   } finally {
     answering = undefined;
@@ -656,14 +786,19 @@ const server = createServer((socket) => {
     try {
       const request = JSON.parse(data.slice(0, end)) as WorkerRequest;
       let result: unknown;
-      if (request.op === "state")
+      if (request.op === "state") {
+        currentControl();
         result = {
           ...state,
           attention,
           seq: journal.seq,
           screen: request.screen ? screen() : "",
         };
-      else if (request.op === "resize") {
+      } else if (request.op === "snapshot") {
+        result = await serialize(snapshot);
+      } else if (request.op === "control") {
+        result = await serialize(() => changeControl(request));
+      } else if (request.op === "resize") {
         if (
           !Number.isInteger(request.cols) ||
           !Number.isInteger(request.rows) ||
@@ -673,9 +808,13 @@ const server = createServer((socket) => {
           request.rows > 100
         )
           throw new Error("Invalid terminal size");
-        child?.resize(request.cols, request.rows);
-        terminal.resize(request.cols, request.rows);
-        result = { ok: true };
+        result = await serialize(() => {
+          checkControl(request);
+          child?.resize(request.cols, request.rows);
+          terminal.resize(request.cols, request.rows);
+          refreshControl(request);
+          return { ok: true };
+        });
       } else if (request.op === "answer") {
         if (!validAnswer(request)) throw new Error("Invalid answer request");
         result = await serialize(() => answer(request));
@@ -729,10 +868,12 @@ const server = createServer((socket) => {
 // ---- Launch ---------------------------------------------------------------------------------
 
 const hookToken = randomBytes(32).toString("hex");
+// A native CLI launch runs its exact argv: no hook listener, settings or relay environment.
 const wantsHooks =
-  provider === "demo" ||
-  (provider === "claude" && config.attention.hooks.claude) ||
-  (provider === "codex" && config.attention.hooks.codex);
+  session.nativeArgs === undefined &&
+  (provider === "demo" ||
+    (provider === "claude" && config.attention.hooks.claude) ||
+    (provider === "codex" && config.attention.hooks.codex));
 // Hooks only add precision; the screen heuristics still work if the listener cannot start.
 const hookServer = wantsHooks
   ? await startHookServer({
@@ -806,11 +947,17 @@ server.listen(socketPath(runDir, session.id), () => {
       name: "xterm-256color",
     });
     state = { ...state, status: "running", pid: child.pid };
+    publish(attention);
     journal.append("lifecycle", { status: "running", pid: child.pid });
     persist();
-    child.onData((data) => {
-      terminal.write(data);
+    const output = (data: string) => {
       pending += data;
+      try {
+        snapshots.observe(data);
+        terminal.write(data);
+      } catch {
+        recordingFailure();
+      }
       lastOutputAt = Date.now();
       outputSinceCheck = true;
       if (!flushTimer)
@@ -822,11 +969,19 @@ server.listen(socketPath(runDir, session.id), () => {
           }
           checkScreen();
         }, 40);
+    };
+    child.onData((data) => {
+      if (snapshotQueue) {
+        snapshotQueue.push(() => output(data));
+        snapshotBytes += Buffer.byteLength(data, "utf8");
+        if (snapshotBytes > 2 * 1024 * 1024) abortSnapshot?.(new Error("Snapshot output queue is full"));
+      } else output(data);
     });
-    child.onExit(({ exitCode }) => {
+    const exited = (exitCode: number) => {
       try {
         flush();
-        state = { ...state, status: "exited", exitCode };
+        controller = null;
+        state = { ...state, status: "exited", exitCode, control: null };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));
         append("lifecycle", { status: "exited", exitCode });
         persist();
@@ -834,6 +989,10 @@ server.listen(socketPath(runDir, session.id), () => {
         recordingFailure();
       }
       setTimeout(() => exitWorker(0), 1500);
+    };
+    child.onExit(({ exitCode }) => {
+      if (snapshotQueue) snapshotQueue.push(() => exited(exitCode));
+      else exited(exitCode);
     });
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };

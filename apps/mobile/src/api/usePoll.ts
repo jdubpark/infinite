@@ -5,7 +5,8 @@ import { AppState } from "react-native";
  * Polls `fn` every `intervalMs` while the app is in the foreground. The last
  * good value stays in `data` when a poll fails; `online` reports whether the
  * latest poll succeeded and `seen` is the local time of the last success.
- * Polling stops while the app is backgrounded and resumes on return.
+ * Polling stops while the app is backgrounded and resumes on return; until
+ * that first poll succeeds, `online` is false because `data` is a cached view.
  * `refresh()` cancels the pending timer and polls now (or right after the
  * poll in flight). The effect restarts when `intervalMs` or `deps` change.
  */
@@ -55,6 +56,7 @@ export function usePoll<T>(
     };
     const listener = AppState.addEventListener("change", (state) => {
       clearTimeout(timer);
+      setOnline(false);
       if (state === "active") void poll();
     });
     void poll();

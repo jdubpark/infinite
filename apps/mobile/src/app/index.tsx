@@ -8,6 +8,7 @@ import {
   type PushState,
 } from "../push/register";
 import { clearConnection, loadConnection } from "../store/connection";
+import { clearDrafts } from "../store/drafts";
 import { Pair } from "../features/pair/Pair";
 import { Inbox } from "../features/inbox/Inbox";
 import { theme } from "../theme";
@@ -45,6 +46,7 @@ export default function Home() {
   async function disconnect() {
     if (connection) await unregisterPush(connection);
     setPush(null);
+    clearDrafts();
     await clearConnection();
     setConnection(null);
   }

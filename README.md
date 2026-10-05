@@ -2,7 +2,7 @@
 
 A persistent agent host for Claude Code, Codex, Grok Build, and OpenCode. Agents run on the host; cmux, a browser, and the React Native phone app attach to the same sessions. Closing the laptop does not move or restart the agent.
 
-**Status: single-tenant cloud pilot deployed; real-provider commissioning is pending.** Infinite is running on the rented Scaleway Pro-11-M-64G behind private Tailscale HTTPS, with an encrypted application volume. Twelve synthetic processes passed the deployed API-restart continuity check. Provider binaries are installed; authenticated model/tool runs, off-host backups, and reboot recovery still need verification. See the [server commissioning record](deploy/ubuntu/infinitebox.md).
+**Status: single-tenant cloud pilot with a paired laptop CLI.** Claude, Codex, Grok, and OpenCode have completed authenticated tool runs on the rented server. Cloud processes survive client disconnection and API restarts. Encrypted backup and data-restore checks are complete. Independent cloud backup storage, cold-boot recovery, and operator-confidential multi-tenant execution remain unfinished. See the [commissioning record](deploy/ubuntu/infinitebox.md).
 
 **Two deployment modes are supported by the architecture:** direct single-tenant execution with no VM isolation requirement, and a managed multi-tenant service with a complete context bucket per user. The single-tenant runner is deployed directly on the owner-controlled host. The managed target also requires confidentiality from the operator, which the current runner does not provide. One full VM and one Infinite installation per user is the development boundary; the rented EPYC 4345P lacks SEV support. See the [managed tenant architecture](docs/multi-tenant.md) and [Proxmox development plan](deploy/proxmox/README.md). Private workloads are refused by that planner.
 
@@ -13,6 +13,20 @@ npm run host -- plan-fleet deploy/proxmox/fleet.example.json
 This emits a secret-free, capacity-checked development specification and makes no infrastructure changes. `tenant-development` runners accept only the rehearsal provider and report their lack of operator confidentiality through `/api/me`. `confidential` initialization refuses until a real attestation and user-key-release implementation exists.
 
 For direct use, initialization defaults to `--deployment-mode single-tenant` and permits the four native providers. No tenant UUID, Proxmox, or attestation is required. Legacy `personal` configurations map to this mode. This does not disable authentication or recording encryption.
+
+## Laptop CLI
+
+```sh
+infinite claude
+infinite codex --model MODEL
+infinite grok
+infinite opencode --model deepseek/deepseek-flash
+infinite list
+infinite resume
+infinite monitor
+```
+
+The CLI is installed and paired on the commissioning laptop. It opens each provider's native cloud terminal and passes through its arguments. `resume` attaches to the same process; `monitor` starts read-only. Press Enter to enable steering, Ctrl+G to monitor, or Ctrl+] to detach. Put wrapper options before the provider, for example `infinite --project PROJECT_ID --title "Task" codex`. Paths and provider configuration belong to the cloud host. See [installation, pairing, and CLI behavior](docs/cli.md).
 
 ## Run locally
 
@@ -44,6 +58,8 @@ The React Native app is in `apps/mobile`. It supports Android and has an iPhone 
 npm run android -w @infinite/mobile
 npm run ios -w @infinite/mobile
 ```
+
+On hosts whose workers enforce input control, the phone sends nothing until you tap **Take control** (or **Take over** when another device holds the session). The lease lasts 30 seconds, renews while the session is on screen, and is released when you leave the session or background the app. Viewers stay read-only.
 
 Push notifications need an EAS project id: run `eas init` and keep the resulting `extra.eas.projectId` in `app.json`.
 
@@ -84,6 +100,8 @@ Push setup, in order:
 - Same-process terminal attachment, screen snapshots, full raw terminal recordings, and paginated replay by sequence number.
 - An encrypted record of session metadata, initial context, output, input intent, and delivery receipts. Records use AES-256-GCM with session/sequence authenticated data and a key outside the state directory.
 - Owner, controller, and viewer access. Creation is owner-only; the phone UI only monitors and steers. These are credential roles, not proof of a physical laptop's identity.
+- Device input control: one renewable 30-second lease per session, enforced in the worker, with explicit takeover. A refused input journals nothing.
+- A laptop CLI that launches native provider CLIs with exact arguments, reattaches over one WebSocket, and starts from a bounded terminal snapshot.
 - Idempotent creation and input IDs. An ambiguous terminal write is not automatically repeated. A delivered receipt means bytes reached the PTY, not that the provider accepted or completed a task.
 - Versioned project context with conflict detection and an immutable starting snapshot per session.
 - Responsive web client and native React Native client. Both visibly distinguish an unreachable host from an exited agent.
@@ -119,4 +137,4 @@ An actual Android debug build was installed on the Pixel 9 emulator. Pairing, st
 
 `scripts/browser-smoke.py` checks desktop/phone browser reconnect and steering against the local rehearsal server using Python Playwright. It reads `.local/devices.json` without printing keys.
 
-See [architecture and protocol](docs/architecture.md), [server comparison](docs/hosting.md), and [Ubuntu commissioning](deploy/ubuntu/README.md). Provider commissioning is incomplete until the real host passes the disconnect test with authenticated providers. The commissioning record distinguishes verified storage controls from backup and recovery work still required.
+See [architecture and protocol](docs/architecture.md), [server comparison](docs/hosting.md), and [Ubuntu commissioning](deploy/ubuntu/README.md). The commissioning record separates authenticated provider results, client/API continuity, tested data restoration, and cold-boot recovery work still required.

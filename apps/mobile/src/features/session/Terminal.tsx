@@ -17,8 +17,10 @@ import {
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { Composer } from "../../components/Composer";
+import { ControlBar } from "../../components/ControlBar";
 import { OfflineBanner } from "../../components/OfflineBanner";
 import { theme } from "../../theme";
+import { useControlSync, useSessionControl } from "./useSessionControl";
 import { KEYS, useSteering } from "./useSteering";
 
 /** The session's current screen, the raw key row and the text composer. */
@@ -32,23 +34,39 @@ export function Terminal({
   backLabel?: string;
 }) {
   const router = useRouter();
+  const control = useSessionControl(connection, id);
   const { data, online, seen, refresh } = usePoll(
     async () => {
-      const [detail, me] = await Promise.all([
+      // A poll that started before a local control change must not undo it.
+      const revision = control.generation();
+      const [session, me] = await Promise.all([
         api<SessionDetail>(connection, `/sessions/${id}`),
         api<Me>(connection, "/me"),
       ]);
-      return { detail, me };
+      return { session, me, revision };
     },
     1500,
     [connection, id],
   );
-  const session = data?.detail ?? null;
-  const role = data?.me.role ?? "viewer";
+  useControlSync(control, data, online);
+  const session = data?.session ?? null;
+  const role = data?.me.role;
   const environment = data?.me.environment ?? "";
   // The person sees the screen here, so text may go into an open dialog.
-  const steering = useSteering(connection, id, refresh, { force: true });
-  const canSteer = online && session?.status === "running" && role !== "viewer";
+  const steering = useSteering(connection, id, refresh, control, {
+    force: true,
+    draftKey: `${connection.url}/${id}/terminal`,
+  });
+  const running = session?.status === "running";
+  // Workers that enforce control take input only from the device holding the lease.
+  const requiresControl = session?.capabilities?.inputControl === 1;
+  const controlled = !requiresControl || control.lease !== null;
+  const canSteer =
+    online && running && role !== undefined && role !== "viewer" && controlled;
+  async function takeControl(takeover: boolean) {
+    await control.claim(takeover);
+    refresh();
+  }
   function back() {
     if (router.canGoBack()) router.back();
     else router.replace("/");
@@ -59,7 +77,7 @@ export function Terminal({
       <View style={s.header}>
         <Button title={backLabel} secondary onPress={back} />
         <Text style={[s.small, !online && s.offlineText]}>
-          {online ? "Connected" : "Reconnecting"}
+          {online ? "Up to date" : "Reconnecting"}
         </Text>
       </View>
       {!session ? (
@@ -79,12 +97,33 @@ export function Terminal({
               {session.pid ? `PID ${session.pid}` : "No live process"}
             </Text>
             <Text style={s.small}>
-              {new URL(connection.url).host} · Checked {seen || "—"}
+              {new URL(connection.url).host} ·{" "}
+              {online
+                ? `Updated ${seen}`
+                : seen
+                  ? `Cached view from ${seen}`
+                  : "Waiting for a fresh response…"}
             </Text>
           </View>
           <OfflineBanner
             online={online}
             message="Last received view. Input is disabled until the host reconnects."
+          />
+          <ControlBar
+            role={role}
+            requiresControl={requiresControl}
+            running={running}
+            online={online}
+            lease={control.lease}
+            holder={control.holder}
+            busy={control.busy}
+            message={control.message}
+            onTake={(takeover) => void takeControl(takeover)}
+            onRelease={() => {
+              control.forget(true);
+              refresh();
+            }}
+            onRefresh={refresh}
           />
           <ScrollView style={s.fill} contentContainerStyle={s.scrollBody}>
             <Text style={s.label}>Current screen</Text>
@@ -92,14 +131,21 @@ export function Terminal({
               {session.screen || "This process has no current screen."}
             </Text>
           </ScrollView>
-          {role !== "viewer" && (
+          {role !== undefined && role !== "viewer" && (
             <Composer
               canSteer={canSteer}
+              idleHint={
+                online && running && !controlled
+                  ? "Take control to type into this terminal"
+                  : undefined
+              }
               busy={steering.busy}
               pending={steering.pending}
               receipt={steering.receipt}
               error={steering.error}
-              onSend={steering.send}
+              text={steering.text}
+              onChangeText={steering.setText}
+              onSend={() => void steering.send()}
             >
               {KEYS.map((key) => (
                 <Button

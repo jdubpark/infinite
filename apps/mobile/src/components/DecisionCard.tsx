@@ -22,6 +22,7 @@ export function DecisionCard({
   status,
   canAnswer,
   readOnly,
+  gate,
   onAnswer,
   onRetry,
   onOpenTerminal,
@@ -32,6 +33,8 @@ export function DecisionCard({
   canAnswer: boolean;
   /** This key may not answer at all (viewer role or no answer capability). */
   readOnly: boolean;
+  /** Why a permitted device cannot answer yet, such as not holding control. */
+  gate?: string;
   onAnswer: (option?: number, text?: string) => void;
   onRetry: () => void;
   onOpenTerminal: () => void;
@@ -105,7 +108,11 @@ export function DecisionCard({
         </>
       ) : (
         <View style={s.options}>
-          {readOnly ? <Text style={s.hint}>{READ_ONLY_TEXT}</Text> : null}
+          {readOnly ? (
+            <Text style={s.hint}>{READ_ONLY_TEXT}</Text>
+          ) : gate ? (
+            <Text style={s.hint}>{gate}</Text>
+          ) : null}
           {prompt.options.map((o) => {
             const accept = o.role.startsWith("accept");
             const highlighted = o.index === prompt.highlighted;

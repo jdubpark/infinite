@@ -77,18 +77,26 @@ export function Brief({
 
   const { events: signals } = useSignals(connection, id);
   const moments = useMemo(() => deriveMoments(signals), [signals]);
+  // Workers that enforce control take input only from the device holding the lease.
+  const requiresControl = session?.capabilities?.inputControl === 1;
   const steering = useSteering(connection, id, refresh, control, {
     draftKey: `${connection.url}/${id}/brief`,
+    requiresControl,
   });
   const prompt =
     session?.attention.state === "needs-you"
       ? session.attention.prompt
       : undefined;
-  const answering = useAnswer(connection, id, prompt, refresh, control);
+  const answering = useAnswer(
+    connection,
+    id,
+    prompt,
+    refresh,
+    control,
+    requiresControl,
+  );
 
   const running = session?.status === "running";
-  // Workers that enforce control take input only from the device holding the lease.
-  const requiresControl = session?.capabilities?.inputControl === 1;
   const controlled = !requiresControl || control.lease !== null;
   const permitted =
     me !== null &&
@@ -237,10 +245,16 @@ export function Brief({
             <Composer
               canSteer={canSteer}
               // Text and Enter would land in the open dialog and pick its highlighted option.
+              // A running worker without attention cannot report one, so only the terminal types.
               blocked={
                 session.attention.prompt
                   ? "Answer the prompt above, or reply instead."
-                  : undefined
+                  : running && session.attention.state === "unavailable"
+                    ? "This session predates the Brief. Use the terminal to type."
+                    : undefined
+              }
+              blockedPlaceholder={
+                session.attention.prompt ? undefined : "Type in the terminal"
               }
               idleHint={
                 online && running && !controlled

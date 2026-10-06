@@ -492,7 +492,8 @@ function checkControl(request: InputControl) {
   } else if (active) throw new Refusal("control-busy");
 }
 function refreshControl(request: InputControl) {
-  if (controller && request.leaseId === controller.lease.id && request.actor?.id === controller.actorId)
+  // A lease that expired while its input was being written ends; the input does not revive it.
+  if (currentControl() && controller && request.leaseId === controller.lease.id && request.actor?.id === controller.actorId)
     controller.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
 }
 /** A retry identifies the intended input, not the client which currently holds control. */

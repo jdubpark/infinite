@@ -7,7 +7,8 @@ import { Button } from "./Button";
  * The docked text composer. The caller owns `text`, so a draft outlives the
  * screen. `pending` means the last send is uncertain: the text stays locked
  * and the button reads "Retry", which resends the same request. `blocked`
- * disables text and Send (not Interrupt) and says why; `idleHint` replaces the
+ * disables text and Send (not Interrupt) and says why, with
+ * `blockedPlaceholder` in the empty field; `idleHint` replaces the
  * placeholder while steering is unavailable. `children` render under the
  * input row (the Terminal's key row).
  */
@@ -18,6 +19,7 @@ export function Composer({
   receipt,
   error,
   blocked,
+  blockedPlaceholder = "Paused while a prompt is open",
   idleHint,
   text,
   onChangeText,
@@ -31,6 +33,7 @@ export function Composer({
   receipt: string;
   error: string;
   blocked?: string;
+  blockedPlaceholder?: string;
   idleHint?: string;
   text: string;
   onChangeText: (text: string) => void;
@@ -64,7 +67,7 @@ export function Composer({
             !canSteer
               ? (idleHint ?? "Waiting for a live connection")
               : blocked
-                ? "Paused while a prompt is open"
+                ? blockedPlaceholder
                 : "Give this session a direction…"
           }
           placeholderTextColor={theme.colors.placeholder}

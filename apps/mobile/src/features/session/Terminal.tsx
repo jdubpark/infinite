@@ -52,14 +52,15 @@ export function Terminal({
   const session = data?.session ?? null;
   const role = data?.me.role;
   const environment = data?.me.environment ?? "";
+  // Workers that enforce control take input only from the device holding the lease.
+  const requiresControl = session?.capabilities?.inputControl === 1;
   // The person sees the screen here, so text may go into an open dialog.
   const steering = useSteering(connection, id, refresh, control, {
     force: true,
     draftKey: `${connection.url}/${id}/terminal`,
+    requiresControl,
   });
   const running = session?.status === "running";
-  // Workers that enforce control take input only from the device holding the lease.
-  const requiresControl = session?.capabilities?.inputControl === 1;
   const controlled = !requiresControl || control.lease !== null;
   const canSteer =
     online && running && role !== undefined && role !== "viewer" && controlled;

@@ -7,7 +7,7 @@ import {
   type Connection,
 } from "../../api/client";
 import { readDraft, writeDraft, type PendingInput } from "../../store/drafts";
-import type { SessionControlHandle } from "./useSessionControl";
+import { leaseFor, type SessionControlHandle } from "./useSessionControl";
 
 export const KEYS = ["enter", "escape", "up", "down", "interrupt"] as const;
 export type SteeringKey = (typeof KEYS)[number];
@@ -18,15 +18,16 @@ export type SteeringKey = (typeof KEYS)[number];
  * same request and the host cannot deliver it twice. The host refuses text
  * over an open dialog (`prompt-open`) unless `force` is set, which only the
  * Terminal does: there the person sees the dialog the text lands in.
- * Every send carries this phone's control lease; the unsent text and an
- * unconfirmed request stay in memory under `draftKey` across navigation.
+ * Every send carries this phone's control lease, and nothing is sent without
+ * one when the session `requiresControl`. The unsent text and an unconfirmed
+ * request stay in memory under `draftKey` across navigation.
  */
 export function useSteering(
   connection: Connection,
   id: string,
   onDelivered: () => void,
   control: Pick<SessionControlHandle, "leaseId" | "refused">,
-  options: { force?: boolean; draftKey: string },
+  options: { force?: boolean; draftKey: string; requiresControl: boolean },
 ) {
   const { draftKey } = options;
   const [busy, setBusy] = useState(false);
@@ -55,10 +56,11 @@ export function useSteering(
     };
     setPendingInput(true);
     try {
+      const lease = leaseFor(control, options.requiresControl);
       const result = await api<{ state: string }>(
         connection,
         `/sessions/${id}/input`,
-        { body: pending.current, control: control.leaseId() },
+        { body: pending.current, control: lease },
       );
       if (result.state !== "delivered")
         throw new Error(
@@ -102,13 +104,11 @@ export function useSteering(
     setError("");
     setReceipt("");
     try {
+      const lease = leaseFor(control, options.requiresControl);
       const result = await api<{ state: string }>(
         connection,
         `/sessions/${id}/key`,
-        {
-          body: { requestId: Crypto.randomUUID(), key },
-          control: control.leaseId(),
-        },
+        { body: { requestId: Crypto.randomUUID(), key }, control: lease },
       );
       if (result.state !== "delivered")
         throw new Error("Key delivery is uncertain. Check the screen first.");

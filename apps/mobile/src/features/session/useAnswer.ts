@@ -9,7 +9,7 @@ import {
   type Connection,
 } from "../../api/client";
 import type { DecisionStatus } from "../../components/DecisionCard";
-import type { SessionControlHandle } from "./useSessionControl";
+import { leaseFor, type SessionControlHandle } from "./useSessionControl";
 
 type AnswerBody = {
   requestId: string;
@@ -52,7 +52,8 @@ const IDLE: CardState = { status: { kind: "idle" } };
  * `status` belongs to the card of the prompt it was set for and resets when a
  * different prompt appears. `notice` reports a refused or changed answer above
  * whatever is shown next, until the next tap or 30 seconds. Every answer
- * carries this phone's control lease.
+ * carries this phone's control lease, and none is sent without one when the
+ * session `requiresControl`.
  */
 export function useAnswer(
   connection: Connection,
@@ -60,6 +61,7 @@ export function useAnswer(
   prompt: Prompt | undefined,
   refresh: () => void,
   control: Pick<SessionControlHandle, "leaseId" | "refused">,
+  requiresControl: boolean,
 ) {
   const [card, setCard] = useState<CardState>(IDLE);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -88,10 +90,11 @@ export function useAnswer(
     setNotice(null);
     setCard({ promptId: body.promptId, status: { kind: "sending" } });
     try {
+      const lease = leaseFor(control, requiresControl);
       const receipt = await api<AnswerReceipt>(
         connection,
         `/sessions/${id}/answer`,
-        { body, control: control.leaseId() },
+        { body, control: lease },
       );
       if (receipt.state !== "delivered")
         throw new ApiError(

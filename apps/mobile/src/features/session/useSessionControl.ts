@@ -3,6 +3,7 @@ import { AppState } from "react-native";
 import { useFocusEffect } from "expo-router";
 import {
   api,
+  ControlRefusal,
   type Connection,
   type ControlLease,
   type SessionRow,
@@ -241,6 +242,24 @@ export function useSessionControl(connection: Connection, id: string) {
 }
 
 export type SessionControlHandle = ReturnType<typeof useSessionControl>;
+
+/**
+ * The lease to send with one input. The worker accepts lease-less input while no device holds
+ * control, so a session that enforces control is refused here, before anything is sent, when
+ * this phone holds no lease (for example a tap that landed just as the lease was dropped).
+ */
+export function leaseFor(
+  control: Pick<SessionControlHandle, "leaseId">,
+  requiresControl: boolean,
+): string | undefined {
+  const lease = control.leaseId();
+  if (requiresControl && lease === undefined)
+    throw new ControlRefusal(
+      "Control changed or expired. Take control again before sending.",
+      "control-lost",
+    );
+  return lease;
+}
 
 /**
  * Feeds one screen's session polls to the control: the holder shown is the host's, and a lease

@@ -254,6 +254,12 @@ test("input control gates answers and text before the dialog guards, and refusal
     assert.equal(typeof busy.body.error, "string");
     assert.equal((await inputEvents()).length, 0);
     assert.equal((await signalsOf(host, id)).filter((e) => e.data.kind === "answer").length, 0);
+    // The lease check runs before the dialog guard: lease-less text is `control-busy`, not `prompt-open`.
+    const unleased = await host.fetchApi(`/sessions/${id}/input`, "controller", { requestId: randomUUID(), text: "no, stop", submit: true }, { "X-Infinite-Client": randomUUID() });
+    assert.equal(unleased.status, 409);
+    assert.equal(unleased.body.code, "control-busy");
+    assert.notEqual(unleased.body.error, "prompt-open");
+    assert.equal((await inputEvents()).length, 0);
 
     // The phone takes over explicitly. The laptop's old lease no longer answers anything.
     const phone = await claimControl(host, id, "controller", { takeover: true });
@@ -288,6 +294,29 @@ test("input control gates answers and text before the dialog guards, and refusal
     assert.equal(answered.length, 1);
     assert.ok(intent!.seq < answered[0].seq && answered[0].seq < result!.seq);
     assertClosedOnce(await signalsOf(host, id));
+  } finally {
+    await host.stop();
+  }
+});
+
+test("an answer accepted just before its lease expires does not revive the lease", { timeout: 60000 }, async () => {
+  const host = await startHost({ config: { attention } });
+  try {
+    const id = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Expiring", prompt: "dialog" });
+    const open = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+    const phone = await claimControl(host, id, "controller");
+    // The real 30 s deadline: the answer passes its lease check about 150 ms before expiry and
+    // finishes after it (two arrows, the marker check and the close check take over 200 ms).
+    await new Promise((resolve) => setTimeout(resolve, phone.lease.expiresAt - Date.now() - 150));
+    const answer = await host.fetchApi(`/sessions/${id}/answer`, "controller", { requestId: randomUUID(), promptId: open.body.attention.prompt.id, option: 2 }, phone.headers);
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    assert.equal(answer.body.result, "closed");
+    assert.ok(Date.now() > phone.lease.expiresAt, "the answer finished after the lease deadline");
+    assert.equal((await host.fetchApi(`/sessions/${id}`)).body.control, null);
+    const stale = await host.fetchApi(`/sessions/${id}/input`, "controller", { requestId: randomUUID(), text: "after expiry", submit: true }, phone.headers);
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.code, "control-lost");
   } finally {
     await host.stop();
   }

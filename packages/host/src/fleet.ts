@@ -17,7 +17,7 @@ const tenantSchema = z
 
 const fleetSchema = z
   .object({
-    provider: z.literal("scaleway-pro-11-m-64g-proxmox-development"),
+    provider: z.literal("proxmox-development"),
     hostMemoryMiB: z.literal(65536),
     reserveMemoryMiB: z.number().int().min(8192).max(32768),
     guestVcpuBudget: z.number().int().min(1).max(16),
@@ -40,7 +40,7 @@ export function planFleet(input: unknown) {
   }
   if (fleet.tenants.some((tenant) => tenant.dataClass !== "synthetic")) {
     throw new Error(
-      "Private workloads are blocked: EPYC 4345P has no SEV support and this backend has no operator-confidential execution.",
+      "Private workloads are blocked: this development backend has no operator-confidential execution.",
     );
   }
   const totalMemoryMiB = fleet.tenants.reduce(

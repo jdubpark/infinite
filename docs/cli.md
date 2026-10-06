@@ -62,11 +62,17 @@ Use separate configured worktrees for parallel writers. Multiple sessions launch
 Requires Node.js 22.14 or newer and Tailscale access to the host.
 
 ```sh
+make
+infinite pair https://YOUR-HOST.tailnet.ts.net --token-file /private/owner.key
+```
+
+`make` (or `make build`) installs dependencies when `node_modules` is missing or older than the lockfile, builds `@infinite/attention` and `@infinite/host`, then runs `scripts/install-client.mjs`. The same steps by hand:
+
+```sh
 npm ci
 npm run build -w @infinite/attention
 npm run build -w @infinite/host
 node scripts/install-client.mjs
-infinite pair https://YOUR-HOST.tailnet.ts.net --token-file /private/owner.key
 ```
 
 The installer places `infinite` in `~/.local/bin` and an independent, versioned client runtime in the user's application-data directory. Add `~/.local/bin` to PATH if the installer reports it missing. The runtime bundles its dependencies and does not require this checkout or its `node_modules` directory. It refuses to overwrite an unrelated existing command.

@@ -201,7 +201,7 @@ test("correlates requires every hook detail line in the dialog block", () => {
   assert.equal(correlates({ title: "Permission needed", detail: "w" }, block), false);
   assert.equal(correlates({ title: "Permission needed", detail: "rm -rf" }, block), false);
   // A shared prefix is not the same command.
-  const cd = "cd /Users/someone/projects/infinite/packages/host &&";
+  const cd = "cd /home/dev/projects/infinite/packages/host &&";
   assert.equal(correlates({ title: "Permission needed", detail: `${cd} ls` }, { title: "Do you want to proceed?", detail: `Bash command\n${cd} git push --force origin main` }), false);
   // Case matters; whitespace layout does not.
   assert.equal(correlates({ title: "Permission needed", detail: "RM -RF build" }, block), false);

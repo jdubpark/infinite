@@ -86,7 +86,7 @@ The `Notifier` in the API process polls session attention and sends a push messa
 
 ## Provider boundary
 
-All four providers initially use their native interactive CLI in a PTY. This gives a common terminal transport and retains normal native behavior without inventing a cross-provider session format. Local `--help` confirmed launch/resume flags; all four providers have now completed authenticated turns and tool edits on the owner-controlled host; see the [commissioning record](../deploy/ubuntu/infinitebox.md).
+All four providers initially use their native interactive CLI in a PTY. This gives a common terminal transport and retains normal native behavior without inventing a cross-provider session format. Local `--help` confirmed launch/resume flags; all four providers have now completed authenticated turns and tool edits on the owner-controlled host; see the [commissioning record](../deploy/ubuntu/commissioning.md).
 
 Future structured adapters can normalize user/assistant messages, approvals, tool calls, and model usage while preserving native IDs. Codex exposes thread/turn lifecycle methods; Grok and OpenCode expose ACP/server interfaces. Each provider must be tested independently; an adapter mock is insufficient. [Codex app server](https://learn.chatgpt.com/docs/app-server), [Grok scripting and ACP](https://docs.x.ai/build/cli/headless-scripting), [OpenCode server](https://opencode.ai/docs/server/).
 
@@ -108,6 +108,8 @@ Every write to the PTY (text, terminal bytes, keys, answers, stop and resize) ru
 
 A worker started before attention existed answers without an `attention` block. The API fills one in so list rows never break, but it never invents an idle or finished state: a live old worker reads as `unavailable`, and a stopped one keeps its lifecycle state.
 
-Web and mobile screens show the time of the last successful refresh and distinguish cached views from fresh data. Foregrounding triggers a refresh; it never silently reacquires input control. Unsent drafts and uncertain request IDs remain in client memory across session navigation, and are cleared on device disconnect or process exit. Mobile recording pages are bounded; the complete journal remains available on the host.
+Web and mobile screens show the time of the last successful refresh and distinguish cached views from fresh data. Foregrounding triggers a refresh; it never silently reacquires input control. A response started before the client went into the background cannot mark its returning view fresh. Unsent drafts and uncertain request IDs remain in client memory across navigation and network disconnects. Removing the pairing, reloading the browser, or exiting the client discards them; drafts are not synchronized between devices.
+
+Browser URLs retain the selected session ID and view, without including draft text or credentials. A bounded memory cache keeps the last 20 session views for immediate display during navigation; input stays disabled until fresh host state and any required lease arrive. Initial activity reads start near the latest sequence and retain at most 100 control events. Mobile recording pages are also bounded; the complete journal remains available on the host. Search and filtering affect the client list, not record retention.
 
 The native interface remains the default. Ctrl+E offers a local draft editor that keeps typing on the laptop and inserts text only when requested. It does not remove network latency from the remote native interface. Native CLI arguments are passed without shell evaluation, encrypted with session metadata, and omitted from list rows. The [CLI contract](cli.md) covers flag placement, context behavior, reconnect, and explicit native recovery after a process exit.

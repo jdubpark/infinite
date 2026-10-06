@@ -135,9 +135,12 @@ export function Terminal({
           {role !== undefined && role !== "viewer" && (
             <Composer
               canSteer={canSteer}
+              onTakeControl={online && running && !controlled ? () => void takeControl(Boolean(control.holder)) : undefined}
+              controlBusy={control.busy}
+              controlLabel={control.holder ? "Take over" : "Take control"}
               idleHint={
                 online && running && !controlled
-                  ? "Take control to type into this terminal"
+                  ? "Draft here. Take control when ready…"
                   : undefined
               }
               busy={steering.busy}

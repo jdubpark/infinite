@@ -1,5 +1,5 @@
 {
-  "provider": "scaleway-pro-11-m-64g-proxmox-development",
+  "provider": "proxmox-development",
   "hostMemoryMiB": 65536,
   "reserveMemoryMiB": 8192,
   "guestVcpuBudget": 12,

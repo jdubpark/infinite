@@ -131,7 +131,7 @@ export function useSteering(
     receipt,
     pending: pendingInput,
     text,
-    setText,
+    setText: (value: string) => { setText(value); setReceipt(""); setError(""); },
     send,
     sendKey,
   };

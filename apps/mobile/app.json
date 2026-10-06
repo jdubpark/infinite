@@ -38,10 +38,7 @@
     ],
     "scheme": "infinite",
     "extra": {
-      "router": {},
-      "eas": {
-        "projectId": "57600396-60ec-4ce3-ba94-a5d48ca6ae25"
-      }
+      "router": {}
     }
   }
 }

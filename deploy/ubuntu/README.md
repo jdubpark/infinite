@@ -1,6 +1,6 @@
 # Ubuntu commissioning
 
-This template runs an owner-controlled, single-tenant host. The Scaleway installation and verified limits are recorded in [infinitebox commissioning](infinitebox.md). For multi-tenant development, use the [synthetic-only Proxmox profile](../proxmox/README.md). Operator-confidential multi-tenancy requires the separate [managed tenant architecture](../../docs/multi-tenant.md).
+This template runs an owner-controlled, single-tenant host. The pilot installation and verified limits are recorded in [Host commissioning](commissioning.md). For multi-tenant development, use the [synthetic-only Proxmox profile](../proxmox/README.md). Operator-confidential multi-tenancy requires the separate [managed tenant architecture](../../docs/multi-tenant.md).
 
 These files describe the deployment template; the commissioning record distinguishes checks performed on the actual server from outstanding work. No paid infrastructure is created by these scripts.
 

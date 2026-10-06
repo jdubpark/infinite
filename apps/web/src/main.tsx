@@ -1,9 +1,10 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import {
   ArrowLeft,
+  ArrowDown,
   ArrowUpRight,
   Check,
   ChevronRight,
@@ -21,7 +22,8 @@ import {
   TerminalSquare,
   WifiOff,
 } from "lucide-react";
-import { api, isControlRefusal, names, type ControlLease, type Me, type Session, type LogEvent } from "./api";
+import { api, ApiError, isControlRefusal, names, type ControlLease, type Me, type Session, type LogEvent } from "./api";
+import { SessionPicker, sessionStatus, useSessionLocation, type SessionTab } from "./session-navigation";
 import "@fontsource/instrument-sans/400.css";
 import "@fontsource/instrument-sans/500.css";
 import "@fontsource/instrument-sans/600.css";
@@ -36,9 +38,9 @@ const time = (value: string) =>
 type PendingInput = { requestId: string; text: string; submit: boolean; force: true };
 // Drafts and uncertain request IDs live only in this tab's memory.
 const drafts = new Map<string, { text: string; pending: PendingInput | null }>();
+// Switching sessions paints the last view immediately, but never restores authority.
+const sessionViews = new Map<string, { session: Session; events: LogEvent[]; cursor: number; seen: string }>();
 const foreground = () => document.visibilityState !== "hidden" && navigator.onLine;
-const sessionStatus = (session: Session) => session.attention?.state === "needs-you"
-  ? "Needs you" : session.attention?.state === "turn-finished" ? "Turn finished" : session.status;
 
 function useLiveRefresh(
   task: (current: () => boolean) => Promise<number | void>,
@@ -56,10 +58,13 @@ function useLiveRefresh(
   const [fresh, setFresh] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [seen, setSeen] = useState("");
+  const [failed, setFailed] = useState(false);
   useEffect(() => {
     let active = true, polling = false, queued = false, generation = 0;
     let timer: ReturnType<typeof setTimeout>;
     setFresh(false);
+    setFailed(false);
+    setSeen("");
     const poll = async () => {
       clearTimeout(timer);
       if (!active || !identity || !foreground()) return;
@@ -71,9 +76,9 @@ function useLiveRefresh(
       let delay = interval;
       try {
         delay = await taskRef.current(current) ?? interval;
-        if (current()) { setFresh(true); setSeen(new Date().toISOString()); }
+        if (current()) { setFresh(true); setFailed(false); setSeen(new Date().toISOString()); }
       } catch {
-        if (current()) { setFresh(false); unavailableRef.current?.(); }
+        if (current()) { setFresh(false); setFailed(true); unavailableRef.current?.(); }
       } finally {
         polling = false;
         if (active) {
@@ -86,6 +91,7 @@ function useLiveRefresh(
     const resync = () => {
       generation++;
       setFresh(false);
+      if (!navigator.onLine) setFailed(true);
       clearTimeout(timer);
       if (foreground()) void poll();
       else unavailableRef.current?.();
@@ -106,7 +112,7 @@ function useLiveRefresh(
       window.removeEventListener("focus", resync);
     };
   }, [identity, interval]);
-  return { fresh, refreshing, seen, refresh: useCallback(() => refreshRef.current(), []) };
+  return { fresh, refreshing, seen, failed, refresh: useCallback(() => refreshRef.current(), []) };
 }
 
 function useSessionControl(id: string) {
@@ -127,12 +133,13 @@ function useSessionControl(id: string) {
     owned.current = null;
     setLease(null);
     if (previous) {
-      setMessage("Monitoring. Take control again when you are ready to send input.");
+      setHolder(current => current?.id === previous.id ? null : current);
+      setMessage("");
       if (release) void releaseRequest(previous);
     }
   };
   const observe = (session: Session, revision: number) => {
-    if (revision !== generation.current) return;
+    if (claiming.current || revision !== generation.current) return;
     setHolder(session.control ?? null);
     const previous = owned.current;
     if (previous && (session.control?.id !== previous.id ||
@@ -154,7 +161,7 @@ function useSessionControl(id: string) {
       generation.current++;
       owned.current = result.control;
       setLease(result.control); setHolder(result.control);
-      setMessage(result.control ? "This device has control." : "Control was not granted. Refresh and try again.");
+      setMessage(result.control ? "" : "Control was not granted. Refresh and try again.");
     } catch (error) {
       if (mounted.current && revision === generation.current) {
         forget();
@@ -162,6 +169,25 @@ function useSessionControl(id: string) {
         setMessage((error as Error).message);
       }
     } finally { claiming.current = false; if (mounted.current) setBusy(false); }
+  };
+  const release = async () => {
+    const previous = owned.current;
+    if (!previous || claiming.current) return;
+    forget();
+    const revision = generation.current;
+    claiming.current = true;
+    setBusy(true);
+    try {
+      await api(`/sessions/${id}/control`, { action: "release", leaseId: previous.id });
+    } catch {
+      if (mounted.current && revision === generation.current)
+        setMessage("Control release was not confirmed. This device stopped sending; the host lease will expire.");
+    } finally {
+      // Discard polls begun before the host acknowledged the release.
+      if (revision === generation.current) generation.current++;
+      claiming.current = false;
+      if (mounted.current) setBusy(false);
+    }
   };
   useEffect(() => {
     mounted.current = true;
@@ -195,7 +221,7 @@ function useSessionControl(id: string) {
     }, 10000);
     return () => { clearTimeout(expire); clearInterval(renew); };
   }, [id, lease]);
-  return { lease, holder, message, busy, claim, forget, observe, generation, owned };
+  return { lease, holder, message, busy, claim, release, forget, observe, generation, owned };
 }
 
 function Mark() {
@@ -212,15 +238,25 @@ function App() {
   const [key, setKey] = useState("");
   const [error, setError] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
+  const route = useSessionLocation();
+  const selected = route.id, creating = route.creating;
+  const [bootstrapError, setBootstrapError] = useState(false);
+  const [attempt, setAttempt] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
+    let current = true;
+    setBootstrapError(false);
     api<Me>("/me")
-      .then(setMe)
-      .catch(() => {})
-      .finally(() => setReady(true));
-  }, []);
+      .then(value => { if (current) { setMe(value); setReady(true); } })
+      .catch(error => {
+        if (!current) return;
+        if (error instanceof ApiError && error.status === 401) setReady(true);
+        else setBootstrapError(true);
+      });
+    const retry = () => setAttempt(value => value + 1);
+    window.addEventListener("online", retry);
+    return () => { current = false; window.removeEventListener("online", retry); };
+  }, [attempt]);
   const host = useLiveRefresh(async (current) => {
     const data = await api<{ sessions: Session[] }>("/sessions");
     if (current()) setSessions(data.sessions.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
@@ -245,7 +281,8 @@ function App() {
     return (
       <main className="login">
         <Mark />
-        <p>Connecting to your host…</p>
+        <p role="status">{bootstrapError ? "Your host is unreachable. Your session link is kept here." : "Connecting to your host…"}</p>
+        {bootstrapError && <button className="primary" onClick={() => setAttempt(value => value + 1)}>Try again</button>}
       </main>
     );
   if (!me)
@@ -311,47 +348,13 @@ function App() {
             <button
               className="icon-button"
               aria-label="New session"
-              onClick={() => {
-                setCreating(true);
-                setSelected(null);
-              }}
+              onClick={route.create}
             >
               <Plus size={20} />
             </button>
           )}
         </div>
-        <nav aria-label="Sessions" className="session-list">
-          {sessions.map((session) => (
-            <button
-              key={session.id}
-              className={`session-row ${selected === session.id ? "selected" : ""}`}
-              onClick={() => {
-                setSelected(session.id);
-                setCreating(false);
-              }}
-            >
-              <div className="row-top">
-                <span className={`dot ${session.status}`} />
-                <strong>{session.title}</strong>
-                <ChevronRight size={16} />
-              </div>
-              <div className="row-meta">
-                <span>{names[session.provider]}</span>
-                <span>{sessionStatus(session)}</span>
-              </div>
-              <div className="row-meta session-id">
-                {session.id.slice(0, 8)}
-              </div>
-            </button>
-          ))}
-          {!sessions.length && (
-            <p className="rail-empty">
-              No sessions yet.
-              <br />
-              Start one from your laptop.
-            </p>
-          )}
-        </nav>
+        <SessionPicker sessions={sessions} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />
         <div className="host-status">
           <div>
             {me.environment === "cloud" ? (
@@ -373,7 +376,7 @@ function App() {
               </>
             ) : (
               <>
-                <WifiOff size={13} /> Connection lost · cached view
+                <WifiOff size={13} /> {host.failed ? "Reconnecting · cached view" : host.seen ? "Checking connection…" : "Connecting to host…"}
               </>
             )}
           </p>
@@ -384,8 +387,10 @@ function App() {
           onClick={async () => {
             await api("/logout", {});
             setMe(null);
-            setSelected(null);
+            route.navigate(null);
+            setSessions([]);
             drafts.clear();
+            sessionViews.clear();
           }}
         >
           <LogOut size={16} /> Disconnect this device
@@ -396,10 +401,7 @@ function App() {
           <div className="breadcrumb">
             <button
               className="back icon-button"
-              onClick={() => {
-                setSelected(null);
-                setCreating(false);
-              }}
+              onClick={() => route.navigate(null)}
               aria-label="Back to sessions"
             >
               <ArrowLeft size={20} />
@@ -416,11 +418,11 @@ function App() {
           </button>
           <span className={`connection ${connected ? "" : "offline"}`}>
             <span className={`dot ${connected ? "running" : "unavailable"}`} />
-            {connected ? "Up to date" : "Reconnecting"}
+            {connected ? "Up to date" : host.failed ? "Reconnecting" : host.seen ? "Refreshing" : "Connecting"}
           </span>
           </div>
         </header>
-        {!connected && (
+        {!connected && host.failed && (
           <div className="connection-notice" role="status">
             This device is offline or the host is unreachable. Work may still be
             running; controls are disabled until a fresh connection arrives.
@@ -429,10 +431,7 @@ function App() {
         {creating ? (
           <Create
             me={me}
-            done={(id) => {
-              setSelected(id);
-              setCreating(false);
-            }}
+            done={route.navigate}
             connected={connected}
           />
         ) : selected ? (
@@ -441,6 +440,8 @@ function App() {
             id={selected}
             me={me}
             connected={connected}
+            tab={route.tab}
+            setTab={route.selectTab}
           />
         ) : (
           <div className="overview">
@@ -467,7 +468,7 @@ function App() {
                 <button
                   className="overview-session"
                   key={session.id}
-                  onClick={() => setSelected(session.id)}
+                  onClick={() => route.navigate(session.id)}
                 >
                   <span className={`provider-avatar ${session.provider}`}>
                     {names[session.provider]?.slice(0, 1)}
@@ -495,7 +496,7 @@ function App() {
                   provider, or launch an installed agent.
                 </p>
                 {me.role === "owner" && (
-                  <button className="primary" onClick={() => setCreating(true)}>
+                  <button className="primary" onClick={route.create}>
                     Start a session
                     <Plus size={17} />
                   </button>
@@ -705,43 +706,92 @@ function SessionView({
   id,
   me,
   connected,
+  tab,
+  setTab,
 }: {
   id: string;
   me: Me;
   connected: boolean;
+  tab: SessionTab;
+  setTab: (tab: SessionTab) => void;
 }) {
-  const [session, setSession] = useState<Session | null>(null);
-  const [tab, setTab] = useState<"screen" | "terminal" | "context">("screen");
+  const cached = useRef(sessionViews.get(id));
+  const [session, setSession] = useState<Session | null>(cached.current?.session ?? null);
   const [text, setText] = useState(() => drafts.get(id)?.text ?? "");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
-  const [events, setEvents] = useState<LogEvent[]>([]);
+  const [events, setEvents] = useState<LogEvent[]>(cached.current?.events ?? []);
   const pending = useRef<PendingInput | null>(drafts.get(id)?.pending ?? null);
   const [pendingInput, setPendingInput] = useState(() => Boolean(drafts.get(id)?.pending));
-  const cursor = useRef(0);
+  const cursor = useRef<number | null>(cached.current?.cursor ?? null);
+  const composer = useRef<HTMLTextAreaElement>(null);
+  const screen = useRef<HTMLPreElement>(null);
+  const body = useRef<HTMLDivElement>(null);
+  const [following, setFollowing] = useState(true);
+  const sending = useRef(false);
+  const [loadError, setLoadError] = useState("");
   const control = useSessionControl(id);
   const view = useLiveRefresh(async (current) => {
     const revision = control.generation.current;
-    const [detail, page] = await Promise.all([
-      api<Session>(`/sessions/${id}`),
-      api<{ events: LogEvent[]; cursor: number; more: boolean }>(`/sessions/${id}/events?after=${cursor.current}`),
-    ]);
+    let detail: Session;
+    try { detail = await api<Session>(`/sessions/${id}`); }
+    catch (error) {
+      if (current()) setLoadError(error instanceof ApiError && error.status === 404
+        ? "This session is not available on this host. Open another session from the list."
+        : "The host is unreachable. Your draft stays in this tab; try again when connected.");
+      throw error;
+    }
+    if (!current()) return;
+    setSession(detail);
+    setLoadError("");
+    control.observe(detail, revision);
+    // Catch up from a bounded recent window, not the recording's first event.
+    const after = cursor.current ?? Math.max(0, detail.seq - 200);
+    const page = await api<{ events: LogEvent[]; cursor: number; more: boolean }>(
+      `/sessions/${id}/events?after=${after}&types=lifecycle,input-intent,input-result,signal&limit=100`);
     if (current()) {
-      setSession(detail);
-      control.observe(detail, revision);
       cursor.current = page.cursor;
-      setEvents((old) => [...old, ...page.events.filter((event) => event.type !== "output")].slice(-100));
+      const next = [...(sessionViews.get(id)?.events ?? []), ...page.events].slice(-100);
+      setEvents(next);
+      sessionViews.delete(id);
+      sessionViews.set(id, { session: detail, events: next, cursor: page.cursor, seen: new Date().toISOString() });
+      if (sessionViews.size > 20) sessionViews.delete(sessionViews.keys().next().value!);
     }
     return page.more ? 0 : 1100;
   }, 1100, id, () => control.forget(true));
   useEffect(() => { drafts.set(id, { text, pending: pending.current }); }, [id, text, pendingInput]);
+  useLayoutEffect(() => {
+    const output = screen.current, viewport = body.current;
+    if (!output || !viewport) return;
+    const fit = () => {
+      const inset = parseFloat(getComputedStyle(viewport).paddingBottom) || 0;
+      const top = output.getBoundingClientRect().top - viewport.getBoundingClientRect().top + viewport.scrollTop;
+      output.style.maxHeight = `${Math.max(100, Math.min(360, viewport.clientHeight - top - inset))}px`;
+      if (following) {
+        output.scrollTop = output.scrollHeight;
+        const obscured = output.getBoundingClientRect().bottom - viewport.getBoundingClientRect().bottom + inset;
+        if (obscured > 0) viewport.scrollTop += obscured;
+      }
+    };
+    fit();
+    const observer = new ResizeObserver(fit);
+    observer.observe(viewport);
+    if (viewport.firstElementChild) observer.observe(viewport.firstElementChild);
+    return () => observer.disconnect();
+  }, [session?.screen, following, tab]);
+  useLayoutEffect(() => {
+    if (!composer.current) return;
+    composer.current.style.height = "auto";
+    composer.current.style.height = `${Math.min(170, composer.current.scrollHeight)}px`;
+  }, [text, tab, session !== null]);
   const requiresControl = session?.capabilities?.inputControl === 1;
   const canSteer = connected && view.fresh && session?.status === "running" &&
     me.role !== "viewer" && (!requiresControl || Boolean(control.lease));
   async function takeControl(takeover = false) {
     if (!view.fresh || session?.status !== "running") return;
     await control.claim(takeover);
+    if (control.owned.current) composer.current?.focus();
     view.refresh();
   }
   function handleInputError(error: unknown) {
@@ -754,7 +804,8 @@ function SessionView({
   }
   async function send(e: React.FormEvent) {
     e.preventDefault();
-    if (!canSteer || busy) return;
+    if (!canSteer || busy || sending.current || !text.trim()) return;
+    sending.current = true;
     setBusy(true);
     setError("");
     setNotice("");
@@ -789,6 +840,7 @@ function SessionView({
           `${(e as Error).message} Your draft was not sent.`);
       } else setError(`${(e as Error).message} Delivery may be uncertain. Check the recording before retrying the same request.`);
     } finally {
+      sending.current = false;
       setBusy(false);
     }
   }
@@ -843,7 +895,8 @@ function SessionView({
   if (!session)
     return (
       <div className="content">
-        <p role="status">Loading this session…</p>
+        <p role="status">{loadError || "Opening this session…"}</p>
+        {loadError && <button className="primary" onClick={view.refresh} disabled={view.refreshing}>Try again</button>}
       </div>
     );
   return (
@@ -872,29 +925,24 @@ function SessionView({
           <Download size={19} />
         </button>
       </div>
-      <div className="control-bar" aria-live="polite">
-        <div>
-          <strong>{requiresControl ? control.lease ? "You have control" : "Monitoring" : me.role === "viewer" ? "Monitoring" : "Shared controls"}</strong>
-          <span>{view.fresh ? `Updated ${time(view.seen)}` : "Reconnecting · cached view"}</span>
-          {requiresControl && !control.lease && control.holder && <small>{control.holder.label} has control</small>}
-        </div>
-        <div className="control-actions">
-          <button className="text-button" onClick={view.refresh} disabled={view.refreshing} aria-label="Refresh this session"><RefreshCw size={16} /></button>
-          {requiresControl && me.role !== "viewer" && session.status === "running" && (
-            control.lease ? <button className="text-button" onClick={() => { control.forget(true); view.refresh(); }}>Stop controlling</button> :
-              <button className="primary" disabled={!view.fresh || control.busy} onClick={() => takeControl(Boolean(control.holder))}>
-                {control.busy ? "Requesting…" : control.holder ? "Take over" : "Take control"}
-              </button>
-          )}
-        </div>
-      </div>
       <div className="tabs" role="tablist" aria-label="Session views">
         {(["screen", "terminal", "context"] as const).map((t) => (
           <button
             role="tab"
+            id={`view-${t}`}
+            aria-controls="session-panel"
+            tabIndex={tab === t ? 0 : -1}
             aria-selected={tab === t}
             key={t}
             onClick={() => setTab(t)}
+            onKeyDown={event => {
+              const views: SessionTab[] = ["screen", "terminal", "context"];
+              const offset = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+              if (!offset) return;
+              event.preventDefault();
+              const next = views[(views.indexOf(t) + offset + views.length) % views.length];
+              setTab(next); document.getElementById(`view-${next}`)?.focus();
+            }}
           >
             {t === "screen"
               ? "Catch up"
@@ -905,7 +953,10 @@ function SessionView({
         ))}
         <span>{session.seq} recorded events</span>
       </div>
-      <div className="session-body">
+      <div className="session-body" id="session-panel" ref={body} role="tabpanel" aria-labelledby={`view-${tab}`} onScroll={() => {
+        if (screen.current && body.current && screen.current.getBoundingClientRect().bottom > body.current.getBoundingClientRect().bottom + 1)
+          setFollowing(false);
+      }}>
         {tab === "terminal" ? (
           <TerminalView id={id} />
         ) : tab === "context" ? (
@@ -915,9 +966,17 @@ function SessionView({
             {session.attention?.now && <div className="attention-summary"><strong>{sessionStatus(session)}</strong><p>{session.attention.now}</p></div>}
             <div className="section-label">
               <h2>Current screen</h2>
-              <span>{view.fresh ? `Updated ${time(view.seen)}` : "Last received · stale"}</span>
+              <div className="screen-actions">
+                <span>{view.fresh ? `Updated ${time(view.seen)}` : view.seen || cached.current?.seen ? `Saved view · ${time(view.seen || cached.current!.seen)}` : "Refreshing…"}</span>
+                <button className="text-button" aria-pressed={following} onClick={() => setFollowing(value => !value)}>
+                  <ArrowDown size={14} />{following ? "Following latest" : "Follow latest"}
+                </button>
+              </div>
             </div>
-            <pre className="screen">
+            <pre className="screen" ref={screen} tabIndex={0} aria-label="Current terminal screen" onScroll={event => {
+              const element = event.currentTarget;
+              setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 24);
+            }}>
               {session.screen ||
                 (session.status === "running"
                   ? "Waiting for output…"
@@ -925,7 +984,7 @@ function SessionView({
             </pre>
             <div className="section-label activity-label">
               <h2>Session activity</h2>
-              <span>Latest 100 control events</span>
+              <span>Recent control events</span>
             </div>
             <ol className="activity">
               {events.map((event) => (
@@ -956,6 +1015,21 @@ function SessionView({
         )}
       </div>
       <div className="composer-area">
+        <div className="control-bar">
+          <div>
+            <strong>{requiresControl ? control.lease ? "You have control" : "Monitoring" : me.role === "viewer" ? "View only" : "Shared controls"}</strong>
+            <span>{!view.fresh || !connected ? "Refreshing before input…" : session.status !== "running" ? "Process is not running" : requiresControl && !control.lease ? control.holder ? `${control.holder.label} has control` : "Draft now, take control to send" : "Ready for input"}</span>
+          </div>
+          <div className="control-actions">
+            <button className="text-button" onClick={view.refresh} disabled={view.refreshing} aria-label="Refresh this session"><RefreshCw size={16} /></button>
+            {requiresControl && me.role !== "viewer" && session.status === "running" && (
+              control.lease ? <button className="text-button" onClick={async () => { await control.release(); view.refresh(); }}>Stop controlling</button> :
+                <button className="primary" disabled={!connected || !view.fresh || control.busy} onClick={() => takeControl(Boolean(control.holder))}>
+                  {control.busy ? "Updating…" : control.holder ? "Take over" : "Take control"}
+                </button>
+            )}
+          </div>
+        </div>
         {control.message && <p className="quiet control-message" role="status">{control.message}</p>}
         {error && (
           <p className="error" role="alert">
@@ -978,6 +1052,7 @@ function SessionView({
               </label>
               <textarea
                 id="message"
+                ref={composer}
                 rows={2}
                 placeholder={
                   canSteer
@@ -985,22 +1060,28 @@ function SessionView({
                     : "Draft here. Take control when you are ready to send…"
                 }
                 value={text}
-                onChange={(e) => setText(e.target.value)}
+                onChange={(e) => { setText(e.target.value); setNotice(""); setError(""); }}
+                onKeyDown={event => {
+                  if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    if (canSteer && text.trim()) event.currentTarget.form?.requestSubmit();
+                  }
+                }}
                 disabled={busy || pendingInput}
                 maxLength={32000}
               />
               <button
                 className="send-button"
                 aria-label={
-                  pendingInput ? "Retry same message" : "Send message"
+                  busy ? "Sending message" : pendingInput ? "Retry same message" : "Send message"
                 }
                 disabled={!canSteer || busy || !text.trim()}
               >
-                {pendingInput ? <RefreshCw size={20} /> : <Send size={20} />}
+                {busy ? <span>Sending…</span> : pendingInput ? <RefreshCw size={20} /> : <Send size={20} />}
               </button>
             </form>
             <div className="composer-footer">
-              <span>{pendingInput ? "Unconfirmed delivery · retry keeps the same request ID" : "Draft stays on this device until you send."}</span>
+              <span>{pendingInput ? "Unconfirmed delivery · retry keeps the same request ID" : text ? "Unsent draft · kept in this tab" : "⌘ / Ctrl + Enter to send · Enter for a new line"}</span>
               <div>
                 <button
                   disabled={!canSteer || busy}

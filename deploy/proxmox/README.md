@@ -1,6 +1,6 @@
-# Proxmox tenant development on Pro-11-M-64G
+# Proxmox tenant development
 
-This is an ordinary-VM development backend. It provides **no confidentiality from the host operator**. The rented EPYC 4345P lacks SEV support. Use synthetic data only. No remote machine has been configured by these files. The [managed tenant contract](../../docs/multi-tenant.md) defines the future confidential service.
+This is an ordinary-VM development backend. It provides **no confidentiality from the host operator**. Use synthetic data only. No remote machine has been configured by these files. The [managed tenant contract](../../docs/multi-tenant.md) defines the future confidential service.
 
 ## Inspect a plan
 
@@ -9,7 +9,7 @@ npm run build
 npm run host -- plan-fleet deploy/proxmox/fleet.example.json
 ```
 
-The example assigns two distinct tenants to Ubuntu 24.04 KVM guests, each with 4 vCPUs, 16 GiB RAM, a 160 GiB private disk, and ten rehearsal session slots. It reserves 8 GiB for the host and leaves 24 GiB unallocated. Session count is not a throughput promise. The 8 physical cores are shared across guests; vCPUs are not dedicated physical cores.
+The example uses the `proxmox-development` provider and assigns two distinct tenants to Ubuntu 24.04 KVM guests, each with 4 vCPUs, 16 GiB RAM, a 160 GiB private disk, and ten rehearsal session slots. It reserves 8 GiB for the host and leaves 24 GiB unallocated. Session count is not a throughput promise. Physical cores are shared across guests; vCPUs are not dedicated physical cores. Existing local plans should use this provider value.
 
 Replace the example tenant UUIDs, addresses, management CIDRs, and resource budgets with actual values before provisioning. `192.0.2.10` is a documentation address, not the rented server. The disk budget is conservative planning input, not a measured usable capacity or RAID configuration. Do not format or repartition the rented server from this example.
 

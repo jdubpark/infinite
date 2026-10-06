@@ -1,11 +1,11 @@
-# infinitebox commissioning
+# Host commissioning
 
 Single-tenant pilot on `SERVER_PUBLIC_IP`, commissioned on 2026-10-05 UTC. This is an owner-controlled Ubuntu host. It does not provide confidentiality from root, the infrastructure operator, or compromised agent software. Multi-tenant private workloads remain disabled.
 
 ## Access and release
 
-- Private application: `https://infinitebox.YOUR-TAILNET.ts.net`.
-- Tailnet address: `TAILNET_IP`; administrator login: `infinite`.
+- Private application: `https://HOST.YOUR-TAILNET.ts.net`.
+- Tailnet address: `TAILNET_IP`; administrator login: `ADMIN_USER`.
 - SSH ED25519 fingerprint, independently supplied by the owner: recorded privately, not in this repository.
 - Application release: `/data/infinite-releases/RELEASE_ID`, selected through `/opt/infinite`.
 - Release archive SHA-256: recorded privately with the release receipt.
@@ -19,7 +19,7 @@ Device keys are generated on the laptop. Only their hashes are installed in `/et
 
 ## Storage and runtime
 
-Live inspection found Ubuntu 24.04.2, AMD EPYC 4345P with 16 logical CPUs, approximately 62 GiB usable RAM, and two mirrored NVMe drives. The existing root, boot, and `/data` partitions were preserved. A later `/proc/mdstat` check confirmed that the initial resynchronization finished and all three arrays reported `[UU]` with both members active.
+Live inspection found Ubuntu 24.04 LTS with 16 logical CPUs, approximately 62 GiB usable RAM, and two mirrored NVMe drives. The existing root, boot, and `/data` partitions were preserved. A later `/proc/mdstat` check confirmed that the initial resynchronization finished and all three arrays reported `[UU]` with both members active.
 
 A new 128 GiB LUKS2 container at `/data/infinite-private/storage.luks` is mounted through `/dev/mapper/infinite-data` at `/srv/infinite-data`. Its UUID is recorded privately with the recovery material. The encrypted filesystem contains control records, provider homes, workspaces, caches, and persistent temporary files. The service additionally gives `/tmp` and `/var/tmp` RAM-backed mounts. Plaintext swap is disabled now and in `fstab`; core dumps are disabled for the service. No existing disk was formatted.
 
@@ -27,7 +27,7 @@ The storage unlock key is supplied from the laptop, used from `/run`, and remove
 
 Recovery material (storage key, journal key, device keys, pinned host key, metadata, and the backup age identity and recipient) is also copied to a private directory on the owner's machine, outside the repository.
 
-The directory is mode 0700 and files are mode 0600. Preserve a separate protected backup of this recovery material. These are recovery files. A separate 212,439,341-byte encrypted data backup is stored privately on the owner's machine, outside the repository. Automatic independent cloud upload remains unconfigured; the server timer creates local encrypted snapshots daily.
+The directory is mode 0700 and files are mode 0600. Preserve a separate protected backup of this recovery material. These are recovery files. A separate encrypted data backup is stored privately on the owner's machine, outside the repository. Automatic independent cloud upload remains unconfigured; the server timer creates local encrypted snapshots daily.
 
 ## Verified behavior
 
@@ -52,7 +52,7 @@ OpenCode initially inherited `/usr/sbin/nologin` for tool execution. The launche
 
 The laptop link showed intermittent Tailscale connection timeouts during testing. A subsequent direct Tailscale ping succeeded at approximately 770 ms and fresh private HTTPS checks returned 200. Treat this as an observed high-latency client connection; no claim of reliable low latency or a physical-phone outage rehearsal is made.
 
-Local receipts and screenshots (cloud continuity, active release, provider commissioning, and browser checks) are kept in an ignored local directory. They contain no device-key values. Remote build output is in `/data/infinite-build/final-build.log`.
+Local receipts and screenshots (cloud continuity, active release, provider commissioning, and browser checks) and remote build output are recorded privately, outside this repository. The receipts contain no device-key values.
 
 ## Provider authentication
 
@@ -63,7 +63,7 @@ Codex, Grok, and Claude authenticated through separate server logins. At the own
 OpenCode enables the `meta` and `deepseek` providers, defaults new sessions to `meta/muse-spark-1.3-contributor`, and disables public session sharing. The installed catalog also offers `deepseek/deepseek-flash` (displayed as DeepSeek V4.1 Flash) and `deepseek/deepseek-v4-pro`. Meta's Contributor tier permits training on prompts and completions; the encrypted execution host does not change those provider terms. Commissioning uses disposable text only. [Meta tier terms](https://dev.meta.ai/docs/pricing-rate-limits#contributor-tier).
 
 ```sh
-ssh -t infinite@SERVER_PUBLIC_IP
+ssh -t ADMIN_USER@SERVER_PUBLIC_IP
 sudo -H -u infinite-agent /usr/local/libexec/infinite/codex login --device-auth
 sudo -H -u infinite-agent /usr/local/libexec/infinite/claude auth login
 sudo -H -u infinite-agent /usr/local/libexec/infinite/grok login --device-auth
@@ -88,15 +88,21 @@ The snapshot and device-control release switched the API at 11:49 UTC on 2026-10
 
 The deployed synthetic rehearsal verified snapshot attachment without duplicate prefix output, two-device takeover, refusal of stale input, and monitor mode without a control claim. The installed laptop CLI restored an unsent draft after releasing and reacquiring control, then detached with the same session PID and runtime ID still running. The draft painted in 1 ms in this single sample and produced no agent input. Only the disposable rehearsal was stopped afterward; this check made no model requests and does not establish native provider UI latency.
 
-Local Chrome verification covered explicit takeover, disabled stale/offline inputs, retained drafts, foreground refresh, and a delayed poll that previously revoked newly acknowledged control. The fixed client retained control after that older response completed. React Native received the same refresh-order repair and passed typecheck/lint; no Android runtime result is claimed. Source, activation, and live verification receipts are kept in the ignored local directory. Ubuntu validation output is `/data/infinite-build/adoption-RELEASE_ID.log`.
+Local Chrome verification covered explicit takeover, disabled stale/offline inputs, retained drafts, foreground refresh, and a delayed poll that previously revoked newly acknowledged control. The fixed client retained control after that older response completed. React Native received the same refresh-order repair and passed typecheck/lint; no Android runtime result is claimed. Source, activation, live verification receipts, and Ubuntu validation output are recorded privately, outside this repository.
 
-Direct Tailscale RTT was 1.183 seconds during this investigation, while loopback API responses took 0.3–10.2 ms. Remote native echo still depends on that network latency. Local native frontend adapters, synchronized laptop workspaces, and portable provider checkpoints remain unimplemented; see [native interaction and continuity](../../docs/native-continuity.md). Transport receipts are kept in the ignored local directory; Ubuntu validation output is `/data/infinite-build/terminal-RELEASE_ID.log`.
+Direct Tailscale RTT was 1.183 seconds during this investigation, while loopback API responses took 0.3–10.2 ms. Remote native echo still depends on that network latency. Local native frontend adapters, synchronized laptop workspaces, and portable provider checkpoints remain unimplemented; see [native interaction and continuity](../../docs/native-continuity.md). Transport receipts and Ubuntu validation output are recorded privately, outside this repository.
 
 The first encrypted archive's name and SHA-256 are recorded privately with its receipt. The snapshot paused the service for 0.192 seconds and preserved its processes. The archive was downloaded and verified on the FileVault-enabled laptop: 1,694 file hashes/sizes, two SQLite integrity checks, 17 decrypted session metadata records, 6,241 authenticated journal events, and all four provider proof files passed. Eighteen external symlinks were inventoried rather than restored automatically. Temporary decrypted restore directories were removed.
 
 `infinite-backup.timer` is enabled for daily 03:30 UTC plus up to 15 minutes. Only the age public recipient is installed on the server; the private identity remains with the owner's recovery files. This timer creates encrypted server-local snapshots. Independent cloud storage upload and retention pruning are not configured. See [backup and restoration](backups.md).
 
 Private receipts for the CLI release, native versions, live CLI check, backup, and restore are kept in the ignored local directory.
+
+## Web interaction update
+
+On 2026-10-06, the web assets were updated without restarting the API or its workers. All 15 served files matched the built artifact hashes, and five running sessions retained their session IDs and native PIDs. The previous index and older assets remain available for rollback. Local tailnet DNS was unavailable during this check; authenticated API and asset verification used an encrypted SSH tunnel.
+
+Local checks passed all 95 repository tests, typechecks, and production builds. Browser checks covered session search, route restoration, navigation with retained drafts, explicit control release, keyboard submission, offline drafting, and reconnect without automatic submission. A visual review passed at desktop, tablet, and phone widths, including latest-output visibility above an expanded draft. React Native changes passed lint and typechecking; native Android validation was excluded.
 
 ## Operations and recovery
 

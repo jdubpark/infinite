@@ -1,6 +1,6 @@
 # Managed tenants with operator confidentiality
 
-Status: accepted product direction, development foundation implemented. Confidential execution, client attestation, key release, encrypted relay, and live VM provisioning are not implemented. The rented Scaleway server now runs the owner-controlled single-tenant pilot; no multi-tenant VMs have been provisioned. See [single-tenant commissioning](../deploy/ubuntu/infinitebox.md).
+Status: accepted product direction, development foundation implemented. Confidential execution, client attestation, key release, encrypted relay, and live VM provisioning are not implemented. The development server now runs the owner-controlled single-tenant pilot; no multi-tenant VMs have been provisioned. See [single-tenant commissioning](../deploy/ubuntu/commissioning.md).
 
 ## Decisions
 
@@ -17,15 +17,15 @@ In multi-tenant mode, each user, including the service owner, gets a separate ex
 
 Execution stays on the server when a laptop disconnects. Clients attach to that same process. The user selected managed confidential VMs rather than user-operated cloud accounts. We can develop the provisioning and tenant boundaries on ordinary VMs, but they cannot receive private workloads under the required confidentiality promise.
 
-The rented **Scaleway Pro-11-M-64G** runs the single-tenant pilot and can support development/control-plane work for the future managed service. Scaleway lists an **AMD EPYC 4345P, 8 cores / 16 threads, 64 GB RAM, and two 1 TB NVMe drives**. AMD explicitly excludes SEV from the EPYC 4005 family. TSME encrypts memory against different threats; it does not supply per-guest protection from the hypervisor. Proxmox cannot add missing SEV hardware. Live inspection confirmed the EPYC 4345P, 16 logical CPUs, approximately 62 GiB usable RAM, and mirrored NVMe storage; the SEV capability conclusion follows AMD's published specification. [Scaleway comparison](https://www.scaleway.com/en/docs/dedibox-hardware/reference-content/server-comparison-table/), [AMD feature comparison](https://www.amd.com/en/products/processors/server/epyc/small-business.html).
+The development host runs the single-tenant pilot and can support control-plane work for the managed service. It has 16 logical CPUs, approximately 62 GiB usable RAM, and mirrored NVMe storage, but lacks the confidential VM features needed for operator-private execution. Hardware identity and verification receipts are recorded privately, outside this repository. Ordinary memory encryption does not supply per-guest protection from the hypervisor, and Proxmox cannot add missing hardware capabilities.
 
 ## Two separate planes
 
 ```mermaid
 flowchart TB
   D[User-controlled trusted laptop / Android client]
-  C[Scaleway control plane\nAccounts, capacity, opaque tenant IDs]
-  R[Scaleway relay / storage\nEncrypted packets and encrypted objects only]
+  C[Control plane\nAccounts, capacity, opaque tenant IDs]
+  R[Relay / storage\nEncrypted packets and encrypted objects only]
   A[Independent attestation authority]
   K[User-held keys and recovery material]
   subgraph Future[Future confidential execution provider]

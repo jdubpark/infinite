@@ -25,6 +25,9 @@ export function Composer({
   onChangeText,
   onSend,
   onInterrupt,
+  onTakeControl,
+  controlBusy = false,
+  controlLabel = "Take control",
   children,
 }: {
   canSteer: boolean;
@@ -39,6 +42,9 @@ export function Composer({
   onChangeText: (text: string) => void;
   onSend: () => void;
   onInterrupt?: () => void;
+  onTakeControl?: () => void;
+  controlBusy?: boolean;
+  controlLabel?: string;
   children?: ReactNode;
 }) {
   const canType = canSteer && !blocked;
@@ -62,10 +68,10 @@ export function Composer({
           multiline
           value={text}
           onChangeText={onChangeText}
-          editable={canType && !busy && !pending}
+          editable={!blocked && !busy && !pending}
           placeholder={
             !canSteer
-              ? (idleHint ?? "Waiting for a live connection")
+              ? (idleHint ?? "Draft here while reconnecting…")
               : blocked
                 ? blockedPlaceholder
                 : "Give this session a direction…"
@@ -74,12 +80,19 @@ export function Composer({
           style={s.message}
           maxLength={32000}
         />
-        <Button
-          title={pending ? "Retry" : "Send"}
+        {onTakeControl ? <Button
+          title={controlBusy ? "Requesting…" : controlLabel}
+          onPress={onTakeControl}
+          disabled={busy || controlBusy}
+        /> : <Button
+          title={busy ? "Sending…" : pending ? "Retry" : "Send"}
           onPress={onSend}
           disabled={!canType || busy || !text.trim()}
-        />
+        />}
       </View>
+      {!pending && !blocked && <Text style={s.draftNote}>
+        {text ? "Unsent draft · kept on this phone while the app is open" : "Drafts stay on this phone until you send."}
+      </Text>}
       {onInterrupt || children ? (
         <View style={s.keys}>
           {onInterrupt ? (
@@ -129,6 +142,7 @@ const s = StyleSheet.create({
     marginBottom: theme.space.compact,
   },
   row: { flexDirection: "row", alignItems: "flex-end", gap: 10 },
+  draftNote: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk, marginTop: 6 },
   message: {
     flex: 1,
     minHeight: 60,

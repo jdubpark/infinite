@@ -244,6 +244,9 @@ export function Brief({
           {me && me.role !== "viewer" ? (
             <Composer
               canSteer={canSteer}
+              onTakeControl={online && running && !controlled ? () => void takeControl(Boolean(control.holder)) : undefined}
+              controlBusy={control.busy}
+              controlLabel={control.holder ? "Take over" : "Take control"}
               // Text and Enter would land in the open dialog and pick its highlighted option.
               // A running worker without attention cannot report one, so only the terminal types.
               blocked={
@@ -258,7 +261,7 @@ export function Brief({
               }
               idleHint={
                 online && running && !controlled
-                  ? "Take control to send from this phone"
+                  ? "Draft here. Take control when ready…"
                   : undefined
               }
               busy={steering.busy}

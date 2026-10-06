@@ -1,14 +1,14 @@
 # Server choice
 
-**Current decision supersedes the earlier shortlist:** the user has rented a Scaleway Pro-11-M-64G and selected managed confidential VMs as the target. Scaleway lists EPYC 4345P, 8 cores / 16 threads, 64 GB RAM, and 2 × 1 TB NVMe. AMD says EPYC 4005 lacks SEV. Use this server for development, control-plane services, and eventually encrypted relay/storage; it cannot supply the required operator-confidential execution. [Scaleway](https://www.scaleway.com/en/docs/dedibox-hardware/reference-content/server-comparison-table/), [AMD](https://www.amd.com/en/products/processors/server/epyc/small-business.html).
+**Current direction:** managed confidential VMs are the execution target. The development server has 16 logical CPUs, 64 GB RAM, and mirrored NVMe storage, but lacks the required confidential VM hardware. It can run the single-tenant pilot, control-plane services, and encrypted relay/storage. Hardware identity and inspection receipts are recorded privately, outside this repository.
 
 See [managed tenants](multi-tenant.md) for backend selection and [Proxmox development](../deploy/proxmox/README.md) for the local capacity plan. The comparison below is retained as the earlier personal-server research, not the current recommendation to buy another ordinary host.
 
-The rented server now runs the owner's single-tenant pilot directly on Ubuntu, with private Tailscale access and an encrypted application volume. See [commissioning](../deploy/ubuntu/infinitebox.md) for live hardware and provider checks. This deployment does not establish the managed tenant confidentiality boundary.
+The rented server now runs the owner's single-tenant pilot directly on Ubuntu, with private Tailscale access and an encrypted application volume. See [commissioning](../deploy/ubuntu/commissioning.md) for live hardware and provider checks. This deployment does not establish the managed tenant confidentiality boundary.
 
 Recommendation checked on 2026-10-04: look for a **Hetzner AX102-1-LTD with 128 GB RAM, mirrored NVMe, and the standard 1 Gbit/s uplink**. If the intended workload is ten simultaneous builds or browser-heavy test runs, compare an **AX162-1-LTD** before ordering. Limited-stock prices are listed offers, not verified inventory reservations.
 
-The reference laptop is an Apple-silicon Mac with **14 CPU cores and 36 GiB unified memory**. An x86 server is not equivalent to its GPU, macOS applications, Keychain, Xcode, or unified memory architecture. The server comparison concerns Linux agent orchestration, compilation, tests, browsers, and storage. Native iPhone builds still need a Mac or a macOS build service.
+Capacity comparisons use a laptop baseline of **14 CPU cores and 36 GiB memory**. Linux server resources do not replace a laptop GPU, macOS applications, Keychain, or Xcode. The server comparison concerns Linux agent orchestration, compilation, tests, browsers, and storage. Native iPhone builds still need a Mac or a macOS build service.
 
 ## Shortlist
 

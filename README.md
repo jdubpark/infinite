@@ -2,9 +2,9 @@
 
 A persistent agent host for Claude Code, Codex, Grok Build, and OpenCode. Agents run on the host; cmux, a browser, and the React Native phone app attach to the same sessions. Closing the laptop does not move or restart the agent.
 
-**Status: single-tenant cloud pilot with a paired laptop CLI.** Claude, Codex, Grok, and OpenCode have completed authenticated tool runs on the rented server. Cloud processes survive client disconnection and API restarts. Encrypted backup and data-restore checks are complete. Independent cloud backup storage, cold-boot recovery, and operator-confidential multi-tenant execution remain unfinished. See the [commissioning record](deploy/ubuntu/infinitebox.md).
+**Status: single-tenant cloud pilot with a paired laptop CLI.** Claude, Codex, Grok, and OpenCode have completed authenticated tool runs on the rented server. Cloud processes survive client disconnection and API restarts. Encrypted backup and data-restore checks are complete. Independent cloud backup storage, cold-boot recovery, and operator-confidential multi-tenant execution remain unfinished. See the [commissioning record](deploy/ubuntu/commissioning.md).
 
-**Two deployment modes are supported by the architecture:** direct single-tenant execution with no VM isolation requirement, and a managed multi-tenant service with a complete context bucket per user. The single-tenant runner is deployed directly on the owner-controlled host. The managed target also requires confidentiality from the operator, which the current runner does not provide. One full VM and one Infinite installation per user is the development boundary; the rented EPYC 4345P lacks SEV support. See the [managed tenant architecture](docs/multi-tenant.md) and [Proxmox development plan](deploy/proxmox/README.md). Private workloads are refused by that planner.
+**Two deployment modes are supported by the architecture:** direct single-tenant execution with no VM isolation requirement, and a managed multi-tenant service with a complete context bucket per user. The single-tenant runner is deployed directly on the owner-controlled host. The managed target also requires confidentiality from the operator, which the current runner does not provide. One full VM and one Infinite installation per user is the development boundary; the development host lacks the required confidential VM support. See the [managed tenant architecture](docs/multi-tenant.md) and [Proxmox development plan](deploy/proxmox/README.md). Private workloads are refused by that planner.
 
 ```sh
 npm run host -- plan-fleet deploy/proxmox/fleet.example.json
@@ -50,6 +50,12 @@ npm run host -- attach SESSION_ID --config .local/config.json
 
 `Ctrl+]` detaches the terminal client. `Ctrl+C` interrupts the underlying agent. Closing a client or the API leaves worker processes alive. To stop a session, use the authenticated owner `POST /api/sessions/:id/stop` endpoint. Stopping the entire VM stops its processes; automatic recovery after a host reboot is not implemented.
 
+## Browser
+
+Search sessions by title, provider, project ID, or session ID. **Active** shows running and starting processes, **Needs you** shows reported attention requests, and **All** includes recordings. The selected session and view stay in the URL, so reload and browser Back return to them.
+
+Type a draft while monitoring or offline, then take control explicitly to send. **Cmd/Ctrl+Enter** sends; Enter adds a line. Switching sessions preserves drafts and recent views in this tab's memory. Reconnecting refreshes the view without sending the draft or reclaiming control. Reloading or closing the tab discards unsent drafts; they are not synchronized to other devices.
+
 ## Phone
 
 The React Native app is in `apps/mobile`. It supports Android and has an iPhone build configuration. Pair it with an HTTPS Tailscale Serve address and a **controller** or **viewer** key. Keys go into Android Keystore/iOS Keychain through Expo SecureStore. Logs are kept in memory while the app is open and remain on the host for replay.
@@ -61,7 +67,9 @@ npm run ios -w @infinite/mobile
 
 On hosts whose workers enforce input control, the phone sends nothing until you tap **Take control** (or **Take over** when another device holds the session). The lease lasts 30 seconds, renews while the session is on screen, and is released when you leave the session or background the app. Viewers stay read-only.
 
-Push notifications need an EAS project id: run `eas init` and keep the resulting `extra.eas.projectId` in `app.json`.
+Search the inbox or pull down to refresh it. The composer allows local drafting while monitoring or reconnecting, with a control action beside the draft when the host is ready. Taking control never sends the draft. Drafts remain in this app's memory across navigation; they are not shared with another device or retained after the app exits.
+
+Push notifications need an EAS project ID. Keep it in the ignored `apps/mobile/.local/eas.json` file as `{ "projectId": "YOUR_EAS_PROJECT_ID" }`, or set `INFINITE_EAS_PROJECT_ID`. The dynamic app config adds it to `extra.eas.projectId` at build time. Set the same variable in the EAS preview and production environments for cloud builds; do not commit the real identifier to `app.json` or `eas.json`. See [Expo dynamic configuration](https://docs.expo.dev/workflow/configuration/).
 
 For an Android emulator connected to the local rehearsal host:
 

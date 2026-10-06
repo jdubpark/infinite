@@ -1,4 +1,5 @@
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useState } from "react";
+import { Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import { PROVIDER_NAMES, groupSessions } from "@infinite/attention";
 import {
@@ -33,7 +34,8 @@ export function Inbox({
   pushNote?: string;
 }) {
   const router = useRouter();
-  const { data, online, seen, refresh } = usePoll(
+  const [query, setQuery] = useState("");
+  const { data, online, loading, refreshing, seen, refresh } = usePoll(
     async () => {
       const [list, me] = await Promise.all([
         api<{ sessions: SessionRow[] }>(connection, "/sessions"),
@@ -50,16 +52,19 @@ export function Inbox({
     [connection],
   );
   const sessions = data?.sessions ?? [];
+  const matches = sessions.filter(session => [session.title, session.id, PROVIDER_NAMES[session.provider]]
+    .some(value => value.toLowerCase().includes(query.trim().toLowerCase())));
   return (
     <View style={s.fill}>
       <View style={s.header}>
         <Text style={s.brand}>infinite</Text>
         <View style={s.connection}>
           <View style={[s.dot, !online && s.offlineDot]} />
-          <Text style={s.small}>{online ? "Up to date" : "Reconnecting"}</Text>
+          <Text style={s.small}>{online ? "Up to date" : loading ? "Connecting" : "Reconnecting"}</Text>
         </View>
       </View>
-      <ScrollView contentContainerStyle={s.list}>
+      <ScrollView contentContainerStyle={s.list} keyboardShouldPersistTaps="handled"
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
         <Text style={s.title}>Your sessions</Text>
         <Text style={s.body}>
           {data?.environment === "local"
@@ -67,7 +72,7 @@ export function Inbox({
             : "Your cloud workspace"}
         </Text>
         <OfflineBanner
-          online={online}
+          online={online || loading}
           message="This view may be stale. Your agents may still be running. Check your private network connection."
         />
         <View style={s.listHeading}>
@@ -75,7 +80,7 @@ export function Inbox({
             {sessions.filter((session) => session.status === "running").length}{" "}
             running
           </Text>
-          <Button title="Refresh" secondary onPress={refresh} />
+          <Button title={refreshing ? "Refreshing…" : "Refresh"} secondary disabled={refreshing} onPress={refresh} />
         </View>
         <Text style={s.small}>
           {online
@@ -84,7 +89,11 @@ export function Inbox({
               ? `Cached view from ${seen}`
               : "Waiting for a fresh response…"}
         </Text>
-        {groupSessions(sessions).map((group) => (
+        <TextInput accessibilityLabel="Find a session" placeholder="Find a session…" value={query} onChangeText={setQuery}
+          autoCorrect={false} autoCapitalize="none" clearButtonMode="while-editing" placeholderTextColor={theme.colors.placeholder} style={s.search} />
+        {query ? <Button title="Clear search" secondary onPress={() => setQuery("")} /> : null}
+        {!matches.length && query ? <Text style={s.body}>No sessions match this search.</Text> : null}
+        {groupSessions(matches).map((group) => (
           <View key={group.title}>
             <Text style={s.groupHeading}>{group.title.toUpperCase()}</Text>
             {group.rows.map((row) => (
@@ -172,6 +181,11 @@ const s = StyleSheet.create({
   offlineDot: { backgroundColor: theme.colors.warningInk },
   small: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk },
   list: { padding: 25 },
+  search: {
+    minHeight: 50, borderWidth: 1, borderColor: theme.colors.fieldRule,
+    borderRadius: theme.radius.control, color: theme.colors.ink, fontSize: 15,
+    paddingHorizontal: 14, paddingVertical: 12, marginTop: 16, marginBottom: 8,
+  },
   title: {
     fontSize: 30,
     fontWeight: "500",

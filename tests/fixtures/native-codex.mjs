@@ -34,6 +34,8 @@ if (args[0] === "app-server") {
         else if (method === "thread/read" || method === "thread/resume") reply({ thread: thread(), pid: process.pid });
         else if (method === "thread/list") reply({ data: [thread(), { id: foreignId }], nextCursor: "next" });
         else if (method === "thread/loaded/list") reply({ data: [threadId, foreignId] });
+        // Real provider plugin catalogs can exceed 12 MB before a turn starts.
+        else if (method === "plugin/list") reply({ catalog: "a".repeat(13 * 1024 * 1024) });
         else if (method === "turn/start") {
           const text = params.input.map(item => item.text ?? "").join(""); history.push(text);
           reply({ turn: { id: randomUUID(), status: "inProgress" } });
@@ -64,8 +66,12 @@ if (args[0] === "app-server") {
     if (message.id === 10) { ws.send(JSON.stringify({ method: "initialized" })); call(resuming ? "thread/resume" : "thread/start", resuming ? { threadId: args.at(-1) } : {}); }
     if (message.id === 11) {
       threadId = message.result.thread.id;
-      if (resuming) console.log("LOCAL NATIVE READY");
+      if (resuming) call("plugin/list", {});
       else call("turn/start", { threadId, input: [{ type: "text", text: args.at(-1) }] });
+    }
+    if (resuming && message.id === 12) {
+      writeFileSync("native-catalog.json", JSON.stringify({ bytes: message.result.catalog.length }));
+      console.log("LOCAL NATIVE READY");
     }
     if (message.method === "item/completed") console.log(message.params.item.text);
     if (message.method === "turn/completed") setTimeout(() => console.log("Observer redraw after turn completed"), 80);

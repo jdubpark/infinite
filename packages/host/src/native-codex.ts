@@ -4,6 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import type { Signal } from "@infinite/attention";
 import type { AgentProfile, InputControl } from "./types.js";
+import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 
 /** The native frontend is opt-in; ordinary PTY launches retain unrestricted argv passthrough. */
 export function validateNativeCodexArgs(args: string[], initialPrompt = "") {
@@ -51,7 +52,7 @@ export async function startNativeCodex(options: {
   let lastMessage: string | undefined;
   let child: ChildProcess | undefined;
   const http = createServer((_req, res) => { res.writeHead(404); res.end(); });
-  const sockets = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024, perMessageDeflate: false });
+  const sockets = new WebSocketServer({ noServer: true, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false });
   const upstreams = new Set<WebSocket>();
   const shutdown = () => {
     if (stopped) return;
@@ -97,7 +98,7 @@ export async function startNativeCodex(options: {
         if (attachment) { options.checkControl(attachment.authority); attachment.used = true; }
       } catch { socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return; }
       sockets.handleUpgrade(req, socket, head, frontend => {
-        const upstream = new WebSocket(endpoint, { headers: { Authorization: `Bearer ${token}` }, maxPayload: 8 * 1024 * 1024, perMessageDeflate: false, handshakeTimeout: 10000 });
+        const upstream = new WebSocket(endpoint, { headers: { Authorization: `Bearer ${token}` }, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false, handshakeTimeout: 10000 });
         upstreams.add(upstream);
         const queue: string[] = [];
         let bytes = 0, startRequest: number | string | undefined;
@@ -108,7 +109,7 @@ export async function startNativeCodex(options: {
         const authority = () => { if (!observer) options.checkControl(attachment!.authority); };
         const timer = setInterval(() => { try { authority(); } catch { close(); } }, 1000);
         const send = (target: WebSocket, data: string) => {
-          if (target.bufferedAmount + Buffer.byteLength(data) > 8 * 1024 * 1024) throw new Error("Native connection is too slow");
+          if (target.bufferedAmount + Buffer.byteLength(data) > NATIVE_MAX_BUFFERED) throw new Error("Native connection is too slow");
           target.send(data);
         };
         frontend.on("close", () => { clearInterval(timer); upstream.close(); if (credential && !observer) attachments.delete(credential); });

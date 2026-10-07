@@ -55,6 +55,7 @@ test("native Codex attachment fences device control, pins its conversation, and 
     assert.equal((await host.fetchApi(`${path}/native`, "viewer")).status, 403);
     assert.equal((await host.fetchApi(`${path}/native`, "controller")).status, 403);
     const first = await connect(url, bearer); clients.push(first.ws);
+    assert.ok(first.ws.extensions.includes("permessage-deflate"), "native cloud connections must negotiate compression");
     const resumed = await first.rpc("thread/resume", { threadId: info.sessionId });
     assert.equal(resumed.result.thread.id, info.sessionId);
     assert.deepEqual(resumed.result.thread.turns, [{ text: "initial prompt" }]);
@@ -141,7 +142,9 @@ test("CLI opens a local native frontend with a loopback credential and detaches 
       cols: 120, rows: 30, cwd: host.root, env: { ...process.env, PATH: bin + ":" + process.env.PATH },
     });
     let output = "", exited = false; client.onData(data => output += data); client.onExit(() => exited = true);
-    await waitFor(async () => output, value => value.includes("LOCAL NATIVE READY"));
+    await waitFor(async () => output, value => value.includes("LOCAL NATIVE READY") || exited);
+    assert.equal(exited, false, "loading a large provider catalog must not disconnect the native frontend");
+    assert.equal(JSON.parse(readFileSync(host.root + "/native-catalog.json", "utf8")).bytes, 13 * 1024 * 1024);
     const sessions = (await host.fetchApi("/sessions")).body.sessions;
     assert.equal(sessions.length, 1);
     const id = sessions[0].id, pid = sessions[0].pid;

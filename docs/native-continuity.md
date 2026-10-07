@@ -105,6 +105,8 @@ A real provider shell command wrote a start marker, remained unfinished when the
 
 Automated boundary tests cover owner-only native authentication, unauthorized loopback access, conversation pinning, stale approval replies after takeover, API/client loss, one backend process, no automatic prompt replay, and passing only a per-attachment credential to the local TUI. Provider turn notifications feed the compact timeline once, labeled by protocol source.
 
+Native connections allow messages up to 32 MiB and bound queued output at 64 MiB. Provider startup catalogs can exceed 12 MB; smaller limits disconnected a real frontend after loading its history. The cloud hop negotiates compression, while local sockets avoid repeated compression work. A regression exercises catalog delivery through the full CLI attachment path.
+
 The first release requires an initial prompt because an empty thread cannot be resumed by another connection in the tested app server. It uses legacy history because the server rejects paginated history hydration. The local UI connects through Infinite's authenticated loopback relay because Codex accepts only root WebSocket addresses. Existing PTY sessions are not migrated. OpenCode, Claude, and Grok adapters, automatic local draft recovery, file synchronization, and execution-host recovery remain separate work.
 
 ## Implementation order

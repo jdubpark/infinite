@@ -4,13 +4,14 @@ import { createServer } from "node:http";
 import { promisify } from "node:util";
 import { WebSocket, WebSocketServer } from "ws";
 import type { ControlLease, Session } from "./types.js";
+import { NATIVE_COMPRESSION, NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 
 // Codex accepts only root WebSocket URLs. Keep the scoped cloud URL and device
 // key inside Infinite, and give the local TUI a short-lived loopback credential.
 async function nativeRelay(url: URL, deviceToken: string) {
   const token = randomBytes(32).toString("hex");
   const server = createServer((_req, res) => { res.writeHead(404); res.end(); });
-  const sockets = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024, perMessageDeflate: false });
+  const sockets = new WebSocketServer({ noServer: true, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false });
   const upstreams = new Set<WebSocket>();
   let closed = false;
   server.on("upgrade", (req, socket, head) => {
@@ -21,12 +22,12 @@ async function nativeRelay(url: URL, deviceToken: string) {
       socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return;
     }
     sockets.handleUpgrade(req, socket, head, frontend => {
-      const upstream = new WebSocket(url, { headers: { Authorization: `Bearer ${deviceToken}` }, maxPayload: 8 * 1024 * 1024, perMessageDeflate: false, handshakeTimeout: 15000 });
+      const upstream = new WebSocket(url, { headers: { Authorization: `Bearer ${deviceToken}` }, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: NATIVE_COMPRESSION, handshakeTimeout: 15000 });
       upstreams.add(upstream);
       const queue: string[] = []; let bytes = 0;
       const close = () => { frontend.terminate(); upstream.terminate(); };
       const send = (to: WebSocket, text: string) => {
-        if (to.bufferedAmount + Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error("Slow native connection");
+        if (to.bufferedAmount + Buffer.byteLength(text) > NATIVE_MAX_BUFFERED) throw new Error("Slow native connection");
         to.send(text);
       };
       frontend.on("message", (data, binary) => {

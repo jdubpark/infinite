@@ -4,10 +4,11 @@ import { z } from "zod";
 import { controlActor, type PairedDevice } from "./device-control.js";
 import { workerCall } from "./ipc.js";
 import type { Manager } from "./manager.js";
+import { NATIVE_COMPRESSION, NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 
 /** Native protocols grant owner capabilities. Browser cookies and narrower device roles cannot attach. */
 export function connectNativeFrontends(server: Server, manager: Manager, authenticate: (token: string) => PairedDevice | undefined) {
-  const sockets = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024, perMessageDeflate: false });
+  const sockets = new WebSocketServer({ noServer: true, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: NATIVE_COMPRESSION });
   const upstreams = new Set<WebSocket>();
   const origin = new URL(manager.config.origin);
   server.on("upgrade", (req, socket, head) => {
@@ -33,7 +34,7 @@ export function connectNativeFrontends(server: Server, manager: Manager, authent
         // The worker supplies an authenticated loopback gate, never an arbitrary owner URL.
         if (!/^ws:\/\/127\.0\.0\.1:\d+\/$/.test(backend.url)) throw new Error("Invalid native endpoint");
         sockets.handleUpgrade(req, socket, head, frontend => {
-          const upstream = new WebSocket(backend.url, { headers: { Authorization: `Bearer ${backend.token}` }, maxPayload: 8 * 1024 * 1024, perMessageDeflate: false, handshakeTimeout: 10000 });
+          const upstream = new WebSocket(backend.url, { headers: { Authorization: `Bearer ${backend.token}` }, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false, handshakeTimeout: 10000 });
           upstreams.add(upstream);
           const queued: string[] = [];
           let bytes = 0, alive = true;
@@ -41,7 +42,7 @@ export function connectNativeFrontends(server: Server, manager: Manager, authent
           const timer = setInterval(() => { if (!alive) { close(); return; } alive = false; frontend.ping(); }, 15000);
           frontend.on("pong", () => { alive = true; });
           const send = (to: WebSocket, text: string) => {
-            if (to.bufferedAmount + Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error("Slow native client");
+            if (to.bufferedAmount + Buffer.byteLength(text) > NATIVE_MAX_BUFFERED) throw new Error("Slow native client");
             to.send(text);
           };
           frontend.on("message", (data, binary) => {

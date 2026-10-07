@@ -19,6 +19,7 @@ import { workerCall } from "./ipc.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
+import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import type {
   Config,
   Provider,
@@ -209,8 +210,8 @@ export class Manager {
   }
   private async createOnce(request: CreateSession) {
     if (request.localUi) {
-      if (request.provider !== "codex") throw new Error("Local native UI is currently available for Codex only");
-      validateNativeCodexArgs(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "");
+      if (!["codex", "opencode"].includes(request.provider)) throw new Error("Local native UI is available for Codex and OpenCode");
+      (request.provider === "codex" ? validateNativeCodexArgs : validateNativeOpenCodeArgs)(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "");
     }
     const id = request.requestId;
     const fingerprint = createHash("sha256")
@@ -249,7 +250,7 @@ export class Manager {
       contextVersion: context.version,
       context: context.text,
       initialPrompt: request.prompt,
-      runtime: { id: randomUUID(), location: this.config.environment, transport: "pty", ...(request.localUi ? { nativeUi: "codex" as const } : {}) },
+      runtime: { id: randomUUID(), location: this.config.environment, transport: "pty", ...(request.localUi ? { nativeUi: request.provider as "codex" | "opencode" } : {}) },
       ...(request.nativeArgs !== undefined ? { nativeArgs: request.nativeArgs } : {}),
     };
     // Native CLI arguments are exact: do not append a second positional prompt or

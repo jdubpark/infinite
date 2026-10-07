@@ -1,6 +1,6 @@
 export type Provider = "claude" | "codex" | "grok" | "opencode" | "demo";
 export type SignalSource = "hook" | "osc" | "screen" | "host" | "protocol";
-export type PromptSource = "hook" | "osc" | "screen";
+export type PromptSource = "hook" | "osc" | "screen" | "protocol";
 export type PromptKind = "permission" | "question" | "elicitation" | "yes-no" | "menu";
 export type OptionRole = "accept" | "accept-always" | "reject" | "reject-with-feedback" | "other";
 

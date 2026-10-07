@@ -2,6 +2,7 @@ import express from "express";
 import { createServer } from "node:http";
 import { connectTerminals, terminalPages } from "./terminal-stream.js";
 import { connectNativeFrontends } from "./native-bridge.js";
+import { proxyNativeHttp } from "./native-http.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -95,7 +96,7 @@ export function createApp(config: Config, key: Buffer) {
       return res.status(403).json({ error: "Host is not allowed" });
     next();
   });
-  app.use(express.json({ limit: "96kb" }));
+  app.use((req, res, next) => express.json({ limit: /^\/api\/sessions\/[^/]+\/opencode(?:\/|$)/.test(req.path) ? "8mb" : "96kb" })(req, res, next));
   function authenticate(token: string) {
     const digest = Buffer.from(hashToken(token), "hex");
     return config.tokens.find((t) =>
@@ -178,7 +179,7 @@ export function createApp(config: Config, key: Buffer) {
     res.json({
       role: res.locals.role,
       terminal: { stream: true, duplex: true, snapshot: true, control: true, raw: res.locals.role === "owner" },
-      nativeUi: config.agents.codex ? ["codex"] : [],
+      nativeUi: ["codex", "opencode"].filter(provider => config.agents[provider as "codex" | "opencode"]),
       environment: config.environment,
       security: runtimeSecurity(config.deployment),
       providers: Object.keys(config.agents).filter(
@@ -239,6 +240,16 @@ export function createApp(config: Config, key: Buffer) {
     const sessionId = id.parse(req.params.id);
     if (!manager.meta(sessionId).session.runtime?.nativeUi) return res.status(409).json({ error: "This session uses its original terminal transport" });
     res.json(await workerCall(config.runDir, sessionId, { op: "native-info" }));
+  });
+  app.all(/^\/api\/sessions\/([a-f\d-]{36})\/opencode(\/.*)?$/, requireRole(["owner"]), async (req, res) => {
+    if (!res.locals.bearer || req.headers.origin || !res.locals.leaseId) return void res.status(403).json({ error: "Native access requires an owner CLI and current control" });
+    const sessionId = id.parse(req.params[0]);
+    if (manager.meta(sessionId).session.runtime?.nativeUi !== "opencode") return void res.status(409).json({ error: "This session does not use an OpenCode server" });
+    const backend = await workerCall<{ url: string; token: string }>(config.runDir, sessionId, { op: "native-connect", actor: res.locals.actor, leaseId: res.locals.leaseId });
+    if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(backend.url)) throw new Error("Invalid native endpoint");
+    const path = new URL(req.originalUrl, origin).pathname.slice(`/api/sessions/${sessionId}/opencode`.length) || "/";
+    const query = new URL(req.originalUrl, origin).search;
+    proxyNativeHttp(req, res, new URL(backend.url + path + query), { Authorization: backend.token }, req.body === undefined ? undefined : Buffer.from(JSON.stringify(req.body)));
   });
   app.get("/api/sessions/:id/events", (req, res) => {
     const after = z.coerce

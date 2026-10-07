@@ -27,7 +27,7 @@ export interface SessionRuntime {
   id: string;
   location: "local" | "cloud";
   transport: "pty";
-  nativeUi?: "codex";
+  nativeUi?: "codex" | "opencode";
 }
 export interface Session {
   id: string;
@@ -97,7 +97,7 @@ export interface WorkerState {
   seq: number;
   screen: string;
   attention: Attention;
-  capabilities?: { terminalSnapshot: 1; inputControl: 1; nativeUi?: "codex" };
+  capabilities?: { terminalSnapshot: 1; inputControl: 1; nativeUi?: "codex" | "opencode" };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
   nativeSession?: { id: string; source: "hook" | "protocol" };

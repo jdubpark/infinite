@@ -9,6 +9,7 @@ infinite claude|codex|grok|opencode [native flags and prompt]
 infinite --project ID --title "Task" codex [native flags]
 infinite --detach codex [native flags]
 infinite --local-ui codex [supported native flags] "Initial prompt"
+infinite --local-ui opencode [--model PROVIDER/MODEL] [--prompt "Task"]
 infinite list [--json]
 infinite projects
 infinite resume [session ID or unique prefix]
@@ -19,8 +20,8 @@ Paths and native resume IDs belong to the cloud host.
 Ctrl+] detaches; Ctrl+G monitors; Enter in monitor mode enables input.
 Ctrl+E opens a local draft; Ctrl+S inserts it; Enter in the native UI submits it.
 A viewer key remains read-only. Reconnecting never starts another agent.
-Local UI is an experimental Codex adapter requiring an initial prompt.
-Resume reopens its existing cloud conversation in the local Codex interface.
+Local UI supports Codex (initial prompt required) and OpenCode experimentally.
+Resume reopens the existing cloud conversation in its local native interface.
 Use --takeover before resume to explicitly take control from another device.
 The Ctrl+] / Ctrl+G / Ctrl+E shortcuts above apply to streamed terminal mode.
 

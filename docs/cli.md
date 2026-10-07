@@ -40,6 +40,24 @@ Supported launch options are `--model`, `--config`, `--ask-for-approval`, `--san
 
 Closing the local interface leaves cloud execution running. Unsaved local drafts are not synchronized. Provider requests are not automatically replayed after a broken connection; check the current conversation before sending again. This mode remains experimental because Codex's WebSocket app-server transport is experimental. It does not provide recovery after an execution-host failure or local/cloud file synchronization.
 
+## Experimental local OpenCode interface
+
+```sh
+infinite --local-ui opencode
+infinite --local-ui opencode --model PROVIDER/MODEL --prompt "Inspect this project"
+infinite resume SESSION_ID
+infinite --takeover resume SESSION_ID
+```
+
+The installed OpenCode TUI runs locally and attaches to one persistent cloud OpenCode server and conversation. Empty sessions work. Supported launch options are `--model`/`-m`, `--agent`, `--prompt`, and `--pure`; other native arguments use ordinary terminal mode. `--pure` remains opt-in and disables external provider plugins. A bare positional argument is not treated as a prompt because OpenCode normally interprets it as a project directory.
+
+A paired owner key is required. The native interface receives only a temporary loopback password; Infinite retains the paired device credential. `resume` rejoins the recorded conversation without creating one or replaying a prompt. A takeover invalidates the old interface's requests and closes its event stream. The cloud backend and observer continue after the laptop interface exits. The observer supplies the existing web/phone recording and terminal controls.
+
+Provider permission and question events show **needs you**. Their current native dialog remains authoritative: use terminal controls to answer it; compact OpenCode approval choices are not yet mapped. Infinite does not answer requests automatically. Provider administration, new/fork/delete operations, and navigation into child sessions are unavailable through this pinned attachment. Cloud credentials, model settings, paths, and tools remain associated with the cloud workspace. This does not synchronize laptop files or unsent native drafts.
+
+OpenCode 1.18.34 was rehearsed with its real TUI, server, and shell tool using a controlled model response fixture. A tool completed after UI detachment, a phone-side follow-up appeared under the same ID after reattachment, and a pending permission was answered explicitly through phone terminal controls. Ten typed characters measured about 22 ms p95 at a simulated 1,000 ms request round trip, with no mutating HTTP requests while typing. This small local rehearsal does not establish live provider authentication, Android runtime behavior, or host reboot recovery. The adapter follows OpenCode's [native attach contract](https://opencode.ai/docs/cli/#attach) and [server API](https://opencode.ai/docs/server/).
+
+
 ## Terminal controls
 
 - **Ctrl+]** detaches without interrupting the agent.

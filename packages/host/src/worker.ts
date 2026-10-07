@@ -36,6 +36,7 @@ import { startHookServer, type HookRoute } from "./hooks.js";
 import { buildLaunch } from "./launch.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
+import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import type {
   Bootstrap,
   ControlActor,
@@ -91,7 +92,7 @@ let state: WorkerState = {
   runtime: session.runtime ?? { id: randomUUID(), location: "local", transport: "pty" },
 };
 let child: ReturnType<typeof spawn> | undefined;
-let native: Awaited<ReturnType<typeof startNativeCodex>> | undefined;
+let native: Awaited<ReturnType<typeof startNativeCodex>> | Awaited<ReturnType<typeof startNativeOpenCode>> | undefined;
 // The host terminal must answer device/cursor queries even with no client attached.
 terminal.onData((data) => {
   if (state.status === "running") child?.write(data);
@@ -973,6 +974,26 @@ server.listen(socketPath(runDir, session.id), async () => {
       env.INFINITE_NATIVE_TOKEN = native.observerToken;
       launch = { command: profile.command, args: [...profile.args, "--remote", native.url,
         "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN", ...validateNativeCodexArgs(session.nativeArgs ?? [], config.prompt)] };
+    }
+    if (session.runtime?.nativeUi === "opencode") {
+      const settings = validateNativeOpenCodeArgs(session.nativeArgs ?? [], config.prompt);
+      native = await startNativeOpenCode({
+        profile, cwd: session.cwd, env, title: session.title, settings,
+        checkControl: authority => {
+          if (state.status !== "running" || !authority.actor || !authority.leaseId) throw new Refusal("control-lost");
+          checkControl(authority);
+        },
+        onThread: id => {
+          state = { ...state, nativeSession: { id, source: "protocol" }, capabilities: { terminalSnapshot: 1, inputControl: 1, nativeUi: "opencode" } };
+          persist();
+        },
+        onExit: () => { child?.kill("SIGTERM"); },
+        onSignal: signal => { record(signal, "protocol"); return attention.prompt?.id; },
+        record: method => { append("input-intent", { op: "native", method }); },
+      });
+      env.OPENCODE_SERVER_PASSWORD = native.observerToken;
+      env.OPENCODE_SERVER_USERNAME = "infinite";
+      launch = { command: profile.command, args: [...profile.args, ...(settings.pure ? ["--pure"] : []), "attach", native.url, "--session", native.info().sessionId, "--dir", session.cwd] };
     }
     child = spawn(launch.command, launch.args, {
       cwd: session.cwd,

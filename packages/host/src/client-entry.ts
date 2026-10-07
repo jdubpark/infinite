@@ -8,6 +8,7 @@ infinite pair https://HOST --token-file FILE
 infinite claude|codex|grok|opencode [native flags and prompt]
 infinite --project ID --title "Task" codex [native flags]
 infinite --detach codex [native flags]
+infinite --local-ui codex [supported native flags] "Initial prompt"
 infinite list [--json]
 infinite projects
 infinite resume [session ID or unique prefix]
@@ -18,6 +19,10 @@ Paths and native resume IDs belong to the cloud host.
 Ctrl+] detaches; Ctrl+G monitors; Enter in monitor mode enables input.
 Ctrl+E opens a local draft; Ctrl+S inserts it; Enter in the native UI submits it.
 A viewer key remains read-only. Reconnecting never starts another agent.
+Local UI is an experimental Codex adapter requiring an initial prompt.
+Resume reopens its existing cloud conversation in the local Codex interface.
+Use --takeover before resume to explicitly take control from another device.
+The Ctrl+] / Ctrl+G / Ctrl+E shortcuts above apply to streamed terminal mode.
 
 Client settings: ~/.config/infinite/client.json (or --client-config FILE).`);
   if (process.argv[2] && !["help", "--help", "-h"].includes(process.argv[2])) process.exitCode = 1;

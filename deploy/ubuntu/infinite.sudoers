@@ -1,6 +1,8 @@
 # Validate with visudo -cf before installing as /etc/sudoers.d/infinite.
 # Every executable must be root-owned and not writable by infinite-agent.
 Defaults:infinite-host !requiretty
+# Per-session backend credential, not a model token or the recording key.
+Defaults:infinite-host env_keep += "INFINITE_NATIVE_TOKEN"
 # Session prompts are command arguments; do not copy them to plaintext sudo logs.
 Defaults:infinite-host !log_allowed, !log_denied
 infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/claude *, /usr/local/libexec/infinite/codex *, /usr/local/libexec/infinite/grok *, /usr/local/libexec/infinite/opencode *, /usr/local/libexec/infinite/demo *

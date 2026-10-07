@@ -150,7 +150,7 @@ export function Brief({
             <View style={s.metaRow}>
               <Text style={s.small}>{PROVIDER_NAMES[session.provider]}</Text>
               <StatePill state={session.attention.state} />
-              <SourceTag hooks={session.attention.hooks} />
+              <SourceTag hooks={session.attention.hooks} source={session.attention.source} />
             </View>
             <Text style={s.small}>
               {new URL(connection.url).host} ·{" "}
@@ -233,7 +233,7 @@ export function Brief({
                 <Text style={s.placeholder}>
                   Nothing recorded yet. Signals appear here as the agent works.
                 </Text>
-                {session.attention.hooks === "none" ? (
+                {session.attention.hooks === "none" && session.attention.source !== "protocol" ? (
                   <Text style={s.placeholder}>
                     This provider reports through the screen only.
                   </Text>

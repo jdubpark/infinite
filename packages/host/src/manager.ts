@@ -18,6 +18,7 @@ import { readEvents, unseal, writeSealed } from "./vault.js";
 import { workerCall } from "./ipc.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
+import { validateNativeCodexArgs } from "./native-codex.js";
 import type {
   Config,
   Provider,
@@ -33,6 +34,7 @@ export interface CreateSession {
   title: string;
   prompt: string;
   nativeArgs?: string[];
+  localUi?: boolean;
 }
 interface StoredSession {
   session: Session;
@@ -206,6 +208,10 @@ export class Manager {
     return operation;
   }
   private async createOnce(request: CreateSession) {
+    if (request.localUi) {
+      if (request.provider !== "codex") throw new Error("Local native UI is currently available for Codex only");
+      validateNativeCodexArgs(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "");
+    }
     const id = request.requestId;
     const fingerprint = createHash("sha256")
       .update(JSON.stringify(request))
@@ -243,7 +249,7 @@ export class Manager {
       contextVersion: context.version,
       context: context.text,
       initialPrompt: request.prompt,
-      runtime: { id: randomUUID(), location: this.config.environment, transport: "pty" },
+      runtime: { id: randomUUID(), location: this.config.environment, transport: "pty", ...(request.localUi ? { nativeUi: "codex" as const } : {}) },
       ...(request.nativeArgs !== undefined ? { nativeArgs: request.nativeArgs } : {}),
     };
     // Native CLI arguments are exact: do not append a second positional prompt or
@@ -280,7 +286,7 @@ export class Manager {
     child.stdin.end(
       JSON.stringify({
         session,
-        profile: request.nativeArgs === undefined ? profile : {
+        profile: request.nativeArgs === undefined || request.localUi ? profile : {
           ...profile, args: [...profile.args, ...request.nativeArgs],
         },
         stateDir: this.config.stateDir,

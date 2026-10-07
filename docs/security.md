@@ -14,6 +14,8 @@ Metadata and context use atomic encrypted writes. Workers fsync recording entrie
 
 The HTTP listener is loopback-only. Host and Origin checks, HttpOnly/SameSite cookies, role checks, bounded request bodies, login throttling, and a restrictive CSP cover the private control interface. Native release clients require HTTPS and keep their key in platform secure storage. Browser data is not cached to localStorage or a service worker. Decrypted log export is an explicit download to the owner's device.
 
+The experimental native Codex gateway grants owner-level provider access and requires a bearer key plus the worker's device-bound control lease. Browser cookies and controller/viewer roles cannot connect. Both provider listeners and the laptop relay bind only to loopback and require per-run capabilities; the local TUI receives a relay capability, not the owner's device key. The worker fences each native request after takeover and never supplies an approval response itself. Conversation pinning prevents accidental session switching; it is not a sandbox against an owner or an agent that can execute commands. The observer capability and provider state stay inside the same trusted tenant runtime.
+
 ## Required on a real host
 
 Use Tailscale with device approval, restrictive ACLs, and SSH policy. Expose the API through **Serve**, never Funnel. Serve is private to the tailnet; it is a transport layer, not file encryption or runtime isolation. Check with a device outside the tailnet that the host is inaccessible. [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).

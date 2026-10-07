@@ -1,11 +1,11 @@
 import { StyleSheet, Text } from "react-native";
-import type { Attention, PromptSource } from "@infinite/attention";
+import type { Attention } from "@infinite/attention";
 import { theme } from "../theme";
 
-/** Where the signal came from: hooks active, screen only, or a prompt read off the screen. */
-export function SourceTag({ hooks, source }: { hooks: Attention["hooks"]; source?: PromptSource }) {
+/** The source of the current status, independent of the terminal recording. */
+export function SourceTag({ hooks, source }: { hooks: Attention["hooks"]; source?: Attention["source"] }) {
   const text =
-    source === "screen" ? "detected from screen" : hooks === "active" ? "hooks active" : "screen only";
+    source === "protocol" ? "provider events" : source === "screen" ? "detected from screen" : hooks === "active" ? "hooks active" : "screen only";
   return <Text style={s.tag}>{text}</Text>;
 }
 

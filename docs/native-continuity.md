@@ -4,7 +4,7 @@
 
 Typing, cursor movement, prompt editing, and navigation within already loaded history must not wait for the cloud. Fetching new cloud data, running tools, and receiving model responses still depend on the network and execution host. Closing the laptop must leave an agent available from a phone or another laptop. Reopening it must reconnect to the latest conversation and workspace without creating or forking a conversation. The native provider interface remains the default; Ctrl+E local drafting is an optional aid for terminal-streamed providers, not proof of native UI parity.
 
-The current pilot runs provider terminals on the execution host and streams their output. That preserves live processes when a laptop disconnects. It does not make a remote terminal equivalent to a locally running interface. Measurements on 2026-10-05 found a direct Tailscale round trip of 1.183 seconds, while loopback API responses took 0.3–10.2 ms. Transport improvements remove application delays; they cannot remove the network round trip from remote echo.
+By default, the pilot runs provider terminals on the execution host and streams their output. That preserves live processes when a laptop disconnects. It does not make a remote terminal equivalent to a locally running interface. Measurements on 2026-10-05 found a direct Tailscale round trip of 1.183 seconds, while loopback API responses took 0.3–10.2 ms. Transport improvements remove application delays; they cannot remove the network round trip from remote echo. Codex now has an opt-in local frontend, described below.
 
 ## Herdr review
 
@@ -58,7 +58,7 @@ The useful MVP subset is the session model, bounded snapshot/subscription protoc
 
 The 2026-10-05 implementation applies these reviewed patterns without changing existing provider processes:
 
-- A persistent runtime UUID sits beside the Infinite session ID. Native Claude/Codex conversation IDs are recorded only when authenticated hooks supply them; account pinning and other provider adapters remain incomplete.
+- A persistent runtime UUID sits beside the Infinite session ID. Native Claude/Codex conversation IDs come from authenticated hooks, or from the private Codex protocol in local UI mode; account pinning and other provider adapters remain incomplete.
 - CLI attachment negotiates a bounded ANSI snapshot with its exact journal cursor, followed by newer events. Unsupported terminal state falls back to replay. This is screen restoration, not a workspace/process checkpoint.
 - Detached workers enforce expiring, device-bound input and resize control. Explicit takeover fences stale clients; API restart preserves ownership and the running process. Viewers cannot claim control, and controller keys still cannot send raw terminal bytes.
 - Browser and React Native views distinguish cached and fresh state, refresh on foreground, retain local drafts, and require explicit control after reconnect. The phone shows the signal timeline and the current screen; it does not page through raw recording events, which remain on the host. The UI exposes compact attention summaries; provider-native structured transcripts remain unimplemented.
@@ -84,7 +84,7 @@ This separates interface placement from execution placement. A laptop outage req
 
 | Provider | Verified capability | Integration status |
 | --- | --- | --- |
-| Codex 0.160.1 | Installed `codex --help` exposes `--remote` and `--remote-auth-token-env`; `app-server --help` exposes authenticated WebSocket listeners. Its protocol exposes persistent thread IDs and thread/turn operations. | Local native remote UI is the preferred adapter. Infinite has not yet commissioned this path or verified in-flight disconnect behavior through it. |
+| Codex 0.160.1 | Installed `codex --help` exposes `--remote` and `--remote-auth-token-env`; `app-server --help` exposes authenticated WebSocket listeners. Its protocol exposes persistent thread IDs and thread/turn operations. | Experimental `--local-ui` adapter implemented. Real TUI/backend checks with a fixture model cover local typing, tool continuity, approval handoff, and same-ID history. Initial prompt required; WebSocket transport remains experimental. |
 | OpenCode 1.18.34 | Installed `opencode attach --help` accepts a server URL and session ID. Its documented server supports independent clients. | Local native remote UI is the preferred adapter. Existing PTY sessions must be adopted without starting competing backends. |
 | Grok 1.0.46 | Installed help exposes a shared leader socket, `agent serve`, and `agent leader --no-exit-on-disconnect`. | Investigate a supported native TUI connection to the persistent leader. These flags alone do not prove remote native UI compatibility or reconnect semantics. |
 | Claude Code 2.1.292 | Installed help exposes background/attach, `--cloud`, and `--environment`. Documented self-hosted environments require Team or Enterprise; interactive attachment to an existing cloud session is account-gated. | Verify account eligibility and same-session interactive attachment before selecting this adapter. A private direct backend for the native CLI has not been verified; neither background attach nor Remote Control alone establishes that capability. |
@@ -96,6 +96,16 @@ Codex and Claude local CLI checks were refreshed on 2026-10-06. Claude's [self-h
 An Infinite logical session needs a stable mapping to its provider-native conversation and runtime. A newly attached UI must attach to that mapping; it must not issue `new`, `fork`, a new initial prompt, or an ambiguous `--continue`. Provider protocol versions and capabilities must be negotiated. Opaque native flags cannot simply be reinterpreted as backend settings: each adapter must preserve supported semantics and reject unsupported combinations explicitly.
 
 Provider sockets must remain private and authenticated. Owner access to an arbitrary provider protocol is not a safe controller/viewer API: native protocols can expose tools, configuration, credentials, and other conversations. Mobile and read-only clients need explicit scoped operations. Persist events and reconcile their cursors before accepting input after reconnecting. Never replay an uncertain input automatically.
+
+### Codex adapter evidence and limits
+
+The 2026-10-07 local rehearsal used real Codex 0.160.1 interfaces and app server with a controlled local Responses API fixture. Across 19 typed characters and a simulated 1,000 ms WebSocket round trip, Infinite's local interface measured 29.4 ms median and 32.0 ms p95, with no outgoing protocol frames for the typed text. Direct local Codex measured 24.9 ms median and 31.8 ms p95 in the same terminal harness. These are small measured samples, not a general latency guarantee; the earlier sub-16 ms target was not met by the native baseline itself.
+
+A real provider shell command wrote a start marker, remained unfinished when the local interface detached, and wrote its completion marker afterward. A follow-up through the controller API appeared on native reattachment with the original provider ID. A second command's pending permission survived interface detachment and executed only after an explicit answer through the phone API. This validates the provider/runtime path with fixture model output, not Android runtime behavior or production model quality. Private probe artifacts remain outside the published repository.
+
+Automated boundary tests cover owner-only native authentication, unauthorized loopback access, conversation pinning, stale approval replies after takeover, API/client loss, one backend process, no automatic prompt replay, and passing only a per-attachment credential to the local TUI. Provider turn notifications feed the compact timeline once, labeled by protocol source.
+
+The first release requires an initial prompt because an empty thread cannot be resumed by another connection in the tested app server. It uses legacy history because the server rejects paginated history hydration. The local UI connects through Infinite's authenticated loopback relay because Codex accepts only root WebSocket addresses. Existing PTY sessions are not migrated. OpenCode, Claude, and Grok adapters, automatic local draft recovery, file synchronization, and execution-host recovery remain separate work.
 
 ## Implementation order
 

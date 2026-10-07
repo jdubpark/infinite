@@ -1,6 +1,7 @@
 import express from "express";
 import { createServer } from "node:http";
 import { connectTerminals, terminalPages } from "./terminal-stream.js";
+import { connectNativeFrontends } from "./native-bridge.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -22,6 +23,7 @@ const createSchema = z
     prompt: z.string().max(24000).default(""),
     nativeArgs: z.array(z.string().max(8192).refine((s) => !s.includes("\0")))
       .max(256).refine((args) => args.join("").length <= 32000).optional(),
+    localUi: z.boolean().optional(),
   })
   .strict();
 const ANSWER_REFUSALS = new Set([
@@ -176,6 +178,7 @@ export function createApp(config: Config, key: Buffer) {
     res.json({
       role: res.locals.role,
       terminal: { stream: true, duplex: true, snapshot: true, control: true, raw: res.locals.role === "owner" },
+      nativeUi: config.agents.codex ? ["codex"] : [],
       environment: config.environment,
       security: runtimeSecurity(config.deployment),
       providers: Object.keys(config.agents).filter(
@@ -230,6 +233,12 @@ export function createApp(config: Config, key: Buffer) {
       ...manager.meta(sessionId).session,
       ...(await manager.state(sessionId, true)),
     });
+  });
+  app.get("/api/sessions/:id/native", requireRole(["owner"]), async (req, res) => {
+    if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });
+    const sessionId = id.parse(req.params.id);
+    if (!manager.meta(sessionId).session.runtime?.nativeUi) return res.status(409).json({ error: "This session uses its original terminal transport" });
+    res.json(await workerCall(config.runDir, sessionId, { op: "native-info" }));
   });
   app.get("/api/sessions/:id/events", (req, res) => {
     const after = z.coerce
@@ -478,6 +487,7 @@ export function createApp(config: Config, key: Buffer) {
   );
   const server = createServer(app);
   const closeTerminals = connectTerminals(server, manager, authenticate);
-  const closeConnections = () => { closeTerminals(); server.closeAllConnections(); };
+  const closeNative = connectNativeFrontends(server, manager, authenticate);
+  const closeConnections = () => { closeTerminals(); closeNative(); server.closeAllConnections(); };
   return { app, manager, pushStore, server, closeConnections };
 }

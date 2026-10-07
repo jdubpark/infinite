@@ -35,6 +35,7 @@ import { socketPath } from "./ipc.js";
 import { startHookServer, type HookRoute } from "./hooks.js";
 import { buildLaunch } from "./launch.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
+import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import type {
   Bootstrap,
   ControlActor,
@@ -90,6 +91,7 @@ let state: WorkerState = {
   runtime: session.runtime ?? { id: randomUUID(), location: "local", transport: "pty" },
 };
 let child: ReturnType<typeof spawn> | undefined;
+let native: Awaited<ReturnType<typeof startNativeCodex>> | undefined;
 // The host terminal must answer device/cursor queries even with no client attached.
 terminal.onData((data) => {
   if (state.status === "running") child?.write(data);
@@ -184,6 +186,7 @@ function recordingFailure() {
   // Stop work when recording fails instead of silently losing the audit trail.
   try {
     child?.kill("SIGSTOP");
+    native?.suspend();
   } catch {
     /* best effort */
   }
@@ -797,6 +800,13 @@ const server = createServer((socket) => {
         };
       } else if (request.op === "snapshot") {
         result = await serialize(snapshot);
+      } else if (request.op === "native-info") {
+        result = native?.info() ?? null;
+      } else if (request.op === "native-connect") {
+        result = await serialize(() => {
+          if (!native || !request.actor || !request.leaseId || state.status !== "running") throw new Refusal("unsupported");
+          return native.connect(request);
+        });
       } else if (request.op === "control") {
         result = await serialize(() => changeControl(request));
       } else if (request.op === "resize") {
@@ -871,6 +881,7 @@ const server = createServer((socket) => {
 const hookToken = randomBytes(32).toString("hex");
 // A native CLI launch runs its exact argv: no hook listener, settings or relay environment.
 const wantsHooks =
+  !session.runtime?.nativeUi &&
   session.nativeArgs === undefined &&
   (provider === "demo" ||
     (provider === "claude" && config.attention.hooks.claude) ||
@@ -885,6 +896,7 @@ const hookServer = wantsHooks
     }).catch(() => null)
   : null;
 function exitWorker(code: number) {
+  native?.stop();
   server.close();
   hookServer?.close();
   try {
@@ -897,7 +909,7 @@ function exitWorker(code: number) {
 
 mkdirSync(runDir, { recursive: true, mode: 0o700 });
 server.on("error", () => process.exit(1));
-server.listen(socketPath(runDir, session.id), () => {
+server.listen(socketPath(runDir, session.id), async () => {
   chmodSync(socketPath(runDir, session.id), 0o600);
   try {
     journal.append("lifecycle", {
@@ -932,7 +944,7 @@ server.listen(socketPath(runDir, session.id), () => {
         import.meta.url,
       ),
     );
-    const launch = buildLaunch(
+    let launch = buildLaunch(
       provider,
       profile,
       config.prompt,
@@ -940,6 +952,26 @@ server.listen(socketPath(runDir, session.id), () => {
       relayPath,
       config.attention.hooks,
     );
+    if (session.runtime?.nativeUi === "codex") {
+      native = await startNativeCodex({
+        profile, cwd: session.cwd, env,
+        noAltScreen: (session.nativeArgs ?? []).includes("--no-alt-screen"),
+        checkControl: (authority) => {
+          if (state.status !== "running" || !authority.actor || !authority.leaseId) throw new Refusal("control-lost");
+          checkControl(authority);
+        },
+        onThread: (id) => {
+          state = { ...state, nativeSession: { id, source: "protocol" }, capabilities: { terminalSnapshot: 1, inputControl: 1, nativeUi: "codex" } };
+          persist();
+        },
+        onExit: () => { child?.kill("SIGTERM"); },
+        onSignal: (signal) => { record(signal, "protocol"); },
+        record: (method) => { append("input-intent", { op: "native", method }); },
+      });
+      env.INFINITE_NATIVE_TOKEN = native.observerToken;
+      launch = { command: profile.command, args: [...profile.args, "--remote", native.url,
+        "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN", ...validateNativeCodexArgs(session.nativeArgs ?? [], config.prompt)] };
+    }
     child = spawn(launch.command, launch.args, {
       cwd: session.cwd,
       env,
@@ -979,6 +1011,7 @@ server.listen(socketPath(runDir, session.id), () => {
       } else output(data);
     });
     const exited = (exitCode: number) => {
+      native?.stop();
       try {
         flush();
         controller = null;

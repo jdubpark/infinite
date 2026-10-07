@@ -27,6 +27,7 @@ export interface SessionRuntime {
   id: string;
   location: "local" | "cloud";
   transport: "pty";
+  nativeUi?: "codex";
 }
 export interface Session {
   id: string;
@@ -96,10 +97,10 @@ export interface WorkerState {
   seq: number;
   screen: string;
   attention: Attention;
-  capabilities?: { terminalSnapshot: 1; inputControl: 1 };
+  capabilities?: { terminalSnapshot: 1; inputControl: 1; nativeUi?: "codex" };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
-  nativeSession?: { id: string; source: "hook" };
+  nativeSession?: { id: string; source: "hook" | "protocol" };
 }
 export interface InputControl {
   actor?: ControlActor;
@@ -107,6 +108,8 @@ export interface InputControl {
 }
 export type WorkerRequest =
   | { op: "state"; screen?: boolean }
+  | { op: "native-info" }
+  | ({ op: "native-connect" } & InputControl)
   | { op: "snapshot" }
   | {
       op: "control";

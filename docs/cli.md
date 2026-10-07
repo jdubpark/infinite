@@ -19,7 +19,26 @@ infinite resume 5ba58d55    # a unique Infinite session ID prefix also works
 infinite monitor           # choose a session to watch
 ```
 
-`resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
+For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
+
+## Experimental local Codex interface
+
+```sh
+infinite --local-ui codex "Inspect this repository"
+infinite resume SESSION_ID
+infinite --takeover resume SESSION_ID
+infinite monitor SESSION_ID
+```
+
+This opt-in mode runs the installed Codex interface on the laptop and keeps its app server on the execution host. Prompt editing and cursor motion happen locally. Model requests, tools, history loading, and remote file searches still depend on the connection. A persistent cloud terminal supplies the recording and the web/phone controls for the same conversation.
+
+Both machines need a Codex version with authenticated `--remote` support. A paired **owner** key is required for the local native interface. The initial launch requires a nonempty prompt: the tested app server cannot attach a second client to an empty conversation. Infinite uses legacy provider history because the tested WebSocket server cannot hydrate the native TUI's paginated default. Existing terminal sessions stay attached to their original process.
+
+Supported launch options are `--model`, `--config`, `--ask-for-approval`, `--sandbox` (including their short forms), `--search`, and `--no-alt-screen`, plus one prompt. Other native arguments require ordinary terminal mode. Options retain their values; Infinite separates the prompt with `--` so prompt text cannot become a provider subcommand. The cloud owns model settings, credentials, working directory, tools, and history. Laptop files are not uploaded.
+
+`resume` opens a new local interface attached by the recorded provider conversation ID; it does not create another thread or resubmit the initial prompt. Native Codex shortcuts apply. Infinite's Ctrl+E, Ctrl+G, and Ctrl+] shortcuts apply only to streamed terminals. `monitor` uses the cloud terminal and remains read-only until control is requested. A phone can take over using the existing controls; the worker rejects stale native requests, including approval replies. Losing control detaches the local interface. Reopen with `resume`; use `--takeover` only when intentionally replacing another device's control.
+
+Closing the local interface leaves cloud execution running. Unsaved local drafts are not synchronized. Provider requests are not automatically replayed after a broken connection; check the current conversation before sending again. This mode remains experimental because Codex's WebSocket app-server transport is experimental. It does not provide recovery after an execution-host failure or local/cloud file synchronization.
 
 ## Terminal controls
 
@@ -42,7 +61,7 @@ If a connection drops while drafting, the unsent draft stays in the current clie
 
 ## Native arguments and cloud workspaces
 
-Everything after the provider name is passed as an argument array to that provider, unchanged. There is no shell evaluation. Put Infinite options before the provider:
+In ordinary terminal mode, everything after the provider name is passed as an argument array to that provider, unchanged. There is no shell evaluation. Put Infinite options before the provider:
 
 ```sh
 infinite projects

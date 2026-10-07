@@ -7,9 +7,11 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Receipt, Session, Status } from "./types.js";
 import { terminalConnection, TerminalAccessError, TerminalControlError, type TerminalPage } from "./client-transport.js";
 import { draftTerminal } from "./client-draft.js";
+import { attachNativeCodex, checkNativeCodex } from "./client-native.js";
+import { validateNativeCodexArgs } from "./native-codex.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
-type Me = { role: string; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
+type Me = { role: string; nativeUi?: string[]; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
 const providerNames: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
 const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
@@ -319,7 +321,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
   const strings = new Set(["--client-config", "--project", "--title", "--token-file"]);
-  const booleans = new Set(["--detach", "--json"]);
+  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover"]);
   const option = () => {
     const name = args.shift()!;
     if (booleans.has(name)) options[name] = true;
@@ -368,12 +370,17 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (providers.has(command)) {
       if (me.role !== "owner") throw new Error("Only an owner device can launch native sessions");
       if (!me.terminal?.stream) throw new Error("Upgrade the host to support native CLI sessions");
+      if (options["--local-ui"]) {
+        if (command !== "codex" || !me.nativeUi?.includes(command)) throw new Error("This host supports --local-ui for Codex only. Other providers retain their native cloud terminal.");
+        validateNativeCodexArgs(args);
+        if (!options["--detach"]) await checkNativeCodex();
+      }
       const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
       const requestId = randomUUID();
       console.error(`[Infinite] Launch ${requestId} on ${config.origin} · project ${projectId}`);
       progress.start(`Starting ${providerNames[command]} on ${new URL(config.origin).hostname}`);
-      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs: args });
+      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs: args, ...(options["--local-ui"] ? { localUi: true } : {}) });
       progress.stop();
       if (options["--detach"]) { console.log(session.id); return true; }
     } else {
@@ -382,7 +389,14 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       progress.stop();
       session = await selectSession(sessions, positional[0], command === "monitor");
     }
-    await attach(config, me, session, command === "monitor", providers.has(command));
+    if (session.runtime?.nativeUi === "codex" && command !== "monitor") {
+      if (me.role !== "owner") throw new Error("Pair an owner device to open the native frontend");
+      await attachNativeCodex(config, session, Boolean(options["--takeover"]));
+    } else {
+      if (options["--takeover"]) throw new Error("--takeover applies to local native UI sessions. Use the terminal's control command for this session.");
+      if (options["--local-ui"] && !providers.has(command)) throw new Error("This existing session retains its original terminal. Native UI requires a session created with --local-ui.");
+      await attach(config, me, session, command === "monitor", providers.has(command));
+    }
   } catch (error) {
     progress.stop();
     console.error(`[Infinite] ${error instanceof Error ? error.message : "Client operation failed"}`);

@@ -1,5 +1,5 @@
 export type Provider = "claude" | "codex" | "grok" | "opencode" | "demo";
-export type SignalSource = "hook" | "osc" | "screen" | "host";
+export type SignalSource = "hook" | "osc" | "screen" | "host" | "protocol";
 export type PromptSource = "hook" | "osc" | "screen";
 export type PromptKind = "permission" | "question" | "elicitation" | "yes-no" | "menu";
 export type OptionRole = "accept" | "accept-always" | "reject" | "reject-with-feedback" | "other";
@@ -30,7 +30,7 @@ export type AnswerResult = "closed" | "still-open" | "changed" | "refused";
 export type Signal =
   | { kind: "hooks-ready"; event: string }
   | { kind: "turn-start"; prompt?: string }
-  | { kind: "turn-end"; message?: string; backgroundTasks: number; stopHookActive?: boolean; failed?: boolean }
+  | { kind: "turn-end"; message?: string; backgroundTasks?: number; stopHookActive?: boolean; failed?: boolean }
   | { kind: "tool-start"; tool: string; toolUseId?: string; input: Record<string, unknown>; quiet: boolean; destructive?: { pattern: string } }
   | { kind: "tool-end"; tool: string; toolUseId?: string; ok: boolean; durationMs?: number; summary?: string; files?: string[]; error?: string }
   | { kind: "prompt-open"; prompt: Prompt }
@@ -60,7 +60,7 @@ export type AttentionState =
 export interface Attention {
   state: AttentionState;
   since: string;
-  source: "hook" | "osc" | "screen" | "lifecycle";
+  source: "hook" | "osc" | "screen" | "lifecycle" | "protocol";
   now: string;
   prompt?: Prompt;
   lastMessage?: string;

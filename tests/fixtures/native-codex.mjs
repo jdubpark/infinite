@@ -68,6 +68,7 @@ if (args[0] === "app-server") {
       else call("turn/start", { threadId, input: [{ type: "text", text: args.at(-1) }] });
     }
     if (message.method === "item/completed") console.log(message.params.item.text);
+    if (message.method === "turn/completed") setTimeout(() => console.log("Observer redraw after turn completed"), 80);
     if (message.method === "item/commandExecution/requestApproval") console.log("Approval requested; awaiting explicit input");
   });
   ws.on("error", () => process.exit(1));

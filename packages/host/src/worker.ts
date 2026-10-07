@@ -413,7 +413,9 @@ function checkScreen() {
         "screen",
       );
     }
-    if (decision.idle) {
+    // Native adapters report actual turn transitions. A quiet screen or late
+    // observer redraw must not override those events; dialogs still use the screen.
+    if (decision.idle && !native) {
       const same = attention.state === decision.idle;
       publish({
         ...attention,
@@ -422,7 +424,7 @@ function checkScreen() {
         source: same ? attention.source : "screen",
       });
     }
-    if (decision.working)
+    if (decision.working && !native)
       publish({ ...attention, state: "working", since: at, source: "screen" });
     // Keep the one-line summary current even when nothing above changed the state.
     if (describeNow(attention, provider) !== attention.now) publish(attention);

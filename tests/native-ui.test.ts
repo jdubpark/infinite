@@ -90,6 +90,7 @@ test("native Codex attachment fences device control, pins its conversation, and 
     await waitFor(async () => existsSync(workspace + "/work-complete"), Boolean);
     await host.start();
     assert.equal((await host.fetchApi(`${path}/native`)).body.sessionId, info.sessionId);
+    await waitFor(async () => (await host.fetchApi(path)).body.screen, screen => screen.includes("Observer redraw after turn completed"));
     const state = (await host.fetchApi(path)).body;
     assert.equal(state.attention.state, "turn-finished");
     assert.equal(state.attention.source, "protocol");
@@ -110,7 +111,7 @@ test("native Codex attachment fences device control, pins its conversation, and 
     queued.send(JSON.stringify({ id: 1, method: "initialize", params: { clientInfo: { name: "queue_test", version: "1" } } }));
     queued.send(JSON.stringify({ id: 2, method: "turn/start", params: { threadId: info.sessionId, input: [{ type: "text", text: "stale queued prompt" }] } }));
     await waitFor(async () => (await host.fetchApi(`${path}/events?after=${beforeQueue}&types=input-intent`)).body.events, events => events.some((event: any) => event.data.op === "native" && event.data.method === "turn/start"));
-    assert.ok(existsSync(workspace + "/upgrade-held"));
+    await waitFor(async () => existsSync(workspace + "/upgrade-held"), Boolean);
     await claimControl(host, id, "controller", { takeover: true });
     unlinkSync(workspace + "/hold-upgrades");
     await waitFor(async () => queued.readyState, state => state === WebSocket.CLOSED);

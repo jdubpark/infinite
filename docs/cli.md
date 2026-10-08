@@ -61,11 +61,11 @@ OpenCode 1.18.34 was rehearsed with its real TUI, server, and shell tool using a
 ## Terminal controls
 
 - **Ctrl+]** detaches without interrupting the agent.
-- **Ctrl+G** releases control, switches to monitoring, and drops unsent buffered keys. An open local draft stays in memory.
+- **Ctrl+G** releases control, switches to monitoring, and drops unsent buffered keys. An open local draft is saved on the laptop.
 - **Enter** in monitor mode requests control for an owner device. Input stays disabled until the host acknowledges it. That Enter is consumed locally; it does not approve a native prompt.
 - **Ctrl+T** in monitor mode explicitly takes control from another device. The previous device's keys and resize requests are refused by the worker.
 - **Ctrl+C** interrupts the agent in interactive mode and detaches in monitor mode.
-- **Ctrl+E** opens an in-memory local draft editor for an interactive owner. Typing and line editing stay on the laptop. Enter adds a line, **Ctrl+S** inserts the draft into the native prompt without submitting it, and **Esc** cancels. The CLI is a terminal surface, so the draft is inserted even while a provider dialog is on screen, as typed keys would be. After insertion is acknowledged, Enter in the native terminal submits the prompt. Multiline insertion requires the provider's bracketed-paste support. Remote output continues updating the saved screen while drafting; closing the editor restores it.
+- **Ctrl+E** opens a local draft editor for an interactive owner. Typing and line editing stay on the laptop. Enter adds a line, **Ctrl+S** inserts the draft into the native prompt without submitting it, **Esc** keeps the draft and closes the editor, and **Ctrl+X** discards it. The CLI is a terminal surface, so the draft is inserted even while a provider dialog is on screen, as typed keys would be. After insertion is acknowledged, Enter in the native terminal submits the prompt. Multiline insertion requires the provider's bracketed-paste support. Remote output continues updating the saved screen while drafting; closing the editor restores it.
 
 A viewer remains read-only. Full native input requires an owner key. Controller keys retain the compact web/mobile steering controls, but cannot send arbitrary terminal control bytes. Monitoring does not resize the shared terminal; an interactive owner supplies its terminal dimensions.
 
@@ -75,7 +75,11 @@ After a broken connection, the CLI discards queued input and reconnects in monit
 
 Control expires after 30 seconds without renewal. This expiry releases input ownership only; the provider process keeps running. The current CLI renews every 10 seconds while interactive. Browser and phone clients open in monitoring mode and stop renewing when backgrounded. Older workers expose no control capability and retain their previous shared-input behavior; they are not restarted during an API upgrade.
 
-If a connection drops while drafting, the unsent draft stays in the current client's memory. After reconnecting, press Enter to enable interaction and Ctrl+E to reopen the draft. Closing the client discards that unsent draft; it has not been uploaded or saved to disk.
+Ctrl+E drafts are saved encrypted beside the private client configuration, scoped to the paired origin, device key, project, session, and runtime. Saves run within 200 ms while typing and flush before insertion or graceful detachment. A sudden process kill can lose the most recent unsaved keystrokes. Resume the same session, acquire control, and press Ctrl+E to review a recovered draft. Recovery never sends text. Each client writes its own file; another live editor's draft is not taken over. Additional recovered drafts remain available after the current one is inserted or discarded.
+
+An insertion is recorded locally as unconfirmed before dispatch and cleared only after the host acknowledges delivery. If the receipt is lost, the recovered text is read-only and Ctrl+S is blocked. Esc returns to the native screen for inspection. Use Ctrl+X to discard text already inserted, or Ctrl+R to mark it as unsent after your review. That explicit choice can duplicate the earlier insertion; the wrapper never makes it automatically.
+
+This recovery covers Infinite's Ctrl+E editor in streamed terminal mode. Native Codex/OpenCode edit buffers and browser/phone drafts retain their own lifecycle; they are not captured or synchronized by this feature. Losing or replacing the paired device key also loses access to its encrypted drafts. Deleting the local `drafts` directory beside the client configuration removes the saved copies.
 
 ## Native arguments and cloud workspaces
 

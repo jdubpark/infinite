@@ -85,8 +85,8 @@ export function terminalConnection(origin: string, token: string, sessionId: str
     if (ended || socket.readyState !== WebSocket.OPEN) throw new Error("Terminal disconnected");
     socket.send(JSON.stringify(value));
   };
-  const write = (op: "raw" | "input", text: string): Promise<void> => {
-    const size = Buffer.byteLength(text), requestId = randomUUID();
+  const write = (op: "raw" | "input", text: string, requestId: string = randomUUID()): Promise<void> => {
+    const size = Buffer.byteLength(text);
     if (pendingBytes + size > 256 * 1024 || pending.size >= 128 || socket.bufferedAmount > 256 * 1024) return Promise.reject(new Error("Input buffer limit reached"));
     return new Promise<void>((resolve, reject) => {
       pending.set(requestId, { at: Date.now(), size, resolve, reject }); pendingBytes += size;
@@ -116,7 +116,7 @@ export function terminalConnection(origin: string, token: string, sessionId: str
       } finally { abort(); }
     },
     raw: (text: string) => write("raw", text),
-    input: (text: string) => write("input", text),
+    input: (text: string, requestId?: string) => write("input", text, requestId),
     resize(cols: number, rows: number) { send({ op: "resize", cols, rows, ...(lease ? { leaseId: lease.id } : {}) }); },
     close: abort,
   };

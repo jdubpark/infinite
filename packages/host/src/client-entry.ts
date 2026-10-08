@@ -19,6 +19,7 @@ Put Infinite options before the provider. Everything after it is passed unchange
 Paths and native resume IDs belong to the cloud host.
 Ctrl+] detaches; Ctrl+G monitors; Enter in monitor mode enables input.
 Ctrl+E opens a local draft; Ctrl+S inserts it; Enter in the native UI submits it.
+Drafts recover after restart. Esc keeps the draft; Ctrl+X discards it.
 A viewer key remains read-only. Reconnecting never starts another agent.
 Local UI supports Codex (initial prompt required) and OpenCode experimentally.
 Resume reopens the existing cloud conversation in its local native interface.

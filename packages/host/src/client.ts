@@ -7,6 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Receipt, Session, Status } from "./types.js";
 import { terminalConnection, TerminalAccessError, TerminalControlError, type TerminalPage } from "./client-transport.js";
 import { draftTerminal } from "./client-draft.js";
+import { localDraftStore } from "./client-draft-store.js";
 import { attachNativeCodex, checkNativeCodex } from "./client-native.js";
 import { attachNativeOpenCode, checkNativeOpenCode } from "./client-opencode.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
@@ -112,13 +113,14 @@ function terminalRenderer() {
     return rendered;
   };
 }
-async function attach(config: ClientConfig, me: Me, session: Session, watch: boolean, launched = false) {
+async function attach(config: ClientConfig, configFile: string, me: Me, session: Session, watch: boolean, launched = false) {
   if (!me.terminal?.stream) throw new Error("Upgrade the host to a version with native CLI streaming support");
   if (!watch && !launched && !["running", "starting"].includes(session.status)) throw new Error("This process is no longer running. Use infinite monitor ID to replay its recording. A server reboot requires explicit provider-native recovery");
   const clientId = randomUUID(), api = connection(config, clientId), abort = new AbortController();
   let render = terminalRenderer();
   const progress = startupProgress();
-  const screen = draftTerminal();
+  const notice = (message: string) => process.stderr.write(`\r\n[Infinite] ${message}\r\n`);
+  const screen = draftTerminal(localDraftStore(configFile, { ...config, sessionId: session.id, projectId: session.projectId, runtimeId: session.runtime?.id }, notice));
   let insertingDraft = false;
   let inputDelivered = Promise.resolve();
   let duplex: ReturnType<typeof terminalConnection> | undefined;
@@ -126,7 +128,6 @@ async function attach(config: ClientConfig, me: Me, session: Session, watch: boo
   let initialControl = interactive, leasesSupported = false, controlPending = false;
   let renewal: ReturnType<typeof setInterval> | undefined;
   let lastStatus: Status = session.status;
-  const notice = (message: string) => process.stderr.write(`\r\n[Infinite] ${message}\r\n`);
   // A detached CLI has no background job to keep alive. Terminate this client
   // after restoring the TTY; an open proxy stream must not prevent detachment.
   const stop = () => { restoreTerminal(); process.exit(0); };
@@ -197,18 +198,21 @@ async function attach(config: ClientConfig, me: Me, session: Session, watch: boo
     if (data.includes("\x1d")) { stop(); return; }
     if (screen.active) {
       if (data === "\x1b" || data === "\x03") { screen.finish(false); return; }
+      if (data === "\x18") { screen.discard(); return; }
+      if (data === "\x12") { screen.reviewed(); return; }
       if (data === "\x13") {
         if (!online || !interactive || lastStatus !== "running") { notice("Draft kept locally. Reconnect and enable interaction before inserting it."); return; }
-        const text = screen.finish(true);
-        if (text) {
+        const draft = screen.finish(true);
+        if (draft) {
+          const { text, requestId } = draft;
           insertingDraft = true;
-          const insertion = duplex ? duplex.input(text) : inputDelivered.then(async () => {
+          const insertion = duplex ? duplex.input(text, requestId) : inputDelivered.then(async () => {
             if (!online || !interactive) throw new Error("Terminal disconnected");
-            const receipt = await api.json<Receipt>(`/sessions/${session.id}/input`, { requestId: randomUUID(), text, submit: false, force: true }, abort.signal);
+            const receipt = await api.json<Receipt>(`/sessions/${session.id}/input`, { requestId, text, submit: false, force: true }, abort.signal);
             if (receipt.state !== "delivered") throw new Error("Uncertain draft insertion");
           });
-          void insertion.catch(error => {
-            if (error instanceof TerminalControlError) screen.keep(text);
+          void insertion.then(() => screen.inserted()).catch(error => {
+            if (error instanceof TerminalControlError) screen.refused();
             uncertain(error);
           }).finally(() => { insertingDraft = false; });
         }
@@ -217,8 +221,8 @@ async function attach(config: ClientConfig, me: Me, session: Session, watch: boo
       if (data.includes("\x07")) { monitor(); return; }
       screen.input(data); return;
     }
-    if (data === "\x05" && interactive && owner) { screen.open(); return; }
     if (insertingDraft) { notice("Waiting for draft insertion. Input is disabled until delivery is confirmed."); return; }
+    if (data === "\x05" && interactive && owner) { screen.open(); return; }
     if (!interactive) {
       if (data === "\x03") { stop(); return; }
       if (data === "\r" || data === "\n" || data === "\x14") {
@@ -397,7 +401,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     } else {
       if (options["--takeover"]) throw new Error("--takeover applies to local native UI sessions. Use the terminal's control command for this session.");
       if (options["--local-ui"] && !providers.has(command)) throw new Error("This existing session retains its original terminal. Native UI requires a session created with --local-ui.");
-      await attach(config, me, session, command === "monitor", providers.has(command));
+      await attach(config, path, me, session, command === "monitor", providers.has(command));
     }
   } catch (error) {
     progress.stop();

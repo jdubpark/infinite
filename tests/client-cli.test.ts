@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -12,6 +12,7 @@ import { createApp } from "../packages/host/src/server.js";
 import { hashToken } from "../packages/host/src/config.js";
 import { workerCall } from "../packages/host/src/ipc.js";
 import type { Config } from "../packages/host/src/types.js";
+import { tmpdir } from "node:os";
 
 const exec = promisify(execFile);
 const wait = async (predicate: () => boolean | Promise<boolean>, timeout = 10000) => {
@@ -19,6 +20,35 @@ const wait = async (predicate: () => boolean | Promise<boolean>, timeout = 10000
   while (Date.now() < until) { if (await predicate()) return; await new Promise(r => setTimeout(r, 80)); }
   throw new Error("Timed out waiting for CLI behavior");
 };
+
+test("local draft recovery isolates pairings and runtimes, preserves concurrent drafts, and refuses tampered ciphertext", async () => {
+  const { localDraftStore } = await import("../packages/host/src/client-draft-store.js");
+  const root = mkdtempSync(join(tmpdir(), "infinite-drafts-")), path = join(root, "client.json");
+  const identity = { origin: "https://host.example", token: randomBytes(32).toString("hex"), sessionId: randomUUID(), projectId: "project", runtimeId: randomUUID() };
+  const notices: string[] = [], report = (s: string) => notices.push(s);
+  try {
+    const first = localDraftStore(path, identity, report), second = localDraftStore(path, identity, report);
+    assert.ok(first.save({ text: "first private draft", state: "draft" }, true));
+    assert.equal(second.restore(), undefined, "another live editor's file is not taken over");
+    assert.ok(second.save({ text: "second private draft", state: "draft" }, true));
+    first.close(); second.close();
+    for (const variant of [{ token: randomBytes(32).toString("hex") }, { origin: "https://other.example" }, { runtimeId: randomUUID() }, { sessionId: randomUUID() }]) {
+      assert.equal(localDraftStore(path, { ...identity, ...variant }, report).restore(), undefined);
+    }
+    const restored = localDraftStore(path, identity, report), remaining = new Set(["first private draft", "second private draft"]);
+    const draft = restored.restore()!; assert.ok(remaining.delete(draft.text));
+    restored.clear();
+    assert.ok(remaining.has(restored.restore()!.text), "discarding one recovered draft preserves the other client's work");
+    const files = readdirSync(join(root, "drafts"), { recursive: true }).map(String).filter(p => p.endsWith(".sealed"));
+    const file = join(root, "drafts", files[0]);
+    const envelope = JSON.parse(readFileSync(file, "utf8")); envelope.t = Buffer.alloc(16).toString("base64");
+    writeFileSync(file, JSON.stringify(envelope));
+    const damaged = localDraftStore(path, identity, report);
+    assert.equal(damaged.restore(), undefined); damaged.close();
+    assert.equal(JSON.parse(readFileSync(file, "utf8")).t, envelope.t, "an unreadable recovery is retained rather than overwritten");
+    assert.match(notices.at(-1)!, /recovery is unavailable/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("CLI reports each startup wait before the host responds and leaves native output clean", { timeout: 15000 }, async () => {
   const root = mkdtempSync("/tmp/inf-start-");
@@ -173,7 +203,7 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     monitor.process.write("\r"); await new Promise(r => setTimeout(r, 120));
     const draftOffset = monitor.output().length;
     monitor.process.write("\x05"); await wait(() => monitor.output().slice(draftOffset).includes("preserve this unsent draft"));
-    monitor.process.write("\x1b"); await new Promise(r => setTimeout(r, 100)); monitor.process.write("after");
+    monitor.process.write("\x18"); await new Promise(r => setTimeout(r, 100)); monitor.process.write("after");
     await wait(() => readFileSync(join(workspace, "input.txt"), "utf8").endsWith("after"));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), "steer\x1b[A\rafter");
     monitor.process.write("\x1d"); await wait(monitor.exited);
@@ -189,13 +219,38 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     resumed.process.write("\x05"); await wait(() => resumed.output().includes("Local draft"));
     resumed.process.write("instant local text"); await wait(() => resumed.output().includes("instant local text"), 500);
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), inputBeforeDraft, "editing stays entirely local");
-    resumed.process.write("\x1b"); await new Promise(r => setTimeout(r, 100));
+    resumed.process.write("\x18"); await new Promise(r => setTimeout(r, 100));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), inputBeforeDraft, "cancelling never sends a draft");
     resumed.process.write("\x05"); await new Promise(r => setTimeout(r, 100));
     resumed.process.write("draft first\rdraft second"); await wait(() => resumed.output().includes("draft second"));
     resumed.process.write("\x13");
     await wait(() => readFileSync(join(workspace, "input.txt"), "utf8") === inputBeforeDraft + "\x1b[200~draft first\ndraft second\x1b[201~");
-    resumed.process.write("\x1d"); await wait(resumed.exited);
+    await new Promise(r => setTimeout(r, 100));
+    resumed.process.write("\x05"); await new Promise(r => setTimeout(r, 100));
+    resumed.process.write("survive a killed client"); await wait(() => resumed.output().includes("survive a killed client"));
+    const saved = () => readdirSync(join(root, "drafts"), { recursive: true }).map(String).filter(p => p.endsWith(".sealed")).map(p => join(root, "drafts", p));
+    await wait(() => { try { return saved().length === 1; } catch { return false; } });
+    assert.equal(statSync(saved()[0]).mode & 0o777, 0o600);
+    assert.ok(!readFileSync(saved()[0], "utf8").includes("survive a killed client"), "draft content is encrypted at rest");
+    resumed.process.kill("SIGKILL"); await wait(resumed.exited);
+    const recovered = start(["resume", sid]);
+    await wait(() => recovered.output().includes("Live session connected"));
+    assert.match(recovered.output(), /Recovered an unsent local draft/);
+    recovered.process.write("\x05"); await wait(() => recovered.output().includes("survive a killed client"));
+    holdReceipts = true;
+    recovered.process.write("\x13");
+    await wait(() => held.length > 0 && readFileSync(join(workspace, "input.txt"), "utf8").endsWith("survive a killed client\x1b[201~"));
+    const uncertainInput = readFileSync(join(workspace, "input.txt"), "utf8");
+    recovered.process.kill("SIGKILL"); await wait(recovered.exited);
+    holdReceipts = false; held.splice(0).forEach(deliver => deliver());
+    const uncertainDraft = start(["resume", sid]);
+    await wait(() => uncertainDraft.output().includes("Live session connected"));
+    assert.match(uncertainDraft.output(), /previous draft insertion is unconfirmed/);
+    uncertainDraft.process.write("\x05"); await wait(() => uncertainDraft.output().includes("Previous insertion unconfirmed"));
+    uncertainDraft.process.write("\x13"); await wait(() => uncertainDraft.output().includes("Insertion blocked"));
+    assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), uncertainInput, "an uncertain insertion is never automatically repeated, even after process death");
+    uncertainDraft.process.write("\x18"); await wait(() => saved().length === 0);
+    uncertainDraft.process.write("\x1d"); await wait(uncertainDraft.exited);
     assert.equal((await app.manager.list()).length, 1);
     const oneShot = await exec(process.execPath, [...cli, "codex", "--version"]);
     assert.match(oneShot.stdout, /native-version-1/);

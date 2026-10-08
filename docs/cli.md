@@ -94,6 +94,8 @@ infinite --client-config /private/client.json monitor SESSION_ID
 
 Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not uploaded or translated. The CLI does not silently copy the current laptop checkout or its secrets.
 
+An opt-in [hybrid Codex prototype](hybrid-execution.md) connects a laptop executor to an existing cloud conversation without bulk upload. It requires an explicit workspace and SSH destination and has no automatic offline cloud handoff. It is separate from the normal launch commands above.
+
 To preserve native command and flag semantics, native CLI launches do not append Infinite's shared context as another positional prompt or inject provider hook flags. The project context version is retained in the encrypted session record; repository instructions and the provider's native cloud history continue to work normally. Browser-created sessions retain the existing shared-prompt behavior. Screen-based attention remains available for new workers; workers launched before that feature omit attention metadata until explicitly replaced.
 
 Use separate configured worktrees for parallel writers. Multiple sessions launched against the same project directory share that working directory. Do not assume that a new session automatically creates a Git worktree.

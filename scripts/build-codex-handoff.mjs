@@ -15,6 +15,8 @@ if (process.argv.includes("--help")) {
 node scripts/build-codex-handoff.mjs
 
 Requires tar, patch, rustup, and an already installed Rust 1.95.0 toolchain.
+Linux builds also require pkg-config and the OpenSSL and libcap development
+packages (pkg-config, libssl-dev and libcap-dev on Ubuntu).
 Downloads the official release source and builds only an alternate app-server
 under ignored .local/. It does not install Rust or replace the installed Codex.
 The provider qualification runs before the backend is published for new sessions.

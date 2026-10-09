@@ -28,7 +28,8 @@ Ctrl+] detaches; Ctrl+G monitors; Enter in monitor mode enables input.
 Ctrl+E opens a local draft; Ctrl+S inserts it; Enter in the native UI submits it.
 Drafts recover after restart. Esc keeps the draft; Ctrl+X discards it.
 A viewer key remains read-only. Reconnecting never starts another agent.
-Local UI supports Codex (initial prompt required) and OpenCode experimentally.
+Local UI supports Codex and OpenCode experimentally.
+Only cloud Codex with --local-ui requires an initial prompt.
 Resume reopens the existing cloud conversation in its local native interface.
 Use --takeover before resume to explicitly take control from another device.
 The Ctrl+] / Ctrl+G / Ctrl+E shortcuts above apply to streamed terminal mode.

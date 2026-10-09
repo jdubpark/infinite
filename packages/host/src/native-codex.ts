@@ -9,7 +9,7 @@ import type { AgentProfile, InputControl } from "./types.js";
 import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 import { connectCodexEnvironments, type CodexEnvironmentClient, type CodexExecutor } from "./codex-environment.js";
 
-/** The native frontend is opt-in; ordinary PTY launches retain unrestricted argv passthrough. */
+/** Default hybrid launches use the native frontend; ordinary cloud PTYs retain argv passthrough. */
 export function validateNativeCodexArgs(args: string[], initialPrompt = "", allowEmpty = false) {
   const values = new Set(["-m", "--model", "-c", "--config", "-a", "--ask-for-approval", "-s", "--sandbox"]);
   const flags = new Set(["--no-alt-screen", "--search"]);
@@ -26,7 +26,7 @@ export function validateNativeCodexArgs(args: string[], initialPrompt = "", allo
     else throw new Error("Local Codex UI supports a prompt, --model, --config, --ask-for-approval, --sandbox, --search and --no-alt-screen. Use terminal mode for other native arguments.");
   }
   // Codex does not materialize an empty thread for a second native frontend.
-  // Require a real user prompt instead of injecting one or manufacturing history.
+  // Hybrid launches can retain the original terminal until the first real prompt.
   if (!(prompt ?? initialPrompt).trim()) {
     if (allowEmpty) return launch;
     throw new Error("Cloud Codex's local interface requires an initial prompt. Use infinite codex to start in your laptop project, or --cloud without --local-ui for a cloud terminal.");

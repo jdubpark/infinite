@@ -4,10 +4,12 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFil
 import { execFile, execFileSync, spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { resolve } from "node:path";
+import { createServer, request } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { spawn as ptySpawn, type IPty } from "node-pty";
+import headless from "@xterm/headless";
 import { startHost, waitFor, claimControl, type Host } from "./helpers.js";
 
 function nativeUrl(host: Host, id: string, control: Awaited<ReturnType<typeof claimControl>>) {
@@ -22,7 +24,11 @@ async function connect(url: URL, headers: Record<string, string>) {
   const ws = new WebSocket(url, { headers });
   await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
   const messages: any[] = [];
-  ws.on("message", data => messages.push(JSON.parse(data.toString())));
+  const chunks: Buffer[] = [];
+  ws.on("message", (data, binary) => {
+    if (binary) chunks.push(Buffer.from(data as Buffer));
+    else messages.push(JSON.parse(data.toString()));
+  });
   ws.on("error", () => {});
   let next = 1;
   const rpc = async (method: string, params: unknown = {}) => {
@@ -32,7 +38,7 @@ async function connect(url: URL, headers: Record<string, string>) {
   };
   await rpc("initialize", { clientInfo: { name: "infinite_test", version: "1" } });
   ws.send(JSON.stringify({ method: "initialized" }));
-  return { ws, rpc, messages };
+  return { ws, rpc, messages, chunks };
 }
 
 test("native Codex attachment fences device control, pins its conversation, and survives API and client loss", { timeout: 35000 }, async () => {
@@ -70,6 +76,18 @@ test("native Codex attachment fences device control, pins its conversation, and 
     ] as const) assert.ok((await first.rpc(method, params)).error, `${method} must not escape the pinned conversation`);
     assert.deepEqual((await first.rpc("thread/loaded/list")).result.data, [info.sessionId]);
     assert.deepEqual((await first.rpc("thread/list")).result, { data: [{ id: info.sessionId, turns: [{ text: "initial prompt" }] }], nextCursor: null });
+
+    const bulkUrl = nativeUrl(host, id, controller); bulkUrl.searchParams.set("catalogChunks", "1");
+    const bulk = await connect(bulkUrl, bearer); clients.push(bulk.ws);
+    bulk.ws.send(JSON.stringify({ id: "catalog", method: "plugin/list", params: {} }));
+    await waitFor(async () => bulk.chunks.length || bulk.messages.some(m => m.id === "catalog"), Boolean);
+    assert.equal(bulk.chunks.length, 1, "large catalogs must wait for a chunk acknowledgement instead of filling the connection");
+    assert.ok(bulk.chunks[0].length <= 64 * 1024 + 12);
+    const settings = await bulk.rpc("thread/settings/update", { threadId: info.sessionId, effort: "high" });
+    assert.deepEqual(settings.result, {}, "model-setting replies must pass an unacknowledged catalog transfer");
+    assert.equal(bulk.chunks.length, 1, "the catalog remains paused while control replies pass");
+    bulk.ws.send(Buffer.alloc(8));
+    await waitFor(async () => bulk.ws.readyState, state => state === WebSocket.CLOSED);
 
     await first.rpc("turn/start", { threadId: info.sessionId, input: [{ type: "text", text: "approval" }] });
     await waitFor(async () => first.messages.some(message => message.method === "item/commandExecution/requestApproval"), Boolean);
@@ -129,10 +147,43 @@ test("native Codex attachment fences device control, pins its conversation, and 
   } finally { for (const client of clients) client.terminate(); await host.stop(); }
 });
 
-test("CLI opens a local native frontend with a loopback credential and detaches without ending the backend", { timeout: 20000 }, async () => {
+test("CLI opens a local native frontend with a loopback credential and detaches without ending the backend", { timeout: 30000 }, async () => {
   const fixture = resolve("tests/fixtures/native-codex.mjs");
   const host = await startHost({ agents: { codex: { command: process.execPath, args: [fixture] } } });
   let client: IPty | undefined;
+  // Hold the cloud handshake at the network boundary, without delaying HTTP
+  // lease renewal. Codex must not spend its initialize timeout on this handshake.
+  const proxy = createServer((req, res) => {
+    const upstream = request(host.origin + req.url, { method: req.method, headers: { ...req.headers, host: new URL(host.origin).host } }, response => {
+      res.writeHead(response.statusCode!, response.headers); response.pipe(res);
+    });
+    upstream.on("error", () => res.destroy()); req.pipe(upstream);
+  });
+  const sockets = new WebSocketServer({ noServer: true });
+  const peers = new Set<WebSocket>();
+  let accept: (() => void) | undefined;
+  proxy.on("upgrade", (req, socket, head) => {
+    accept = () => sockets.handleUpgrade(req, socket, head, frontend => {
+      const upstream = new WebSocket(host.origin.replace("http:", "ws:") + req.url, { headers: { Authorization: req.headers.authorization! } });
+      peers.add(frontend); peers.add(upstream);
+      const queued: { data: Buffer; binary: boolean }[] = [];
+      frontend.on("message", (data, binary) => {
+        if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary });
+        else queued.push({ data: Buffer.from(data as Buffer), binary });
+      });
+      upstream.on("open", () => { for (const frame of queued) upstream.send(frame.data, { binary: frame.binary }); });
+      upstream.on("message", (data, binary) => frontend.send(data, { binary }));
+      frontend.on("close", () => upstream.close()); upstream.on("close", () => frontend.close());
+      frontend.on("error", () => upstream.terminate()); upstream.on("error", () => frontend.terminate());
+    });
+  });
+  const terminal = new headless.Terminal({ cols: 120, rows: 30, allowProposedApi: true });
+  const terminalSettled = () => new Promise<void>(resolve => terminal.write("", resolve));
+  const assertTerminalRestored = () => {
+    assert.equal(terminal.modes.mouseTrackingMode, "none", "mouse movement must not become shell input after the native interface exits");
+    assert.equal(terminal.modes.bracketedPasteMode, false);
+    assert.equal(terminal.modes.sendFocusMode, false);
+  };
   try {
     const bin = host.root + "/bin"; mkdirSync(bin);
     // A fixture executable at the normal local CLI boundary; production has no test flag.
@@ -144,9 +195,11 @@ test("CLI opens a local native frontend with a loopback credential and detaches 
       "--cloud", "--local-ui", "codex", "--model", "fixture-model", "--no-alt-screen", "login"], {
       cols: 120, rows: 30, cwd: host.root, env: { ...process.env, PATH: bin + ":" + process.env.PATH },
     });
-    let output = "", exited = false; client.onData(data => output += data); client.onExit(() => exited = true);
+    let output = "", exited = false; client.onData(data => { output += data; terminal.write(data); }); client.onExit(() => exited = true);
     await waitFor(async () => output, value => value.includes("LOCAL NATIVE READY") || exited);
     assert.equal(exited, false, "loading a large provider catalog must not disconnect the native frontend");
+    await terminalSettled();
+    assert.equal(terminal.modes.mouseTrackingMode, "any", "the provider enabled mouse reporting before exit");
     assert.equal(JSON.parse(readFileSync(host.root + "/native-catalog.json", "utf8")).bytes, 13 * 1024 * 1024);
     const sessions = (await host.fetchApi("/sessions")).body.sessions;
     assert.equal(sessions.length, 1);
@@ -163,11 +216,44 @@ test("CLI opens a local native frontend with a loopback credential and detaches 
     client.write("local follow-up\r");
     await waitFor(async () => (await host.fetchApi(`/sessions/${id}`)).body.screen, value => value.includes("local follow-up"));
     client.kill("SIGTERM"); await waitFor(async () => exited, Boolean);
+    await terminalSettled(); assertTerminalRestored();
     const after = (await host.fetchApi(`/sessions/${id}`)).body;
     assert.equal(after.status, "running"); assert.equal(after.pid, pid); assert.equal(after.control, null);
     const requests = readFileSync(host.config.projects[0].path + "/provider-requests.jsonl", "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.deepEqual(requests.filter(r => r.method === "turn/start").map(r => r.params.input[0].text), ["login", "local follow-up"]);
-  } finally { try { client?.kill("SIGKILL"); } catch {} await host.stop(); }
+    await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+    writeFileSync(config, JSON.stringify({ origin: `http://127.0.0.1:${(proxy.address() as { port: number }).port}`, token: host.tokens.owner }), { mode: 0o600 });
+    for (const ending of ["normal", "signal", "disconnect"] as const) {
+      output = ""; exited = false; accept = undefined;
+      unlinkSync(host.root + "/native-client.json");
+      let exitCode: number | undefined;
+      client = ptySpawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", config, "resume", id], {
+        cols: 120, rows: 30, cwd: host.root, env: { ...process.env, PATH: bin + ":" + process.env.PATH },
+      });
+      client.onData(data => { output += data; terminal.write(data); }); client.onExit(event => { exited = true; exitCode = event.exitCode; });
+      await waitFor(async () => accept, Boolean);
+      assert.equal(existsSync(host.root + "/native-client.json"), false, "the provider's initialization deadline must start after the cloud handshake");
+      accept!();
+      await waitFor(async () => output, value => value.includes("LOCAL NATIVE READY"));
+      await terminalSettled(); assert.equal(terminal.modes.mouseTrackingMode, "any");
+      if (ending === "disconnect") for (const peer of peers) peer.terminate();
+      else client.write(ending === "normal" ? "\x04" : "\x18");
+      await waitFor(async () => exited, Boolean);
+      await terminalSettled(); assertTerminalRestored();
+      assert.equal((await host.fetchApi(`/sessions/${id}`)).body.pid, pid);
+      assert.equal((await host.fetchApi(`/sessions/${id}`)).body.control, null);
+      if (ending === "normal") assert.equal(exitCode, 0);
+      else {
+        assert.notEqual(exitCode, 0, "a crashed or disconnected interface must not report success");
+        assert.match(output, ending === "signal" ? /SIGKILL/ : /Cloud connection closed/);
+        assert.ok(output.lastIndexOf("[Infinite]") > output.lastIndexOf("\x1b[?1049l"), "the exit reason must remain visible after terminal restoration");
+      }
+    }
+  } finally {
+    try { client?.kill("SIGKILL"); } catch {}
+    for (const peer of peers) peer.terminate(); sockets.close(); proxy.closeAllConnections(); proxy.close();
+    terminal.dispose(); await host.stop();
+  }
 });
 
 test("default Codex uses the laptop project, hands off a verified checkpoint, and pauses uncertain effects", { timeout: 60000 }, async () => {

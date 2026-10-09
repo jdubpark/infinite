@@ -22,7 +22,7 @@ export function workerCall<T>(
     socket.on("connect", () => socket.write(JSON.stringify(request) + "\n"));
     socket.on("data", (chunk) => {
       data += chunk;
-      if (data.length > 2 * 1024 * 1024)
+      if (data.length > (request.op === "workspace-export" ? 40 : 2) * 1024 * 1024)
         return socket.destroy(new Error("Oversized worker response"));
       const end = data.indexOf("\n");
       if (end < 0) return;

@@ -26,6 +26,7 @@ import type {
   Session,
   WorkerState,
   Bootstrap,
+  LaptopWorkspace,
 } from "./types.js";
 
 export interface CreateSession {
@@ -36,6 +37,7 @@ export interface CreateSession {
   prompt: string;
   nativeArgs?: string[];
   localUi?: boolean;
+  workspace?: LaptopWorkspace & { token: string };
 }
 interface StoredSession {
   session: Session;
@@ -209,9 +211,12 @@ export class Manager {
     return operation;
   }
   private async createOnce(request: CreateSession) {
+    if (request.workspace && (request.provider !== "codex" || !request.localUi))
+      throw new Error("Laptop execution requires the Codex native interface");
     if (request.localUi) {
       if (!["codex", "opencode"].includes(request.provider)) throw new Error("Local native UI is available for Codex and OpenCode");
-      (request.provider === "codex" ? validateNativeCodexArgs : validateNativeOpenCodeArgs)(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "");
+      if (request.provider === "codex") validateNativeCodexArgs(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "", Boolean(request.workspace));
+      else validateNativeOpenCodeArgs(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "");
     }
     const id = request.requestId;
     const fingerprint = createHash("sha256")
@@ -252,6 +257,7 @@ export class Manager {
       initialPrompt: request.prompt,
       runtime: { id: randomUUID(), location: this.config.environment, transport: "pty", ...(request.localUi ? { nativeUi: request.provider as "codex" | "opencode" } : {}) },
       ...(request.nativeArgs !== undefined ? { nativeArgs: request.nativeArgs } : {}),
+      ...(request.workspace ? { workspace: { cwd: request.workspace.cwd, roots: request.workspace.roots } } : {}),
     };
     // Native CLI arguments are exact: do not append a second positional prompt or
     // provider settings. The context snapshot remains available in the record.
@@ -294,6 +300,7 @@ export class Manager {
         runDir: this.config.runDir,
         key: this.key.toString("base64"),
         prompt,
+        ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
         attention: {
           // Native CLI launches keep their exact argv: no hook settings are injected.
           hooks: request.nativeArgs !== undefined
@@ -306,7 +313,7 @@ export class Manager {
     child.unref();
     for (let attempt = 0; attempt < 80; attempt++) {
       const state = await this.state(id);
-      if (state.status !== "unavailable" && state.status !== "starting")
+      if (state.status !== "unavailable" && (request.workspace || state.status !== "starting"))
         return { ...session, ...state };
       await new Promise((resolve) => setTimeout(resolve, 50));
     }

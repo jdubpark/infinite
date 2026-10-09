@@ -1,13 +1,16 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
+import { existsSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import type { Signal } from "@infinite/attention";
 import type { AgentProfile, InputControl } from "./types.js";
 import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
+import { connectCodexEnvironments, type CodexEnvironmentClient, type CodexExecutor } from "./codex-environment.js";
 
 /** The native frontend is opt-in; ordinary PTY launches retain unrestricted argv passthrough. */
-export function validateNativeCodexArgs(args: string[], initialPrompt = "") {
+export function validateNativeCodexArgs(args: string[], initialPrompt = "", allowEmpty = false) {
   const values = new Set(["-m", "--model", "-c", "--config", "-a", "--ask-for-approval", "-s", "--sandbox"]);
   const flags = new Set(["--no-alt-screen", "--search"]);
   let prompt: string | undefined;
@@ -24,13 +27,26 @@ export function validateNativeCodexArgs(args: string[], initialPrompt = "") {
   }
   // Codex does not materialize an empty thread for a second native frontend.
   // Require a real user prompt instead of injecting one or manufacturing history.
-  if (!(prompt ?? initialPrompt).trim()) throw new Error("The experimental Codex local UI requires an initial prompt, for example: infinite --local-ui codex 'Inspect this repository'. Empty sessions still use infinite codex.");
+  if (!(prompt ?? initialPrompt).trim()) {
+    if (allowEmpty) return launch;
+    throw new Error("Cloud Codex's local interface requires an initial prompt. Use infinite codex to start in your laptop project, or --cloud without --local-ui for a cloud terminal.");
+  }
   // A prompt such as "login" is text, never a provider administration command.
   return [...launch, "--", prompt ?? initialPrompt];
 }
 
 type Message = { id?: number | string; method?: string; params?: Record<string, any>; result?: any; error?: unknown };
 type Attachment = { authority: InputControl; used: boolean };
+type Executor = CodexExecutor;
+
+/** A prepared host uses the qualified backend automatically; wrapped profiles
+ * select their backend explicitly so a different Unix identity is never bypassed. */
+function appServerLaunch(profile: AgentProfile) {
+  if (profile.appServerCommand) return { command: profile.appServerCommand, args: profile.appServerArgs ?? [] };
+  const prepared = fileURLToPath(new URL("../../../.local/codex-handoff/bin/codex-app-server", import.meta.url));
+  if (profile.command === "codex" && profile.args.length === 0 && existsSync(prepared)) return { command: prepared, args: [] };
+  return { command: profile.command, args: [...profile.args, "app-server"] };
+}
 
 /**
  * One cloud backend and one cloud observer TUI per Infinite session. Provider credentials
@@ -38,6 +54,8 @@ type Attachment = { authority: InputControl; used: boolean };
  */
 export async function startNativeCodex(options: {
   profile: AgentProfile; cwd: string; env: Record<string, string>;
+  execution?: Executor;
+  onExecutionUnavailable?: () => void;
   checkControl: (authority: InputControl) => void;
   onThread: (id: string) => void;
   onExit: () => void;
@@ -50,6 +68,8 @@ export async function startNativeCodex(options: {
   const attachments = new Map<string, Attachment>();
   let threadId: string | undefined, ready = false, stopped = false;
   let lastMessage: string | undefined;
+  let execution = options.execution, selecting = false;
+  let environments: CodexEnvironmentClient | undefined;
   let child: ChildProcess | undefined;
   const http = createServer((_req, res) => { res.writeHead(404); res.end(); });
   const sockets = new WebSocketServer({ noServer: true, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false });
@@ -61,9 +81,11 @@ export async function startNativeCodex(options: {
     sockets.close(); http.close();
     child?.kill("SIGTERM");
     attachments.clear();
+    environments?.close();
   };
   try {
-    child = spawn(options.profile.command, [...options.profile.args, "app-server", "--listen", "ws://127.0.0.1:0",
+    const backend = appServerLaunch(options.profile);
+    child = spawn(backend.command, [...backend.args, "--listen", "ws://127.0.0.1:0",
       "--ws-auth", "capability-token", "--ws-token-sha256", createHash("sha256").update(token).digest("hex")], {
       cwd: options.cwd, env: options.env, stdio: ["ignore", "pipe", "pipe"],
     });
@@ -88,6 +110,10 @@ export async function startNativeCodex(options: {
     });
     // Continue draining diagnostics; they can contain local paths and are not public records.
     child.stdout!.resume(); child.stderr!.resume();
+    if (execution) {
+      environments = await connectCodexEnvironments({ endpoint, token, onDisconnect: options.onExecutionUnavailable });
+      await environments.register(execution);
+    }
     http.on("upgrade", (req, socket, head) => {
       socket.on("error", () => {});
       const credential = req.headers.authorization?.match(/^Bearer ([a-f\d]{64})$/)?.[1];
@@ -121,8 +147,8 @@ export async function startNativeCodex(options: {
             if (binary) throw new Error("Expected native JSON");
             const message = JSON.parse(data.toString()) as Message;
             const method = message.method, params = message.params;
-            const refuse = () => {
-              if (message.id !== undefined) send(frontend, JSON.stringify({ id: message.id, error: { code: -32600, message: "This Infinite attachment is pinned to one conversation. Start or switch sessions through Infinite." } }));
+            const refuse = (reason = "This Infinite attachment is pinned to one conversation. Start or switch sessions through Infinite.") => {
+              if (message.id !== undefined) send(frontend, JSON.stringify({ id: message.id, error: { code: -32600, message: reason } }));
             };
             if (method === "thread/start") {
               if (!observer || threadId || startRequest !== undefined || message.id === undefined) { refuse(); return; }
@@ -133,6 +159,31 @@ export async function startNativeCodex(options: {
             } else if (method === "thread/fork" || method === "thread/delete" || method === "thread/archive" || method === "thread/unarchive") { refuse(); return; }
             if (params?.threadId !== undefined && params.threadId !== threadId) { refuse(); return; }
             if (method === "thread/resume" && (params?.path || params?.history || !threadId || params?.threadId !== threadId)) { refuse(); return; }
+            if (execution && method) {
+              if (selecting && ["thread/start", "thread/resume", "thread/settings/update", "turn/start", "turn/settings/update"].includes(method)) { refuse("Execution is moving to the cloud. Retry after handoff completes."); return; }
+              const executor = execution;
+              if (method === "initialize") message.params = { ...params, capabilities: { ...params?.capabilities, experimentalApi: true } };
+              if (method === "thread/start" || method === "turn/start") {
+                message.params = { ...message.params, cwd: executor.cwd, runtimeWorkspaceRoots: executor.roots,
+                  environments: [{ environmentId: executor.environmentId, cwd: executor.cwd, runtimeWorkspaceRoots: executor.roots }] };
+              }
+              // Resume/settings cwd overrides can reset Codex's sticky environment to
+              // the app-server host. The session's selected workspace stays authoritative.
+              if (method === "thread/resume" || method === "thread/settings/update") {
+                message.params = { ...params };
+                delete message.params.cwd;
+                delete message.params.runtimeWorkspaceRoots;
+                delete message.params.environments;
+              }
+              if (method === "environment/add" || method === "environment/remove" ||
+                  (method === "environment/info" && params?.environmentId !== executor.environmentId) ||
+                  /^(fs|process)\//.test(method) ||
+                  /^command\/exec(?:\/|$)/.test(method) || /^fuzzyFileSearch(?:\/|$)/.test(method) ||
+                  method === "gitDiffToRemote" || method === "thread/shellCommand" ||
+                  (method === "turn/settings/update" && params?.environments !== undefined)) {
+                refuse("This workspace action is unavailable for laptop execution. Use the conversation's laptop tools; the cloud workspace will not be substituted."); return;
+              }
+            }
             if (method && message.id !== undefined) {
               if (pending.size >= 1024) throw new Error("Too many pending native requests");
               pending.set(message.id, method);
@@ -157,12 +208,14 @@ export async function startNativeCodex(options: {
             if (observer && startRequest !== undefined && message.id === startRequest && message.result?.thread?.id) {
               if (threadId && threadId !== message.result.thread.id) throw new Error("Native conversation changed");
               threadId = message.result.thread.id;
+              environments?.observe({ method: "thread/started", params: { thread: { id: threadId } } });
               options.onThread(threadId!);
             }
             if (observer && threadId && !ready && !checking && ["turn/started", "turn/completed"].includes(message.method ?? "")) {
               checking = true;
               send(upstream, JSON.stringify({ id: checkpointRequest, method: "thread/read", params: { threadId, includeTurns: true } }));
             }
+            if (observer) environments?.observe(message);
             // Only the persistent observer records provider events, so extra UIs do
             // not duplicate timeline entries. A provider turn ending is not task completion.
             if (observer && message.params?.threadId === threadId) {
@@ -197,6 +250,18 @@ export async function startNativeCodex(options: {
         const credential = randomBytes(32).toString("hex");
         attachments.set(credential, { authority, used: false });
         return { url, token: credential, sessionId: threadId };
+      },
+      supportsExecutionSelection: environments?.supportsSelection ?? false,
+      async selectExecution(next: Executor, release: () => void) {
+        if (!environments || !threadId || selecting || stopped) throw new Error("Execution selection is unavailable");
+        selecting = true;
+        try {
+          const current = environments.current(threadId);
+          if (!current.observed) throw new Error("The provider conversation has not been observed");
+          const receipt = await environments.select({ threadId, turnId: current.turnId, executor: next,
+            releaseHeldOperation: () => { execution = next; release(); } });
+          return receipt;
+        } finally { selecting = false; }
       },
       stop: shutdown,
       suspend: () => { child?.kill("SIGSTOP"); },

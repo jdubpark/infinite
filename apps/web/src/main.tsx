@@ -914,6 +914,16 @@ function SessionView({
             Started {time(session.createdAt)} <span>·</span>{" "}
             {session.pid ? `PID ${session.pid}` : "No live process"}
           </p>
+          {session.execution && (
+            <p className="session-meta">
+              {connected && view.fresh ? "Tools: " : "Last received tools: "}{session.execution.location === "cloud" ? "Cloud" : "Laptop"} <span>·</span>{" "}
+              {session.execution.state === "online" ? "connected" : session.execution.state} <span>·</span>{" "}
+              {session.execution.location === "cloud" ? "Cloud handoff complete" : session.execution.cloudReady ? "Ready for cloud handoff" : "Preparing cloud handoff"}
+              {session.execution.checkpoint && <> · Checkpoint {Math.max(0, Math.floor((Date.now() - Date.parse(session.execution.checkpoint.capturedAt)) / 1000))}s ago</>}
+              {session.execution.reason && <> · {session.execution.reason}</>}
+              {session.execution.reconciliation && <> · Laptop edits preserved; cloud copy available for reconciliation</>}
+            </p>
+          )}
         </div>
         <button
           className="icon-button export"

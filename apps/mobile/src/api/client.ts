@@ -97,6 +97,7 @@ export type SessionRow = {
   /** Present on workers that enforce input control; older workers take shared input. */
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };
   control?: ControlLease | null;
+  execution?: { location: "laptop" | "cloud"; state: "connecting" | "online" | "offline" | "preparing" | "paused"; cloudReady: boolean; checkpoint?: { id: string; capturedAt: string }; reason?: string; reconciliation?: "available" };
 };
 export type SessionDetail = SessionRow & {
   screen?: string;

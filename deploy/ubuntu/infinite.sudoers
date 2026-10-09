@@ -5,4 +5,4 @@ Defaults:infinite-host !requiretty
 Defaults:infinite-host env_keep += "INFINITE_NATIVE_TOKEN OPENCODE_SERVER_PASSWORD OPENCODE_SERVER_USERNAME OPENCODE_CONFIG_CONTENT"
 # Session prompts are command arguments; do not copy them to plaintext sudo logs.
 Defaults:infinite-host !log_allowed, !log_denied
-infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/claude *, /usr/local/libexec/infinite/codex *, /usr/local/libexec/infinite/grok *, /usr/local/libexec/infinite/opencode *, /usr/local/libexec/infinite/demo *
+infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/claude *, /usr/local/libexec/infinite/codex *, /usr/local/libexec/infinite/codex-app-server *, /usr/local/libexec/infinite/grok *, /usr/local/libexec/infinite/opencode *, /usr/local/libexec/infinite/demo *

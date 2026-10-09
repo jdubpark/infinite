@@ -2,7 +2,7 @@ import type { Attention } from "./types.js";
 
 export type InboxGroup = "Needs you" | "Working" | "Finished" | "Exited";
 
-export function groupFor(att: Attention): InboxGroup {
+function groupFor(att: Attention): InboxGroup {
   switch (att.state) {
     case "needs-you": return "Needs you";
     case "working": return "Working";

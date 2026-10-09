@@ -3,7 +3,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { promisify } from "node:util";
 import { WebSocket, WebSocketServer } from "ws";
-import type { ControlLease, Session } from "./types.js";
+import type { ControlLease, Session, WorkerState } from "./types.js";
 import { NATIVE_COMPRESSION, NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 
 // Codex accepts only root WebSocket URLs. Keep the scoped cloud URL and device
@@ -83,13 +83,16 @@ export async function attachNativeCodex(config: { origin: string; token: string 
     await new Promise(resolve => setTimeout(resolve, 500));
   }
   if (info?.provider !== "codex" || !info.sessionId) throw new Error("The cloud conversation is not ready. Use infinite monitor to inspect its startup; resuming will not create another session.");
+  const current = await request<Pick<WorkerState, "execution">>(`/sessions/${session.id}`);
   const { control } = await request<{ control: ControlLease }>(`/sessions/${session.id}/control`, { action: "claim", ...(takeover ? { takeover: true } : {}) });
   const url = new URL(`/api/sessions/${session.id}/native`, config.origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.searchParams.set("client", clientId); url.searchParams.set("lease", control.id);
   const relay = await nativeRelay(url, config.token);
   const ttyMode = spawnSync("stty", ["-g"], { stdio: ["inherit", "pipe", "ignore"], encoding: "utf8", timeout: 2000 }).stdout?.trim();
-  console.error(`[Infinite] Local native UI · cloud execution · session ${session.id}\n[Infinite] Exiting this interface leaves the cloud session available. Use infinite monitor to watch it.`);
+  const execution = current.execution;
+  const status = execution ? `${execution.location} tools · ${execution.state}${execution.checkpoint ? ` · checkpoint ${Math.max(0, Math.floor((Date.now() - Date.parse(execution.checkpoint.capturedAt)) / 1000))}s old` : ""}` : "cloud execution";
+  console.error(`[Infinite] Local native UI · ${status} · session ${session.id}\n[Infinite] Exiting this interface leaves the session available. Use infinite monitor to watch it.`);
   const child = spawn("codex", ["--remote", relay.url, "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN", ...(info.noAltScreen === true ? ["--no-alt-screen"] : []), "resume", info.sessionId], {
     stdio: "inherit", env: { ...process.env, INFINITE_NATIVE_TOKEN: relay.token },
   });
@@ -107,7 +110,7 @@ export async function attachNativeCodex(config: { origin: string; token: string 
     if (renewing || ended) return;
     renewing = true;
     void request(`/sessions/${session.id}/control`, { action: "renew", leaseId: control.id })
-      .catch(() => { detachReason = "Control could not be renewed. The local interface detached; cloud execution continues. Reopen with infinite resume after checking the session."; detached(); })
+      .catch(() => { detachReason = "Control could not be renewed. The local interface detached; check the session before reopening with infinite resume."; detached(); })
       .finally(() => { renewing = false; });
   }, 10000);
   try {

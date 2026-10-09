@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import type { Receipt, Session, Status } from "./types.js";
+import type { Receipt, Session, Status, WorkerState } from "./types.js";
 import { terminalConnection, TerminalAccessError, TerminalControlError, type TerminalPage } from "./client-transport.js";
 import { draftTerminal } from "./client-draft.js";
 import { localDraftStore } from "./client-draft-store.js";
@@ -12,9 +13,11 @@ import { attachNativeCodex, checkNativeCodex } from "./client-native.js";
 import { attachNativeOpenCode, checkNativeOpenCode } from "./client-opencode.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
+import { checkLaptopExecutor, startLaptopService } from "./laptop-service.js";
+import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWorkspaceManifest } from "./workspace-checkpoint.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
-type Me = { role: string; nativeUi?: string[]; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
+type Me = { role: string; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
 const providerNames: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
 const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
@@ -63,8 +66,12 @@ function connection(config: ClientConfig, clientId = randomUUID()) {
   };
   return { request, json: async <T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> => (await request(path, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined)).json() as Promise<T> };
 }
-function printSessions(sessions: Session[]) {
-  for (const s of sessions) console.log(`${s.id}  ${s.provider.padEnd(8)}  ${s.status.padEnd(15)}  ${clean(s.title)}`);
+function printSessions(sessions: (Session & Partial<WorkerState>)[]) {
+  for (const s of sessions) {
+    const execution = s.execution;
+    const detail = execution ? `  · ${execution.location} tools · ${execution.state}${execution.checkpoint ? ` · checkpoint ${Math.max(0, Math.floor((Date.now() - Date.parse(execution.checkpoint.capturedAt)) / 1000))}s old` : ""}${execution.location === "laptop" ? execution.cloudReady ? " · cloud ready" : " · cloud preparing" : ""}` : "";
+    console.log(`${s.id}  ${s.provider.padEnd(8)}  ${s.status.padEnd(15)}  ${clean(s.title)}${detail}`);
+  }
 }
 async function selectSession(sessions: Session[], requested: string | undefined, monitor: boolean) {
   if (requested) {
@@ -326,21 +333,30 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
   const progress = startupProgress();
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
-  const strings = new Set(["--client-config", "--project", "--title", "--token-file"]);
-  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover"]);
+  const includes: string[] = [];
+  const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output"]);
+  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud"]);
   const option = () => {
     const name = args.shift()!;
-    if (booleans.has(name)) options[name] = true;
+    if (name === "--include" && args.length) includes.push(args.shift()!);
+    else if (booleans.has(name)) options[name] = true;
     else if (strings.has(name) && args.length) options[name] = args.shift()!;
     else throw new Error(`Unknown or incomplete Infinite option: ${name}`);
   };
   // Keep server administration commands and their --config semantics intact.
-  const candidate = args.find(a => providers.has(a) || ["pair", "resume", "monitor", "projects", "list"].includes(a));
+  const candidate = args.find(a => providers.has(a) || ["pair", "resume", "monitor", "recover", "projects", "list"].includes(a));
   if (!candidate || (candidate === "list" && args.includes("--config"))) return false;
   try {
     while (args[0]?.startsWith("--")) option();
     const command = args.shift()!;
-    if (!providers.has(command) && !["pair", "resume", "monitor", "projects", "list"].includes(command)) return false;
+    if (!providers.has(command) && !["pair", "resume", "monitor", "recover", "projects", "list"].includes(command)) return false;
+    if (options["--cloud"] && options["--laptop"]) throw new Error("Choose either the default laptop execution or --cloud");
+    if (command === "codex" && !options["--cloud"]) options["--laptop"] = true;
+    if (options["--laptop"]) {
+      if (command !== "codex") throw new Error("--laptop starts a Codex session in this directory. Resume existing sessions with infinite resume ID.");
+      options["--local-ui"] = true;
+    }
+    if (includes.length && !options["--laptop"]) throw new Error("--include is available for laptop execution; remove --cloud");
     const positional: string[] = [];
     if (!providers.has(command)) while (args.length) { if (args[0].startsWith("--")) option(); else positional.push(args.shift()!); }
     const path = resolve(String(options["--client-config"] ?? process.env.INFINITE_CLIENT_CONFIG ?? join(homedir(), ".config/infinite/client.json")));
@@ -372,13 +388,53 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     const me = await api.json<Me>("/me");
     progress.stop();
     if (command === "projects") { me.projects.forEach(p => console.log(`${p.id}  ${clean(p.name)}`)); return true; }
+    if (command === "recover") {
+      if (me.role !== "owner") throw new Error("Workspace recovery requires an owner device key");
+      const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
+      const selected = await selectSession(sessions, positional[0], true);
+      progress.start("Downloading a cloud checkpoint for reconciliation");
+      const call = async (method: string, extra: Record<string, unknown> = {}) =>
+        (await api.request(`/sessions/${selected.id}/workspace-export`, { method, ...extra }, AbortSignal.timeout(300000))).json();
+      const exported = await call("sync/export");
+      const manifest = validateWorkspaceManifest(exported.manifest);
+      const directory = join(dirname(path), "workspaces", selected.id), storeDir = join(directory, "objects");
+      const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
+      for (let offset = 0; offset < hashes.length; offset += 512) {
+        for (const hash of await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512))) {
+          const { base64 } = await call("sync/blob", { hash });
+          await putWorkspaceBlob(storeDir, hash, base64);
+        }
+      }
+      const destination = resolve(String(options["--output"] ?? join(directory, "recovered", manifest.id)));
+      const recovered = await materializeWorkspace({ manifest, storeDir, destination });
+      progress.stop();
+      console.log(recovered.cwd);
+      console.error("[Infinite] Cloud checkpoint downloaded. Compare this copy with your preserved laptop project; tools remain in the cloud.");
+      return true;
+    }
     let session: Session;
+    let emptyLaptopPrompt = false;
     if (providers.has(command)) {
       if (me.role !== "owner") throw new Error("Only an owner device can launch native sessions");
       if (!me.terminal?.stream) throw new Error("Upgrade the host to support native CLI sessions");
+      let workspace: { cwd: string; roots: string[]; token: string } | undefined;
+      if (options["--laptop"]) {
+        if (!me.execution?.laptop) throw new Error("Upgrade the single-tenant host for laptop execution, or use --cloud to explicitly select its configured workspace");
+        await checkLaptopExecutor();
+        const cwd = realpathSync(process.cwd());
+        let root = cwd;
+        try { root = realpathSync(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()); } catch { /* Non-Git directories are valid projects. */ }
+        const roots = [...new Set([root, ...includes.map(value => realpathSync(resolve(value)))])];
+        if (roots.length > 16 || roots.some(value => !statSync(value).isDirectory())) throw new Error("Select at most 16 project directories");
+        if (roots.some(value => value === dirname(value) || value === realpathSync(homedir()))) throw new Error("Run inside a project directory; selecting the entire home or filesystem is not supported");
+        workspace = { cwd, roots, token: randomBytes(32).toString("hex") };
+      }
       if (options["--local-ui"]) {
         if (!["codex", "opencode"].includes(command) || !me.nativeUi?.includes(command)) throw new Error("This host does not support this provider’s local UI. Other providers retain their native cloud terminal.");
-        (command === "codex" ? validateNativeCodexArgs : validateNativeOpenCodeArgs)(args);
+        if (command === "codex") {
+          const launch = validateNativeCodexArgs(args, "", Boolean(workspace));
+          emptyLaptopPrompt = Boolean(workspace) && launch.at(-2) !== "--";
+        } else validateNativeOpenCodeArgs(args);
         if (!options["--detach"]) await (command === "codex" ? checkNativeCodex : checkNativeOpenCode)();
       }
       const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
@@ -386,7 +442,24 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const requestId = randomUUID();
       console.error(`[Infinite] Launch ${requestId} on ${config.origin} · project ${projectId}`);
       progress.start(`Starting ${providerNames[command]} on ${new URL(config.origin).hostname}`);
-      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs: args, ...(options["--local-ui"] ? { localUi: true } : {}) });
+      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs: args, ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
+      if (workspace) {
+        progress.start("Connecting the laptop executor");
+        await startLaptopService({ ...config, sessionId: session.id, workspaceToken: workspace.token, cwd: workspace.cwd, roots: workspace.roots, configFile: path });
+        // Tunnel readiness precedes provider admission. Detached launch must not
+        // report success if the backend rejects this executor or the first thread.
+        progress.start("Preparing the first laptop turn");
+        const deadline = Date.now() + 30000;
+        while (true) {
+          const current = await api.json<Session & WorkerState>(`/sessions/${session.id}`);
+          if (["exited", "recording-error", "unavailable"].includes(current.status))
+            throw new Error("Codex could not prepare laptop execution. Inspect this session with infinite monitor; the original request was not replayed.");
+          if (current.status === "running" && current.nativeSession?.source === "protocol" && current.execution?.state === "online") { session = current; break; }
+          if (Date.now() >= deadline) throw new Error("Laptop execution is still preparing. Inspect the existing session with infinite monitor before retrying; do not create a duplicate task.");
+          await delay(100);
+        }
+        console.error(`[Infinite] Tools use ${clean(workspace.cwd)} on this laptop. Cloud preparation runs in the background; the session shows readiness and checkpoint age. Closing the interface leaves the laptop service running.`);
+      }
       progress.stop();
       if (options["--detach"]) { console.log(session.id); return true; }
     } else {
@@ -395,7 +468,11 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       progress.stop();
       session = await selectSession(sessions, positional[0], command === "monitor");
     }
-    if (session.runtime?.nativeUi && command !== "monitor") {
+    if (command === "resume" && session.workspace && session.runtime?.nativeUi === "codex" && me.role === "owner") {
+      const info = await api.json<{ sessionId?: string }>(`/sessions/${session.id}/native`);
+      emptyLaptopPrompt = !info.sessionId;
+    }
+    if (session.runtime?.nativeUi && command !== "monitor" && !emptyLaptopPrompt) {
       if (me.role !== "owner") throw new Error("Pair an owner device to open the native frontend");
       await (session.runtime.nativeUi === "codex" ? attachNativeCodex : attachNativeOpenCode)(config, session, Boolean(options["--takeover"]));
     } else {

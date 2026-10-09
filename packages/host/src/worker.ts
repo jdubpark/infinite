@@ -37,6 +37,8 @@ import { buildLaunch } from "./launch.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
+import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
+import { createHybridWorkspace } from "./hybrid-workspace.js";
 import type {
   Bootstrap,
   ControlActor,
@@ -90,9 +92,12 @@ let state: WorkerState = {
   capabilities: { terminalSnapshot: 1, inputControl: 1 },
   control: null,
   runtime: session.runtime ?? { id: randomUUID(), location: "local", transport: "pty" },
+  ...(session.workspace ? { execution: { location: "laptop", state: "connecting", cloudReady: false } as const } : {}),
 };
 let child: ReturnType<typeof spawn> | undefined;
 let native: Awaited<ReturnType<typeof startNativeCodex>> | Awaited<ReturnType<typeof startNativeOpenCode>> | undefined;
+let executor: ExecutorTunnel | undefined;
+let hybrid: Awaited<ReturnType<typeof createHybridWorkspace>> | undefined;
 // The host terminal must answer device/cursor queries even with no client attached.
 terminal.onData((data) => {
   if (state.status === "running") child?.write(data);
@@ -805,6 +810,15 @@ const server = createServer((socket) => {
         result = await serialize(snapshot);
       } else if (request.op === "native-info") {
         result = native?.info() ?? null;
+      } else if (request.op === "executor-connect") {
+        if (!executor || !config.executorTokenHash || typeof request.token !== "string" ||
+            !/^[a-f0-9]{64}$/.test(request.token) ||
+            createHash("sha256").update(request.token).digest("hex") !== config.executorTokenHash ||
+            !["starting", "running"].includes(state.status)) throw new Refusal("unsupported");
+        result = executor.attach();
+      } else if (request.op === "workspace-export") {
+        if (!hybrid || !["sync/export", "sync/blob"].includes(request.method)) throw new Refusal("unsupported");
+        result = await hybrid.control(request.method, { hash: request.hash });
       } else if (request.op === "native-connect") {
         result = await serialize(() => {
           if (!native || !request.actor || !request.leaseId || state.status !== "running") throw new Refusal("unsupported");
@@ -900,6 +914,7 @@ const hookServer = wantsHooks
   : null;
 function exitWorker(code: number) {
   native?.stop();
+  hybrid?.close(); executor?.close();
   server.close();
   hookServer?.close();
   try {
@@ -956,8 +971,40 @@ server.listen(socketPath(runDir, session.id), async () => {
       config.attention.hooks,
     );
     if (session.runtime?.nativeUi === "codex") {
+      if (session.workspace) {
+        hybrid = await createHybridWorkspace({
+          workspace: session.workspace, directory: join(dir, "workspace"), command: profile.command, commandArgs: profile.args,
+          ...(profile.workspaceDir ? { workspaceDirectory: join(profile.workspaceDir, session.id), sharedWorkspace: profile.sharedWorkspace } : {}),
+          record: data => { append("lifecycle", { execution: data }); },
+          publish: execution => {
+            state = { ...state, execution };
+            executor?.pause(execution.location !== "laptop" || execution.state !== "online");
+            persist();
+          },
+          select: async execution => {
+            if (!native || !("selectExecution" in native)) throw new Error("Codex execution selection is unavailable");
+            await native.selectExecution(execution, () => executor?.retire());
+          },
+        });
+        executor = await createExecutorTunnel({
+          cwd: session.workspace.cwd,
+          onConnection: online => hybrid?.connection(online),
+          onControl: (method, params) => hybrid!.control(method, params),
+          onActivity: activity => hybrid?.activity(activity),
+          record: data => { append("lifecycle", { executor: data }); },
+        });
+        persist();
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([executor.ready, new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => reject(new Error("Laptop executor did not connect; no provider turn was started")), 30000);
+          })]);
+        } finally { clearTimeout(timeout); }
+      }
       native = await startNativeCodex({
         profile, cwd: session.cwd, env,
+        ...(executor && session.workspace ? { execution: { ...executor.environment, roots: session.workspace.roots } } : {}),
+        onExecutionUnavailable: () => hybrid?.providerReady(false),
         noAltScreen: (session.nativeArgs ?? []).includes("--no-alt-screen"),
         checkControl: (authority) => {
           if (state.status !== "running" || !authority.actor || !authority.leaseId) throw new Refusal("control-lost");
@@ -971,9 +1018,10 @@ server.listen(socketPath(runDir, session.id), async () => {
         onSignal: (signal) => { record(signal, "protocol"); },
         record: (method) => { append("input-intent", { op: "native", method }); },
       });
+      hybrid?.providerReady(native.supportsExecutionSelection);
       env.INFINITE_NATIVE_TOKEN = native.observerToken;
       launch = { command: profile.command, args: [...profile.args, "--remote", native.url,
-        "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN", ...validateNativeCodexArgs(session.nativeArgs ?? [], config.prompt)] };
+        "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN", ...validateNativeCodexArgs(session.nativeArgs ?? [], config.prompt, Boolean(session.workspace))] };
     }
     if (session.runtime?.nativeUi === "opencode") {
       const settings = validateNativeOpenCodeArgs(session.nativeArgs ?? [], config.prompt);
@@ -1035,6 +1083,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     });
     const exited = (exitCode: number) => {
       native?.stop();
+      hybrid?.close(); executor?.close();
       try {
         flush();
         controller = null;

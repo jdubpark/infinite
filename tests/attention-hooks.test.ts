@@ -15,9 +15,8 @@ test("claude PreToolUse becomes tool-start with destructive flag and quiet marki
   assert.deepEqual(bash.destructive, { pattern: "rm-recursive-force" });
   const [read] = mapClaudeHook({ ...base, hook_event_name: "PreToolUse", tool_name: "Read", tool_input: { file_path: "/w/a.ts" } });
   assert.equal(read.kind === "tool-start" && read.quiet, true);
-  const [ask] = mapClaudeHook({ ...base, hook_event_name: "PreToolUse", tool_name: "AskUserQuestion", tool_input: { questions: [{ question: "Which DB?", header: "DB", options: [{ label: "Postgres", description: "" }, { label: "SQLite", description: "" }], multiSelect: false }] } });
+  const [ask, open] = mapClaudeHook({ ...base, hook_event_name: "PreToolUse", tool_name: "AskUserQuestion", tool_input: { questions: [{ question: "Which DB?", header: "DB", options: [{ label: "Postgres", description: "" }, { label: "SQLite", description: "" }], multiSelect: false }] } });
   assert.equal(ask.kind, "tool-start");
-  const open = mapClaudeHook({ ...base, hook_event_name: "PreToolUse", tool_name: "AskUserQuestion", tool_input: { questions: [{ question: "Which DB?", header: "DB", options: [{ label: "Postgres", description: "" }, { label: "SQLite", description: "" }], multiSelect: false }] } })[1];
   assert.equal(open.kind, "prompt-open");
   if (open.kind !== "prompt-open") throw new Error();
   assert.equal(open.prompt.kind, "question");
@@ -59,7 +58,7 @@ test("claude PermissionRequest, PostToolUse, Stop, Notification", () => {
   assert.equal(mapClaudeHook({ nonsense: true }).length, 0);
 });
 
-test("codex hooks, notify and osc", () => {
+test("codex hooks and notify", () => {
   const [perm] = mapCodexHook({ session_id: "s", cwd: "/w", hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "rm -rf dist" }, tool_use_id: "c1" });
   assert.equal(perm.kind, "prompt-open");
   if (perm.kind !== "prompt-open") throw new Error();
@@ -68,9 +67,6 @@ test("codex hooks, notify and osc", () => {
   assert.equal(stop.kind === "turn-end" && stop.message, "Renamed.");
   const [notify] = mapCodexNotify({ type: "agent-turn-complete", "thread-id": "t", "turn-id": "1", cwd: "/w", "input-messages": ["x"], "last-assistant-message": "Rename complete" });
   assert.equal(notify.kind === "turn-end" && notify.message, "Rename complete");
-  const osc = mapCodexOsc("Codex: approval requested");
-  assert.equal(osc[0].kind, "notice");
-  assert.equal(osc[1]?.kind, "prompt-open");
 });
 
 test("codex OSC text opens a prompt or ends a turn only on a known leading phrase", () => {

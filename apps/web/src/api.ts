@@ -15,6 +15,7 @@ export type Session = {
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };
   control?: ControlLease | null;
   runtime?: { id: string; location: string; transport: "pty" };
+  execution?: { location: "laptop" | "cloud"; state: "connecting" | "online" | "offline" | "preparing" | "paused"; cloudReady: boolean; checkpoint?: { id: string; capturedAt: string }; reason?: string; reconciliation?: "available" };
   attention?: { state: string; now: string; lastMessage?: string };
 };
 export type LogEvent = {

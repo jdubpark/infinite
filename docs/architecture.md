@@ -2,11 +2,11 @@
 
 This page describes the implemented **single-tenant runner**. The managed service now requires a separate runner and confidential execution boundary per user. Global control-plane accounts must never become runner data-access roles. See [managed tenants](multi-tenant.md) for the accepted architecture, hardware limitation, development backend, and confidential release gates.
 
-The native UI and checkpoint requirements are refined in [native interaction and continuity](native-continuity.md), including source reviews of Herdr and Orca. The runner now implements separate runtime identity, snapshot-plus-delta attachment, per-worker capability negotiation, and device-control ownership. A cloud PTY preserves execution but cannot provide local-speed echo over a slow network. Experimental native frontend/backend adapters exist for Codex and OpenCode. Structured compact provider transcripts and workspace synchronization remain future work.
+The native UI and checkpoint requirements are refined in [native interaction and continuity](native-continuity.md), including source reviews of Herdr and Orca. The runner now implements separate runtime identity, snapshot-plus-delta attachment, per-worker capability negotiation, and device-control ownership. A cloud PTY preserves execution but cannot provide local-speed echo over a slow network. Experimental native frontend/backend adapters exist for Codex and OpenCode. Structured compact provider transcripts remain future work; Codex workspace preparation and handoff are described below.
 
 ## Execution model
 
-The user chose permanent cloud execution on 2026-10-04. The laptop and phone are clients. Returning to the laptop means reconnecting to the existing cloud process, with no provider `new`, `fork`, or `resume` call. This avoids trying to transfer live processes between macOS and Linux.
+Codex defaults to the invoking laptop project while its conversation backend stays in the cloud. A detached service prepares verified project generations; the worker records executor activity and selects a fresh cloud environment after an eligible outage. Reconnecting keeps the same conversation and cloud placement. `--cloud` opts out; other providers keep their existing cloud execution. [Hybrid execution](hybrid-execution.md) defines checkpoint semantics, provider qualification, uncertainty and recovery.
 
 ```mermaid
 flowchart LR

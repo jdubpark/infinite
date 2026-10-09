@@ -19,7 +19,7 @@ case "$provider" in
     export DISABLE_UPDATES=1
     export DISABLE_AUTOUPDATER=1
     ;;
-  codex|grok|opencode) ;;
+  codex|codex-app-server|grok|opencode) ;;
   demo)
     exec /usr/local/bin/node /opt/infinite/packages/host/dist/demo.js "$@"
     ;;

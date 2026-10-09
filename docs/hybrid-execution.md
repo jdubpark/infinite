@@ -1,15 +1,89 @@
-# Hybrid Codex prototype
+# Hybrid execution and cloud handoff
+
+## Default flow
+
+`infinite codex` uses the invoking laptop project by default. `--cloud` opts out and uses the configured cloud project. The conversation, provider history, model credentials, permissions and recording remain on one persistent cloud backend. Other providers retain their existing execution behavior.
+
+The first tool does not wait for a repository scan or upload. A detached laptop service registers the actual launch directory before the original prompt starts. It prepares the complete selected project and explicit `--include` directories in the background. Closing the interface leaves that service running.
+
+On laptop loss, the worker allows five seconds for an idle relay to reconnect. This avoids moving a healthy laptop session during an API restart. When the checkpoint covers all observed executor operations and the provider supports environment selection, the worker starts a cloud executor against the already prepared tree and selects it in the existing conversation. A captured request that has not been dispatched receives an explicit not-executed error; the next provider step refreshes its environment. An unresolved request, process or writable file handle pauses continuation. Infinite never replays it or supplies a provider approval.
+
+```mermaid
+flowchart LR
+  Conversation[Persistent cloud conversation] --> Laptop[Laptop tools]
+  Laptop --> Capture[Incremental background checkpoint]
+  Capture --> Prepared[Verified prepared cloud tree]
+  Prepared --> Cloud[Cloud tools after outage]
+  Cloud --> Recovery[Separate recovery copy on laptop]
+```
+
+## Project scope and checkpoints
+
+The canonical launch directory remains authoritative, including nested directories. Git determines the project root; additional directories require `--include`. The entire selected scope is copied, including unread files, ignored files, binary contents, empty directories, executable bits, local commits, staged and unstaged changes, and untracked files. Selecting the entire home or filesystem is refused. Personal configuration outside these roots is not mirrored.
+
+Linked Git worktrees project their selected HEAD, index and worktree settings together with common repository objects and refs. Other worktrees' private metadata is excluded. Nested Git pointers require a separately selected root. External object alternates, escaping links, special files and unsupported names prevent checkpoint publication. Symlinks within the selected scope are remapped to their corresponding cloud locations. There is no silent cache or dependency exclusion.
+
+Content travels in bounded SHA-256 chunks over the authenticated executor connection. Already verified chunks and unchanged file metadata are reused. Periodic full reads supplement incremental captures. A new manifest is acknowledged only after its chunks and execution tree are verified and durable. Failed or interrupted preparation leaves the previous complete checkpoint eligible if it still covers all observed tool outcomes. New editor saves may remain on the laptop; the checkpoint timestamp shows the recoverable point.
+
+Preparation trees reuse unchanged files from the previous inactive tree. The old tree is retired after publication. Cloud task execution never writes the immutable content store, and the manifest remains the reconciliation baseline after its execution tree becomes writable.
+
+A checkpoint records a **capture span**, not an atomic filesystem snapshot. Stable reads, metadata verification and the macOS vnode change detector reject observed races. Writable shared mappings and application-level database transactions need an application-specific snapshot; these checks do not certify them. Process memory, open terminals, browser state and local databases are not migrated.
+
+## Execution state and uncertainty
+
+The API, web and phone distinguish tool location from conversation-host location. Session execution state reports connecting, online, preparing or paused, checkpoint age, readiness and a concrete blocker. `cloudReady` means a verified prepared tree covers the recorded executor boundary and the backend supports selection. It does not certify every package, external service or platform capability.
+
+Dispatch and results are journaled before forwarding. Any meaningful executor operation advances the revision. A later cloud checkpoint must cover that revision before handoff. New dispatch is held during loss and selection; a fresh environment ID prevents reuse of laptop connection metadata. Live-turn selection and sticky future-turn selection are both acknowledged, and the loaded thread selection is read back before releasing a held not-executed result.
+
+An uncertain command stays paused even if some output or side effects were observed. Killing a parent process does not prove its descendants stopped. Publication epochs prevent late laptop checkpoints and responses from replacing cloud state; they are not a revocable sandbox for arbitrary descendants or external effects. Detached local work may still affect the preserved laptop copy. Independent human edits are also preserved there. No automatic command replay, permission approval or reverse takeover is performed.
+
+The backend's native host-file utilities are refused through the attached UI when they would bypass the selected workspace. Provider MCP services remain associated with their configured server; hardware, keychains, laptop-only services and unavailable cloud credentials do not migrate. A new executor reports its actual shell, OS, cwd and roots. Cross-platform dependencies may require rebuilding from the copied lockfiles. Platform-specific builds still require an appropriate executor.
+
+## Returning to the laptop
+
+Reconnection keeps tools on the cloud executor. A surviving laptop service can download a separate recovery copy. Explicit recovery also works after service loss:
+
+```sh
+infinite recover SESSION_ID
+infinite recover SESSION_ID --output NEW_DIRECTORY
+```
+
+Recovery authenticates the owner, verifies downloaded content, and creates a new directory. It prints the recovered cwd. Compare that copy with the original laptop tree to reconcile offline changes; existing files are never overwritten. Automatic conflict merging, applying a merged tree, and moving tools back to the laptop remain separate work. Reconnecting or recovering files does not resend a prompt.
+
+## Preparing the host
+
+The supported provider integration pins Codex 0.162.0 with the narrow app-server patch in `patches/`. Stock Codex can run laptop tools but does not expose the required live and sticky selection API. Its session reports handoff unavailable rather than pretending to be ready.
+
+```sh
+npm run prepare:codex
+```
+
+This builds and qualifies an alternate app-server before publishing it under ignored runtime storage. New default Codex profiles select that backend automatically; the installed Codex frontend is unchanged. Wrapped profiles use `appServerCommand` and `appServerArgs` explicitly to preserve their execution identity. See [Ubuntu deployment](../deploy/ubuntu/README.md) for the separate agent account, shared execution-data directory and private control store. No host deployment is implied by local verification.
+
+Both transfer endpoints require a paired owner. Executor attachment additionally requires a per-session capability. Capabilities stay out of model context and native frontend arguments. Checkpoint files and source data are plaintext in private runtime directories and need encrypted host storage; journals remain application-encrypted. All files within the selected roots are transferred, including any credentials stored there. The single-tenant trust boundary does not provide confidentiality from its owner or administrator.
+
+Worker and provider process restart recovery, automatic dependency provisioning, arbitrary descendant containment, atomic database snapshots, and automatic merge/application are not implemented. API restart preserves the detached worker. Source and content storage currently require operator-managed retention.
+
+## Verification
+
+The existing provider-boundary integration owns default project selection, dirty/untracked/included files, real checkpoint transfer, API restart, automatic handoff, uncertain-operation pause, recovery and authorization. It uses actual Infinite processes with a fixture provider, without fabricating checkpoint receipts.
+
+Separate rehearsals use actual Codex app-server, TUI and exec-server processes with an isolated loopback model fixture. They verify first-turn local instructions and edits, empty launch without a synthetic prompt, idle handoff, and active-turn continuation after abrupt laptop service loss. A delayed old-environment command is refused before execution; the next command and later native prompt use cloud files in the original thread. Offline laptop changes and the unrelated host project stay intact. The installed CLI bundle also completed launch, background preparation, handoff and recovery. These are local integration results, not proof of a deployed cross-OS host or live provider account.
+
+The [implementation plan](plans/2026-10-09-001-feat-seamless-hybrid-execution-plan.md) retains stronger isolation and reconciliation follow-ups. This page describes the implemented boundary.
+
+## Earlier SSH prototype
 
 The opt-in [prototype script](../scripts/hybrid-codex.mjs) keeps an existing Infinite Codex conversation on its cloud backend and attaches the current laptop as its execution environment. It uses the installed Codex execution server, Infinite's owner authentication and device control, and an authenticated loopback executor reached through a private SSH reverse tunnel. It does not upload a repository before starting work.
 
-This is a single-tenant development prototype. Use a disposable native Codex conversation and a fixture repository. Normal `infinite codex` and `infinite --local-ui codex` launches retain cloud execution. The phone and web clients do not yet display a separate execution environment or its availability, and no production launch default has changed.
+This is a single-tenant development prototype. Use a disposable native Codex conversation and a fixture repository. The integrated default launch described above replaces this manual setup. The script retains its original behavior and does not use the checkpoint coordinator.
 
 ## Run
 
 Create a native Codex conversation, let its first turn finish, and detach its interface. Keep its Infinite session ID. The chosen cloud project remains the conversation's administrative association; `--cwd` selects the laptop files used by the prototype.
 
 ```sh
-infinite --detach --local-ui --project PROJECT_ID codex "Describe the intended task; do not use tools yet."
+infinite --cloud --detach --local-ui --project PROJECT_ID codex "Describe the intended task; do not use tools yet."
 node scripts/hybrid-codex.mjs \
   --session SESSION_ID \
   --ssh USER@HOST \
@@ -43,17 +117,12 @@ A live rehearsal with Codex 0.161.0 on macOS and 0.160.0 on Linux verified lapto
 
 The automated process-lifecycle regression uses fixture executables and a fixture host; it verifies wrapper cleanup without requiring a cloud account. A separate probe using real Codex processes and a fixture model verified that disconnected laptop tool calls fail without writing into the cloud workspace. These checks do not establish automatic offline handoff, arbitrary background-process cleanup, or support for other providers.
 
-## Offline behavior and remaining gates
+## Current prototype offline behavior
 
 When the laptop is unavailable, local tool calls fail with an executor connection error. Codex may still reason about that failure; disconnection does not freeze all model activity. There is no automatic substitution of a cloud working directory and no automatic resend by the prototype. A phone can inspect the conversation, but cannot make an unavailable laptop execute commands.
 
-Before making hybrid execution a normal launch mode:
-
-- Persist conversation ownership separately from execution ownership, workspace identity, and executor generation.
-- Show the selected repository, tool location, connectivity and checkpoint age on the CLI, phone and web clients.
-- Gate a new execution generation on interrupted-command reconciliation, including background processes and uncertain external effects.
-- Verify provider permissions, native patch tools, instruction discovery, local MCP configuration and reconnect behavior across supported Codex versions.
-- Prepare an optional cloud workspace from explicit incremental checkpoints, preserving uncommitted and divergent files. A lid-close hook cannot upload data after connectivity has disappeared.
-- Rehearse checkpoint-based cloud handoff with exclusive execution ownership. A macOS process cannot migrate intact to Linux.
+The integrated launch described above owns checkpoint preparation and automatic handoff. This prototype's lifecycle test establishes wrapper/helper cleanup only; it does not establish execution-lease expiry for arbitrary processes.
 
 The protocol foundation is Codex's experimental `environment/add`, `environment/info`, and per-turn environment selection in the installed generated schema. The official [app-server guide](https://learn.chatgpt.com/docs/app-server) describes the native client protocol and experimental environment inspection. The separate [self-hosted sandbox guide](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted) illustrates harness/executor separation, but its hosted registration and authentication flow is not used here.
+
+On 2026-10-09, freshly generated experimental types from installed Codex 0.162.0 still expose `environment/add`, `turn/start.environments`, per-environment cwd and workspace roots. This is protocol evidence, not a new cloud-handoff test. The upstream [execution-server documentation](https://github.com/openai/codex/blob/main/codex-rs/exec-server/README.md) describes filesystem/process RPCs and authenticated connections; it does not establish Infinite's fencing or checkpoint contract. [Git partial-clone documentation](https://git-scm.com/docs/partial-clone) explains deferred object retrieval, which can reduce history transfer but does not establish completeness of a selected checkout by itself.

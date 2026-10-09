@@ -25,6 +25,11 @@ const createSchema = z
     nativeArgs: z.array(z.string().max(8192).refine((s) => !s.includes("\0")))
       .max(256).refine((args) => args.join("").length <= 32000).optional(),
     localUi: z.boolean().optional(),
+    workspace: z.object({
+      cwd: z.string().min(1).max(4096).refine(value => value.startsWith("/") && !value.includes("\0")),
+      roots: z.array(z.string().min(1).max(4096).refine(value => value.startsWith("/") && !value.includes("\0"))).min(1).max(16),
+      token: z.string().regex(/^[a-f0-9]{64}$/),
+    }).strict().optional(),
   })
   .strict();
 const ANSWER_REFUSALS = new Set([
@@ -180,6 +185,7 @@ export function createApp(config: Config, key: Buffer) {
       role: res.locals.role,
       terminal: { stream: true, duplex: true, snapshot: true, control: true, raw: res.locals.role === "owner" },
       nativeUi: ["codex", "opencode"].filter(provider => config.agents[provider as "codex" | "opencode"]),
+      execution: { laptop: Boolean(config.agents.codex) && runtimeSecurity(config.deployment).tenancy === "single-tenant", cloudHandoff: Boolean(config.agents.codex) && runtimeSecurity(config.deployment).tenancy === "single-tenant" },
       environment: config.environment,
       security: runtimeSecurity(config.deployment),
       providers: Object.keys(config.agents).filter(
@@ -225,9 +231,12 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/sessions", async (_req, res) =>
     res.json({ sessions: await manager.list() }),
   );
-  app.post("/api/sessions", requireRole(["owner"]), async (req, res) =>
-    res.status(201).json(await manager.create(createSchema.parse(req.body))),
-  );
+  app.post("/api/sessions", requireRole(["owner"]), async (req, res) => {
+    const request = createSchema.parse(req.body);
+    if (request.workspace && (!res.locals.bearer || runtimeSecurity(config.deployment).tenancy !== "single-tenant"))
+      return void res.status(403).json({ error: "Laptop execution requires an owner device key and a single-tenant host" });
+    res.status(201).json(await manager.create(request));
+  });
   app.get("/api/sessions/:id", async (req, res) => {
     const sessionId = id.parse(req.params.id);
     res.json({
@@ -240,6 +249,14 @@ export function createApp(config: Config, key: Buffer) {
     const sessionId = id.parse(req.params.id);
     if (!manager.meta(sessionId).session.runtime?.nativeUi) return res.status(409).json({ error: "This session uses its original terminal transport" });
     res.json(await workerCall(config.runDir, sessionId, { op: "native-info" }));
+  });
+  app.post("/api/sessions/:id/workspace-export", requireRole(["owner"]), async (req, res) => {
+    if (!res.locals.bearer || req.headers.origin) return void res.status(403).json({ error: "Workspace recovery requires a paired owner CLI" });
+    const sessionId = id.parse(req.params.id);
+    if (!manager.meta(sessionId).session.workspace) return void res.status(409).json({ error: "This session has no hybrid workspace" });
+    const request = z.object({ method: z.enum(["sync/export", "sync/blob"]), hash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(req.body);
+    if (request.method === "sync/blob" && !request.hash) return void res.status(400).json({ error: "A content hash is required" });
+    res.json(await workerCall(config.runDir, sessionId, { op: "workspace-export", ...request }, 300000));
   });
   app.all(/^\/api\/sessions\/([a-f\d-]{36})\/opencode(\/.*)?$/, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer || req.headers.origin || !res.locals.leaseId) return void res.status(403).json({ error: "Native access requires an owner CLI and current control" });

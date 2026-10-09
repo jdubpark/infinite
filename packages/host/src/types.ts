@@ -29,6 +29,18 @@ export interface SessionRuntime {
   transport: "pty";
   nativeUi?: "codex" | "opencode";
 }
+export interface LaptopWorkspace {
+  cwd: string;
+  roots: string[];
+}
+export interface ExecutionState {
+  location: "laptop" | "cloud";
+  state: "connecting" | "online" | "offline" | "preparing" | "paused";
+  cloudReady: boolean;
+  checkpoint?: { id: string; capturedAt: string };
+  reason?: string;
+  reconciliation?: "available";
+}
 export interface Session {
   id: string;
   provider: Provider;
@@ -44,6 +56,7 @@ export interface Session {
   initialPrompt: string;
   nativeArgs?: string[];
   runtime?: SessionRuntime;
+  workspace?: LaptopWorkspace;
 }
 export interface Event {
   seq: number;
@@ -59,6 +72,12 @@ export interface Project {
 export interface AgentProfile {
   command: string;
   args: string[];
+  /** Optional qualified standalone Codex app-server; the regular command remains the TUI. */
+  appServerCommand?: string;
+  appServerArgs?: string[];
+  /** Optional data root outside private control state for a separate execution identity. */
+  workspaceDir?: string;
+  sharedWorkspace?: boolean;
 }
 export interface Config {
   deployment?: import("./deployment.js").Deployment;
@@ -101,6 +120,7 @@ export interface WorkerState {
   control?: ControlLease | null;
   runtime?: SessionRuntime;
   nativeSession?: { id: string; source: "hook" | "protocol" };
+  execution?: ExecutionState;
 }
 export interface InputControl {
   actor?: ControlActor;
@@ -109,6 +129,8 @@ export interface InputControl {
 export type WorkerRequest =
   | { op: "state"; screen?: boolean }
   | { op: "native-info" }
+  | { op: "executor-connect"; token: string }
+  | { op: "workspace-export"; method: "sync/export" | "sync/blob"; hash?: string }
   | ({ op: "native-connect" } & InputControl)
   | { op: "snapshot" }
   | {
@@ -148,6 +170,7 @@ export interface Bootstrap {
   runDir: string;
   key: string;
   prompt: string;
+  executorTokenHash?: string;
   attention: {
     hooks: { claude: boolean; codex: boolean };
     idleAfterMs: number;

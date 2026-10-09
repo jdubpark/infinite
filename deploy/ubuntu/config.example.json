@@ -19,7 +19,14 @@
   ],
   "agents": {
     "claude": {"command": "/usr/bin/sudo", "args": ["-n", "-H", "-u", "infinite-agent", "--", "/usr/local/libexec/infinite/claude"]},
-    "codex": {"command": "/usr/bin/sudo", "args": ["-n", "-H", "-u", "infinite-agent", "--", "/usr/local/libexec/infinite/codex"]},
+    "codex": {
+      "command": "/usr/bin/sudo",
+      "args": ["-n", "-H", "-u", "infinite-agent", "--", "/usr/local/libexec/infinite/codex"],
+      "appServerCommand": "/usr/bin/sudo",
+      "appServerArgs": ["-n", "-H", "-u", "infinite-agent", "--", "/usr/local/libexec/infinite/codex-app-server"],
+      "workspaceDir": "/srv/infinite-data/workspaces/hybrid",
+      "sharedWorkspace": true
+    },
     "grok": {"command": "/usr/bin/sudo", "args": ["-n", "-H", "-u", "infinite-agent", "--", "/usr/local/libexec/infinite/grok"]},
     "opencode": {"command": "/usr/bin/sudo", "args": ["-n", "-H", "-u", "infinite-agent", "--", "/usr/local/libexec/infinite/opencode"]}
   }

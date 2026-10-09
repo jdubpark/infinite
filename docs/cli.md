@@ -1,6 +1,6 @@
 # Laptop CLI
 
-The laptop CLI runs the native Claude Code, Codex, Grok, or OpenCode terminal on the cloud host. It carries the native terminal output and input over authenticated private HTTPS. Detaching, closing a terminal, or losing the laptop connection leaves the cloud process running.
+The laptop CLI keeps provider conversations on the cloud host. Codex uses the current laptop project by default and prepares automatic cloud handoff in the background. `--cloud` selects the configured host workspace. Claude Code, Grok and OpenCode retain their cloud execution behavior. Detaching or losing the interface leaves the cloud conversation running.
 
 Launch and attach report their current stage immediately, with elapsed time during longer waits. These messages go to stderr; JSON listings and detached session IDs remain machine-readable on stdout. Progress stops when native output takes over.
 
@@ -19,12 +19,35 @@ infinite resume 5ba58d55    # a unique Infinite session ID prefix also works
 infinite monitor           # choose a session to watch
 ```
 
-For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
+For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite --cloud codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
+
+## Laptop execution and automatic handoff
+
+Run inside the project you want Codex to inspect or change:
+
+```sh
+infinite codex "Inspect this repository"
+infinite --include ../shared codex "Update this project and its shared library"
+infinite --detach codex "Run the checks"
+infinite resume SESSION_ID
+```
+
+The launch directory is authoritative, including when it is inside a repository subdirectory. Infinite selects the Git project root and any explicit `--include` directories as workspace roots. The cloud app server registers the laptop executor before the original prompt starts; tools can read uncommitted and untracked files immediately without uploading the repository or opening an SSH tunnel. A configured host project still groups the session and supplies its administrative process directory; it does not replace the selected laptop directory.
+
+The laptop service survives CLI exit and native-interface detachment. `resume` attaches to the same conversation and keeps the selected executor. It does not restart a lost laptop service. The service reconnects its transport to the same executor, never replays a command, and stops when that executor exits, pairing is revoked, or the host confirms the session ended. Start requires macOS or Linux, a single-tenant host, an owner device key, and compatible authenticated Codex app-server and exec-server support. Provider permissions remain explicit. Workspace roots configure Codex; they do not confine arbitrary shell commands or replace its sandbox policy.
+
+The conversation's tools use the laptop executor. Native-interface file-picker search, standalone shell shortcuts, and standalone Git helpers are currently refused because those provider APIs target the app-server filesystem. They need a separate laptop implementation before they can be enabled here. Detached launch reports success only after the provider has admitted its thread and the laptop is connected.
+
+Automatic handoff is enabled by default. The host must have the qualified backend prepared with `npm run prepare:codex`; a stock backend reports its missing capability. Once background preparation is ready, an outage continues from the verified checkpoint in the same conversation. An uncertain tool outcome pauses for reconciliation instead of being replayed. Checkpoint age and the current blocker appear on web and phone. `infinite --cloud codex` opts out of laptop execution and synchronization; `--laptop` remains a compatibility alias.
+
+`infinite codex` also supports an empty prompt. Its persistent terminal accepts the first real input; once history exists, native reattachment is available. No synthetic prompt is submitted.
+
+After cloud handoff, `infinite recover SESSION_ID --output NEW_DIRECTORY` downloads a verified recovery copy and prints its cwd. Omit `--output` to use private client storage. The original laptop files remain available for comparison; tools stay in the cloud. See [scope, checkpoint semantics and platform limits](hybrid-execution.md).
 
 ## Experimental local Codex interface
 
 ```sh
-infinite --local-ui codex "Inspect this repository"
+infinite --cloud --local-ui codex "Inspect this repository"
 infinite resume SESSION_ID
 infinite --takeover resume SESSION_ID
 infinite monitor SESSION_ID
@@ -94,7 +117,7 @@ infinite --client-config /private/client.json monitor SESSION_ID
 
 Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not uploaded or translated. The CLI does not silently copy the current laptop checkout or its secrets.
 
-An opt-in [hybrid Codex prototype](hybrid-execution.md) connects a laptop executor to an existing cloud conversation without bulk upload. It requires an explicit workspace and SSH destination and has no automatic offline cloud handoff. It is separate from the normal launch commands above.
+Default Codex launches use the laptop project and background cloud handoff described above. The earlier [SSH prototype](hybrid-execution.md#earlier-ssh-prototype) remains available for isolated protocol experiments and retains its original offline behavior.
 
 To preserve native command and flag semantics, native CLI launches do not append Infinite's shared context as another positional prompt or inject provider hook flags. The project context version is retained in the encrypted session record; repository instructions and the provider's native cloud history continue to work normally. Browser-created sessions retain the existing shared-prompt behavior. Screen-based attention remains available for new workers; workers launched before that feature omit attention metadata until explicitly replaced.
 

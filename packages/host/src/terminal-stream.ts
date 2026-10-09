@@ -74,7 +74,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
     try { url = new URL(req.url ?? "/", origin); }
     catch { socket.destroy(); return; }
     const match = /^\/api\/sessions\/([a-f0-9-]{36})\/terminal$/.exec(url.pathname);
-    if (url.pathname.endsWith("/native")) return; // handled by the owner-only native bridge
+    if (url.pathname.endsWith("/native") || url.pathname.endsWith("/executor")) return; // owner-only native bridge
     const after = Number(url.searchParams.get("after") ?? 0);
     const hosts = [origin.host, `127.0.0.1:${manager.config.port}`, `localhost:${manager.config.port}`];
     if (!match || !z.uuid().safeParse(match[1]).success || !Number.isSafeInteger(after) || after < 0 ||

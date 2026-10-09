@@ -44,7 +44,8 @@ const schema = z
     agents: z
       .partialRecord(
         z.enum(["claude", "codex", "grok", "opencode", "demo"]),
-        z.object({ command: z.string(), args: z.array(z.string()) }),
+        z.object({ command: z.string(), args: z.array(z.string()), appServerCommand: z.string().optional(), appServerArgs: z.array(z.string()).optional(),
+          workspaceDir: z.string().refine(isAbsolute, "Workspace directory must be absolute").optional(), sharedWorkspace: z.boolean().optional() }),
       )
       .default({}),
     attention: z

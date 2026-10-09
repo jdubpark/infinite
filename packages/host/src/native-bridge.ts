@@ -14,25 +14,30 @@ export function connectNativeFrontends(server: Server, manager: Manager, authent
   server.on("upgrade", (req, socket, head) => {
     let url: URL;
     try { url = new URL(req.url ?? "/", origin); } catch { return; }
-    if (!url.pathname.endsWith("/native")) return;
+    if (!url.pathname.endsWith("/native") && !url.pathname.endsWith("/executor")) return;
     socket.on("error", () => {});
-    const match = /^\/api\/sessions\/([a-f\d-]{36})\/native$/.exec(url.pathname);
+    const match = /^\/api\/sessions\/([a-f\d-]{36})\/(native|executor)$/.exec(url.pathname);
+    const executor = match?.[2] === "executor";
+    const executorToken = req.headers["x-infinite-executor"];
     const token = req.headers.authorization?.match(/^Bearer (.{32,200})$/)?.[1];
     const device = token ? authenticate(token) : undefined;
     const clientId = url.searchParams.get("client"), leaseId = url.searchParams.get("lease");
     const deny = () => socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
-    if (!match || !z.uuid().safeParse(match[1]).success || !z.uuid().safeParse(clientId).success || !z.uuid().safeParse(leaseId).success ||
+    if (!match || !z.uuid().safeParse(match[1]).success ||
+        (executor ? typeof executorToken !== "string" || !/^[a-f0-9]{64}$/.test(executorToken) : !z.uuid().safeParse(clientId).success || !z.uuid().safeParse(leaseId).success) ||
         !device || device.role !== "owner" || req.headers.origin || sockets.clients.size >= 16 ||
         ![origin.host, `127.0.0.1:${manager.config.port}`, `localhost:${manager.config.port}`].includes(req.headers.host ?? "")) { deny(); return; }
     void (async () => {
       try {
         manager.meta(match[1]);
-        const backend = await workerCall<{ url: string; token: string }>(manager.config.runDir, match[1], {
+        const backend = await workerCall<{ url: string; token: string }>(manager.config.runDir, match[1], executor ? {
+          op: "executor-connect", token: executorToken as string,
+        } : {
           op: "native-connect", actor: controlActor(device, clientId!), leaseId: leaseId!,
         });
         if (socket.destroyed) return;
         // The worker supplies an authenticated loopback gate, never an arbitrary owner URL.
-        if (!/^ws:\/\/127\.0\.0\.1:\d+\/$/.test(backend.url)) throw new Error("Invalid native endpoint");
+        if (!(executor ? /^ws:\/\/127\.0\.0\.1:\d+\/device$/ : /^ws:\/\/127\.0\.0\.1:\d+\/$/).test(backend.url)) throw new Error("Invalid native endpoint");
         sockets.handleUpgrade(req, socket, head, frontend => {
           const upstream = new WebSocket(backend.url, { headers: { Authorization: `Bearer ${backend.token}` }, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false, handshakeTimeout: 10000 });
           upstreams.add(upstream);

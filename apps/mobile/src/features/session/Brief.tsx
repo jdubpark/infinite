@@ -51,7 +51,7 @@ export function Brief({
       // A poll that started before a local control change must not undo it.
       const revision = control.generation();
       const session = await api<SessionDetail>(connection, `/sessions/${id}`);
-      return { session, revision };
+      return { session, revision, receivedAt: Date.now() };
     },
     1500,
     [connection, id],
@@ -160,6 +160,16 @@ export function Brief({
                   ? `Cached view from ${seen}`
                   : "Waiting for a fresh response…"}
             </Text>
+            {session.execution ? (
+              <Text style={s.small}>
+                {online ? "Tools: " : "Last received tools: "}{session.execution.location === "cloud" ? "Cloud" : "Laptop"} ·{" "}
+                {session.execution.state === "online" ? "connected" : session.execution.state} ·{" "}
+                {session.execution.location === "cloud" ? "Cloud handoff complete" : session.execution.cloudReady ? "Ready for cloud handoff" : "Preparing cloud handoff"}
+                {session.execution.checkpoint ? ` · Checkpoint ${Math.max(0, Math.floor(((poll?.receivedAt ?? 0) - Date.parse(session.execution.checkpoint.capturedAt)) / 1000))}s ago` : ""}
+                {session.execution.reason ? ` · ${session.execution.reason}` : ""}
+                {session.execution.reconciliation ? " · Laptop edits preserved; cloud copy available for reconciliation" : ""}
+              </Text>
+            ) : null}
           </View>
           <OfflineBanner
             online={online}

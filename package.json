@@ -8,6 +8,7 @@
     "apps/*"
   ],
   "scripts": {
+    "prepare:codex": "node scripts/build-codex-handoff.mjs",
     "postinstall": "node scripts/prepare-pty.mjs && npm run build -w @infinite/attention",
     "build": "npm run build -w @infinite/attention && npm run build -w @infinite/host && npm run build -w @infinite/web",
     "typecheck": "npm run typecheck --workspaces --if-present",

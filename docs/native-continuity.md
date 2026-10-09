@@ -107,6 +107,12 @@ Automated boundary tests cover owner-only native authentication, unauthorized lo
 
 Native connections allow messages up to 32 MiB and bound queued output at 64 MiB. Provider startup catalogs can exceed 12 MB; smaller limits disconnected a real frontend after loading its history. The cloud hop negotiates compression, while local sockets avoid repeated compression work. A regression exercises catalog delivery through the full CLI attachment path.
 
+Updated laptop clients request `catalogChunks=1` on the cloud connection. Large `plugin/list` responses travel in binary chunks with at most 64 KiB of data, one unacknowledged chunk at a time. Each chunk starts with three big-endian unsigned 32-bit integers: transfer ID, byte offset, and total message length. The client acknowledges with the transfer ID and next byte offset, then restores the complete, unchanged JSON response for Codex. A missing acknowledgement closes the attachment after 20 seconds. Small replies and heartbeats can pass between chunks; only catalog read responses may be overtaken. Turn events and approvals keep their original order. Older clients and hosts retain ordinary text frames.
+
+The laptop restores mouse, focus, paste, keyboard, cursor, and alternate-screen modes whenever the local native interface exits, including provider crashes and lost connections. Restoring line settings alone does not stop terminal mouse reports from reaching the shell.
+
+The laptop opens the authenticated cloud WebSocket before starting Codex, so connection setup does not consume Codex's initialization timeout. Control renewal remains active during setup, and a failed or cancelled attachment releases its lease. Exit diagnostics appear after terminal restoration; signal exits and lost cloud connections return a nonzero status instead of silently reporting success.
+
 The first release requires an initial prompt because an empty thread cannot be resumed by another connection in the tested app server. It uses legacy history because the server rejects paginated history hydration. The local UI connects through Infinite's authenticated loopback relay because Codex accepts only root WebSocket addresses. Existing PTY sessions are not migrated. Claude and Grok adapters, automatic local draft recovery, file synchronization, and execution-host recovery remain separate work.
 
 ### OpenCode adapter evidence and limits

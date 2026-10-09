@@ -82,8 +82,11 @@ if (args[0] === "app-server") {
   process.stdin.setRawMode(true);
   let input = "";
   process.stdin.on("data", data => {
+    if (resuming && data.toString() === "\x04") process.exit(0);
+    if (resuming && data.toString() === "\x18") process.kill(process.pid, "SIGKILL");
     input += data.toString().replace(/\x1b\[20[01]~/g, "");
     if (input.includes("\r") && threadId) { call("turn/start", { threadId, input: [{ type: "text", text: input.split("\r")[0] }] }); input = ""; }
   });
-  process.stdout.write("\x1b[?2004h");
+  // A native TUI can exit without cleaning up its terminal modes.
+  process.stdout.write("\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?25l");
 }

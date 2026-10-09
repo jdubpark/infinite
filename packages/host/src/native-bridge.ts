@@ -4,7 +4,7 @@ import { z } from "zod";
 import { controlActor, type PairedDevice } from "./device-control.js";
 import { workerCall } from "./ipc.js";
 import type { Manager } from "./manager.js";
-import { NATIVE_COMPRESSION, NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
+import { nativeCatalogSender, NATIVE_COMPRESSION, NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 
 /** Native protocols grant owner capabilities. Browser cookies and narrower device roles cannot attach. */
 export function connectNativeFrontends(server: Server, manager: Manager, authenticate: (token: string) => PairedDevice | undefined) {
@@ -39,6 +39,8 @@ export function connectNativeFrontends(server: Server, manager: Manager, authent
           const queued: string[] = [];
           let bytes = 0, alive = true;
           const close = () => { frontend.terminate(); upstream.terminate(); };
+          const catalogs = url.searchParams.get("catalogChunks") === "1" ? nativeCatalogSender(frontend, close) : undefined;
+          const catalogRequests = new Set<number | string>();
           const timer = setInterval(() => { if (!alive) { close(); return; } alive = false; frontend.ping(); }, 15000);
           frontend.on("pong", () => { alive = true; });
           const send = (to: WebSocket, text: string) => {
@@ -47,16 +49,36 @@ export function connectNativeFrontends(server: Server, manager: Manager, authent
           };
           frontend.on("message", (data, binary) => {
             try {
-              if (binary) throw new Error("Invalid native frame");
+              if (binary) {
+                if (!catalogs) throw new Error("Invalid native frame");
+                catalogs.acknowledge(Buffer.from(data as Buffer)); return;
+              }
+              if (catalogs) {
+                const message = JSON.parse(data.toString());
+                if (message.method === "plugin/list" && (typeof message.id === "string" || typeof message.id === "number")) {
+                  if (catalogRequests.size >= 1024) throw new Error("Too many native catalog requests");
+                  catalogRequests.add(message.id);
+                }
+              }
               if (upstream.readyState === WebSocket.OPEN) send(upstream, data.toString());
               else if (upstream.readyState === WebSocket.CONNECTING) { bytes += Buffer.byteLength(data.toString()); if (bytes > 256 * 1024) throw new Error("Native queue is full"); queued.push(data.toString()); }
               else close();
             } catch { close(); }
           });
           upstream.on("open", () => { try { for (const text of queued) send(upstream, text); queued.length = 0; bytes = 0; } catch { close(); } });
-          upstream.on("message", (data, binary) => { try { if (binary || frontend.readyState !== WebSocket.OPEN) throw new Error("Disconnected"); send(frontend, data.toString()); } catch { close(); } });
-          frontend.on("close", () => { clearInterval(timer); upstream.close(); });
-          upstream.on("close", () => { clearInterval(timer); upstreams.delete(upstream); frontend.close(); });
+          upstream.on("message", (data, binary) => {
+            try {
+              if (binary || frontend.readyState !== WebSocket.OPEN) throw new Error("Disconnected");
+              const text = data.toString();
+              if (catalogs) {
+                const message = JSON.parse(text);
+                if (!message.method && catalogRequests.delete(message.id) && Buffer.byteLength(text) > 64 * 1024) { catalogs.send(text); return; }
+              }
+              send(frontend, text);
+            } catch { close(); }
+          });
+          frontend.on("close", () => { clearInterval(timer); catalogs?.close(); upstream.close(); });
+          upstream.on("close", () => { clearInterval(timer); catalogs?.close(); upstreams.delete(upstream); frontend.close(); });
           frontend.on("error", close); upstream.on("error", close);
         });
       } catch { if (!socket.destroyed) deny(); }

@@ -24,8 +24,9 @@ node scripts/qualify-codex-handoff.mjs --app-server PATH [--codex PATH]
 
 Use the alternate app-server built by scripts/build-codex-handoff.mjs.
 The installed Codex supplies real, authenticated loopback exec-servers.
-Two fixture-model scenarios verify same-turn and next-turn environment adoption
-and a command refused before dispatch. Runtime data stays in ignored .local/.
+Three fixture-model scenarios verify direct and code-mode tools, same-turn and
+next-turn environment adoption, and a command refused before dispatch.
+Runtime data stays in ignored .local/.
 No model credentials, existing conversation, or production settings are used.
 This is not proof of arbitrary process migration or general outage recovery.`);
   process.exit(0);
@@ -44,6 +45,7 @@ const delay = milliseconds => new Promise(resolve => setTimeout(resolve, millise
 const save = (path, value) => writeFile(path, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
 
 async function runScenario(mode) {
+  const codeMode = mode === "code-mode";
   const directory = join(output, mode);
   const paths = Object.fromEntries(["home", "host", "laptop", "cloud"].map(name => [name, join(directory, name)]));
   for (const path of Object.values(paths)) await mkdir(path, { recursive: true, mode: 0o700 });
@@ -173,12 +175,15 @@ async function runScenario(mode) {
         emit(response, "response.created", { response: { id: `response-${index}`, status: "in_progress", output: [] } });
         if (index === 1) {
           await waitFor(() => turnId, "Turn startup");
-          if (mode === "captured-step") await selectCloud();
+          if (mode !== "refused-operation") await selectCloud();
         }
-        assert(input.tools.some(tool => tool.name === "exec_command"), "Native exec_command was not offered");
+        assert(input.tools.some(tool => tool.name === (codeMode ? "exec" : "exec_command")), "Expected native tool interface was not offered");
         const item = [1, 2, 4].includes(index)
-          ? { id: `call-${index}`, type: "function_call", call_id: `call-${index}`, name: "exec_command",
-              arguments: JSON.stringify({ cmd: "cat marker.txt", yield_time_ms: 10000, max_output_tokens: 200 }) }
+          ? codeMode
+            ? { id: `call-${index}`, type: "custom_tool_call", call_id: `call-${index}`, name: "exec",
+                input: 'text(await tools.exec_command({cmd:"cat marker.txt",yield_time_ms:10000,max_output_tokens:200}));' }
+            : { id: `call-${index}`, type: "function_call", call_id: `call-${index}`, name: "exec_command",
+                arguments: JSON.stringify({ cmd: "cat marker.txt", yield_time_ms: 10000, max_output_tokens: 200 }) }
           : { id: `message-${index}`, type: "message", role: "assistant", status: "completed",
               content: [{ type: "output_text", text: "Fixture complete.", annotations: [] }] };
         emit(response, "response.output_item.done", { output_index: 0, item });
@@ -203,6 +208,8 @@ sandbox_mode = "danger-full-access"
 enabled = false
 [feedback]
 enabled = false
+[features]
+code_mode_only = ${codeMode}
 [model_providers.fixture]
 name = "Fixture"
 base_url = "http://127.0.0.1:${model.address().port}/v1"
@@ -242,8 +249,10 @@ requires_openai_auth = false
     assert.equal(modelRequests, 3);
     assert(JSON.stringify(requests[0]).includes("Environment marker: LAPTOP_MARKER"), "First step missed laptop instructions");
     assert(JSON.stringify(requests[1]).includes("Environment marker: CLOUD_MARKER"), "Next step missed destination instructions");
-    const outputs = requests.map(request => request.input.filter(item => item.type === "function_call_output").map(item => JSON.stringify(item.output)));
-    if (mode === "captured-step") {
+    const toolOutput = item => ["function_call_output", "custom_tool_call_output"].includes(item.type);
+    const outputs = requests.map(request => request.input.filter(toolOutput).map(item => JSON.stringify(item.output)));
+    if (codeMode) assert(!outputs[1].some(output => output.includes("failed to spawn code-mode host")), "Packaged backend is missing its code-mode helper");
+    if (mode !== "refused-operation") {
       assert(outputs[1].some(output => output.includes("LAPTOP_MARKER")), "Already-captured command was retargeted");
       receipt.oldCaptureStayedOnLaptop = true;
     } else {
@@ -259,7 +268,7 @@ requires_openai_auth = false
     assert.equal(followup.params.turn.status, "completed");
     assert.equal(modelRequests, 5);
     assert(JSON.stringify(requests[3]).includes("Environment marker: CLOUD_MARKER"), "Future turn lost cloud instructions");
-    const followupOutput = requests[4].input.filter(item => item.type === "function_call_output").map(item => JSON.stringify(item.output));
+    const followupOutput = requests[4].input.filter(toolOutput).map(item => JSON.stringify(item.output));
     assert(followupOutput.some(output => output.includes("CLOUD_MARKER")), "Future turn lost cloud execution");
     receipt.nextTurnAtCloud = true;
   } catch (error) {
@@ -288,10 +297,10 @@ requires_openai_auth = false
 
 try {
   const receipts = [];
-  for (const mode of ["captured-step", "refused-operation"]) receipts.push(await runScenario(mode));
+  for (const mode of ["captured-step", "refused-operation", "code-mode"]) receipts.push(await runScenario(mode));
   await save(join(output, "receipt.json"), { status: "qualified-narrow-boundary", receipts,
     limits: ["same operating system", "single native command", "no uncertain effect", "no persistent checkpoint or general process fence"] });
-  console.log("Passed: first-step laptop context, preserved old capture, next-step cloud execution, and held determinate refusal in the same turn.");
+  console.log("Passed: direct and code-mode tools, laptop context, preserved old capture, same-turn cloud execution, sticky future turns, and determinate refusal.");
   console.log("Scope: one native command on the same operating system. General outage recovery and process fencing remain unqualified.");
   console.log(`Private receipts: ${output}`);
 } catch (error) {

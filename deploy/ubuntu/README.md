@@ -52,7 +52,7 @@ sudo -H -u infinite-agent git config --global --add safe.directory \
   '/srv/infinite-data/workspaces/hybrid/*'
 ```
 
-Keep the trailing wildcard quoted. This trusts repositories beneath that directory; do not replace it with an unrestricted `*`. Verify the installed Git accepts the scoped setting with the account-specific checks below. See [Git safe.directory](https://git-scm.com/docs/git-config#Documentation/git-config.txt-safedirectory).
+Keep the trailing wildcard quoted. This trusts repositories beneath that directory; do not replace it with an unrestricted `*`. Use Git 2.46 or newer: older Ubuntu Git packages can reject repositories despite this scoped setting. The [Git installation guide](https://git-scm.com/install/linux) lists the upstream Ubuntu package source. Verify access with the account-specific checks below. See [Git safe.directory](https://git-scm.com/docs/git-config/2.46.0#Documentation/git-config.txt-safedirectory).
 
 This group is a single-tenant trust boundary. Agent processes sharing the account and group can access other active workspaces in that group. Separate directories prevent accidental concurrent edits; they do not isolate active projects from one another.
 
@@ -72,13 +72,16 @@ Prepare the Codex backend on the target operating system as the unprivileged bui
 npm run prepare:codex
 ```
 
-Preparation builds the pinned alternate app-server and runs provider qualification before publishing `.local/codex-handoff/bin/codex-app-server`. Qualification uses real Codex executors with a fixture model to check environment changes within a turn and refusal before command dispatch. It does not use model credentials or replace stock Codex. Keep stock Codex installed for the native interface and execution server.
+Preparation builds the pinned alternate app-server and fetches its matching `codex-code-mode-host` companion from the official npm distribution, then qualifies the complete bundle before publishing it under `.local/codex-handoff/bin/`. Qualification uses real Codex executors with a fixture model to check direct and code-mode tools, environment changes within and between turns, and refusal before command dispatch. It does not use model credentials or replace stock Codex. Keep stock Codex installed for the native interface and execution server.
 
 After preparation succeeds, install the backend and its wrapper as an administrator:
 
 ```sh
 sudo install -d -o root -g root -m 0755 \
   /opt/infinite-agents/v1/bin /usr/local/libexec/infinite
+sudo install -o root -g root -m 0755 \
+  .local/codex-handoff/bin/codex-code-mode-host \
+  /opt/infinite-agents/v1/bin/codex-code-mode-host
 sudo install -o root -g root -m 0755 \
   .local/codex-handoff/bin/codex-app-server \
   /opt/infinite-agents/v1/bin/codex-app-server

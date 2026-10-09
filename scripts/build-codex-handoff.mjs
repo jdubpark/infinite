@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -14,16 +15,19 @@ if (process.argv.includes("--help")) {
 
 node scripts/build-codex-handoff.mjs
 
-Requires tar, patch, rustup, and an already installed Rust 1.95.0 toolchain.
+Requires npm, tar, patch, rustup, and an already installed Rust 1.95.0 toolchain.
 Linux builds also require pkg-config and the OpenSSL and libcap development
 packages (pkg-config, libssl-dev and libcap-dev on Ubuntu).
-Downloads the official release source and builds only an alternate app-server
-under ignored .local/. It does not install Rust or replace the installed Codex.
+Builds an alternate app-server from official release source and packages the
+matching official code-mode helper under ignored .local/. It does not install
+Rust or replace the installed Codex.
 The provider qualification runs before the backend is published for new sessions.
 The patch exposes live environment selection; it does not add a process fence.`);
   process.exit(0);
 }
 if (process.argv.length > 2) throw new Error("Unknown argument. See --help.");
+if (!["darwin", "linux"].includes(process.platform) || !["x64", "arm64"].includes(process.arch))
+  throw new Error("Backend preparation supports macOS and Linux on x64 or arm64.");
 const version = "0.162.0", toolchain = "1.95.0";
 const repository = dirname(dirname(fileURLToPath(import.meta.url)));
 const local = join(repository, ".local");
@@ -59,13 +63,37 @@ try {
   await run("rustup", ["run", toolchain, "cargo", "build", "--locked", "-j", "4", "-p", "codex-app-server", "--bin", "codex-app-server"], workspace, {
     ...process.env, CARGO_TARGET_DIR: target, CARGO_PROFILE_DEV_DEBUG: "0", CARGO_INCREMENTAL: "0",
   });
-  const binary = join(target, "debug", "codex-app-server");
-  await run(process.execPath, [join(repository, "scripts/qualify-codex-handoff.mjs"), "--app-server", binary], repository);
+  // Use the companion shipped in the pinned official distribution. Its V8
+  // runtime is distributed as a binary and is not part of the app-server patch.
+  const stock = join(directory, "stock");
+  await mkdir(stock, { mode: 0o700 });
+  await writeFile(join(stock, "package.json"), '{"name":"infinite-codex-runtime","version":"0.0.0","private":true}\n');
+  await run("npm", ["install", "--prefix", stock, "--no-save", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", `@openai/codex@${version}`], stock);
+  const require = createRequire(join(stock, "package.json"));
+  const codexRequire = createRequire(require.resolve("@openai/codex/package.json"));
+  const platformPackage = codexRequire.resolve(`@openai/codex-${process.platform}-${process.arch}/package.json`);
+  const packageMetadata = JSON.parse(await readFile(platformPackage, "utf8"));
+  if (packageMetadata.version !== `${version}-${process.platform}-${process.arch}`)
+    throw new Error("The official code-mode helper version does not match the backend.");
+  const triple = `${process.arch === "x64" ? "x86_64" : "aarch64"}-${process.platform === "linux" ? "unknown-linux-musl" : "apple-darwin"}`;
+  const helper = join(dirname(platformPackage), "vendor", triple, "bin", "codex-code-mode-host");
+  // Qualify the complete publishable bundle, including the helper used by
+  // code-mode-only models. Direct exec_command probes cannot detect its absence.
+  const bundle = join(directory, "bin"), names = ["codex-code-mode-host", "codex-app-server"];
+  await mkdir(bundle, { mode: 0o700 });
+  for (const name of names) {
+    await copyFile(name === "codex-code-mode-host" ? helper : join(target, "debug", name), join(bundle, name));
+    await chmod(join(bundle, name), 0o700);
+  }
+  await run(process.execPath, [join(repository, "scripts/qualify-codex-handoff.mjs"), "--app-server", join(bundle, "codex-app-server")], repository);
   const bin = join(local, "codex-handoff", "bin");
   await mkdir(bin, { recursive: true, mode: 0o700 });
-  const staged = join(bin, ".codex-app-server-next");
-  await copyFile(binary, staged); await chmod(staged, 0o700);
-  await rename(staged, join(bin, "codex-app-server"));
+  // Publish the same-version companion before making the new backend visible.
+  for (const name of names) {
+    const staged = join(bin, `.${name}-next`);
+    await copyFile(join(bundle, name), staged); await chmod(staged, 0o700);
+    await rename(staged, join(bin, name));
+  }
   console.log("Qualified backend prepared for new Infinite Codex sessions. Installed Codex is unchanged.");
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));

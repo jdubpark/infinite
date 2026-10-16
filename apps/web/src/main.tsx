@@ -22,7 +22,7 @@ import {
   TerminalSquare,
   WifiOff,
 } from "lucide-react";
-import { useApi, ApiError, isControlRefusal, names, type ControlLease, type Me, type Session, type LogEvent } from "./api";
+import { useApi, ago, ApiError, isControlRefusal, names, type ControlLease, type Me, type ProjectDetail, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
 import { clearDrafts, readDraft, settleDraft, useSessionDraft, writeDraft, type PendingInput } from "./drafts";
 import { creations, lifecycles } from "./requests";
 import { MachinePicker, MachineProvider, useMachines } from "./machines";
@@ -550,6 +550,28 @@ function Create({
   const [prompt, setPrompt] = useState(request?.prompt ?? "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [project, setProject] = useState<ProjectDetail | null>(null);
+  const [applying, setApplying] = useState(false);
+  useEffect(() => {
+    setProject(null);
+    if (!projectId) return;
+    let active = true;
+    const load = () => api<ProjectDetail>(`/projects/${projectId}`).then(detail => { if (active) setProject(detail); }).catch(() => { if (active) setProject(null); });
+    void load();
+    const timer = setInterval(load, 5000);
+    return () => { active = false; clearInterval(timer); };
+  }, [api, projectId]);
+  async function applyPending(force: boolean) {
+    const id = projectId;
+    if (!id || applying) return;
+    setApplying(true);
+    setError("");
+    try {
+      const sync = await api<ProjectSyncStatus>(`/projects/${id}/sync/apply`, force ? { force } : {});
+      if (mounted.current) setProject(previous => previous?.id === id ? { ...previous, sync } : previous);
+    } catch (error) { if (mounted.current) setError((error as Error).message); }
+    finally { if (mounted.current) setApplying(false); }
+  }
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (busy || !connected || me.role !== "owner" || !provider || !projectId) return;
@@ -612,6 +634,14 @@ function Create({
               </option>
             ))}
           </select>
+          {project && (
+            <p className="quiet" role="status">
+              Synced from laptop {ago(project.sync.lastSyncedAt)} · applied {ago(project.sync.appliedAt)}
+              {project.sync.pendingGeneration && <> · pending: {project.sync.pendingGeneration.reason === "session-running" ? "a session is running" : "cloud files changed"}{" "}
+                {me.role === "owner" && <button type="button" className="text-button" disabled={applying || !connected} onClick={() => void applyPending(project.sync.pendingGeneration!.reason === "cloud-changed")}>
+                  {applying ? "Applying…" : project.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"}</button>}</>}
+            </p>
+          )}
           <label htmlFor="title">Session name</label>
           <input
             id="title"
@@ -938,7 +968,7 @@ function SessionView({
             <span className="quiet">/ {session.status}</span>
           </div>
           <p className="session-meta">
-            {me.environment === "cloud" ? "Cloud" : "Local"} host <span>·</span>{" "}
+            Tools run on {session.executionLocation === "laptop" ? "your laptop" : me.machine?.label || "this machine"} <span>·</span>{" "}
             Started {time(session.createdAt)} <span>·</span>{" "}
             {session.pid ? `PID ${session.pid}` : "No live process"}
           </p>

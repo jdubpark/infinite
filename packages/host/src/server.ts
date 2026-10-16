@@ -103,8 +103,11 @@ export function createApp(config: Config, key: Buffer) {
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
+  // Native records written before executionLocation existed carry only the hybrid workspace.
+  const executionLocation = (session: { executionLocation?: "cloud" | "laptop"; workspace?: unknown }): "cloud" | "laptop" =>
+    session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const listSessions = async () => {
-    const native = (await manager.list()).map(session => ({ ...session, backend: "infinite" as const, machineId: config.machine!.id, resumable: resumable(session) }));
+    const native = (await manager.list()).map(session => ({ ...session, executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id, resumable: resumable(session) }));
     // Provider conversation IDs survive restarts and can exist in several
     // recordings. Only a currently verified worker PID identifies this runtime.
     const known = new Set(native.filter(s => s.status === "running" && s.nativeSession && s.pid)
@@ -351,7 +354,7 @@ export function createApp(config: Config, key: Buffer) {
       ...manager.meta(sessionId).session,
       ...(await manager.state(sessionId, true)),
     };
-    res.json({ ...session, backend: "infinite", machineId: config.machine!.id, resumable: resumable(session) });
+    res.json({ ...session, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id, resumable: resumable(session) });
   });
   app.get("/api/sessions/:id/messages", (req, res) => {
     const session = manager.meta(id.parse(req.params.id)).session;

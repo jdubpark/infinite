@@ -172,3 +172,10 @@ export type LogEvent = {
 export type ChatMessage = { id: string; role: string; text: string; toolName?: string; ts?: string };
 export type MessagesPage = { messages: ChatMessage[]; cursor: string | number; more?: boolean; source?: string; available?: boolean };
 export type ProjectFile = { path: string; name: string; text?: string; mimeType: string; size: number; modifiedAt: string; base64?: string };
+export type ProjectSyncStatus = { projectId: string; lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: { id: string; capturedAt: string; receivedAt: string; reason: "session-running" | "cloud-changed" } };
+export type ProjectDetail = { id: string; name: string; sync: ProjectSyncStatus };
+export function ago(iso?: string, now = Date.now()) {
+  if (!iso) return "never";
+  const s = Math.max(0, Math.floor((now - Date.parse(iso)) / 1000));
+  return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`;
+}

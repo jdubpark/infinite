@@ -3,7 +3,7 @@ import { KeyboardAvoidingView, ScrollView, StyleSheet, Text, TextInput, View } f
 import { useRouter } from "expo-router";
 import * as Crypto from "expo-crypto";
 import { PROVIDER_NAMES } from "@infinite/attention";
-import { api, ApiError, connectionKey, type Connection, type Me, type SessionRow } from "../../api/client";
+import { ago, api, ApiError, connectionKey, type Connection, type Me, type ProjectDetail, type SessionRow } from "../../api/client";
 import { creations } from "../../store/requests";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
@@ -28,6 +28,19 @@ export function Create({ connection }: { connection: Connection }) {
   const selectedProvider = providers.find(value => value === provider) ?? providers[0];
   const projects = me?.projects ?? [];
   const selectedProject = projects.some(item => item.id === project) ? project : projects[0]?.id;
+  const { data: polledDetail, refresh: refreshDetail } = usePoll(() => selectedProject ? api<ProjectDetail>(connection, `/projects/${selectedProject}`) : Promise.resolve(null), 5000, [connection, selectedProject]);
+  // The poll keeps its last value across a project change; show only the selected project's status.
+  const detail = polledDetail?.id === selectedProject ? polledDetail : null;
+  const [applying, setApplying] = useState(false);
+  const [syncError, setSyncError] = useState("");
+  async function applyPending(force: boolean) {
+    if (!selectedProject || applying) return;
+    setApplying(true);
+    setSyncError("");
+    try { await api(connection, `/projects/${selectedProject}/sync/apply`, { body: force ? { force } : {} }); }
+    catch (error) { if (mounted.current) setSyncError((error as Error).message); }
+    finally { if (mounted.current) { setApplying(false); refreshDetail(); } }
+  }
   const locked = busy || Boolean(request);
   async function submit() {
     if (sending.current || !online || me?.role !== "owner" || !selectedProvider || !selectedProject || !title.trim()) return;
@@ -54,7 +67,10 @@ export function Create({ connection }: { connection: Connection }) {
       <Text style={s.label}>Session host</Text>
       <View style={s.choices}>{(me?.backends ?? ["infinite"]).map(value => <Button key={value} title={value === "cmux" ? "cmux" : "Infinite"} secondary={backend !== value} disabled={locked} onPress={() => { setBackend(value); setProvider(undefined); }} />)}</View>
       <Text style={s.label}>Project</Text>
-      <View style={s.choices}>{projects.map(item => <Button key={item.id} title={item.name} secondary={selectedProject !== item.id} disabled={locked} onPress={() => setProject(item.id)} />)}</View>
+      <View style={s.choices}>{projects.map(item => <Button key={item.id} title={item.name} secondary={selectedProject !== item.id} disabled={locked} onPress={() => { setProject(item.id); setSyncError(""); }} />)}</View>
+      {detail ? <Text style={s.note}>Synced from laptop {ago(detail.sync.lastSyncedAt)} · applied {ago(detail.sync.appliedAt)}{detail.sync.pendingGeneration ? ` · pending: ${detail.sync.pendingGeneration.reason === "session-running" ? "a session is running" : "cloud files changed"}` : ""}</Text> : null}
+      {detail?.sync.pendingGeneration && me?.role === "owner" ? <Button title={applying ? "Applying…" : detail.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"} secondary disabled={applying || !online} onPress={() => void applyPending(detail.sync.pendingGeneration!.reason === "cloud-changed")} /> : null}
+      {syncError ? <Text style={s.warning} accessibilityRole="alert">{syncError}</Text> : null}
       {me && !projects.length ? <Text style={s.warning}>Add an allowed project to this machine’s Infinite configuration first.</Text> : null}
       <Text style={s.label}>Agent</Text>
       <View style={s.choices}>{providers.map(value => <Button key={value} title={PROVIDER_NAMES[value]} secondary={selectedProvider !== value} disabled={locked} onPress={() => setProvider(value)} />)}</View>

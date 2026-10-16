@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { startHost, waitFor } from "./helpers.js";
 import { readSyncState, stopSyncService } from "../packages/host/src/sync-service.js";
@@ -45,6 +45,16 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
     assert.match(forced.stdout, /^synced \d+s ago · applied \d+s ago\n$/);
     assert.equal(readFileSync(join(host.config.projects[0].path, "file.txt"), "utf8"), "second\n");
     assert.equal(existsSync(join(host.config.projects[0].path, "cloud.txt")), false, "a forced apply replaces cloud edits");
+
+    // A failed apply shows its category and the retry command; the host cannot stage beside the project directory.
+    chmodSync(host.root, 0o500);
+    try {
+      writeFileSync(join(checkout, "file.txt"), "third\n");
+      await waitFor(() => host.fetchApi("/projects/rehearsal"), r => r.body.sync.pendingGeneration?.reason === "apply-failed", 30000);
+      const failure = /· pending \(apply failed: permission\. The host account cannot read, write, or remove part of the cloud project\.[^)]* Retry with infinite sync --apply\)/;
+      assert.match((await exec(process.execPath, [...cli, "projects"])).stdout, failure);
+      assert.match((await exec(process.execPath, [...cli, "sync", "--status"])).stdout, failure);
+    } finally { chmodSync(host.root, 0o700); }
 
     // Stopping and inspecting the local service work while the host is down.
     await host.stopApi();

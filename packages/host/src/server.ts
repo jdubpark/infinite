@@ -19,7 +19,7 @@ import { CmuxSessions } from "./cmux/index.js";
 import { CmuxError } from "./cmux/client.js";
 import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
 import { connectRemoteAccess } from "./remote-access.js";
-import { ProjectSync, ProjectSyncError } from "./project-sync.js";
+import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import type { Config, Role, Receipt } from "./types.js";
 
 const id = z.uuid();
@@ -664,11 +664,13 @@ export function createApp(config: Config, key: Buffer) {
   app.use(
     (
       error: unknown,
-      _req: express.Request,
+      req: express.Request,
       res: express.Response,
       _next: express.NextFunction,
     ) => {
-      if (error instanceof ProjectSyncError) return res.status(error.status).json({ code: error.code, error: error.message });
+      // `error` carries the message every client displays; a failed sync operation also names its category.
+      if (error instanceof ProjectSyncError)
+        return res.status(error.status).json({ code: error.code, error: error.message, ...(error.category ? { category: error.category, message: error.message } : {}) });
       if (error instanceof ContentError) return res.status(error.status).json({ error: error.message });
       if (error instanceof z.ZodError)
         return res.status(400).json({
@@ -678,12 +680,17 @@ export function createApp(config: Config, key: Buffer) {
             message: i.message,
           })),
         });
-      if ((error as NodeJS.ErrnoException).code === "ENOENT")
-        return res.status(404).json({ error: "Session not found" });
       if ((error as { type?: string }).type === "entity.too.large")
         return res.status(413).json({ error: "Request body is too large" });
       if (error instanceof SyntaxError)
         return res.status(400).json({ error: "Invalid JSON" });
+      // Workspace sync failures are about the project tree, not a session; their category never names a path.
+      if (/^\/api\/projects\/[^/]+\/sync\//.test(req.path)) {
+        const failure = syncFailure(error);
+        return res.status(409).json({ code: "sync-failed", category: failure.category, error: failure.message, message: failure.message });
+      }
+      if ((error as NodeJS.ErrnoException).code === "ENOENT")
+        return res.status(404).json({ error: "Session not found" });
       if (["control-busy", "control-lost"].includes((error as WorkerError).code ?? ""))
         return res.status(409).json({
           code: (error as WorkerError).code,

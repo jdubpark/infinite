@@ -3,7 +3,7 @@ import { Alert, KeyboardAvoidingView, ScrollView, StyleSheet, Text, TextInput, V
 import { useRouter } from "expo-router";
 import * as Crypto from "expo-crypto";
 import { PROVIDER_NAMES } from "@infinite/attention";
-import { ago, api, ApiError, connectionKey, type Connection, type Me, type ProjectDetail, type SessionRow } from "../../api/client";
+import { ago, api, ApiError, connectionKey, pendingLabel, type Connection, type Me, type ProjectDetail, type SessionRow } from "../../api/client";
 import { creations } from "../../store/requests";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
@@ -77,7 +77,7 @@ export function Create({ connection }: { connection: Connection }) {
       <View style={s.choices}>{(me?.backends ?? ["infinite"]).map(value => <Button key={value} title={value === "cmux" ? "cmux" : "Infinite"} secondary={backend !== value} disabled={locked} onPress={() => { setBackend(value); setProvider(undefined); }} />)}</View>
       <Text style={s.label}>Project</Text>
       <View style={s.choices}>{projects.map(item => <Button key={item.id} title={item.name} secondary={selectedProject !== item.id} disabled={locked} onPress={() => { setProject(item.id); setSyncError(""); }} />)}</View>
-      {detail ? <Text style={s.note}>Synced from laptop {ago(detail.sync.lastSyncedAt)} · applied {ago(detail.sync.appliedAt)}{detail.sync.pendingGeneration ? ` · pending: ${detail.sync.pendingGeneration.reason === "session-running" ? "a session is running" : "cloud files changed"}` : ""}</Text> : null}
+      {detail ? <Text style={s.note}>Synced from laptop {ago(detail.sync.lastSyncedAt)} · applied {ago(detail.sync.appliedAt)}{detail.sync.pendingGeneration ? ` · pending: ${pendingLabel(detail.sync.pendingGeneration)}` : ""}</Text> : null}
       {detail?.sync.pendingGeneration && me?.role === "owner" ? <Button title={applying ? "Applying…" : detail.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"} secondary disabled={applying || !online} onPress={() => confirmApply(detail.sync.pendingGeneration!.reason === "cloud-changed")} /> : null}
       {syncs && syncError ? <Text style={s.warning} accessibilityRole="alert">{syncError}</Text> : null}
       {me && !projects.length ? <Text style={s.warning}>Add an allowed project to this machine’s Infinite configuration first.</Text> : null}

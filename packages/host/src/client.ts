@@ -377,9 +377,16 @@ function age(iso?: string) {
   const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
   return seconds < 60 ? `${seconds}s ago` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : `${Math.floor(seconds / 3600)}h ago`;
 }
-type ProjectDetail = { id: string; name: string; sync: { lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: { reason: string; receivedAt: string } } };
+type Pending = { reason: string; receivedAt: string; capturedAt?: string; category?: string; message?: string };
+type ProjectDetail = { id: string; name: string; sync: { lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: Pending } };
+function describePending(pending: Pending) {
+  if (pending.reason === "session-running") return "session running";
+  if (pending.reason === "cloud-changed") return "cloud changed; use infinite sync --apply --force or infinite pull";
+  if (pending.reason === "apply-failed") return `apply failed: ${clean(pending.category ?? "other")}${pending.message ? `. ${clean(pending.message)}` : ""} Retry with infinite sync --apply`;
+  return clean(pending.reason);
+}
 function describeSync(sync: ProjectDetail["sync"]) {
-  const pending = sync.pendingGeneration ? ` · pending (${sync.pendingGeneration.reason === "session-running" ? "session running" : "cloud changed; use infinite sync --apply --force or infinite pull"})` : "";
+  const pending = sync.pendingGeneration ? ` · pending (${describePending(sync.pendingGeneration)})` : "";
   return `synced ${age(sync.lastSyncedAt)} · applied ${age(sync.appliedAt)}${pending}`;
 }
 

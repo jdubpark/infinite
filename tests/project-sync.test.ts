@@ -262,7 +262,7 @@ test("the cloud .infinite/ wins over a laptop copy", async () => {
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test("a failed apply leaves no stale pending marker", async () => {
+test("a failed apply keeps the newest generation pending with a sanitized category", async () => {
   const f = fixture();
   try {
     writeFileSync(join(f.laptop, "a.txt"), "1\n");
@@ -272,17 +272,25 @@ test("a failed apply leaves no stale pending marker", async () => {
     // The next generation fails while the host scans a cloud file it cannot read.
     writeFileSync(join(f.cloud, "unreadable.txt"), "x\n", { mode: 0o000 });
     writeFileSync(join(f.laptop, "a.txt"), "3\n");
-    await assert.rejects(push(f, false, second.manifest));
+    const refusedScan = (error: ProjectSyncError) => error.code === "apply-failed" && error.category === "permission" && !error.message.includes(f.root);
+    await assert.rejects(push(f, false, second.manifest), refusedScan);
     let status = f.sync.status("example");
-    assert.equal(status.pendingGeneration, undefined, "no marker names the older generation");
-    assert.notEqual(status.lastSyncedManifest, status.appliedManifest);
-    // A forced apply that fails while staging clears the marker for the newest generation.
+    assert.equal(status.pendingGeneration?.reason, "apply-failed");
+    assert.equal(status.pendingGeneration?.category, "permission");
+    assert.equal(status.pendingGeneration?.id, status.lastSyncedManifest, "the marker names the newest generation");
+    assert.ok(status.pendingGeneration?.message && !status.pendingGeneration.message.includes(f.root), "the message never names a host path");
+    // A forced apply that fails while staging keeps the marker for the newest generation.
     await assert.rejects(f.sync.apply("example", { running: busy }), (error: ProjectSyncError) => error.code === "session-running");
     chmodSync(f.root, 0o500);
-    await assert.rejects(f.sync.apply("example", { running: idle, force: true }), (error: NodeJS.ErrnoException) => error.code === "EACCES");
+    await assert.rejects(f.sync.apply("example", { running: idle, force: true }), (error: ProjectSyncError) => error.code === "apply-failed" && error.category === "permission");
     assert.equal(f.sync.applying("example"), false, "a failed publication does not keep refusing new sessions");
     status = f.sync.status("example");
-    assert.equal(status.pendingGeneration, undefined);
+    assert.deepEqual([status.pendingGeneration?.reason, status.pendingGeneration?.category], ["apply-failed", "permission"]);
     assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "1\n");
+    // Once the cause is fixed, an explicit apply clears the marker.
+    chmodSync(f.root, 0o700);
+    const applied = await f.sync.apply("example", { running: idle, force: true });
+    assert.equal(applied.pendingGeneration, undefined);
+    assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "3\n");
   } finally { chmodSync(f.root, 0o700); rmSync(f.root, { recursive: true, force: true }); }
 });

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
@@ -174,4 +174,30 @@ test("a running session whose worker does not answer still holds the next genera
     if (worker) process.kill(worker, "SIGCONT");
     await host.stop(); rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("a failed apply answers a sync-specific refusal and keeps the generation pending", { timeout: 60000 }, async () => {
+  const host = await startHost();
+  const root = realpathSync(mkdtempSync("/tmp/inf-psync-fail-"));
+  const laptop = join(root, "laptop"); mkdirSync(laptop);
+  const storeDir = join(root, "store");
+  try {
+    writeFileSync(join(laptop, "notes.md"), "v1\n");
+    assert.equal((await pushTree(host, laptop, storeDir)).commit.status, 200);
+    // The host cannot create its stage beside the project directory.
+    chmodSync(host.root, 0o500);
+    writeFileSync(join(laptop, "notes.md"), "v2\n");
+    const { manifest, commit } = await pushTree(host, laptop, storeDir);
+    assert.equal(commit.status, 409);
+    assert.deepEqual({ code: commit.body.code, category: commit.body.category }, { code: "apply-failed", category: "permission" });
+    assert.equal(commit.body.error, commit.body.message);
+    assert.ok(!commit.body.error.includes(host.root), "the refusal never names a host path");
+    const detail = await host.fetchApi("/projects/rehearsal");
+    assert.deepEqual([detail.body.sync.pendingGeneration?.reason, detail.body.sync.pendingGeneration?.category, detail.body.sync.pendingGeneration?.id], ["apply-failed", "permission", manifest.id]);
+    chmodSync(host.root, 0o700);
+    const applied = await host.fetchApi("/projects/rehearsal/sync/apply", "owner", {});
+    assert.equal(applied.status, 200);
+    assert.equal(applied.body.pendingGeneration, undefined);
+    assert.equal(readFileSync(join(host.config.projects[0].path, "notes.md"), "utf8"), "v2\n");
+  } finally { chmodSync(host.root, 0o700); await host.stop(); rmSync(root, { recursive: true, force: true }); }
 });

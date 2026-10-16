@@ -12,7 +12,7 @@ It records its pid, root, and last commit beside the private client configuratio
 
 `infinite sync --stop` signals the recorded pid only after confirming that the process still runs as the sync service, then removes the record. `infinite sync --status` lists each project's local service and, when the host answers, its sync state. Both work without reaching the host. A record whose process is gone, after a crash or reboot, is reported as stale.
 
-Transient failures are retried every few seconds, and `--status` shows the current problem. A host refusal with 401, 403, or 404, such as a revoked device key or a removed project, stops the service. It does not run unless the owner started it.
+Failures are retried, and `--status` shows the current problem. After a failed commit, the next attempt waits twice as long as the last one, from 3 seconds up to 5 minutes, until a commit succeeds. When the host keeps a generation but cannot apply it for a reason the same content would meet again (`apply-failed` with category `permission`, `cross-device`, `special-file`, or `missing-path`), the service does not push that content again. It pushes the next laptop change, and it clears its problem once an explicit apply or a reset on the host replaces the failure marker. A host refusal with 401, 403, 404, or 413, such as a revoked device key, a removed project, or a manifest over the host's bound, stops the service. It does not run unless the owner started it.
 
 ## Host side
 
@@ -22,7 +22,7 @@ The host verifies each chunk against its hash and accepts request bodies up to 1
 
 A committed manifest is **applied** when no cloud session is running or starting in that project and the live cloud tree still matches the scan the host took right after the last apply. The comparison ignores the Infinite-owned `.infinite/` directory. Before the first apply, the directory must be empty apart from `.infinite/`. A manifest whose entries equal the applied generation is recorded as applied without replacing the tree.
 
-Applying materializes the tree in a sibling stage directory, moves the current directory to `.NAME.infinite-previous` (replacing the older copy), and renames the stage into place. The cloud project's `.infinite/` directory moves into the new tree. A `.infinite/` directory from the laptop is discarded, so the cloud copy wins. If a step fails, the live tree and its `.infinite/` directory are moved back and the error is reported. After a successful apply the host scans the new tree, and that scan is the reference for the next drift check. The host refuses a project path that is the filesystem root, the host account's home directory, or a directory holding the host's own state.
+Applying materializes the tree in a sibling stage directory, moves the current directory to `.NAME.infinite-previous` (replacing the older copy), and renames the stage into place. The cloud project's `.infinite/` directory moves into the new tree. A `.infinite/` directory from the laptop is discarded, so the cloud copy wins. If a step fails, the live tree and its `.infinite/` directory are moved back and the generation stays pending with reason `apply-failed`. After a successful apply the host scans the new tree, and that scan is the reference for the next drift check. The host refuses a project path that is the filesystem root, the host account's home directory, or a directory holding the host's own state.
 
 When cloud agents run under a different Unix account from the host, as in the [Ubuntu template](../deploy/ubuntu/README.md#separate-identities-and-directories), the applied tree must be writable by the agent and every file the agent creates must stay readable and removable by the host. The host materializes for a shared group when the project directory's parent has the setgid bit or the config sets `sync.sharedGroup: true`: directories 2770, files group read/write, and group execute where the laptop file is executable. Otherwise files keep the laptop's modes. A default ACL granting the group `rwx` must sit on that parent, because each apply renames a tree staged beside the project directory into place and new directories inherit the parent's default ACL. Without it, files an agent creates under `umask 077` block drift scans and the next apply. `.infinite/` must stay writable by the host, which moves it into each new tree. The agent account also needs a scoped Git `safe.directory` entry, since the host owns the repository.
 
@@ -34,14 +34,26 @@ A manifest that cannot be applied stays **pending** with a reason. The pending m
 | --- | --- | --- |
 | `session-running` | A cloud session is running or starting in this project | After it exits: `infinite sync --apply`, **Apply now** on web or phone, or the next laptop change |
 | `cloud-changed` | The cloud tree differs from the scan taken after the last apply, or the directory was not empty before the first apply | `infinite pull` to save the cloud copy, then `infinite sync --apply --force` or **Replace cloud files** on web or phone |
+| `apply-failed` | The drift scan or the swap failed; `category` and `message` say why | Fix the cause, then `infinite sync --apply`, **Apply now** on web or phone, or the next laptop change |
 
-`--force` skips the drift check and the identical-manifest shortcut; a running session still refuses the apply. A forced apply therefore replaces the tree even when the manifest matches the applied generation, which resets cloud edits to the laptop content. An explicit apply that is refused answers `409` with the reason as its code and leaves the generation pending.
+An `apply-failed` marker carries a `category` and a fixed `message` that never names a host path:
 
-`GET /api/projects/:id` returns the project's `id`, `name`, and a `sync` object. `lastSyncedAt` and `lastSyncedManifest` describe the newest received generation, `appliedAt` and `appliedManifest` the generation in place, and `pendingGeneration` (`id`, `capturedAt`, `receivedAt`, `reason`) a waiting one. Any paired role can read it. `infinite projects` and `infinite sync --status` print a summary of it: sync age, apply age, and the pending reason.
+| Category | Typical cause |
+| --- | --- |
+| `permission` | The host account cannot read, write, or remove part of the tree, such as an agent-created file without group access |
+| `cross-device` | The project directory is a mount point or spans filesystems, so it cannot be renamed |
+| `no-space` | The host ran out of disk space or quota |
+| `special-file` | A device or FIFO stood where the host expected a regular file |
+| `missing-path` | The project directory is missing |
+| `other` | Anything else, such as the cloud tree changing during the scan |
+
+`--force` skips the drift check and the identical-manifest shortcut; a running session still refuses the apply. A forced apply therefore replaces the tree even when the manifest matches the applied generation, which resets cloud edits to the laptop content. An explicit apply that is refused answers `409` with the reason as its code and leaves the generation pending. A failed apply answers `409` with code `apply-failed`, its `category`, and the message in `error` and `message`. Any other failure on a sync route answers `409` with code `sync-failed` and a category, never the session refusal text.
+
+`GET /api/projects/:id` returns the project's `id`, `name`, and a `sync` object. `lastSyncedAt` and `lastSyncedManifest` describe the newest received generation, `appliedAt` and `appliedManifest` the generation in place, and `pendingGeneration` (`id`, `capturedAt`, `receivedAt`, `reason`, and for `apply-failed` also `category` and `message`) a waiting one. Any paired role can read it. `infinite projects` and `infinite sync --status` print a summary of it: sync age, apply age, and the pending reason.
 
 ## Clients
 
-On a cloud host, the web and phone Create screens show the selected project's sync age, apply age, and pending reason. Owners get **Apply now** for `session-running` and **Replace cloud files** for `cloud-changed`; the second asks for confirmation first. Laptop hosts hide sync state. The session view shows "Tools run on" the machine, or "your laptop" for `--laptop` execution, using the live executor location when the session reports one.
+On a cloud host, the web and phone Create screens show the selected project's sync age, apply age, and pending reason. Owners get **Apply now** for `session-running` and `apply-failed`, and **Replace cloud files** for `cloud-changed`; the second asks for confirmation first. An `apply-failed` line shows its category and message. Laptop hosts hide sync state. The session view shows "Tools run on" the machine, or "your laptop" for `--laptop` execution, using the live executor location when the session reports one.
 
 ## Pull
 

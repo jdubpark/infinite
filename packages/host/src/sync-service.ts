@@ -140,19 +140,37 @@ export async function startSyncService(options: SyncServiceOptions): Promise<voi
 }
 
 class FatalSyncError extends Error {}
+/** A refusal the host explained: its status and code, and for a failed sync operation, a category. */
+class SyncRequestError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string, readonly category?: string) { super(message); }
+}
+const POLL = 3000;
+const BACKOFF_LIMIT = 5 * 60 * 1000;
+/** Apply failures the same content meets again; it is not pushed again until the laptop changes or the owner applies it. */
+const LASTING = new Set(["permission", "cross-device", "special-file", "missing-path"]);
+async function refusal(response: Response): Promise<never> {
+  const reply = await response.json().catch(() => ({})) as { error?: unknown; code?: unknown; category?: unknown };
+  const reason = typeof reply.error === "string" ? reply.error : `HTTP ${response.status}`;
+  // A revoked key, a removed project, or a manifest over the host's bound will not recover by retrying.
+  if ([401, 403, 404, 413].includes(response.status)) throw new FatalSyncError(`Host refused sync (${response.status}): ${reason}`);
+  throw new SyncRequestError(reason, response.status, typeof reply.code === "string" ? reply.code : undefined, typeof reply.category === "string" ? reply.category : undefined);
+}
 async function api<T>(options: SyncServiceOptions, path: string, signal: AbortSignal, body: unknown, raw?: Buffer, timeout = 60000): Promise<T> {
   const response = await fetch(`${options.origin}/api/projects/${options.projectId}/sync/${path}`, {
     method: raw ? "PUT" : "POST", redirect: "error", signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
     headers: { Authorization: `Bearer ${options.token}`, "Content-Type": raw ? "application/octet-stream" : "application/json" },
     body: raw ? new Uint8Array(raw) : JSON.stringify(body),
   });
-  if (!response.ok) {
-    const reply = await response.json().catch(() => ({})) as { error?: unknown };
-    const reason = typeof reply.error === "string" ? reply.error : `HTTP ${response.status}`;
-    // A revoked key or a removed project will not recover by retrying.
-    throw [401, 403, 404].includes(response.status) ? new FatalSyncError(`Host refused sync (${response.status}): ${reason}`) : new Error(reason);
-  }
+  if (!response.ok) await refusal(response);
   return await response.json() as T;
+}
+async function pendingReason(options: SyncServiceOptions, signal: AbortSignal): Promise<string | undefined> {
+  const response = await fetch(`${options.origin}/api/projects/${options.projectId}`, {
+    redirect: "error", signal: AbortSignal.any([signal, AbortSignal.timeout(60000)]), headers: { Authorization: `Bearer ${options.token}` },
+  });
+  if (!response.ok) await refusal(response);
+  const reason = ((await response.json()) as { sync?: { pendingGeneration?: { reason?: unknown } } }).sync?.pendingGeneration?.reason;
+  return typeof reason === "string" ? reason : undefined;
 }
 
 async function runSyncService(): Promise<void> {
@@ -199,16 +217,20 @@ async function runSyncService(): Promise<void> {
     writeState(config.stateFile, state);
     // After a stop removed the file, a late write must not bring it back.
     const record = () => { if (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) writeState(config.stateFile, state); };
-    let previous: WorkspaceManifest | undefined, committed: string | undefined, lastFull = 0, failures = 0;
+    const ready = () => { if (!reported) { reported = true; process.send?.({ type: "ready" }, error => { if (error) stop(); }); } };
+    // `held`: the host kept the last pushed content but cannot apply it for a lasting reason.
+    let previous: WorkspaceManifest | undefined, committed: string | undefined, lastFull = 0, failures = 0, pushFailures = 0, held = false;
     while (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) {
+      let content: string | undefined, pushing = false;
       try {
         const forceFull = Date.now() - lastFull > 60000;
         progress();
         const manifest = await captureWorkspace({ roots: [config.root], cwd: config.root, storeDir: config.storeDir, signal: abort.signal, previous, forceFull, onProgress: progress });
         previous = manifest;
         if (forceFull) lastFull = Date.now();
-        const content = fingerprint(manifest);
+        content = fingerprint(manifest);
         if (content !== committed) {
+          pushing = true; held = false;
           progress();
           const { generation } = await api<{ generation: string }>(config, "begin", abort.signal, {});
           const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
@@ -227,20 +249,31 @@ async function runSyncService(): Promise<void> {
           const heartbeat = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
           try { await api(config, "commit", abort.signal, { generation, manifest }, undefined, COMMIT_TIMEOUT); }
           finally { clearInterval(heartbeat); }
-          committed = content;
+          committed = content; pushFailures = 0;
           state.lastCommitAt = new Date().toISOString(); state.lastManifest = manifest.id; delete state.problem;
           record();
+        } else if (held) {
+          // An explicit apply on the host, or a reset, replaces the failure marker; then normal pushing resumes.
+          if (await pendingReason(config, abort.signal) !== "apply-failed") { held = false; pushFailures = 0; delete state.problem; record(); }
         } else if (state.problem) { delete state.problem; record(); }
         failures = 0;
-        if (!reported) { reported = true; process.send?.({ type: "ready" }, error => { if (error) stop(); }); }
+        ready();
       } catch (error) {
         if (abort.signal.aborted) break;
         if (error instanceof FatalSyncError) { reason = error.message; break; }
         failures += 1;
-        state.problem = (error instanceof Error ? error.message : "Workspace sync is retrying").slice(0, 200); record();
-        if (!reported && failures > 5) { reason = state.problem; break; }
+        if (pushing) pushFailures += 1;
+        // A held apply failure stays the reported problem until it is resolved or new content is pushed.
+        if (!held || pushing) state.problem = (error instanceof Error ? error.message : "Workspace sync is retrying").slice(0, 200);
+        // The host received this content and kept it pending; pushing the same content again would fail the same way.
+        if (pushing && error instanceof SyncRequestError && error.code === "apply-failed" && LASTING.has(error.category ?? "")) { committed = content; held = true; }
+        record();
+        if (held) ready();
+        else if (!reported && failures > 5) { reason = state.problem; break; }
       }
-      await delay(3000, undefined, { signal: abort.signal }).catch(() => {});
+      // After startup, consecutive failed pushes back off exponentially, from the poll interval to five minutes.
+      const wait = reported && pushFailures ? Math.min(BACKOFF_LIMIT, POLL * 2 ** (pushFailures - 1)) : POLL;
+      await delay(wait, undefined, { signal: abort.signal }).catch(() => {});
     }
   } catch (error) { process.exitCode = 1; if (error instanceof Error && error.message !== STARTUP_ERROR) reason ??= error.message; }
   finally {

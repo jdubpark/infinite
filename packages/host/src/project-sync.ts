@@ -6,17 +6,24 @@ import { basename, dirname, join, resolve } from "node:path";
 import { unseal, writeSealed } from "./vault.js";
 import {
   captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob,
-  validateWorkspaceManifest, type WorkspaceEntry, type WorkspaceManifest,
+  validateWorkspaceManifest, WorkspaceCaptureChangedError, type WorkspaceEntry, type WorkspaceManifest,
 } from "./workspace-checkpoint.js";
 import type { Config } from "./types.js";
 
+export type SyncFailureCategory = "permission" | "cross-device" | "no-space" | "special-file" | "missing-path" | "other";
+export interface PendingGeneration {
+  id: string; capturedAt: string; receivedAt: string;
+  reason: "session-running" | "cloud-changed" | "apply-failed";
+  /** Set for `apply-failed`: a fixed category and message that never name a path. */
+  category?: SyncFailureCategory; message?: string;
+}
 export interface ProjectSyncStatus {
   projectId: string;
   lastSyncedAt?: string;
   lastSyncedManifest?: string;
   appliedAt?: string;
   appliedManifest?: string;
-  pendingGeneration?: { id: string; capturedAt: string; receivedAt: string; reason: "session-running" | "cloud-changed" };
+  pendingGeneration?: PendingGeneration;
 }
 type Received = { manifest: WorkspaceManifest; receivedAt: string; generation: string };
 /**
@@ -29,9 +36,33 @@ export type RunningCheck = () => Promise<boolean>;
 type Applied = { manifest: WorkspaceManifest; appliedAt: string; baseline?: WorkspaceManifest };
 
 export class ProjectSyncError extends Error {
-  constructor(message: string, readonly code: "cloud-changed" | "session-running" | "sync-applying" | "stale-generation" | "missing-content" | "invalid-manifest" | "unknown-project", readonly status = 409) {
+  constructor(message: string, readonly code: "cloud-changed" | "session-running" | "apply-failed" | "sync-failed" | "sync-applying" | "stale-generation" | "missing-content" | "invalid-manifest" | "unknown-project",
+    readonly status = 409, readonly category?: SyncFailureCategory) {
     super(message);
   }
+}
+
+const FAILURES: Record<SyncFailureCategory, string> = {
+  permission: "The host account cannot read, write, or remove part of the cloud project. Check its owner, group, and default ACL.",
+  "cross-device": "The cloud project directory is a mount point or spans filesystems, so the host cannot replace it.",
+  "no-space": "The host ran out of disk space or quota.",
+  "special-file": "The cloud project holds a socket, FIFO, or device file the host cannot read.",
+  "missing-path": "The cloud project directory is missing.",
+  other: "The host could not complete the workspace sync operation.",
+};
+/**
+ * A filesystem error as a category and a fixed message, never the raw error text, which names host paths.
+ * `ENOENT` means a missing project only when the project directory itself is gone.
+ */
+export function syncFailure(error: unknown, projectPath?: string): { category: SyncFailureCategory; message: string } {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code ?? "";
+  const missing = projectPath !== undefined && ["ENOENT", "ENOTDIR"].includes(code) && !existsSync(projectPath);
+  const category: SyncFailureCategory = ["EACCES", "EPERM", "EROFS"].includes(code) ? "permission"
+    : ["EXDEV", "EBUSY"].includes(code) ? "cross-device"
+    : ["ENOSPC", "EDQUOT"].includes(code) ? "no-space"
+    : ["ENXIO", "ENODEV"].includes(code) ? "special-file"
+    : missing ? "missing-path" : "other";
+  return { category, message: error instanceof WorkspaceCaptureChangedError ? "The cloud project changed while the host scanned it." : FAILURES[category] };
 }
 
 const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
@@ -98,9 +129,9 @@ export class ProjectSync {
   private readPending(projectId: string) {
     const file = join(this.dir(projectId), "pending.json");
     if (!existsSync(file)) return undefined;
-    return JSON.parse(readFileSync(file, "utf8")) as ProjectSyncStatus["pendingGeneration"];
+    return JSON.parse(readFileSync(file, "utf8")) as PendingGeneration;
   }
-  private writePending(projectId: string, value: ProjectSyncStatus["pendingGeneration"] | undefined) {
+  private writePending(projectId: string, value: PendingGeneration | undefined) {
     const file = join(this.dir(projectId), "pending.json");
     if (!value) { rmSync(file, { force: true }); return; }
     writeJson(file, value);
@@ -172,8 +203,21 @@ export class ProjectSync {
       return this.status(projectId);
     };
     if (await options.running()) return pending("session-running");
-    if (!options.force && await this.drifted(projectId, project.path, applied)) return pending("cloud-changed");
-    const target = await this.projectRoot(project.path);
+    try {
+      if (!options.force && await this.drifted(projectId, project.path, applied)) return pending("cloud-changed");
+      return await this.publish(projectId, project.path, received);
+    } catch (error) {
+      if (error instanceof ProjectSyncError) throw error;
+      // The generation stays received and pending with a reason; a later laptop change or an explicit apply retries it.
+      const failure = syncFailure(error, project.path);
+      this.writePending(projectId, { id: received.manifest.id, capturedAt: received.manifest.capturedAt, receivedAt: received.receivedAt, reason: "apply-failed", ...failure });
+      throw new ProjectSyncError(failure.message, "apply-failed", 409, failure.category);
+    }
+  }
+
+  /** Replace the project tree with the received generation and record it as applied. */
+  private async publish(projectId: string, path: string, received: Received): Promise<ProjectSyncStatus> {
+    const target = await this.projectRoot(path);
     const parent = dirname(target), name = basename(target);
     const stage = join(parent, `.${name}.infinite-stage-${randomUUID()}`);
     const previous = join(parent, `.${name}.infinite-previous`);
@@ -192,7 +236,6 @@ export class ProjectSync {
       // Put the live tree and Infinite's own directory back before the stage is discarded.
       if (retired) await rename(previous, target).catch(() => {});
       if (carried) await rename(carried, owned).catch(() => {});
-      this.writePending(projectId, undefined);
       throw error;
     } finally { await removeTree(stage).catch(() => {}); }
     // Drift compares against what materialize actually wrote: resolved symlink targets and this host's symlink modes.

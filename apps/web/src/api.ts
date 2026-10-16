@@ -113,7 +113,15 @@ export function connectApi(connection: Connection): { api: Api; close: () => voi
 export type ChatMessage = { id: string; role: string; text: string; toolName?: string; ts?: string };
 export type MessagesPage = { messages: ChatMessage[]; cursor: string | number; more?: boolean; source?: string; available?: boolean };
 export type ProjectFile = { path: string; name: string; text?: string; mimeType: string; size: number; modifiedAt: string; base64?: string };
-export type ProjectSyncStatus = { projectId: string; lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: { id: string; capturedAt: string; receivedAt: string; reason: "session-running" | "cloud-changed" } };
+export type PendingGeneration = { id: string; capturedAt: string; receivedAt: string; reason: "session-running" | "cloud-changed" | "apply-failed"; category?: string; message?: string };
+export type ProjectSyncStatus = { projectId: string; lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: PendingGeneration };
+/** Why a laptop generation waits, in the words the Create screen shows. */
+export function pendingLabel(pending: PendingGeneration) {
+  if (pending.reason === "session-running") return "a session is running";
+  if (pending.reason === "cloud-changed") return "cloud files changed";
+  if (pending.reason === "apply-failed") return `apply failed (${pending.category ?? "other"})${pending.message ? `: ${pending.message}` : ""}`;
+  return "waiting to apply";
+}
 export type ProjectDetail = { id: string; name: string; sync: ProjectSyncStatus };
 export function ago(iso?: string, now = Date.now()) {
   if (!iso) return "never";

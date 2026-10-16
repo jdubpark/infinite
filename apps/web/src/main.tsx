@@ -22,7 +22,7 @@ import {
   TerminalSquare,
   WifiOff,
 } from "lucide-react";
-import { useApi, ago, ApiError, isControlRefusal, names, type ControlLease, type Me, type ProjectDetail, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
+import { useApi, ago, ApiError, isControlRefusal, names, pendingLabel, type ControlLease, type Me, type ProjectDetail, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
 import { clearDrafts, readDraft, settleDraft, useSessionDraft, writeDraft, type PendingInput } from "./drafts";
 import { creations, lifecycles } from "./requests";
 import { MachinePicker, MachineProvider, useMachines } from "./machines";
@@ -643,7 +643,7 @@ function Create({
           {syncs && project && (
             <p className="quiet" role="status">
               Synced from laptop {ago(project.sync.lastSyncedAt)} · applied {ago(project.sync.appliedAt)}
-              {project.sync.pendingGeneration && <> · pending: {project.sync.pendingGeneration.reason === "session-running" ? "a session is running" : "cloud files changed"}{" "}
+              {project.sync.pendingGeneration && <> · pending: {pendingLabel(project.sync.pendingGeneration)}{" "}
                 {me.role === "owner" && <button type="button" className="text-button" disabled={applying || !connected} onClick={() => void applyPending(project.sync.pendingGeneration!.reason === "cloud-changed")}>
                   {applying ? "Applying…" : project.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"}</button>}</>}
             </p>

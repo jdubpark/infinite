@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { startSyncService, readSyncState, stopSyncService } from "../packages/host/src/sync-service.js";
+import { ProjectSyncError } from "../packages/host/src/project-sync.js";
 import { inProcessHost, startHost, waitFor } from "./helpers.js";
 
 test("the detached sync service pushes edits, stays pending while a session runs, and stops on request", { timeout: 90000 }, async () => {
@@ -65,6 +66,50 @@ test("a first upload that outlasts the startup inactivity bound completes while 
     assert.ok(Date.now() - started > 3 * bound, "the first upload outlasted the inactivity bound");
     assert.equal(readFileSync(join(host.config.projects[0].path, "d1/f99.txt"), "utf8"), "1:99\n");
   } finally {
+    if (existsSync(stateFile)) stopSyncService(stateFile);
+    await host.stop(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("failed commits back off, and a lasting apply failure holds the content until an explicit apply", { timeout: 120000 }, async () => {
+  const host = await inProcessHost();
+  const root = realpathSync(mkdtempSync("/tmp/inf-syncsvc-"));
+  const laptop = join(root, "laptop"); mkdirSync(laptop);
+  const stateFile = join(root, "sync", "rehearsal.json");
+  const commit = host.projectSync.commit.bind(host.projectSync);
+  const detail = async () => (await host.fetchApi("/projects/rehearsal")).body.sync;
+  try {
+    writeFileSync(join(laptop, "app.ts"), "one\n");
+    await startSyncService({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal", root: laptop, stateFile, storeDir: join(root, "sync", "rehearsal-store") });
+
+    // A transient refusal is retried with the same content, each wait longer than the last.
+    const attempts: number[] = [];
+    host.projectSync.commit = (async () => { attempts.push(Date.now()); throw new ProjectSyncError("The host is busy", "apply-failed", 409, "other"); }) as typeof commit;
+    writeFileSync(join(laptop, "app.ts"), "two\n");
+    await waitFor(async () => attempts.length, count => count >= 3, 40000);
+    const [first, second] = [attempts[1] - attempts[0], attempts[2] - attempts[1]];
+    assert.ok(second - first >= 2000, `retries back off (${first} ms, then ${second} ms)`);
+    stopSyncService(stateFile);
+    host.projectSync.commit = commit;
+
+    // A lasting failure: the host cannot create its stage beside the project directory.
+    await startSyncService({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal", root: laptop, stateFile, storeDir: join(root, "sync", "rehearsal-store") });
+    chmodSync(host.root, 0o500);
+    writeFileSync(join(laptop, "app.ts"), "three\n");
+    const failed = await waitFor(detail, sync => sync.pendingGeneration?.reason === "apply-failed", 20000);
+    assert.equal(failed.pendingGeneration.category, "permission");
+    await waitFor(async () => readSyncState(stateFile)?.problem, problem => Boolean(problem?.includes("cannot read, write, or remove")), 10000);
+    // The same content is not pushed again.
+    await delay(7000);
+    assert.equal((await detail()).lastSyncedAt, failed.lastSyncedAt);
+    chmodSync(host.root, 0o700);
+    assert.equal((await host.fetchApi("/projects/rehearsal/sync/apply", "owner", {})).status, 200);
+    assert.equal(readFileSync(join(host.config.projects[0].path, "app.ts"), "utf8"), "three\n");
+    // The service notices the explicit apply and clears its problem without another push.
+    await waitFor(async () => readSyncState(stateFile), state => Boolean(state && !state.problem), 20000);
+    assert.equal((await detail()).lastSyncedAt, failed.lastSyncedAt);
+  } finally {
+    chmodSync(host.root, 0o700);
     if (existsSync(stateFile)) stopSyncService(stateFile);
     await host.stop(); rmSync(root, { recursive: true, force: true });
   }

@@ -1,8 +1,8 @@
 # Hybrid execution and cloud handoff
 
-## Default flow
+## Laptop flow
 
-`infinite codex` uses the invoking laptop project by default. `--cloud` opts out and uses the configured cloud project. The conversation, provider history, model credentials, permissions and recording remain on one persistent cloud backend. Other providers retain their existing execution behavior.
+`infinite --laptop codex` uses the invoking laptop project. Without `--laptop`, Codex runs on the cloud project like every other provider; see [workspace sync](workspace-sync.md) for how that project is kept current. The conversation, provider history, model credentials, permissions and recording remain on one persistent cloud backend. `--laptop` is available for Codex only.
 
 The first tool does not wait for a repository scan or upload. A detached laptop service registers the actual launch directory before the original prompt starts. It prepares the complete selected project and explicit `--include` directories in the background. Closing the interface leaves that service running.
 
@@ -48,7 +48,7 @@ infinite recover SESSION_ID
 infinite recover SESSION_ID --output NEW_DIRECTORY
 ```
 
-Recovery authenticates the owner, verifies downloaded content, and creates a new directory. It prints the recovered cwd. Compare that copy with the original laptop tree to reconcile offline changes; existing files are never overwritten. Automatic conflict merging, applying a merged tree, and moving tools back to the laptop remain separate work. Reconnecting or recovering files does not resend a prompt.
+Recovery authenticates the owner, verifies downloaded content, and creates a new directory. It prints the recovered cwd. Compare that copy with the original laptop tree to reconcile offline changes; existing files are never overwritten. Automatic conflict merging, applying a merged tree, and moving tools back to the laptop remain separate work. Reconnecting or recovering files does not resend a prompt. For the configured cloud project itself, `infinite pull` downloads the current tree; see [workspace sync](workspace-sync.md#pull).
 
 ## Preparing the host
 
@@ -78,14 +78,14 @@ The [implementation plan](plans/2026-10-09-001-feat-seamless-hybrid-execution-pl
 
 The opt-in [prototype script](../scripts/hybrid-codex.mjs) keeps an existing Infinite Codex conversation on its cloud backend and attaches the current laptop as its execution environment. It uses the installed Codex execution server, Infinite's owner authentication and device control, and an authenticated loopback executor reached through a private SSH reverse tunnel. It does not upload a repository before starting work.
 
-This is a single-tenant development prototype. Use a disposable native Codex conversation and a fixture repository. The integrated default launch described above replaces this manual setup. The script retains its original behavior and does not use the checkpoint coordinator.
+This is a single-tenant development prototype. Use a disposable native Codex conversation and a fixture repository. The integrated `--laptop` launch described above replaces this manual setup. The script retains its original behavior and does not use the checkpoint coordinator.
 
 ## Run
 
 Create a native Codex conversation, let its first turn finish, and detach its interface. Keep its Infinite session ID. The chosen cloud project remains the conversation's administrative association; `--cwd` selects the laptop files used by the prototype.
 
 ```sh
-infinite --cloud --detach --local-ui --project PROJECT_ID codex "Describe the intended task; do not use tools yet."
+infinite --detach --local-ui --project PROJECT_ID codex "Describe the intended task; do not use tools yet."
 node scripts/hybrid-codex.mjs \
   --session SESSION_ID \
   --ssh USER@HOST \

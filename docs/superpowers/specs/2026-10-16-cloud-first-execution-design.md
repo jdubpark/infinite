@@ -35,7 +35,7 @@ Everything in this document applies to sessions started through `infinite`, the 
 ## Non-goals
 
 - Automatic migration of a running laptop process to the cloud in the default mode.
-- Two-way file sync or automatic merge of cloud changes back to the Mac. Pulling cloud changes uses the existing recovery download into a separate directory.
+- Two-way file sync or automatic merge of cloud changes back to the Mac. Pulling cloud changes uses a project-level download into a separate directory.
 - Copying browser cookies or keychains from the Mac.
 - Multi-tenant operator confidentiality. That gate is unchanged in `docs/multi-tenant.md`.
 - A native Mac app. The Mac connector is the web client, the `infinite` CLI, and the local native provider UIs.
@@ -63,16 +63,16 @@ A delegate key never creates, resumes, or stops a session, never edits configura
 
 ## Workspace sync
 
-The laptop service already built for hybrid preparation becomes the workspace sync service. It runs detached on the Mac, watches each configured project, and pushes the selected scope to the cloud workspace for that project in bounded SHA-256 chunks over the authenticated connection. Scope rules are unchanged from `docs/hybrid-execution.md`: Git decides the project root, `--include` adds directories, the whole scope travels including ignored and untracked files, and the home or filesystem root is refused.
+The laptop service already built for hybrid preparation becomes the workspace sync service. It runs detached on the Mac, watches each configured project, and pushes the selected scope to the cloud workspace for that project in bounded SHA-256 chunks over the authenticated connection. Scope rules follow `docs/hybrid-execution.md` with one restriction: project sync has one root, the Git root of the launch directory; `--include` belongs to `--laptop` execution. The whole scope travels including ignored and untracked files, and the home or filesystem root is refused.
 
 Differences from the hybrid preparer:
 
 - The cloud workspace is the executing copy. The synced tree is applied to the configured project directory as a new generation, not held as a standby checkpoint.
 - Sync is laptop to cloud only. While a session is running in that workspace, incoming generations are staged and listed as pending. Applying a pending generation is an explicit owner action on web, phone, or CLI, because applying it under a running tool would change files the agent is reading.
-- A project records `lastSyncedManifest`, `lastSyncedAt`, and `pendingGeneration`. `GET /api/projects/:id` returns them. All clients show sync age next to execution location.
+- A project records `lastSyncedManifest`, `lastSyncedAt`, and `pendingGeneration`. `GET /api/projects/:id` returns them. Sync age is shown in the project picker on the Create screen; the session view shows the execution location.
 - Publication epochs and takeover fencing are not used. There is one executor per workspace, and it is the cloud.
 
-Cloud changes return to the Mac through `infinite recover SESSION_ID --output DIRECTORY`, which is unchanged. Comparing and merging is the owner's work until the reconciliation units in `docs/plans/2026-10-09-001-feat-seamless-hybrid-execution-plan.md` are built.
+Cloud changes return to the Mac through `infinite pull PROJECT_ID --output DIRECTORY`, a project-level export. `infinite recover` stays for `--laptop` sessions. Comparing and merging is the owner's work until the reconciliation units in `docs/plans/2026-10-09-001-feat-seamless-hybrid-execution-plan.md` are built.
 
 ## Context bundle
 

@@ -2,7 +2,7 @@
 
 For web/phone creation across cloud and laptop machines, cmux discovery, and the outbound relay, see [remote machines](remote-machines.md). The commands below describe the separately installed terminal client. Host setup commands use `node packages/host/dist/cli.js`.
 
-The laptop CLI keeps provider conversations on the cloud host. Codex uses the current laptop project by default and prepares automatic cloud handoff in the background. `--cloud` selects the configured host workspace. Claude Code, Grok and OpenCode retain their cloud execution behavior. Detaching or losing the interface leaves the cloud conversation running.
+The laptop CLI keeps provider conversations and tools on the cloud host. `infinite sync` keeps the configured cloud project current with this checkout, one way. Codex can instead run tools in the current laptop project with `--laptop`, which prepares automatic cloud handoff in the background. Detaching or losing the interface leaves the cloud conversation running.
 
 Launch and attach report their current stage immediately, with elapsed time during longer waits. These messages go to stderr; JSON listings and detached session IDs remain machine-readable on stdout. Progress stops when native output takes over.
 
@@ -21,16 +21,16 @@ infinite resume 5ba58d55    # a unique Infinite session ID prefix also works
 infinite monitor           # choose a session to watch
 ```
 
-For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite --cloud codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
+For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
 
-## Laptop execution and automatic handoff
+## Laptop execution with `--laptop`
 
 Run inside the project you want Codex to inspect or change:
 
 ```sh
-infinite codex "Inspect this repository"
-infinite --include ../shared codex "Update this project and its shared library"
-infinite --detach codex "Run the checks"
+infinite --laptop codex "Inspect this repository"
+infinite --laptop --include ../shared codex "Update this project and its shared library"
+infinite --laptop --detach codex "Run the checks"
 infinite resume SESSION_ID
 ```
 
@@ -40,16 +40,32 @@ The laptop service survives CLI exit and native-interface detachment. `resume` a
 
 The conversation's tools use the laptop executor. Native-interface file-picker search, standalone shell shortcuts, and standalone Git helpers are currently refused because those provider APIs target the app-server filesystem. They need a separate laptop implementation before they can be enabled here. Detached launch reports success only after the provider has admitted its thread and the laptop is connected.
 
-Automatic handoff is enabled by default. The host must have the qualified backend prepared with `npm run prepare:codex`; a stock backend reports its missing capability. Once background preparation is ready, an outage continues from the verified checkpoint in the same conversation. An uncertain tool outcome pauses for reconciliation instead of being replayed. Checkpoint age and the current blocker appear on web and phone. `infinite --cloud codex` opts out of laptop execution and synchronization; `--laptop` remains a compatibility alias.
+Automatic handoff is part of `--laptop` mode. The host must have the qualified backend prepared with `npm run prepare:codex`; a stock backend reports its missing capability. Once background preparation is ready, an outage continues from the verified checkpoint in the same conversation. An uncertain tool outcome pauses for reconciliation instead of being replayed. Checkpoint age and the current blocker appear on web and phone. `--cloud` is accepted and has no effect; cloud execution is the default.
 
-`infinite codex` also supports an empty prompt. Its persistent terminal accepts the first real input; once history exists, native reattachment is available. No synthetic prompt is submitted.
+`infinite --laptop codex` also supports an empty prompt. Its persistent terminal accepts the first real input; once history exists, native reattachment is available. No synthetic prompt is submitted.
 
 After cloud handoff, `infinite recover SESSION_ID --output NEW_DIRECTORY` downloads a verified recovery copy and prints its cwd. Omit `--output` to use private client storage. The original laptop files remain available for comparison; tools stay in the cloud. See [scope, checkpoint semantics and platform limits](hybrid-execution.md).
+
+## Workspace sync and pull
+
+```sh
+infinite sync --project PROJECT_ID     # from inside the checkout; the Git root is synced
+infinite sync --status
+infinite sync --apply [--force] --project PROJECT_ID
+infinite sync --stop --project PROJECT_ID
+infinite pull PROJECT_ID --output NEW_DIRECTORY
+```
+
+`sync` starts a detached service that uploads the Git root of the current directory to the configured cloud project and keeps uploading changes every few seconds. Outside a Git repository it uploads the current directory. The whole scope travels, including ignored and untracked files; the home directory and filesystem root are refused, and `--include` is not available (use `--laptop` for multi-root laptop execution). The command returns after the first upload is committed; the service keeps running after the terminal closes and does not restart after a reboot. `--project` defaults to the paired project.
+
+A received generation is applied on the host when no cloud session is running or starting in that project and the cloud tree still matches its state right after the last apply. Otherwise it stays pending with a reason, shown by `infinite projects`, `infinite sync --status`, web, and phone. `--apply` applies a pending generation; `--force` replaces a cloud tree that changed since the last apply, but never overrides a running session. Every apply keeps the replaced tree beside the project as `.NAME.infinite-previous`, replacing the older copy. `--status` and `--stop` work while the host is unreachable; `--status` reports a record whose process is gone as stale.
+
+`pull` downloads the current cloud project tree into a new directory and prints its path. Omit `--output` to use private client storage; an existing destination is refused. It never writes into the checkout. Compare and merge by hand. Details: [workspace sync](workspace-sync.md).
 
 ## Experimental local Codex interface
 
 ```sh
-infinite --cloud --local-ui codex "Inspect this repository"
+infinite --local-ui codex "Inspect this repository"
 infinite resume SESSION_ID
 infinite --takeover resume SESSION_ID
 infinite monitor SESSION_ID
@@ -117,9 +133,9 @@ infinite --detach --project PROJECT_ID claude "Review this checkout"
 infinite --client-config /private/client.json monitor SESSION_ID
 ```
 
-Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not uploaded or translated. The CLI does not silently copy the current laptop checkout or its secrets.
+Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not uploaded or translated. The CLI does not silently copy the current laptop checkout or its secrets. Only `infinite sync` uploads a checkout, and only after the owner starts it.
 
-Default Codex launches use the laptop project and background cloud handoff described above. The earlier [SSH prototype](hybrid-execution.md#earlier-ssh-prototype) remains available for isolated protocol experiments and retains its original offline behavior.
+`--laptop` Codex launches use the laptop project and background cloud handoff described above. The earlier [SSH prototype](hybrid-execution.md#earlier-ssh-prototype) remains available for isolated protocol experiments and retains its original offline behavior.
 
 To preserve native command and flag semantics, native CLI launches do not append Infinite's shared context as another positional prompt or inject provider hook flags. The project context version is retained in the encrypted session record; repository instructions and the provider's native cloud history continue to work normally. Browser-created sessions retain the existing shared-prompt behavior. Screen-based attention remains available for new workers; workers launched before that feature omit attention metadata until explicitly replaced.
 

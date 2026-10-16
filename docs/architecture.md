@@ -6,7 +6,7 @@ The native UI and checkpoint requirements are refined in [native interaction and
 
 ## Execution model
 
-Codex defaults to the invoking laptop project while its conversation backend stays in the cloud. A detached service prepares verified project generations; the worker records executor activity and selects a fresh cloud environment after an eligible outage. Reconnecting keeps the same conversation and cloud placement. `--cloud` opts out; other providers keep their existing cloud execution. [Hybrid execution](hybrid-execution.md) defines checkpoint semantics, provider qualification, uncertainty and recovery.
+Every provider runs on the selected machine by default; `Session.executionLocation` records `cloud` or `laptop`. Codex accepts `--laptop`, which keeps the invoking laptop project as the executor while its conversation backend stays in the cloud, with background preparation and automatic handoff as described in [hybrid execution](hybrid-execution.md). The configured cloud project directory is kept current by the one-way [workspace sync](workspace-sync.md) service. Reconnecting keeps the same conversation and placement.
 
 ```mermaid
 flowchart LR
@@ -36,7 +36,7 @@ Terminal-native input can include arbitrary keyboard sequences over owner-only t
 
 Creation uses a client UUID as the logical session ID. The stored request fingerprint makes an identical retry return the existing session; a conflicting reuse fails. Creation does not automatically retry spawning after an ambiguous failure.
 
-New session metadata also pins a separate runtime UUID, execution location, and transport. Detaching and reconnecting never change that runtime. Authenticated Claude/Codex hooks may identify the native conversation; absence means unknown. Native argument passthrough does not inject hooks, so such sessions may have no native conversation mapping. This is not a portable recovery checkpoint or a complete provider-account binding.
+New session metadata also pins a separate runtime UUID, execution location, and transport. Records written before execution location was stored are reported as `laptop` when they carry a hybrid workspace and `cloud` otherwise. Detaching and reconnecting never change that runtime. Authenticated Claude/Codex hooks may identify the native conversation; absence means unknown. Native argument passthrough does not inject hooks, so such sessions may have no native conversation mapping. This is not a portable recovery checkpoint or a complete provider-account binding.
 
 Input carries a client-generated `requestId`. The worker durably appends intent, writes to the PTY, then durably appends the result. Concurrent identical retries return one receipt. If the write may have happened but the result was not recorded, that ID remains uncertain. It must not be silently reissued under another ID. Exactly-once execution of a provider's tool is not guaranteed by exactly-once terminal input.
 
@@ -65,6 +65,12 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | Resize / terminate | `POST /api/sessions/:id/resize`, `/stop` | Owner |
 | Read project context | `GET /api/projects/:id/context` | Any |
 | Replace context with version check | `PUT /api/projects/:id/context` | Owner |
+| Project detail and sync state | `GET /api/projects/:id` | Any |
+| Receive a laptop generation | `POST /api/projects/:id/sync/{begin,has,commit}`, `PUT /api/projects/:id/sync/blob/:hash` | Owner CLI |
+| Apply a pending generation | `POST /api/projects/:id/sync/apply` | Owner |
+| Export the cloud tree | `POST /api/projects/:id/sync/export`, `GET /api/projects/:id/sync/blob/:hash` | Owner CLI |
+
+**Owner CLI** routes accept only a paired owner bearer key; a browser session is refused. While a sync commit or apply holds a project, session creation and resume in that project answer `409` with code `sync-applying`. [Workspace sync](workspace-sync.md) defines the transfer limits, apply rules, and pending reasons.
 
 Session IDs and project IDs are validated. Executables and project working directories come from private host configuration. The owner-only native CLI launch accepts an argument array, including provider flags that may access other files available to the agent account; this is not a sandbox boundary within a tenant. Web and phone creation use configured provider arguments. Infinite workers pass prompts and native arguments directly to the executable. The cmux adapter quotes each configured argument before launching in the chosen workspace shell. Active-host process inspection can see launch arguments.
 

@@ -26,11 +26,13 @@ infinite resume
 infinite monitor
 ```
 
-The CLI is installed and paired on the commissioning laptop. Codex uses the current laptop project by default; the other providers retain their native cloud terminals. `resume` attaches to the same process; `monitor` starts read-only. Press Enter to enable steering, Ctrl+G to monitor, or Ctrl+] to detach. Put wrapper options before the provider, for example `infinite --project PROJECT_ID --title "Task" codex`. Use `--cloud` before `codex` to select the configured cloud project. See [installation, pairing, and CLI behavior](docs/cli.md).
+The CLI is installed and paired on the commissioning laptop. Every provider runs on the cloud host by default. `resume` attaches to the same process; `monitor` starts read-only. Press Enter to enable steering, Ctrl+G to monitor, or Ctrl+] to detach. Put wrapper options before the provider, for example `infinite --project PROJECT_ID --title "Task" codex`. See [installation, pairing, and CLI behavior](docs/cli.md).
 
-Run `infinite codex` inside your project. Tools use that directory immediately while a detached service prepares an incremental cloud checkpoint. With a qualified backend, laptop loss automatically moves tools to the prepared cloud workspace in the same conversation; uncertain operations pause. `infinite recover SESSION_ID` downloads cloud edits into a separate copy for reconciliation. See [laptop execution](docs/cli.md#laptop-execution-and-automatic-handoff).
+Run `infinite sync` inside a checkout to keep the configured cloud project current with it, one way; `infinite pull` downloads the cloud tree into a new directory. See [workspace sync](docs/workspace-sync.md).
 
-An experimental `infinite --cloud --local-ui codex "Initial prompt"` mode runs Codex's interface locally while its backend remains on the host. Typing stays local; `resume` rejoins the recorded conversation. This requires a supported Codex binary on both machines and an initial prompt. See [local Codex usage and limits](docs/cli.md#experimental-local-codex-interface). OpenCode also supports `infinite --local-ui opencode`, including empty sessions; see [local OpenCode usage](docs/cli.md#experimental-local-opencode-interface).
+Run `infinite --laptop codex` inside your project to keep tools on the laptop. Tools use that directory immediately while a detached service prepares an incremental cloud checkpoint. With a qualified backend, laptop loss automatically moves tools to the prepared cloud workspace in the same conversation; uncertain operations pause. `infinite recover SESSION_ID` downloads cloud edits into a separate copy for reconciliation. See [laptop execution](docs/cli.md#laptop-execution-with---laptop).
+
+An experimental `infinite --local-ui codex "Initial prompt"` mode runs Codex's interface locally while its backend remains on the host. Typing stays local; `resume` rejoins the recorded conversation. This requires a supported Codex binary on both machines and an initial prompt. See [local Codex usage and limits](docs/cli.md#experimental-local-codex-interface). OpenCode also supports `infinite --local-ui opencode`, including empty sessions; see [local OpenCode usage](docs/cli.md#experimental-local-opencode-interface).
 
 ## Run locally
 

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { chmod, lstat, readdir, realpath, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -19,11 +19,17 @@ export interface ProjectSyncStatus {
   pendingGeneration?: { id: string; capturedAt: string; receivedAt: string; reason: "session-running" | "cloud-changed" };
 }
 type Received = { manifest: WorkspaceManifest; receivedAt: string; generation: string };
+/**
+ * Whether a cloud session is running or starting in the project. Commit and apply
+ * call it inside the project's queue after `applying()` turns true, so a session
+ * start refused by `applying()` cannot slip in between the check and the publish.
+ */
+export type RunningCheck = () => Promise<boolean>;
 /** `baseline` is a scan of the published tree; records without one compare against the manifest. */
 type Applied = { manifest: WorkspaceManifest; appliedAt: string; baseline?: WorkspaceManifest };
 
 export class ProjectSyncError extends Error {
-  constructor(message: string, readonly code: "cloud-changed" | "session-running" | "stale-generation" | "missing-content" | "invalid-manifest" | "unknown-project", readonly status = 409) {
+  constructor(message: string, readonly code: "cloud-changed" | "session-running" | "sync-applying" | "stale-generation" | "missing-content" | "invalid-manifest" | "unknown-project", readonly status = 409) {
     super(message);
   }
 }
@@ -39,7 +45,7 @@ const inside = (root: string, path: string) => path === root || path.startsWith(
 export class ProjectSync {
   private readonly generations = new Map<string, string>();
   private readonly serial = new Map<string, Promise<unknown>>();
-  private readonly publishing = new Set<string>();
+  private readonly changing = new Set<string>();
   constructor(private readonly config: Config, private readonly key: Buffer) {}
 
   private project(projectId: string) {
@@ -66,6 +72,13 @@ export class ProjectSync {
     const next = previous.then(task, task);
     this.serial.set(projectId, next.catch(() => {}));
     return next;
+  }
+  /** A queued task that may replace the project tree. `applying()` is true for all of it. */
+  private changeQueue<T>(projectId: string, task: () => Promise<T>): Promise<T> {
+    return this.queue(projectId, async () => {
+      this.changing.add(projectId);
+      try { return await task(); } finally { this.changing.delete(projectId); }
+    });
   }
 
   status(projectId: string): ProjectSyncStatus {
@@ -102,15 +115,19 @@ export class ProjectSync {
   }
   async putBlob(projectId: string, hash: string, bytes: Buffer) {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
+    if (createHash("sha256").update(bytes).digest("hex") !== hash) throw new ProjectSyncError("The uploaded content does not match its hash", "invalid-manifest", 400);
     await putWorkspaceBlob(join(this.dir(projectId), "blobs"), hash, bytes.toString("base64"));
   }
   async readBlob(projectId: string, hash: string) {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
-    return readWorkspaceBlob(join(this.dir(projectId), "blobs"), hash);
+    try { return await readWorkspaceBlob(join(this.dir(projectId), "blobs"), hash); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ProjectSyncError("This content is not stored for the project", "missing-content", 404);
+      throw error;
+    }
   }
 
-  commit(projectId: string, generation: string, value: unknown, running: boolean) {
-    return this.queue(projectId, async () => {
+  commit(projectId: string, generation: string, value: unknown, running: RunningCheck) {
+    return this.changeQueue(projectId, async () => {
       this.project(projectId);
       if (this.generations.get(projectId) !== generation) throw new ProjectSyncError("This sync generation is stale; begin again", "stale-generation");
       if (Buffer.byteLength(JSON.stringify(value) ?? "") > MAX_MANIFEST_BYTES) throw new ProjectSyncError("Manifest exceeds the size limit", "invalid-manifest", 413);
@@ -126,15 +143,15 @@ export class ProjectSync {
     });
   }
 
-  apply(projectId: string, options: { force?: boolean; running: boolean }) {
-    return this.queue(projectId, () => this.applyReceived(projectId, options, true));
+  apply(projectId: string, options: { force?: boolean; running: RunningCheck }) {
+    return this.changeQueue(projectId, () => this.applyReceived(projectId, options, true));
   }
-  /** A generation is replacing the project tree right now; new sessions must not start in it. */
+  /** A commit or apply holds this project and may replace its tree; new sessions must not start in it. */
   applying(projectId: string) {
-    return this.publishing.has(projectId);
+    return this.changing.has(projectId);
   }
 
-  private async applyReceived(projectId: string, options: { force?: boolean; running: boolean }, explicit = false): Promise<ProjectSyncStatus> {
+  private async applyReceived(projectId: string, options: { force?: boolean; running: RunningCheck }, explicit = false): Promise<ProjectSyncStatus> {
     const project = this.project(projectId);
     const received = this.read<Received>(projectId, "received");
     if (!received) return this.status(projectId);
@@ -145,13 +162,9 @@ export class ProjectSync {
       if (explicit) throw new ProjectSyncError(reason === "session-running" ? "A session is running in this project; stop it or wait before applying" : "The cloud workspace changed since the last applied generation; pull it or apply with force", reason);
       return this.status(projectId);
     };
-    if (options.running) return pending("session-running");
+    if (await options.running()) return pending("session-running");
     if (!options.force && await this.drifted(projectId, project.path, applied)) return pending("cloud-changed");
-    this.publishing.add(projectId);
-    try { return await this.publish(projectId, project.path, received); } finally { this.publishing.delete(projectId); }
-  }
-  private async publish(projectId: string, path: string, received: Received): Promise<ProjectSyncStatus> {
-    const target = await this.projectRoot(path);
+    const target = await this.projectRoot(project.path);
     const parent = dirname(target), name = basename(target);
     const stage = join(parent, `.${name}.infinite-stage-${randomUUID()}`);
     const previous = join(parent, `.${name}.infinite-previous`);

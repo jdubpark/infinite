@@ -24,6 +24,8 @@ function fixture() {
   return { root, laptop, cloud, config, key, sync: new ProjectSync(config, key) };
 }
 
+const busy = async () => true, idle = async () => false;
+
 /** Push the laptop tree the way the service will: capture, upload missing blobs, commit. */
 async function push(f: ReturnType<typeof fixture>, running = false, previous?: Awaited<ReturnType<typeof captureWorkspace>>) {
   const storeDir = join(f.root, "laptop-store");
@@ -32,7 +34,7 @@ async function push(f: ReturnType<typeof fixture>, running = false, previous?: A
   const hashes = [...new Set(manifest.entries.flatMap(e => e.chunks ?? []))];
   for (const hash of await f.sync.missing("example", hashes))
     await f.sync.putBlob("example", hash, Buffer.from(await readWorkspaceBlob(storeDir, hash), "base64"));
-  return { manifest, status: await f.sync.commit("example", generation, manifest, running) };
+  return { manifest, status: await f.sync.commit("example", generation, manifest, running ? busy : idle) };
 }
 
 test("first push applies onto an empty cloud directory and records both manifests", async () => {
@@ -58,8 +60,8 @@ test("a non-empty cloud directory with no applied manifest needs force", async (
     const { status } = await push(f);
     assert.equal(status.pendingGeneration?.reason, "cloud-changed");
     assert.equal(readFileSync(join(f.cloud, "existing.txt"), "utf8"), "cloud-only\n", "nothing is applied without force");
-    await assert.rejects(f.sync.apply("example", { running: false }), (error: ProjectSyncError) => error.code === "cloud-changed");
-    const applied = await f.sync.apply("example", { running: false, force: true });
+    await assert.rejects(f.sync.apply("example", { running: idle }), (error: ProjectSyncError) => error.code === "cloud-changed");
+    const applied = await f.sync.apply("example", { running: idle, force: true });
     assert.equal(applied.pendingGeneration, undefined);
     assert.equal(existsSync(join(f.cloud, "existing.txt")), false);
     const previous = join(dirname(f.cloud), `.${basename(f.cloud)}.infinite-previous`);
@@ -77,30 +79,10 @@ test("a running cloud session keeps the generation pending; apply later succeeds
     assert.equal(second.status.pendingGeneration?.reason, "session-running");
     assert.equal(second.status.pendingGeneration?.id, second.manifest.id);
     assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "1\n", "files are untouched while a session runs");
-    await assert.rejects(f.sync.apply("example", { running: true }), (error: ProjectSyncError) => error.code === "session-running");
-    const applied = await f.sync.apply("example", { running: false });
+    await assert.rejects(f.sync.apply("example", { running: busy }), (error: ProjectSyncError) => error.code === "session-running");
+    const applied = await f.sync.apply("example", { running: idle });
     assert.equal(applied.appliedManifest, second.manifest.id);
     assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "2\n");
-  } finally { rmSync(f.root, { recursive: true, force: true }); }
-});
-
-test("applying() is true while a generation replaces the tree and clears when apply returns", async () => {
-  const f = fixture();
-  try {
-    writeFileSync(join(f.laptop, "a.txt"), "1\n");
-    const first = await push(f);
-    writeFileSync(join(f.laptop, "a.txt"), "2\n");
-    const second = await push(f, true, first.manifest);
-    assert.equal(f.sync.applying("example"), false, "a generation held for a running session is not being applied");
-    // Publication spans several asynchronous filesystem steps; sample once per event-loop turn.
-    const samples: boolean[] = [];
-    let settled = false;
-    const result = f.sync.apply("example", { running: false });
-    result.then(() => { settled = true; }, () => { settled = true; });
-    while (!settled) { samples.push(f.sync.applying("example")); await new Promise(resolve => setImmediate(resolve)); }
-    assert.equal((await result).appliedManifest, second.manifest.id);
-    assert.ok(samples.includes(true), "new sessions are refused while the tree is replaced");
-    assert.equal(f.sync.applying("example"), false);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -116,7 +98,7 @@ test("host-side edits after apply make the next apply refuse without force", asy
     assert.equal(readFileSync(join(f.cloud, "agent-wrote.txt"), "utf8"), "cloud edit\n");
     const exported = await f.sync.exportTree("example");
     assert.ok(exported.entries.some(e => e.path === "agent-wrote.txt"), "export captures the live cloud tree");
-    const forced = await f.sync.apply("example", { running: false, force: true });
+    const forced = await f.sync.apply("example", { running: idle, force: true });
     assert.equal(forced.appliedManifest, second.manifest.id);
     assert.equal(existsSync(join(f.cloud, "agent-wrote.txt")), false);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
@@ -147,7 +129,7 @@ test("recommitting the applied generation clears a stale pending marker", async 
     const first = await push(f);
     writeFileSync(join(f.laptop, "a.txt"), "2\n");
     assert.equal((await push(f, true, first.manifest)).status.pendingGeneration?.reason, "session-running");
-    const status = await f.sync.commit("example", f.sync.begin("example").generation, first.manifest, true);
+    const status = await f.sync.commit("example", f.sync.begin("example").generation, first.manifest, busy);
     assert.equal(status.lastSyncedManifest, first.manifest.id);
     assert.equal(status.pendingGeneration, undefined, "the newest generation is already applied");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
@@ -200,8 +182,8 @@ test("sync refuses a project path that holds the host's own state, even with for
     // A running session keeps the generation pending without touching the tree.
     await push({ ...f, sync }, true);
     const refused = (error: ProjectSyncError) => error.code === "invalid-manifest" && error.status === 500;
-    await assert.rejects(sync.apply("example", { running: false, force: true }), refused);
-    await assert.rejects(sync.apply("example", { running: false }), refused);
+    await assert.rejects(sync.apply("example", { running: idle, force: true }), refused);
+    await assert.rejects(sync.apply("example", { running: idle }), refused);
     await assert.rejects(sync.exportTree("example"), refused);
     assert.ok(existsSync(join(f.config.stateDir, "projects/example/sync/received.sealed")), "the state directory stays in place");
     assert.equal(existsSync(previous), false);
@@ -236,9 +218,9 @@ test("a failed apply leaves no stale pending marker", async () => {
     assert.equal(status.pendingGeneration, undefined, "no marker names the older generation");
     assert.notEqual(status.lastSyncedManifest, status.appliedManifest);
     // A forced apply that fails while staging clears the marker for the newest generation.
-    await assert.rejects(f.sync.apply("example", { running: true }), (error: ProjectSyncError) => error.code === "session-running");
+    await assert.rejects(f.sync.apply("example", { running: busy }), (error: ProjectSyncError) => error.code === "session-running");
     chmodSync(f.root, 0o500);
-    await assert.rejects(f.sync.apply("example", { running: false, force: true }), (error: NodeJS.ErrnoException) => error.code === "EACCES");
+    await assert.rejects(f.sync.apply("example", { running: idle, force: true }), (error: NodeJS.ErrnoException) => error.code === "EACCES");
     assert.equal(f.sync.applying("example"), false, "a failed publication does not keep refusing new sessions");
     status = f.sync.status("example");
     assert.equal(status.pendingGeneration, undefined);

@@ -56,6 +56,42 @@ export interface Host {
   stop: () => Promise<void>;
 }
 
+/** JSON requests to an API at `origin`, authenticated with the named role's device key. */
+export function apiClient(origin: string, tokens: Record<Role, string>): Host["fetchApi"] {
+  return async (path, role = "owner", body, headers = {}, method) => {
+    const response = await fetch(origin + "/api" + path, {
+      method: method ?? (body ? "POST" : "GET"),
+      headers: {
+        ...(role ? { Authorization: `Bearer ${tokens[role]}` } : {}),
+        ...(body ? { "Content-Type": "application/json" } : {}),
+        ...headers,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return { status: response.status, headers: response.headers, body: await response.json() };
+  };
+}
+
+/** Stop every session worker recorded under `config.stateDir`, then wait for them to exit. */
+export async function stopSessionWorkers(config: Config) {
+  let ids: string[] = [];
+  try {
+    ids = readdirSync(join(config.stateDir, "sessions")).filter((n) => /^[a-f0-9-]{36}$/.test(n));
+  } catch {
+    /* no sessions were created */
+  }
+  for (const id of ids)
+    try {
+      const actor = { id: "test-cleanup", label: "Test cleanup" };
+      const state = await workerCall<{ capabilities?: { inputControl?: number } }>(config.runDir, id, { op: "state" });
+      const lease = state.capabilities?.inputControl
+        ? await workerCall<ControlLease>(config.runDir, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
+      await workerCall(config.runDir, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
+    } catch {
+      /* already exited */
+    }
+}
+
 /** Boots a real API (`cli.ts serve`) on a free port with owner, controller and viewer device keys. */
 export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config> } = {}): Promise<Host> {
   // Unix socket paths are short-limited, so the state lives under /tmp rather than os.tmpdir().
@@ -89,18 +125,7 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
   writeFileSync(configFile, JSON.stringify(config));
   let child: ChildProcess | undefined;
 
-  const fetchApi: Host["fetchApi"] = async (path, role = "owner", body, headers = {}, method) => {
-    const response = await fetch(origin + "/api" + path, {
-      method: method ?? (body ? "POST" : "GET"),
-      headers: {
-        ...(role ? { Authorization: `Bearer ${tokens[role]}` } : {}),
-        ...(body ? { "Content-Type": "application/json" } : {}),
-        ...headers,
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    return { status: response.status, headers: response.headers, body: await response.json() };
-  };
+  const fetchApi = apiClient(origin, tokens);
   const stopApi = async () => {
     const api = child;
     if (!api || api.exitCode !== null || api.signalCode !== null) return;
@@ -131,22 +156,7 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     );
   };
   const stop = async () => {
-    let ids: string[] = [];
-    try {
-      ids = readdirSync(join(config.stateDir, "sessions")).filter((n) => /^[a-f0-9-]{36}$/.test(n));
-    } catch {
-      /* no sessions were created */
-    }
-    for (const id of ids)
-      try {
-        const actor = { id: "test-cleanup", label: "Test cleanup" };
-        const state = await workerCall<{ capabilities?: { inputControl?: number } }>(config.runDir, id, { op: "state" });
-        const lease = state.capabilities?.inputControl
-          ? await workerCall<ControlLease>(config.runDir, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
-        await workerCall(config.runDir, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
-      } catch {
-        /* already exited */
-      }
+    await stopSessionWorkers(config);
     await stopApi();
     // Workers exit 1.5 s after their child; wait so they never write into a removed directory.
     await new Promise((resolve) => setTimeout(resolve, 1700));

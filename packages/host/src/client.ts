@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -15,7 +15,7 @@ import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { checkLaptopExecutor, startLaptopService } from "./laptop-service.js";
 import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWorkspaceManifest } from "./workspace-checkpoint.js";
-import { readSyncState, startSyncService, stopSyncService } from "./sync-service.js";
+import { readSyncState, startSyncService, stopSyncService, syncServiceRunning } from "./sync-service.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
@@ -349,15 +349,16 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   };
   while (args[0]?.startsWith("--")) option();
   const command = args.shift() ?? "";
+  const positional: string[] = [];
+  // Unknown commands belong to the server CLI, whose options this parser must not reject.
+  if (CLIENT_COMMANDS.has(command)) while (args.length) { if (args[0].startsWith("--")) option(); else positional.push(args.shift()!); }
+  // Checked after trailing options, so `infinite sync --include DIR` is refused like the leading form.
   if (options["--cloud"] && options["--laptop"]) throw new Error("Choose either cloud execution or --laptop");
   if (options["--laptop"]) {
     if (command !== "codex") throw new Error("--laptop starts a Codex session in this directory. Resume existing sessions with infinite resume ID.");
     options["--local-ui"] = true;
   }
   if (includes.length && !options["--laptop"]) throw new Error("--include applies to --laptop execution; cloud sessions use the configured project");
-  const positional: string[] = [];
-  // Unknown commands belong to the server CLI, whose options this parser must not reject.
-  if (CLIENT_COMMANDS.has(command)) while (args.length) { if (args[0].startsWith("--")) option(); else positional.push(args.shift()!); }
   return { command, args: providers.has(command) ? args : positional, options, includes };
 }
 
@@ -413,6 +414,28 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command === "list" && !existsSync(path) && !options["--client-config"] && !process.env.INFINITE_CLIENT_CONFIG) return false;
     const config = loadConfig(path), api = connection(config);
     if (command === "list") { const { sessions } = await api.json<{ sessions: Session[] }>("/sessions"); if (options["--json"]) console.log(JSON.stringify(sessions, null, 2)); else printSessions(sessions); return true; }
+    if (command === "sync" && (options["--stop"] || options["--status"])) {
+      // The service is a local process: stopping or inspecting it must not depend on reaching the host.
+      const syncDir = join(dirname(path), "sync");
+      const recorded = existsSync(syncDir) ? readdirSync(syncDir).flatMap(name => /^([a-z0-9-]{1,80})\.json$/.exec(name)?.[1] ?? []) : [];
+      if (options["--stop"]) {
+        const projectId = String(options["--project"] ?? config.projectId ?? (recorded.length === 1 ? recorded[0] : ""));
+        if (!/^[a-z0-9-]{1,80}$/.test(projectId)) throw new Error(`Choose a project with --project ID${recorded.length ? ` (recorded: ${recorded.join(", ")})` : ""}`);
+        console.log(stopSyncService(join(syncDir, `${projectId}.json`)) ? "Sync service stopped. The cloud copy keeps its last applied generation." : "No sync service was running for this project.");
+        return true;
+      }
+      let me: Me | undefined, offline = "";
+      try { me = await api.json<Me>("/me", undefined, AbortSignal.timeout(5000)); }
+      catch (error) { offline = error instanceof HttpError ? `host returned HTTP ${error.status}` : "host unreachable"; }
+      for (const id of new Set([...(me ? me.projects.map(p => p.id) : config.projectId ? [config.projectId] : []), ...recorded])) {
+        const state = recorded.includes(id) ? readSyncState(join(syncDir, `${id}.json`)) : undefined;
+        const local = !state ? "no local service" : !syncServiceRunning(state) ? `stale service record (pid ${state.pid} not running)`
+          : `service pid ${state.pid} · ${clean(state.root)}${state.problem ? ` · problem: ${clean(state.problem)}` : ""}`;
+        const detail = me && await api.json<ProjectDetail>(`/projects/${id}`).catch(() => undefined);
+        console.log(`${id}  ${local}${detail ? ` · ${describeSync(detail.sync)}` : offline ? ` · ${offline}` : ""}`);
+      }
+      return true;
+    }
     if (command !== "projects") progress.start(`Connecting to ${new URL(config.origin).hostname}`);
     const me = await api.json<Me>("/me");
     progress.stop();
@@ -450,18 +473,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command === "sync") {
       if (me.role !== "owner") throw new Error("Workspace sync requires an owner device key");
       const syncDir = join(dirname(path), "sync");
-      if (options["--status"]) {
-        for (const p of me.projects) {
-          const state = readSyncState(join(syncDir, `${p.id}.json`));
-          const detail = await api.json<ProjectDetail>(`/projects/${p.id}`).catch(() => undefined);
-          console.log(`${p.id}  ${state ? `service pid ${state.pid} · ${clean(state.root)}${state.problem ? ` · problem: ${clean(state.problem)}` : ""}` : "no local service"}${detail ? ` · ${describeSync(detail.sync)}` : ""}`);
-        }
-        return true;
-      }
       const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
       const stateFile = join(syncDir, `${projectId}.json`);
-      if (options["--stop"]) { console.log(stopSyncService(stateFile) ? "Sync service stopped. The cloud copy keeps its last applied generation." : "No sync service was running for this project."); return true; }
       if (options["--apply"]) {
         // A large tree can take minutes to publish; a refusal (409) leaves its reason in the pending marker.
         const applied = await api.request(`/projects/${projectId}/sync/apply`, options["--force"] ? { force: true } : {}, AbortSignal.timeout(300000)).catch(async (error: unknown) => {

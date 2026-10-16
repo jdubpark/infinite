@@ -49,4 +49,6 @@ test("sync and pull commands parse their options", () => {
   const pull = parseClientArgs(["pull", "example", "--output", "/tmp/x"]);
   assert.deepEqual(pull.args, ["example"]); assert.equal(pull.options["--output"], "/tmp/x");
   assert.throws(() => parseClientArgs(["--include", "../lib", "sync"]), /--include applies to --laptop/);
+  assert.throws(() => parseClientArgs(["sync", "--include", "../lib"]), /--include applies to --laptop/, "a trailing --include is refused too");
+  assert.throws(() => parseClientArgs(["sync", "--laptop"]), /--laptop starts a Codex session/);
 });

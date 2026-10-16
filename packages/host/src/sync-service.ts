@@ -50,6 +50,8 @@ function validateOptions(options: SyncServiceOptions): SyncServiceOptions {
   return { ...options, origin: origin.origin, root, storeDir, stateFile };
 }
 
+/** The recorded service still runs; a record left by a killed service or a reboot does not. */
+export const syncServiceRunning = (state: SyncState) => runningService(state.pid);
 export function readSyncState(stateFile: string): SyncState | undefined {
   try { return JSON.parse(readFileSync(stateFile, "utf8")) as SyncState; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }

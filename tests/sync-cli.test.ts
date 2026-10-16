@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -46,10 +46,24 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
     assert.equal(readFileSync(join(host.config.projects[0].path, "file.txt"), "utf8"), "second\n");
     assert.equal(existsSync(join(host.config.projects[0].path, "cloud.txt")), false, "a forced apply replaces cloud edits");
 
-    const stopped = await exec(process.execPath, [...cli, "sync", "--stop", "--project", "rehearsal"]);
+    // Stopping and inspecting the local service work while the host is down.
+    await host.stopApi();
+    const stopped = await exec(process.execPath, [...cli, "sync", "--stop"]);
     assert.match(stopped.stdout, /stopped/);
-    const idle = await exec(process.execPath, [...cli, "sync", "--status"]);
-    assert.match(idle.stdout, /^rehearsal  no local service · synced \d+s ago/);
+    assert.equal(existsSync(stateFile), false);
+    await waitFor(async () => { try { process.kill(state.pid, 0); return true; } catch { return false; } }, alive => !alive, 10000);
+    const offline = await exec(process.execPath, [...cli, "sync", "--status"]);
+    assert.equal(offline.stdout, "rehearsal  no local service · host unreachable\n");
+    // Without the host to vouch for the ID, a path-like project must not name the client configuration.
+    await assert.rejects(exec(process.execPath, [...cli, "sync", "--stop", "--project", "../client"]), (error: { stderr: string }) => /Choose a project with --project ID/.test(error.stderr));
+    assert.ok(existsSync(clientFile), "the device credentials stay in place");
+
+    // A record left behind by a killed service names a pid that no longer runs it.
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    writeFileSync(stateFile, JSON.stringify({ ...state, pid: dead }), { mode: 0o600 });
+    await host.start();
+    const stale = await exec(process.execPath, [...cli, "sync", "--status"]);
+    assert.match(stale.stdout, new RegExp(`^rehearsal  stale service record \\(pid ${dead} not running\\) · synced \\d+s ago`));
   } finally {
     if (existsSync(stateFile)) stopSyncService(stateFile);
     await host.stop(); rmSync(root, { recursive: true, force: true });

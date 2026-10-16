@@ -14,12 +14,14 @@ React Native selected by the user. Implementation choice: TypeScript, Node.js wo
 An individual running a single-tenant host, or multiple users on the managed service with independent private contexts and execution environments, including the service owner as an ordinary tenant. Each user works from a laptop and checks or steers from a phone or another computer. Flights, sleep, lost Wi-Fi, and laptop shutdown must not terminate cloud work.
 
 ## Product Purpose
-Keep Claude Code, Codex, Grok Build, and OpenCode sessions on a persistent cloud execution host. Devices attach to the same processes and recover their recorded output after a connection outage.
+Create, monitor, and steer Claude Code, Codex, Grok Build, and OpenCode sessions on a selected persistent cloud host or an online laptop from web and phone clients. Devices attach to the same processes and recover their recorded output after a connection outage. Infinite also discovers existing Claude Code and Codex sessions in cmux; CmuxControl remains a separate cmux controller.
 
 ## Operating Context
 Conversations remain on a persistent cloud backend. The selected hybrid direction, refined on 2026-10-09, runs tools against the actual laptop project while it is available and prepares the entire selected project plus explicitly included directories incrementally in the background. When the laptop goes offline, tools should continue on a verified cloud checkpoint after execution ownership and unfinished operations are reconciled. First-time preparation must not delay local work. See [hybrid execution and cloud handoff](docs/hybrid-execution.md) for the implemented checkpoint contract and platform limits. Codex enables this flow by default; `--cloud` opts out.
 
-New sessions originate from the laptop; secondary devices monitor and steer. The target is managed confidential VMs: the service operator must not be able to read tenant context. User-owned cloud accounts were offered and not selected. Team collaboration and public discovery remain outside the MVP.
+Any paired owner device can create a session on a configured machine and project. Controller devices can steer existing sessions; viewers can monitor. Each machine retains its own sessions, credentials, and files. An outbound encrypted relay supports access without an inbound laptop port or a device VPN. A laptop must remain online and awake for sessions running there; remote access does not migrate them to the cloud. See [remote machines](docs/remote-machines.md) for setup, cmux support, and the distinction from hybrid execution.
+
+The target for managed workloads remains confidential VMs: the service operator must not be able to read tenant context. User-owned cloud accounts were offered and not selected. Team collaboration and public discovery remain outside the MVP.
 
 Support both deployment modes. **Single tenant** runs directly on the host with one user's context and no added tenant/VM isolation requirement. **Multi-tenant** assigns each user a separate execution environment and complete context bucket. The operator-confidentiality requirement applies to managed multi-tenant private workloads; the single-tenant owner explicitly controls and trusts their own execution host. Authentication, encrypted recordings, and device roles still apply in either mode.
 

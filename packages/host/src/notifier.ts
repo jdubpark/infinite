@@ -13,7 +13,7 @@ export class Notifier {
     private readonly manager: Pick<Manager, "list">,
     private readonly store: PushStore,
     private readonly sender: PushSender,
-    private readonly options: { detail: "minimal" | "full"; events: string[]; intervalMs: number },
+    private readonly options: { detail: "minimal" | "full"; events: string[]; intervalMs: number; machineId?: string },
   ) {}
   start() { this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
   stop() { clearInterval(this.timer); }
@@ -57,7 +57,7 @@ export class Notifier {
         : ["Recording stopped", `${row.title} stopped recording`];
     return {
       to, title, body: this.options.detail === "full" ? row.attention.now || minimal : minimal,
-      data: { url: `/session/${row.id}` }, channelId: "attention" as const,
+      data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
       priority: row.attention.state === "needs-you" ? ("high" as const) : ("default" as const), collapseId: row.id,
     };
   }

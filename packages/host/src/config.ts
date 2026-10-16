@@ -4,15 +4,20 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { Config } from "./types.js";
 import { assertRunnerDeployment, parseDeployment } from "./deployment.js";
+import { machineIdentity } from "./machine.js";
 
 /**
  * Provider hooks injected at launch when the config does not say. Codex hooks stay off until
  * spike S2 confirms that `-c hooks.*` and `--dangerously-bypass-hook-trust` work as intended.
  */
 export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
+export const machineLabelSchema = z.string().trim().min(1).max(80);
 
 const schema = z
   .object({
+    machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
+    cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
+    remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),
     port: z.number().int().min(0).max(65535),
     origin: z.url(),
@@ -110,6 +115,21 @@ export function readConfig(file: string): { config: Config; key: Buffer } {
   const key = readFileSync(config.keyFile);
   if (key.length !== 32)
     throw new Error("Encryption key must contain exactly 32 random bytes");
+  config.machine = machineIdentity(config, key);
+  if ((config.cmux?.enabled || config.remote?.enabled) && config.deployment?.mode !== "single-tenant")
+    throw new Error("Machine access and cmux require a single-tenant host");
+  if (config.remote?.relay) {
+    if (!config.remote.enabled) throw new Error("Enable remote access before configuring a relay");
+    const relay = new URL(config.remote.relay.url);
+    const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(relay.hostname);
+    if (!(relay.protocol === "https:" || (loopback && relay.protocol === "http:")) || relay.username || relay.password || relay.search || relay.hash || relay.pathname !== "/")
+      throw new Error("Relay must be a bare HTTPS origin (HTTP is allowed for loopback development)");
+    const file = config.remote.relay.tokenFile;
+    const rel = relative(resolve(config.stateDir), resolve(file));
+    if ((!rel.startsWith("..") && !isAbsolute(rel)) || (statSync(file).mode & 0o777) !== 0o600)
+      throw new Error("Relay registration key must be private and outside the state directory");
+    if (!/^[A-Za-z0-9_-]{32,200}$/.test(readFileSync(file, "utf8").trim())) throw new Error("Invalid relay registration key");
+  }
   const origin = new URL(config.origin);
   if (config.environment === "cloud" && origin.protocol !== "https:")
     throw new Error("Cloud clients require an HTTPS origin");

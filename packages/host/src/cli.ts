@@ -18,7 +18,7 @@ import { execFileSync } from "node:child_process";
 import { createApp } from "./server.js";
 import { Notifier } from "./notifier.js";
 import { expoSender } from "./push.js";
-import { DEFAULT_HOOKS, readConfig, hashToken } from "./config.js";
+import { DEFAULT_HOOKS, readConfig, hashToken, machineLabelSchema } from "./config.js";
 import { workerCall } from "./ipc.js";
 import { Manager } from "./manager.js";
 import { parseDeployment } from "./deployment.js";
@@ -26,8 +26,9 @@ import { planFleet } from "./fleet.js";
 import type { Config, Provider, Role } from "./types.js";
 
 import { handleClientCommand } from "./client.js";
+import { handleMachineCommand } from "./machine-cli.js";
 
-if (!await handleClientCommand(process.argv.slice(2))) {
+if (!await handleMachineCommand(process.argv.slice(2)) && !await handleClientCommand(process.argv.slice(2))) {
 const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
@@ -43,6 +44,10 @@ const { values, positionals } = parseArgs({
     prompt: { type: "string" },
     "deployment-mode": { type: "string" },
     "tenant-id": { type: "string" },
+    local: { type: "boolean" },
+    name: { type: "string" },
+    cmux: { type: "boolean" },
+    remote: { type: "boolean" },
   },
 });
 const command = positionals[0] ?? "help";
@@ -56,6 +61,7 @@ const configFile = resolve(
 );
 
 function initialize() {
+  const label = machineLabelSchema.parse(values.name ?? (dev || values.local ? "Local machine" : "Cloud host"));
   const deployment = parseDeployment({
     mode: values["deployment-mode"] ?? "single-tenant",
     ...(values["tenant-id"] ? { tenantId: values["tenant-id"] } : {}),
@@ -99,13 +105,16 @@ function initialize() {
     ),
   );
   const config: Config = {
+    machine: { id: randomUUID(), label },
+    ...(values.cmux ? { cmux: { enabled: true } } : {}),
+    ...(values.remote ? { remote: { enabled: true } } : {}),
     deployment,
     port,
     origin: values.origin ?? `http://127.0.0.1:${port}`,
     stateDir,
     runDir,
     keyFile,
-    environment: dev ? "local" : "cloud",
+    environment: dev || values.local ? "local" : "cloud",
     enableDemo: dev || rehearsalOnly,
     maxSessions: 24,
     tokens: Object.entries(devices).map(([role, token]) => ({
@@ -228,6 +237,17 @@ name belong to that provider and use cloud paths.
 
 npm run dev                          Start a private local rehearsal
 infinite init --origin https://HOST   Create host configuration and device keys
+infinite init --local --remote --cmux --name Laptop --project PROJECT_DIRECTORY
+infinite machine-info --config FILE  Show this machine's identity and projects
+infinite project-add ID DIRECTORY --name NAME --config FILE
+infinite device-add --role owner --name Phone --token-file FILE --config FILE
+infinite device-revoke DEVICE_ID --config FILE
+infinite install-service --config FILE       Start host at login (macOS/Linux)
+infinite uninstall-service --config FILE
+infinite relay-init --config FILE --port 4790
+infinite relay-add --machine UUID --token-file KEY_FILE --config FILE
+infinite relay-serve --config FILE
+infinite connect-relay https://RELAY --token-file KEY_FILE --config FILE
 infinite init --deployment-mode single-tenant --origin https://HOST
 infinite serve --config FILE          Start the API; workers survive API exit
 infinite doctor --config FILE         Check configured CLI binaries
@@ -238,7 +258,7 @@ infinite plan-fleet FILE               Print a secret-free development VM plan
 infinite init --deployment-mode tenant-development --tenant-id UUID --origin https://HOST
 
 Use SSH from a cmux terminal: ssh -t HOST 'infinite attach SESSION_ID'
-Use the owner key only on your laptop. Pair phones with the controller key.`);
+Pair a phone as owner to create/end sessions, controller to steer, or viewer to watch.`);
 else if (command === "plan-fleet") {
   if (!positionals[1]) throw new Error("Provide a fleet JSON file");
   console.log(
@@ -249,7 +269,7 @@ else if (command === "plan-fleet") {
     ),
   );
 } else if (command === "init") {
-  if (!values.origin?.startsWith("https://"))
+  if (!values.local && !values.origin?.startsWith("https://"))
     throw new Error("init requires --origin https://your-host.tailnet.ts.net");
   initialize();
 } else {
@@ -272,7 +292,7 @@ else if (command === "plan-fleet") {
     const fd = openSync(lock, "wx", 0o600);
     writeFileSync(fd, String(process.pid));
     closeSync(fd);
-    const { manager, pushStore, server, closeConnections } = createApp(config, key);
+    const { sessions, pushStore, server, closeConnections } = createApp(config, key);
     server.listen(config.port, "127.0.0.1", () =>
       console.log(
         `Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`,
@@ -283,13 +303,14 @@ else if (command === "plan-fleet") {
         ? readFileSync(config.push.accessTokenFile, "utf8").trim()
         : undefined;
       new Notifier(
-        manager,
+        sessions,
         pushStore,
         expoSender({ endpoint: config.push.endpoint, accessToken }),
         {
           detail: config.push.detail,
           events: config.push.events,
           intervalMs: 2000,
+          machineId: config.machine?.id,
         },
       ).start();
       console.log(`Push notifications: enabled (${config.push.detail} bodies)`);

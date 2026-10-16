@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import * as Crypto from "expo-crypto";
 import {
   api,
@@ -6,7 +6,7 @@ import {
   ControlRefusal,
   type Connection,
 } from "../../api/client";
-import { readDraft, writeDraft, type PendingInput } from "../../store/drafts";
+import { readDraft, settleDraft, useSessionDraft, writeDraft, type PendingInput } from "../../store/drafts";
 import { leaseFor, type SessionControlHandle } from "./useSessionControl";
 
 export const KEYS = ["enter", "escape", "up", "down", "interrupt"] as const;
@@ -33,42 +33,37 @@ export function useSteering(
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [receipt, setReceipt] = useState("");
-  const [text, setText] = useState(() => readDraft(draftKey).text);
-  const pending = useRef<PendingInput | null>(readDraft(draftKey).pending);
-  const [pendingInput, setPendingInput] = useState(
-    () => readDraft(draftKey).pending !== null,
-  );
-  useEffect(() => {
-    writeDraft(draftKey, { text, pending: pending.current });
-  }, [draftKey, text, pendingInput]);
+  const draft = useSessionDraft(draftKey);
+  const inFlight = useRef(false);
 
   /** Resolves true once the host confirms delivery to the terminal. */
   async function send(): Promise<boolean> {
+    if (inFlight.current) return false;
+    inFlight.current = true;
     setBusy(true);
     setError("");
     setReceipt("");
-    const retrying = pending.current !== null;
-    pending.current ??= {
+    const current = readDraft(draftKey);
+    const retrying = current.pending !== null;
+    const request: PendingInput = current.pending ?? {
       requestId: Crypto.randomUUID(),
-      text,
+      text: current.text,
       submit: true,
       ...(options.force ? { force: true } : {}),
     };
-    setPendingInput(true);
+    writeDraft(draftKey, { text: current.text, pending: request });
     try {
       const lease = leaseFor(control, options.requiresControl);
       const result = await api<{ state: string }>(
         connection,
         `/sessions/${id}/input`,
-        { body: pending.current, control: lease },
+        { body: request, control: lease },
       );
       if (result.state !== "delivered")
         throw new Error(
           "Delivery is uncertain. Check the screen before sending again.",
         );
-      pending.current = null;
-      setPendingInput(false);
-      setText("");
+      settleDraft(draftKey, request.requestId, true);
       setReceipt("Delivered to terminal. Agent execution is not yet confirmed.");
       onDelivered();
       return true;
@@ -77,8 +72,7 @@ export function useSteering(
         // Refused before anything was typed. A refused retry says nothing about the first try.
         control.refused();
         if (!retrying) {
-          pending.current = null;
-          setPendingInput(false);
+          settleDraft(draftKey, request.requestId, false);
         }
         setError(
           retrying
@@ -88,18 +82,20 @@ export function useSteering(
         onDelivered();
       } else if (e instanceof ApiError && e.code === "prompt-open") {
         // Refused before anything was typed: the text stays in the box, unsent.
-        pending.current = null;
-        setPendingInput(false);
+        settleDraft(draftKey, request.requestId, false);
         setError("A prompt is open. Answer it above, or reply instead.");
         onDelivered();
       } else setError((e as Error).message);
       return false;
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   }
 
   async function sendKey(key: SteeringKey) {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setBusy(true);
     setError("");
     setReceipt("");
@@ -121,6 +117,7 @@ export function useSteering(
         onDelivered();
       } else setError((e as Error).message);
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   }
@@ -129,9 +126,9 @@ export function useSteering(
     busy,
     error,
     receipt,
-    pending: pendingInput,
-    text,
-    setText: (value: string) => { setText(value); setReceipt(""); setError(""); },
+    pending: draft.pending !== null,
+    text: draft.text,
+    setText: (value: string) => { writeDraft(draftKey, { ...readDraft(draftKey), text: value }); setReceipt(""); setError(""); },
     send,
     sendKey,
   };

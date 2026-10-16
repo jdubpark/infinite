@@ -1,9 +1,10 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { ActivityIndicator, StyleSheet, Text } from "react-native";
+import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import type { Connection } from "../../api/client";
 import { loadConnection } from "../../store/connection";
+import { Button } from "../../components/Button";
 import { theme } from "../../theme";
 
 /**
@@ -15,30 +16,32 @@ export function SessionGate({
 }: {
   render: (connection: Connection, id: string) => ReactNode;
 }) {
-  const { id } = useLocalSearchParams<{ id: string }>();
+  const { id, machine } = useLocalSearchParams<{ id: string; machine?: string }>();
   const router = useRouter();
-  const [connection, setConnection] = useState<Connection | null>(null);
+  const [saved, setSaved] = useState<{ connection: Connection; machine?: string } | null>(null);
+  const connection = saved?.machine === machine ? saved?.connection : null;
   const [error, setError] = useState("");
   useEffect(() => {
-    loadConnection()
+    let active = true;
+    loadConnection(machine)
       .then((value) => {
-        if (value) setConnection(value);
-        else router.replace("/");
+        if (!active) return;
+        if (value) setSaved({ connection: value, machine });
+        else { setError("This machine is not paired. Return to Machines and connect it first."); }
       })
       .catch(() =>
         setError(
           "Could not open the saved connection. Return to Sessions and pair again.",
         ),
       );
-  }, [router]);
+    return () => { active = false; };
+  }, [machine, router]);
   return (
     <SafeAreaView style={s.safe}>
       {connection && id ? (
-        render(connection, id)
+        <View key={`${machine}/${id}`} style={s.safe}>{render(connection, id)}</View>
       ) : error ? (
-        <Text accessibilityRole="alert" style={s.error}>
-          {error}
-        </Text>
+        <View><Text accessibilityRole="alert" style={s.error}>{error}</Text><Button title="Machines" onPress={() => router.replace("/")} /></View>
       ) : (
         <ActivityIndicator style={s.loading} />
       )}

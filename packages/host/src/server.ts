@@ -6,18 +6,26 @@ import { proxyNativeHttp } from "./native-http.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { Manager } from "./manager.js";
 import { hashToken } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
 import { workerCall, type WorkerError } from "./ipc.js";
 import { PushStore, isExpoToken } from "./push.js";
 import { controlActor, type PairedDevice } from "./device-control.js";
+import { machineIdentity } from "./machine.js";
+import { CmuxSessions } from "./cmux/index.js";
+import { CmuxError } from "./cmux/client.js";
+import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
+import { connectRemoteAccess } from "./remote-access.js";
 import type { Config, Role, Receipt } from "./types.js";
 
 const id = z.uuid();
 const createSchema = z
   .object({
     requestId: id,
+    backend: z.enum(["infinite", "cmux"]).optional(),
     provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]),
     projectId: z.string().max(80),
     title: z.string().trim().min(1).max(100),
@@ -67,8 +75,23 @@ const inputSchema = z
   })
   .strict();
 export function createApp(config: Config, key: Buffer) {
+  config.machine = machineIdentity(config, key);
+  if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
+    throw new Error("Machine access and cmux require a single-tenant host");
   const app = express();
   const manager = new Manager(config, key);
+  const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
+  const resumable = (session: { status: string; provider: string; workspace?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
+    session.status === "exited" && !session.workspace && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
+  const listSessions = async () => {
+    const native = (await manager.list()).map(session => ({ ...session, backend: "infinite" as const, machineId: config.machine!.id, resumable: resumable(session) }));
+    // Provider conversation IDs survive restarts and can exist in several
+    // recordings. Only a currently verified worker PID identifies this runtime.
+    const known = new Set(native.filter(s => s.status === "running" && s.nativeSession && s.pid)
+      .map(s => `${s.provider}:${s.nativeSession!.id}:${s.pid}`));
+    const external = cmux ? (await cmux.list()).filter(s => s.status !== "running" || !s.nativeSession || !s.pid || !known.has(`${s.provider}:${s.nativeSession.id}:${s.pid}`)) : [];
+    return [...native, ...external.map(s => ({ ...s, backend: "cmux" as const, machineId: config.machine!.id, resumable: resumable(s) }))];
+  };
   const pushStore = new PushStore(config.stateDir, key);
   async function inputAuthority(sessionId: string, res: express.Response) {
     // Retained workers from earlier releases hash the entire request. Adding
@@ -87,8 +110,8 @@ export function createApp(config: Config, key: Buffer) {
       "Referrer-Policy": "no-referrer",
       "X-Frame-Options": "DENY",
       "Content-Security-Policy":
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-      "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self' wss: ws://127.0.0.1:* ws://localhost:*; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+      "Permissions-Policy": "camera=(), microphone=(self), geolocation=()",
     });
     if (req.headers.origin && req.headers.origin !== origin.origin)
       return res.status(403).json({ error: "Origin is not allowed" });
@@ -183,6 +206,9 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/me", (_req, res) =>
     res.json({
       role: res.locals.role,
+      machine: { ...config.machine, environment: config.environment },
+      backends: ["infinite", ...(cmux ? ["cmux"] : [])],
+      backendProviders: { infinite: Object.keys(config.agents).filter(p => p !== "demo" || config.enableDemo), cmux: cmux ? ["claude", "codex"].filter(p => p in config.agents) : [] },
       terminal: { stream: true, duplex: true, snapshot: true, control: true, raw: res.locals.role === "owner" },
       nativeUi: ["codex", "opencode"].filter(provider => config.agents[provider as "codex" | "opencode"]),
       execution: { laptop: Boolean(config.agents.codex) && runtimeSecurity(config.deployment).tenancy === "single-tenant", cloudHandoff: Boolean(config.agents.codex) && runtimeSecurity(config.deployment).tenancy === "single-tenant" },
@@ -229,20 +255,93 @@ export function createApp(config: Config, key: Buffer) {
     res.json({ ok: true });
   });
   app.get("/api/sessions", async (_req, res) =>
-    res.json({ sessions: await manager.list() }),
+    res.json({ sessions: await listSessions() }),
   );
   app.post("/api/sessions", requireRole(["owner"]), async (req, res) => {
-    const request = createSchema.parse(req.body);
+    const parsed = createSchema.safeParse(req.body);
+    if (!parsed.success) return void res.status(400).json({ code: "invalid-create", error: "Invalid session details", details: parsed.error.issues.map(issue => ({ path: issue.path.join("."), message: issue.message })) });
+    const request = parsed.data;
     if (request.workspace && (!res.locals.bearer || runtimeSecurity(config.deployment).tenancy !== "single-tenant"))
       return void res.status(403).json({ error: "Laptop execution requires an owner device key and a single-tenant host" });
-    res.status(201).json(await manager.create(request));
+    if (request.backend === "cmux") {
+      if (!cmux) return void res.status(409).json({ error: "cmux is not enabled on this machine" });
+      if (request.nativeArgs || request.workspace || request.localUi) return void res.status(400).json({ error: "Choose a configured project and agent for cmux" });
+      return void res.status(201).json(await cmux.create(request));
+    }
+    const { backend: _backend, ...nativeRequest } = request;
+    res.status(201).json(await manager.create(nativeRequest));
+  });
+  // Imported sessions keep their own transport and journal. Authorization is the same
+  // as the managed-worker routes; raw native gateways remain worker-only.
+  app.use("/api/sessions/:id", async (req, res, next) => {
+    if (!cmux) return next();
+    const sessionId = id.parse(req.params.id);
+    if (existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) return next();
+    const action = req.path;
+    if (req.method === "GET") {
+      if (action === "/" || action === "") {
+        const session = await cmux.get(sessionId);
+        return void res.json({ ...session, machineId: config.machine!.id, resumable: resumable(session) });
+      }
+      if (action === "/events") {
+        await cmux.get(sessionId);
+        const after = z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0).parse(req.query.after);
+        const limit = z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit);
+        const page = cmux.events(sessionId, after, limit);
+        const types = typeof req.query.types === "string" ? new Set(req.query.types.split(",")) : undefined;
+        return void res.json({ ...page, events: types ? page.events.filter(e => types.has(e.type)) : page.events });
+      }
+      if (action === "/messages") return void res.json(await cmux.messages(sessionId,
+        z.string().max(100).optional().parse(req.query.after), z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit)));
+      if (action === "/file") return void res.json(await sessionFile(await cmux.get(sessionId), z.string().parse(req.query.path)));
+      return void res.status(409).json({ error: "This action is unavailable for cmux sessions", code: "unsupported" });
+    }
+    if (req.method !== "POST") return void res.status(405).json({ error: "Unsupported method" });
+    const roles = ["/stop", "/resize", "/resume"].includes(action) ? ["owner"] : ["owner", "controller"];
+    if (!roles.includes(res.locals.role)) return void res.status(403).json({ error: "This device is not allowed to perform that action" });
+    const authority = { actor: res.locals.actor, leaseId: res.locals.leaseId };
+    try {
+      if (action === "/control") {
+        const body = z.object({ action: z.enum(["claim", "renew", "release"]), leaseId: id.optional(), takeover: z.boolean().optional() }).strict().parse(req.body);
+        return void res.json({ control: await cmux.call(sessionId, { op: "control", ...body, actor: res.locals.actor }) });
+      }
+      if (action === "/input") return void res.json(await cmux.call(sessionId, { op: "input", ...inputSchema.parse(req.body), ...authority }));
+      if (action === "/answer") return void res.json(await cmux.call(sessionId, { op: "answer", ...answerSchema.parse(req.body), ...authority }));
+      if (action === "/key") {
+        const body = z.object({ requestId: id, key: z.enum(["interrupt", "enter", "escape", "up", "down", "tab"]) }).strict().parse(req.body);
+        return void res.json(await cmux.call(sessionId, { op: "key", ...body, ...authority }));
+      }
+      if (action === "/stop") return void res.json(await cmux.call(sessionId, { op: "stop", ...z.object({ requestId: id }).strict().parse(req.body), ...authority }));
+      if (action === "/resume") return void res.json(await cmux.resume(sessionId, z.object({ requestId: id }).strict().parse(req.body).requestId));
+      return void res.status(409).json({ error: "This action is unavailable for cmux sessions", code: "unsupported" });
+    } catch (error) {
+      const code = (error as WorkerError).code;
+      if (code === "prompt-open" || (code && ANSWER_REFUSALS.has(code)))
+        return void res.status(409).json({ error: code, attention: (await cmux.get(sessionId)).attention });
+      throw error;
+    }
   });
   app.get("/api/sessions/:id", async (req, res) => {
     const sessionId = id.parse(req.params.id);
-    res.json({
+    const session = {
       ...manager.meta(sessionId).session,
       ...(await manager.state(sessionId, true)),
-    });
+    };
+    res.json({ ...session, backend: "infinite", machineId: config.machine!.id, resumable: resumable(session) });
+  });
+  app.get("/api/sessions/:id/messages", (req, res) => {
+    const session = manager.meta(id.parse(req.params.id)).session;
+    res.json(recordedMessages(manager, session, z.string().max(100).optional().parse(req.query.after),
+      z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit)));
+  });
+  app.get("/api/sessions/:id/file", async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    const session = manager.meta(sessionId).session;
+    if (session.workspace) throw new ContentError("Hybrid files must be inspected on their executor or through an explicit recovery copy");
+    res.json(await sessionFile(session, z.string().parse(req.query.path)));
+  });
+  app.post("/api/sessions/:id/resume", requireRole(["owner"]), async (req, res) => {
+    res.json(await manager.resume(id.parse(req.params.id), z.object({ requestId: id }).strict().parse(req.body).requestId));
   });
   app.get("/api/sessions/:id/native", requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });
@@ -487,6 +586,7 @@ export function createApp(config: Config, key: Buffer) {
       res: express.Response,
       _next: express.NextFunction,
     ) => {
+      if (error instanceof ContentError) return res.status(error.status).json({ error: error.message });
       if (error instanceof z.ZodError)
         return res.status(400).json({
           error: "Invalid request",
@@ -506,6 +606,11 @@ export function createApp(config: Config, key: Buffer) {
             ? "Another device controls this session. Take over explicitly to send input."
             : "Control changed or expired. This input was not sent. Refresh and take control again.",
         });
+      if (error instanceof CmuxError) {
+        const status = ["cmux-unavailable", "session-unavailable", "cmux-busy"].includes(error.code) ? 503
+          : ["invalid-cursor", "invalid-control"].includes(error.code) ? 400 : 409;
+        return res.status(status).json({ code: error.code, error: error.message });
+      }
       // Never echo filesystem paths, prompts, tokens, or child process details.
       return res.status(409).json({
         error:
@@ -516,6 +621,7 @@ export function createApp(config: Config, key: Buffer) {
   const server = createServer(app);
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
-  const closeConnections = () => { closeTerminals(); closeNative(); server.closeAllConnections(); };
-  return { app, manager, pushStore, server, closeConnections };
+  const closeRemote = connectRemoteAccess(server, config);
+  const closeConnections = () => { closeTerminals(); closeNative(); closeRemote(); cmux?.close(); server.closeAllConnections(); };
+  return { app, manager, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

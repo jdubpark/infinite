@@ -1,7 +1,26 @@
 import type { Attention, Provider } from "@infinite/attention";
+import { createRemoteClient, RemoteError } from "@infinite/remote";
+import * as Crypto from "expo-crypto";
 import { loadClientId } from "../store/connection";
 
-export type Connection = { url: string; token: string };
+export type Connection = { id?: string; machineId?: string; label?: string; url: string; token: string; relay?: { machineId: string } };
+export const connectionKey = (connection: Connection) => connection.id ?? `${connection.url}/${connection.relay?.machineId ?? "direct"}`;
+const remotes = new Map<string, { token: string; client: ReturnType<typeof createRemoteClient> }>();
+const remoteKey = (connection: Connection) => `${connectionKey(connection)}/${connection.url}/${connection.relay?.machineId ?? "direct"}`;
+export function closeConnection(connection: Connection) {
+  remotes.get(remoteKey(connection))?.client.close();
+  remotes.delete(remoteKey(connection));
+}
+function remote(connection: Connection) {
+  const key = remoteKey(connection);
+  let saved = remotes.get(key);
+  if (!saved || saved.token !== connection.token) {
+    saved?.client.close();
+    saved = { token: connection.token, client: createRemoteClient(connection, { randomBytes: Crypto.getRandomBytes }) };
+    remotes.set(key, saved);
+  }
+  return saved.client;
+}
 
 export class ApiError extends Error {
   constructor(
@@ -32,7 +51,7 @@ export async function api<T>(
   connection: Connection,
   path: string,
   init: {
-    method?: "GET" | "POST" | "DELETE";
+    method?: "GET" | "POST" | "PUT" | "DELETE";
     body?: unknown;
     /** The lease id this phone holds; the host refuses input without it. */
     control?: string;
@@ -41,12 +60,28 @@ export async function api<T>(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12000);
   try {
+    const headers = {
+      "X-Infinite-Client": await loadClientId(),
+      ...(init.control ? { "X-Infinite-Control": init.control } : {}),
+    };
+    if (connection.relay) {
+      try {
+        return await remote(connection).request<T>(path, { ...init, headers, signal: controller.signal });
+      } catch (error) {
+        if (error instanceof RemoteError) {
+          const value = error.body as { error?: string; code?: string; attention?: Attention } | undefined;
+          const code = value?.code ?? value?.error ?? error.code;
+          if (code === "control-busy" || code === "control-lost") throw new ControlRefusal(error.message, code);
+          throw new ApiError(error.message, error.status, code, value?.attention);
+        }
+        throw error;
+      }
+    }
     const response = await fetch(`${connection.url}/api${path}`, {
       method: init.method ?? (init.body ? "POST" : "GET"),
       headers: {
         Authorization: `Bearer ${connection.token}`,
-        "X-Infinite-Client": await loadClientId(),
-        ...(init.control ? { "X-Infinite-Control": init.control } : {}),
+        ...headers,
         ...(init.body ? { "Content-Type": "application/json" } : {}),
       },
       body: init.body ? JSON.stringify(init.body) : undefined,
@@ -86,6 +121,10 @@ export async function api<T>(
 export type ControlLease = { id: string; label: string; expiresAt: number };
 export type SessionRow = {
   id: string;
+  machineId?: string;
+  backend?: "infinite" | "cmux";
+  projectId?: string;
+  resumable?: boolean;
   title: string;
   provider: Provider;
   status: string;
@@ -115,6 +154,11 @@ export type AnswerReceipt = {
 export type Me = {
   role: "owner" | "controller" | "viewer";
   environment: string;
+  machine?: { id: string; label: string; environment: string };
+  backends?: ("infinite" | "cmux")[];
+  providers?: Provider[];
+  backendProviders?: { infinite: Provider[]; cmux?: Provider[] };
+  projects?: { id: string; name: string }[];
   capabilities?: { signals: boolean; answer: boolean; push: boolean };
 };
 export type LogEvent = {
@@ -123,3 +167,7 @@ export type LogEvent = {
   type: string;
   data: Record<string, unknown>;
 };
+
+export type ChatMessage = { id: string; role: string; text: string; toolName?: string; ts?: string };
+export type MessagesPage = { messages: ChatMessage[]; cursor: string | number; more?: boolean; source?: string; available?: boolean };
+export type ProjectFile = { path: string; name: string; text?: string; mimeType: string; size: number; modifiedAt: string; base64?: string };

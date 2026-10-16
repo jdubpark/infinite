@@ -1,5 +1,7 @@
 # Laptop CLI
 
+For web/phone creation across cloud and laptop machines, cmux discovery, and the outbound relay, see [remote machines](remote-machines.md). The commands below describe the separately installed terminal client. Host setup commands use `node packages/host/dist/cli.js`.
+
 The laptop CLI keeps provider conversations on the cloud host. Codex uses the current laptop project by default and prepares automatic cloud handoff in the background. `--cloud` selects the configured host workspace. Claude Code, Grok and OpenCode retain their cloud execution behavior. Detaching or losing the interface leaves the cloud conversation running.
 
 Launch and attach report their current stage immediately, with elapsed time during longer waits. These messages go to stderr; JSON listings and detached session IDs remain machine-readable on stdout. Progress stops when native output takes over.
@@ -132,11 +134,12 @@ make
 infinite pair https://YOUR-HOST.tailnet.ts.net --token-file /private/owner.key
 ```
 
-`make` (or `make build`) installs dependencies when `node_modules` is missing or older than the lockfile, builds `@infinite/attention` and `@infinite/host`, then runs `scripts/install-client.mjs`. The same steps by hand:
+`make` (or `make build`) installs dependencies when `node_modules` is missing or older than the lockfile, builds `@infinite/attention`, `@infinite/remote`, and `@infinite/host`, then runs `scripts/install-client.mjs`. The same steps by hand:
 
 ```sh
 npm ci
 npm run build -w @infinite/attention
+npm run build -w @infinite/remote
 npm run build -w @infinite/host
 node scripts/install-client.mjs
 ```

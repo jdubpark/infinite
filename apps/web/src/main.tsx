@@ -22,7 +22,11 @@ import {
   TerminalSquare,
   WifiOff,
 } from "lucide-react";
-import { api, ApiError, isControlRefusal, names, type ControlLease, type Me, type Session, type LogEvent } from "./api";
+import { useApi, ApiError, isControlRefusal, names, type ControlLease, type Me, type Session, type LogEvent } from "./api";
+import { clearDrafts, readDraft, settleDraft, useSessionDraft, writeDraft, type PendingInput } from "./drafts";
+import { creations, lifecycles } from "./requests";
+import { MachinePicker, MachineProvider, useMachines } from "./machines";
+import { Conversation, ProjectFiles, Dictation, PromptDecision, SessionLifecycle } from "./session-extras";
 import { SessionPicker, sessionStatus, useSessionLocation, type SessionTab } from "./session-navigation";
 import "@fontsource/instrument-sans/400.css";
 import "@fontsource/instrument-sans/500.css";
@@ -35,9 +39,6 @@ const time = (value: string) =>
     hour: "2-digit",
     minute: "2-digit",
   });
-type PendingInput = { requestId: string; text: string; submit: boolean; force: true };
-// Drafts and uncertain request IDs live only in this tab's memory.
-const drafts = new Map<string, { text: string; pending: PendingInput | null }>();
 // Switching sessions paints the last view immediately, but never restores authority.
 const sessionViews = new Map<string, { session: Session; events: LogEvent[]; cursor: number; seen: string }>();
 const foreground = () => document.visibilityState !== "hidden" && navigator.onLine;
@@ -116,6 +117,7 @@ function useLiveRefresh(
 }
 
 function useSessionControl(id: string) {
+  const api = useApi();
   const [lease, setLease] = useState<ControlLease | null>(null);
   const [holder, setHolder] = useState<ControlLease | null>(null);
   const [message, setMessage] = useState("");
@@ -233,12 +235,14 @@ function Mark() {
   );
 }
 function App() {
+  const api = useApi();
+  const machines = useMachines();
   const [me, setMe] = useState<Me | null>(null);
   const [ready, setReady] = useState(false);
   const [key, setKey] = useState("");
   const [error, setError] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
-  const route = useSessionLocation();
+  const route = useSessionLocation(machines.active.id);
   const selected = route.id, creating = route.creating;
   const [bootstrapError, setBootstrapError] = useState(false);
   const [attempt, setAttempt] = useState(0);
@@ -281,6 +285,7 @@ function App() {
     return (
       <main className="login">
         <Mark />
+        <MachinePicker expanded />
         <p role="status">{bootstrapError ? "Your host is unreachable. Your session link is kept here." : "Connecting to your host…"}</p>
         {bootstrapError && <button className="primary" onClick={() => setAttempt(value => value + 1)}>Try again</button>}
       </main>
@@ -290,6 +295,7 @@ function App() {
       <main className="login">
         <div className="login-sheet">
           <Mark />
+          <MachinePicker />
           <div className="login-heading">
             <h1>
               Pick up where
@@ -336,6 +342,7 @@ function App() {
     <div className={`app ${selected || creating ? "has-detail" : ""}`}>
       <aside className="sidebar">
         <Mark />
+        <MachinePicker />
         <div className="workspace-label">
           <span>Personal workspace</span>
           <ShieldCheck size={15} />
@@ -363,9 +370,7 @@ function App() {
               <Laptop size={18} />
             )}
             <strong>
-              {me.environment === "cloud"
-                ? "Cloud execution host"
-                : "Local rehearsal host"}
+              {me.machine?.label || (me.environment === "cloud" ? "Cloud machine" : "Laptop")}
             </strong>
           </div>
           <p>
@@ -385,12 +390,15 @@ function App() {
         <button
           className="logout"
           onClick={async () => {
-            await api("/logout", {});
+            if (machines.active.connection) { machines.remove(); }
+            else await api("/logout", {});
             setMe(null);
             route.navigate(null);
             setSessions([]);
-            drafts.clear();
-            sessionViews.clear();
+            creations.clear(machines.active.id);
+            lifecycles.clearMachine(machines.active.id);
+            clearDrafts(machines.active.id);
+            for (const key of sessionViews.keys()) if (key.startsWith(`${machines.active.id}/`)) sessionViews.delete(key);
           }}
         >
           <LogOut size={16} /> Disconnect this device
@@ -527,54 +535,66 @@ function Create({
   done: (id: string) => void;
   connected: boolean;
 }) {
-  const [provider, setProvider] = useState(
-    me.providers.includes("demo") ? "demo" : me.providers[0],
-  );
-  const [projectId, setProjectId] = useState(me.projects[0]?.id);
-  const [title, setTitle] = useState("");
-  const [prompt, setPrompt] = useState("");
+  const api = useApi();
+  const machines = useMachines();
+  const machine = machines.active.id;
+  const creation = creations.use(machine);
+  const request = creation.pending;
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const [backend, setBackend] = useState<"infinite" | "cmux">(request?.backend ?? "infinite");
+  const providers = me.backendProviders?.[backend] ?? (backend === "infinite" ? me.providers : []);
+  const [provider, setProvider] = useState(request?.provider ?? (providers.includes("demo") ? "demo" : providers[0]));
+  const [projectId, setProjectId] = useState(request?.projectId ?? me.projects[0]?.id);
+  const [title, setTitle] = useState(request?.title ?? "");
+  const [prompt, setPrompt] = useState(request?.prompt ?? "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const request = useRef<{
-    requestId: string;
-    provider: string;
-    projectId: string;
-    title: string;
-    prompt: string;
-  } | null>(null);
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    if (busy || !connected || me.role !== "owner" || !provider || !projectId) return;
+    if (!request && !title.trim()) { setError("Enter a session name."); return; }
     setBusy(true);
     setError("");
-    request.current ??= {
+    const body = creations.begin(machine, {
       requestId: crypto.randomUUID(),
+      backend,
       provider,
       projectId,
-      title,
+      title: title.trim(),
       prompt,
-    };
+    });
     try {
-      const session = await api<Session>("/sessions", request.current);
-      done(session.id);
+      const session = await api<Session>("/sessions", body);
+      const settled = creations.complete(machine, body.requestId, { id: session.id });
+      if (settled && mounted.current) done(session.id);
     } catch (error) {
-      setError((error as Error).message);
+      creations.fail(machine, body.requestId, (error as Error).message, error instanceof ApiError && error.status === 400 && error.code === "invalid-create");
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   }
   return (
     <div className="create content">
       <h1>Start something.</h1>
-      <p className="intro">Choose an agent and a workspace on your host.</p>
+      <p className="intro">Create a session on {me.machine?.label || machines.active.label}.</p>
+      <MachinePicker />
+      {me.role !== "owner" && <p className="error">An owner key is required to create sessions.</p>}
+      {creation.result && <p role="status">Session created. <button className="text-button" onClick={() => done(creation.result!.id)}>Open created session</button></p>}
       <form onSubmit={submit}>
-        <fieldset disabled={busy || Boolean(request.current)}>
+        <fieldset disabled={busy || Boolean(request)}>
+          <label htmlFor="backend">Session host</label>
+          <select id="backend" value={backend} onChange={event => {
+            const next = event.target.value as "infinite" | "cmux";
+            setBackend(next); setProvider((me.backendProviders?.[next] ?? (next === "infinite" ? me.providers : []))[0]);
+          }}>{(me.backends ?? ["infinite"]).map(value => <option key={value} value={value}>{value === "cmux" ? "cmux" : "Infinite"}</option>)}</select>
           <label htmlFor="provider">Agent</label>
           <select
             id="provider"
             value={provider}
             onChange={(e) => setProvider(e.target.value)}
           >
-            {me.providers.map((p) => (
+            {providers.map((p) => (
               <option key={p} value={p}>
                 {names[p]}
               </option>
@@ -618,15 +638,15 @@ function Create({
             ? "Rehearsal is a local test process. It does not call an AI model."
             : "The agent uses the account and permissions configured on the host. A permission prompt can pause work until you respond."}
         </p>
-        {error && (
+        {(error || creation.message) && (
           <p className="error" role="alert">
-            {error} Retry will use the same creation request.
+            {error || creation.message}{request ? " Retry will use the same creation request." : ""}
           </p>
         )}
-        <button className="primary" disabled={busy || !connected}>
+        <button className="primary" disabled={busy || !connected || me.role !== "owner" || !provider || !projectId || !title.trim()}>
           {busy
             ? "Starting…"
-            : request.current
+            : request
               ? "Retry same request"
               : "Start session"}
           <ArrowUpRight size={18} />
@@ -636,6 +656,7 @@ function Create({
   );
 }
 function TerminalView({ id }: { id: string }) {
+  const api = useApi();
   const element = useRef<HTMLDivElement>(null);
   const [error, setError] = useState("");
   useEffect(() => {
@@ -715,15 +736,22 @@ function SessionView({
   tab: SessionTab;
   setTab: (tab: SessionTab) => void;
 }) {
-  const cached = useRef(sessionViews.get(id));
+  const api = useApi();
+  const machines = useMachines();
+  const cacheKey = `${machines.active.id}/${id}`;
+  const cached = useRef(sessionViews.get(cacheKey));
   const [session, setSession] = useState<Session | null>(cached.current?.session ?? null);
-  const [text, setText] = useState(() => drafts.get(id)?.text ?? "");
+  const draft = useSessionDraft(cacheKey);
+  const text = draft.text;
+  const pendingInput = draft.pending !== null;
+  function setText(next: string | ((previous: string) => string)) {
+    const current = readDraft(cacheKey);
+    writeDraft(cacheKey, { ...current, text: typeof next === "function" ? next(current.text) : next });
+  }
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [events, setEvents] = useState<LogEvent[]>(cached.current?.events ?? []);
-  const pending = useRef<PendingInput | null>(drafts.get(id)?.pending ?? null);
-  const [pendingInput, setPendingInput] = useState(() => Boolean(drafts.get(id)?.pending));
   const cursor = useRef<number | null>(cached.current?.cursor ?? null);
   const composer = useRef<HTMLTextAreaElement>(null);
   const screen = useRef<HTMLPreElement>(null);
@@ -752,15 +780,14 @@ function SessionView({
       `/sessions/${id}/events?after=${after}&types=lifecycle,input-intent,input-result,signal&limit=100`);
     if (current()) {
       cursor.current = page.cursor;
-      const next = [...(sessionViews.get(id)?.events ?? []), ...page.events].slice(-100);
+      const next = [...(sessionViews.get(cacheKey)?.events ?? []), ...page.events].slice(-100);
       setEvents(next);
-      sessionViews.delete(id);
-      sessionViews.set(id, { session: detail, events: next, cursor: page.cursor, seen: new Date().toISOString() });
+      sessionViews.delete(cacheKey);
+      sessionViews.set(cacheKey, { session: detail, events: next, cursor: page.cursor, seen: new Date().toISOString() });
       if (sessionViews.size > 20) sessionViews.delete(sessionViews.keys().next().value!);
     }
     return page.more ? 0 : 1100;
   }, 1100, id, () => control.forget(true));
-  useEffect(() => { drafts.set(id, { text, pending: pending.current }); }, [id, text, pendingInput]);
   useLayoutEffect(() => {
     const output = screen.current, viewport = body.current;
     if (!output || !viewport) return;
@@ -804,19 +831,20 @@ function SessionView({
   }
   async function send(e: React.FormEvent) {
     e.preventDefault();
-    if (!canSteer || busy || sending.current || !text.trim()) return;
+    if (!canSteer || busy || sending.current || !text.trim() || (session?.attention?.prompt && tab !== "terminal" && tab !== "screen")) return;
     sending.current = true;
     setBusy(true);
     setError("");
     setNotice("");
-    const retrying = pending.current !== null;
-    // The live screen is shown here, so text may go into an open dialog, as on a terminal.
-    pending.current ??= { requestId: crypto.randomUUID(), text, submit: true, force: true };
-    setPendingInput(true);
+    const current = readDraft(cacheKey);
+    const retrying = current.pending !== null;
+    // Only the terminal views permit typing directly into an open dialog.
+    const request: PendingInput = current.pending ?? { requestId: crypto.randomUUID(), text: current.text, submit: true, ...(tab === "terminal" || tab === "screen" ? { force: true } : {}) };
+    writeDraft(cacheKey, { text: current.text, pending: request });
     try {
       const receipt = await api<{ state: string }>(
         `/sessions/${id}/input`,
-        pending.current,
+        request,
         undefined,
         control.owned.current?.id,
       );
@@ -824,20 +852,20 @@ function SessionView({
         throw new Error(
           "Delivery is uncertain. Check the terminal before sending anything else.",
         );
-      setText("");
-      pending.current = null;
-      setPendingInput(false);
+      settleDraft(cacheKey, request.requestId, true);
       setNotice(
         "Delivered to the terminal. Agent execution is not yet confirmed.",
       );
     } catch (e) {
       if (handleInputError(e)) {
         if (!retrying) {
-          pending.current = null;
-          setPendingInput(false);
+          settleDraft(cacheKey, request.requestId, false);
         }
         setError(retrying ? `${(e as Error).message} This retry was refused. Earlier delivery remains unconfirmed; its request ID is kept.` :
           `${(e as Error).message} Your draft was not sent.`);
+      } else if (e instanceof ApiError && e.code === "prompt-open" && !retrying) {
+        settleDraft(cacheKey, request.requestId, false); view.refresh();
+        setError("A prompt is open. Answer it above, or use the terminal.");
       } else setError(`${(e as Error).message} Delivery may be uncertain. Check the recording before retrying the same request.`);
     } finally {
       sending.current = false;
@@ -936,7 +964,7 @@ function SessionView({
         </button>
       </div>
       <div className="tabs" role="tablist" aria-label="Session views">
-        {(["screen", "terminal", "context"] as const).map((t) => (
+        {(["chat", "screen", "terminal", "files", "context"] as const).map((t) => (
           <button
             role="tab"
             id={`view-${t}`}
@@ -946,7 +974,7 @@ function SessionView({
             key={t}
             onClick={() => setTab(t)}
             onKeyDown={event => {
-              const views: SessionTab[] = ["screen", "terminal", "context"];
+              const views: SessionTab[] = ["chat", "screen", "terminal", "files", "context"];
               const offset = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
               if (!offset) return;
               event.preventDefault();
@@ -954,11 +982,7 @@ function SessionView({
               setTab(next); document.getElementById(`view-${next}`)?.focus();
             }}
           >
-            {t === "screen"
-              ? "Catch up"
-              : t === "terminal"
-                ? "Full terminal"
-                : "Context"}
+            {t === "chat" ? "Chat" : t === "screen" ? "Catch up" : t === "terminal" ? "Terminal" : t === "files" ? "Files" : "Context"}
           </button>
         ))}
         <span>{session.seq} recorded events</span>
@@ -967,7 +991,7 @@ function SessionView({
         if (screen.current && body.current && screen.current.getBoundingClientRect().bottom > body.current.getBoundingClientRect().bottom + 1)
           setFollowing(false);
       }}>
-        {tab === "terminal" ? (
+        {tab === "chat" ? <Conversation id={id} /> : tab === "files" ? <ProjectFiles id={id} online={connected && view.fresh} /> : tab === "terminal" ? (
           <TerminalView id={id} />
         ) : tab === "context" ? (
           <Context session={session} me={me} connected={connected && view.fresh} />
@@ -1025,12 +1049,14 @@ function SessionView({
         )}
       </div>
       <div className="composer-area">
+        {session.attention?.prompt && <PromptDecision key={session.attention.prompt.id} sessionId={id} backend={session.backend} prompt={session.attention.prompt} canAnswer={Boolean(canSteer && me.capabilities?.answer !== false)} controlId={control.lease?.id} refresh={view.refresh} onRefused={() => control.forget()} openTerminal={() => setTab("terminal")} />}
         <div className="control-bar">
           <div>
             <strong>{requiresControl ? control.lease ? "You have control" : "Monitoring" : me.role === "viewer" ? "View only" : "Shared controls"}</strong>
             <span>{!view.fresh || !connected ? "Refreshing before input…" : session.status !== "running" ? "Process is not running" : requiresControl && !control.lease ? control.holder ? `${control.holder.label} has control` : "Draft now, take control to send" : "Ready for input"}</span>
           </div>
           <div className="control-actions">
+            <SessionLifecycle session={session} role={me.role} online={connected && view.fresh} controlId={control.lease?.id} refresh={view.refresh} />
             <button className="text-button" onClick={view.refresh} disabled={view.refreshing} aria-label="Refresh this session"><RefreshCw size={16} /></button>
             {requiresControl && me.role !== "viewer" && session.status === "running" && (
               control.lease ? <button className="text-button" onClick={async () => { await control.release(); view.refresh(); }}>Stop controlling</button> :
@@ -1085,7 +1111,7 @@ function SessionView({
                 aria-label={
                   busy ? "Sending message" : pendingInput ? "Retry same message" : "Send message"
                 }
-                disabled={!canSteer || busy || !text.trim()}
+                disabled={!canSteer || busy || !text.trim() || Boolean(session.attention?.prompt && tab !== "terminal" && tab !== "screen")}
               >
                 {busy ? <span>Sending…</span> : pendingInput ? <RefreshCw size={20} /> : <Send size={20} />}
               </button>
@@ -1093,6 +1119,7 @@ function SessionView({
             <div className="composer-footer">
               <span>{pendingInput ? "Unconfirmed delivery · retry keeps the same request ID" : text ? "Unsent draft · kept in this tab" : "⌘ / Ctrl + Enter to send · Enter for a new line"}</span>
               <div>
+                <Dictation disabled={busy || pendingInput} onText={value => setText(current => `${current}${current ? " " : ""}${value}`)} />
                 <button
                   disabled={!canSteer || busy}
                   onClick={() => key("enter")}
@@ -1137,6 +1164,7 @@ function Context({
   me: Me;
   connected: boolean;
 }) {
+  const api = useApi();
   const [context, setContext] = useState({ version: 0, text: "" });
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1210,4 +1238,4 @@ function Context({
     </div>
   );
 }
-createRoot(document.getElementById("root")!).render(<App />);
+createRoot(document.getElementById("root")!).render(<MachineProvider><App /></MachineProvider>);

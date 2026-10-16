@@ -2,31 +2,33 @@ import { useEffect, useState } from "react";
 import { ChevronRight, Search, X } from "lucide-react";
 import { names, type Session } from "./api";
 
-export type SessionTab = "screen" | "terminal" | "context";
+export type SessionTab = "chat" | "screen" | "terminal" | "files" | "context";
 type Location = { id: string | null; tab: SessionTab; creating: boolean };
 
-function readLocation(): Location {
-  const match = window.location.hash.match(/^#\/sessions\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})(?:\/(screen|terminal|context))?$/i);
-  return { id: match?.[1] ?? null, tab: (match?.[2] as SessionTab) ?? "screen", creating: window.location.hash === "#/new" };
+function readLocation(machine: string): Location {
+  const hash = window.location.hash.replace(new RegExp(`^#/machines/${machine}(?=/|$)`), "#");
+  const match = hash.match(/^#\/sessions\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})(?:\/(chat|screen|terminal|files|context))?$/i);
+  return { id: match?.[1] ?? null, tab: (match?.[2] as SessionTab) ?? "chat", creating: hash === "#/new" };
 }
 
 // Only the route lives in the URL. Drafts, output and credentials never do.
-export function useSessionLocation() {
-  const [location, setLocation] = useState(readLocation);
+export function useSessionLocation(machine = "direct") {
+  const prefix = machine === "direct" ? "" : `/machines/${machine}`;
+  const [location, setLocation] = useState(() => readLocation(machine));
   useEffect(() => {
-    const update = () => setLocation(readLocation());
+    const update = () => setLocation(readLocation(machine));
     window.addEventListener("hashchange", update);
     return () => window.removeEventListener("hashchange", update);
-  }, []);
-  function navigate(id: string | null, tab: SessionTab = "screen") {
-    window.location.hash = id ? `/sessions/${id}/${tab}` : "/";
+  }, [machine]);
+  function navigate(id: string | null, tab: SessionTab = "chat") {
+    window.location.hash = id ? `${prefix}/sessions/${id}/${tab}` : prefix || "/";
   }
   function selectTab(tab: SessionTab) {
     if (!location.id) return;
-    history.replaceState(null, "", `#/sessions/${location.id}/${tab}`);
-    setLocation(readLocation());
+    history.replaceState(null, "", `#${prefix}/sessions/${location.id}/${tab}`);
+    setLocation(readLocation(machine));
   }
-  return { ...location, navigate, selectTab, create: () => { window.location.hash = "/new"; } };
+  return { ...location, navigate, selectTab, create: () => { window.location.hash = `${prefix}/new`; } };
 }
 
 export const sessionStatus = (session: Session) => session.attention?.state === "needs-you"
@@ -63,12 +65,12 @@ export function SessionPicker({ sessions, selected, loading, onSelect }: {
       {matches.map(session => <button key={session.id} aria-current={selected === session.id ? "page" : undefined}
         className={`session-row ${selected === session.id ? "selected" : ""}`} onClick={() => onSelect(session.id)}>
         <div className="row-top"><span className={`dot ${needsYou(session) ? "needs-you" : session.status}`} /><strong>{session.title}</strong><ChevronRight size={16} /></div>
-        <div className="row-meta"><span>{names[session.provider]}</span><span>{sessionStatus(session)}</span></div>
+        <div className="row-meta"><span>{names[session.provider]}{session.backend === "cmux" ? " · cmux" : ""}</span><span>{sessionStatus(session)}</span></div>
         {session.attention?.now && <p className="row-preview">{session.attention.now}</p>}
         <div className="row-meta session-id">{session.id.slice(0, 8)}</div>
       </button>)}
       {!matches.length && <div className="rail-empty" role="status">
-        {loading ? "Loading your sessions…" : query ? "No matching sessions in this view." : filter === "attention" ? "No sessions need your attention." : filter === "active" ? "No active sessions." : "Start a session from your laptop to see it here."}
+        {loading ? "Loading your sessions…" : query ? "No matching sessions in this view." : filter === "attention" ? "No sessions need your attention." : filter === "active" ? "No active sessions." : "Create a session on this machine to see it here."}
         {!loading && filter !== "all" && <button className="text-button" onClick={() => setFilter("all")}>Show all sessions</button>}
       </div>}
     </nav>

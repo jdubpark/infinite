@@ -20,6 +20,7 @@ import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
+import { ContentError } from "./session-content.js";
 import type {
   Config,
   Provider,
@@ -38,6 +39,8 @@ export interface CreateSession {
   nativeArgs?: string[];
   localUi?: boolean;
   workspace?: LaptopWorkspace & { token: string };
+  resumedFrom?: string;
+  resumeNativeSession?: { id: string; source: "hook" | "protocol" };
 }
 interface StoredSession {
   session: Session;
@@ -210,6 +213,58 @@ export class Manager {
     this.serial = operation.catch(() => {});
     return operation;
   }
+  resume(sessionId: string, requestId: string): Promise<Session & WorkerState> {
+    const operation = this.serial.then(() => this.resumeOnce(sessionId, requestId));
+    this.serial = operation.catch(() => {});
+    return operation;
+  }
+  private async resumeOnce(sessionId: string, requestId: string): Promise<Session & WorkerState> {
+    if (requestId === sessionId) throw new ContentError("Resumption needs a new request identity", 400);
+    const receiptFile = join(this.config.stateDir, "resumptions", `${requestId}.sealed`);
+    if (existsSync(receiptFile)) {
+      const receipt = unseal<{ sourceId: string; targetId: string }>(this.key, `resume:${requestId}`, readFileSync(receiptFile, "utf8"));
+      if (receipt.sourceId !== sessionId) throw new ContentError("Request ID already belongs to a different resumption");
+      return { ...this.meta(receipt.targetId).session, ...(await this.state(receipt.targetId)) };
+    }
+    const remember = (result: Session & WorkerState) => {
+      writeSealed(receiptFile, this.key, `resume:${requestId}`, { sourceId: sessionId, targetId: result.id });
+      return result;
+    };
+    const session = this.meta(sessionId).session;
+    const state = await this.state(sessionId);
+    if (state.status === "running" || state.status === "starting") return remember({ ...session, ...state });
+    const native = state.nativeSession ?? session.resumeNativeSession;
+    if (state.status !== "exited") throw new ContentError("The previous process has not confirmed exit. Reconnect before resuming.");
+    if (!native || !/^[A-Za-z0-9_-]{1,200}$/.test(native.id) || !["claude", "codex", "opencode"].includes(session.provider))
+      throw new ContentError("This recording has no supported native conversation to resume");
+    if (session.workspace) throw new ContentError("Recover this hybrid workspace with the laptop CLI before starting a new runtime");
+    const args = session.provider === "claude" ? ["--resume", native.id]
+      : session.provider === "codex" ? ["resume", native.id] : ["--session", native.id];
+    const request: CreateSession = { requestId, provider: session.provider, projectId: session.projectId,
+      title: session.title, prompt: "", nativeArgs: args, resumedFrom: sessionId, resumeNativeSession: native };
+    // Creation metadata is durable before spawn. Recover its exact receipt even
+    // if the API stopped before it could record the resumption result.
+    if (existsSync(join(this.config.stateDir, "sessions", requestId, "meta.sealed")))
+      return remember(await this.createOnce(request));
+    const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(id => /^[a-f0-9-]{36}$/.test(id) && id !== sessionId);
+    const continuations = await Promise.all(ids.map(async id => {
+      let candidate: Session;
+      try { candidate = this.meta(id).session; }
+      catch { throw new ContentError("A recording cannot be authenticated. Recover it before starting another continuation."); }
+      if (candidate.provider !== session.provider) return undefined;
+      const current = await this.state(id).catch(() => unavailable());
+      if (candidate.resumedFrom !== sessionId && candidate.resumeNativeSession?.id !== native.id && current.nativeSession?.id !== native.id) return undefined;
+      if (current.status === "exited") return undefined;
+      if (current.status !== "running" && current.status !== "starting")
+        throw new ContentError("Another continuation has not confirmed exit. Reconnect before resuming.");
+      return { ...candidate, ...current };
+    }));
+    const live = continuations.filter((candidate): candidate is Session & WorkerState => candidate !== undefined);
+    if (live.length > 1) throw new ContentError("Multiple continuations are active. Open an existing session before resuming.");
+    if (live[0]) return remember(live[0]);
+    // Use the same admission queue as create, without re-entering it.
+    return remember(await this.createOnce(request));
+  }
   private async createOnce(request: CreateSession) {
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -246,6 +301,9 @@ export class Manager {
     const context = this.context(request.projectId);
     const session: Session = {
       id,
+      backend: "infinite",
+      machineId: this.config.machine?.id,
+      ...(request.resumedFrom ? { resumedFrom: request.resumedFrom, resumeNativeSession: request.resumeNativeSession } : {}),
       provider: request.provider,
       title: request.title,
       projectId: request.projectId,

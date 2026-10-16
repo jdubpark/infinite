@@ -1,4 +1,6 @@
-/** A text send whose delivery is unconfirmed; "Retry" resends it with the same requestId. */
+import { useCallback, useSyncExternalStore } from "react";
+
+/** A text send whose delivery is unconfirmed; Retry keeps the same requestId. */
 export type PendingInput = {
   requestId: string;
   text: string;
@@ -6,20 +8,44 @@ export type PendingInput = {
   force?: boolean;
 };
 type Draft = { text: string; pending: PendingInput | null };
-
-// Unsent drafts never leave process memory. Disconnecting the phone clears them.
+const EMPTY: Draft = { text: "", pending: null };
+// Drafts never leave process memory. Receipts settle here even after a screen unmounts.
 const drafts = new Map<string, Draft>();
+const listeners = new Map<string, Set<() => void>>();
 
-/** The composer's text and unconfirmed request, kept across navigation within one app run. */
 export function readDraft(key: string): Draft {
-  return drafts.get(key) ?? { text: "", pending: null };
+  return drafts.get(key) ?? EMPTY;
 }
 
 export function writeDraft(key: string, draft: Draft) {
+  const previous = readDraft(key);
+  if (previous.text === draft.text && previous.pending === draft.pending) return;
   if (!draft.text && !draft.pending) drafts.delete(key);
   else drafts.set(key, draft);
+  listeners.get(key)?.forEach(listener => listener());
 }
 
-export function clearDrafts() {
-  drafts.clear();
+/** A delayed receipt can settle its own request, never a newer draft or send. */
+export function settleDraft(key: string, requestId: string, delivered: boolean) {
+  const draft = readDraft(key);
+  if (draft.pending?.requestId !== requestId) return;
+  writeDraft(key, {
+    text: delivered && draft.text === draft.pending.text ? "" : draft.text,
+    pending: null,
+  });
+}
+
+export function useSessionDraft(key: string) {
+  const subscribe = useCallback((listener: () => void) => {
+    let group = listeners.get(key);
+    if (!group) { group = new Set(); listeners.set(key, group); }
+    group.add(listener);
+    return () => { group.delete(listener); if (!group.size) listeners.delete(key); };
+  }, [key]);
+  const snapshot = useCallback(() => readDraft(key), [key]);
+  return useSyncExternalStore(subscribe, snapshot);
+}
+
+export function clearDrafts(machine?: string) {
+  for (const key of drafts.keys()) if (!machine || key.startsWith(`${machine}/`)) writeDraft(key, EMPTY);
 }

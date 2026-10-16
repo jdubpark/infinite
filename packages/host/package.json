@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@infinite/attention": "0.1.0",
+    "@infinite/remote": "0.1.0",
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/headless": "^5.5.0",
     "express": "^5.2.1",

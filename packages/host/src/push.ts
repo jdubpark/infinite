@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { unseal, writeSealed } from "./vault.js";
 
 export interface PushDevice { deviceId: string; token: string; platform: "android" | "ios"; addedAt: string }
-export interface PushMessage { to: string; title: string; body: string; data: { url: string }; channelId: "attention"; priority: "high" | "default"; collapseId: string }
+export interface PushMessage { to: string; title: string; body: string; data: { url: string; machineId?: string }; channelId: "attention"; priority: "high" | "default"; collapseId: string }
 export interface PushTicket { status: "ok" | "error"; id?: string; message?: string; details?: { error?: string } }
 export type PushSender = (messages: PushMessage[]) => Promise<PushTicket[]>;
 

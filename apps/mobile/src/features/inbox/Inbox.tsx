@@ -4,6 +4,7 @@ import { useRouter } from "expo-router";
 import { PROVIDER_NAMES, groupSessions } from "@infinite/attention";
 import {
   api,
+  connectionKey,
   type Connection,
   type Me,
   type SessionRow,
@@ -45,7 +46,7 @@ export function Inbox({
         sessions: [...list.sessions].sort((a, b) =>
           b.createdAt.localeCompare(a.createdAt),
         ),
-        environment: me.environment,
+        me,
       };
     },
     2500,
@@ -67,19 +68,18 @@ export function Inbox({
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
         <Text style={s.title}>Your sessions</Text>
         <Text style={s.body}>
-          {data?.environment === "local"
-            ? "Local rehearsal host"
-            : "Your cloud workspace"}
+          {data?.me.machine?.label || connection.label || (data?.me.environment === "local" ? "Laptop" : "Cloud machine")}
         </Text>
         <OfflineBanner
           online={online || loading}
-          message="This view may be stale. Your agents may still be running. Check your private network connection."
+          message="This view may be stale. Your agents may still be running. Check the machine and your network connection."
         />
         <View style={s.listHeading}>
           <Text style={s.small}>
             {sessions.filter((session) => session.status === "running").length}{" "}
             running
           </Text>
+          {data?.me.role === "owner" ? <Button title="New session" disabled={!online} onPress={() => router.push({ pathname: "/new", params: { machine: connectionKey(connection) } })} /> : null}
           <Button title={refreshing ? "Refreshing…" : "Refresh"} secondary disabled={refreshing} onPress={refresh} />
         </View>
         <Text style={s.small}>
@@ -104,7 +104,7 @@ export function Inbox({
                 onPress={() =>
                   router.push({
                     pathname: "/session/[id]",
-                    params: { id: row.id },
+                    params: { id: row.id, machine: connectionKey(connection) },
                   })
                 }
                 style={({ pressed }) => [
@@ -126,7 +126,7 @@ export function Inbox({
                   {row.attention.now || "—"}
                 </Text>
                 <Text style={s.meta}>
-                  {PROVIDER_NAMES[row.provider]} ·{" "}
+                  {PROVIDER_NAMES[row.provider]}{row.backend === "cmux" ? " · cmux" : ""} ·{" "}
                   {timeAgo(row.attention.since)}
                 </Text>
               </Pressable>
@@ -137,8 +137,7 @@ export function Inbox({
           <View style={s.empty}>
             <Text style={s.subtitle}>A session that stays.</Text>
             <Text style={s.body}>
-              Start a session from your laptop. It will appear here as soon as
-              the host receives it.
+              {data?.me.role === "owner" ? "Start a session on this machine from this phone." : "Sessions appear here when an owner creates one on this machine."}
             </Text>
           </View>
         )}
@@ -146,7 +145,7 @@ export function Inbox({
       <View style={s.bottom}>
         {pushNote ? <Text style={s.small}>{pushNote}</Text> : null}
         <Button
-          title="Disconnect this phone"
+          title="Remove this machine"
           secondary
           onPress={onDisconnect}
         />

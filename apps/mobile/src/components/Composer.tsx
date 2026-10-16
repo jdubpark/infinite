@@ -91,7 +91,7 @@ export function Composer({
         />}
       </View>
       {!pending && !blocked && <Text style={s.draftNote}>
-        {text ? "Unsent draft · kept on this phone while the app is open" : "Drafts stay on this phone until you send."}
+        {text ? "Unsent draft · kept on this phone while the app is open" : "Use your keyboard’s microphone to dictate. Review, then Send."}
       </Text>}
       {onInterrupt || children ? (
         <View style={s.keys}>

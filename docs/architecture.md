@@ -2,7 +2,7 @@
 
 This page describes the implemented **single-tenant runner**. The managed service now requires a separate runner and confidential execution boundary per user. Global control-plane accounts must never become runner data-access roles. See [managed tenants](multi-tenant.md) for the accepted architecture, hardware limitation, development backend, and confidential release gates.
 
-The native UI and checkpoint requirements are refined in [native interaction and continuity](native-continuity.md), including source reviews of Herdr and Orca. The runner now implements separate runtime identity, snapshot-plus-delta attachment, per-worker capability negotiation, and device-control ownership. A cloud PTY preserves execution but cannot provide local-speed echo over a slow network. Experimental native frontend/backend adapters exist for Codex and OpenCode. Structured compact provider transcripts remain future work; Codex workspace preparation and handoff are described below.
+The native UI and checkpoint requirements are refined in [native interaction and continuity](native-continuity.md), including source reviews of Herdr and Orca. The runner now implements separate runtime identity, snapshot-plus-delta attachment, per-worker capability negotiation, and device-control ownership. A cloud PTY preserves execution but cannot provide local-speed echo over a slow network. Experimental native frontend/backend adapters exist for Codex and OpenCode. Compact chat shows explicit recorded messages and available cmux native transcripts; complete structured transcripts across all providers remain future work. Codex workspace preparation and handoff are described below.
 
 ## Execution model
 
@@ -22,13 +22,13 @@ flowchart LR
   API --> Journal
 ```
 
-The native process lives under its worker, not the HTTP server. An API crash leaves workers alive. Each worker owns its recording and input receipt map. The single HTTP listener binds only to `127.0.0.1`; HTTPS and private device networking belong to Tailscale Serve. A laptop can use ordinary SSH from a cmux pane to run `infinite attach SESSION_ID` on the host. No cmux internals are required.
+The native process lives under its worker, not the HTTP server. An API crash leaves workers alive. Each worker owns its recording and input receipt map. The single HTTP listener binds only to `127.0.0.1`; Tailscale Serve can provide private HTTPS. A laptop can use ordinary SSH from a cmux pane to run `infinite attach SESSION_ID` on the host. Web and phone clients can also select independently paired machines. An optional outbound runner connection reaches an opaque relay, which forwards encrypted requests into the same authorized API. The optional cmux backend discovers existing Claude Code and Codex conversations and creates new cmux workspaces. Its process lifecycle and snapshot recording differ from detached Infinite workers. [Remote machines](remote-machines.md) defines those contracts and setup; neither backend changes execution ownership merely because a client switches machines.
 
 ## State and failure behavior
 
 `starting → running → exited`. An unreachable worker is reported as `unavailable`, never “completed.” Recording failure sets `recording-error` and attempts to suspend the native process with SIGSTOP. This favors preserving the record over continuing silently without one. Operator intervention is required if storage fills.
 
-Browser/network loss does not change worker state. API restart discovers existing workers through their private sockets and existing encrypted metadata. Host power loss, a native crash, or loss of the worker process is a different failure: this version retains the recording but does not recreate or resume the process. There is no second cloud host or high availability claim.
+Browser/network loss does not change worker state. API restart discovers existing workers through their private sockets and existing encrypted metadata. Host power loss, a native crash, or loss of the worker process is a different failure: the recording remains, but the process is not recreated automatically. An owner can explicitly resume a confirmed exited conversation with a known native ID for supported providers; this creates a fresh runtime and recording without resending its original prompt. Unknown or unavailable runtimes cannot be resumed this way. There is no second cloud host or high availability claim.
 
 Terminal-native input can include arbitrary keyboard sequences over owner-only terminal connections or SSH/local IPC. Web/mobile text input rejects escape/control injection. Multiline paste is allowed only after the terminal application advertises bracketed-paste support. Explicit Enter/Escape/arrow/interrupt controls handle provider menus. None of these controls infer tool approval.
 
@@ -54,6 +54,8 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | Device capabilities | `GET /api/me` | Any paired role |
 | List / inspect sessions | `GET /api/sessions`, `GET /api/sessions/:id` | Any |
 | Create session | `POST /api/sessions` | Owner |
+| Read chat / preview a project file | `GET /api/sessions/:id/messages`, `/file?path=` | Any |
+| Explicitly resume an exited conversation | `POST /api/sessions/:id/resume` | Owner |
 | Replay logs | `GET /api/sessions/:id/events`, optionally filtered with `?types=` | Any |
 | Answer an on-screen dialog | `POST /api/sessions/:id/answer` | Owner, controller |
 | Register / remove a push token | `POST /api/devices/push`, `DELETE /api/devices/push` | Any |
@@ -64,7 +66,7 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | Read project context | `GET /api/projects/:id/context` | Any |
 | Replace context with version check | `PUT /api/projects/:id/context` | Owner |
 
-Session IDs and project IDs are validated. Executables and project working directories come from private host configuration. The owner-only native CLI launch accepts an argument array, including provider flags that may access other files available to the agent account; this is not a sandbox boundary within a tenant. Browser creation uses the configured provider arguments. Prompts and native arguments are passed directly to the executable, never through a shell; active-host process inspection can see them.
+Session IDs and project IDs are validated. Executables and project working directories come from private host configuration. The owner-only native CLI launch accepts an argument array, including provider flags that may access other files available to the agent account; this is not a sandbox boundary within a tenant. Web and phone creation use configured provider arguments. Infinite workers pass prompts and native arguments directly to the executable. The cmux adapter quotes each configured argument before launching in the chosen workspace shell. Active-host process inspection can see launch arguments.
 
 The maximum concurrency defaults to 24; it is a count limit, not CPU, memory, spend, or per-provider quota enforcement. Resource limits and isolated worktrees belong to commissioning. Do not run multiple editors against one configured checkout until those directories are separated.
 
@@ -118,6 +120,6 @@ Web and mobile screens show the time of the last successful refresh and distingu
 
 The CLI's Ctrl+E editor additionally saves encrypted local drafts across process restarts. Each client writes a separate atomic file, keyed to its pairing, project, session, and runtime. Only a closed or dead writer's draft is recovered. Before insertion the client durably records its request ID as uncertain; a delivered receipt clears the record, a confirmed control refusal returns it to unsent, and every other failure retains the uncertainty. Recovery never dispatches text. See the [draft controls](cli.md#terminal-controls) for review and discard behavior and the limits of native provider edit buffers.
 
-Browser URLs retain the selected session ID and view, without including draft text or credentials. A bounded memory cache keeps the last 20 session views for immediate display during navigation; input stays disabled until fresh host state and any required lease arrive. Initial activity reads start near the latest sequence and retain at most 100 control events. Mobile recording pages are also bounded; the complete journal remains available on the host. Search and filtering affect the client list, not record retention.
+Browser URLs retain the selected machine, session ID and view, without including draft text or credentials. A bounded memory cache keeps the last 20 session views for immediate display during navigation; input stays disabled until fresh host state and any required lease arrive. Initial activity reads start near the latest sequence and retain at most 100 control events. Mobile recording pages are also bounded; the complete journal remains available on the host. Search and filtering affect the client list, not record retention.
 
 The native interface remains the default. Ctrl+E offers a local draft editor that keeps typing on the laptop and inserts text only when requested. It does not remove network latency from the remote native interface. Native CLI arguments are passed without shell evaluation, encrypted with session metadata, and omitted from list rows. The [CLI contract](cli.md) covers flag placement, context behavior, reconnect, and explicit native recovery after a process exit.

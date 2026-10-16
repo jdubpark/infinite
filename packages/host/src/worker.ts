@@ -92,6 +92,7 @@ let state: WorkerState = {
   capabilities: { terminalSnapshot: 1, inputControl: 1 },
   control: null,
   runtime: session.runtime ?? { id: randomUUID(), location: "local", transport: "pty" },
+  ...(session.resumeNativeSession ? { nativeSession: session.resumeNativeSession } : {}),
   ...(session.workspace ? { execution: { location: "laptop", state: "connecting", cloudReady: false } as const } : {}),
 };
 let child: ReturnType<typeof spawn> | undefined;
@@ -577,6 +578,7 @@ function deliver(
   const result = append("input-result", {
     requestId: request.requestId,
     state: "delivered",
+    ...(request.op === "input" && request.submit ? { message: request.text } : {}),
   });
   receipt.state = "delivered";
   receipt.seq = result.seq;

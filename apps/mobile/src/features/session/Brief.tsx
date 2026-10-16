@@ -11,6 +11,7 @@ import { useRouter } from "expo-router";
 import { PROVIDER_NAMES, deriveMoments } from "@infinite/attention";
 import {
   api,
+  connectionKey,
   type Connection,
   type Me,
   type SessionDetail,
@@ -26,6 +27,9 @@ import { OfflineBanner } from "../../components/OfflineBanner";
 import { SourceTag } from "../../components/SourceTag";
 import { StatePill } from "../../components/StatePill";
 import { theme } from "../../theme";
+import { Conversation } from "./Conversation";
+import { Files } from "./Files";
+import { Lifecycle } from "./Lifecycle";
 import { useAnswer } from "./useAnswer";
 import { useControlSync, useSessionControl } from "./useSessionControl";
 import { useSignals } from "./useSignals";
@@ -40,6 +44,7 @@ export function Brief({
   id: string;
 }) {
   const router = useRouter();
+  const [tab, setTab] = useState<"chat" | "activity" | "files">("chat");
   const control = useSessionControl(connection, id);
   const {
     data: poll,
@@ -80,7 +85,7 @@ export function Brief({
   // Workers that enforce control take input only from the device holding the lease.
   const requiresControl = session?.capabilities?.inputControl === 1;
   const steering = useSteering(connection, id, refresh, control, {
-    draftKey: `${connection.url}/${id}/brief`,
+    draftKey: `${connectionKey(connection)}/${id}/brief`,
     requiresControl,
   });
   const prompt =
@@ -120,10 +125,10 @@ export function Brief({
   }
   function back() {
     if (router.canGoBack()) router.back();
-    else router.replace("/");
+    else router.replace({ pathname: "/", params: { machine: connectionKey(connection) } });
   }
   function openTerminal() {
-    router.push({ pathname: "/session/[id]/terminal", params: { id } });
+    router.push({ pathname: "/session/[id]/terminal", params: { id, machine: connectionKey(connection) } });
   }
 
   return (
@@ -153,7 +158,7 @@ export function Brief({
               <SourceTag hooks={session.attention.hooks} source={session.attention.source} />
             </View>
             <Text style={s.small}>
-              {new URL(connection.url).host} ·{" "}
+              {connection.label || new URL(connection.url).host} ·{" "}
               {online
                 ? `Updated ${seen}`
                 : seen
@@ -209,6 +214,7 @@ export function Brief({
               <DecisionCard
                 key={prompt.id}
                 prompt={prompt}
+                backend={session.backend}
                 status={answering.status}
                 canAnswer={canAnswer}
                 readOnly={readOnly}
@@ -226,6 +232,10 @@ export function Brief({
                 onOpenTerminal={openTerminal}
               />
             )}
+            <View style={s.metaRow}>
+              {(["chat", "activity", "files"] as const).map(value => <Button key={value} title={value[0].toUpperCase() + value.slice(1)} secondary={tab !== value} onPress={() => setTab(value)} />)}
+            </View>
+            {tab === "chat" ? <Conversation connection={connection} id={id} /> : tab === "files" ? <Files connection={connection} id={id} online={online} /> : <>
             <Text style={s.label}>
               So far
               {moments.length ? (
@@ -250,6 +260,8 @@ export function Brief({
                 ) : null}
               </View>
             )}
+            </>}
+            <Lifecycle connection={connection} session={session} role={me?.role} online={online} control={control.lease?.id} refresh={refresh} />
           </ScrollView>
           {me && me.role !== "viewer" ? (
             <Composer

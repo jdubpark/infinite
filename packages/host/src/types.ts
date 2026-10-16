@@ -26,7 +26,7 @@ export interface TerminalSnapshot {
 export interface SessionRuntime {
   id: string;
   location: "local" | "cloud";
-  transport: "pty";
+  transport: "pty" | "cmux";
   nativeUi?: "codex" | "opencode";
 }
 export interface LaptopWorkspace {
@@ -43,6 +43,10 @@ export interface ExecutionState {
 }
 export interface Session {
   id: string;
+  backend?: "infinite" | "cmux";
+  machineId?: string;
+  resumedFrom?: string;
+  resumeNativeSession?: { id: string; source: "hook" | "protocol" };
   provider: Provider;
   title: string;
   projectId: string;
@@ -80,6 +84,9 @@ export interface AgentProfile {
   sharedWorkspace?: boolean;
 }
 export interface Config {
+  machine?: { id: string; label: string };
+  cmux?: { enabled: boolean; command?: string; hooksDir?: string };
+  remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
   deployment?: import("./deployment.js").Deployment;
   port: number;
   origin: string;
@@ -116,7 +123,7 @@ export interface WorkerState {
   seq: number;
   screen: string;
   attention: Attention;
-  capabilities?: { terminalSnapshot: 1; inputControl: 1; nativeUi?: "codex" | "opencode" };
+  capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode" };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
   nativeSession?: { id: string; source: "hook" | "protocol" };

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   KeyboardAvoidingView,
   Platform,
@@ -8,7 +8,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { api, type Connection } from "../../api/client";
+import { api, type Connection, type Me } from "../../api/client";
 import { saveConnection } from "../../store/connection";
 import { Button } from "../../components/Button";
 import { theme } from "../../theme";
@@ -16,12 +16,18 @@ import { theme } from "../../theme";
 export function Pair({
   onPaired,
   initialError = "",
+  onCancel,
 }: {
   onPaired: (connection: Connection) => void;
   initialError?: string;
+  onCancel?: () => void;
 }) {
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
+  const [label, setLabel] = useState("");
+  const [relayMachine, setRelayMachine] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(initialError);
   async function pair() {
@@ -42,11 +48,12 @@ export function Pair({
         endpoint.hash
       )
         throw new Error("Use a bare HTTPS address on your private network.");
-      const next = { url: endpoint.origin, token: token.trim() };
-      await api(next, "/me");
-      await saveConnection(next);
+      const next: Connection = { url: endpoint.origin, token: token.trim(), ...(relayMachine.trim() ? { relay: { machineId: relayMachine.trim() } } : {}) };
+      const me = await api<Me>(next, "/me");
+      if (!mounted.current) return;
+      const saved = await saveConnection({ ...next, id: me.machine?.id, machineId: me.machine?.id, label: label.trim() || me.machine?.label || endpoint.hostname });
       setToken("");
-      onPaired(next);
+      if (mounted.current) onPaired(saved);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -65,21 +72,25 @@ export function Pair({
         <Text style={s.brand}>infinite</Text>
         <Text style={s.hero}>Pick up where{`\n`}you left off.</Text>
         <Text style={s.body}>
-          Your agents stay on your host. Connect through your private network to
-          catch up and steer.
+          Connect a laptop or cloud machine to create sessions, catch up, and steer from this phone.
         </Text>
-        <Text style={s.label}>Host address</Text>
+        {onCancel ? <Button title="Back to machines" secondary onPress={onCancel} disabled={busy} /> : null}
+        <Text style={s.label}>Machine name (optional)</Text>
+        <TextInput accessibilityLabel="Machine name" value={label} onChangeText={setLabel} placeholder="My laptop or cloud" placeholderTextColor={theme.colors.placeholder} style={s.input} maxLength={80} />
+        <Text style={s.label}>Host or relay address</Text>
         <TextInput
           accessibilityLabel="Host address"
           value={url}
           onChangeText={setUrl}
-          placeholder="https://host.your-tailnet.ts.net"
+          placeholder="https://host.example.com"
           placeholderTextColor={theme.colors.placeholder}
           autoCapitalize="none"
           autoCorrect={false}
           keyboardType="url"
           style={s.input}
         />
+        <Text style={s.label}>Relay machine ID (relay connections only)</Text>
+        <TextInput accessibilityLabel="Relay machine ID" value={relayMachine} onChangeText={setRelayMachine} placeholder="Leave empty for a direct connection" placeholderTextColor={theme.colors.placeholder} autoCapitalize="none" autoCorrect={false} style={s.input} />
         <Text style={s.label}>Device key</Text>
         <TextInput
           accessibilityLabel="Device key"
@@ -104,8 +115,7 @@ export function Pair({
           </Text>
         ) : null}
         <Text style={s.footnote}>
-          The device key is stored in this phone’s secure storage. New sessions
-          start from your laptop.
+          Device keys stay in this phone’s secure storage. Owner keys can create and end sessions; controller keys can steer existing sessions. Relay connections are encrypted between this phone and the machine.
         </Text>
       </ScrollView>
     </KeyboardAvoidingView>

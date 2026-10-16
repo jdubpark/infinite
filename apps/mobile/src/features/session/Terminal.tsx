@@ -10,6 +10,7 @@ import { useRouter } from "expo-router";
 import { PROVIDER_NAMES } from "@infinite/attention";
 import {
   api,
+  connectionKey,
   type Connection,
   type Me,
   type SessionDetail,
@@ -57,7 +58,7 @@ export function Terminal({
   // The person sees the screen here, so text may go into an open dialog.
   const steering = useSteering(connection, id, refresh, control, {
     force: true,
-    draftKey: `${connection.url}/${id}/terminal`,
+    draftKey: `${connectionKey(connection)}/${id}/terminal`,
     requiresControl,
   });
   const running = session?.status === "running";
@@ -70,7 +71,7 @@ export function Terminal({
   }
   function back() {
     if (router.canGoBack()) router.back();
-    else router.replace("/");
+    else router.replace({ pathname: "/", params: { machine: connectionKey(connection) } });
   }
   return (
     // Android runs edge-to-edge, so the window no longer resizes for the keyboard.
@@ -98,7 +99,7 @@ export function Terminal({
               {session.pid ? `PID ${session.pid}` : "No live process"}
             </Text>
             <Text style={s.small}>
-              {new URL(connection.url).host} ·{" "}
+              {connection.label || new URL(connection.url).host} ·{" "}
               {online
                 ? `Updated ${seen}`
                 : seen

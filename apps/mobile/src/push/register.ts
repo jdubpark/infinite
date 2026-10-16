@@ -3,12 +3,13 @@ import * as Device from "expo-device";
 import Constants from "expo-constants";
 import { Platform } from "react-native";
 import * as SecureStore from "expo-secure-store";
-import { api, type Connection } from "../api/client";
+import { api, connectionKey, type Connection } from "../api/client";
 
 const TOKEN_KEY = "infinite.push.v1";
 export type PushState = "registered" | "denied" | "unavailable";
 
 let tokenListener: Notifications.EventSubscription | null = null;
+const registered = new Map<string, Connection>();
 
 function platform() {
   return Platform.OS === "ios" ? "ios" : "android";
@@ -43,13 +44,15 @@ export async function registerForPush(
     body: { token, platform: platform() },
   });
   await SecureStore.setItemAsync(TOKEN_KEY, token);
-  tokenListener?.remove();
-  tokenListener = Notifications.addPushTokenListener(async (next) => {
+  registered.set(connectionKey(connection), connection);
+  tokenListener ??= Notifications.addPushTokenListener(async () => {
     try {
-      await api(connection, "/devices/push", {
-        body: { token: next.data, platform: platform() },
-      });
-      await SecureStore.setItemAsync(TOKEN_KEY, next.data);
+      // Native token rotation invalidates the Expo token; never send APNs/FCM data as an Expo token.
+      const next = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+      await Promise.allSettled([...registered.values()].map(profile => api(profile, "/devices/push", {
+        body: { token: next, platform: platform() },
+      })));
+      await SecureStore.setItemAsync(TOKEN_KEY, next);
     } catch {
       /* retried on next launch */
     }
@@ -58,13 +61,13 @@ export async function registerForPush(
 }
 
 export async function unregisterPush(connection: Connection) {
-  tokenListener?.remove();
-  tokenListener = null;
+  registered.delete(connectionKey(connection));
+  if (!registered.size) { tokenListener?.remove(); tokenListener = null; }
   const token = await SecureStore.getItemAsync(TOKEN_KEY).catch(() => null);
   if (!token) return;
   await api(connection, "/devices/push", {
     method: "DELETE",
     body: { token },
   }).catch(() => {});
-  await SecureStore.deleteItemAsync(TOKEN_KEY).catch(() => {});
+  if (!registered.size) await SecureStore.deleteItemAsync(TOKEN_KEY).catch(() => {});
 }

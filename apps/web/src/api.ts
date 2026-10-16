@@ -1,6 +1,13 @@
+import { createContext, useContext } from "react";
+import { createRemoteClient, RemoteError } from "@infinite/remote";
+import type { Attention } from "@infinite/attention";
+export type Connection = { id: string; label: string; url: string; token: string; relay?: { machineId: string } };
 export type ControlLease = { id: string; label: string; expiresAt: number };
 export type Session = {
   id: string;
+  machineId?: string;
+  backend?: "infinite" | "cmux";
+  resumable?: boolean;
   title: string;
   provider: string;
   projectId: string;
@@ -14,9 +21,9 @@ export type Session = {
   contextVersion: number;
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };
   control?: ControlLease | null;
-  runtime?: { id: string; location: string; transport: "pty" };
+  runtime?: { id: string; location: string; transport: "pty" | "cmux" };
   execution?: { location: "laptop" | "cloud"; state: "connecting" | "online" | "offline" | "preparing" | "paused"; cloudReady: boolean; checkpoint?: { id: string; capturedAt: string }; reason?: string; reconciliation?: "available" };
-  attention?: { state: string; now: string; lastMessage?: string };
+  attention?: Attention;
 };
 export type LogEvent = {
   seq: number;
@@ -27,6 +34,10 @@ export type LogEvent = {
 export type Me = {
   role: "owner" | "controller" | "viewer";
   environment: "cloud" | "local";
+  machine?: { id: string; label: string; environment: string };
+  backends?: ("infinite" | "cmux")[];
+  backendProviders?: { infinite: string[]; cmux?: string[] };
+  capabilities?: { signals: boolean; answer: boolean; push: boolean };
   providers: string[];
   projects: { id: string; name: string }[];
   terminal?: { stream: boolean; duplex: boolean; raw: boolean; snapshot?: boolean; control?: boolean };
@@ -63,7 +74,7 @@ export async function api<T>(
     signal: controller.signal,
   });
   const data = await response.json();
-  if (!response.ok) throw new ApiError(data.error ?? "Connection failed", response.status, data.code, data.control);
+  if (!response.ok) throw new ApiError(data.error ?? "Connection failed", response.status, data.code ?? data.error, data.control);
   return data as T;
   } catch (error) {
     if ((error as Error).name === "AbortError") throw new Error("The host did not respond.");
@@ -79,3 +90,25 @@ export const names: Record<string, string> = {
   opencode: "OpenCode",
   demo: "Rehearsal",
 };
+
+export type Api = typeof api;
+export const ApiContext = createContext<Api>(api);
+export const useApi = () => useContext(ApiContext);
+export function connectApi(connection: Connection): { api: Api; close: () => void } {
+  const client = createRemoteClient(connection);
+  return { close: () => client.close(), api: async <T>(path: string, body?: unknown, method?: string, controlId?: string): Promise<T> => {
+    try {
+      return await client.request<T>(path, { method: (method ?? (body ? "POST" : "GET")) as "GET" | "POST" | "PUT" | "DELETE", body,
+        headers: { "X-Infinite-Client": clientId, ...(controlId ? { "X-Infinite-Control": controlId } : {}) } });
+    } catch (error) {
+      if (error instanceof RemoteError) {
+        const value = error.body as { error?: string; code?: string; control?: ControlLease } | undefined;
+        throw new ApiError(error.message, error.status, value?.code ?? value?.error ?? error.code, value?.control);
+      }
+      throw error;
+    }
+  } };
+}
+export type ChatMessage = { id: string; role: string; text: string; toolName?: string; ts?: string };
+export type MessagesPage = { messages: ChatMessage[]; cursor: string | number; more?: boolean; source?: string; available?: boolean };
+export type ProjectFile = { path: string; name: string; text?: string; mimeType: string; size: number; modifiedAt: string; base64?: string };

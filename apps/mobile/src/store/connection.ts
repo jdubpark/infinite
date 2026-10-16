@@ -1,23 +1,60 @@
 import * as SecureStore from "expo-secure-store";
 import * as Crypto from "expo-crypto";
-import type { Connection } from "../api/client";
+import { connectionKey, type Connection } from "../api/client";
 
 /** Unchanged from the single-file app so existing pairings survive. */
 export const SECRET_KEY = "infinite.connection.v1";
+const PROFILES_KEY = "infinite.machines.v2";
+type SavedConnections = { active: string; profiles: Connection[] };
 
-export async function loadConnection(): Promise<Connection | null> {
-  const value = await SecureStore.getItemAsync(SECRET_KEY);
-  return value ? (JSON.parse(value) as Connection) : null;
+export async function loadConnections(): Promise<SavedConnections> {
+  const value = await SecureStore.getItemAsync(PROFILES_KEY);
+  if (value) return JSON.parse(value) as SavedConnections;
+  const legacy = await SecureStore.getItemAsync(SECRET_KEY);
+  if (!legacy) return { active: "", profiles: [] };
+  const connection = { ...(JSON.parse(legacy) as Connection), id: Crypto.randomUUID() };
+  const saved = { active: connection.id, profiles: [connection] };
+  await persist(saved);
+  await SecureStore.deleteItemAsync(SECRET_KEY);
+  return saved;
 }
 
-export async function saveConnection(connection: Connection) {
-  await SecureStore.setItemAsync(SECRET_KEY, JSON.stringify(connection), {
+async function persist(saved: SavedConnections) {
+  await SecureStore.setItemAsync(PROFILES_KEY, JSON.stringify(saved), {
     keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
   });
 }
 
-export async function clearConnection() {
-  await SecureStore.deleteItemAsync(SECRET_KEY);
+let writes: Promise<void> = Promise.resolve();
+function update(change: (saved: SavedConnections) => SavedConnections) {
+  const next = writes.then(async () => persist(change(await loadConnections())));
+  writes = next.catch(() => {});
+  return next;
+}
+
+export async function loadConnection(id?: string): Promise<Connection | null> {
+  const saved = await loadConnections();
+  return saved.profiles.find(profile => connectionKey(profile) === (id ?? saved.active)) ?? null;
+}
+
+export async function saveConnection(connection: Connection) {
+  const next = { ...connection, id: connection.id ?? Crypto.randomUUID() };
+  await update(saved => ({ active: next.id, profiles: [...saved.profiles.filter(profile => connectionKey(profile) !== next.id), next] }));
+  return next;
+}
+
+export async function selectConnection(id: string) {
+  await update(saved => {
+    if (!saved.profiles.some(profile => connectionKey(profile) === id)) throw new Error("Machine is not paired.");
+    return { ...saved, active: id };
+  });
+}
+
+export async function clearConnection(id?: string) {
+  await update(saved => {
+    const profiles = saved.profiles.filter(profile => connectionKey(profile) !== (id ?? saved.active));
+    return { active: profiles.some(profile => connectionKey(profile) === saved.active) ? saved.active : profiles[0] ? connectionKey(profiles[0]) : "", profiles };
+  });
 }
 
 const CLIENT_KEY = "infinite.client.v1";
@@ -39,4 +76,9 @@ export function loadClientId(): Promise<string> {
     return created;
   })();
   return clientId;
+}
+
+export async function identifyConnection(connection: Connection, machineId: string) {
+  if (connection.machineId === machineId) return;
+  await update(saved => ({ ...saved, profiles: saved.profiles.map(profile => connectionKey(profile) === connectionKey(connection) ? { ...profile, machineId } : profile) }));
 }

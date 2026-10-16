@@ -19,6 +19,7 @@ const READ_ONLY_TEXT = "This device key can view but not steer.";
  */
 export function DecisionCard({
   prompt,
+  backend,
   status,
   canAnswer,
   readOnly,
@@ -28,6 +29,7 @@ export function DecisionCard({
   onOpenTerminal,
 }: {
   prompt: Prompt;
+  backend?: "infinite" | "cmux";
   status: DecisionStatus;
   /** Options and reply are enabled: permitted, online and running. */
   canAnswer: boolean;
@@ -42,8 +44,9 @@ export function DecisionCard({
   const [reply, setReply] = useState("");
   const busy = status.kind === "sending" || status.kind === "sent";
   const enabled = canAnswer && !busy;
-  const needsTerminal =
-    prompt.multiSelect || !prompt.hash || prompt.options.length === 0;
+  const feedText = backend === "cmux" && prompt.source === "protocol" && prompt.acceptsText && Boolean(prompt.hash);
+  const needsTerminal = !feedText && (prompt.multiSelect || !prompt.hash || prompt.options.length === 0);
+  const textReply = prompt.acceptsText && prompt.kind !== "yes-no" && (backend !== "cmux" || prompt.source === "protocol");
   // Status sits right under the options, where the person just tapped.
   // Outcomes that outlive the prompt ("changed", refusals) are the Brief's notice.
   const statusLine = (
@@ -98,12 +101,12 @@ export function DecisionCard({
       {needsTerminal ? (
         <>
           <Text style={s.hint}>
-            {prompt.multiSelect
+            {backend === "cmux" ? "Answer this prompt in native cmux on the machine." : prompt.multiSelect
               ? "This question allows several answers."
-              : "The dialog has not been read from the screen yet."}{" "}
-            Open the terminal to answer.
+              : "The dialog has not been read from the screen yet."}
+            {backend !== "cmux" ? " Open the terminal to answer." : ""}
           </Text>
-          <Button title="Open terminal" secondary onPress={onOpenTerminal} />
+          {backend !== "cmux" ? <Button title="Open terminal" secondary onPress={onOpenTerminal} /> : null}
           {statusLine}
         </>
       ) : (
@@ -142,12 +145,12 @@ export function DecisionCard({
             );
           })}
           {statusLine}
-          {prompt.acceptsText && prompt.kind !== "yes-no" && !readOnly ? (
+          {textReply && !readOnly ? (
             <View style={s.reply}>
               <TextInput
                 accessibilityLabel="Reply instead"
                 multiline
-                submitBehavior="blurAndSubmit"
+                submitBehavior="newline"
                 value={reply}
                 onChangeText={setReply}
                 editable={enabled}
@@ -163,6 +166,7 @@ export function DecisionCard({
               />
             </View>
           ) : null}
+          {backend === "cmux" && prompt.acceptsText && !textReply ? <Text style={s.hint}>To reply with text, answer in native cmux on the machine.</Text> : null}
         </View>
       )}
     </View>

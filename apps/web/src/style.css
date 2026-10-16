@@ -1104,3 +1104,41 @@ small,
     }
   }
 }
+
+/* Machine selection and remote session tools share the existing paper/ink palette. */
+.machine-root { height: 100dvh; min-height: 0; }
+.machine-picker { margin: 18px 0; min-width: 0; }
+.machine-picker > label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted, #617066); }
+.machine-select { display: flex; align-items: center; gap: 8px; }
+.machine-select select { min-width: 0; flex: 1; margin: 0; }
+.machine-pair { margin-top: 12px; padding: 14px; border: 1px solid #dce1d6; border-radius: 12px; background: #f8f9f4; max-height: 62dvh; overflow: auto; }
+.machine-pair label { font-size: 12px; margin: 12px 0 5px; }
+.machine-pair input { min-width: 0; width: 100%; padding: 10px; }
+.machine-pair p { font-size: 11px; line-height: 1.6; }
+.machine-pair .primary { width: 100%; font-size: 12px; padding: 12px; }
+.login > .machine-picker { width: min(100%, 440px); }
+.conversation, .project-files { max-width: 880px; margin: 0 auto; padding: 8px 0 24px; }
+.chat-message { padding: 18px 20px; margin: 16px 0; background: #f0f2eb; border-radius: 12px; }
+.chat-message.from-user { background: #e7eee3; border-left: 3px solid #3b6848; }
+.chat-meta { display: flex; align-items: center; gap: 12px; color: #617066; font-size: 11px; margin-bottom: 9px; }
+.chat-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.7; }
+.file-path { display: flex; gap: 10px; align-items: center; }
+.file-path input { flex: 1; min-width: 0; margin: 0; }
+.file-preview { white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 10px; padding: 20px; background: #202923; color: #e4e9de; font-size: 12px; line-height: 1.6; }
+.file-image { display: block; max-width: 100%; max-height: 70dvh; object-fit: contain; }
+.prompt-decision { max-height: 32dvh; overflow: auto; padding: 14px 16px; margin-bottom: 12px; border-radius: 10px; background: #f4ead4; font-size: 13px; line-height: 1.5; }
+.prompt-decision pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.prompt-options { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.prompt-options button, .prompt-decision > button { border: 1px solid #d7cbaa; border-radius: 8px; padding: 10px 12px; background: #faf9f5; font-size: 12px; }
+.prompt-options form { display: flex; gap: 8px; width: 100%; }
+.prompt-options form textarea { min-width: 0; flex: 1; margin: 0; }
+.lifecycle-control { display: inline-flex; gap: 6px; align-items: center; }
+.lifecycle-control > span { max-width: 250px; font-size: 11px; }
+@media (max-width: 720px) {
+  .machine-picker { margin: 12px 0; }
+  .file-path { align-items: stretch; flex-direction: column; }
+  .tabs { overflow-x: auto; flex-shrink: 0; }
+  .tabs > button { white-space: nowrap; }
+  .tabs > span { display: none; }
+  .prompt-decision { max-height: 25dvh; }
+}

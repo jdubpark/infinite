@@ -62,7 +62,7 @@ On a cloud host, the web and phone Create screens show the selected project's sy
 
 ## Pull
 
-`infinite pull` asks the host to scan the live cloud project tree, downloads the chunks the laptop lacks, materializes the tree into a new directory, and prints its path. Without `--output` the directory goes into private client storage. An existing destination is refused, and the checkout is never written. The copy includes `.infinite/`. Compare and merge by hand. `infinite recover SESSION_ID` remains the download for `--laptop` sessions after handoff.
+`infinite pull` asks the host to scan the live cloud project tree, downloads the chunks the laptop lacks, materializes the tree into a new directory, and prints its path. Without `--output` the directory goes into private client storage. An existing destination is refused, and so is one inside any checkout a sync service on this laptop has recorded, running or not, because the service would upload the pulled copy. The checkout is never written. The copy includes `.infinite/`. Compare and merge by hand. `infinite recover SESSION_ID` remains the download for `--laptop` sessions after handoff.
 
 ## Limits
 

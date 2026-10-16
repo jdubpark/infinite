@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Receipt, Session, Status, WorkerState } from "./types.js";
@@ -368,6 +368,24 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   return { command, args: providers.has(command) ? args : positional, options, includes };
 }
 
+/** Real path of `path`, resolving the nearest existing ancestor when the path does not exist yet. */
+function realPath(path: string): string {
+  const missing: string[] = [];
+  for (let current = resolve(path); ; current = dirname(current)) {
+    try { return join(realpathSync(current), ...missing); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(current) === current) throw error;
+      missing.unshift(basename(current));
+    }
+  }
+}
+/** Checkout roots recorded by sync services in `syncDir`, running or not. An unreadable record names no root. */
+function syncRoots(syncDir: string) {
+  if (!existsSync(syncDir)) return [];
+  return readdirSync(syncDir).flatMap(name => {
+    if (!/^[a-z0-9-]{1,80}\.json$/.test(name)) return [];
+    try { const root = readSyncState(join(syncDir, name))?.root; return typeof root === "string" ? [root] : []; } catch { return []; }
+  });
+}
 function gitRoot(cwd: string) {
   try { return realpathSync(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()); }
   catch { return cwd; }
@@ -513,18 +531,23 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       if (me.role !== "owner") throw new Error("Workspace pull requires an owner device key");
       const projectId = positional[0] ?? String(config.projectId ?? me.projects[0]?.id ?? "");
       if (!PROJECT_ID.test(projectId) || !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      const directory = join(dirname(path), "pulls", projectId), storeDir = join(directory, "objects");
+      const output = options["--output"] === undefined ? undefined : resolve(String(options["--output"]));
+      // A sync service uploads everything under its root, so a pulled copy there would travel back to the cloud.
+      const target = realPath(output ?? directory);
+      if (syncRoots(join(dirname(path), "sync")).some(root => target === root || target.startsWith(root.endsWith(sep) ? root : root + sep)))
+        throw new Error("Choose an --output directory outside every synced checkout; the sync service would upload the pulled copy");
       progress.start("Downloading the cloud project tree");
       // The host scans the whole cloud tree before replying; api.json would cap that at 15 s.
       const { manifest: exported } = await (await api.request(`/projects/${projectId}/sync/export`, {}, AbortSignal.timeout(300000))).json() as { manifest: unknown };
       const manifest = validateWorkspaceManifest(exported);
-      const directory = join(dirname(path), "pulls", projectId), storeDir = join(directory, "objects");
       const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
       for (let offset = 0; offset < hashes.length; offset += 512)
         for (const hash of await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512))) {
           const { base64 } = await api.json<{ base64: string }>(`/projects/${projectId}/sync/blob/${hash}`);
           await putWorkspaceBlob(storeDir, hash, base64);
         }
-      const destination = resolve(String(options["--output"] ?? join(directory, manifest.id)));
+      const destination = output ?? join(directory, manifest.id);
       const pulled = await materializeWorkspace({ manifest, storeDir, destination });
       progress.stop();
       console.log(pulled.cwd);

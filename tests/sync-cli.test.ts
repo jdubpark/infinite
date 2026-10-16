@@ -44,6 +44,10 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
     const cwd = pulled.stdout.trim();
     assert.equal(readFileSync(join(cwd, "cloud.txt"), "utf8"), "from cloud\n");
     assert.equal(existsSync(join(checkout, "cloud.txt")), false, "pull never writes into the checkout");
+    // The running service would upload a copy pulled into its checkout.
+    await assert.rejects(exec(process.execPath, [...cli, "pull", "rehearsal", "--output", join(checkout, "nested", "pulled")]),
+      (error: { stderr: string }) => /Choose an --output directory outside every synced checkout/.test(error.stderr));
+    assert.equal(existsSync(join(checkout, "nested")), false);
 
     writeFileSync(join(checkout, "file.txt"), "second\n");
     await waitFor(() => host.fetchApi("/projects/rehearsal"), r => r.body.sync.pendingGeneration?.reason === "cloud-changed", 30000);

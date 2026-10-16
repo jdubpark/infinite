@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
 import { inProcessHost, startHost, waitFor, type Host } from "./helpers.js";
 
@@ -59,6 +59,13 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
     assert.equal(mismatched.status, 400);
     assert.equal((await mismatched.json()).code, "invalid-manifest");
     assert.equal((await putChunk(host, absent, Buffer.alloc(1024 * 1024 + 1))).status, 413);
+    // A body one byte over the chunk bound is refused as too large even when its hash is right.
+    const oversize = Buffer.alloc(256 * 1024 + 1);
+    assert.equal((await putChunk(host, createHash("sha256").update(oversize).digest("hex"), oversize)).status, 413);
+    // A manifest at the bound still fits the commit body with its generation, so the store judges it.
+    const begun = (await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {})).body.generation;
+    const atBound = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation: begun, manifest: "x".repeat(32 * 1024 * 1024 - 2) });
+    assert.deepEqual([atBound.status, atBound.body.code], [400, "invalid-manifest"]);
 
     writeFileSync(join(laptop, "notes.md"), "v1\n");
     const first = await pushTree(host, laptop, storeDir);

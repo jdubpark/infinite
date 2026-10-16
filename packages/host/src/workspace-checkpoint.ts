@@ -11,6 +11,8 @@ import { createWorkspaceWatch, type WorkspaceWatch } from "./workspace-watch.js"
 const CHUNK_BYTES = 256 * 1024;
 const MAX_ENTRIES = 500000;
 const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
+/** Upper bounds a transfer can check before it parses: one content chunk, and one manifest as JSON. */
+export const WORKSPACE_LIMITS = { chunkBytes: CHUNK_BYTES, manifestBytes: MAX_MANIFEST_BYTES } as const;
 const HASH = /^[a-f0-9]{64}$/;
 const execute = promisify(execFile);
 const verifiedBlobs = new Map<string, string>();

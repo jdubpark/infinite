@@ -20,7 +20,7 @@ Failures are retried, and `--status` shows the current problem. After a failed c
 
 The host stores received chunks and the newest manifest for each project under its private state directory. Manifest and apply records are sealed with the host key. Chunks are plaintext files and need [encrypted host storage](security.md#required-on-a-real-host). Upload and export routes accept only a paired owner bearer key; a browser session is refused. On a host that is not single-tenant, such as a tenant-development runner, every sync route answers `403`, as laptop execution does.
 
-The host verifies each chunk against its hash and accepts request bodies up to 1 MiB. Presence checks take at most 512 hashes. A commit is parsed after owner authentication, with a 32 MiB JSON limit. It is refused when a newer generation has begun, when the manifest has more or fewer than one root, or when it names a chunk the host does not have.
+The host verifies each chunk against its hash and accepts chunk bodies up to the 256 KiB chunk bound; a larger body answers `413`. Presence checks take at most 512 hashes. A commit is parsed after owner authentication, with a JSON limit of the 32 MiB manifest bound plus 64 KiB for the generation that wraps it. It is refused when a newer generation has begun, when the manifest has more or fewer than one root, or when it names a chunk the host does not have.
 
 The host's scans of the cloud tree also leave special files out, so a stale dev-server socket neither blocks a scan nor counts as a cloud change. `skipped` in the sync status counts the special files the latest host scan left out since the API started.
 

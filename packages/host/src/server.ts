@@ -20,6 +20,7 @@ import { CmuxError } from "./cmux/client.js";
 import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
 import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
+import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import type { Config, Role, Receipt } from "./types.js";
 
 const id = z.uuid();
@@ -612,12 +613,14 @@ export function createApp(config: Config, key: Buffer) {
     const body = z.object({ hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(512) }).strict().parse(req.body);
     res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes) });
   });
-  app.put("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: "1mb" }), async (req, res) => {
+  // A body over one chunk can never be stored; it answers 413 before it is read.
+  app.put("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.chunkBytes }), async (req, res) => {
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk as application/octet-stream" });
     await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body);
     res.json({ stored: true });
   });
-  app.post("/api/projects/:id/sync/commit", requireRole(["owner"]), requireOwnerCli, express.json({ limit: "32mb" }), async (req, res) => {
+  // The body wraps a manifest of up to the manifest bound with its generation; the store checks the manifest itself.
+  app.post("/api/projects/:id/sync/commit", requireRole(["owner"]), requireOwnerCli, express.json({ limit: WORKSPACE_LIMITS.manifestBytes + 64 * 1024 }), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     const body = z.object({ generation: z.uuid(), manifest: z.unknown() }).strict().parse(req.body);
     res.json(await projectSync.commit(projectId, body.generation, body.manifest, () => projectRunning(projectId)));

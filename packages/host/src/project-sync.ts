@@ -39,6 +39,9 @@ const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
 const OWNED_PREFIX = ".infinite";
 const ownedPath = (path: string) => path === OWNED_PREFIX || path.startsWith(`${OWNED_PREFIX}/`);
 const entrySignature = (entry: WorkspaceEntry) => JSON.stringify([entry.path, entry.kind, entry.mode, entry.size ?? null, entry.chunks ?? null, entry.target ?? null]);
+/** Two captures of one tree differ in id and capture times; their entries, ignoring local stat stamps, do not. */
+const sameEntries = (a: WorkspaceManifest, b: WorkspaceManifest) =>
+  a.entries.length === b.entries.length && a.entries.every((entry, index) => entrySignature(entry) === entrySignature(b.entries[index]));
 const inside = (root: string, path: string) => path === root || path.startsWith(root === "/" ? "/" : `${root}/`);
 
 /** One-way laptop-to-cloud synchronization state for configured projects. */
@@ -156,7 +159,12 @@ export class ProjectSync {
     const received = this.read<Received>(projectId, "received");
     if (!received) return this.status(projectId);
     const applied = this.read<Applied>(projectId, "applied");
-    if (applied?.manifest.id === received.manifest.id) { this.writePending(projectId, undefined); return this.status(projectId); }
+    // A recapture of the applied content is already in place: record it as applied without replacing the tree.
+    if (applied && (applied.manifest.id === received.manifest.id || sameEntries(applied.manifest, received.manifest))) {
+      if (applied.manifest.id !== received.manifest.id) this.write(projectId, "applied", { ...applied, manifest: received.manifest } satisfies Applied);
+      this.writePending(projectId, undefined);
+      return this.status(projectId);
+    }
     const pending = (reason: "session-running" | "cloud-changed") => {
       this.writePending(projectId, { id: received.manifest.id, capturedAt: received.manifest.capturedAt, receivedAt: received.receivedAt, reason });
       if (explicit) throw new ProjectSyncError(reason === "session-running" ? "A session is running in this project; stop it or wait before applying" : "The cloud workspace changed since the last applied generation; pull it or apply with force", reason);

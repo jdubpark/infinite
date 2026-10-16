@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { randomBytes } from "node:crypto";
 import { ProjectSync, ProjectSyncError } from "../packages/host/src/project-sync.js";
@@ -132,6 +132,24 @@ test("recommitting the applied generation clears a stale pending marker", async 
     const status = await f.sync.commit("example", f.sync.begin("example").generation, first.manifest, busy);
     assert.equal(status.lastSyncedManifest, first.manifest.id);
     assert.equal(status.pendingGeneration, undefined, "the newest generation is already applied");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a recapture of unchanged content is marked applied without replacing the tree", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.laptop, "a.txt"), "1\n");
+    const first = await push(f);
+    const previous = join(dirname(f.cloud), `.${basename(f.cloud)}.infinite-previous`);
+    const before = { tree: statSync(f.cloud).ino, previous: statSync(previous).ino };
+    const second = await push(f, true);
+    assert.notEqual(second.manifest.id, first.manifest.id, "a new capture carries a new id");
+    assert.equal(second.status.appliedManifest, second.manifest.id);
+    assert.equal(second.status.pendingGeneration, undefined, "nothing waits on the running session");
+    assert.equal(second.status.appliedAt, first.status.appliedAt, "appliedAt stays the time the tree was published");
+    assert.deepEqual({ tree: statSync(f.cloud).ino, previous: statSync(previous).ino }, before, "neither the tree nor the retired copy was swapped");
+    assert.deepEqual(readdirSync(dirname(f.cloud)).filter(n => n.includes("infinite-stage")), []);
+    assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "1\n");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

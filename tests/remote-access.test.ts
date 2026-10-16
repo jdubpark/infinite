@@ -229,8 +229,15 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     for (const path of ["/login", "/sessions/../me", "/sessions/%2e%2e/me", "/sessions/" + randomUUID() + "/raw"]) {
       await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403);
     }
+    // Workspace content moves only over a direct owner connection.
+    const hash = "a".repeat(64);
+    for (const [method, path] of [["POST", "/projects/project/sync/begin"], ["POST", "/projects/project/sync/has"], ["PUT", `/projects/project/sync/blob/${hash}`],
+      ["GET", `/projects/project/sync/blob/${hash}`], ["POST", "/projects/project/sync/commit"], ["POST", "/projects/project/sync/export"]] as const)
+      await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     await assert.rejects(client.request("/projects/project/context", { method: "PUT", body: { text: "x".repeat(MAX_REQUEST_BYTES) } }), (error: RemoteError) => error.status === 413);
     assert.equal(runner.requests.length, 1);
+    assert.deepEqual(await client.request("/projects/project"), { count: 2, method: "GET", path: "/api/projects/project" });
+    assert.deepEqual(await client.request("/projects/project/sync/apply", { body: {} }), { count: 3, method: "POST", path: "/api/projects/project/sync/apply" });
     runner.oversized();
     await assert.rejects(client.request("/me"), (error: RemoteError) => error.status === 413 && error.code === "response-too-large");
     const beforeRevoke = runner.requests.length;

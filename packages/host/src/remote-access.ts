@@ -28,6 +28,8 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (["GET", "POST"].includes(method) && url.pathname === "/api/sessions") return true;
   if (["POST", "DELETE"].includes(method) && url.pathname === "/api/devices/push") return true;
   if (["GET", "PUT"].includes(method) && /^\/api\/projects\/[a-z0-9-]{1,80}\/context$/.test(url.pathname)) return true;
+  if (method === "GET" && /^\/api\/projects\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
+  if (method === "POST" && /^\/api\/projects\/[a-z0-9-]{1,80}\/sync\/apply$/.test(url.pathname)) return true;
   const match = /^\/api\/sessions\/([^/]+)(?:\/([^/]+))?$/.exec(url.pathname);
   if (!match || !UUID.test(match[1])) return false;
   return method === "GET" ? [undefined, "events", "messages", "file"].includes(match[2])

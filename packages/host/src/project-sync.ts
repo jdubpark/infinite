@@ -39,6 +39,7 @@ const inside = (root: string, path: string) => path === root || path.startsWith(
 export class ProjectSync {
   private readonly generations = new Map<string, string>();
   private readonly serial = new Map<string, Promise<unknown>>();
+  private readonly publishing = new Set<string>();
   constructor(private readonly config: Config, private readonly key: Buffer) {}
 
   private project(projectId: string) {
@@ -128,6 +129,10 @@ export class ProjectSync {
   apply(projectId: string, options: { force?: boolean; running: boolean }) {
     return this.queue(projectId, () => this.applyReceived(projectId, options, true));
   }
+  /** A generation is replacing the project tree right now; new sessions must not start in it. */
+  applying(projectId: string) {
+    return this.publishing.has(projectId);
+  }
 
   private async applyReceived(projectId: string, options: { force?: boolean; running: boolean }, explicit = false): Promise<ProjectSyncStatus> {
     const project = this.project(projectId);
@@ -142,7 +147,11 @@ export class ProjectSync {
     };
     if (options.running) return pending("session-running");
     if (!options.force && await this.drifted(projectId, project.path, applied)) return pending("cloud-changed");
-    const target = await this.projectRoot(project.path);
+    this.publishing.add(projectId);
+    try { return await this.publish(projectId, project.path, received); } finally { this.publishing.delete(projectId); }
+  }
+  private async publish(projectId: string, path: string, received: Received): Promise<ProjectSyncStatus> {
+    const target = await this.projectRoot(path);
     const parent = dirname(target), name = basename(target);
     const stage = join(parent, `.${name}.infinite-stage-${randomUUID()}`);
     const previous = join(parent, `.${name}.infinite-previous`);

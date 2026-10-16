@@ -84,6 +84,26 @@ test("a running cloud session keeps the generation pending; apply later succeeds
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("applying() is true while a generation replaces the tree and clears when apply returns", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.laptop, "a.txt"), "1\n");
+    const first = await push(f);
+    writeFileSync(join(f.laptop, "a.txt"), "2\n");
+    const second = await push(f, true, first.manifest);
+    assert.equal(f.sync.applying("example"), false, "a generation held for a running session is not being applied");
+    // Publication spans several asynchronous filesystem steps; sample once per event-loop turn.
+    const samples: boolean[] = [];
+    let settled = false;
+    const result = f.sync.apply("example", { running: false });
+    result.then(() => { settled = true; }, () => { settled = true; });
+    while (!settled) { samples.push(f.sync.applying("example")); await new Promise(resolve => setImmediate(resolve)); }
+    assert.equal((await result).appliedManifest, second.manifest.id);
+    assert.ok(samples.includes(true), "new sessions are refused while the tree is replaced");
+    assert.equal(f.sync.applying("example"), false);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("host-side edits after apply make the next apply refuse without force", async () => {
   const f = fixture();
   try {
@@ -219,6 +239,7 @@ test("a failed apply leaves no stale pending marker", async () => {
     await assert.rejects(f.sync.apply("example", { running: true }), (error: ProjectSyncError) => error.code === "session-running");
     chmodSync(f.root, 0o500);
     await assert.rejects(f.sync.apply("example", { running: false, force: true }), (error: NodeJS.ErrnoException) => error.code === "EACCES");
+    assert.equal(f.sync.applying("example"), false, "a failed publication does not keep refusing new sessions");
     status = f.sync.status("example");
     assert.equal(status.pendingGeneration, undefined);
     assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "1\n");

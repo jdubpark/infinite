@@ -19,6 +19,7 @@ import { CmuxSessions } from "./cmux/index.js";
 import { CmuxError } from "./cmux/client.js";
 import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
 import { connectRemoteAccess } from "./remote-access.js";
+import { ProjectSync, ProjectSyncError } from "./project-sync.js";
 import type { Config, Role, Receipt } from "./types.js";
 
 const id = z.uuid();
@@ -80,6 +81,16 @@ export function createApp(config: Config, key: Buffer) {
     throw new Error("Machine access and cmux require a single-tenant host");
   const app = express();
   const manager = new Manager(config, key);
+  const projectSync = new ProjectSync(config, key);
+  const projectRunning = async (projectId: string) =>
+    (await manager.list()).some(s => s.projectId === projectId && ["running", "starting"].includes(s.status) && s.executionLocation !== "laptop");
+  const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
+  // Apply snapshots `running` once; a session started mid-apply would write into a tree about to be retired.
+  const refusedWhileApplying = (projectId: string, res: express.Response) => {
+    if (!projectSync.applying(projectId)) return false;
+    res.status(409).json({ code: "sync-applying", error: "A workspace sync is being applied to this project. Start the session after it finishes." });
+    return true;
+  };
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
@@ -124,7 +135,8 @@ export function createApp(config: Config, key: Buffer) {
       return res.status(403).json({ error: "Host is not allowed" });
     next();
   });
-  app.use((req, res, next) => express.json({ limit: /^\/api\/sessions\/[^/]+\/opencode(?:\/|$)/.test(req.path) ? "8mb" : "96kb" })(req, res, next));
+  app.use((req, res, next) => express.json({ limit: /^\/api\/sessions\/[^/]+\/opencode(?:\/|$)/.test(req.path) ? "8mb"
+    : /^\/api\/projects\/[^/]+\/sync\/commit$/.test(req.path) ? "32mb" : "96kb" })(req, res, next));
   function authenticate(token: string) {
     const digest = Buffer.from(hashToken(token), "hex");
     return config.tokens.find((t) =>
@@ -269,6 +281,7 @@ export function createApp(config: Config, key: Buffer) {
       return void res.status(201).json(await cmux.create(request));
     }
     const { backend: _backend, ...nativeRequest } = request;
+    if (refusedWhileApplying(request.projectId, res)) return;
     res.status(201).json(await manager.create(nativeRequest));
   });
   // Imported sessions keep their own transport and journal. Authorization is the same
@@ -341,7 +354,10 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await sessionFile(session, z.string().parse(req.query.path)));
   });
   app.post("/api/sessions/:id/resume", requireRole(["owner"]), async (req, res) => {
-    res.json(await manager.resume(id.parse(req.params.id), z.object({ requestId: id }).strict().parse(req.body).requestId));
+    const sessionId = id.parse(req.params.id);
+    const { requestId } = z.object({ requestId: id }).strict().parse(req.body);
+    if (refusedWhileApplying(manager.meta(sessionId).session.projectId, res)) return;
+    res.json(await manager.resume(sessionId, requestId));
   });
   app.get("/api/sessions/:id/native", requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });
@@ -548,6 +564,42 @@ export function createApp(config: Config, key: Buffer) {
       );
     },
   );
+  app.get("/api/projects/:id", (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    const project = config.projects.find(p => p.id === projectId);
+    if (!project) return res.status(404).json({ error: "Unknown project" });
+    return res.json({ id: project.id, name: project.name, sync: projectSync.status(projectId) });
+  });
+  app.post("/api/projects/:id/sync/begin", requireRole(["owner"]), (req, res) => {
+    if (!res.locals.bearer) return res.status(403).json({ error: "Workspace sync requires a paired owner CLI" });
+    return res.json(projectSync.begin(projectSchema.parse(req.params.id)));
+  });
+  app.post("/api/projects/:id/sync/has", requireRole(["owner"]), async (req, res) => {
+    const body = z.object({ hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(512) }).strict().parse(req.body);
+    res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes) });
+  });
+  app.put("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), express.raw({ type: "application/octet-stream", limit: "1mb" }), async (req, res) => {
+    if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk as application/octet-stream" });
+    await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body);
+    res.json({ stored: true });
+  });
+  app.post("/api/projects/:id/sync/commit", requireRole(["owner"]), async (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    const body = z.object({ generation: z.uuid(), manifest: z.unknown() }).strict().parse(req.body);
+    res.json(await projectSync.commit(projectId, body.generation, body.manifest, await projectRunning(projectId)));
+  });
+  app.post("/api/projects/:id/sync/apply", requireRole(["owner"]), async (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    const body = z.object({ force: z.boolean().optional() }).strict().parse(req.body ?? {});
+    res.json(await projectSync.apply(projectId, { force: body.force, running: await projectRunning(projectId) }));
+  });
+  app.post("/api/projects/:id/sync/export", requireRole(["owner"]), async (req, res) => {
+    if (!res.locals.bearer) return void res.status(403).json({ error: "Workspace export requires a paired owner CLI" });
+    res.json({ manifest: await projectSync.exportTree(projectSchema.parse(req.params.id)) });
+  });
+  app.get("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), async (req, res) => {
+    res.json({ base64: await projectSync.readBlob(projectSchema.parse(req.params.id), String(req.params.hash)) });
+  });
   app.get("/api/projects/:id/context", (req, res) => {
     if (!config.projects.some((p) => p.id === req.params.id))
       return res.status(404).json({ error: "Unknown project" });
@@ -586,6 +638,7 @@ export function createApp(config: Config, key: Buffer) {
       res: express.Response,
       _next: express.NextFunction,
     ) => {
+      if (error instanceof ProjectSyncError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof ContentError) return res.status(error.status).json({ error: error.message });
       if (error instanceof z.ZodError)
         return res.status(400).json({
@@ -623,5 +676,5 @@ export function createApp(config: Config, key: Buffer) {
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
   const closeConnections = () => { closeTerminals(); closeNative(); closeRemote(); cmux?.close(); server.closeAllConnections(); };
-  return { app, manager, sessions: { list: listSessions }, pushStore, server, closeConnections };
+  return { app, manager, projectSync, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

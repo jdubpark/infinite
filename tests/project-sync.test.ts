@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { chmodSync, chownSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { randomBytes } from "node:crypto";
 import { ProjectSync, ProjectSyncError } from "../packages/host/src/project-sync.js";
@@ -8,7 +8,7 @@ import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/worksp
 import { hashToken } from "../packages/host/src/config.js";
 import type { Config } from "../packages/host/src/types.js";
 
-function fixture() {
+function fixture(sync?: Config["sync"]) {
   const root = realpathSync(mkdtempSync("/tmp/inf-psync-"));
   const laptop = join(root, "laptop"); mkdirSync(laptop);
   const cloud = join(root, "cloud"); mkdirSync(cloud);
@@ -16,7 +16,7 @@ function fixture() {
   const keyFile = join(root, "key"); writeFileSync(keyFile, key, { mode: 0o600 });
   const config: Config = {
     port: 0, origin: "http://127.0.0.1:1", stateDir: join(root, "state"), runDir: join(root, "run"), keyFile,
-    environment: "local", enableDemo: true, maxSessions: 24, agents: {},
+    environment: "local", enableDemo: true, maxSessions: 24, agents: {}, ...(sync ? { sync } : {}),
     projects: [{ id: "example", name: "Example", path: cloud }],
     tokens: [{ id: "o", label: "o", role: "owner", hash: hashToken("x".repeat(40)) }],
   };
@@ -50,6 +50,33 @@ test("first push applies onto an empty cloud directory and records both manifest
     assert.equal(readFileSync(join(f.cloud, "README.md"), "utf8"), "hello\n");
     assert.deepEqual(readdirSync(dirname(f.cloud)).filter(n => n.includes("infinite-stage")), [], "stage directories are removed after publication");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a setgid parent or sync.sharedGroup makes the applied tree group-writable; otherwise laptop modes stay", async () => {
+  const mode = (path: string) => statSync(path).mode & 0o7777;
+  for (const setup of ["setgid", "configured", "plain"] as const) {
+    const f = fixture(setup === "configured" ? { sharedGroup: true } : undefined);
+    try {
+      // New directories take the parent's group; the setgid bit survives chmod only for a group the user is in.
+      chownSync(f.root, process.getuid!(), process.getgid!());
+      if (setup === "setgid") {
+        // The Ubuntu template's workspaces directory is setgid.
+        chmodSync(f.root, 0o2700);
+        assert.equal(mode(f.root) & 0o2000, 0o2000, "the fixture parent carries the setgid bit");
+      }
+      mkdirSync(join(f.laptop, "src"), { mode: 0o755 });
+      writeFileSync(join(f.laptop, "src/index.ts"), "export {};\n", { mode: 0o644 });
+      writeFileSync(join(f.laptop, "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+      const first = await push(f);
+      writeFileSync(join(f.laptop, "src/index.ts"), "export const a = 1;\n");
+      // The second apply replaces a tree with shared directories.
+      const second = await push(f, false, first.manifest);
+      assert.equal(second.status.appliedManifest, second.manifest.id, setup);
+      const shared = setup !== "plain";
+      assert.deepEqual([mode(f.cloud), mode(join(f.cloud, "src")), mode(join(f.cloud, "src/index.ts")), mode(join(f.cloud, "run.sh"))],
+        shared ? [0o2770, 0o2770, 0o660, 0o770] : [mode(f.laptop), 0o755, 0o644, 0o755], setup);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }
 });
 
 test("a non-empty cloud directory with no applied manifest needs force", async () => {

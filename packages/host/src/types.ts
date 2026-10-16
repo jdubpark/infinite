@@ -90,6 +90,8 @@ export interface Config {
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
   deployment?: import("./deployment.js").Deployment;
+  /** Workspace sync. `sharedGroup` makes applied trees group-writable for a separate agent account. */
+  sync?: { sharedGroup?: boolean };
   port: number;
   origin: string;
   stateDir: string;

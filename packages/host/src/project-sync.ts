@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { chmod, lstat, readdir, realpath, rename, rm } from "node:fs/promises";
+import { chmod, lstat, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { unseal, writeSealed } from "./vault.js";
@@ -180,7 +180,8 @@ export class ProjectSync {
     const owned = join(target, OWNED_PREFIX);
     let carried: string | undefined, retired = false;
     try {
-      const source = (await materializeWorkspace({ manifest: received.manifest, storeDir: join(this.dir(projectId), "blobs"), destination: stage })).roots[0];
+      const sharedGroup = await this.sharedGroup(parent);
+      const source = (await materializeWorkspace({ manifest: received.manifest, storeDir: join(this.dir(projectId), "blobs"), destination: stage, sharedGroup })).roots[0];
       // The cloud copy of Infinite's own directory wins; a laptop copy never replaces it.
       await removeTree(join(source, OWNED_PREFIX));
       await removeTree(previous);
@@ -202,6 +203,14 @@ export class ProjectSync {
     return this.status(projectId);
   }
 
+  /**
+   * A separate agent account edits the tree through a shared group: the configured flag, or a setgid
+   * parent such as the Ubuntu template's workspaces directory. Shared trees get group-writable files
+   * and 2770 directories instead of the laptop's modes.
+   */
+  private async sharedGroup(parent: string) {
+    return this.config.sync?.sharedGroup === true || Boolean((await stat(parent)).mode & 0o2000);
+  }
   /** The live cloud tree differs from the last applied generation, ignoring Infinite's own directory. */
   private async drifted(projectId: string, path: string, applied?: Applied): Promise<boolean> {
     const live = (await this.scan(projectId, path, applied?.baseline)).entries.filter(e => !ownedPath(e.path) && e.path !== "");

@@ -23,6 +23,7 @@ Create a control user `infinite-host` with home `/srv/infinite-data/control-home
 | `/srv/infinite-data/agent-home` | infinite-agent | 0700, provider auth and native history on encrypted storage |
 | `/srv/infinite-data/workspaces` | infinite-host:infinite-workspace | 2750, host controls workspace creation and removal |
 | `/srv/infinite-data/workspaces/hybrid` | infinite-host:infinite-workspace | 2750 with default ACL, host controls session directories |
+| `/srv/infinite-data/workspaces/PROJECT` | infinite-host:infinite-workspace | 2770 with default ACL, a configured project; workspace sync replaces it on each apply |
 | `/run/infinite` | infinite-host | 0700, worker sockets |
 | `/run/infinite-key` | infinite-host | 0700, runtime key directory |
 | `/run/infinite-key/vault.key` | infinite-host | 0600, 32 raw random bytes restored from owner-held recovery material |
@@ -37,7 +38,13 @@ sudo install -d -o infinite-host -g infinite-workspace -m 2750 \
   /srv/infinite-data/workspaces /srv/infinite-data/workspaces/hybrid
 sudo setfacl -m d:u::rwx,d:g::rwx,d:m::rwx,d:o::--- \
   /srv/infinite-data/workspaces/hybrid
+sudo setfacl -d -m g::rwx,m::rwx /srv/infinite-data/workspaces
+sudo install -d -o infinite-host -g infinite-workspace -m 2770 \
+  /srv/infinite-data/workspaces/project-a
+sudo setfacl -d -m g::rwx,m::rwx /srv/infinite-data/workspaces/project-a
 ```
+
+Repeat the last two commands for each configured project directory. Workspace sync applies a laptop generation by building the new tree in a private stage beside the project directory and renaming it into place, so the applied tree inherits the default ACL of `/srv/infinite-data/workspaces`, not of the directory it replaces. The default ACL on that parent adds no access to the parent itself; the agent still cannot create or rename entries in it. Because the parent is setgid, the host materializes synced trees for the shared group: directories 2770, files group read/write, executables group executable. `sync.sharedGroup: true` in the config forces the same modes when the parent is not setgid. Keep `.infinite/` inside a project owned by `infinite-host` or group-writable: Linux moves a directory to a new parent only when the mover can write the directory itself, and each apply carries `.infinite/` into the new tree.
 
 Allow both accounts to traverse the encrypted mount's parent directories, without granting the agent write access to those directories. The agent must not be able to rename or replace the workspace root. Keep control state, provider homes, runtime sockets, and keys private. Do not apply workspace ownership or ACLs recursively to `/srv/infinite-data`. End existing sessions and restart the service after changing group membership; surviving workers retain their old supplementary groups.
 
@@ -45,14 +52,14 @@ Setgid directories preserve the workspace group. The default ACL preserves group
 
 Session directories and preparation roots remain mode 2700 while files are prepared. At cloud selection, only the selected preparation root becomes 2770 and its session directory becomes 2750. Interior execution directories use 2770 and files grant the workspace group read/write access, plus execute access for executable files. Other prepared generations remain inaccessible to the agent.
 
-Git also requires an ownership exception because materialized repositories belong to the host account. As an administrator, add a protected global setting for the agent account, scoped to the hybrid workspace directory:
+Git also requires an ownership exception because materialized repositories belong to the host account. As an administrator, add a protected global setting for the agent account, scoped to the workspace directory:
 
 ```sh
 sudo -H -u infinite-agent git config --global --add safe.directory \
-  '/srv/infinite-data/workspaces/hybrid/*'
+  '/srv/infinite-data/workspaces/*'
 ```
 
-Keep the trailing wildcard quoted. This trusts repositories beneath that directory; do not replace it with an unrestricted `*`. Use Git 2.46 or newer: older Ubuntu Git packages can reject repositories despite this scoped setting. The [Git installation guide](https://git-scm.com/install/linux) lists the upstream Ubuntu package source. Verify access with the account-specific checks below. See [Git safe.directory](https://git-scm.com/docs/git-config/2.46.0#Documentation/git-config.txt-safedirectory).
+Keep the trailing wildcard quoted. This trusts repositories beneath that directory, which covers synced project directories and hybrid trees; do not replace it with an unrestricted `*`. Use Git 2.46 or newer: older Ubuntu Git packages can reject repositories despite this scoped setting. The [Git installation guide](https://git-scm.com/install/linux) lists the upstream Ubuntu package source. Verify access with the account-specific checks below. See [Git safe.directory](https://git-scm.com/docs/git-config/2.46.0#Documentation/git-config.txt-safedirectory).
 
 This group is a single-tenant trust boundary. Agent processes sharing the account and group can access other active workspaces in that group. Separate directories prevent accidental concurrent edits; they do not isolate active projects from one another.
 
@@ -143,6 +150,17 @@ sudo -H -u infinite-agent git -C "$HYBRID_REPOSITORY" diff --stat
 ```
 
 Confirm the agent cannot traverse a session's preparation tree before handoff and cannot rename its session directory afterward. The Git commands must succeed through the agent identity without disabling ownership checks globally.
+
+For workspace sync, apply a disposable checkout to a disposable project with `infinite sync`. Set `PROJECT` to that project directory and `FILE` to a file the host materialized there, then run:
+
+```sh
+getfacl --omit-header /srv/infinite-data/workspaces "$PROJECT"
+sudo -H -u infinite-agent sh -c 'umask 077 && echo check >> "$1/$2" && echo new > "$1/agent-created.txt"' sh "$PROJECT" "$FILE"
+sudo -H -u infinite-agent git -C "$PROJECT" status --short
+sudo -H -u infinite-host test -r "$PROJECT/agent-created.txt"
+```
+
+The agent must edit the host's file, create a new one under `umask 077`, and run `git status`; the host must read the new file. These edits make the next laptop change report `cloud-changed`. Reset the disposable project with `infinite sync --apply --force` and confirm the apply succeeds, which shows the host can remove agent-created files.
 
 Do not enable automatic destructive tool approval to make the acceptance test pass. Configure only the permissions the owner's workload actually needs. Server hardening, per-project isolation, spend limits, alerts, and provider quota handling remain deployment responsibilities.
 

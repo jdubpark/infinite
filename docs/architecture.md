@@ -70,7 +70,7 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | Apply a pending generation | `POST /api/projects/:id/sync/apply` | Owner |
 | Export the cloud tree | `POST /api/projects/:id/sync/export`, `GET /api/projects/:id/sync/blob/:hash` | Owner CLI |
 
-**Owner CLI** routes accept only a paired owner bearer key; a browser session is refused. While a sync commit or apply holds a project, session creation and resume in that project answer `409` with code `sync-applying`. [Workspace sync](workspace-sync.md) defines the transfer limits, apply rules, and pending reasons.
+**Owner CLI** routes accept only a paired owner bearer key; a browser session is refused. While a sync commit or apply holds a project, Infinite-managed session creation and resume in that project answer `409` with code `sync-applying`; cmux sessions are not refused. [Workspace sync](workspace-sync.md) defines the transfer limits, apply rules, and pending reasons.
 
 Session IDs and project IDs are validated. Executables and project working directories come from private host configuration. The owner-only native CLI launch accepts an argument array, including provider flags that may access other files available to the agent account; this is not a sandbox boundary within a tenant. Web and phone creation use configured provider arguments. Infinite workers pass prompts and native arguments directly to the executable. The cmux adapter quotes each configured argument before launching in the chosen workspace shell. Active-host process inspection can see launch arguments.
 

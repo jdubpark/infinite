@@ -40,7 +40,7 @@ The laptop service survives CLI exit and native-interface detachment. `resume` a
 
 The conversation's tools use the laptop executor. Native-interface file-picker search, standalone shell shortcuts, and standalone Git helpers are currently refused because those provider APIs target the app-server filesystem. They need a separate laptop implementation before they can be enabled here. Detached launch reports success only after the provider has admitted its thread and the laptop is connected.
 
-Automatic handoff is part of `--laptop` mode. The host must have the qualified backend prepared with `npm run prepare:codex`; a stock backend reports its missing capability. Once background preparation is ready, an outage continues from the verified checkpoint in the same conversation. An uncertain tool outcome pauses for reconciliation instead of being replayed. Checkpoint age and the current blocker appear on web and phone. `--cloud` is accepted and has no effect; cloud execution is the default.
+Automatic handoff is part of `--laptop` mode. The host must have the qualified backend prepared with `npm run prepare:codex`; a stock backend reports its missing capability. Once background preparation is ready, an outage continues from the verified checkpoint in the same conversation. An uncertain tool outcome pauses for reconciliation instead of being replayed. Checkpoint age and the current blocker appear on web and phone. `--cloud` is accepted with no effect and cannot be combined with `--laptop`; cloud execution is the default.
 
 `infinite --laptop codex` also supports an empty prompt. Its persistent terminal accepts the first real input; once history exists, native reattachment is available. No synthetic prompt is submitted.
 
@@ -56,11 +56,13 @@ infinite sync --stop --project PROJECT_ID
 infinite pull PROJECT_ID --output NEW_DIRECTORY
 ```
 
-`sync` starts a detached service that uploads the Git root of the current directory to the configured cloud project and keeps uploading changes every few seconds. Outside a Git repository it uploads the current directory. The whole scope travels, including ignored and untracked files; the home directory and filesystem root are refused, and `--include` is not available (use `--laptop` for multi-root laptop execution). The command returns after the first upload is committed; the service keeps running after the terminal closes and does not restart after a reboot. `--project` defaults to the paired project.
+- `sync` starts a detached service that keeps the configured cloud project current with the Git root of the current directory, one way, including ignored and untracked files.
+- `--status` lists each project's local service and sync state, and works while the host is unreachable.
+- `--apply` applies a pending generation; `--force` also replaces cloud changes made since the last apply.
+- `--stop` ends the local service.
+- `pull` downloads the current cloud project tree into a new directory and prints its path, without writing into the checkout.
 
-A received generation is applied on the host when no cloud session is running or starting in that project and the cloud tree still matches its state right after the last apply. Otherwise it stays pending with a reason, shown by `infinite projects`, `infinite sync --status`, web, and phone. `--apply` applies a pending generation; `--force` replaces a cloud tree that changed since the last apply, but never overrides a running session. Every apply keeps the replaced tree beside the project as `.NAME.infinite-previous`, replacing the older copy. `--status` and `--stop` work while the host is unreachable; `--status` reports a record whose process is gone as stale.
-
-`pull` downloads the current cloud project tree into a new directory and prints its path. Omit `--output` to use private client storage; an existing destination is refused. It never writes into the checkout. Compare and merge by hand. Details: [workspace sync](workspace-sync.md).
+[Workspace sync](workspace-sync.md) defines the scope, apply rules, pending reasons, and limits.
 
 ## Experimental local Codex interface
 
@@ -133,7 +135,7 @@ infinite --detach --project PROJECT_ID claude "Review this checkout"
 infinite --client-config /private/client.json monitor SESSION_ID
 ```
 
-Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not uploaded or translated. The CLI does not silently copy the current laptop checkout or its secrets. Only `infinite sync` uploads a checkout, and only after the owner starts it.
+Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not uploaded or translated. The CLI does not silently copy the current laptop checkout or its secrets. Only `infinite sync` and `--laptop` background preparation upload a checkout, and only after the owner starts them.
 
 `--laptop` Codex launches use the laptop project and background cloud handoff described above. The earlier [SSH prototype](hybrid-execution.md#earlier-ssh-prototype) remains available for isolated protocol experiments and retains its original offline behavior.
 

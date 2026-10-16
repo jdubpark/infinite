@@ -193,6 +193,8 @@ On laptop return, show a nonblocking Review local changes entry. The preview sep
 
 Default local Codex launch, background complete-root checkpoints, durable executor revision tracking, prepared cloud trees, automatic qualified handoff, visible execution state, and separate recovery downloads are implemented. Real-provider rehearsals cover idle and active-turn outages in the original conversation. The installed client bundle and empty launch have also been exercised. The default is enabled with `--cloud` as the opt-out.
 
+Update, 2026-10-16: cloud execution became the default for every provider, and this flow became the explicit `--laptop` mode; `--cloud` is accepted with no effect. See [hybrid execution](../hybrid-execution.md) and [workspace sync](../workspace-sync.md).
+
 The implementation uses stable file reads, change detection and verified manifests over a capture span. It does not claim an atomic filesystem/database snapshot or arbitrary descendant containment. Epochs fence publication and new RPC dispatch; unresolved operations pause. Cloud tools remain selected on laptop return, and recovery preserves the original tree. Automatic conflict application and return-to-laptop execution remain future work. The stronger containment, toolchain provisioning and application guarantees below remain research follow-ups; they are not advertised by the current `cloudReady` field. The current behavioral boundary is documented in [hybrid execution](../hybrid-execution.md).
 
 - [ ] **Unit 1: Qualify the provider boundary**

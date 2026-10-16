@@ -69,7 +69,7 @@ Differences from the hybrid preparer:
 
 - The cloud workspace is the executing copy. The synced tree is applied to the configured project directory as a new generation, not held as a standby checkpoint.
 - Sync is laptop to cloud only. While a session is running in that workspace, incoming generations are staged and listed as pending. Applying a pending generation is an explicit owner action on web, phone, or CLI, because applying it under a running tool would change files the agent is reading.
-- A project records `lastSyncedManifest`, `lastSyncedAt`, and `pendingGeneration`. `GET /api/projects/:id` returns them. Sync age is shown in the project picker on the Create screen; the session view shows the execution location.
+- A project records `lastSyncedAt`, `lastSyncedManifest`, `appliedAt`, `appliedManifest`, and `pendingGeneration`. `GET /api/projects/:id` returns them. Sync age is shown in the project picker on the Create screen; the session view shows the execution location.
 - Publication epochs and takeover fencing are not used. There is one executor per workspace, and it is the cloud.
 
 Cloud changes return to the Mac through `infinite pull PROJECT_ID --output DIRECTORY`, a project-level export. `infinite recover` stays for `--laptop` sessions. Comparing and merging is the owner's work until the reconciliation units in `docs/plans/2026-10-09-001-feat-seamless-hybrid-execution-plan.md` are built.
@@ -181,7 +181,7 @@ The host, not the delegate, decides what is allowed.
 
 | Change | Endpoint | Role |
 | --- | --- | --- |
-| Project sync state | `GET /api/projects/:id` adds `lastSyncedAt`, `pendingGeneration` | Any |
+| Project sync state | `GET /api/projects/:id` adds `lastSyncedAt`, `lastSyncedManifest`, `appliedAt`, `appliedManifest`, `pendingGeneration` | Any |
 | Apply pending generation | `POST /api/projects/:id/sync/apply` | Owner |
 | Upload bundle | `PUT /api/projects/:id/bundle`, `DELETE` | Owner |
 | List bundle items | `GET /api/projects/:id/bundle` | Owner, controller |

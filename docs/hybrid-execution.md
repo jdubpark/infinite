@@ -1,4 +1,4 @@
-# Hybrid execution and cloud handoff
+# Laptop execution mode and recovery
 
 ## Laptop flow
 

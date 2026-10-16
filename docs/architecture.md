@@ -6,7 +6,7 @@ The native UI and checkpoint requirements are refined in [native interaction and
 
 ## Execution model
 
-Every provider runs on the selected machine by default; `Session.executionLocation` records `cloud` or `laptop`. Codex accepts `--laptop`, which keeps the invoking laptop project as the executor while its conversation backend stays in the cloud, with background preparation and automatic handoff as described in [hybrid execution](hybrid-execution.md). The configured cloud project directory is kept current by the one-way [workspace sync](workspace-sync.md) service. Reconnecting keeps the same conversation and placement.
+Every provider runs on the selected machine by default; `Session.executionLocation` records `cloud` or `laptop`. Codex accepts `--laptop`, which keeps the invoking laptop project as the executor while its conversation backend stays in the cloud, with background preparation and automatic handoff as described in [laptop execution mode](hybrid-execution.md). The configured cloud project directory is kept current by the one-way [workspace sync](workspace-sync.md) service. Reconnecting keeps the same conversation and placement.
 
 ```mermaid
 flowchart LR

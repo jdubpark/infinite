@@ -18,7 +18,7 @@ import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWork
 import { readSyncState, startSyncService, stopSyncService, syncServiceRunning } from "./sync-service.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
-type Me = { role: string; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
+type Me = { role: string; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
 const providerNames: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
 /** Project IDs name local sync files, so an ID from the host or the command line is checked before it becomes a path. */
@@ -69,11 +69,13 @@ function connection(config: ClientConfig, clientId = randomUUID()) {
   };
   return { request, json: async <T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> => (await request(path, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined)).json() as Promise<T> };
 }
-function printSessions(sessions: (Session & Partial<WorkerState>)[]) {
+/** One line per session, with where its tools run: the live executor when the session reports one, else its recorded location. */
+function printSessions(sessions: (Session & Partial<WorkerState>)[], machine: string) {
   for (const s of sessions) {
     const execution = s.execution;
-    const detail = execution ? `  · ${execution.location} tools · ${execution.state}${execution.checkpoint ? ` · checkpoint ${Math.max(0, Math.floor((Date.now() - Date.parse(execution.checkpoint.capturedAt)) / 1000))}s old` : ""}${execution.location === "laptop" ? execution.cloudReady ? " · cloud ready" : " · cloud preparing" : ""}` : "";
-    console.log(`${s.id}  ${s.provider.padEnd(8)}  ${s.status.padEnd(15)}  ${clean(s.title)}${detail}`);
+    const where = (execution?.location ?? s.executionLocation) === "laptop" ? "laptop tools" : `tools on ${clean(machine)}`;
+    const detail = execution ? ` · ${execution.state}${execution.checkpoint ? ` · checkpoint ${Math.max(0, Math.floor((Date.now() - Date.parse(execution.checkpoint.capturedAt)) / 1000))}s old` : ""}${execution.location === "laptop" ? execution.cloudReady ? " · cloud ready" : " · cloud preparing" : ""}` : "";
+    console.log(`${s.id}  ${s.provider.padEnd(8)}  ${s.status.padEnd(15)}  ${clean(s.title)}  · ${where}${detail}`);
   }
 }
 async function selectSession(sessions: Session[], requested: string | undefined, monitor: boolean) {
@@ -446,7 +448,12 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     // Existing local-host list remains available before a laptop is paired.
     if (command === "list" && !existsSync(path) && !options["--client-config"] && !process.env.INFINITE_CLIENT_CONFIG) return false;
     const config = loadConfig(path), api = connection(config);
-    if (command === "list") { const { sessions } = await api.json<{ sessions: Session[] }>("/sessions"); if (options["--json"]) console.log(JSON.stringify(sessions, null, 2)); else printSessions(sessions); return true; }
+    if (command === "list") {
+      const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
+      if (options["--json"]) console.log(JSON.stringify(sessions, null, 2));
+      else printSessions(sessions, (await api.json<Me>("/me")).machine?.label || new URL(config.origin).hostname);
+      return true;
+    }
     if (command === "sync" && (options["--stop"] || options["--status"])) {
       // The service is a local process: stopping or inspecting it must not depend on reaching the host.
       const syncDir = join(dirname(path), "sync");

@@ -2,7 +2,7 @@
 
 Infinite provides one web and phone interface for independently paired machines. Select a machine, choose a configured project and agent, then create or steer its sessions. An owner key permits creation, resumption, and termination; a controller key permits steering; a viewer key permits monitoring. CmuxControl remains an independent cmux controller and is not a dependency.
 
-A machine can be a cloud host or an online laptop. The laptop must be awake, connected, and running Infinite. Closing a browser or disconnecting a phone leaves its sessions running. Laptop sleep does not move a laptop process to the cloud. Codex's separate [hybrid execution](hybrid-execution.md) flow has its own preparation and handoff requirements; selecting a machine in these clients does not enable that flow.
+A machine can be a cloud host or an online laptop. The laptop must be awake, connected, and running Infinite. Closing a browser or disconnecting a phone leaves its sessions running. Laptop sleep does not move a laptop process to the cloud. Codex's separate [laptop execution mode](hybrid-execution.md) has its own preparation and handoff requirements; selecting a machine in these clients does not enable that flow.
 
 ## Set up a machine
 

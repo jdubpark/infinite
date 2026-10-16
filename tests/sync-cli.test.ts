@@ -113,6 +113,11 @@ test("a cloud launch reports laptop changes that wait for an apply, then starts 
     assert.match(launched.stderr, /\[Infinite\] Laptop changes from \d+s ago are pending; run infinite sync --apply\n/);
     assert.match(launched.stdout, /^[0-9a-f-]{36}\n$/, "the launch continues");
     assert.equal(existsSync(join(host.config.projects[0].path, "file.txt")), false, "the session starts on the tree in place");
+    // Every listed session names where its tools run.
+    const machine = (await host.fetchApi("/me")).body.machine.label;
+    const lines = (await exec(process.execPath, [...cli, "list"])).stdout.trim().split("\n");
+    assert.equal(lines.length, 2);
+    for (const line of lines) assert.ok(line.endsWith(`· tools on ${machine}`), line);
   } finally {
     if (existsSync(stateFile)) stopSyncService(stateFile);
     await host.stop(); rmSync(root, { recursive: true, force: true });

@@ -52,3 +52,12 @@ test("sync and pull commands parse their options", () => {
   assert.throws(() => parseClientArgs(["sync", "--include", "../lib"]), /--include applies to --laptop/, "a trailing --include is refused too");
   assert.throws(() => parseClientArgs(["sync", "--laptop"]), /--laptop starts a Codex session/);
 });
+
+test("sync accepts one action and no arguments; pull takes at most one project", () => {
+  assert.throws(() => parseClientArgs(["sync", "--force"]), /--force applies to infinite sync --apply/);
+  assert.throws(() => parseClientArgs(["sync", "--stop", "--status"]), /Choose one of --stop, --status, or --apply/);
+  assert.throws(() => parseClientArgs(["sync", "--apply", "--stop"]), /Choose one of --stop, --status, or --apply/);
+  assert.throws(() => parseClientArgs(["sync", "example"]), /infinite sync takes no arguments/);
+  assert.throws(() => parseClientArgs(["pull", "a", "b"]), /infinite pull takes at most one project ID/);
+  assert.deepEqual(parseClientArgs(["pull"]).args, []);
+});

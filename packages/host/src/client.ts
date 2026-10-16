@@ -21,6 +21,8 @@ type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
 const providerNames: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
+/** Project IDs name local sync files, so an ID from the host or the command line is checked before it becomes a path. */
+const PROJECT_ID = /^[a-z0-9-]{1,80}$/;
 const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 function startupProgress() {
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -359,6 +361,10 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
     options["--local-ui"] = true;
   }
   if (includes.length && !options["--laptop"]) throw new Error("--include applies to --laptop execution; cloud sessions use the configured project");
+  if (["--stop", "--status", "--apply"].filter(name => options[name]).length > 1) throw new Error("Choose one of --stop, --status, or --apply");
+  if (options["--force"] && !options["--apply"]) throw new Error("--force applies to infinite sync --apply");
+  if (command === "sync" && positional.length) throw new Error("infinite sync takes no arguments; run it inside the checkout and choose the project with --project ID");
+  if (command === "pull" && positional.length > 1) throw new Error("infinite pull takes at most one project ID");
   return { command, args: providers.has(command) ? args : positional, options, includes };
 }
 
@@ -420,14 +426,14 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const recorded = existsSync(syncDir) ? readdirSync(syncDir).flatMap(name => /^([a-z0-9-]{1,80})\.json$/.exec(name)?.[1] ?? []) : [];
       if (options["--stop"]) {
         const projectId = String(options["--project"] ?? config.projectId ?? (recorded.length === 1 ? recorded[0] : ""));
-        if (!/^[a-z0-9-]{1,80}$/.test(projectId)) throw new Error(`Choose a project with --project ID${recorded.length ? ` (recorded: ${recorded.join(", ")})` : ""}`);
+        if (!PROJECT_ID.test(projectId)) throw new Error(`Choose a project with --project ID${recorded.length ? ` (recorded: ${recorded.join(", ")})` : ""}`);
         console.log(stopSyncService(join(syncDir, `${projectId}.json`)) ? "Sync service stopped. The cloud copy keeps its last applied generation." : "No sync service was running for this project.");
         return true;
       }
       let me: Me | undefined, offline = "";
       try { me = await api.json<Me>("/me", undefined, AbortSignal.timeout(5000)); }
       catch (error) { offline = error instanceof HttpError ? `host returned HTTP ${error.status}` : "host unreachable"; }
-      for (const id of new Set([...(me ? me.projects.map(p => p.id) : config.projectId ? [config.projectId] : []), ...recorded])) {
+      for (const id of new Set([...(me ? me.projects.map(p => p.id) : config.projectId ? [config.projectId] : []).filter(id => PROJECT_ID.test(id)), ...recorded])) {
         const state = recorded.includes(id) ? readSyncState(join(syncDir, `${id}.json`)) : undefined;
         const local = !state ? "no local service" : !syncServiceRunning(state) ? `stale service record (pid ${state.pid} not running)`
           : `service pid ${state.pid} · ${clean(state.root)}${state.problem ? ` · problem: ${clean(state.problem)}` : ""}`;
@@ -474,7 +480,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       if (me.role !== "owner") throw new Error("Workspace sync requires an owner device key");
       const syncDir = join(dirname(path), "sync");
       const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
-      if (!me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      if (!PROJECT_ID.test(projectId) || !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
       const stateFile = join(syncDir, `${projectId}.json`);
       if (options["--apply"]) {
         // A large tree can take minutes to publish; a refusal (409) leaves its reason in the pending marker.
@@ -496,7 +502,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command === "pull") {
       if (me.role !== "owner") throw new Error("Workspace pull requires an owner device key");
       const projectId = positional[0] ?? String(config.projectId ?? me.projects[0]?.id ?? "");
-      if (!me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      if (!PROJECT_ID.test(projectId) || !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
       progress.start("Downloading the cloud project tree");
       // The host scans the whole cloud tree before replying; api.json would cap that at 15 s.
       const { manifest: exported } = await (await api.request(`/projects/${projectId}/sync/export`, {}, AbortSignal.timeout(300000))).json() as { manifest: unknown };
@@ -512,7 +518,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const pulled = await materializeWorkspace({ manifest, storeDir, destination });
       progress.stop();
       console.log(pulled.cwd);
-      console.error("[Infinite] Cloud project downloaded into a new directory. Compare it with your checkout; nothing on this Mac was overwritten.");
+      console.error("[Infinite] Cloud project downloaded into a new directory. Compare it with your checkout; nothing on this computer was overwritten.");
       return true;
     }
     let session: Session;

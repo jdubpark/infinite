@@ -89,6 +89,10 @@ test(
     try {
       const a = await makeTenant("a");
       const b = await makeTenant("b");
+      // Workspace sync accepts whole checkouts, so a tenant-development runner refuses every sync route.
+      const absent = "0".repeat(64);
+      for (const [method, route] of [["POST", "begin"], ["POST", "has"], ["PUT", `blob/${absent}`], ["GET", `blob/${absent}`], ["POST", "commit"], ["POST", "apply"], ["POST", "export"]] as const)
+        assert.equal((await a.request(`/projects/workspace/sync/${route}`, method === "GET" ? undefined : {}, a.token, method)).status, 403, `${method} ${route}`);
       assert.equal(
         (await b.request("/sessions", undefined, a.token)).status,
         401,

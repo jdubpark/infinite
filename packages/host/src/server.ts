@@ -602,6 +602,9 @@ export function createApp(config: Config, key: Buffer) {
     if (!project) return void res.status(404).json({ error: "Unknown project" });
     res.json({ id: project.id, name: project.name, sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
   });
+  // Sync moves whole checkouts, ignored files and credentials included, so it shares laptop execution's single-tenant gate.
+  app.use("/api/projects/:id/sync", (_req, res, next) => runtimeSecurity(config.deployment).tenancy === "single-tenant" ? next()
+    : void res.status(403).json({ error: "Workspace sync requires a single-tenant host" }));
   app.post("/api/projects/:id/sync/begin", requireRole(["owner"]), requireOwnerCli, (req, res) => {
     res.json(projectSync.begin(projectSchema.parse(req.params.id)));
   });

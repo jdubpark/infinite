@@ -303,6 +303,7 @@ export class Manager {
       id,
       backend: "infinite",
       machineId: this.config.machine?.id,
+      executionLocation: request.workspace ? "laptop" : "cloud",
       ...(request.resumedFrom ? { resumedFrom: request.resumedFrom, resumeNativeSession: request.resumeNativeSession } : {}),
       provider: request.provider,
       title: request.title,

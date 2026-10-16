@@ -45,6 +45,8 @@ export interface Session {
   id: string;
   backend?: "infinite" | "cmux";
   machineId?: string;
+  /** Where this session's tools run. Laptop execution is the explicit --laptop mode. */
+  executionLocation?: "cloud" | "laptop";
   resumedFrom?: string;
   resumeNativeSession?: { id: string; source: "hook" | "protocol" };
   provider: Provider;

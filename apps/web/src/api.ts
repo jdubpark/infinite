@@ -6,6 +6,7 @@ export type ControlLease = { id: string; label: string; expiresAt: number };
 export type Session = {
   id: string;
   machineId?: string;
+  executionLocation?: "cloud" | "laptop";
   backend?: "infinite" | "cmux";
   resumable?: boolean;
   title: string;

@@ -10,8 +10,7 @@ infinite pair https://HOST --token-file FILE
 infinite claude|codex|grok|opencode [native flags and prompt]
 infinite --project ID --title "Task" codex [native flags]
 infinite --detach codex [native flags]
-infinite [--include DIR] codex ["Initial prompt"]
-infinite --cloud codex [native flags and prompt]
+infinite --laptop [--include DIR] codex ["Initial prompt"]
 infinite --local-ui codex [supported native flags] "Initial prompt"
 infinite --local-ui opencode [--model PROVIDER/MODEL] [--prompt "Task"]
 infinite list [--json]
@@ -21,7 +20,7 @@ infinite monitor [session ID or unique prefix]
 infinite recover SESSION_ID [--output NEW_DIRECTORY]
 
 Put Infinite options before the provider. Everything after it is passed unchanged.
-Codex uses the invoking laptop directory by default; --cloud opts out.
+Sessions run on the cloud machine. --laptop runs Codex tools in this directory with background cloud handoff.
 The laptop executor stays available after CLI exit.
 Native resume IDs belong to the cloud conversation.
 Ctrl+] detaches; Ctrl+G monitors; Enter in monitor mode enables input.

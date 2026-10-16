@@ -211,7 +211,7 @@ export function createApp(config: Config, key: Buffer) {
       backendProviders: { infinite: Object.keys(config.agents).filter(p => p !== "demo" || config.enableDemo), cmux: cmux ? ["claude", "codex"].filter(p => p in config.agents) : [] },
       terminal: { stream: true, duplex: true, snapshot: true, control: true, raw: res.locals.role === "owner" },
       nativeUi: ["codex", "opencode"].filter(provider => config.agents[provider as "codex" | "opencode"]),
-      execution: { laptop: Boolean(config.agents.codex) && runtimeSecurity(config.deployment).tenancy === "single-tenant", cloudHandoff: Boolean(config.agents.codex) && runtimeSecurity(config.deployment).tenancy === "single-tenant" },
+      execution: { laptop: Boolean(config.agents.codex) && runtimeSecurity(config.deployment).tenancy === "single-tenant", cloudHandoff: Boolean(config.agents.codex) && runtimeSecurity(config.deployment).tenancy === "single-tenant", default: "cloud" as const },
       environment: config.environment,
       security: runtimeSecurity(config.deployment),
       providers: Object.keys(config.agents).filter(

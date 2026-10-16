@@ -122,6 +122,7 @@ export type ControlLease = { id: string; label: string; expiresAt: number };
 export type SessionRow = {
   id: string;
   machineId?: string;
+  executionLocation?: "cloud" | "laptop";
   backend?: "infinite" | "cmux";
   projectId?: string;
   resumable?: boolean;

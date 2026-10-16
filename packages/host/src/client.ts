@@ -329,8 +329,11 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-export async function handleClientCommand(argv: string[]): Promise<boolean> {
-  const progress = startupProgress();
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list"]);
+export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
+
+/** Infinite options come before the provider; everything after a provider is passed through unchanged. */
+export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
@@ -343,22 +346,32 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     else if (strings.has(name) && args.length) options[name] = args.shift()!;
     else throw new Error(`Unknown or incomplete Infinite option: ${name}`);
   };
+  while (args[0]?.startsWith("--")) option();
+  const command = args.shift() ?? "";
+  if (options["--cloud"] && options["--laptop"]) throw new Error("Choose either cloud execution or --laptop");
+  if (options["--laptop"]) {
+    if (command !== "codex") throw new Error("--laptop starts a Codex session in this directory. Resume existing sessions with infinite resume ID.");
+    options["--local-ui"] = true;
+  }
+  if (includes.length && !options["--laptop"]) throw new Error("--include applies to --laptop execution; cloud sessions use the configured project");
+  const positional: string[] = [];
+  // Unknown commands belong to the server CLI, whose options this parser must not reject.
+  if (CLIENT_COMMANDS.has(command)) while (args.length) { if (args[0].startsWith("--")) option(); else positional.push(args.shift()!); }
+  return { command, args: providers.has(command) ? args : positional, options, includes };
+}
+
+export async function handleClientCommand(argv: string[]): Promise<boolean> {
+  const progress = startupProgress();
+  const args = [...argv];
   // Keep server administration commands and their --config semantics intact.
   const candidate = args.find(a => providers.has(a) || ["pair", "resume", "monitor", "recover", "projects", "list"].includes(a));
   if (!candidate || (candidate === "list" && args.includes("--config"))) return false;
   try {
-    while (args[0]?.startsWith("--")) option();
-    const command = args.shift()!;
-    if (!providers.has(command) && !["pair", "resume", "monitor", "recover", "projects", "list"].includes(command)) return false;
-    if (options["--cloud"] && options["--laptop"]) throw new Error("Choose either the default laptop execution or --cloud");
-    if (command === "codex" && !options["--cloud"]) options["--laptop"] = true;
-    if (options["--laptop"]) {
-      if (command !== "codex") throw new Error("--laptop starts a Codex session in this directory. Resume existing sessions with infinite resume ID.");
-      options["--local-ui"] = true;
-    }
-    if (includes.length && !options["--laptop"]) throw new Error("--include is available for laptop execution; remove --cloud");
-    const positional: string[] = [];
-    if (!providers.has(command)) while (args.length) { if (args[0].startsWith("--")) option(); else positional.push(args.shift()!); }
+    const parsed = parseClientArgs(args);
+    const { command, options, includes } = parsed;
+    if (!providers.has(command) && !CLIENT_COMMANDS.has(command)) return false;
+    const positional = providers.has(command) ? [] : parsed.args;
+    const nativeArgs = providers.has(command) ? parsed.args : [];
     const path = resolve(String(options["--client-config"] ?? process.env.INFINITE_CLIENT_CONFIG ?? join(homedir(), ".config/infinite/client.json")));
     if (command === "pair") {
       if (!positional[0] || !options["--token-file"]) throw new Error("Usage: infinite pair https://HOST --token-file FILE (use - to read the key from stdin)");
@@ -419,7 +432,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       if (!me.terminal?.stream) throw new Error("Upgrade the host to support native CLI sessions");
       let workspace: { cwd: string; roots: string[]; token: string } | undefined;
       if (options["--laptop"]) {
-        if (!me.execution?.laptop) throw new Error("Upgrade the single-tenant host for laptop execution, or use --cloud to explicitly select its configured workspace");
+        if (!me.execution?.laptop) throw new Error("Upgrade the single-tenant host for laptop execution, or omit --laptop to use its configured cloud project");
         await checkLaptopExecutor();
         const cwd = realpathSync(process.cwd());
         let root = cwd;
@@ -432,9 +445,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       if (options["--local-ui"]) {
         if (!["codex", "opencode"].includes(command) || !me.nativeUi?.includes(command)) throw new Error("This host does not support this provider’s local UI. Other providers retain their native cloud terminal.");
         if (command === "codex") {
-          const launch = validateNativeCodexArgs(args, "", Boolean(workspace));
+          const launch = validateNativeCodexArgs(nativeArgs, "", Boolean(workspace));
           emptyLaptopPrompt = Boolean(workspace) && launch.at(-2) !== "--";
-        } else validateNativeOpenCodeArgs(args);
+        } else validateNativeOpenCodeArgs(nativeArgs);
         if (!options["--detach"]) await (command === "codex" ? checkNativeCodex : checkNativeOpenCode)();
       }
       const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
@@ -442,7 +455,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const requestId = randomUUID();
       console.error(`[Infinite] Launch ${requestId} on ${config.origin} · project ${projectId}`);
       progress.start(`Starting ${providerNames[command]} on ${new URL(config.origin).hostname}`);
-      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs: args, ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
+      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs, ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
       if (workspace) {
         progress.start("Connecting the laptop executor");
         await startLaptopService({ ...config, sessionId: session.id, workspaceToken: workspace.token, cwd: workspace.cwd, roots: workspace.roots, configFile: path });

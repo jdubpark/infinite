@@ -256,7 +256,7 @@ test("CLI opens a local native frontend with a loopback credential and detaches 
   }
 });
 
-test("default Codex uses the laptop project, hands off a verified checkpoint, and pauses uncertain effects", { timeout: 60000 }, async () => {
+test("--laptop Codex uses the laptop project, hands off a verified checkpoint, and pauses uncertain effects", { timeout: 60000 }, async () => {
   const fixture = resolve("tests/fixtures/native-codex.mjs");
   const host = await startHost({ agents: { codex: { command: process.execPath, args: [fixture] } } });
   const clients: WebSocket[] = [];
@@ -280,7 +280,7 @@ test("default Codex uses the laptop project, hands off a verified checkpoint, an
     writeFileSync(config, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
     const launchIn = async (directory: string, title: string, include?: string) => {
       const cli = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"),
-        "--client-config", config, "--title", title, ...(include ? ["--include", include] : []), "--detach", "codex", "workspace edit"], {
+        "--client-config", config, "--title", title, "--laptop", ...(include ? ["--include", include] : []), "--detach", "codex", "workspace edit"], {
         cwd: directory, env: { ...process.env, PATH: bin + ":" + process.env.PATH }, stdio: ["ignore", "pipe", "pipe"],
       });
       launch = cli;
@@ -304,6 +304,7 @@ test("default Codex uses the laptop project, hands off a verified checkpoint, an
     const state = (await host.fetchApi(path)).body;
     assert.equal(state.workspace.cwd, realpathSync(cwd));
     assert.deepEqual(state.workspace.roots, [realpathSync(laptop), realpathSync(included)]);
+    assert.equal(state.executionLocation, "laptop");
     assert.equal(state.execution.location, "laptop"); assert.equal(state.execution.state, "online");
     const executorPid = Number(readFileSync(cwd + "/executor-pid", "utf8")); executorPids.add(executorPid);
     assert.ok(alive(executorPid), "closing the launch CLI must leave the laptop service alive");

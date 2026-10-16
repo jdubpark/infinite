@@ -29,7 +29,7 @@ export function validateNativeCodexArgs(args: string[], initialPrompt = "", allo
   // Hybrid launches can retain the original terminal until the first real prompt.
   if (!(prompt ?? initialPrompt).trim()) {
     if (allowEmpty) return launch;
-    throw new Error("Cloud Codex's local interface requires an initial prompt. Use infinite codex to start in your laptop project, or --cloud without --local-ui for a cloud terminal.");
+    throw new Error("Cloud Codex's local interface requires an initial prompt. Use infinite --laptop codex to start in your laptop project, or omit --local-ui for a cloud terminal.");
   }
   // A prompt such as "login" is text, never a provider administration command.
   return [...launch, "--", prompt ?? initialPrompt];

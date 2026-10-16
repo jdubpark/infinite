@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { randomBytes } from "node:crypto";
 import { ProjectSync, ProjectSyncError } from "../packages/host/src/project-sync.js";
@@ -115,6 +115,7 @@ test("stale generations and missing content are refused", async () => {
     await assert.rejects(f.sync.commit("example", current.generation, manifest, false), (error: ProjectSyncError) => error.code === "missing-content");
     assert.throws(() => f.sync.status("nope"), (error: ProjectSyncError) => error.code === "unknown-project");
     await assert.rejects(f.sync.missing("nope", []), (error: ProjectSyncError) => error.code === "unknown-project");
+    await assert.rejects(f.sync.readBlob("nope", "0".repeat(64)), (error: ProjectSyncError) => error.code === "unknown-project");
     assert.equal(existsSync(join(f.config.stateDir, "projects", "nope")), false, "unknown projects leave no state behind");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
@@ -152,4 +153,74 @@ test("read-only directories do not block later applies, and .infinite/ is carrie
     for (const entry of readdirSync(f.root, { withFileTypes: true, recursive: true })) if (entry.isDirectory()) chmodSync(join(entry.parentPath, entry.name), 0o700);
     rmSync(f.root, { recursive: true, force: true });
   }
+});
+
+test("symlinks the host wrote do not count as cloud changes", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.laptop, "a.txt"), "1\n");
+    symlinkSync("./a.txt", join(f.laptop, "dot"));
+    symlinkSync(join(f.laptop, "a.txt"), join(f.laptop, "absolute"));
+    const first = await push(f);
+    writeFileSync(join(f.laptop, "a.txt"), "2\n");
+    const second = await push(f, false, first.manifest);
+    assert.equal(second.status.pendingGeneration, undefined);
+    assert.equal(second.status.appliedManifest, second.manifest.id);
+    assert.equal(readFileSync(join(f.cloud, "dot"), "utf8"), "2\n");
+    assert.equal(readFileSync(join(f.cloud, "absolute"), "utf8"), "2\n");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("sync refuses a project path that holds the host's own state, even with force", async () => {
+  const f = fixture();
+  const previous = join(dirname(f.root), `.${basename(f.root)}.infinite-previous`);
+  try {
+    const sync = new ProjectSync({ ...f.config, projects: [{ id: "example", name: "Example", path: f.root }] }, f.key);
+    writeFileSync(join(f.laptop, "a.txt"), "1\n");
+    // A running session keeps the generation pending without touching the tree.
+    await push({ ...f, sync }, true);
+    const refused = (error: ProjectSyncError) => error.code === "invalid-manifest" && error.status === 500;
+    await assert.rejects(sync.apply("example", { running: false, force: true }), refused);
+    await assert.rejects(sync.apply("example", { running: false }), refused);
+    await assert.rejects(sync.exportTree("example"), refused);
+    assert.ok(existsSync(join(f.config.stateDir, "projects/example/sync/received.sealed")), "the state directory stays in place");
+    assert.equal(existsSync(previous), false);
+  } finally { rmSync(previous, { recursive: true, force: true }); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the cloud .infinite/ wins over a laptop copy", async () => {
+  const f = fixture();
+  try {
+    mkdirSync(join(f.laptop, ".infinite")); writeFileSync(join(f.laptop, ".infinite/laptop.json"), "{}\n");
+    mkdirSync(join(f.cloud, ".infinite")); writeFileSync(join(f.cloud, ".infinite/state.json"), "cloud\n");
+    writeFileSync(join(f.laptop, "a.txt"), "1\n");
+    const { manifest, status } = await push(f);
+    assert.equal(status.appliedManifest, manifest.id);
+    assert.equal(readFileSync(join(f.cloud, ".infinite/state.json"), "utf8"), "cloud\n");
+    assert.equal(existsSync(join(f.cloud, ".infinite/laptop.json")), false);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a failed apply leaves no stale pending marker", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.laptop, "a.txt"), "1\n");
+    const first = await push(f);
+    writeFileSync(join(f.laptop, "a.txt"), "2\n");
+    const second = await push(f, true, first.manifest);
+    // The next generation fails while the host scans a cloud file it cannot read.
+    writeFileSync(join(f.cloud, "unreadable.txt"), "x\n", { mode: 0o000 });
+    writeFileSync(join(f.laptop, "a.txt"), "3\n");
+    await assert.rejects(push(f, false, second.manifest));
+    let status = f.sync.status("example");
+    assert.equal(status.pendingGeneration, undefined, "no marker names the older generation");
+    assert.notEqual(status.lastSyncedManifest, status.appliedManifest);
+    // A forced apply that fails while staging clears the marker for the newest generation.
+    await assert.rejects(f.sync.apply("example", { running: true }), (error: ProjectSyncError) => error.code === "session-running");
+    chmodSync(f.root, 0o500);
+    await assert.rejects(f.sync.apply("example", { running: false, force: true }), (error: NodeJS.ErrnoException) => error.code === "EACCES");
+    status = f.sync.status("example");
+    assert.equal(status.pendingGeneration, undefined);
+    assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "1\n");
+  } finally { chmodSync(f.root, 0o700); rmSync(f.root, { recursive: true, force: true }); }
 });

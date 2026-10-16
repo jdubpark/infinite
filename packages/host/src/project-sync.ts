@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { chmod, lstat, mkdir, readdir, realpath, rename, rm } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { chmod, lstat, readdir, realpath, rename, rm } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { unseal, writeSealed } from "./vault.js";
 import {
   captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob,
@@ -18,7 +19,8 @@ export interface ProjectSyncStatus {
   pendingGeneration?: { id: string; capturedAt: string; receivedAt: string; reason: "session-running" | "cloud-changed" };
 }
 type Received = { manifest: WorkspaceManifest; receivedAt: string; generation: string };
-type Applied = { manifest: WorkspaceManifest; appliedAt: string };
+/** `baseline` is a scan of the published tree; records without one compare against the manifest. */
+type Applied = { manifest: WorkspaceManifest; appliedAt: string; baseline?: WorkspaceManifest };
 
 export class ProjectSyncError extends Error {
   constructor(message: string, readonly code: "cloud-changed" | "session-running" | "stale-generation" | "missing-content" | "invalid-manifest" | "unknown-project", readonly status = 409) {
@@ -31,6 +33,7 @@ const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
 const OWNED_PREFIX = ".infinite";
 const ownedPath = (path: string) => path === OWNED_PREFIX || path.startsWith(`${OWNED_PREFIX}/`);
 const entrySignature = (entry: WorkspaceEntry) => JSON.stringify([entry.path, entry.kind, entry.mode, entry.size ?? null, entry.chunks ?? null, entry.target ?? null]);
+const inside = (root: string, path: string) => path === root || path.startsWith(root === "/" ? "/" : `${root}/`);
 
 /** One-way laptop-to-cloud synchronization state for configured projects. */
 export class ProjectSync {
@@ -100,7 +103,7 @@ export class ProjectSync {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
     await putWorkspaceBlob(join(this.dir(projectId), "blobs"), hash, bytes.toString("base64"));
   }
-  readBlob(projectId: string, hash: string) {
+  async readBlob(projectId: string, hash: string) {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
     return readWorkspaceBlob(join(this.dir(projectId), "blobs"), hash);
   }
@@ -116,6 +119,8 @@ export class ProjectSync {
       const hashes = [...new Set(manifest.entries.flatMap(e => e.chunks ?? []))];
       if ((await hasWorkspaceBlobs(join(this.dir(projectId), "blobs"), hashes)).length) throw new ProjectSyncError("The manifest references content that was not uploaded", "missing-content");
       this.write(projectId, "received", { manifest, receivedAt: new Date().toISOString(), generation } satisfies Received);
+      // A pending marker always describes the newest received generation.
+      this.writePending(projectId, undefined);
       return this.applyReceived(projectId, { running });
     });
   }
@@ -136,8 +141,8 @@ export class ProjectSync {
       return this.status(projectId);
     };
     if (options.running) return pending("session-running");
-    if (!options.force && await this.drifted(projectId, project.path, applied?.manifest)) return pending("cloud-changed");
-    const target = await realpath(project.path);
+    if (!options.force && await this.drifted(projectId, project.path, applied)) return pending("cloud-changed");
+    const target = await this.projectRoot(project.path);
     const parent = dirname(target), name = basename(target);
     const stage = join(parent, `.${name}.infinite-stage-${randomUUID()}`);
     const previous = join(parent, `.${name}.infinite-previous`);
@@ -145,6 +150,8 @@ export class ProjectSync {
     let carried: string | undefined, retired = false;
     try {
       const source = (await materializeWorkspace({ manifest: received.manifest, storeDir: join(this.dir(projectId), "blobs"), destination: stage })).roots[0];
+      // The cloud copy of Infinite's own directory wins; a laptop copy never replaces it.
+      await removeTree(join(source, OWNED_PREFIX));
       await removeTree(previous);
       if (existsSync(owned)) { await rename(owned, join(source, OWNED_PREFIX)); carried = join(source, OWNED_PREFIX); }
       await rename(target, previous); retired = true;
@@ -153,33 +160,43 @@ export class ProjectSync {
       // Put the live tree and Infinite's own directory back before the stage is discarded.
       if (retired) await rename(previous, target).catch(() => {});
       if (carried) await rename(carried, owned).catch(() => {});
+      this.writePending(projectId, undefined);
       throw error;
     } finally { await removeTree(stage).catch(() => {}); }
-    this.write(projectId, "applied", { manifest: received.manifest, appliedAt: new Date().toISOString() } satisfies Applied);
+    // Drift compares against what materialize actually wrote: resolved symlink targets and this host's symlink modes.
+    // Without a baseline, drift falls back to the manifest.
+    const baseline = await this.scan(projectId, target).catch(() => undefined);
+    this.write(projectId, "applied", { manifest: received.manifest, appliedAt: new Date().toISOString(), baseline } satisfies Applied);
     this.writePending(projectId, undefined);
     return this.status(projectId);
   }
 
   /** The live cloud tree differs from the last applied generation, ignoring Infinite's own directory. */
-  private async drifted(projectId: string, path: string, applied?: WorkspaceManifest): Promise<boolean> {
-    const live = await this.scan(projectId, path);
-    const liveEntries = live.entries.filter(e => !ownedPath(e.path) && e.path !== "");
-    if (!applied) return liveEntries.length > 0;
-    const expected = new Set(applied.entries.filter(e => !ownedPath(e.path) && e.path !== "").map(entrySignature));
-    if (liveEntries.length !== expected.size) return true;
-    return liveEntries.some(e => !expected.has(entrySignature(e)));
+  private async drifted(projectId: string, path: string, applied?: Applied): Promise<boolean> {
+    const live = (await this.scan(projectId, path, applied?.baseline)).entries.filter(e => !ownedPath(e.path) && e.path !== "");
+    const reference = applied?.baseline ?? applied?.manifest;
+    if (!reference) return live.length > 0;
+    const expected = new Set(reference.entries.filter(e => !ownedPath(e.path) && e.path !== "").map(entrySignature));
+    if (live.length !== expected.size) return true;
+    return live.some(e => !expected.has(entrySignature(e)));
   }
-  private async scan(projectId: string, path: string) {
+  /** Canonical project directory. Refuses the filesystem root, the home directory, and any path holding the host's own state. */
+  private async projectRoot(path: string) {
     const root = await realpath(path);
+    const own = await Promise.all([this.config.stateDir, this.config.runDir, dirname(this.config.keyFile)].map(canonical));
+    if (root === "/" || root === await canonical(homedir()) || own.some(dir => inside(root, dir)))
+      throw new ProjectSyncError("The project path is the root or home directory or holds the host's own state; sync refuses it", "invalid-manifest", 500);
     if (!(await lstat(root)).isDirectory()) throw new ProjectSyncError("Configured project path is not a directory", "invalid-manifest", 500);
-    const storeDir = join(this.dir(projectId), "scan");
-    await mkdir(storeDir, { recursive: true, mode: 0o700 });
-    return captureWorkspace({ roots: [root], cwd: root, storeDir });
+    return root;
+  }
+  /** Capture the live tree into the shared content store, reusing unchanged files from `previous` when it describes this root. */
+  private async scan(projectId: string, path: string, previous?: WorkspaceManifest) {
+    const root = await this.projectRoot(path);
+    return captureWorkspace({ roots: [root], cwd: root, storeDir: join(this.dir(projectId), "blobs"), previous: previous?.roots[0] === root ? previous : undefined });
   }
   async exportTree(projectId: string): Promise<WorkspaceManifest> {
     const project = this.project(projectId);
-    const root = await realpath(project.path);
-    return captureWorkspace({ roots: [root], cwd: root, storeDir: join(this.dir(projectId), "blobs") });
+    return this.queue(projectId, () => this.scan(projectId, project.path, this.read<Applied>(projectId, "applied")?.baseline));
   }
 }
 
@@ -201,4 +218,12 @@ async function removeTree(path: string) {
 async function ownerWritable(directory: string) {
   await chmod(directory, 0o700);
   for (const entry of await readdir(directory, { withFileTypes: true })) if (entry.isDirectory()) await ownerWritable(join(directory, entry.name));
+}
+/** Real path of `path`, resolving the nearest existing ancestor when the path itself does not exist yet. */
+async function canonical(path: string): Promise<string> {
+  try { return await realpath(path); } catch (error) {
+    const absolute = resolve(path);
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(absolute) === absolute) throw error;
+    return join(await canonical(dirname(absolute)), basename(absolute));
+  }
 }

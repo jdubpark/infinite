@@ -38,3 +38,15 @@ test("server administration commands keep their own options even when a provider
   assert.equal(parsed.command, "new");
   assert.deepEqual(parsed.args, []);
 });
+
+test("sync and pull commands parse their options", () => {
+  const start = parseClientArgs(["sync", "--project", "example"]);
+  assert.equal(start.command, "sync"); assert.equal(start.options["--project"], "example");
+  const stop = parseClientArgs(["sync", "--stop"]);
+  assert.equal(stop.options["--stop"], true);
+  const apply = parseClientArgs(["sync", "--apply", "--force"]);
+  assert.equal(apply.options["--apply"], true); assert.equal(apply.options["--force"], true);
+  const pull = parseClientArgs(["pull", "example", "--output", "/tmp/x"]);
+  assert.deepEqual(pull.args, ["example"]); assert.equal(pull.options["--output"], "/tmp/x");
+  assert.throws(() => parseClientArgs(["--include", "../lib", "sync"]), /--include applies to --laptop/);
+});

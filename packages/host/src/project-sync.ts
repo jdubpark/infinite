@@ -160,7 +160,8 @@ export class ProjectSync {
     if (!received) return this.status(projectId);
     const applied = this.read<Applied>(projectId, "applied");
     // A recapture of the applied content is already in place: record it as applied without replacing the tree.
-    if (applied && (applied.manifest.id === received.manifest.id || sameEntries(applied.manifest, received.manifest))) {
+    // A forced apply still republishes it, which resets cloud edits to the laptop content.
+    if (!options.force && applied && (applied.manifest.id === received.manifest.id || sameEntries(applied.manifest, received.manifest))) {
       if (applied.manifest.id !== received.manifest.id) this.write(projectId, "applied", { ...applied, manifest: received.manifest } satisfies Applied);
       this.writePending(projectId, undefined);
       return this.status(projectId);

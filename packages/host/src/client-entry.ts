@@ -19,10 +19,13 @@ infinite projects
 infinite resume [session ID or unique prefix]
 infinite monitor [session ID or unique prefix]
 infinite recover SESSION_ID [--output NEW_DIRECTORY]
+infinite sync [--project ID] | --stop | --status | --apply [--force]
+infinite pull [PROJECT_ID] [--output NEW_DIRECTORY]
 
 Put Infinite options before the provider. Everything after it is passed unchanged.
 Sessions run on the cloud machine. --laptop runs Codex tools in this directory with background cloud handoff.
 The laptop executor stays available after CLI exit.
+Sync keeps the cloud project current with this checkout, one way; pull downloads the cloud copy.
 Native resume IDs belong to the cloud conversation.
 Ctrl+] detaches; Ctrl+G monitors; Enter in monitor mode enables input.
 Ctrl+E opens a local draft; Ctrl+S inserts it; Enter in the native UI submits it.

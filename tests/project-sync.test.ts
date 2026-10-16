@@ -104,6 +104,20 @@ test("host-side edits after apply make the next apply refuse without force", asy
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("a forced apply restores laptop content over cloud edits even when the generation is already applied", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.laptop, "a.txt"), "laptop\n");
+    const { manifest } = await push(f);
+    writeFileSync(join(f.cloud, "a.txt"), "cloud edit\n");
+    const forced = await f.sync.apply("example", { force: true, running: idle });
+    assert.equal(forced.appliedManifest, manifest.id);
+    assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "laptop\n");
+    const previous = join(dirname(f.cloud), `.${basename(f.cloud)}.infinite-previous`);
+    assert.equal(readFileSync(join(previous, "a.txt"), "utf8"), "cloud edit\n", "the replaced cloud edit is kept once");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("stale generations and missing content are refused", async () => {
   const f = fixture();
   try {

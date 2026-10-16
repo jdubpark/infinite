@@ -15,6 +15,7 @@ import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { checkLaptopExecutor, startLaptopService } from "./laptop-service.js";
 import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWorkspaceManifest } from "./workspace-checkpoint.js";
+import { readSyncState, startSyncService, stopSyncService } from "./sync-service.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
@@ -329,7 +330,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "sync", "pull"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
@@ -338,7 +339,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
   const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output"]);
-  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud"]);
+  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force"]);
   const option = () => {
     const name = args.shift()!;
     if (name === "--include" && args.length) includes.push(args.shift()!);
@@ -360,11 +361,26 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   return { command, args: providers.has(command) ? args : positional, options, includes };
 }
 
+function gitRoot(cwd: string) {
+  try { return realpathSync(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()); }
+  catch { return cwd; }
+}
+function age(iso?: string) {
+  if (!iso) return "never";
+  const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
+  return seconds < 60 ? `${seconds}s ago` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : `${Math.floor(seconds / 3600)}h ago`;
+}
+type ProjectDetail = { id: string; name: string; sync: { lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: { reason: string; receivedAt: string } } };
+function describeSync(sync: ProjectDetail["sync"]) {
+  const pending = sync.pendingGeneration ? ` · pending (${sync.pendingGeneration.reason === "session-running" ? "session running" : "cloud changed; use infinite sync --apply --force or infinite pull"})` : "";
+  return `synced ${age(sync.lastSyncedAt)} · applied ${age(sync.appliedAt)}${pending}`;
+}
+
 export async function handleClientCommand(argv: string[]): Promise<boolean> {
   const progress = startupProgress();
   const args = [...argv];
   // Keep server administration commands and their --config semantics intact.
-  const candidate = args.find(a => providers.has(a) || ["pair", "resume", "monitor", "recover", "projects", "list"].includes(a));
+  const candidate = args.find(a => providers.has(a) || CLIENT_COMMANDS.has(a));
   if (!candidate || (candidate === "list" && args.includes("--config"))) return false;
   try {
     const parsed = parseClientArgs(args);
@@ -400,7 +416,13 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command !== "projects") progress.start(`Connecting to ${new URL(config.origin).hostname}`);
     const me = await api.json<Me>("/me");
     progress.stop();
-    if (command === "projects") { me.projects.forEach(p => console.log(`${p.id}  ${clean(p.name)}`)); return true; }
+    if (command === "projects") {
+      for (const p of me.projects) {
+        const detail = await api.json<ProjectDetail>(`/projects/${p.id}`).catch(() => undefined);
+        console.log(`${p.id}  ${clean(p.name)}${detail ? `  · ${describeSync(detail.sync)}` : ""}`);
+      }
+      return true;
+    }
     if (command === "recover") {
       if (me.role !== "owner") throw new Error("Workspace recovery requires an owner device key");
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
@@ -425,6 +447,60 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       console.error("[Infinite] Cloud checkpoint downloaded. Compare this copy with your preserved laptop project; tools remain in the cloud.");
       return true;
     }
+    if (command === "sync") {
+      if (me.role !== "owner") throw new Error("Workspace sync requires an owner device key");
+      const syncDir = join(dirname(path), "sync");
+      if (options["--status"]) {
+        for (const p of me.projects) {
+          const state = readSyncState(join(syncDir, `${p.id}.json`));
+          const detail = await api.json<ProjectDetail>(`/projects/${p.id}`).catch(() => undefined);
+          console.log(`${p.id}  ${state ? `service pid ${state.pid} · ${clean(state.root)}${state.problem ? ` · problem: ${clean(state.problem)}` : ""}` : "no local service"}${detail ? ` · ${describeSync(detail.sync)}` : ""}`);
+        }
+        return true;
+      }
+      const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
+      if (!me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      const stateFile = join(syncDir, `${projectId}.json`);
+      if (options["--stop"]) { console.log(stopSyncService(stateFile) ? "Sync service stopped. The cloud copy keeps its last applied generation." : "No sync service was running for this project."); return true; }
+      if (options["--apply"]) {
+        // A large tree can take minutes to publish; a refusal (409) leaves its reason in the pending marker.
+        const applied = await api.request(`/projects/${projectId}/sync/apply`, options["--force"] ? { force: true } : {}, AbortSignal.timeout(300000)).catch(async (error: unknown) => {
+          if (!(error instanceof HttpError) || error.status !== 409) throw error;
+          throw new Error(`Not applied. ${describeSync((await api.json<ProjectDetail>(`/projects/${projectId}`)).sync)}`);
+        });
+        console.log(describeSync(await applied.json() as ProjectDetail["sync"])); return true;
+      }
+      const root = gitRoot(realpathSync(process.cwd()));
+      if (root === realpathSync(homedir()) || root === dirname(root)) throw new Error("Run inside a project directory; selecting the entire home or filesystem is not supported");
+      progress.start(`Uploading ${clean(root)} to project ${projectId}`);
+      await startSyncService({ origin: config.origin, token: config.token, projectId, root, stateFile, storeDir: join(syncDir, `${projectId}-store`) });
+      progress.stop();
+      const detail = await api.json<ProjectDetail>(`/projects/${projectId}`);
+      console.error(`[Infinite] Sync service running for ${clean(root)} → ${projectId}. ${describeSync(detail.sync)}. It keeps running after this command exits; stop it with infinite sync --stop.`);
+      return true;
+    }
+    if (command === "pull") {
+      if (me.role !== "owner") throw new Error("Workspace pull requires an owner device key");
+      const projectId = positional[0] ?? String(config.projectId ?? me.projects[0]?.id ?? "");
+      if (!me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      progress.start("Downloading the cloud project tree");
+      // The host scans the whole cloud tree before replying; api.json would cap that at 15 s.
+      const { manifest: exported } = await (await api.request(`/projects/${projectId}/sync/export`, {}, AbortSignal.timeout(300000))).json() as { manifest: unknown };
+      const manifest = validateWorkspaceManifest(exported);
+      const directory = join(dirname(path), "pulls", projectId), storeDir = join(directory, "objects");
+      const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
+      for (let offset = 0; offset < hashes.length; offset += 512)
+        for (const hash of await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512))) {
+          const { base64 } = await api.json<{ base64: string }>(`/projects/${projectId}/sync/blob/${hash}`);
+          await putWorkspaceBlob(storeDir, hash, base64);
+        }
+      const destination = resolve(String(options["--output"] ?? join(directory, manifest.id)));
+      const pulled = await materializeWorkspace({ manifest, storeDir, destination });
+      progress.stop();
+      console.log(pulled.cwd);
+      console.error("[Infinite] Cloud project downloaded into a new directory. Compare it with your checkout; nothing on this Mac was overwritten.");
+      return true;
+    }
     let session: Session;
     let emptyLaptopPrompt = false;
     if (providers.has(command)) {
@@ -434,9 +510,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       if (options["--laptop"]) {
         if (!me.execution?.laptop) throw new Error("Upgrade the single-tenant host for laptop execution, or omit --laptop to use its configured cloud project");
         await checkLaptopExecutor();
-        const cwd = realpathSync(process.cwd());
-        let root = cwd;
-        try { root = realpathSync(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()); } catch { /* Non-Git directories are valid projects. */ }
+        const cwd = realpathSync(process.cwd()), root = gitRoot(cwd);
         const roots = [...new Set([root, ...includes.map(value => realpathSync(resolve(value)))])];
         if (roots.length > 16 || roots.some(value => !statSync(value).isDirectory())) throw new Error("Select at most 16 project directories");
         if (roots.some(value => value === dirname(value) || value === realpathSync(homedir()))) throw new Error("Run inside a project directory; selecting the entire home or filesystem is not supported");

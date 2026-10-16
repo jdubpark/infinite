@@ -33,6 +33,7 @@ A manifest that cannot be applied stays **pending** with a reason. The pending m
 | Reason | Meaning | What clears it |
 | --- | --- | --- |
 | `session-running` | A cloud session is running or starting in this project | After it exits: `infinite sync --apply`, **Apply now** on web or phone, or the next laptop change |
+| `awaiting-apply` | Reported in place of `session-running` once no session holds the project; never stored | `infinite sync --apply`, **Apply now** on web or phone, or the next laptop change |
 | `cloud-changed` | The cloud tree differs from the scan taken after the last apply, or the directory was not empty before the first apply | `infinite pull` to save the cloud copy, then `infinite sync --apply --force` or **Replace cloud files** on web or phone |
 | `apply-failed` | The drift scan or the swap failed; `category` and `message` say why | Fix the cause, then `infinite sync --apply`, **Apply now** on web or phone, or the next laptop change |
 
@@ -49,7 +50,7 @@ An `apply-failed` marker carries a `category` and a fixed `message` that never n
 
 `--force` skips the drift check and the identical-manifest shortcut; a running session still refuses the apply. A forced apply therefore replaces the tree even when the manifest matches the applied generation, which resets cloud edits to the laptop content. An explicit apply that is refused answers `409` with the reason as its code and leaves the generation pending. A failed apply answers `409` with code `apply-failed`, its `category`, and the message in `error` and `message`. Any other failure on a sync route answers `409` with code `sync-failed` and a category, never the session refusal text.
 
-`GET /api/projects/:id` returns the project's `id`, `name`, and a `sync` object. `lastSyncedAt` and `lastSyncedManifest` describe the newest received generation, `appliedAt` and `appliedManifest` the generation in place, and `pendingGeneration` (`id`, `capturedAt`, `receivedAt`, `reason`, and for `apply-failed` also `category` and `message`) a waiting one. Any paired role can read it. `infinite projects` and `infinite sync --status` print a summary of it: sync age, apply age, and the pending reason.
+`GET /api/projects/:id` returns the project's `id`, `name`, and a `sync` object. `lastSyncedAt` and `lastSyncedManifest` describe the newest received generation, `appliedAt` and `appliedManifest` the generation in place, and `pendingGeneration` (`id`, `capturedAt`, `receivedAt`, `reason`, and for `apply-failed` also `category` and `message`) a waiting one. Any paired role can read it. `infinite projects` and `infinite sync --status` print a summary of it: sync age, apply age, and the pending reason. Before a cloud launch, the CLI reads it and prints `Laptop changes from AGE are pending; run infinite sync --apply` when a generation waits, then starts the session on the tree in place.
 
 ## Clients
 

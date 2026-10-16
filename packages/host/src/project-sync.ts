@@ -13,7 +13,8 @@ import type { Config } from "./types.js";
 export type SyncFailureCategory = "permission" | "cross-device" | "no-space" | "special-file" | "missing-path" | "other";
 export interface PendingGeneration {
   id: string; capturedAt: string; receivedAt: string;
-  reason: "session-running" | "cloud-changed" | "apply-failed";
+  /** `awaiting-apply` is never stored: a read reports it for a `session-running` marker once no session holds the project. */
+  reason: "session-running" | "cloud-changed" | "apply-failed" | "awaiting-apply";
   /** Set for `apply-failed`: a fixed category and message that never name a path. */
   category?: SyncFailureCategory; message?: string;
 }
@@ -124,6 +125,13 @@ export class ProjectSync {
     if (applied) { status.appliedAt = applied.appliedAt; status.appliedManifest = applied.manifest.id; }
     const pending = this.readPending(projectId);
     if (pending) status.pendingGeneration = pending;
+    return status;
+  }
+  /** Status as of now: a generation that waited for a session reads `awaiting-apply` once no session holds the project. */
+  async liveStatus(projectId: string, running: RunningCheck): Promise<ProjectSyncStatus> {
+    const status = this.status(projectId);
+    if (status.pendingGeneration?.reason === "session-running" && !(await running()))
+      status.pendingGeneration = { ...status.pendingGeneration, reason: "awaiting-apply" };
     return status;
   }
   private readPending(projectId: string) {

@@ -382,6 +382,7 @@ type ProjectDetail = { id: string; name: string; sync: { lastSyncedAt?: string; 
 function describePending(pending: Pending) {
   if (pending.reason === "session-running") return "session running";
   if (pending.reason === "cloud-changed") return "cloud changed; use infinite sync --apply --force or infinite pull";
+  if (pending.reason === "awaiting-apply") return "no session running; apply with infinite sync --apply";
   if (pending.reason === "apply-failed") return `apply failed: ${clean(pending.category ?? "other")}${pending.message ? `. ${clean(pending.message)}` : ""} Retry with infinite sync --apply`;
   return clean(pending.reason);
 }
@@ -553,6 +554,11 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       }
       const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      if (!workspace) {
+        // A cloud session starts on the tree in place; laptop changes that wait for an apply are not in it.
+        const pending = (await api.json<ProjectDetail>(`/projects/${projectId}`).catch(() => undefined))?.sync?.pendingGeneration;
+        if (pending) console.error(`[Infinite] Laptop changes from ${age(pending.capturedAt ?? pending.receivedAt)} are pending; run infinite sync --apply`);
+      }
       const requestId = randomUUID();
       console.error(`[Infinite] Launch ${requestId} on ${config.origin} · project ${projectId}`);
       progress.start(`Starting ${providerNames[command]} on ${new URL(config.origin).hostname}`);

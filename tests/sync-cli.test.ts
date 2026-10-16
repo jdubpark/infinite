@@ -4,7 +4,8 @@ import { execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { startHost, waitFor } from "./helpers.js";
+import { randomUUID } from "node:crypto";
+import { demoProfile, startHost, waitFor } from "./helpers.js";
 import { readSyncState, stopSyncService } from "../packages/host/src/sync-service.js";
 
 const exec = promisify(execFile);
@@ -74,6 +75,33 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
     await host.start();
     const stale = await exec(process.execPath, [...cli, "sync", "--status"]);
     assert.match(stale.stdout, new RegExp(`^rehearsal  stale service record \\(pid ${dead} not running\\) · synced \\d+s ago`));
+  } finally {
+    if (existsSync(stateFile)) stopSyncService(stateFile);
+    await host.stop(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a cloud launch reports laptop changes that wait for an apply, then starts on the tree in place", { timeout: 120000 }, async () => {
+  const host = await startHost({ agents: { demo: demoProfile(), claude: demoProfile() } });
+  const root = realpathSync(mkdtempSync("/tmp/inf-synccli-"));
+  const checkout = join(root, "checkout"); mkdirSync(checkout);
+  const clientFile = join(root, "client.json"), tokenFile = join(root, "owner.key");
+  writeFileSync(tokenFile, host.tokens.owner, { mode: 0o600 });
+  const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/cli.ts"), "--client-config", clientFile];
+  const stateFile = join(root, "sync", "rehearsal.json");
+  try {
+    await exec(process.execPath, [...cli, "pair", host.origin, "--token-file", tokenFile]);
+    const busy = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: busy, provider: "demo", projectId: "rehearsal", title: "Busy", prompt: "" });
+    await waitFor(() => host.fetchApi(`/sessions/${busy}`), r => r.body.status === "running");
+    writeFileSync(join(checkout, "file.txt"), "from laptop\n");
+    await exec(process.execPath, [...cli, "sync", "--project", "rehearsal"], { cwd: checkout });
+    await waitFor(() => host.fetchApi("/projects/rehearsal"), r => r.body.sync.pendingGeneration?.reason === "session-running", 30000);
+    // Infinite options come before the provider; everything after it belongs to the provider.
+    const launched = await exec(process.execPath, [...cli, "--detach", "--title", "Next", "claude"], { timeout: 60000 });
+    assert.match(launched.stderr, /\[Infinite\] Laptop changes from \d+s ago are pending; run infinite sync --apply\n/);
+    assert.match(launched.stdout, /^[0-9a-f-]{36}\n$/, "the launch continues");
+    assert.equal(existsSync(join(host.config.projects[0].path, "file.txt")), false, "the session starts on the tree in place");
   } finally {
     if (existsSync(stateFile)) stopSyncService(stateFile);
     await host.stop(); rmSync(root, { recursive: true, force: true });

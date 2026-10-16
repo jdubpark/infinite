@@ -78,9 +78,14 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
     assert.equal(refused.status, 409);
     assert.equal(refused.body.code, "session-running");
 
+    assert.equal((await host.fetchApi("/projects/rehearsal")).body.sync.pendingGeneration?.reason, "session-running");
+
     const stop = await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() });
     assert.equal(stop.status, 200);
     await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "exited");
+    // The marker still says session-running, but nothing holds the project now.
+    const waiting = (await host.fetchApi("/projects/rehearsal")).body.sync.pendingGeneration;
+    assert.deepEqual([waiting?.reason, waiting?.id], ["awaiting-apply", second.manifest.id]);
     const applied = await host.fetchApi("/projects/rehearsal/sync/apply", "owner", {});
     assert.equal(applied.status, 200);
     assert.equal(applied.body.appliedManifest, second.manifest.id);

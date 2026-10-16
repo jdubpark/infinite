@@ -596,11 +596,11 @@ export function createApp(config: Config, key: Buffer) {
       );
     },
   );
-  app.get("/api/projects/:id", (req, res) => {
+  app.get("/api/projects/:id", async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     const project = config.projects.find(p => p.id === projectId);
-    if (!project) return res.status(404).json({ error: "Unknown project" });
-    return res.json({ id: project.id, name: project.name, sync: projectSync.status(projectId) });
+    if (!project) return void res.status(404).json({ error: "Unknown project" });
+    res.json({ id: project.id, name: project.name, sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
   });
   app.post("/api/projects/:id/sync/begin", requireRole(["owner"]), requireOwnerCli, (req, res) => {
     res.json(projectSync.begin(projectSchema.parse(req.params.id)));

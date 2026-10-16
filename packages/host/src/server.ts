@@ -23,6 +23,11 @@ import { ProjectSync, ProjectSyncError } from "./project-sync.js";
 import type { Config, Role, Receipt } from "./types.js";
 
 const id = z.uuid();
+/** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
+function alive(pid: unknown) {
+  if (!Number.isInteger(pid) || (pid as number) <= 1) return false;
+  try { process.kill(pid as number, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
 const createSchema = z
   .object({
     requestId: id,
@@ -82,10 +87,8 @@ export function createApp(config: Config, key: Buffer) {
   const app = express();
   const manager = new Manager(config, key);
   const projectSync = new ProjectSync(config, key);
-  // Session starts admitted past the sync check that manager.list() may not show yet.
+  // Session starts admitted past the sync check that the session list may not show yet.
   const startsInFlight = new Map<string, number>();
-  const projectRunning = async (projectId: string) => startsInFlight.has(projectId) ||
-    (await manager.list()).some(s => s.projectId === projectId && ["running", "starting"].includes(s.status) && s.executionLocation !== "laptop");
   /**
    * A sync commit or apply evaluates projectRunning only after `applying()` turns true.
    * A start either sees that flag and is refused, or is counted before the check runs.
@@ -114,6 +117,19 @@ export function createApp(config: Config, key: Buffer) {
       .map(s => `${s.provider}:${s.nativeSession!.id}:${s.pid}`));
     const external = cmux ? (await cmux.list()).filter(s => s.status !== "running" || !s.nativeSession || !s.pid || !known.has(`${s.provider}:${s.nativeSession.id}:${s.pid}`)) : [];
     return [...native, ...external.map(s => ({ ...s, backend: "cmux" as const, machineId: config.machine!.id, resumable: resumable(s) }))];
+  };
+  /**
+   * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
+   * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
+   * tools run elsewhere, and an exited session never counts. A session list that cannot be read counts as running.
+   */
+  const projectRunning = async (projectId: string) => {
+    if (startsInFlight.has(projectId)) return true;
+    let sessions: Awaited<ReturnType<typeof listSessions>>;
+    try { sessions = await listSessions(); } catch { return true; }
+    return sessions.some(s => s.projectId === projectId && s.executionLocation !== "laptop" &&
+      (["running", "starting"].includes(s.status) ||
+        (["unavailable", "recording-error"].includes(s.status) && (alive(s.pid) || alive((s as { workerPid?: unknown }).workerPid)))));
   };
   const pushStore = new PushStore(config.stateDir, key);
   async function inputAuthority(sessionId: string, res: express.Response) {
@@ -293,7 +309,7 @@ export function createApp(config: Config, key: Buffer) {
     if (request.backend === "cmux") {
       if (!cmux) return void res.status(409).json({ error: "cmux is not enabled on this machine" });
       if (request.nativeArgs || request.workspace || request.localUi) return void res.status(400).json({ error: "Choose a configured project and agent for cmux" });
-      return void res.status(201).json(await cmux.create(request));
+      return void res.status(201).json(await startInProject(request.projectId, () => cmux.create(request)));
     }
     const { backend: _backend, ...nativeRequest } = request;
     res.status(201).json(await startInProject(request.projectId, () => manager.create(nativeRequest)));
@@ -339,7 +355,10 @@ export function createApp(config: Config, key: Buffer) {
         return void res.json(await cmux.call(sessionId, { op: "key", ...body, ...authority }));
       }
       if (action === "/stop") return void res.json(await cmux.call(sessionId, { op: "stop", ...z.object({ requestId: id }).strict().parse(req.body), ...authority }));
-      if (action === "/resume") return void res.json(await cmux.resume(sessionId, z.object({ requestId: id }).strict().parse(req.body).requestId));
+      if (action === "/resume") {
+        const { requestId } = z.object({ requestId: id }).strict().parse(req.body);
+        return void res.json(await startInProject((await cmux.get(sessionId)).projectId, () => cmux.resume(sessionId, requestId)));
+      }
       return void res.status(409).json({ error: "This action is unavailable for cmux sessions", code: "unsupported" });
     } catch (error) {
       const code = (error as WorkerError).code;

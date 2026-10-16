@@ -7,8 +7,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn as ptySpawn } from "node-pty";
 import { CmuxSessions } from "../packages/host/src/cmux/index.js";
+import { createApp } from "../packages/host/src/server.js";
+import { hashToken } from "../packages/host/src/config.js";
+import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
 import type { Config, ControlLease, Receipt } from "../packages/host/src/types.js";
-import { claimControl, startHost, waitFor } from "./helpers.js";
+import { apiClient, claimControl, startHost, waitFor } from "./helpers.js";
 
 // A real executable stands at the cmux process boundary. It supplies terminal
 // observations, but all authorization, journals and receipts belong to the adapter.
@@ -414,4 +417,47 @@ test("concurrent cmux observations share work and do not delay control", { timeo
   await active;
   assert.equal((await admitted).state, "delivered", "admitted mutations retain their own safety checks and receipt");
   assert.equal(await expired, "cmux-busy", "abandoned queued observations expire without another CLI refresh");
+});
+
+test("a cmux session in the project holds a workspace sync, and cmux starts are refused while one applies", { timeout: 30000 }, async (t) => {
+  const f = await fixture(t);
+  // The app opens its own view of the same cmux state.
+  await f.sessions.close();
+  const owner = randomBytes(32).toString("base64url");
+  // Worker sockets need a short run directory.
+  const runDir = mkdtempSync("/tmp/inf-cmuxrun-");
+  t.after(() => rmSync(runDir, { recursive: true, force: true }));
+  const config: Config = { ...f.config, runDir, tokens: [{ id: "owner", label: "Owner", role: "owner", hash: hashToken(owner) }] };
+  writeFileSync(config.keyFile, f.key, { mode: 0o600 });
+  const app = createApp(config, f.key);
+  await new Promise<void>(resolve => app.server.listen(0, "127.0.0.1", resolve));
+  config.port = (app.server.address() as { port: number }).port;
+  t.after(async () => { app.closeConnections(); await new Promise<void>(resolve => app.server.close(() => resolve())); });
+  const origin = `http://127.0.0.1:${config.port}`;
+  const fetchApi = apiClient(origin, { owner, controller: owner, viewer: owner });
+  const listed = await fetchApi("/sessions");
+  assert.ok(listed.body.sessions.some((s: { backend: string; projectId: string; status: string }) => s.backend === "cmux" && s.projectId === "project" && s.status === "running"));
+
+  const laptop = join(f.root, "laptop"), storeDir = join(f.root, "laptop-store");
+  mkdirSync(laptop); writeFileSync(join(laptop, "a.txt"), "laptop\n");
+  const manifest = await captureWorkspace({ roots: [laptop], cwd: laptop, storeDir });
+  const { generation } = (await fetchApi("/projects/project/sync/begin", "owner", {})).body;
+  for (const hash of (await fetchApi("/projects/project/sync/has", "owner", { hashes: [...new Set(manifest.entries.flatMap(e => e.chunks ?? []))] })).body.missing)
+    await fetch(`${origin}/api/projects/project/sync/blob/${hash}`, { method: "PUT", headers: { Authorization: `Bearer ${owner}`, "Content-Type": "application/octet-stream" }, body: Buffer.from(await readWorkspaceBlob(storeDir, hash), "base64") });
+  const commit = await fetchApi("/projects/project/sync/commit", "owner", { generation, manifest });
+  assert.equal(commit.body.pendingGeneration?.reason, "session-running", "the cmux session runs in the project directory");
+  assert.equal(existsSync(join(f.cwd, "a.txt")), false);
+
+  // Hold an apply at its running check; a cmux create for the project is refused before reaching cmux.
+  let atCheck!: () => void, answer!: (running: boolean) => void;
+  const reached = new Promise<void>(resolve => { atCheck = resolve; });
+  const held = app.projectSync.apply("project", { running: () => { atCheck(); return new Promise<boolean>(resolve => { answer = resolve; }); } });
+  await reached;
+  const launches = f.mutations().filter(row => row.method === "workspace.create").length;
+  const refused = await fetchApi("/sessions", "owner", { requestId: randomUUID(), backend: "cmux", provider: "claude", projectId: "project", title: "Late", prompt: "" });
+  assert.equal(refused.status, 409);
+  assert.equal(refused.body.code, "sync-applying");
+  assert.equal(f.mutations().filter(row => row.method === "workspace.create").length, launches, "cmux was never asked to launch");
+  answer(true);
+  await assert.rejects(held, { code: "session-running" });
 });

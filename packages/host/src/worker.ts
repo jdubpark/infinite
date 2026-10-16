@@ -122,11 +122,13 @@ let flushTimer: ReturnType<typeof setTimeout> | undefined;
 let snapshotQueue: (() => void)[] | undefined;
 let snapshotBytes = 0;
 let abortSnapshot: ((error: Error) => void) | undefined;
+// The worker pid lets the API tell a worker that is slow to answer from one that is gone.
 const persist = () =>
   writeSealed(join(dir, "status.sealed"), key, `${session.id}:status`, {
     ...state,
     screen: "",
     seq: journal.seq,
+    workerPid: process.pid,
   });
 /** Every journal write goes through here so a failed write always suspends the session. */
 function append(type: Event["type"], data: Event["data"]): Event {
@@ -937,6 +939,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       provider,
       contextVersion: session.contextVersion,
     });
+    persist();
     const env: Record<string, string> = {};
     for (const name of [
       "PATH",

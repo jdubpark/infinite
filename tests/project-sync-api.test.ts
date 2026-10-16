@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -146,4 +147,31 @@ test("session starts are refused while a sync holds the project, and an admitted
     assert.equal(applied.status, 200, "the finished start no longer holds the project");
     assert.equal(applied.body.appliedManifest, second.manifest.id);
   } finally { await host.stop(); }
+});
+
+test("a running session whose worker does not answer still holds the next generation pending", { timeout: 90000 }, async () => {
+  const host = await startHost();
+  const root = realpathSync(mkdtempSync("/tmp/inf-psync-stall-"));
+  const laptop = join(root, "laptop"); mkdirSync(laptop);
+  const storeDir = join(root, "store");
+  let worker: number | undefined;
+  try {
+    writeFileSync(join(laptop, "notes.md"), "v1\n");
+    assert.equal((await pushTree(host, laptop, storeDir)).commit.status, 200);
+    const id = randomUUID();
+    assert.equal((await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Busy", prompt: "" })).status, 201);
+    const running = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "running" && r.body.pid > 0);
+    // Stop the session's worker, the provider's parent, so its state call times out during the commit.
+    worker = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(running.body.pid)], { encoding: "utf8" }).trim());
+    assert.ok(worker > 1);
+    process.kill(worker, "SIGSTOP");
+    writeFileSync(join(laptop, "notes.md"), "v2\n");
+    const second = await pushTree(host, laptop, storeDir);
+    assert.equal(second.commit.status, 200);
+    assert.equal(second.commit.body.pendingGeneration?.reason, "session-running");
+    assert.equal(readFileSync(join(host.config.projects[0].path, "notes.md"), "utf8"), "v1\n", "the tree under the session was not replaced");
+  } finally {
+    if (worker) process.kill(worker, "SIGCONT");
+    await host.stop(); rmSync(root, { recursive: true, force: true });
+  }
 });

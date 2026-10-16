@@ -123,6 +123,8 @@ export interface Receipt {
 export interface WorkerState {
   status: Status;
   pid?: number;
+  /** Written to the sealed status only; a row carries it when the worker did not answer. */
+  workerPid?: number;
   exitCode?: number;
   seq: number;
   screen: string;

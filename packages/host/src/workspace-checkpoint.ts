@@ -153,7 +153,8 @@ export function validateWorkspaceManifest(value: unknown, expectedRoots?: string
   return { ...body, id: value.id };
 }
 
-type Store = { root: string; blobs: string; shards: Set<string> };
+/** `unsynced` collects shards whose new entries a capture syncs once at its end instead of after every chunk. */
+type Store = { root: string; blobs: string; shards: Set<string>; unsynced?: Set<string> };
 async function privateDirectory(path: string) {
   const created = await mkdir(path, { recursive: true, mode: 0o700 });
   const info = await lstat(path);
@@ -217,7 +218,9 @@ async function writeBlob(store: Store, hash: string, bytes: Buffer) {
   try {
     try { await handle.writeFile(bytes); await handle.sync(); }
     finally { await handle.close(); }
-    await rename(temporary, file); await syncDirectory(shard); await syncDirectory(store.blobs); await syncDirectory(store.root);
+    // Shard creation already made the shard's own entry durable; only the new name needs a directory sync.
+    await rename(temporary, file);
+    if (store.unsynced) store.unsynced.add(shard); else await syncDirectory(shard);
     rememberBlob(file, stamp(await lstat(file, { bigint: true })));
   } finally { await rm(temporary, { force: true }); }
 }
@@ -259,6 +262,8 @@ async function openDirectory(path: string) { return open(path, constants.O_RDONL
 export async function captureWorkspace(options: {
   roots: string[]; cwd: string; storeDir: string; signal?: AbortSignal;
   previous?: WorkspaceManifest; forceFull?: boolean;
+  /** Called at most every 100 ms while entries are walked and chunks written, so a caller can tell a long capture from a stalled one. */
+  onProgress?: () => void;
 }): Promise<WorkspaceManifest> {
   abort(options.signal);
   if (!options.roots.length || options.roots.length > 64) throw new Error("Invalid workspace roots");
@@ -268,7 +273,12 @@ export async function captureWorkspace(options: {
   if (roots.some(root => inside(root, canonicalStore))) throw new Error("Workspace storage must be outside all selected roots");
   const cwdRoot = roots.map((root, index) => ({ root, index })).filter(item => inside(item.root, cwd)).sort((a, b) => b.root.length - a.root.length)[0];
   if (!cwdRoot) throw new Error("Workspace cwd is outside the selected roots");
-  const store = await storeAt(options.storeDir), handles: FileHandle[] = [];
+  const store: Store = { ...await storeAt(options.storeDir), unsynced: new Set() }, handles: FileHandle[] = [];
+  let reported = Date.now();
+  const tick = () => {
+    if (!options.onProgress || Date.now() - reported < 100) return;
+    reported = Date.now(); options.onProgress();
+  };
   const gitProjections = new Map<string, { common: string; selected: string; pointerStamp: string }>();
   const gitLocation = async (root: string) => {
     const { stdout } = await execute("git", ["-C", root, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], {
@@ -323,7 +333,7 @@ export async function captureWorkspace(options: {
         total += length;
         if (!Number.isSafeInteger(total) || result.length * 67 > MAX_MANIFEST_BYTES) throw new Error("Workspace file exceeds the manifest size bound");
         const bytes = buffer.subarray(0, length), hash = sha(bytes);
-        if (!written.has(hash)) { await writeBlob(store, hash, bytes); written.add(hash); }
+        if (!written.has(hash)) { await writeBlob(store, hash, bytes); written.add(hash); tick(); }
         result.push(hash);
         if (length < CHUNK_BYTES) break;
       }
@@ -377,6 +387,7 @@ export async function captureWorkspace(options: {
     const directory = await opendir(directoryPath);
     for await (const child of directory) {
       abort(options.signal);
+      tick();
       const childPath = path ? `${path}/${child.name}` : child.name;
       if (!relativePath(childPath)) throw new Error("Unsupported workspace filename");
       const file = join(directoryPath, child.name), childInfo = await lstat(file, { bigint: true });
@@ -469,11 +480,16 @@ export async function captureWorkspace(options: {
       version: 1, capturedAt: new Date().toISOString(), captureStartedAt,
       cwd: { root: cwdRoot.index, path: posix.relative(cwdRoot.root, cwd) }, roots, entries,
     };
+    // Every chunk a returned manifest names has a durable directory entry.
+    for (const shard of store.unsynced!) { await syncDirectory(shard); tick(); }
+    store.unsynced!.clear();
     return validateWorkspaceManifest({ ...body, id: manifestId(body) });
   } catch (error) {
     if (["ENOENT", "ENOTDIR", "ELOOP", "ESTALE"].includes((error as NodeJS.ErrnoException).code ?? "")) changed();
     throw error;
   } finally {
+    // A failed capture's chunks can be named by a later manifest that finds them already stored.
+    await Promise.all([...store.unsynced!].map(shard => syncDirectory(shard).catch(() => {})));
     await watch?.close();
     await Promise.all(handles.map(handle => handle.close()));
   }

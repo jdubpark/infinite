@@ -7,12 +7,19 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { captureWorkspace, readWorkspaceBlob, type WorkspaceManifest } from "./workspace-checkpoint.js";
 
-export interface SyncServiceOptions { origin: string; token: string; projectId: string; root: string; stateFile: string; storeDir: string }
+export interface SyncServiceOptions {
+  origin: string; token: string; projectId: string; root: string; stateFile: string; storeDir: string;
+  /** Startup inactivity bound in milliseconds; defaults to 60 s. */
+  startupInactivityMs?: number;
+}
 export interface SyncState { pid: number; projectId: string; root: string; origin: string; startedAt: string; lastCommitAt?: string; lastManifest?: string; problem?: string }
 
-/** Startup inactivity bound: the child reports each phase and uploaded chunk, and every report restarts it. */
+/** Startup inactivity bound: the child reports capture progress, each phase and uploaded chunk, and every report restarts it. */
 const STARTUP_TIMEOUT = 60000;
+/** The host applies the tree inside the commit request; a first apply of a large project can take minutes. */
+const COMMIT_TIMEOUT = 30 * 60 * 1000;
 const STARTUP_ERROR = "The workspace sync service did not complete its first upload. Nothing was applied on the host.";
+const STALLED = "Run infinite sync again to resume; chunks already uploaded are kept.";
 const inside = (root: string, path: string) => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
 const printable = (text: string) => text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 300);
 /**
@@ -42,7 +49,9 @@ function validateOptions(options: SyncServiceOptions): SyncServiceOptions {
   const origin = new URL(options.origin);
   if (origin.username || origin.password || origin.pathname !== "/" || origin.search || origin.hash ||
       (origin.protocol !== "https:" && !(origin.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname))) ||
-      !/^[a-z0-9-]{1,80}$/.test(options.projectId) || !/^[\x21-\x7e]{32,200}$/.test(options.token)) throw new Error("Invalid sync pairing.");
+      !/^[a-z0-9-]{1,80}$/.test(options.projectId) || !/^[\x21-\x7e]{32,200}$/.test(options.token) ||
+      (options.startupInactivityMs !== undefined && (!Number.isInteger(options.startupInactivityMs) || options.startupInactivityMs < 100 || options.startupInactivityMs > STARTUP_TIMEOUT)))
+    throw new Error("Invalid sync pairing.");
   const root = realpathSync(options.root);
   if (!statSync(root).isDirectory() || root === sep || root === realpathSync(homedir())) throw new Error("Select a project directory, not the entire home or filesystem.");
   const storeDir = canonical(options.storeDir), stateFile = canonical(options.stateFile);
@@ -91,16 +100,16 @@ export async function startSyncService(options: SyncServiceOptions): Promise<voi
   // service's arguments, environment, or state file.
   await new Promise<void>((resolve, reject) => {
     let started = false, ready = false, detached = false, finished = false;
-    const timer = setTimeout(() => fail(), STARTUP_TIMEOUT);
+    const timer = setTimeout(() => fail(undefined, true), validated.startupInactivityMs ?? STARTUP_TIMEOUT);
     const cleanup = () => { clearTimeout(timer); child.off("message", message); child.off("disconnect", disconnected); child.off("exit", exited); child.off("error", failed); };
-    const fail = (reason?: string) => {
+    const fail = (reason?: string, stalled = false) => {
       if (finished) return;
       finished = true; cleanup();
       if (child.connected) try { child.disconnect(); } catch { /* Already disconnected. */ }
       child.kill("SIGTERM");
       const killTimer = setTimeout(() => child.kill("SIGKILL"), 4000); killTimer.unref();
       child.once("exit", () => clearTimeout(killTimer));
-      reject(new Error(reason ? `${STARTUP_ERROR} ${reason}` : STARTUP_ERROR));
+      reject(new Error(reason ? `${STARTUP_ERROR} ${reason}` : stalled ? `${STARTUP_ERROR} ${STALLED}` : STARTUP_ERROR));
     };
     const failed = () => fail();
     // A final message can still be queued when the exit arrives; the disconnect that follows it decides.
@@ -131,9 +140,9 @@ export async function startSyncService(options: SyncServiceOptions): Promise<voi
 }
 
 class FatalSyncError extends Error {}
-async function api<T>(options: SyncServiceOptions, path: string, signal: AbortSignal, body: unknown, raw?: Buffer): Promise<T> {
+async function api<T>(options: SyncServiceOptions, path: string, signal: AbortSignal, body: unknown, raw?: Buffer, timeout = 60000): Promise<T> {
   const response = await fetch(`${options.origin}/api/projects/${options.projectId}/sync/${path}`, {
-    method: raw ? "PUT" : "POST", redirect: "error", signal: AbortSignal.any([signal, AbortSignal.timeout(60000)]),
+    method: raw ? "PUT" : "POST", redirect: "error", signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
     headers: { Authorization: `Bearer ${options.token}`, "Content-Type": raw ? "application/octet-stream" : "application/json" },
     body: raw ? new Uint8Array(raw) : JSON.stringify(body),
   });
@@ -161,8 +170,8 @@ async function runSyncService(): Promise<void> {
       });
     } catch { stop(); }
   };
-  const startup = setTimeout(stop, STARTUP_TIMEOUT);
-  // Until detach, each phase and uploaded chunk restarts both sides' inactivity timers.
+  let inactivity = STARTUP_TIMEOUT, startup = setTimeout(stop, inactivity);
+  // Until detach, capture progress, each phase and each uploaded chunk restart both sides' inactivity timers.
   const progress = () => {
     if (reported) return;
     startup.refresh();
@@ -185,6 +194,7 @@ async function runSyncService(): Promise<void> {
       if (abort.signal.aborted) failed();
       else try { process.send?.({ type: "boot" }, error => { if (error) failed(); }); } catch { failed(); }
     });
+    if (config.startupInactivityMs) { inactivity = config.startupInactivityMs; clearTimeout(startup); startup = setTimeout(stop, inactivity); }
     const state: SyncState = { pid: process.pid, projectId: config.projectId, root: config.root, origin: config.origin, startedAt: new Date().toISOString() };
     writeState(config.stateFile, state);
     // After a stop removed the file, a late write must not bring it back.
@@ -194,7 +204,7 @@ async function runSyncService(): Promise<void> {
       try {
         const forceFull = Date.now() - lastFull > 60000;
         progress();
-        const manifest = await captureWorkspace({ roots: [config.root], cwd: config.root, storeDir: config.storeDir, signal: abort.signal, previous, forceFull });
+        const manifest = await captureWorkspace({ roots: [config.root], cwd: config.root, storeDir: config.storeDir, signal: abort.signal, previous, forceFull, onProgress: progress });
         previous = manifest;
         if (forceFull) lastFull = Date.now();
         const content = fingerprint(manifest);
@@ -213,7 +223,10 @@ async function runSyncService(): Promise<void> {
               progress();
             }
           }
-          await api(config, "commit", abort.signal, { generation, manifest });
+          // The host applies inside this request and reports nothing until it finishes; a heartbeat keeps startup alive meanwhile.
+          const heartbeat = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
+          try { await api(config, "commit", abort.signal, { generation, manifest }, undefined, COMMIT_TIMEOUT); }
+          finally { clearInterval(heartbeat); }
           committed = content;
           state.lastCommitAt = new Date().toISOString(); state.lastManifest = manifest.id; delete state.problem;
           record();

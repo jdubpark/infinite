@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { hashToken } from "../packages/host/src/config.js";
+import { createApp } from "../packages/host/src/server.js";
 import { workerCall } from "../packages/host/src/ipc.js";
 import type { Config, Role, ControlLease } from "../packages/host/src/types.js";
 
@@ -192,4 +193,35 @@ export async function claimControl(
   if (claimed.status !== 200) throw new Error(`Control claim failed: ${JSON.stringify(claimed.body)}`);
   const lease = claimed.body.control as ControlLease;
   return { lease, headers: { "X-Infinite-Client": clientId, "X-Infinite-Control": lease.id } };
+}
+
+/** An API served from this process, so a test can hold the sync queue open through the ProjectSync it returns. */
+export async function inProcessHost() {
+  const root = realpathSync(mkdtempSync("/tmp/inf-psync-guard-"));
+  const workspace = join(root, "workspace"); mkdirSync(workspace);
+  const key = randomBytes(32);
+  const keyFile = join(root, "key"); writeFileSync(keyFile, key, { mode: 0o600 });
+  const roles: Role[] = ["owner", "controller", "viewer"];
+  const tokens = Object.fromEntries(roles.map(role => [role, randomBytes(32).toString("base64url")])) as Record<Role, string>;
+  const config: Config = {
+    port: 0, origin: "http://127.0.0.1", keyFile, stateDir: join(root, "state"), runDir: join(root, "run"),
+    environment: "local", enableDemo: true, maxSessions: 24, agents: { demo: demoProfile() },
+    projects: [{ id: "rehearsal", name: "Rehearsal", path: workspace }],
+    tokens: roles.map(role => ({ id: role, label: role, role, hash: hashToken(tokens[role]) })),
+  };
+  const host = createApp(config, key);
+  await new Promise<void>(resolve => host.server.listen(0, "127.0.0.1", resolve));
+  config.port = (host.server.address() as { port: number }).port;
+  const origin = `http://127.0.0.1:${config.port}`;
+  return {
+    ...host, root, config, origin, tokens, fetchApi: apiClient(origin, tokens),
+    stop: async () => {
+      await stopSessionWorkers(config);
+      host.closeConnections();
+      await new Promise<void>(resolve => host.server.close(() => resolve()));
+      // Workers exit 1.5 s after their child; wait so they never write into a removed directory.
+      await new Promise(resolve => setTimeout(resolve, 1700));
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
 }

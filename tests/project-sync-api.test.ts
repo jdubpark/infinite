@@ -2,12 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
-import { createApp } from "../packages/host/src/server.js";
-import { hashToken } from "../packages/host/src/config.js";
-import type { Config, Role } from "../packages/host/src/types.js";
-import { apiClient, demoProfile, startHost, stopSessionWorkers, waitFor, type Host } from "./helpers.js";
+import { inProcessHost, startHost, waitFor, type Host } from "./helpers.js";
 
 type Api = Pick<Host, "origin" | "tokens" | "fetchApi">;
 
@@ -30,37 +27,6 @@ async function upload(host: Api, laptop: string, storeDir: string) {
 async function pushTree(host: Api, laptop: string, storeDir: string) {
   const { manifest, generation } = await upload(host, laptop, storeDir);
   return { manifest, commit: await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation, manifest }) };
-}
-
-/** An API served from this process, so a test can hold the sync queue open through the ProjectSync it returns. */
-async function inProcessHost() {
-  const root = realpathSync(mkdtempSync("/tmp/inf-psync-guard-"));
-  const workspace = join(root, "workspace"); mkdirSync(workspace);
-  const key = randomBytes(32);
-  const keyFile = join(root, "key"); writeFileSync(keyFile, key, { mode: 0o600 });
-  const roles: Role[] = ["owner", "controller", "viewer"];
-  const tokens = Object.fromEntries(roles.map(role => [role, randomBytes(32).toString("base64url")])) as Record<Role, string>;
-  const config: Config = {
-    port: 0, origin: "http://127.0.0.1", keyFile, stateDir: join(root, "state"), runDir: join(root, "run"),
-    environment: "local", enableDemo: true, maxSessions: 24, agents: { demo: demoProfile() },
-    projects: [{ id: "rehearsal", name: "Rehearsal", path: workspace }],
-    tokens: roles.map(role => ({ id: role, label: role, role, hash: hashToken(tokens[role]) })),
-  };
-  const host = createApp(config, key);
-  await new Promise<void>(resolve => host.server.listen(0, "127.0.0.1", resolve));
-  config.port = (host.server.address() as { port: number }).port;
-  const origin = `http://127.0.0.1:${config.port}`;
-  return {
-    ...host, root, config, origin, tokens, fetchApi: apiClient(origin, tokens),
-    stop: async () => {
-      await stopSessionWorkers(config);
-      host.closeConnections();
-      await new Promise<void>(resolve => host.server.close(() => resolve()));
-      // Workers exit 1.5 s after their child; wait so they never write into a removed directory.
-      await new Promise(resolve => setTimeout(resolve, 1700));
-      rmSync(root, { recursive: true, force: true });
-    },
-  };
 }
 
 test("sync routes receive a laptop tree, hold it while a session runs, and apply on request", { timeout: 60000 }, async () => {

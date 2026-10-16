@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { startSyncService, readSyncState, stopSyncService } from "../packages/host/src/sync-service.js";
-import { startHost, waitFor } from "./helpers.js";
+import { inProcessHost, startHost, waitFor } from "./helpers.js";
 
 test("the detached sync service pushes edits, stays pending while a session runs, and stops on request", { timeout: 90000 }, async () => {
   const host = await startHost();
@@ -41,6 +41,29 @@ test("the detached sync service pushes edits, stays pending while a session runs
     assert.equal(stopSyncService(stateFile), true);
     assert.equal(existsSync(stateFile), false);
     await waitFor(async () => { try { process.kill(state.pid, 0); return true; } catch { return false; } }, alive => alive === false, 10000);
+  } finally {
+    if (existsSync(stateFile)) stopSyncService(stateFile);
+    await host.stop(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a first upload that outlasts the startup inactivity bound completes while capture and commit report progress", { timeout: 120000 }, async () => {
+  const host = await inProcessHost();
+  const root = realpathSync(mkdtempSync("/tmp/inf-syncsvc-"));
+  const laptop = join(root, "laptop");
+  const stateFile = join(root, "sync", "rehearsal.json");
+  for (let d = 0; d < 2; d++) {
+    mkdirSync(join(laptop, `d${d}`), { recursive: true });
+    for (let f = 0; f < 100; f++) writeFileSync(join(laptop, `d${d}`, `f${f}.txt`), `${d}:${f}\n`);
+  }
+  // The host answers the commit only after applying; hold it well past the bound.
+  const bound = 2000, commit = host.projectSync.commit.bind(host.projectSync);
+  host.projectSync.commit = (async (...args: Parameters<typeof commit>) => { await delay(3 * bound); return commit(...args); }) as typeof commit;
+  try {
+    const started = Date.now();
+    await startSyncService({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal", root: laptop, stateFile, storeDir: join(root, "sync", "rehearsal-store"), startupInactivityMs: bound });
+    assert.ok(Date.now() - started > 3 * bound, "the first upload outlasted the inactivity bound");
+    assert.equal(readFileSync(join(host.config.projects[0].path, "d1/f99.txt"), "utf8"), "1:99\n");
   } finally {
     if (existsSync(stateFile)) stopSyncService(stateFile);
     await host.stop(); rmSync(root, { recursive: true, force: true });

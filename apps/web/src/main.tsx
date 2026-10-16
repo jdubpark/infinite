@@ -554,11 +554,25 @@ function Create({
   const [applying, setApplying] = useState(false);
   // An apply failure belongs to the workspace it was sent for.
   const [syncError, setSyncError] = useState<{ projectId: string; message: string } | null>(null);
+  // The age text changes on every poll, so only a new pending reason or an applied generation is announced.
+  const [syncNotice, setSyncNotice] = useState("");
+  const syncSeen = useRef<{ projectId?: string; pending?: string; applied?: string }>({});
   // Only a cloud host receives laptop sync; a local host is the laptop.
   const syncs = me.environment === "cloud";
   useEffect(() => {
+    if (!project) return;
+    const waiting = project.sync.pendingGeneration;
+    const pending = waiting ? `${waiting.id}:${waiting.reason}` : undefined, applied = project.sync.appliedManifest;
+    const before = syncSeen.current;
+    syncSeen.current = { projectId: project.id, pending, applied };
+    if (before.projectId !== project.id) return;
+    if (waiting && pending !== before.pending) setSyncNotice(`Laptop changes pending: ${pendingLabel(waiting)}.`);
+    else if (applied && applied !== before.applied) setSyncNotice("Laptop changes applied.");
+  }, [project]);
+  useEffect(() => {
     setProject(null);
     setSyncError(null);
+    setSyncNotice("");
     if (!projectId || !syncs) return;
     let active = true;
     const load = () => api<ProjectDetail>(`/projects/${projectId}`).then(detail => { if (active) setProject(detail); }).catch(() => { if (active) setProject(null); });
@@ -640,8 +654,9 @@ function Create({
               </option>
             ))}
           </select>
+          {syncs && <p className="sr-only" role="status">{syncNotice}</p>}
           {syncs && project && (
-            <p className="quiet" role="status">
+            <p className="quiet">
               Synced from laptop {ago(project.sync.lastSyncedAt)} · applied {ago(project.sync.appliedAt)}
               {project.sync.pendingGeneration && <> · pending: {pendingLabel(project.sync.pendingGeneration)}{" "}
                 {me.role === "owner" && <button type="button" className="text-button" disabled={applying || !connected} onClick={() => void applyPending(project.sync.pendingGeneration!.reason === "cloud-changed")}>

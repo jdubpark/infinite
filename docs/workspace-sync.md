@@ -58,7 +58,7 @@ An `apply-failed` marker carries a `category` and a fixed `message` that never n
 
 ## Clients
 
-On a cloud host, the web and phone Create screens show the selected project's sync age, apply age, and pending reason. Owners get **Apply now** for `session-running` and `apply-failed`, and **Replace cloud files** for `cloud-changed`; the second asks for confirmation first. An `apply-failed` line shows its category and message. Laptop hosts hide sync state. The session view shows "Tools run on" the machine, or "your laptop" for `--laptop` execution, using the live executor location when the session reports one.
+On a cloud host, the web and phone Create screens show the selected project's sync age, apply age, and pending reason. Owners get **Apply now** for `session-running` and `apply-failed`, and **Replace cloud files** for `cloud-changed`; the second asks for confirmation first. An `apply-failed` line shows its category and message. On the web, the sync line is not a live region, since its ages change on every poll; screen readers hear only a new pending reason or an applied generation. Laptop hosts hide sync state. The session view shows "Tools run on" the machine, or "your laptop" for `--laptop` execution, using the live executor location when the session reports one.
 
 ## Pull
 

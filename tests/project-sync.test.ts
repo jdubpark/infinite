@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, chownSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { chmodSync, chownSync, mkdtempSync, mkdirSync, readFileSync, renameSync, writeFileSync, existsSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { randomBytes } from "node:crypto";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { ProjectSync, ProjectSyncError } from "../packages/host/src/project-sync.js";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
 import { hashToken } from "../packages/host/src/config.js";
@@ -25,6 +26,19 @@ function fixture(sync?: Config["sync"]) {
 }
 
 const busy = async () => true, idle = async () => false;
+
+/** Make every rename into `destination` that `matches` fail, as a crash between steps would leave it. */
+function failRenames(destination: string, matches: (from: string) => boolean) {
+  const fsp = createRequire(import.meta.url)("node:fs/promises") as typeof import("node:fs/promises");
+  const original = fsp.rename;
+  fsp.rename = (async (from: string, to: string) => {
+    if (to === destination && matches(String(from))) throw Object.assign(new Error("injected failure"), { code: "EIO" });
+    return original(from, to);
+  }) as typeof fsp.rename;
+  syncBuiltinESMExports();
+  return () => { fsp.rename = original; syncBuiltinESMExports(); };
+}
+const stages = (f: { cloud: string }) => readdirSync(dirname(f.cloud)).filter(n => n.includes("infinite-stage"));
 
 /** Push the laptop tree the way the service will: capture, upload missing blobs, commit. */
 async function push(f: ReturnType<typeof fixture>, running = false, previous?: Awaited<ReturnType<typeof captureWorkspace>>) {
@@ -167,6 +181,72 @@ test("an apply links unchanged files from the verified tree, a forced apply rewr
     assert.equal(readFileSync(join(f.cloud, "b.txt"), "utf8"), "same\n", "a forced apply restores laptop content");
     assert.notEqual(statSync(join(f.cloud, "b.txt")).ino, statSync(join(previous, "b.txt")).ino, "a forced apply never links cloud files");
     assert.equal(readFileSync(join(previous, "b.txt"), "utf8"), "edit\n");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a failure between the two renames puts the live tree and .infinite/ back", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.laptop, "a.txt"), "1\n");
+    const first = await push(f);
+    mkdirSync(join(f.cloud, ".infinite")); writeFileSync(join(f.cloud, ".infinite/state.json"), "cloud\n");
+    writeFileSync(join(f.laptop, "a.txt"), "2\n");
+    // The live tree has moved aside; publishing the new root fails.
+    const restore = failRenames(f.cloud, from => from.includes(".infinite-stage-"));
+    try {
+      await assert.rejects(push(f, false, first.manifest), (error: ProjectSyncError) => error.code === "apply-failed" && error.category === "other");
+    } finally { restore(); }
+    assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "1\n");
+    assert.equal(readFileSync(join(f.cloud, ".infinite/state.json"), "utf8"), "cloud\n");
+    assert.deepEqual(stages(f), []);
+    assert.equal(f.sync.status("example").pendingGeneration?.reason, "apply-failed");
+    const applied = await f.sync.apply("example", { running: idle });
+    assert.equal(applied.pendingGeneration, undefined);
+    assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "2\n");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("an apply stopped between the two renames is recovered when the store starts", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.laptop, "a.txt"), "1\n");
+    const first = await push(f);
+    mkdirSync(join(f.cloud, ".infinite")); writeFileSync(join(f.cloud, ".infinite/state.json"), "cloud\n");
+    writeFileSync(join(f.laptop, "a.txt"), "2\n");
+    // Neither the publication nor the rollback reaches the project path, as if the host stopped after the first rename.
+    const restore = failRenames(f.cloud, () => true);
+    try { await assert.rejects(push(f, false, first.manifest)); } finally { restore(); }
+    assert.equal(existsSync(f.cloud), false, "the project directory is missing");
+    assert.equal(stages(f).length, 1, "the stage still holds the carried .infinite/");
+    // A restarted API restores the previous copy and the carried directory, then removes the stage.
+    new ProjectSync(f.config, f.key);
+    const deadline = Date.now() + 5000;
+    while ((existsSync(f.cloud) ? stages(f).length : 1) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "1\n");
+    assert.equal(readFileSync(join(f.cloud, ".infinite/state.json"), "utf8"), "cloud\n");
+    assert.deepEqual(stages(f), []);
+    const applied = await f.sync.apply("example", { running: idle });
+    assert.equal(applied.pendingGeneration, undefined);
+    assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "2\n");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("an apply restores a missing project directory from its previous copy before it starts", async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.laptop, "a.txt"), "1\n");
+    const first = await push(f);
+    writeFileSync(join(f.laptop, "a.txt"), "2\n");
+    const second = await push(f, false, first.manifest);
+    const previous = join(dirname(f.cloud), `.${basename(f.cloud)}.infinite-previous`);
+    // A stop right after the live tree moved aside, with no stage left to clean up.
+    rmSync(previous, { recursive: true, force: true });
+    renameSync(f.cloud, previous);
+    writeFileSync(join(f.laptop, "a.txt"), "3\n");
+    const third = await push(f, false, second.manifest);
+    assert.equal(third.status.appliedManifest, third.manifest.id);
+    assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "3\n");
+    assert.equal(readFileSync(join(previous, "a.txt"), "utf8"), "2\n", "the restored tree was the one replaced");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

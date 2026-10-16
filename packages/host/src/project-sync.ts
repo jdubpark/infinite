@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { chmod, lstat, readdir, realpath, rename, rm, stat } from "node:fs/promises";
+import { chmod, lstat, open, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { unseal, writeSealed } from "./vault.js";
@@ -91,7 +91,10 @@ export class ProjectSync {
   private readonly generations = new Map<string, string>();
   private readonly serial = new Map<string, Promise<unknown>>();
   private readonly changing = new Set<string>();
-  constructor(private readonly config: Config, private readonly key: Buffer) {}
+  constructor(private readonly config: Config, private readonly key: Buffer) {
+    // An API stopped in the middle of an apply leaves its stage, and possibly a missing project directory, behind.
+    for (const project of config.projects) void this.queue(project.id, () => this.recover(project.path)).catch(() => {});
+  }
 
   private project(projectId: string) {
     const project = this.config.projects.find(p => p.id === projectId);
@@ -222,6 +225,7 @@ export class ProjectSync {
     };
     if (await options.running()) return pending("session-running");
     try {
+      await this.recover(project.path);
       if (!options.force && await this.drifted(projectId, project.path, applied)) return pending("cloud-changed");
       // Without force, the drift check just verified that the live tree matches the applied generation.
       return await this.publish(projectId, project.path, received, options.force ? undefined : applied);
@@ -241,28 +245,32 @@ export class ProjectSync {
   private async publish(projectId: string, path: string, received: Received, verified?: Applied): Promise<ProjectSyncStatus> {
     const target = await this.projectRoot(path);
     const parent = dirname(target), name = basename(target);
-    const stage = join(parent, `.${name}.infinite-stage-${randomUUID()}`);
+    // The new root always sits at STAGE/root, so recovery finds a carried .infinite/ without knowing the laptop path.
+    const stage = join(parent, `.${name}.infinite-stage-${randomUUID()}`), source = join(stage, "root");
     const previous = join(parent, `.${name}.infinite-previous`);
-    const owned = join(target, OWNED_PREFIX);
+    const owned = join(target, OWNED_PREFIX), carried = join(source, OWNED_PREFIX);
     const reuse = verified && reusable(verified, received.manifest) ? { manifest: verified.manifest, roots: [target] } : undefined;
-    let carried: string | undefined, retired = false, written: WorkspaceManifest | undefined;
+    let moved = false, retired = false, restored = true, written: WorkspaceManifest | undefined;
     try {
       const sharedGroup = await this.sharedGroup(parent);
-      const source = (await materializeWorkspace({ manifest: received.manifest, storeDir: join(this.dir(projectId), "blobs"), destination: stage, sharedGroup, previous: reuse, flush: "once" })).roots[0];
+      const tree = await materializeWorkspace({ manifest: received.manifest, storeDir: join(this.dir(projectId), "blobs"), destination: join(stage, "tree"), sharedGroup, previous: reuse, flush: "once" });
+      await rename(tree.roots[0], source);
       // The cloud copy of Infinite's own directory wins; a laptop copy never replaces it.
-      await removeTree(join(source, OWNED_PREFIX));
+      await removeTree(carried);
       await removeTree(previous);
-      if (existsSync(owned)) { await rename(owned, join(source, OWNED_PREFIX)); carried = join(source, OWNED_PREFIX); }
+      if (existsSync(owned)) { await rename(owned, carried); moved = true; }
       // Only this host can write the private stage, so a metadata pass now describes what the swap publishes.
       written = await describeMaterializedTree(received.manifest, source, target, ownedPath).catch(() => undefined);
       await rename(target, previous); retired = true;
       await rename(source, target);
+      await syncDirectory(parent);
     } catch (error) {
-      // Put the live tree and Infinite's own directory back before the stage is discarded.
-      if (retired) await rename(previous, target).catch(() => {});
-      if (carried) await rename(carried, owned).catch(() => {});
+      // Put the live tree and Infinite's own directory back. If that fails, the stage keeps .infinite/ for recovery.
+      if (retired) await rename(previous, target).catch(() => { restored = false; });
+      if (moved && restored) await rename(carried, owned).catch(() => { restored = false; });
+      await syncDirectory(parent).catch(() => {});
       throw error;
-    } finally { await removeTree(stage).catch(() => {}); }
+    } finally { if (restored) await removeTree(stage).catch(() => {}); }
     // Drift compares against what materialize actually wrote: resolved symlink targets and this host's modes. When the
     // metadata pass could not describe it, a full scan does. Without a baseline, drift falls back to the manifest.
     const baseline = written ?? await this.scan(projectId, target).catch(() => undefined);
@@ -290,12 +298,34 @@ export class ProjectSync {
   }
   /** Canonical project directory. Refuses the filesystem root, the home directory, and any path holding the host's own state. */
   private async projectRoot(path: string) {
-    const root = await realpath(path);
+    const root = await this.refuseHostPaths(await realpath(path));
+    if (!(await lstat(root)).isDirectory()) throw new ProjectSyncError("Configured project path is not a directory", "invalid-manifest", 500);
+    return root;
+  }
+  private async refuseHostPaths(root: string) {
     const own = await Promise.all([this.config.stateDir, this.config.runDir, dirname(this.config.keyFile)].map(canonical));
     if (root === "/" || root === await canonical(homedir()) || own.some(dir => inside(root, dir)))
       throw new ProjectSyncError("The project path is the root or home directory or holds the host's own state; sync refuses it", "invalid-manifest", 500);
-    if (!(await lstat(root)).isDirectory()) throw new ProjectSyncError("Configured project path is not a directory", "invalid-manifest", 500);
     return root;
+  }
+  /**
+   * Finish an apply that stopped between its steps, after a crash or a kill: restore a missing project directory from
+   * its previous copy, return a carried .infinite/ to the project, and remove leftover stages. Runs inside the project's
+   * queue, at construction and before each apply, so no apply of this project is in progress.
+   */
+  private async recover(path: string) {
+    const target = await this.refuseHostPaths(await canonical(path));
+    const parent = dirname(target), name = basename(target);
+    const previous = join(parent, `.${name}.infinite-previous`), owned = join(target, OWNED_PREFIX);
+    let changed = false;
+    if (!(await present(target)) && (await lstat(previous).catch(() => undefined))?.isDirectory()) { await rename(previous, target); changed = true; }
+    for (const entry of await readdir(parent)) {
+      if (STAGE.exec(entry)?.[1] !== name) continue;
+      const stage = join(parent, entry), carried = join(stage, "root", OWNED_PREFIX);
+      if (await present(carried) && (await lstat(target).catch(() => undefined))?.isDirectory() && !(await present(owned))) await rename(carried, owned);
+      await removeTree(stage); changed = true;
+    }
+    if (changed) await syncDirectory(parent);
   }
   /** Capture the live tree into the shared content store, reusing unchanged files from `previous` when it describes this root. */
   private async scan(projectId: string, path: string, previous?: WorkspaceManifest) {
@@ -306,6 +336,13 @@ export class ProjectSync {
     const project = this.project(projectId);
     return this.queue(projectId, () => this.scan(projectId, project.path, this.read<Applied>(projectId, "applied")?.baseline));
   }
+}
+
+const STAGE = /^\.(.+)\.infinite-stage-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const present = async (path: string) => Boolean(await lstat(path).catch(() => undefined));
+async function syncDirectory(path: string) {
+  const handle = await open(path, "r");
+  try { await handle.sync(); } finally { await handle.close(); }
 }
 
 function writeJson(file: string, value: unknown) {

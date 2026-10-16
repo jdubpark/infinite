@@ -4,6 +4,8 @@ import { chmodSync, chownSync, mkdtempSync, mkdirSync, readFileSync, renameSync,
 import { join, dirname, basename } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createRequire, syncBuiltinESMExports } from "node:module";
+import { execFileSync } from "node:child_process";
+import { createServer, type Server } from "node:net";
 import { ProjectSync, ProjectSyncError } from "../packages/host/src/project-sync.js";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
 import { hashToken } from "../packages/host/src/config.js";
@@ -248,6 +250,34 @@ test("an apply restores a missing project directory from its previous copy befor
     assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "3\n");
     assert.equal(readFileSync(join(previous, "a.txt"), "utf8"), "2\n", "the restored tree was the one replaced");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("sockets and FIFOs are left out of laptop captures and cloud scans, and the host counts them", async () => {
+  const f = fixture();
+  const servers: Server[] = [];
+  const socket = async (path: string) => { const server = createServer(); servers.push(server); await new Promise<void>(resolve => server.listen(path, resolve)); };
+  try {
+    writeFileSync(join(f.laptop, "a.txt"), "1\n");
+    mkdirSync(join(f.laptop, ".git")); await socket(join(f.laptop, ".git/fsmonitor--daemon.ipc"));
+    execFileSync("mkfifo", [join(f.laptop, "pipe")]);
+    const skipped: string[] = [];
+    const manifest = await captureWorkspace({ roots: [f.laptop], cwd: f.laptop, storeDir: join(f.root, "laptop-store"), onSkipped: path => skipped.push(path) });
+    assert.deepEqual(skipped.sort(), [".git/fsmonitor--daemon.ipc", "pipe"]);
+    assert.ok(!manifest.entries.some(e => e.path === "pipe" || e.path.endsWith(".ipc")));
+    const first = await push(f);
+    assert.equal(first.status.appliedManifest, first.manifest.id);
+    // A stale dev-server socket in the cloud tree neither blocks the drift scan nor counts as a change.
+    await socket(join(f.cloud, "dev.sock"));
+    writeFileSync(join(f.laptop, "a.txt"), "2\n");
+    const second = await push(f, false, first.manifest);
+    assert.equal(second.status.appliedManifest, second.manifest.id);
+    assert.equal(second.status.skipped, 1);
+    await f.sync.exportTree("example");
+    assert.equal(f.sync.status("example").skipped, undefined, "the new tree holds no special file");
+  } finally {
+    await Promise.all(servers.map(server => new Promise(resolve => server.close(resolve))));
+    rmSync(f.root, { recursive: true, force: true });
+  }
 });
 
 test("stale generations and missing content are refused", async () => {

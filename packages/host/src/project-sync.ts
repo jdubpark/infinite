@@ -25,6 +25,8 @@ export interface ProjectSyncStatus {
   appliedAt?: string;
   appliedManifest?: string;
   pendingGeneration?: PendingGeneration;
+  /** Sockets, FIFOs and device files the host's latest scan of the cloud tree left out, since this API started. */
+  skipped?: number;
 }
 type Received = { manifest: WorkspaceManifest; receivedAt: string; generation: string };
 /**
@@ -91,6 +93,7 @@ export class ProjectSync {
   private readonly generations = new Map<string, string>();
   private readonly serial = new Map<string, Promise<unknown>>();
   private readonly changing = new Set<string>();
+  private readonly skipped = new Map<string, number>();
   constructor(private readonly config: Config, private readonly key: Buffer) {
     // An API stopped in the middle of an apply leaves its stage, and possibly a missing project directory, behind.
     for (const project of config.projects) void this.queue(project.id, () => this.recover(project.path)).catch(() => {});
@@ -138,6 +141,7 @@ export class ProjectSync {
     if (applied) { status.appliedAt = applied.appliedAt; status.appliedManifest = applied.manifest.id; }
     const pending = this.readPending(projectId);
     if (pending) status.pendingGeneration = pending;
+    if (this.skipped.get(projectId)) status.skipped = this.skipped.get(projectId);
     return status;
   }
   /** Status as of now: a generation that waited for a session reads `awaiting-apply` once no session holds the project. */
@@ -330,7 +334,10 @@ export class ProjectSync {
   /** Capture the live tree into the shared content store, reusing unchanged files from `previous` when it describes this root. */
   private async scan(projectId: string, path: string, previous?: WorkspaceManifest) {
     const root = await this.projectRoot(path);
-    return captureWorkspace({ roots: [root], cwd: root, storeDir: join(this.dir(projectId), "blobs"), previous: previous?.roots[0] === root ? previous : undefined });
+    let skipped = 0;
+    const manifest = await captureWorkspace({ roots: [root], cwd: root, storeDir: join(this.dir(projectId), "blobs"), previous: previous?.roots[0] === root ? previous : undefined, onSkipped: () => { skipped += 1; } });
+    this.skipped.set(projectId, skipped);
+    return manifest;
   }
   async exportTree(projectId: string): Promise<WorkspaceManifest> {
     const project = this.project(projectId);

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
@@ -17,12 +18,17 @@ test("the detached sync service pushes edits, stays pending while a session runs
   const storeDir = join(root, "sync", "rehearsal-store");
   // An apply renames the cloud tree aside before moving the new one in; a read in between finds nothing.
   const cloudFile = () => { try { return readFileSync(join(host.config.projects[0].path, "app.ts"), "utf8"); } catch { return undefined; } };
+  // A language-server socket in the checkout is left out and reported once at startup.
+  const server = createServer();
   try {
     writeFileSync(join(laptop, "app.ts"), "one\n");
-    await startSyncService({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal", root: laptop, stateFile, storeDir });
+    await new Promise<void>(resolve => server.listen(join(laptop, "lsp.sock"), resolve));
+    const started = await startSyncService({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal", root: laptop, stateFile, storeDir });
+    assert.deepEqual(started.skipped, { count: 1, paths: ["lsp.sock"] });
     const state = readSyncState(stateFile)!;
     assert.ok(state.pid > 0);
     assert.equal(state.root, laptop);
+    assert.equal(state.skipped, 1);
     await waitFor(() => host.fetchApi("/projects/rehearsal"), r => Boolean(r.body.sync.appliedManifest), 20000);
     assert.equal(cloudFile(), "one\n");
 
@@ -43,6 +49,7 @@ test("the detached sync service pushes edits, stays pending while a session runs
     assert.equal(existsSync(stateFile), false);
     await waitFor(async () => { try { process.kill(state.pid, 0); return true; } catch { return false; } }, alive => alive === false, 10000);
   } finally {
+    await new Promise(resolve => server.close(resolve));
     if (existsSync(stateFile)) stopSyncService(stateFile);
     await host.stop(); rmSync(root, { recursive: true, force: true });
   }

@@ -8,6 +8,8 @@ Workspace sync keeps a configured cloud project directory current with the owner
 
 The service rescans every few seconds and uploads only when content, layout, or modes changed. Each upload begins a generation, asks the host which chunks it lacks with `POST /api/projects/:id/sync/has`, sends those with `PUT /api/projects/:id/sync/blob/:hash`, then commits the manifest. `infinite sync` returns after the first commit. The service reports progress while it captures, uploads, and waits for the host to apply that commit, so a first upload of a large tree can take many minutes. Startup fails only if the service reports nothing for 60 seconds or keeps failing before its first commit; chunks already uploaded stay on both sides, so running `infinite sync` again resumes. A commit request may wait up to 30 minutes for the host's apply.
 
+Sockets, FIFOs, and device files, such as Git's fsmonitor socket or a language server's socket, have no content to copy, so captures leave them out. `infinite sync` prints the ones its first capture left out, once, and `--status` shows how many the latest capture left out.
+
 It records its pid, root, and last commit beside the private client configuration under `sync/`, next to its local chunk store; both must lie outside the synced checkout. Closing the terminal leaves it running. It does not restart after a reboot; run `infinite sync` again. One service runs per project, and a second start is refused until the first is stopped.
 
 `infinite sync --stop` signals the recorded pid only after confirming that the process still runs as the sync service, then removes the record. `infinite sync --status` lists each project's local service and, when the host answers, its sync state. Both work without reaching the host. A record whose process is gone, after a crash or reboot, is reported as stale.
@@ -19,6 +21,8 @@ Failures are retried, and `--status` shows the current problem. After a failed c
 The host stores received chunks and the newest manifest for each project under its private state directory. Manifest and apply records are sealed with the host key. Chunks are plaintext files and need [encrypted host storage](security.md#required-on-a-real-host). Upload and export routes accept only a paired owner bearer key; a browser session is refused.
 
 The host verifies each chunk against its hash and accepts request bodies up to 1 MiB. Presence checks take at most 512 hashes. A commit is parsed after owner authentication, with a 32 MiB JSON limit. It is refused when a newer generation has begun, when the manifest has more or fewer than one root, or when it names a chunk the host does not have.
+
+The host's scans of the cloud tree also leave special files out, so a stale dev-server socket neither blocks a scan nor counts as a cloud change. `skipped` in the sync status counts the special files the latest host scan left out since the API started.
 
 A committed manifest is **applied** when no cloud session is running or starting in that project and the live cloud tree still matches the scan the host took right after the last apply. The comparison ignores the Infinite-owned `.infinite/` directory. Before the first apply, the directory must be empty apart from `.infinite/`. A manifest whose entries equal the applied generation is recorded as applied without replacing the tree.
 

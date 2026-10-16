@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
+import { createServer } from "node:net";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -18,10 +19,16 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
   writeFileSync(tokenFile, host.tokens.owner, { mode: 0o600 });
   const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/cli.ts"), "--client-config", clientFile];
   const stateFile = join(root, "sync", "rehearsal.json");
+  const server = createServer();
   try {
     await exec(process.execPath, [...cli, "pair", host.origin, "--token-file", tokenFile]);
     writeFileSync(join(checkout, "file.txt"), "from laptop\n");
-    await exec(process.execPath, [...cli, "sync", "--project", "rehearsal"], { cwd: checkout });
+    await new Promise<void>(resolve => server.listen(join(checkout, "dev.sock"), resolve));
+    const started = await exec(process.execPath, [...cli, "sync", "--project", "rehearsal"], { cwd: checkout });
+    assert.match(started.stderr, /Left out 1 socket, FIFO, or device file, which sync cannot copy: dev\.sock\n/);
+    // Closing the server removes the socket; the next capture clears the recorded count.
+    await new Promise(resolve => server.close(resolve));
+    await waitFor(async () => readSyncState(stateFile), recorded => Boolean(recorded && !recorded.skipped), 15000);
     const state = readSyncState(stateFile);
     assert.ok(state);
     await waitFor(() => host.fetchApi("/projects/rehearsal"), r => Boolean(r.body.sync.appliedManifest), 30000);

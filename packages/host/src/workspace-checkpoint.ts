@@ -271,6 +271,8 @@ export async function captureWorkspace(options: {
   previous?: WorkspaceManifest; forceFull?: boolean;
   /** Called at most every 100 ms while entries are walked and chunks written, so a caller can tell a long capture from a stalled one. */
   onProgress?: () => void;
+  /** Sockets, FIFOs and device files have no content to copy; each one is left out and reported here with its root-relative path. */
+  onSkipped?: (path: string) => void;
 }): Promise<WorkspaceManifest> {
   abort(options.signal);
   if (!options.roots.length || options.roots.length > 64) throw new Error("Invalid workspace roots");
@@ -454,7 +456,7 @@ export async function captureWorkspace(options: {
         add({ root, path: childPath, kind: "file", mode: Number(childInfo.mode & 0o777n), size, chunks: hashes, sourceStamp });
       } else if (childInfo.isSymbolicLink()) {
         add({ root, path: childPath, kind: "symlink", mode: Number(childInfo.mode & 0o777n), target: await readlink(file) });
-      } else throw new Error("Workspace contains an unsupported special file");
+      } else options.onSkipped?.(childPath);
     }
   }
   let captureStartedAt = new Date().toISOString();

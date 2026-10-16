@@ -12,7 +12,9 @@ export interface SyncServiceOptions {
   /** Startup inactivity bound in milliseconds; defaults to 60 s. */
   startupInactivityMs?: number;
 }
-export interface SyncState { pid: number; projectId: string; root: string; origin: string; startedAt: string; lastCommitAt?: string; lastManifest?: string; problem?: string }
+export interface SyncState { pid: number; projectId: string; root: string; origin: string; startedAt: string; lastCommitAt?: string; lastManifest?: string; problem?: string; skipped?: number }
+/** Special files the first capture left out: how many, and up to 20 of their root-relative paths. */
+export interface SyncStart { skipped: { count: number; paths: string[] } }
 
 /** Startup inactivity bound: the child reports capture progress, each phase and uploaded chunk, and every report restarts it. */
 const STARTUP_TIMEOUT = 60000;
@@ -85,7 +87,7 @@ export function stopSyncService(stateFile: string): boolean {
 }
 
 /** Launch the detached service and resolve after its first committed generation. */
-export async function startSyncService(options: SyncServiceOptions): Promise<void> {
+export async function startSyncService(options: SyncServiceOptions): Promise<SyncStart> {
   const validated = validateOptions(options);
   const existing = readSyncState(validated.stateFile);
   if (existing) {
@@ -98,6 +100,7 @@ export async function startSyncService(options: SyncServiceOptions): Promise<voi
   });
   // The device key is passed only through private IPC, never copied into the
   // service's arguments, environment, or state file.
+  const result: SyncStart = { skipped: { count: 0, paths: [] } };
   await new Promise<void>((resolve, reject) => {
     let started = false, ready = false, detached = false, finished = false;
     const timer = setTimeout(() => fail(undefined, true), validated.startupInactivityMs ?? STARTUP_TIMEOUT);
@@ -132,11 +135,15 @@ export async function startSyncService(options: SyncServiceOptions): Promise<voi
       if (type === "detached" && ready && !detached) { detached = true; return; }
       if (type !== "ready" || !started || ready) { fail(); return; }
       ready = true;
+      const { skipped } = value as { skipped?: { count?: unknown; paths?: unknown } };
+      if (Number.isSafeInteger(skipped?.count) && Array.isArray(skipped?.paths))
+        result.skipped = { count: skipped.count as number, paths: skipped.paths.filter((path): path is string => typeof path === "string").slice(0, 20).map(printable) };
       try { child.send({ type: "detach" }, error => { if (error) fail(); }); } catch { fail(); }
     };
     child.on("error", () => {});
     child.on("error", failed); child.on("exit", exited); child.on("disconnect", disconnected); child.on("message", message);
   });
+  return result;
 }
 
 class FatalSyncError extends Error {}
@@ -217,7 +224,13 @@ async function runSyncService(): Promise<void> {
     writeState(config.stateFile, state);
     // After a stop removed the file, a late write must not bring it back.
     const record = () => { if (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) writeState(config.stateFile, state); };
-    const ready = () => { if (!reported) { reported = true; process.send?.({ type: "ready" }, error => { if (error) stop(); }); } };
+    // Special files the latest capture left out; the first capture's are reported once, at startup.
+    let skipped: string[] = [];
+    const ready = () => {
+      if (reported) return;
+      reported = true;
+      process.send?.({ type: "ready", skipped: { count: skipped.length, paths: skipped.slice(0, 20) } }, error => { if (error) stop(); });
+    };
     // `held`: the host kept the last pushed content but cannot apply it for a lasting reason.
     let previous: WorkspaceManifest | undefined, committed: string | undefined, lastFull = 0, failures = 0, pushFailures = 0, held = false;
     while (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) {
@@ -225,8 +238,11 @@ async function runSyncService(): Promise<void> {
       try {
         const forceFull = Date.now() - lastFull > 60000;
         progress();
-        const manifest = await captureWorkspace({ roots: [config.root], cwd: config.root, storeDir: config.storeDir, signal: abort.signal, previous, forceFull, onProgress: progress });
+        const left: string[] = [];
+        const manifest = await captureWorkspace({ roots: [config.root], cwd: config.root, storeDir: config.storeDir, signal: abort.signal, previous, forceFull, onProgress: progress, onSkipped: path => left.push(path) });
         previous = manifest;
+        if (left.length !== skipped.length) { if (left.length) state.skipped = left.length; else delete state.skipped; record(); }
+        skipped = left;
         if (forceFull) lastFull = Date.now();
         content = fingerprint(manifest);
         if (content !== committed) {

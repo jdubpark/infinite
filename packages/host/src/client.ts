@@ -378,7 +378,7 @@ function age(iso?: string) {
   return seconds < 60 ? `${seconds}s ago` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : `${Math.floor(seconds / 3600)}h ago`;
 }
 type Pending = { reason: string; receivedAt: string; capturedAt?: string; category?: string; message?: string };
-type ProjectDetail = { id: string; name: string; sync: { lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: Pending } };
+type ProjectDetail = { id: string; name: string; sync: { lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: Pending; skipped?: number } };
 function describePending(pending: Pending) {
   if (pending.reason === "session-running") return "session running";
   if (pending.reason === "cloud-changed") return "cloud changed; use infinite sync --apply --force or infinite pull";
@@ -388,7 +388,8 @@ function describePending(pending: Pending) {
 }
 function describeSync(sync: ProjectDetail["sync"]) {
   const pending = sync.pendingGeneration ? ` · pending (${describePending(sync.pendingGeneration)})` : "";
-  return `synced ${age(sync.lastSyncedAt)} · applied ${age(sync.appliedAt)}${pending}`;
+  const skipped = sync.skipped ? ` · ${sync.skipped} special file${sync.skipped === 1 ? "" : "s"} left out of the cloud scan` : "";
+  return `synced ${age(sync.lastSyncedAt)} · applied ${age(sync.appliedAt)}${pending}${skipped}`;
 }
 
 export async function handleClientCommand(argv: string[]): Promise<boolean> {
@@ -444,7 +445,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       for (const id of new Set([...(me ? me.projects.map(p => p.id) : config.projectId ? [config.projectId] : []).filter(id => PROJECT_ID.test(id)), ...recorded])) {
         const state = recorded.includes(id) ? readSyncState(join(syncDir, `${id}.json`)) : undefined;
         const local = !state ? "no local service" : !syncServiceRunning(state) ? `stale service record (pid ${state.pid} not running)`
-          : `service pid ${state.pid} · ${clean(state.root)}${state.problem ? ` · problem: ${clean(state.problem)}` : ""}`;
+          : `service pid ${state.pid} · ${clean(state.root)}${state.skipped ? ` · ${state.skipped} special file${state.skipped === 1 ? "" : "s"} left out` : ""}${state.problem ? ` · problem: ${clean(state.problem)}` : ""}`;
         const detail = me && await api.json<ProjectDetail>(`/projects/${id}`).catch(() => undefined);
         console.log(`${id}  ${local}${detail ? ` · ${describeSync(detail.sync)}` : offline ? ` · ${offline}` : ""}`);
       }
@@ -501,8 +502,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const root = gitRoot(realpathSync(process.cwd()));
       if (root === realpathSync(homedir()) || root === dirname(root)) throw new Error("Run inside a project directory; selecting the entire home or filesystem is not supported");
       progress.start(`Uploading ${clean(root)} to project ${projectId}`);
-      await startSyncService({ origin: config.origin, token: config.token, projectId, root, stateFile, storeDir: join(syncDir, `${projectId}-store`) });
+      const { skipped } = await startSyncService({ origin: config.origin, token: config.token, projectId, root, stateFile, storeDir: join(syncDir, `${projectId}-store`) });
       progress.stop();
+      if (skipped.count) console.error(`[Infinite] Left out ${skipped.count} socket, FIFO, or device file${skipped.count === 1 ? "" : "s"}, which sync cannot copy: ${skipped.paths.map(clean).join(", ")}${skipped.count > skipped.paths.length ? ", …" : ""}`);
       const detail = await api.json<ProjectDetail>(`/projects/${projectId}`);
       console.error(`[Infinite] Sync service running for ${clean(root)} → ${projectId}. ${describeSync(detail.sync)}. It keeps running after this command exits; stop it with infinite sync --stop.`);
       return true;

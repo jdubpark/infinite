@@ -33,10 +33,14 @@ test("the detached sync service pushes edits, stays pending while a session runs
     assert.equal(cloudFile(), "one\n");
 
     writeFileSync(join(laptop, "app.ts"), "two\n");
-    const pushed = await waitFor(() => host.fetchApi("/projects/rehearsal"), r => cloudFile() === "two\n" && !r.body.sync.pendingGeneration, 20000);
+    // The cloud file reads "two" a moment before the apply is recorded; wait for the record too.
+    const pushed = await waitFor(() => host.fetchApi("/projects/rehearsal"),
+      r => cloudFile() === "two\n" && !r.body.sync.pendingGeneration && r.body.sync.appliedManifest === r.body.sync.lastSyncedManifest, 20000);
     // Two capture cycles over an unchanged tree must not push or replace the cloud copy again.
     await delay(7000);
-    assert.equal((await host.fetchApi("/projects/rehearsal")).body.sync.appliedAt, pushed.body.sync.appliedAt);
+    const idle = (await host.fetchApi("/projects/rehearsal")).body.sync;
+    const recorded = (sync: Record<string, unknown>) => [sync.appliedAt, sync.lastSyncedManifest, sync.lastSyncedAt];
+    assert.deepEqual(recorded(idle), recorded(pushed.body.sync), "no new generation was received or applied");
 
     const id = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Busy", prompt: "" });

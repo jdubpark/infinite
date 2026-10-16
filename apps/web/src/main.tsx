@@ -552,24 +552,30 @@ function Create({
   const [busy, setBusy] = useState(false);
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [applying, setApplying] = useState(false);
+  // An apply failure belongs to the workspace it was sent for.
+  const [syncError, setSyncError] = useState<{ projectId: string; message: string } | null>(null);
+  // Only a cloud host receives laptop sync; a local host is the laptop.
+  const syncs = me.environment === "cloud";
   useEffect(() => {
     setProject(null);
-    if (!projectId) return;
+    setSyncError(null);
+    if (!projectId || !syncs) return;
     let active = true;
     const load = () => api<ProjectDetail>(`/projects/${projectId}`).then(detail => { if (active) setProject(detail); }).catch(() => { if (active) setProject(null); });
     void load();
     const timer = setInterval(load, 5000);
     return () => { active = false; clearInterval(timer); };
-  }, [api, projectId]);
+  }, [api, projectId, syncs]);
   async function applyPending(force: boolean) {
     const id = projectId;
     if (!id || applying) return;
+    if (force && !window.confirm("Replace the cloud copy of this workspace with the laptop's latest sync? Changes made in the cloud since the last apply will be discarded.")) return;
     setApplying(true);
-    setError("");
+    setSyncError(null);
     try {
       const sync = await api<ProjectSyncStatus>(`/projects/${id}/sync/apply`, force ? { force } : {});
       if (mounted.current) setProject(previous => previous?.id === id ? { ...previous, sync } : previous);
-    } catch (error) { if (mounted.current) setError((error as Error).message); }
+    } catch (error) { if (mounted.current) setSyncError({ projectId: id, message: (error as Error).message }); }
     finally { if (mounted.current) setApplying(false); }
   }
   async function submit(e: React.FormEvent) {
@@ -634,7 +640,7 @@ function Create({
               </option>
             ))}
           </select>
-          {project && (
+          {syncs && project && (
             <p className="quiet" role="status">
               Synced from laptop {ago(project.sync.lastSyncedAt)} · applied {ago(project.sync.appliedAt)}
               {project.sync.pendingGeneration && <> · pending: {project.sync.pendingGeneration.reason === "session-running" ? "a session is running" : "cloud files changed"}{" "}
@@ -642,6 +648,7 @@ function Create({
                   {applying ? "Applying…" : project.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"}</button>}</>}
             </p>
           )}
+          {syncs && syncError?.projectId === projectId && <p className="error" role="alert">{syncError.message}</p>}
           <label htmlFor="title">Session name</label>
           <input
             id="title"
@@ -968,7 +975,7 @@ function SessionView({
             <span className="quiet">/ {session.status}</span>
           </div>
           <p className="session-meta">
-            Tools run on {session.executionLocation === "laptop" ? "your laptop" : me.machine?.label || "this machine"} <span>·</span>{" "}
+            Tools run on {(session.execution?.location ?? session.executionLocation) === "laptop" ? "your laptop" : me.machine?.label || "this machine"} <span>·</span>{" "}
             Started {time(session.createdAt)} <span>·</span>{" "}
             {session.pid ? `PID ${session.pid}` : "No live process"}
           </p>

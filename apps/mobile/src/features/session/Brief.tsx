@@ -165,7 +165,7 @@ export function Brief({
                   ? `Cached view from ${seen}`
                   : "Waiting for a fresh response…"}
             </Text>
-            <Text style={s.small}>Tools run on {session.executionLocation === "laptop" ? "your laptop" : me?.machine?.label || connection.label || "this machine"}</Text>
+            <Text style={s.small}>Tools run on {(session.execution?.location ?? session.executionLocation) === "laptop" ? "your laptop" : me?.machine?.label || connection.label || "this machine"}</Text>
             {session.execution ? (
               <Text style={s.small}>
                 {online ? "Tools: " : "Last received tools: "}{session.execution.location === "cloud" ? "Cloud" : "Laptop"} ·{" "}

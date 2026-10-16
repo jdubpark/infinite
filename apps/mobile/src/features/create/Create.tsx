@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { KeyboardAvoidingView, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Alert, KeyboardAvoidingView, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import * as Crypto from "expo-crypto";
 import { PROVIDER_NAMES } from "@infinite/attention";
@@ -28,9 +28,11 @@ export function Create({ connection }: { connection: Connection }) {
   const selectedProvider = providers.find(value => value === provider) ?? providers[0];
   const projects = me?.projects ?? [];
   const selectedProject = projects.some(item => item.id === project) ? project : projects[0]?.id;
-  const { data: polledDetail, refresh: refreshDetail } = usePoll(() => selectedProject ? api<ProjectDetail>(connection, `/projects/${selectedProject}`) : Promise.resolve(null), 5000, [connection, selectedProject]);
+  // Only a cloud host receives laptop sync; a local host is the laptop.
+  const syncs = me?.environment === "cloud";
+  const { data: polledDetail, refresh: refreshDetail } = usePoll(() => syncs && selectedProject ? api<ProjectDetail>(connection, `/projects/${selectedProject}`) : Promise.resolve(null), 5000, [connection, selectedProject, syncs]);
   // The poll keeps its last value across a project change; show only the selected project's status.
-  const detail = polledDetail?.id === selectedProject ? polledDetail : null;
+  const detail = syncs && polledDetail?.id === selectedProject ? polledDetail : null;
   const [applying, setApplying] = useState(false);
   const [syncError, setSyncError] = useState("");
   async function applyPending(force: boolean) {
@@ -40,6 +42,13 @@ export function Create({ connection }: { connection: Connection }) {
     try { await api(connection, `/projects/${selectedProject}/sync/apply`, { body: force ? { force } : {} }); }
     catch (error) { if (mounted.current) setSyncError((error as Error).message); }
     finally { if (mounted.current) { setApplying(false); refreshDetail(); } }
+  }
+  function confirmApply(force: boolean) {
+    if (!force) return void applyPending(false);
+    Alert.alert("Replace cloud files?", "The cloud copy of this project is replaced with the laptop's latest sync. Changes made in the cloud since the last apply are discarded.", [
+      { text: "Keep cloud files", style: "cancel" },
+      { text: "Replace", style: "destructive", onPress: () => void applyPending(true) },
+    ]);
   }
   const locked = busy || Boolean(request);
   async function submit() {
@@ -69,8 +78,8 @@ export function Create({ connection }: { connection: Connection }) {
       <Text style={s.label}>Project</Text>
       <View style={s.choices}>{projects.map(item => <Button key={item.id} title={item.name} secondary={selectedProject !== item.id} disabled={locked} onPress={() => { setProject(item.id); setSyncError(""); }} />)}</View>
       {detail ? <Text style={s.note}>Synced from laptop {ago(detail.sync.lastSyncedAt)} · applied {ago(detail.sync.appliedAt)}{detail.sync.pendingGeneration ? ` · pending: ${detail.sync.pendingGeneration.reason === "session-running" ? "a session is running" : "cloud files changed"}` : ""}</Text> : null}
-      {detail?.sync.pendingGeneration && me?.role === "owner" ? <Button title={applying ? "Applying…" : detail.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"} secondary disabled={applying || !online} onPress={() => void applyPending(detail.sync.pendingGeneration!.reason === "cloud-changed")} /> : null}
-      {syncError ? <Text style={s.warning} accessibilityRole="alert">{syncError}</Text> : null}
+      {detail?.sync.pendingGeneration && me?.role === "owner" ? <Button title={applying ? "Applying…" : detail.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"} secondary disabled={applying || !online} onPress={() => confirmApply(detail.sync.pendingGeneration!.reason === "cloud-changed")} /> : null}
+      {syncs && syncError ? <Text style={s.warning} accessibilityRole="alert">{syncError}</Text> : null}
       {me && !projects.length ? <Text style={s.warning}>Add an allowed project to this machine’s Infinite configuration first.</Text> : null}
       <Text style={s.label}>Agent</Text>
       <View style={s.choices}>{providers.map(value => <Button key={value} title={PROVIDER_NAMES[value]} secondary={selectedProvider !== value} disabled={locked} onPress={() => setProvider(value)} />)}</View>

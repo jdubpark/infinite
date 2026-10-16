@@ -205,6 +205,13 @@ async function verifyBlob(store: Store, hash: string) {
   if (verifiedBlobs.get(file) === stamp(info)) return;
   await readBlob(store, hash);
 }
+/** Write back every dirty buffer of the filesystem holding `path`: syncfs on Linux, a full sync elsewhere. */
+async function flushFilesystem(path: string) {
+  if (process.platform === "linux") {
+    try { await execute("sync", ["-f", path], { timeout: 600000 }); return; } catch { /* Older coreutils lack -f. */ }
+  }
+  await execute("sync", [], { timeout: 600000 });
+}
 async function syncDirectory(path: string) { const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY); try { await handle.sync(); } finally { await handle.close(); } }
 async function writeBlob(store: Store, hash: string, bytes: Buffer) {
   if (bytes.length > CHUNK_BYTES || !HASH.test(hash) || sha(bytes) !== hash) throw new Error("Invalid workspace blob content");
@@ -495,6 +502,40 @@ export async function captureWorkspace(options: {
   }
 }
 
+/**
+ * Describe the tree that materializeWorkspace wrote at `at` from the single-root `manifest`, as it will read once moved to
+ * `root`, using one metadata pass instead of reading files: content comes from the manifest, and modes, link targets and
+ * stat stamps from disk. `skip` leaves out paths the caller replaced. Call it while only the caller can write the tree;
+ * a later change alters a stamp, so a capture that takes this as `previous` reads that file again. Undefined when an
+ * entry no longer looks as written; the caller then scans instead.
+ */
+export async function describeMaterializedTree(manifest: WorkspaceManifest, at: string, root: string, skip?: (path: string) => boolean): Promise<WorkspaceManifest | undefined> {
+  if (manifest.roots.length !== 1) return undefined;
+  const entries: WorkspaceEntry[] = [];
+  try {
+    for (const entry of manifest.entries) {
+      if (skip?.(entry.path)) continue;
+      const file = join(at, entry.path), info = await lstat(file, { bigint: true }), mode = Number(info.mode & 0o777n);
+      if (entry.kind === "directory") {
+        if (!info.isDirectory()) return undefined;
+        entries.push({ root: 0, path: entry.path, kind: "directory", mode });
+      } else if (entry.kind === "file") {
+        if (!info.isFile() || info.size !== BigInt(entry.size!)) return undefined;
+        entries.push({ root: 0, path: entry.path, kind: "file", mode, size: entry.size, chunks: [...entry.chunks!], sourceStamp: stamp(info) });
+      } else {
+        if (!info.isSymbolicLink()) return undefined;
+        entries.push({ root: 0, path: entry.path, kind: "symlink", mode, target: await readlink(file) });
+      }
+    }
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
+    throw error;
+  }
+  const now = new Date().toISOString();
+  const body: Omit<WorkspaceManifest, "id"> = { version: 1, capturedAt: now, captureStartedAt: now, cwd: { root: 0, path: "" }, roots: [root], entries };
+  try { return validateWorkspaceManifest({ ...body, id: manifestId(body) }); } catch { return undefined; }
+}
+
 /** Publish a complete generation into a previously absent destination.
  * `sharedGroup` prepares shared interior permissions behind a private 02700
  * generation root. Only the coordinator may expose the chosen root at promotion.
@@ -505,7 +546,10 @@ export async function captureWorkspace(options: {
 export async function materializeWorkspace(options: {
   manifest: WorkspaceManifest; storeDir: string; destination: string; sharedGroup?: boolean;
   previous?: { manifest: WorkspaceManifest; roots: string[] };
+  /** `each` (default) syncs every written file and directory; `once` flushes the filesystem once before publication. */
+  flush?: "each" | "once";
 }): Promise<{ cwd: string; roots: string[] }> {
+  const each = options.flush !== "once";
   const manifest = validateWorkspaceManifest(options.manifest), store = await storeAt(options.storeDir);
   const previous = options.previous ? validateWorkspaceManifest(options.previous.manifest, manifest.roots) : undefined;
   const previousEntries = new Map(previous?.entries.map(entry => [key(entry.root, entry.path), entry]));
@@ -515,10 +559,10 @@ export async function materializeWorkspace(options: {
     for (const root of previousRoots) {
       if (await realpath(root) !== root || !(await lstat(root)).isDirectory()) throw new Error("Previous workspace roots must be canonical directories");
     }
-    // Retain the same source-to-destination layout, including overlapping roots.
+    // Retain the same source-to-destination layout, including overlapping roots. A single root has no layout to keep.
     const offsets = previousRoots.map((root, index) => manifest.roots[index] === "/" ? root :
       root.endsWith(manifest.roots[index]) ? root.slice(0, -manifest.roots[index].length) : undefined);
-    if (offsets.some(offset => offset === undefined || offset !== offsets[0])) throw new Error("Previous workspace root mapping is inconsistent");
+    if (previousRoots.length > 1 && offsets.some(offset => offset === undefined || offset !== offsets[0])) throw new Error("Previous workspace root mapping is inconsistent");
   }
   const fileMode = (entry: WorkspaceEntry) => options.sharedGroup ? (entry.mode & 0o700) | 0o060 | ((entry.mode & 0o111) ? 0o010 : 0) : entry.mode;
   async function reuseFile(entry: WorkspaceEntry, destinationFile: string): Promise<boolean> {
@@ -597,14 +641,15 @@ export async function materializeWorkspace(options: {
           await handle.writeFile(bytes); total += bytes.length;
         }
         if (total !== entry.size) throw new Error("Workspace file is incomplete");
-        await handle.chmod(fileMode(entry)); await handle.sync();
+        await handle.chmod(fileMode(entry)); if (each) await handle.sync();
       } finally { await handle.close(); }
     }
     for (const [path, mode] of [...directoryModes].sort(([a], [b]) => b.length - a.length)) {
       const handle = await openDirectory(path);
-      try { if (path !== stage) await handle.chmod(mode); await handle.sync(); }
+      try { if (path !== stage) await handle.chmod(mode); if (each) await handle.sync(); }
       finally { await handle.close(); }
     }
+    if (!each) await flushFilesystem(stage);
     await rename(stage, destination); published = true;
     await syncDirectory(parent);
     const roots = manifest.roots.map(root => mapped(destination, root));

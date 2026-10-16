@@ -145,6 +145,31 @@ test("a forced apply restores laptop content over cloud edits even when the gene
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("an apply links unchanged files from the verified tree, a forced apply rewrites them, and edits to linked files still count", async () => {
+  const f = fixture();
+  try {
+    const previous = join(dirname(f.cloud), `.${basename(f.cloud)}.infinite-previous`);
+    writeFileSync(join(f.laptop, "a.txt"), "1\n"); writeFileSync(join(f.laptop, "b.txt"), "same\n");
+    const first = await push(f);
+    writeFileSync(join(f.laptop, "a.txt"), "2\n");
+    const second = await push(f, false, first.manifest);
+    assert.equal(second.status.appliedManifest, second.manifest.id);
+    assert.equal(statSync(join(f.cloud, "b.txt")).ino, statSync(join(previous, "b.txt")).ino, "the unchanged file is a hard link into the retired tree");
+    assert.notEqual(statSync(join(f.cloud, "a.txt")).ino, statSync(join(previous, "a.txt")).ino);
+    assert.equal(readFileSync(join(f.cloud, "a.txt"), "utf8"), "2\n");
+    // An in-place cloud edit of a linked file, same size, is still drift.
+    writeFileSync(join(f.cloud, "b.txt"), "edit\n");
+    writeFileSync(join(f.laptop, "a.txt"), "3\n");
+    const third = await push(f, false, second.manifest);
+    assert.equal(third.status.pendingGeneration?.reason, "cloud-changed");
+    const forced = await f.sync.apply("example", { running: idle, force: true });
+    assert.equal(forced.appliedManifest, third.manifest.id);
+    assert.equal(readFileSync(join(f.cloud, "b.txt"), "utf8"), "same\n", "a forced apply restores laptop content");
+    assert.notEqual(statSync(join(f.cloud, "b.txt")).ino, statSync(join(previous, "b.txt")).ino, "a forced apply never links cloud files");
+    assert.equal(readFileSync(join(previous, "b.txt"), "utf8"), "edit\n");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("stale generations and missing content are refused", async () => {
   const f = fixture();
   try {

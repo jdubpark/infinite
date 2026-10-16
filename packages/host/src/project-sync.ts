@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { unseal, writeSealed } from "./vault.js";
 import {
-  captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob,
+  captureWorkspace, describeMaterializedTree, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob,
   validateWorkspaceManifest, WorkspaceCaptureChangedError, type WorkspaceEntry, type WorkspaceManifest,
 } from "./workspace-checkpoint.js";
 import type { Config } from "./types.js";
@@ -75,6 +75,16 @@ const entrySignature = (entry: WorkspaceEntry) => JSON.stringify([entry.path, en
 const sameEntries = (a: WorkspaceManifest, b: WorkspaceManifest) =>
   a.entries.length === b.entries.length && a.entries.every((entry, index) => entrySignature(entry) === entrySignature(b.entries[index]));
 const inside = (root: string, path: string) => path === root || path.startsWith(root === "/" ? "/" : `${root}/`);
+/**
+ * Files of the applied generation may be hard-linked into the next one only when both describe the same laptop root
+ * and the drift reference agrees with the applied manifest on every file, so a match against it proves the content.
+ */
+function reusable(applied: Applied, next: WorkspaceManifest) {
+  if (applied.manifest.roots.length !== 1 || JSON.stringify(applied.manifest.roots) !== JSON.stringify(next.roots)) return false;
+  if (!applied.baseline) return true;
+  const content = new Map(applied.baseline.entries.filter(e => e.kind === "file").map(e => [e.path, JSON.stringify(e.chunks)]));
+  return applied.manifest.entries.every(e => e.kind !== "file" || ownedPath(e.path) || content.get(e.path) === JSON.stringify(e.chunks));
+}
 
 /** One-way laptop-to-cloud synchronization state for configured projects. */
 export class ProjectSync {
@@ -213,7 +223,8 @@ export class ProjectSync {
     if (await options.running()) return pending("session-running");
     try {
       if (!options.force && await this.drifted(projectId, project.path, applied)) return pending("cloud-changed");
-      return await this.publish(projectId, project.path, received);
+      // Without force, the drift check just verified that the live tree matches the applied generation.
+      return await this.publish(projectId, project.path, received, options.force ? undefined : applied);
     } catch (error) {
       if (error instanceof ProjectSyncError) throw error;
       // The generation stays received and pending with a reason; a later laptop change or an explicit apply retries it.
@@ -223,21 +234,27 @@ export class ProjectSync {
     }
   }
 
-  /** Replace the project tree with the received generation and record it as applied. */
-  private async publish(projectId: string, path: string, received: Received): Promise<ProjectSyncStatus> {
+  /**
+   * Replace the project tree with the received generation and record it as applied. `verified` is the applied
+   * generation the live tree was just checked against; its unchanged files are hard-linked instead of rewritten.
+   */
+  private async publish(projectId: string, path: string, received: Received, verified?: Applied): Promise<ProjectSyncStatus> {
     const target = await this.projectRoot(path);
     const parent = dirname(target), name = basename(target);
     const stage = join(parent, `.${name}.infinite-stage-${randomUUID()}`);
     const previous = join(parent, `.${name}.infinite-previous`);
     const owned = join(target, OWNED_PREFIX);
-    let carried: string | undefined, retired = false;
+    const reuse = verified && reusable(verified, received.manifest) ? { manifest: verified.manifest, roots: [target] } : undefined;
+    let carried: string | undefined, retired = false, written: WorkspaceManifest | undefined;
     try {
       const sharedGroup = await this.sharedGroup(parent);
-      const source = (await materializeWorkspace({ manifest: received.manifest, storeDir: join(this.dir(projectId), "blobs"), destination: stage, sharedGroup })).roots[0];
+      const source = (await materializeWorkspace({ manifest: received.manifest, storeDir: join(this.dir(projectId), "blobs"), destination: stage, sharedGroup, previous: reuse, flush: "once" })).roots[0];
       // The cloud copy of Infinite's own directory wins; a laptop copy never replaces it.
       await removeTree(join(source, OWNED_PREFIX));
       await removeTree(previous);
       if (existsSync(owned)) { await rename(owned, join(source, OWNED_PREFIX)); carried = join(source, OWNED_PREFIX); }
+      // Only this host can write the private stage, so a metadata pass now describes what the swap publishes.
+      written = await describeMaterializedTree(received.manifest, source, target, ownedPath).catch(() => undefined);
       await rename(target, previous); retired = true;
       await rename(source, target);
     } catch (error) {
@@ -246,9 +263,9 @@ export class ProjectSync {
       if (carried) await rename(carried, owned).catch(() => {});
       throw error;
     } finally { await removeTree(stage).catch(() => {}); }
-    // Drift compares against what materialize actually wrote: resolved symlink targets and this host's symlink modes.
-    // Without a baseline, drift falls back to the manifest.
-    const baseline = await this.scan(projectId, target).catch(() => undefined);
+    // Drift compares against what materialize actually wrote: resolved symlink targets and this host's modes. When the
+    // metadata pass could not describe it, a full scan does. Without a baseline, drift falls back to the manifest.
+    const baseline = written ?? await this.scan(projectId, target).catch(() => undefined);
     this.write(projectId, "applied", { manifest: received.manifest, appliedAt: new Date().toISOString(), baseline } satisfies Applied);
     this.writePending(projectId, undefined);
     return this.status(projectId);

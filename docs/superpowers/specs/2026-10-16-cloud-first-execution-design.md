@@ -28,6 +28,10 @@ What the pivot does not change: platform-bound work such as iOS simulator builds
 - When the owner is unreachable, a delegate agent can clear blocked sessions within an owner-written policy, and every action it takes is attributed and reviewable.
 - Every client shows execution location, sync age, bundle sync time, and who answered each prompt.
 
+## Scope boundary: the Infinite CLI only
+
+Everything in this document applies to sessions started through `infinite`, the Infinite web client, the phone app, or a delegate. Running `claude`, `codex`, `grok`, or `opencode` directly on the Mac is unchanged: no sync service watches those directories, no bundle is read, no hooks are injected, and no delegate sees those sessions. The workspace sync service only watches projects the owner configured for Infinite, and only while the Infinite laptop service is running. Installing or updating Infinite must not modify provider configuration, shell startup files, or global hooks for the owner's plain CLIs.
+
 ## Non-goals
 
 - Automatic migration of a running laptop process to the cloud in the default mode.

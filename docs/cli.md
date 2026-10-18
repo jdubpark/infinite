@@ -211,12 +211,15 @@ In ordinary terminal mode, everything after the provider name is passed as an ar
 
 ```sh
 infinite projects
+infinite projects forget [DIRECTORY] [--project PROJECT_ID]
 infinite --project PROJECT_ID --title "Investigate tests" codex --model MODEL
 infinite --detach --project PROJECT_ID claude "Review this checkout"
 infinite --client-config "$CLIENT_CONFIG_FILE" monitor SESSION_ID
 ```
 
 Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not translated. A launch without `--project` uploads the selected checkout through workspace sync. Use `--project ID` to select an existing server project without automatic upload. Sync scope includes ignored files, untracked files, and Git metadata; credentials inside that scope travel to the server.
+
+`infinite projects forget` removes the folder mapping for the current Git root, the supplied directory's Git root, or `--project PROJECT_ID`, and keeps the server directory and cloud files. See [workspace sync](workspace-sync.md#folder-mapping) for when it is refused.
 
 `--laptop` Codex launches use the laptop project and background cloud handoff described above. The earlier [SSH prototype](hybrid-execution.md#earlier-ssh-prototype) remains available for isolated protocol experiments and retains its original offline behavior.
 

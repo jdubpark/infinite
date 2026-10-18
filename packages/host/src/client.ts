@@ -17,10 +17,10 @@ import { checkLaptopExecutor, startLaptopService } from "./laptop-service.js";
 import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWorkspaceManifest } from "./workspace-checkpoint.js";
 import { readSyncState, startSyncService, stopSyncService, syncServiceRunning } from "./sync-service.js";
 import { localProjectPath } from "./mirrored-projects.js";
-import { boundTeamProject, handleTeamClientCommand } from "./team-cli.js";
+import { boundTeamProject, forgetBoundTeamProject, handleTeamClientCommand } from "./team-cli.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
-type Me = { role: string; capabilities?: { workspaceMirror?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
+type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
 const providerNames: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
 /** Project IDs name local sync files, so an ID from the host or the command line is checked before it becomes a path. */
@@ -46,6 +46,11 @@ function originOf(value: string) {
   if (url.username || url.password || url.search || url.hash || url.pathname !== "/") throw new Error("Use the host origin without credentials, a path, or query parameters");
   if (url.protocol !== "https:" && !(url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname))) throw new Error("Remote pairing requires HTTPS");
   return url.origin;
+}
+function writeClientConfig(path: string, config: ClientConfig) {
+  const temporary = path + "." + randomUUID();
+  writeFileSync(temporary, JSON.stringify(config, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+  renameSync(temporary, path); chmodSync(path, 0o600);
 }
 function loadConfig(path: string): ClientConfig {
   if (!existsSync(path)) throw new Error(`Pair this laptop first: infinite pair https://HOST --token-file FILE\nClient configuration: ${path}`);
@@ -586,9 +591,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       config.projectId = String(options["--project"] ?? me.projects[0]?.id ?? "");
       if (!me.projects.some(p => p.id === config.projectId)) throw new Error("Unknown project ID");
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-      const temporary = path + "." + randomUUID();
-      writeFileSync(temporary, JSON.stringify(config, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-      renameSync(temporary, path); chmodSync(path, 0o600);
+      writeClientConfig(path, config);
       console.log(`Paired ${config.origin} as ${me.role}. Credentials saved privately at ${path}`);
       return true;
     }
@@ -677,6 +680,28 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       return true;
     }
     if (command === "projects") {
+      if (positional[0] === "forget") {
+        if (me.capabilities?.mirrorForget !== 1) throw new Error("Upgrade the host before forgetting a mirrored project.");
+        if (positional.length > 2) throw new Error("Usage: infinite projects forget [DIRECTORY] [--project ID]");
+        const projectId = options["--project"] === undefined ? undefined : String(options["--project"]);
+        let selected = projectId;
+        if (!selected) {
+          const directory = realpathSync(resolve(String(positional[1] ?? process.cwd())));
+          const relativePath = localProjectPath(gitRoot(directory));
+          const matches = me.projects.filter(project => project.name === relativePath);
+          if (matches.length !== 1) throw new Error(matches.length ? "More than one mirrored project matches this directory; use --project ID." : "No mirrored project matches this directory. Resolve it with a native launch before forgetting it.");
+          selected = matches[0].id;
+        }
+        if (!PROJECT_ID.test(selected)) throw new Error("Invalid project ID.");
+        const retained = await api.json<{ id: string; name: string; path: string }>(`/projects/${selected}/mirror`, undefined, undefined, undefined, "DELETE");
+        forgetBoundTeamProject(config, path, selected);
+        if (config.projectId === selected) {
+          delete config.projectId;
+          writeClientConfig(path, config);
+        }
+        console.log(`Forgot mirrored project ${clean(retained.id)} (${clean(retained.name)}). Server directory retained at ${clean(retained.path)}; cloud files were kept.`);
+        return true;
+      }
       for (const p of me.projects) {
         const detail = await api.json<ProjectDetail>(`/projects/${p.id}`).catch(() => undefined);
         console.log(`${p.id}  ${clean(p.name)}${detail ? `  · ${describeSync(detail.sync)}` : ""}`);

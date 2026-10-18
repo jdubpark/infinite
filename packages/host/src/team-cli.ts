@@ -172,6 +172,17 @@ export function boundTeamProject(config: ClientConfig, configPath: string, direc
   if (typeof projectId !== "string" || !projectIdPattern.test(projectId)) throw new Error("Saved repository binding is invalid; inspect private team CLI state before launching.");
   return projectId;
 }
+export function forgetBoundTeamProject(config: ClientConfig, configPath: string, projectId: string): void {
+  const identity = createHash("sha256").update(`${new URL(config.origin).origin}\n${config.token}`).digest("hex");
+  const file = join(dirname(configPath), "team-cli", identity, "repo-mappings.json");
+  const mappings = readPrivateJson(file, {}) as Record<string, unknown>;
+  let changed = false;
+  for (const [key, value] of Object.entries(mappings)) {
+    const bound = typeof value === "string" ? value : (value as { projectId?: unknown } | undefined)?.projectId;
+    if (bound === projectId) { delete mappings[key]; changed = true; }
+  }
+  if (changed) privateJson(file, mappings);
+}
 function commandArray(text: string, flag: string) {
   let value: unknown;
   try { value = JSON.parse(text); } catch { throw new Error(`${flag} must contain a JSON command array.`); }

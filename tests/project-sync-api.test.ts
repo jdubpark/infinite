@@ -5,7 +5,9 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileS
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { inProcessHost, startHost, waitFor, type Host } from "./helpers.js";
+import { fixture as teamFixture } from "./team-fixture.js";
 
 type Api = Pick<Host, "origin" | "tokens" | "fetchApi">;
 
@@ -35,6 +37,98 @@ test("owner CLI resolves distinct home-relative projects without falling back to
     assert.equal(login.status, 200);
     assert.equal((await host.fetchApi("/projects/resolve", null, { path: "Projects/browser" }, { Cookie: login.headers.get("set-cookie")!.split(";")[0], Origin: host.config.origin })).status, 403);
   } finally { await host.stop(); }
+});
+
+test("mirrored project IDs are readable, collision-safe, persistent, and retain legacy IDs", async () => {
+  const outside = realpathSync(mkdtempSync("/tmp/inf-mirror-ids-"));
+  const home = join(outside, "home"), configured = join(outside, "configured");
+  mkdirSync(configured);
+  const host = await startHost({ config: { sync: { homeDir: home }, projects: [{ id: "sample", name: "Configured", path: configured }] } });
+  const suffix = (path: string) => createHash("sha256").update(path).digest("hex").slice(0, 8);
+  const resolveId = async (path: string) => (await host.fetchApi("/projects/resolve", "owner", { path })).body.id;
+  try {
+    assert.equal(await resolveId("Projects/Sample"), `sample-${suffix("Projects/Sample")}`, "a configured ID is never taken");
+    assert.equal(await resolveId("Apps/Sample/codebase"), "sample-codebase", "three components keep the parent as a prefix");
+    assert.equal(await resolveId("code"), "code");
+    assert.equal(await resolveId("Other/Sample"), `sample-${suffix("Other/Sample")}`);
+    const capabilities = (await host.fetchApi("/me")).body.capabilities;
+    assert.deepEqual([capabilities.workspaceMirror, capabilities.mirrorForget], [1, 1], "older CLIs keep the version 1 mapping contract");
+
+    const legacyPath = "Old/legacy";
+    const legacyId = `folder-${createHash("sha256").update(legacyPath).digest("hex").slice(0, 32)}`;
+    await host.stopApi();
+    writeSealed(join(host.config.stateDir, "mirrored-projects.sealed"), readFileSync(host.config.keyFile), "mirrored-projects", [legacyPath]);
+    await host.start();
+    assert.equal(await resolveId(legacyPath), legacyId, "legacy mappings keep their original IDs after restart");
+    assert.equal(await resolveId("Work/Persisted"), "persisted");
+    const stored = unseal<{ version: number; entries: { path: string; id: string }[] }>(readFileSync(host.config.keyFile), "mirrored-projects", readFileSync(join(host.config.stateDir, "mirrored-projects.sealed"), "utf8"));
+    assert.equal(stored.version, 2, "the next mutation upgrades storage to version 2");
+    assert.deepEqual(stored.entries.map(entry => entry.id), [legacyId, "persisted"]);
+    await host.stopApi(); await host.start();
+    assert.equal(await resolveId("Work/Persisted"), "persisted", "IDs are restored from storage after restart");
+    assert.equal(await resolveId(legacyPath), legacyId);
+  } finally { await host.stop(); rmSync(outside, { recursive: true, force: true }); }
+});
+
+test("forget tombstones a mapping, reserves its ID for other folders, and allows the same folder to reclaim it", async () => {
+  const host = await inProcessHost();
+  try {
+    host.config.sync = { homeDir: join(host.root, "mirror-home") };
+    const first = await host.fetchApi("/projects/resolve", "owner", { path: "Projects/Shared" });
+    const forgotten = await host.fetchApi(`/projects/${first.body.id}/mirror`, "owner", undefined, {}, "DELETE");
+    assert.equal(forgotten.status, 200);
+    assert.equal(forgotten.body.path, first.body.path);
+    assert.ok(existsSync(first.body.path));
+    assert.equal((await host.fetchApi(`/projects/${first.body.id}`)).status, 404);
+    assert.equal((await host.fetchApi("/projects/resolve", "owner", { path: "Work/Shared" })).body.id,
+      `shared-${createHash("sha256").update("Work/Shared").digest("hex").slice(0, 8)}`);
+    assert.equal((await host.fetchApi("/projects/resolve", "owner", { path: "Projects/Shared" })).body.id, first.body.id);
+    assert.equal((await host.fetchApi("/projects/rehearsal/mirror", "owner", undefined, {}, "DELETE")).body.code, "project-not-mirrored");
+
+    const session = randomUUID();
+    assert.equal((await host.fetchApi("/sessions", "owner", { requestId: session, provider: "demo", projectId: first.body.id, title: "Hold mirror", prompt: "" })).status, 201);
+    await waitFor(() => host.fetchApi(`/sessions/${session}`), result => ["starting", "running"].includes(result.body.status));
+    const refused = await host.fetchApi(`/projects/${first.body.id}/mirror`, "owner", undefined, {}, "DELETE");
+    assert.deepEqual([refused.status, refused.body.code], [409, "session-running"]);
+    assert.equal((await host.fetchApi(`/sessions/${session}/stop`, "owner", { requestId: randomUUID() })).status, 200);
+    await waitFor(() => host.fetchApi(`/sessions/${session}`), result => result.body.status === "exited");
+  } finally { await host.stop(); }
+});
+
+test("mirroring refuses a destination overlapping a project teamwork folder", async () => {
+  const host = await inProcessHost();
+  try {
+    host.config.sync = { homeDir: join(host.root, "mirror-home") };
+    host.config.projects.push({ id: "team-project", name: "Team", path: join(host.root, "team-cloud"), teamworkDir: join(host.config.sync.homeDir, "Projects", "Team") });
+    const result = await host.fetchApi("/projects/resolve", "owner", { path: "Projects/Team/repo" });
+    assert.equal(result.status, 409);
+    assert.match(result.body.error, /teamwork folder/);
+  } finally { await host.stop(); }
+});
+
+test("forget refuses a mirrored project with an unfinished team run", { timeout: 60000 }, async () => {
+  const home = realpathSync(mkdtempSync("/tmp/inf-mirror-team-"));
+  const repository = join(home, "Projects", "team");
+  mkdirSync(repository, { recursive: true });
+  const git = (...args: string[]) => execFileSync("git", ["-C", repository, ...args], { stdio: "ignore" });
+  git("init", "--initial-branch=main");
+  writeFileSync(join(repository, "README.md"), "Mirrored team fixture\n");
+  git("add", "README.md");
+  git("-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial mirrored fixture");
+  const run = await teamFixture("lifecycle", undefined, { sync: { homeDir: home } });
+  try {
+    const host = run.host;
+    const mapped = await host.fetchApi("/projects/resolve", "owner", { path: "Projects/team" });
+    assert.equal(mapped.status, 200, JSON.stringify(mapped.body));
+    const current = (await host.fetchApi(`/projects/${mapped.body.id}/team`, "owner")).body;
+    const enrolled = await host.fetchApi(`/projects/${mapped.body.id}/team`, "owner", { requestId: randomUUID(), revision: current.revision, team: { checks: [{ command: process.execPath, args: ["-e", "process.exit(0)"] }] } }, {}, "PUT");
+    assert.equal(enrolled.status, 200, JSON.stringify(enrolled.body));
+    const started = await host.fetchApi("/teams", "owner", { ...run.create(), projectId: mapped.body.id });
+    assert.equal(started.status, 200, JSON.stringify(started.body));
+    const refused = await host.fetchApi(`/projects/${mapped.body.id}/mirror`, "owner", undefined, {}, "DELETE");
+    assert.deepEqual([refused.status, refused.body.code], [409, "project-team-active"]);
+    assert.equal((await host.fetchApi("/me")).body.projects.some((project: { id: string }) => project.id === mapped.body.id), true, "a refused forget keeps the mapping");
+  } finally { await run.close(); rmSync(home, { recursive: true, force: true }); }
 });
 
 const putChunk = (host: Api, hash: string, body: Buffer) => fetch(`${host.origin}/api/projects/rehearsal/sync/blob/${hash}`, {

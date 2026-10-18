@@ -337,7 +337,7 @@ export function createApp(config: Config, key: Buffer) {
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
       projects: config.projects.map(({ id, name, path, team, linear }) => ({ id, name, path, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
       capabilities: {
-        ...(mirroredProjects ? { workspaceMirror: 1 } : {}),
+        ...(mirroredProjects ? { workspaceMirror: 1, mirrorForget: 1 } : {}),
         signals: true,
         answer: ["owner", "controller"].includes(res.locals.role),
         push: Boolean(config.push?.enabled),
@@ -386,6 +386,26 @@ export function createApp(config: Config, key: Buffer) {
     if (!mirroredProjects) return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
     const { path } = z.object({ path: z.string().max(4096) }).strict().parse(req.body);
     res.json(mirroredProjects.resolve(path));
+  });
+  app.delete("/api/projects/:id/mirror", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    if (!mirroredProjects || runtimeSecurity(config.deployment).tenancy !== "single-tenant")
+      return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
+    const projectId = projectSchema.parse(req.params.id);
+    if (!mirroredProjects.isMirrored(projectId)) throw new TeamError(409, "project-not-mirrored", "Only mirrored projects can be forgotten.");
+    if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
+    // Holding the configuration lock refuses new sessions, teams and goals while the checks run.
+    projectConfigChanges.add(projectId);
+    try {
+      if (projectSync.applying(projectId)) throw new TeamError(409, "sync-applying", "A workspace sync is being applied to this project. Retry after it finishes.");
+      if (projectFileChanges.has(projectId)) throw new TeamError(409, "project-files-changing", "Project files are being changed. Retry after the transfer finishes.");
+      assertNoHandoff(projectId);
+      if (teams.list().some(team => team.projectId === projectId && !["ready-for-review", "no-change", "cancelled"].includes(team.status)))
+        throw new TeamError(409, "project-team-active", "A team run for this project is still active. Finish or cancel it before forgetting the mirror.");
+      if (goals.list().some(goal => goal.projectId === projectId && ["running", "needs-input", "paused"].includes(goal.status)))
+        throw new TeamError(409, "project-goal-active", "A goal for this project is still active. Finish or cancel it before forgetting the mirror.");
+      if (await projectRunning(projectId, true)) throw new TeamError(409, "session-running", "A session is running or starting in this project. Stop it before forgetting the mirror.");
+      res.json(mirroredProjects.forget(projectId));
+    } finally { projectConfigChanges.delete(projectId); }
   });
   app.get("/api/projects/:id/team", requireRole(["owner"]), requireOwnerCli, (req, res) => {
     res.json(enrollment.get(projectSchema.parse(req.params.id)));

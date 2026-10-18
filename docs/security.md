@@ -156,6 +156,8 @@ Separate the API service Unix identity from native agent execution identities. T
 
 Authenticate providers on the server in their own protected home, with only the credentials needed for approved projects. An SSH-agent forwarded from the laptop stops being useful when the laptop disappears. Copying the entire laptop home would import excessive credentials and platform-specific paths. Inventory skills, AGENTS.md, MCP services, environment variables, tool versions, Git identity, and project dependencies explicitly.
 
+Repository briefings execute through a root-owned wrapper as `infinite-agent`, using that account's provider authentication (Codex, or Muse Spark and DeepSeek through OpenCode) and read-only source collection. The selected project source and explicitly supplied recorded chat messages are sent to the configured writer's provider; when the account holds a TypeSafe key, changed-line excerpts and claim excerpts are also sent to Jev. Muse Spark 1.3 Contributor is a contributor data-use model; check the provider's terms before routing a project to it. Approve that transmission for each project before enabling automatic briefings. The feature does not discover provider histories or other sessions. The agent account remains a shared single-tenant trust boundary; briefings are unavailable when the runtime cannot resolve a cloud source root, including current hybrid laptop and cmux sessions. See [repository briefings](repository-briefings.md) for deployment and evidence limits.
+
 For unattended GitHub delivery, the optional [GitHub App renewal service](../deploy/ubuntu/github-app.md)
 keeps the app private key outside agent-readable storage and issues one-repository
 installation tokens. The Git/GitHub client refuses expired or mismatched tokens

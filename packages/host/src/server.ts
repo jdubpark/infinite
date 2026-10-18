@@ -36,6 +36,7 @@ import { createGoalSchema, goalActionSchema, goalSteerSchema, goalOutcomeSchema 
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
+import { RepositoryBriefings } from "./repository-briefings.js";
 
 const id = z.uuid();
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
@@ -205,6 +206,9 @@ export function createApp(config: Config, key: Buffer) {
   };
   const pushStore = new PushStore(config.stateDir, key);
   const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
+  const repositoryBriefings = config.repositoryBriefings
+    ? new RepositoryBriefings(config.repositoryBriefings, manager, config.projects, config.teams?.workspaceDir)
+    : undefined;
   async function inputAuthority(sessionId: string, res: express.Response) {
     // Retained workers from earlier releases hash the entire request. Adding
     // optional fields would make a pre-upgrade receipt impossible to retry.
@@ -343,7 +347,8 @@ export function createApp(config: Config, key: Buffer) {
         signals: true,
         answer: ["owner", "controller"].includes(res.locals.role),
         push: Boolean(config.push?.enabled),
-        ...(summarizer ? { summaries: { model: summarizer.model } } : {}),
+        ...(repositoryBriefings || summarizer ? { summaries: { model: repositoryBriefings?.model ?? summarizer!.model } } : {}),
+        ...(repositoryBriefings ? { repositoryBriefings: { model: repositoryBriefings.model, automatic: config.repositoryBriefings!.automatic } } : {}),
         ...(config.remote?.enabled ? { remoteTerminal: 1 } : {}),
         desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: DESKTOP_LIMITS.chunkBytes, maxFileBytes: DESKTOP_LIMITS.maxFileBytes },
       },
@@ -564,6 +569,7 @@ export function createApp(config: Config, key: Buffer) {
       if (action === "/messages") return void res.json(await cmux.messages(sessionId,
         z.string().max(100).optional().parse(req.query.after), z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit)));
       if (action === "/file") return void res.json(await sessionFile(await cmux.get(sessionId), z.string().parse(req.query.path)));
+      if (action === "/summary" && req.query.status === "1") return void res.json({ state: "unavailable", error: "Repository briefing is unavailable for cmux sessions." });
       return void res.status(409).json({ error: "This action is unavailable for cmux sessions", code: "unsupported" });
     }
     if (req.method !== "POST") return void res.status(405).json({ error: "Unsupported method" });
@@ -614,10 +620,23 @@ export function createApp(config: Config, key: Buffer) {
   });
   // A digest of the chat after a cursor. The text is the model's reading, labeled as such.
   app.get("/api/sessions/:id/summary", async (req, res) => {
-    if (!summarizer) return void res.status(503).json({ code: "summaries-unavailable", error: "This host has no summary model configured." });
     const sessionId = id.parse(req.params.id);
     const session = manager.meta(sessionId).session;
+    if (req.query.status === "1") {
+      if (!repositoryBriefings) return void res.json({ state: "unavailable", error: "Repository briefings are not configured on this host." });
+      return void res.json(await repositoryBriefings.status(session));
+    }
+    if (req.query.status !== undefined) return void res.status(400).json({ error: "Use status=1 to read repository briefing status." });
     const from = z.string().regex(/^\d{1,16}$/).default("0").parse(req.query.after);
+    if (!Number.isSafeInteger(Number(from))) return void res.status(400).json({ error: "Invalid message cursor" });
+    if (repositoryBriefings) {
+      try {
+        res.json(await repositoryBriefings.summarize(session, from));
+      } catch {
+        res.status(502).json({ code: "repository-briefing-failed", error: "The repository brief could not be generated." });
+      }
+      return;
+    }
     const transcript = (await manager.state(sessionId)).capabilities?.transcript === 1;
     const messages = [];
     let cursor = from, pages = 0;
@@ -627,6 +646,7 @@ export function createApp(config: Config, key: Buffer) {
       cursor = page.cursor;
       if (!page.more || ++pages >= 10 || messages.length >= 1000) break;
     }
+    if (!summarizer) return void res.status(503).json({ code: "summaries-unavailable", error: "This host has no summary model configured." });
     try {
       res.json(await summarizer.summarize(sessionId, messages, from, cursor));
     } catch (error) {
@@ -991,14 +1011,16 @@ export function createApp(config: Config, key: Buffer) {
   server.once("listening", () => usage.start());
   server.once("listening", () => goals.start());
   server.once("listening", () => handoffs.start());
+  if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });
   server.once("close", () => teams.close());
   server.once("close", () => usage.close());
   server.once("close", () => goals.close());
+  server.once("close", () => repositoryBriefings?.close());
   server.once("close", () => linear.close());
   server.once("close", () => handoffs.close());
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); };
+  const closeConnections = () => { handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

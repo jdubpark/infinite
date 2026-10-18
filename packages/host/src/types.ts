@@ -112,6 +112,8 @@ export interface Config {
   sync?: { sharedGroup?: boolean; homeDir?: string };
   /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
   summaries?: { model: string; apiKeyFile: string; baseUrl: string };
+  /** Read-only repository briefs produced by an administrator-configured host wrapper. */
+  repositoryBriefings?: { command: string; args: string[]; runner?: "muse" | "deepseek" | "codex"; model?: string; automatic: boolean; intervalMs: number; cooldownMs: number; timeoutMs: number };
   port: number;
   origin: string;
   stateDir: string;

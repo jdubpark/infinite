@@ -335,11 +335,12 @@ else if (command === "plan-fleet") {
     });
     for (const signal of ["SIGTERM", "SIGINT"] as const)
       process.once(signal, () => {
-        server.close(() => {
+        const closing = closeConnections();
+        server.close(async () => {
+          await closing;
           unlock();
           process.exit(0);
         });
-        closeConnections();
       });
   } else {
     const manager = new Manager(config, key);

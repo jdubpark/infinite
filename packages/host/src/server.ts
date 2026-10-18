@@ -28,6 +28,7 @@ import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { TeamService, TeamError } from "./teams.js";
+import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
 import { GoalService } from "./goals.js";
 import { LinearService } from "./linear.js";
@@ -338,7 +339,7 @@ export function createApp(config: Config, key: Buffer) {
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
       projects: config.projects.map(({ id, name, path, team, linear }) => ({ id, name, path, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
       capabilities: {
-        ...(mirroredProjects ? { workspaceMirror: 1 } : {}),
+        ...(mirroredProjects ? { workspaceMirror: 1, mirrorForget: 1 } : {}),
         signals: true,
         answer: ["owner", "controller"].includes(res.locals.role),
         push: Boolean(config.push?.enabled),
@@ -362,6 +363,39 @@ export function createApp(config: Config, key: Buffer) {
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  app.get("/api/teams/:id/bundle", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;
+    const stop = () => {
+      if (!child || finished) return;
+      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* Already exited. */ }
+    };
+    const disconnect = () => { if (!res.writableEnded) { stop(); finished = true; clearTimeout(timer); } };
+    req.once("aborted", disconnect);
+    res.once("close", disconnect);
+    const timer = setTimeout(() => { stop(); finished = true; res.destroy(); }, 10 * 60 * 1000);
+    timer.unref();
+    res.once("close", () => clearTimeout(timer));
+    const bundle = await teams.bundle(id.parse(req.params.id));
+    if (req.aborted || res.destroyed || res.writableEnded) return;
+    const limit = 512 * 1024 * 1024;
+    child = spawnTeamBundle(bundle.workspace, bundle.branch, config.teams?.commandPrefix);
+    res.status(200).set({ "Content-Type": "application/octet-stream", "X-Infinite-Branch": bundle.branch, "X-Infinite-Head": bundle.head });
+    let size = 0;
+    child.stdout.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) { stop(); finished = true; clearTimeout(timer); res.destroy(); return; }
+      if (!res.write(chunk)) child.stdout.pause();
+    });
+    res.on("drain", () => child.stdout.resume());
+    child.stderr.resume();
+    child.once("error", () => { finished = true; clearTimeout(timer); res.destroy(); });
+    child.once("close", code => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      if (code !== 0) res.destroy(); else res.end();
+    });
+  });
   app.post("/api/teams", requireRole(["owner"]), async (req, res) => {
     const body = createTeamSchema.parse(req.body);
     assertNoHandoff(body.projectId);
@@ -386,7 +420,29 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {
     if (!mirroredProjects) return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
     const { path } = z.object({ path: z.string().max(4096) }).strict().parse(req.body);
-    res.json(mirroredProjects.resolve(path));
+    const project = mirroredProjects.resolve(path);
+    enrollment.restore(project.id);
+    res.json(project);
+  });
+  app.delete("/api/projects/:id/mirror", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    if (!mirroredProjects || runtimeSecurity(config.deployment).tenancy !== "single-tenant")
+      return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
+    const projectId = projectSchema.parse(req.params.id);
+    if (!mirroredProjects.isMirrored(projectId)) throw new TeamError(409, "project-not-mirrored", "Only mirrored projects can be forgotten.");
+    if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
+    // Holding the configuration lock refuses new sessions, teams and goals while the checks run.
+    projectConfigChanges.add(projectId);
+    try {
+      if (projectSync.applying(projectId)) throw new TeamError(409, "sync-applying", "A workspace sync is being applied to this project. Retry after it finishes.");
+      if (projectFileChanges.has(projectId)) throw new TeamError(409, "project-files-changing", "Project files are being changed. Retry after the transfer finishes.");
+      assertNoHandoff(projectId);
+      if (teams.list().some(team => team.projectId === projectId && !["ready-for-review", "no-change", "cancelled"].includes(team.status)))
+        throw new TeamError(409, "project-team-active", "A team run for this project is still active. Finish or cancel it before forgetting the mirror.");
+      if (goals.list().some(goal => goal.projectId === projectId && ["running", "needs-input", "paused"].includes(goal.status)))
+        throw new TeamError(409, "project-goal-active", "A goal for this project is still active. Finish or cancel it before forgetting the mirror.");
+      if (await projectRunning(projectId, true)) throw new TeamError(409, "session-running", "A session is running or starting in this project. Stop it before forgetting the mirror.");
+      res.json(mirroredProjects.forget(projectId));
+    } finally { projectConfigChanges.delete(projectId); }
   });
   app.get("/api/projects/:id/team", requireRole(["owner"]), requireOwnerCli, (req, res) => {
     res.json(enrollment.get(projectSchema.parse(req.params.id)));

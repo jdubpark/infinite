@@ -112,7 +112,7 @@ export function validateLinearConfig(config: Config) {
     const file = config.linear.apiKeyFile;
     if (!isAbsolute(file) || (statSync(file).mode & 0o777) !== 0o600 || !statSync(file).isFile()) throw new Error();
     const actual = realpathSync(file);
-    for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.map(project => project.path)].filter((value): value is string => Boolean(value))) {
+    for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
       let base: string;
       try { base = realpathSync(directory); } catch { base = resolve(directory); }
       const rel = relative(base, actual);

@@ -40,7 +40,7 @@ infinite close SESSION_ID  # confirm before ending its provider process
 Initialize a project from a clean Git checkout, then start and control teams from that directory:
 
 ```sh
-infinite repo init [DIRECTORY] [--project PROJECT_ID]
+infinite repo init [DIRECTORY] [--project PROJECT_ID] [--teamwork PATH|none]
 infinite repo init --check-json '[{"command":"make","args":["test"]}]'
 infinite repo init --linear-team TEAM_UUID --linear-project PROJECT_UUID
 infinite team start "Add a feature"
@@ -48,6 +48,7 @@ infinite team start --prd requirements.md
 infinite team status
 infinite team status TEAM_ID --json
 infinite team watch TEAM_ID
+infinite team pull TEAM_ID [--json]
 infinite team steer TEAM_ID "Keep the change within the API package"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing route"
 infinite team pause TEAM_ID
@@ -78,9 +79,11 @@ Paths are resolved before looking up parents, so a symlink outside the parent
 does not inherit its defaults. Defaults stay in private client storage for the
 paired host and device key; another pairing needs its own setup.
 
-For a repository, `repo init` binds the canonical Git root to its cloud project in private client state. Existing repositories must have a clean checkout. A freshly initialized, empty repository needs no first commit: the CLI creates an empty baseline only in the cloud snapshot and leaves local files, Git metadata, and history unchanged. The command infers `npm ci` when an npm lockfile exists and `npm run check` when `package.json` defines a `check` script. For a new empty repository without checks, onboarding authorizes the first team to establish them. Its coordinator must define verification commands before implementation; the host then runs them against the integrated work and requires independent review. Existing repositories without identifiable checks still need `--check-json` as a JSON array of `{ "command": "...", "args": [...] }` objects; `--setup-json` accepts one setup command in the same format. For a newly resolved local project, it uploads a one-time source snapshot from an isolated clone of the current commit. It does not start continuous sync or include ignored and untracked files. An explicit `--project` or existing directory binding configures the selected project without uploading local source. A pending cloud generation is refused; an already applied generation is retained without replacement.
+For a repository, `repo init` binds the canonical Git root to its cloud project in private client state. Existing repositories must have a clean checkout. `--teamwork PATH` selects a local folder outside the repository and below the local home; the host stores its matching home-relative path and uses it for new team runs. `--teamwork none` removes that setting, while omission preserves it. The option requires a Git repository. A freshly initialized, empty repository needs no first commit: the CLI creates an empty baseline only in the cloud snapshot and leaves local files, Git metadata, and history unchanged. The command infers `npm ci` when an npm lockfile exists and `npm run check` when `package.json` defines a `check` script. For a new empty repository without checks, onboarding authorizes the first team to establish them. Its coordinator must define verification commands before implementation; the host then runs them against the integrated work and requires independent review. Existing repositories without identifiable checks still need `--check-json` as a JSON array of `{ "command": "...", "args": [...] }` objects; `--setup-json` accepts one setup command in the same format. For a newly resolved local project, it uploads a one-time source snapshot from an isolated clone of the current commit. It does not start continuous sync or include ignored and untracked files. An explicit `--project` or existing directory binding configures the selected project without uploading local source. A pending cloud generation is refused; an already applied generation is retained without replacement.
 
 The host must have team workspace storage configured, and the project must have required checks or explicit authorization for the team to establish them, before `team start` can run. The host's configured lineup is used by default. `--provider PROVIDER` requests a single-provider team explicitly. `team start` uses the current directory's saved project binding, or an explicit `--project PROJECT_ID`. `team status` without an ID lists teams on the paired host; the other commands address a team by ID. `--linear-team` and `--linear-project` configure the optional project issue mapping during initialization. `--handoff auto|off` defaults to `auto` for this onboarding path.
+
+Run `team pull TEAM_ID` from the enrolled repository bound to that team's project to fetch its integrated branch as a local branch. It leaves your working tree and checked-out branch alone, skips a result already contained by that branch, and lets Git refuse a conflicting branch update.
 
 Ordinary provider launches from an enrolled directory also use its saved project binding. For example, `infinite claude` opens that project's existing cloud checkout without uploading local changes or starting continuous sync. Launching from a subdirectory preserves its relative working directory. Use explicit sync commands when the cloud source needs an update.
 
@@ -211,12 +214,15 @@ In ordinary terminal mode, accepted arguments after the provider name are passed
 
 ```sh
 infinite projects
+infinite projects forget [DIRECTORY] [--project PROJECT_ID]
 infinite --project PROJECT_ID --title "Investigate tests" codex --model MODEL
 infinite --detach --project PROJECT_ID claude "Review this checkout"
 infinite --client-config "$CLIENT_CONFIG_FILE" monitor SESSION_ID
 ```
 
 Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not translated. A launch without `--project` uploads the selected checkout through workspace sync. Use `--project ID` to select an existing server project without automatic upload. Sync scope includes ignored files, untracked files, and Git metadata; credentials inside that scope travel to the server.
+
+`infinite projects forget` removes the folder mapping for the current Git root, the supplied directory's Git root, or `--project PROJECT_ID`, and keeps the server directory and cloud files. See [workspace sync](workspace-sync.md#folder-mapping) for when it is refused.
 
 `--laptop` Codex launches use the laptop project and background cloud handoff described above. The earlier [SSH prototype](hybrid-execution.md#earlier-ssh-prototype) remains available for isolated protocol experiments and retains its original offline behavior.
 

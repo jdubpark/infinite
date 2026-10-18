@@ -1,6 +1,7 @@
 import type { HandoffPolicy, TeamHandoffContext } from "./handoff-types.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { ProviderLimits } from "./provider-limits.js";
 import type { Config } from "./types.js";
@@ -11,14 +12,15 @@ import { teamPrompt } from "./team-prompts.js";
 import { teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
 import type { LinearService } from "./linear.js";
-import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureMemberResult, captureDeliveryBaseline, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, validateTeamPlan } from "./team-workspace.js";
+import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
+import { assertTeamworkPath } from "./repo-enrollment.js";
 export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
 type Action = { requestId: string; revision: number };
 type StartInProject = <T>(projectId: string, start: () => Promise<T>) => Promise<T>;
 type Stored = {
-  run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean;
+  run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
   pending?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number };
   halt?: "pause" | "cancel" | "steer" | "block";
   deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
@@ -74,6 +76,14 @@ export class TeamService {
     if (!stored) throw new TeamError(404, "team-not-found", "This team does not exist.");
     return stored;
   }
+  private assertRunPath(stored: Stored, path: string, create = false) {
+    const root = stored.root ?? this.config.teams?.workspaceDir;
+    if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
+    if (!stored.anchor && root !== this.config.teams?.workspaceDir)
+      throw new TeamError(409, "team-root-unsafe", "A team root outside the configured workspace directory requires a trusted anchor.");
+    const canonical = stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, create) : ensureDefaultTeamRoot(root, create);
+    assertTeamPath(canonical, path);
+  }
   private view(stored: Stored): TeamView {
     const { members, ...run } = structuredClone(stored.run);
     // Queue evidence from this exact state before a goal can use its sync gate
@@ -95,6 +105,21 @@ export class TeamService {
   }
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   get(id: string): TeamView { return this.view(this.record(id)); }
+  async bundle(id: string) {
+    const stored = this.record(id), run = stored.run;
+    if (run.status !== "ready-for-review") throw new TeamError(409, "team-not-ready", "This team is not ready to pull.");
+    const { revision, headCommit, branch, workspace } = run;
+    if (!headCommit) throw new TeamError(409, "team-no-result", "This team has no recorded result to pull.");
+    this.assertRunPath(stored, workspace);
+    const head = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["rev-parse", "--verify", `refs/heads/${branch}`]) }, workspace, undefined, 30000, this.config.teams?.commandPrefix).catch(() => {
+      throw new TeamError(409, "team-branch-changed", "The team's integration branch no longer matches its recorded result.");
+    });
+    if (run.status !== "ready-for-review" || run.revision !== revision || run.headCommit !== headCommit)
+      throw new TeamError(409, "team-not-ready", "This team changed while its result was being prepared. Refresh team status and retry.");
+    if (head.exitCode !== 0 || head.interrupted || head.truncated || head.stdout.trim() !== headCommit)
+      throw new TeamError(409, "team-branch-changed", "The team's integration branch no longer matches its recorded result.");
+    return { workspace, branch, head: headCommit };
+  }
   activeForProject(projectId: string) {
     return [...this.records.values()].some(({ run }) => run.projectId === projectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status));
   }
@@ -155,11 +180,16 @@ export class TeamService {
       const parent = goal?.parentRunId ? this.record(goal.parentRunId).run : undefined;
       if (parent && (parent.goal?.id !== goal!.id || parent.projectId !== parsed.projectId || !["ready-for-review", "merged"].includes(parent.status) || !parent.headCommit))
         throw new TeamError(409, "invalid-goal-parent", "Continue only from a ready, recorded run of this goal and project.");
-      if (parent) assertTeamPath(this.config.teams.workspaceDir, parent.workspace);
+      if (parent) this.assertRunPath(this.record(parent.id), parent.workspace);
       const source = { path: parent?.workspace ?? project.path, ...(parent ? { head: parent.headCommit!, ...(parent.status === "merged" ? { startCommit: parent.deliveryReceipt!.mergeCommit } : {}) } : internal?.handoff ? { head: internal.handoff.checkpointHead } : {}) };
       const parentRevision = parent?.revision;
       const at = timestamp();
-      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(this.config.teams.workspaceDir, parsed.requestId), branch: `infinite/team-${parsed.requestId}`, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      const slug = parsed.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/g, "") || "team";
+      const suffix = parsed.requestId.slice(0, 8);
+      const directoryName = `${project.teamworkDir ? "" : `${project.id}-`}${at.slice(0, 10)}-${slug}-${suffix}`;
+      const branch = `infinite/${slug}-${suffix}`;
+      const root = project.teamworkDir ?? this.config.teams.workspaceDir;
+      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
           throw new TeamError(409, "delivery-lineup-required", "Automatic merge requires a configured strong coordinator and independent strong reviewer.");
@@ -170,7 +200,12 @@ export class TeamService {
         if (parent?.verification) run.verification = structuredClone(parent.verification);
       }
       this.assertBudget(run);
-      const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
+      const anchor = project.teamworkDir ? realpathSync(this.config.sync?.homeDir ?? homedir()) : undefined;
+      if (anchor) {
+        assertTeamworkPath(this.config, root);
+        ensureHostDirectory(anchor, root, 0o750);
+      } else ensureDefaultTeamRoot(root, true);
+      const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, root, ...(anchor ? { anchor } : {}), source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
       this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
       this.operation(stored, "prepare", async signal => this.startInProject(run.projectId, async () => {
         const assertParent = () => {
@@ -178,7 +213,9 @@ export class TeamService {
             throw new TeamError(409, "parent-workspace-changed", "The previous goal run changed while its continuation was being prepared.");
         };
         assertParent();
-        const workspace = await prepareTeamWorkspace(source.path, this.config.teams!.workspaceDir, run.id, this.config.teams?.commandPrefix, signal, source.head, source.startCommit);
+        if (project.teamworkDir) assertTeamworkPath(this.config, root);
+        this.assertRunPath(stored, teamWorkspacePath(root, directoryName), true);
+        const workspace = await prepareTeamWorkspace(source.path, root, directoryName, branch, this.config.teams?.commandPrefix, signal, source.head, anchor, source.startCommit);
         assertParent();
         if (project.team?.setup) {
           const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
@@ -430,7 +467,7 @@ export class TeamService {
         if (run.reason !== reason) { run.reason = reason; this.save(stored); }
       }
       if (stored.pending) return;
-      assertTeamPath(this.config.teams!.workspaceDir, run.workspace);
+      this.assertRunPath(stored, run.workspace);
       for (const member of run.members.filter(item => item.revision === run.revision && activeMember(item))) {
         if (member.status === "queued") { await this.launch(stored, member); continue; }
         if (!member.report) {
@@ -599,6 +636,7 @@ export class TeamService {
     const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id, feedback);
     run.status = role === "project-manager" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
     this.operation(stored, "member", async signal => {
+      this.assertRunPath(stored, run.workspace);
       const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal);
       // Bootstrap dependencies exist only after the first implementation. A failed
       // setup must not prevent the integrator from repairing the project.
@@ -619,7 +657,7 @@ export class TeamService {
   }
   private async launch(stored: Stored, member: TeamMember) {
     this.assertBudget(stored.run);
-    assertTeamPath(this.config.teams!.workspaceDir, member.cwd);
+    this.assertRunPath(stored, member.cwd);
     // Recover an already-created assignment even while Linear is unavailable. A new
     // process requires the bridge's fresh feature and parent issue observations.
     if (!this.hasLaunch(member)) {
@@ -640,7 +678,7 @@ export class TeamService {
     }
     // All launch fields were persisted with the queued member before this call.
     let result;
-    try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession({ requestId: member.sessionId, provider: member.provider ?? stored.run.provider, projectId: stored.run.projectId, title: member.title, prompt: member.prompt }, assignment(member), member.cwd, member.modelProfile)); }
+    try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession({ requestId: member.sessionId, provider: member.provider ?? stored.run.provider, projectId: stored.run.projectId, title: member.title, prompt: member.prompt }, assignment(member), member.cwd, member.modelProfile, stored.root)); }
     catch (error) { if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; } throw error; }
     member.status = result.status === "unavailable" ? "unavailable" : "running"; member.startedAt ??= timestamp(); this.save(stored);
   }

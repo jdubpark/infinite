@@ -237,13 +237,13 @@ export class Manager {
     this.serial = operation.catch(() => {});
     return operation;
   }
-  /** The team scheduler owns cwd selection. Public create requests never accept this override. */
-  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile): Promise<Session & WorkerState> {
+  /** The team scheduler owns cwd selection, below the root its run was created under. Public create requests never accept this override. */
+  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
     const selection = modelProfile ? teamModelProfileSchema.parse(modelProfile) : undefined;
     if (selection && selection.provider !== request.provider) throw new ContentError("The team model profile does not match its assigned provider", 400);
-    const root = realpathSync(this.config.teams.workspaceDir);
+    const root = realpathSync(workspaceRoot ?? this.config.teams.workspaceDir);
     const canonical = realpathSync(cwd);
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);

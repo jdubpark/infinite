@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { startHost, waitFor } from "./helpers.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -102,5 +102,19 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
           await host.fetchApi(`/teams/${run.id}/cancel`, "owner", { requestId: randomUUID(), revision: run.revision });
     } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
   };
-  return { host, source, receipts, base, create, get, settled, close };
+  /** Serve the fixture's parent folder as the sync home and enroll a sibling teamwork folder through the API. */
+  const enrollTeamwork = async (sync: Partial<NonNullable<Config["sync"]>> = {}, teamwork = "teamwork") => {
+    const home = realpathSync(dirname(source));
+    host.config.sync = { homeDir: home, ...sync };
+    await host.stopApi();
+    writeFileSync(join(host.root, "config.json"), JSON.stringify(host.config));
+    await host.start();
+    const current = await host.fetchApi("/projects/rehearsal/team", "owner");
+    assert.equal(current.status, 200, JSON.stringify(current.body));
+    const saved = await host.fetchApi("/projects/rehearsal/team", "owner", { requestId: randomUUID(), revision: current.body.revision, team: current.body.team, teamwork }, {}, "PUT");
+    assert.equal(saved.status, 200, JSON.stringify(saved.body));
+    assert.equal(saved.body.teamwork, teamwork);
+    return join(home, ...teamwork.split("/"));
+  };
+  return { host, source, receipts, base, create, get, settled, close, enrollTeamwork };
 }

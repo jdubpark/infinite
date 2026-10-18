@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { homedir } from "node:os";
 import { z } from "zod";
 import { validateLinearConfig } from "./config.js";
 import type { Config, Project } from "./types.js";
 import { teamProjectSchema, type TeamCommand } from "./team-types.js";
 import { TeamError, teamCommand } from "./team-workspace.js";
 import { unseal, writeSealed } from "./vault.js";
+import { homeRelativePath } from "./mirrored-projects.js";
 
 const enrollmentTeamSchema = teamProjectSchema;
 const enrollmentLinearSchema = z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict();
@@ -15,6 +17,7 @@ export const repoEnrollmentRequestSchema = z.object({
   revision: z.number().int().min(0),
   team: enrollmentTeamSchema,
   linear: z.union([enrollmentLinearSchema, z.null()]).optional(),
+  teamwork: z.union([z.string().refine(homeRelativePath), z.null()]).optional(),
 }).strict();
 export type RepoEnrollmentRequest = z.infer<typeof repoEnrollmentRequestSchema>;
 
@@ -24,6 +27,7 @@ export interface RepoEnrollmentView {
   path: string;
   team?: z.infer<typeof enrollmentTeamSchema>;
   linear?: z.infer<typeof enrollmentLinearSchema>;
+  teamwork?: string | null;
   revision: number;
   execution: "cloud" | "local";
   hostSetup: { ready: boolean; missing: string[] };
@@ -34,6 +38,7 @@ interface StoredEnrollment {
   team: z.infer<typeof enrollmentTeamSchema>;
   /** null records an explicit removal; absence means no project overlay was saved. */
   linear?: z.infer<typeof enrollmentLinearSchema> | null;
+  teamwork?: string | null;
   revision: number;
 }
 interface Receipt { fingerprint: string; projectId: string; path: string; response: RepoEnrollmentView }
@@ -43,6 +48,43 @@ interface Options { isBusy?: (projectId: string) => boolean | Promise<boolean> }
 const emptyStore = (): EnrollmentStore => ({ version: 1, projects: {}, requests: {} });
 const canonicalPath = (path: string) => realpathSync(resolve(path));
 const fingerprint = (value: RepoEnrollmentRequest) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+
+/** Recheck a saved teamwork root against current host paths before using it. */
+export function assertTeamworkPath(config: Config, path: string) {
+  const home = canonicalMissing(resolve(config.sync?.homeDir ?? homedir()));
+  const target = resolve(path);
+  if (target === home || !target.startsWith(home.endsWith(sep) ? home : `${home}${sep}`))
+    throw new TeamError(409, "teamwork-path-invalid", "The teamwork folder must be below the sync home directory.");
+  let current = home;
+  for (const part of relative(home, target).split(sep)) {
+    current = join(current, part);
+    try {
+      const info = lstatSync(current);
+      if (info.isSymbolicLink()) throw new TeamError(409, "teamwork-path-symlink", "The teamwork folder cannot contain a symbolic link.");
+      if (!info.isDirectory()) throw new TeamError(409, "teamwork-path-invalid", "The teamwork folder path contains a non-directory component.");
+    } catch (error) {
+      if (error instanceof TeamError || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  const comparable = (value: string) => { try { return canonicalMissing(resolve(value)); } catch { return resolve(value); } };
+  const conflicts = [...config.projects.map(project => project.path), config.stateDir, config.runDir, config.keyFile,
+    config.teams?.workspaceDir, config.linear?.apiKeyFile, config.push?.accessTokenFile,
+    config.remote?.relay?.tokenFile, config.summaries?.apiKeyFile].filter((value): value is string => Boolean(value));
+  const overlaps = (left: string, right: string) => {
+    const rel = relative(left, right);
+    return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+  if (conflicts.some(value => { const other = comparable(value); return overlaps(target, other) || overlaps(other, target); }))
+    throw new TeamError(409, "teamwork-path-conflict", "The teamwork folder overlaps a project or protected host path.");
+}
+
+function canonicalMissing(path: string): string {
+  try { return realpathSync(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(path) === path) throw error;
+    return join(canonicalMissing(dirname(path)), basename(path));
+  }
+}
 
 /** Applies owner-authenticated team enrollment overlays after mirrored projects have loaded. */
 export class RepoEnrollmentService {
@@ -62,7 +104,8 @@ export class RepoEnrollmentService {
     const saved = this.store.projects[projectId];
     this.assertPathBinding(project, saved);
     this.assertProjectPathAllowed(this.projectPath(project));
-    return this.view(project, saved?.revision ?? 0);
+    // A conflicting saved folder stays readable so repo init can replace or remove it.
+    return this.view(project, saved?.revision ?? 0, saved);
   }
 
   async put(projectId: string, input: RepoEnrollmentRequest): Promise<RepoEnrollmentView> {
@@ -97,6 +140,8 @@ export class RepoEnrollmentService {
     if (await this.options.isBusy?.(projectId)) throw new TeamError(409, "project-busy", "Repository enrollment cannot change while a team run or project synchronization is active.");
 
     this.assertProjectPathAllowed(path);
+    const teamworkPath = request.teamwork === undefined ? (current?.teamwork ? this.teamworkPath(current.teamwork) : project.teamworkDir) : request.teamwork === null ? undefined : this.teamworkPath(request.teamwork);
+    this.assertTeamworkPathAllowed(teamworkPath);
     const commit = await this.assertCleanGitRoot(project.path, this.config.teams?.commandPrefix);
     if (!commit) throw new TeamError(409, "project-git-head-required", "Commit the repository before enrolling it for team work.");
 
@@ -106,9 +151,10 @@ export class RepoEnrollmentService {
       path,
       team: structuredClone(request.team),
       linear: request.linear === undefined ? inheritedLinear : request.linear,
+      ...(request.teamwork !== undefined ? { teamwork: request.teamwork === null ? null : this.relativeTeamworkPath(teamworkPath!) } : current?.teamwork !== undefined ? { teamwork: current.teamwork } : project.teamworkDir ? { teamwork: this.relativeTeamworkPath(teamworkPath!) } : {}),
       revision: nextRevision,
     };
-    const prospective: Config = { ...this.config, projects: this.config.projects.map(item => item.id === projectId ? { ...item, team: entry.team, ...(entry.linear === null ? { linear: undefined } : entry.linear ? { linear: entry.linear } : {}) } : item) };
+    const prospective: Config = { ...this.config, projects: this.config.projects.map(item => item.id === projectId ? { ...item, team: entry.team, ...(entry.teamwork ? { teamworkDir: teamworkPath } : {}), ...(entry.linear === null ? { linear: undefined } : entry.linear ? { linear: entry.linear } : {}) } : item) };
     try { validateLinearConfig(prospective); }
     catch { throw new TeamError(409, "linear-configuration-invalid", "The requested Linear mapping conflicts with the host credential or protected workspace paths."); }
     if (await this.options.isBusy?.(projectId)) throw new TeamError(409, "project-busy", "Repository enrollment cannot change while a team run or project synchronization is active.");
@@ -116,9 +162,11 @@ export class RepoEnrollmentService {
       throw new TeamError(409, "project-changed", "The repository changed during enrollment validation. Refresh it before saving.");
 
     const responseProject: Project = { ...project, team: entry.team as Project["team"] };
+    if (entry.teamwork) responseProject.teamworkDir = teamworkPath;
+    else delete responseProject.teamworkDir;
     if (entry.linear) responseProject.linear = entry.linear;
     else delete responseProject.linear;
-    const response = this.view(responseProject, nextRevision);
+    const response = this.view(responseProject, nextRevision, entry);
     const next: EnrollmentStore = {
       version: 1,
       projects: { ...this.store.projects, [projectId]: entry },
@@ -127,6 +175,8 @@ export class RepoEnrollmentService {
     writeSealed(this.file, this.key, "repo-enrollments", next);
     this.store = next;
     Object.assign(project, { team: entry.team });
+    if (entry.teamwork) project.teamworkDir = teamworkPath;
+    else delete project.teamworkDir;
     if (entry.linear === null) delete project.linear;
     else if (entry.linear) project.linear = entry.linear;
     return structuredClone(response);
@@ -149,6 +199,24 @@ export class RepoEnrollmentService {
 
   private pathMismatch() { return new TeamError(409, "project-path-mismatch", "The configured repository path no longer matches its saved enrollment."); }
 
+  private syncHome() { return canonicalMissing(resolve(this.config.sync?.homeDir ?? homedir())); }
+
+  private teamworkPath(path: string): string {
+    if (!homeRelativePath(path)) throw new TeamError(409, "teamwork-path-invalid", "The teamwork folder must be a valid home-relative path.");
+    const home = this.syncHome();
+    const target = resolve(home, ...path.split("/"));
+    if (target === home || !target.startsWith(home.endsWith(sep) ? home : `${home}${sep}`))
+      throw new TeamError(409, "teamwork-path-invalid", "The teamwork folder must be below the sync home directory.");
+    return target;
+  }
+
+  private relativeTeamworkPath(path: string) { return relative(this.syncHome(), path).split(sep).join("/"); }
+
+  private assertTeamworkPathAllowed(path?: string) {
+    if (!path) return;
+    assertTeamworkPath(this.config, path);
+  }
+
   private assertProjectPathAllowed(path: string) {
     const protectedPaths = [
       this.config.stateDir, this.config.runDir, this.config.keyFile, this.config.teams?.workspaceDir,
@@ -168,7 +236,7 @@ export class RepoEnrollmentService {
     }
   }
 
-  private view(project: Project, revision: number): RepoEnrollmentView {
+  private view(project: Project, revision: number, saved?: StoredEnrollment): RepoEnrollmentView {
     const missing: string[] = [];
     if (!this.config.teams?.workspaceDir) missing.push("teams.workspaceDir");
     if (!this.config.teams?.commandPrefix && Object.values(this.config.agents).some(agent => agent && /(^|\/)sudo$/.test(agent.command)))
@@ -179,6 +247,7 @@ export class RepoEnrollmentService {
       path: project.path,
       ...(project.team ? { team: structuredClone(project.team) as RepoEnrollmentView["team"] } : {}),
       ...(project.linear ? { linear: { ...project.linear } } : {}),
+      ...(saved && Object.hasOwn(saved, "teamwork") ? { teamwork: saved.teamwork ?? null } : Object.hasOwn(project, "teamworkDir") ? { teamwork: project.teamworkDir ? this.relativeTeamworkPath(project.teamworkDir) : null } : {}),
       revision,
       execution: this.config.environment === "cloud" ? "cloud" : "local",
       hostSetup: { ready: missing.length === 0, missing },
@@ -186,19 +255,23 @@ export class RepoEnrollmentService {
   }
 
   private applyOverlays() {
-    for (const [projectId, enrollment] of Object.entries(this.store.projects)) {
-      const project = this.config.projects.find(item => item.id === projectId);
-      if (!project) continue;
-      try {
-        if (this.projectPath(project) !== enrollment.path) continue;
-        this.assertProjectPathAllowed(enrollment.path);
-      }
-      catch { continue; }
-      project.team = enrollment.team as Project["team"];
-      if (Object.hasOwn(enrollment, "linear")) {
-        if (enrollment.linear) project.linear = enrollment.linear;
-        else delete project.linear;
-      }
+    for (const projectId of Object.keys(this.store.projects)) this.restore(projectId);
+  }
+
+  restore(projectId: string) {
+    const enrollment = this.store.projects[projectId];
+    const project = this.config.projects.find(item => item.id === projectId);
+    if (!project || !enrollment) return;
+    try {
+      if (this.projectPath(project) !== enrollment.path) return;
+      this.assertProjectPathAllowed(enrollment.path);
+      if (enrollment.teamwork) project.teamworkDir = this.teamworkPath(enrollment.teamwork);
+      else if (Object.hasOwn(enrollment, "teamwork")) delete project.teamworkDir;
+    } catch { return; }
+    project.team = enrollment.team as Project["team"];
+    if (Object.hasOwn(enrollment, "linear")) {
+      if (enrollment.linear) project.linear = enrollment.linear;
+      else delete project.linear;
     }
   }
 

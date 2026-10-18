@@ -9,15 +9,15 @@ const MICRO_DOLLARS_PER_DOLLAR = 1_000_000;
 
 /**
  * Prices one record. A configured price table wins over the reported cost. Prices are USD per
- * million tokens, so tokens times price gives micro-dollars directly. Reasoning tokens are not
- * priced separately because providers already count them in output.
+ * million tokens, so tokens times price gives micro-dollars directly. Reasoning tokens bill at
+ * the output rate.
  */
 export function priceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined): { cost: number; pricing: Pricing } {
   const price = prices?.[`${record.providerId}/${record.modelId}`];
   if (price) {
     const { tokens } = record;
     const microDollars = tokens.input * price.input
-      + tokens.output * price.output
+      + (tokens.output + tokens.reasoning) * price.output
       + tokens.cacheRead * (price.cacheRead ?? price.input)
       + tokens.cacheWrite * (price.cacheWrite ?? price.input);
     return { cost: Math.round(microDollars) / MICRO_DOLLARS_PER_DOLLAR, pricing: "configured" };
@@ -40,9 +40,9 @@ export function periodStart(period: "day" | "week" | "month", now: Date): Date {
 export function sumUsage(rows: { cost: number; pricing: Pricing; tokens: UsageTokens }[]): UsageTotals {
   const tokens: UsageTokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
   const pricing: Record<Pricing, number> = { configured: 0, provider: 0, unknown: 0 };
-  let microDollars = 0;
+  let dollars = 0;
   for (const row of rows) {
-    microDollars += Math.round(row.cost * MICRO_DOLLARS_PER_DOLLAR);
+    dollars += row.cost;
     pricing[row.pricing] += 1;
     tokens.input += row.tokens.input;
     tokens.output += row.tokens.output;
@@ -50,5 +50,5 @@ export function sumUsage(rows: { cost: number; pricing: Pricing; tokens: UsageTo
     tokens.cacheRead += row.tokens.cacheRead;
     tokens.cacheWrite += row.tokens.cacheWrite;
   }
-  return { cost: microDollars / MICRO_DOLLARS_PER_DOLLAR, tokens, messages: rows.length, pricing };
+  return { cost: Math.round(dollars * MICRO_DOLLARS_PER_DOLLAR) / MICRO_DOLLARS_PER_DOLLAR, tokens, messages: rows.length, pricing };
 }

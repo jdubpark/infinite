@@ -17,6 +17,11 @@ test("configured prices override the reported cost and are per million tokens", 
   assert.deepEqual(priceUsage(record, { "deepseek/deepseek-flash": { input: 1, output: 1 } }).cost, 1 + 0.5 + 2); // cacheRead defaults to input
 });
 
+test("reasoning tokens bill at the output rate", () => {
+  const record = { ...base, tokens: { input: 0, output: 0, reasoning: 1_000_000, cacheRead: 0, cacheWrite: 0 } };
+  assert.deepEqual(priceUsage(record, { "deepseek/deepseek-flash": { input: 1, output: 2 } }), { cost: 2, pricing: "configured" });
+});
+
 test("reported cost is used without a table, and zero without a table is unknown", () => {
   assert.deepEqual(priceUsage({ ...base, reportedCost: 0.02 }, undefined), { cost: 0.02, pricing: "provider" });
   assert.deepEqual(priceUsage({ ...base, reportedCost: 0 }, {}), { cost: 0, pricing: "unknown" });
@@ -28,6 +33,12 @@ test("period starts are UTC day, Monday week, and month", () => {
   assert.equal(periodStart("week", now).toISOString(), "2026-10-12T00:00:00.000Z");
   assert.equal(periodStart("month", now).toISOString(), "2026-10-01T00:00:00.000Z");
   assert.equal(periodStart("week", new Date("2026-10-18T00:00:00Z")).toISOString(), "2026-10-12T00:00:00.000Z"); // a Sunday ends the week
+});
+
+test("sumUsage rounds the total to micro-dollars once, not per row", () => {
+  const zero = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+  const totals = sumUsage([0.0000004, 0.0000004, 0.0000004].map((cost) => ({ cost, pricing: "provider" as const, tokens: zero })));
+  assert.equal(totals.cost, 0.000001);
 });
 
 test("sumUsage adds costs, tokens, and counts pricing sources", () => {

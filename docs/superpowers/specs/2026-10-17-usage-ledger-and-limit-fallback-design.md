@@ -147,6 +147,8 @@ What an observation may do:
 - **Write the host-level limit entry.** Only a corroborated observation writes `providerLimits`. The entry lasts until the provider's stated `resetsAt`, capped at 24 hours; when the provider stated no reset time the entry lasts 15 minutes. There is no one-hour default.
 - **Annotate.** Every observation, whatever its confidence, is recorded in the session's journal and attention record for people to see.
 
+Observations are grouped into a **limit episode** held in the worker's own state, never keyed on the displayed attention record. An episode begins at the first observation from any source and ends after three consecutive screen checks with no match and no armed corroboration, or when the agent completes a turn that did not fail. Within one episode the worker journals at most one single-source and one corroborated signal, whatever order the hook and the screen arrive in. A successful turn also clears the attention record's `limit` so a stale observation is not shown after the agent has recovered. (Added 2026-10-18 after review.)
+
 ### Host-level limit memory
 
 `TeamService` keeps `providerLimits`, a map from provider to `{ detectedAt, resetsAt?, expiresAt, sessionId, runId?, confidence }`, persisted in a sealed file. A corroborated limit is recorded here regardless of which run observed it, with the expiry rules above, and is cleared early when a member of that provider later completes a turn successfully. `GET /api/me` and the team views expose the current entries so the dashboards can say why members are launching on fallbacks.

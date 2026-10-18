@@ -1,0 +1,54 @@
+import type { UsageConfig } from "./config.js";
+
+export interface UsageTokens { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
+export interface UsageRecord { provider: "opencode"; providerId: string; modelId: string; messageId: string; completedAt: string; tokens: UsageTokens; reportedCost: number }
+export type Pricing = "configured" | "provider" | "unknown";
+export interface UsageTotals { cost: number; tokens: UsageTokens; messages: number; pricing: Record<Pricing, number> }
+
+const MICRO_DOLLARS_PER_DOLLAR = 1_000_000;
+
+/**
+ * Prices one record. A configured price table wins over the reported cost. Prices are USD per
+ * million tokens, so tokens times price gives micro-dollars directly. Reasoning tokens are not
+ * priced separately because providers already count them in output.
+ */
+export function priceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined): { cost: number; pricing: Pricing } {
+  const price = prices?.[`${record.providerId}/${record.modelId}`];
+  if (price) {
+    const { tokens } = record;
+    const microDollars = tokens.input * price.input
+      + tokens.output * price.output
+      + tokens.cacheRead * (price.cacheRead ?? price.input)
+      + tokens.cacheWrite * (price.cacheWrite ?? price.input);
+    return { cost: Math.round(microDollars) / MICRO_DOLLARS_PER_DOLLAR, pricing: "configured" };
+  }
+  if (record.reportedCost > 0) return { cost: record.reportedCost, pricing: "provider" };
+  return { cost: 0, pricing: "unknown" };
+}
+
+/** Start of the budget period containing `now`, in UTC. Weeks start on Monday. */
+export function periodStart(period: "day" | "week" | "month", now: Date): Date {
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+  const day = now.getUTCDate();
+  if (period === "month") return new Date(Date.UTC(year, month, 1));
+  if (period === "day") return new Date(Date.UTC(year, month, day));
+  const daysSinceMonday = (now.getUTCDay() + 6) % 7;
+  return new Date(Date.UTC(year, month, day - daysSinceMonday));
+}
+
+export function sumUsage(rows: { cost: number; pricing: Pricing; tokens: UsageTokens }[]): UsageTotals {
+  const tokens: UsageTokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+  const pricing: Record<Pricing, number> = { configured: 0, provider: 0, unknown: 0 };
+  let microDollars = 0;
+  for (const row of rows) {
+    microDollars += Math.round(row.cost * MICRO_DOLLARS_PER_DOLLAR);
+    pricing[row.pricing] += 1;
+    tokens.input += row.tokens.input;
+    tokens.output += row.tokens.output;
+    tokens.reasoning += row.tokens.reasoning;
+    tokens.cacheRead += row.tokens.cacheRead;
+    tokens.cacheWrite += row.tokens.cacheWrite;
+  }
+  return { cost: microDollars / MICRO_DOLLARS_PER_DOLLAR, tokens, messages: rows.length, pricing };
+}

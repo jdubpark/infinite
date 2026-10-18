@@ -1,7 +1,7 @@
-import { appendFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 
 if (process.argv[2] === "--command-prefix") {
   const [, receiptDir, command, ...args] = process.argv.slice(2);
@@ -10,6 +10,18 @@ if (process.argv[2] === "--command-prefix") {
   child.once("error", () => process.exit(127));
   child.once("exit", code => process.exit(code ?? 128));
   await new Promise(() => {});
+}
+if (process.argv[2] === "--permission-setup") {
+  appendFileSync(join(process.argv[3], "permission-setup.jsonl"), JSON.stringify({ cwd: process.cwd() }) + "\n", { mode: 0o600 });
+  process.exit(0);
+}
+if (process.argv[2] === "--bootstrap-setup") {
+  if (!existsSync("check.mjs")) throw new Error("The implemented check file is missing");
+  const check = readFileSync("check.mjs", "utf8");
+  if (process.argv[3] !== "bootstrap-fail" && !check.includes("a.txt"))
+    throw new Error("The implemented check does not cover the requested files");
+  process.stdout.write("Bootstrap setup completed.\n");
+  process.exit(0);
 }
 if (process.argv[2] === "--hold-check") {
   const receiptDir = process.argv[3];
@@ -30,6 +42,11 @@ const assignment = JSON.parse(process.env.INFINITE_TEAM_ASSIGNMENT ?? "null");
 if (!assignment || !process.env.INFINITE_HOOK_URL || !process.env.INFINITE_HOOK_TOKEN)
   throw new Error("The team worker did not provide its reporting capability");
 const receiptFile = join(receiptDir, `${assignment.memberId}.json`);
+// Peers poll this directory while members run. Replace a receipt whole, never truncate it in place.
+function saveReceipt() {
+  writeFileSync(`${receiptFile}.tmp`, JSON.stringify(receipt), { mode: 0o600 });
+  renameSync(`${receiptFile}.tmp`, receiptFile);
+}
 const providerIndex = process.argv.indexOf("--fixture-provider");
 const receipt = { ...assignment, cwd: process.cwd(), pid: process.pid, startedAt: Date.now(),
   ...(providerIndex >= 0 ? { provider: process.argv[providerIndex + 1], argv: process.argv.slice(2) } : {}) };
@@ -50,10 +67,12 @@ if (receipt.provider === "opencode") {
     receipt.variant = args[variant + 1];
   }
   receipt.prompt = args[boundary + 1];
+  if (scenario === "integrator-limit" && assignment.role === "integrator")
+    receipt.sawPartial = existsSync("repair.txt");
 }
 // A limit fallback must start in the limited member's working copy, partial file included.
 if (scenario.startsWith("limit")) receipt.sawPartial = existsSync("a.txt");
-writeFileSync(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
+saveReceipt();
 
 async function report(value, overrides = {}) {
   const response = await fetch(`${process.env.INFINITE_HOOK_URL}/team-report`, {
@@ -119,12 +138,16 @@ async function main() {
       { id: "a", title: "Build the first file", instructions: "Write a.txt with the current revision", paths: ["a.txt"], dependsOn: [] },
       { id: "b", title: "Build the second file", instructions: "Write b.txt with the current revision", paths: ["b.txt"], dependsOn: [] },
     ];
+    if (scenario.startsWith("bootstrap")) tasks[0].paths.push("check.mjs");
     if (scenario === "usage") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "deepseek-high";
     } else if (scenario === "mixed") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "astra-xhigh";
+    } else if (scenario.startsWith("permissions") || scenario.startsWith("delivery") || scenario === "integrator-limit") {
+      tasks[0].agentProfileId = "haiku";
+      tasks[1].agentProfileId = "codex-light";
     } else if (scenario.startsWith("limit")) {
       tasks[0].agentProfileId = "haiku";
       tasks[1].agentProfileId = "astra-light";
@@ -134,11 +157,32 @@ async function main() {
       tasks[0].agentProfileId = "spark-high";
       Object.assign(tasks[1], JSON.parse(readFileSync(join(receiptDir, "invalid-profile.json"), "utf8")));
     }
-    await report({ kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks });
+    const verification = { setup: { command: process.execPath, args: [process.argv[1], "--bootstrap-setup", scenario] },
+      checks: [{ command: process.execPath, args: ["check.mjs"] }] };
+    if (scenario === "bootstrap-change" && assignment.revision > 1)
+      verification.checks[0].args.push("--different");
+    await report({ kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
+      ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) });
+  } else if (assignment.role === "permission-coordinator") {
+    const launchPrompt = process.argv.at(-1) ?? "";
+    const decisionId = /"decisionId":"([a-f0-9-]{36})"/.exec(launchPrompt)?.[1];
+    if (!decisionId) throw new Error("The permission review assignment omitted its decision identity");
+    if (!["permissions", "permissions-restart", "permissions-judge-exit"].includes(scenario)) {
+      writeFileSync(join(receiptDir, `${assignment.runId}.judge-ready`), "ready", { mode: 0o600 });
+      const until = Date.now() + 30000;
+      while (!existsSync(join(receiptDir, `${assignment.runId}.judge-release`))) {
+        if (Date.now() >= until) throw new Error("The test did not release the permission coordinator");
+        await new Promise(resolve => setTimeout(resolve, 40));
+      }
+    }
+    if (scenario === "permissions-judge-exit") process.exit(2);
+    await report({ kind: "permission-decision", decisionId: scenario === "permissions-foreign" ? randomUUID() : decisionId,
+      verdict: scenario === "permissions-escalate" ? "escalate" : "approve-once",
+      summary: "The request is limited to reading the assigned project file for the stated objective." });
   } else if (assignment.role === "implementer") {
     await waitForPeer();
     const asked = join(receiptDir, `${assignment.runId}.${assignment.taskId}.asked`);
-    if (scenario === "mixed" && assignment.taskId === "b" && !existsSync(asked)) {
+    if ((scenario === "mixed" || (scenario === "bootstrap-replan" || scenario === "bootstrap-change") && assignment.revision === 1) && assignment.taskId === "b" && !existsSync(asked)) {
       writeFileSync(asked, "asked", { mode: 0o600 });
       await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"] });
       return;
@@ -159,7 +203,7 @@ async function main() {
       const hour = reset.getUTCHours();
       receipt.limitNotice = `You've hit your session limit · resets ${hour % 12 || 12}:${String(reset.getUTCMinutes()).padStart(2, "0")}${hour < 12 ? "am" : "pm"}`;
       receipt.expectedResetsAt = reset.toISOString();
-      writeFileSync(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
+      saveReceipt();
       process.stdout.write(`${receipt.limitNotice}\n`);
       await new Promise(resolve => setTimeout(resolve, 500));
       const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
@@ -173,6 +217,48 @@ async function main() {
     if (scenario === "question") {
       while (!existsSync(join(receiptDir, `${assignment.runId}.release`)))
         await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    if (scenario.startsWith("permissions") && assignment.taskId === "a") {
+      const menu = scenario === "permissions-restart"
+        ? `\nBash command\ncat original.txt\nDo you want to proceed?\n${Array.from({ length: 8 }, (_, index) => `  ${index + 1}. No, stop`).join("\n")}\n❯ 9. Yes\n`
+        : "\nBash command\ncat original.txt\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again for Bash commands\n  3. No, and tell Claude what to do differently (esc)\n";
+      process.stdout.write(`\u001b[2J\u001b[H${menu}`);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "cat original.txt" } }),
+      });
+      if (response.status !== 204) throw new Error(`Provider permission hook was refused with status ${response.status}`);
+      if (scenario === "permissions-stale") {
+        writeFileSync(join(receiptDir, `${assignment.runId}.target-ready`), "ready", { mode: 0o600 });
+        const until = Date.now() + 30000;
+        while (!existsSync(join(receiptDir, `${assignment.runId}.target-change`))) {
+          if (Date.now() >= until) throw new Error("The test did not change the permission prompt");
+          await new Promise(resolve => setTimeout(resolve, 40));
+        }
+        process.stdout.write("\u001b[2J\u001b[H");
+        await new Promise(resolve => setTimeout(resolve, 250));
+        const closed = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ hook_event_name: "PermissionDenied", reason: "The fixture changed the pending request" }),
+        });
+        if (closed.status !== 204) throw new Error(`Provider prompt change was refused with status ${closed.status}`);
+      }
+      await new Promise(resolve => process.stdin.once("data", resolve));
+      if (scenario === "permissions-restart") await new Promise(resolve => setTimeout(resolve, 5000));
+      process.stdout.write("\u001b[2J\u001b[HPermission request closed.\n");
+    }
+    if (scenario.startsWith("bootstrap") && assignment.taskId === "a") {
+      const check = scenario === "bootstrap-fail"
+        ? 'console.error("Coordinator check failed"); process.exit(17);'
+        : [
+          'import assert from "node:assert/strict";',
+          'import { readFileSync } from "node:fs";',
+          'assert.equal(readFileSync("a.txt", "utf8"), readFileSync("b.txt", "utf8"));',
+        ].join("\n");
+      writeFileSync("check.mjs", check + "\n");
     }
     // Keep both processes alive after the barrier so overlap can be measured
     // independently of the member states returned by the API.
@@ -194,11 +280,40 @@ async function main() {
       ].join("\n") + "\n");
     }
     receipt.finishedAt = Date.now();
-    writeFileSync(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
+    saveReceipt();
     await report({ kind: "result", summary: `Implemented ${assignment.taskId}.txt` });
   } else if (assignment.role === "integrator") {
+    if (scenario === "integrator-limit" && receipt.provider === "claude") {
+      writeFileSync("repair.txt", "partial repair from the limited integrator\n");
+      console.log("You've hit your session limit · resets 3:45pm");
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}` },
+        body: JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit" }),
+      });
+      if (response.status !== 204) throw new Error(`Claude limit hook was refused with status ${response.status}`);
+      await new Promise(() => {});
+    }
     writeFileSync("repair.txt", `${assignment.memberId}\n`);
     await report({ kind: "result", summary: "Applied a local repair for verification" });
+  } else if (assignment.role === "delivery") {
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const base = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim().split("\n")[0];
+    const mergeCommit = execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", `${scenario === "delivery-baseline-changed" ? base : head}^{tree}`, "-p", base, "-m", "Synthetic squash delivery"], { encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/heads/synthetic-merge", mergeCommit]);
+    writeFileSync(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }), { mode: 0o600 });
+    if (scenario === "delivery-hold" || scenario === "delivery-unreported") {
+      while (!existsSync(join(receiptDir, "delivery-release"))) await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    if (scenario === "delivery-unreported") process.exit(0);
+    if (scenario === "delivery-repair" && !existsSync("repair.txt")) {
+      await report({ kind: "delivery-repair", headCommit: head, summary: "CI requires a scoped repair before another review." }); return;
+    }
+    if (scenario === "delivery-dirty") writeFileSync("unreviewed.txt", "This was not reviewed.\n");
+    await report({ kind: "delivery", headCommit: scenario === "delivery-stale" ? "0".repeat(40) : head,
+      pullRequestUrl: scenario === "delivery-foreign" ? "https://github.com/example/other/pull/1" : "https://github.com/example/app/pull/1",
+      mergeCommit: scenario === "delivery-baseline-tree" ? execFileSync("git", ["rev-parse", `${head}^{tree}`], { encoding: "utf8" }).trim() : mergeCommit, summary: "Synthetic delivery report exercising host binding; no GitHub request was made." });
   } else if (assignment.role === "reviewer") {
     for (const name of ["a.txt", "b.txt"])
       if (!readFileSync(name, "utf8").startsWith("revision ")) throw new Error("The review checkout lacks integrated work");

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -64,7 +65,9 @@ async function main() {
       dataShape: "The progress object contains a numeric completed field", acceptance: [`The completed field is ${target}`],
       expectedOutcome: "The next progress step is available; product impact needs user evidence", uiChanges: scenario === "ui-evidence",
     }, tasks: [{ id: "progress", title: `Add progress step ${target}`, instructions: `Set completed to ${target} and leave no draft field`,
-      agentProfileId: "light", paths: [scenario === "scope" ? "outside.txt" : "features/progress.json"], dependsOn: [] }] });
+      agentProfileId: "light", paths: [scenario === "scope" ? "outside.txt" : "features/progress.json"], dependsOn: [] }],
+    ...(scenario === "bootstrap-goal" && progress.completed === 0
+      ? { verification: { checks: [{ command: process.execPath, args: ["check.mjs"] }] } } : {}) });
   } else if (assignment.role === "scout") {
     await until(() => readdirSync(receipts).filter(name => name.endsWith(".json"))
       .map(name => JSON.parse(readFileSync(join(receipts, name), "utf8")))
@@ -76,6 +79,8 @@ async function main() {
       evidence: [{ source: checks ? "check.mjs" : "features/progress.json",
         observation: checks ? "check.mjs validates progress" : `progress starts at ${progress.completed}` }] });
   } else if (assignment.role === "implementer") {
+    if (scenario === "bootstrap-goal" && progress.completed === 0)
+      await until(() => existsSync(join(receipts, "release-first-implementation")));
     const model = process.argv[process.argv.indexOf("--model") + 1];
     if (scenario === "cycles" && progress.completed === 0 && model !== "gpt-6-astra") {
       writeFileSync("features/progress.json", JSON.stringify({ completed: 0, draft: "Step prepared by the light worker" }) + "\n");
@@ -86,6 +91,12 @@ async function main() {
       throw new Error("Escalation discarded the first worker's partial edit");
     writeFileSync("features/progress.json", JSON.stringify({ completed: progress.completed + 1 }) + "\n");
     await report({ kind: "result", summary: "Implemented the next scoped progress step" });
+  } else if (assignment.role === "delivery") {
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const base = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim().split("\n")[0];
+    const mergeCommit = execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", `${head}^{tree}`, "-p", base, "-m", "Synthetic squash delivery"], { encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/heads/synthetic-merge", mergeCommit]);
+    await report({ kind: "delivery", headCommit: head, pullRequestUrl: "https://github.com/example/app/pull/1", mergeCommit, summary: "Synthetic merge report for goal lifecycle verification; no external GitHub operation." });
   } else if (assignment.role === "reviewer") {
     if (!Number.isInteger(progress.completed) || progress.completed < 1 || progress.draft)
       throw new Error("The reviewed implementation is incomplete");

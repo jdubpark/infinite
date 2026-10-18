@@ -49,4 +49,33 @@ If you find existing private information while working, remove or replace it and
 - Run `npm run check` (typecheck, tests, builds) before declaring host or shared-package work complete.
 - For the phone app, also run `npm run lint -w @infinite/mobile` and `npx tsc --noEmit` in `apps/mobile`.
 - Product, design, and protocol context: `PRODUCT.md`, `DESIGN.md`, `docs/architecture.md`, `docs/security.md`.
-- Do not weaken the honesty rules in `PRODUCT.md`: the host never infers task completion and never approves a provider permission on its own.
+- Do not weaken the honesty rules in `PRODUCT.md`: the host never infers task completion or approves a provider permission on its own. A strong coordinator may decide current one-shot requests only under explicit owner delegation, with recorded scope and guarded delivery.
+
+## Repository summaries and architecture review
+
+Use Jevcode's headless repository briefing agent for human-facing change summaries, substantial handoffs, and architecture review. The coordinator owns the brief; workers supply scoped evidence. Never invoke another briefing agent from within a briefing run.
+
+Use it to compress agent activity into meaningful changes, explain system responsibilities and boundaries, rank critical code for human inspection, draw the system and change diagrams, and identify constraints that should guide subsequent agent work. Prioritize permissions, session lifecycle, durable state, transport, provider adapters, and shared contracts when affected. Include important unchanged code and unresolved architectural questions.
+
+Configure `JEVCODE_ROOT` outside the repository to a built Jevcode installation on the execution host. Muse Spark 1.3 Contributor writes briefs through OpenCode, with DeepSeek V4.1 Flash as the fallback. Jev (TypeSafe System One) decides when a refresh is worth its cost, which sections are stale, and whether each claim's citations support it.
+
+Briefs refresh automatically. Where the execution host installs Jevcode's Stop hooks and this repository is opted in (`jevcode optin`, which covers every clone and worktree), every Claude Code and Codex turn ends with a detached `jevcode auto` check that costs no model tokens when nothing changed. Do not run briefs routinely. At a handoff, or before writing a human-facing summary, request a refresh with your own session transcript and read the result:
+
+```sh
+node "$JEVCODE_ROOT/scripts/jevcode.mjs" auto --repo "$PWD" --log "$SESSION_TRANSCRIPT"
+node "$JEVCODE_ROOT/scripts/jevcode.mjs" show --repo "$PWD"
+```
+
+For a forced full brief over an explicit range, set `REVIEW_BASE` to the comparison commit:
+
+```sh
+node "$JEVCODE_ROOT/scripts/jevcode.mjs" brief --repo "$PWD" --base "$REVIEW_BASE"
+```
+
+Run from the repository root. The base compares that commit to the current working tree; omitting it only reviews changes since HEAD. Add repeated `--focus` paths and `--log` files only for the assigned scope. Select logs explicitly; do not discover global histories. Keep reports and checkpoints outside tracked source. When the human says a brief was unhelpful, late, or wrong, record it with `jevcode feedback noise|late|wrong [--section NAME]`; Jevcode tunes its timing and claim checks from those outcomes. See the installation's `docs/repo-agent.md` for setup, state, data use, and collection limits.
+
+Lead the human summary with the outcome, system shape, and at most five ranked review questions with source references. Follow with meaningful changes, check evidence, guidance for agents, and gaps. Separate observed code, agent claims, and inference; label proposed guidance as proposed. Historical check logs do not certify the current tree, and a generated brief grants no approval or completion status. Required checks and independent review still apply.
+
+If OpenCode is unavailable, use `--runner codex`. If no allowed writer is available, use Jevcode's `prompt` or `context` command with the approved reviewer. If Jevcode itself is unavailable, report that gap and use the same brief structure directly. Do not install credentials, change provider configuration, or bypass permissions to produce a summary.
+
+Cloud sessions on the host get the same briefs from the host's repository-briefing runtime, which drives `jevcode auto` per session and serves the result at `GET /api/sessions/:id/summary`. Read [repository briefings](docs/repository-briefings.md) when configuring that runtime or inspecting its output.

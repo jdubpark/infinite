@@ -30,7 +30,23 @@ const schema = z
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),
     usage: usageConfigSchema.optional(),
-    sync: z.object({ sharedGroup: z.boolean().optional() }).strict().optional(),
+    sync: z.object({ sharedGroup: z.boolean().optional(), homeDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
+    // Model-written chat digests. The key file is read once at startup and never logged.
+    summaries: z.object({
+      model: z.string().min(1).max(100),
+      apiKeyFile: z.string().refine(isAbsolute, "Summary key file must be absolute"),
+      baseUrl: z.url().default("https://api.openai.com"),
+    }).strict().optional(),
+    repositoryBriefings: z.object({
+      command: z.string().refine(isAbsolute, "Repository briefing command must be absolute"),
+      args: z.array(z.string().max(4096)).default([]),
+      runner: z.enum(["muse", "deepseek", "codex"]).optional(),
+      model: z.string().min(1).max(100).optional(),
+      automatic: z.boolean().default(true),
+      intervalMs: z.number().int().min(100).default(5000),
+      cooldownMs: z.number().int().min(0).default(60000),
+      timeoutMs: z.number().int().min(10000).max(1800000).default(300000),
+    }).strict().optional(),
     port: z.number().int().min(0).max(65535),
     origin: z.url(),
     stateDir: z.string(),
@@ -56,7 +72,7 @@ const schema = z
           name: z.string(),
           path: z.string(),
           team: teamProjectSchema.optional(),
-          linear: z.object({ teamId: z.uuid() }).strict().optional(),
+          linear: z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict().optional(),
         }),
       )
       .min(1),
@@ -107,7 +123,7 @@ export function validateLinearConfig(config: Config) {
     const file = config.linear.apiKeyFile;
     if (!isAbsolute(file) || (statSync(file).mode & 0o777) !== 0o600 || !statSync(file).isFile()) throw new Error();
     const actual = realpathSync(file);
-    for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.map(project => project.path)].filter((value): value is string => Boolean(value))) {
+    for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
       let base: string;
       try { base = realpathSync(directory); } catch { base = resolve(directory); }
       const rel = relative(base, actual);

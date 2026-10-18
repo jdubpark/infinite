@@ -68,7 +68,7 @@ export class GoalService {
   list() { return [...this.records.values()].map(({ goal }) => this.get(goal.id)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   get(id: string) {
     const goal = structuredClone(this.record(id).goal);
-    const tracking = this.linear?.updateGoal(goal);
+    const tracking = this.linear?.updateGoal(goal, goal.linearTracking === true);
     goal.linear = this.linear?.getGoal(id) ?? tracking ?? goal.linear;
     const rollups = goal.cycles.map(cycle => {
       try {
@@ -105,18 +105,18 @@ export class GoalService {
       if (!this.enabled()) throw new TeamError(409, "goals-not-configured", "Configure a team lineup with a strong coordinator and reviewer before starting a goal.");
       if (Buffer.byteLength(JSON.stringify(request)) > 40000) throw new TeamError(409, "goal-too-large", "Keep the goal and evidence below 40 KiB. Link to longer source material.");
       const project = this.config.projects.find(value => value.id === request.projectId);
-      if (!project?.team?.checks.length) throw new TeamError(409, "goal-project-not-configured", "This project needs required team checks before a goal can start.");
+      if (!project?.team || (!project.team.checks.length && !project.team.establishChecks)) throw new TeamError(409, "goal-project-not-configured", "Configure required checks or authorize the team to establish them before a goal can start.");
       if (request.linearIssueId && !project.linear) throw new TeamError(409, "linear-not-configured", "Configure Linear for this project before linking an issue.");
       const { requestId, ...fields } = request;
       const createdAt = now();
       const stored: Stored = { fingerprint, receipts: {}, goal: {
-        ...fields, id: requestId, revision: 1, status: "running", createdAt, updatedAt: createdAt,
+        ...fields, linearTracking: Boolean(project.linear), id: requestId, revision: 1, status: "running", createdAt, updatedAt: createdAt,
         deadlineAt: new Date(Date.now() + request.maxMinutes * 60000).toISOString(),
         lineup: structuredClone(this.config.teams!.lineup!), cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
       } };
       this.event(stored, "Goal approved. The coordinator can select and build work within its scope and limits.");
       this.records.set(requestId, stored); this.save(stored);
-      stored.goal.linear = this.linear?.updateGoal(stored.goal); this.save(stored);
+      stored.goal.linear = this.linear?.updateGoal(stored.goal, stored.goal.linearTracking === true); this.save(stored);
       return structuredClone(stored.goal);
     });
   }
@@ -135,7 +135,7 @@ export class GoalService {
   private setControl(stored: Stored, action: PendingControl["action"], text?: string) {
     if (!stored.goal.activeTeamId) return;
     const team = this.teams.get(stored.goal.activeTeamId);
-    if (["ready-for-review", "no-change", "cancelled", "blocked"].includes(team.status)) return;
+    if (["ready-for-review", "merged", "no-change", "cancelled", "blocked"].includes(team.status)) return;
     stored.control = { action, requestId: randomUUID(), teamId: team.id, revision: team.revision, ...(text ? { text } : {}) };
   }
   pause(id: string, input: Action) { return this.action(id, "pause", goalActionSchema.parse(input)); }
@@ -182,7 +182,7 @@ export class GoalService {
       this.admit(stored, "outcome", body);
       goal.outcomes.push({ result: body.result, summary: body.summary, evidence: body.evidence, at: now(), revision: goal.revision });
       if (body.result === "achieved") goal.status = "achieved";
-      else if (goal.status === "achieved") goal.status = goal.cycles.some(cycle => cycle.status === "ready-for-review") ? "ready-for-review" : "no-opportunity";
+      else if (goal.status === "achieved") goal.status = goal.cycles.some(cycle => ["ready-for-review", "merged"].includes(cycle.status)) ? "ready-for-review" : "no-opportunity";
       this.event(stored, "A user recorded a product outcome with supporting evidence.");
       this.save(stored); return structuredClone(goal);
     });
@@ -213,7 +213,7 @@ export class GoalService {
   private refresh(stored: Stored, team: TeamView) {
     const cycle = stored.goal.cycles.find(value => value.teamId === team.id)!;
     Object.assign(cycle, { status: team.status, memberCount: team.members.length, baseCommit: team.baseCommit, headCommit: team.headCommit, branch: team.branch, workspace: team.workspace, brief: team.brief, reason: team.reason });
-    if (["ready-for-review", "no-change", "blocked", "cancelled"].includes(team.status)) cycle.finishedAt ??= now();
+    if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) cycle.finishedAt ??= now();
     stored.goal.memberCount = stored.goal.cycles.reduce((sum, value) => sum + value.memberCount, 0);
   }
   private async applyControl(stored: Stored) {
@@ -242,7 +242,7 @@ export class GoalService {
   }
   private async launch(stored: Stored) {
     const pending = stored.launch!;
-    const team = await this.teams.createForGoal(pending.request, pending.context, stored.goal.lineup);
+    const team = await this.teams.createForGoal(pending.request, pending.context, stored.goal.lineup, stored.goal.linearTracking === true);
     if (this.closed) return;
     if (!stored.goal.cycles.some(cycle => cycle.teamId === team.id)) stored.goal.cycles.push({ teamId: team.id, cycle: pending.context.cycle, goalRevision: pending.context.revision, status: team.status, startedAt: team.createdAt, memberCount: team.members.length });
     stored.goal.activeTeamId = team.id; stored.launch = undefined;
@@ -252,7 +252,7 @@ export class GoalService {
   private async step(stored: Stored) {
     if (this.closed) return;
     const goal = stored.goal;
-    goal.linear = this.linear?.updateGoal(goal) ?? goal.linear;
+    goal.linear = this.linear?.updateGoal(goal, goal.linearTracking === true) ?? goal.linear;
     if (goal.linear?.status === "blocked" && !terminal.has(goal.status)) {
       goal.status = "blocked"; goal.reason = goal.linear.reason ?? "The Linear issue no longer matches this approved goal. Review it before starting another goal.";
       this.setControl(stored, "cancel"); this.event(stored, goal.reason);
@@ -277,8 +277,8 @@ export class GoalService {
     if (goal.activeTeamId) {
       const team = this.teams.get(goal.activeTeamId);
       this.refresh(stored, team);
-      if (["ready-for-review", "no-change", "blocked", "cancelled"].includes(team.status)) {
-        if (["running", "needs-input"].includes(goal.status) && ["ready-for-review", "no-change"].includes(team.status) && team.linear && team.linear.status !== "synced") {
+      if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) {
+        if (["running", "needs-input"].includes(goal.status) && ["ready-for-review", "merged", "no-change"].includes(team.status) && team.linear && team.linear.status !== "synced") {
           if (team.linear.status === "blocked") {
             goal.status = "blocked"; goal.reason = team.linear.reason ?? "The feature's Linear issue no longer permits continuation.";
             this.event(stored, goal.reason);
@@ -289,7 +289,7 @@ export class GoalService {
           if (team.status === "blocked" || team.status === "cancelled") {
             goal.status = team.stopReason ? "limit-reached" : "blocked"; goal.reason = team.reason ?? "The active team stopped before producing a reviewed result.";
           } else if (team.status === "no-change") {
-            goal.status = goal.cycles.some(cycle => cycle.status === "ready-for-review") ? "ready-for-review" : "no-opportunity";
+            goal.status = goal.cycles.some(cycle => ["ready-for-review", "merged"].includes(cycle.status)) ? "ready-for-review" : "no-opportunity";
             goal.reason = team.reason ?? "The coordinator found no further work justified by the available evidence.";
           } else {
             goal.status = "running"; goal.reason = undefined;
@@ -314,12 +314,12 @@ export class GoalService {
       this.event(stored, goal.reason); this.save(stored); return;
     }
     if (!trackingReady) return;
-    const parent = [...goal.cycles].reverse().find(cycle => cycle.status === "ready-for-review");
+    const parent = [...goal.cycles].reverse().find(cycle => ["ready-for-review", "merged"].includes(cycle.status));
     const cycle = goal.cycles.length + 1;
     const sourceIssue = goal.linear?.issue;
     const context: TeamGoalContext = { id: goal.id, revision: goal.revision, cycle, successCriteria: goal.successCriteria, nonGoals: goal.nonGoals, allowedPaths: goal.allowedPaths, evidence: goal.evidence,
       ...(sourceIssue ? { sourceIssue: { id: sourceIssue.id, identifier: sourceIssue.identifier, url: sourceIssue.url, title: sourceIssue.title, description: sourceIssue.description } } : {}),
-      previousWork: goal.cycles.filter(value => value.status === "ready-for-review").map(value => `${value.brief?.title ?? `Feature ${value.cycle}`}: ${value.brief?.expectedOutcome ?? "Reviewed change"}`.slice(0, 2000)),
+      previousWork: goal.cycles.filter(value => ["ready-for-review", "merged"].includes(value.status)).map(value => `${value.brief?.title ?? `Feature ${value.cycle}`}: ${value.brief?.expectedOutcome ?? "Reviewed change"}`.slice(0, 2000)),
       deadlineAt: goal.deadlineAt, maxMembers: Math.min(60, goal.maxMembers - goal.memberCount), ...(parent ? { parentRunId: parent.teamId } : {}) };
     const objective = [goal.objective, ...goal.steering.map(value => `User direction: ${value.text}`)].join("\n\n");
     stored.launch = { context, request: { requestId: randomUUID(), projectId: goal.projectId, provider: goal.lineup.coordinator.provider, useConfiguredLineup: true, title: `${goal.title} · ${cycle}`.slice(0, 100), objective, parallelism: goal.parallelism } };

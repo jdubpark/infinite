@@ -1,86 +1,14 @@
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { CmuxError, array, object, string, type Json } from "./client.js";
+import { CmuxError } from "./client.js";
 import type { CmuxProvider } from "./discovery.js";
+import { parseTranscriptRecord, type TranscriptMessage } from "../transcript.js";
 
-export interface Message {
-  id: string;
-  role: "user" | "assistant" | "tool";
-  text: string;
-  toolName?: string;
-  ts?: string;
-}
+export type Message = TranscriptMessage;
 
 const WINDOW = 4 * 1024 * 1024;
 const MAX_MESSAGE = 128 * 1024;
-const INJECTED = /^(?:<environment_context>|<user_instructions>|# AGENTS\.md|<permissions instructions>|<INSTRUCTIONS>)/;
-
-function textContent(content: unknown): string {
-  if (typeof content === "string") return content.trim();
-  return array(content).flatMap((block) => {
-    if (["text", "input_text", "output_text"].includes(block.type) && typeof block.text === "string") return [block.text];
-    if (["image", "input_image"].includes(block.type)) return ["[image]"];
-    return [];
-  }).join("\n").trim();
-}
-
-function userText(text: string): string {
-  const command = /<command-name>([\s\S]*?)<\/command-name>/.exec(text);
-  if (command) return [command[1].trim(), /<command-args>([\s\S]*?)<\/command-args>/.exec(text)?.[1].trim()].filter(Boolean).join(" ");
-  const cleaned = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
-  return /^<(?:local-command-(?:stdout|stderr|caveat)|command-message|bash-stdout|bash-stderr|task-notification|user-prompt-submit-hook)[\s>]/.test(cleaned) ? "" : cleaned;
-}
-
-function toolText(name: string, input: unknown): string {
-  const data = object(input);
-  const text = string(data.command) ?? string(data.cmd) ?? string(data.file_path) ?? string(data.path) ?? string(data.description) ?? string(data.prompt);
-  return text ? text.slice(0, 2000) : name;
-}
-
-function parseRecord(raw: string, provider: CmuxProvider, offset: number): Message[] {
-  let row: Json;
-  try { row = object(JSON.parse(raw)); } catch { return []; }
-  const ts = string(row.timestamp);
-  if (provider === "claude") {
-    if (row.isSidechain || row.isMeta || row.isCompactSummary || row.isVisibleInTranscriptOnly) return [];
-    const id = string(row.uuid) ?? `line-${offset}`;
-    if (row.type === "attachment" && row.attachment?.type === "queued_command") {
-      const text = userText(string(row.attachment.prompt) ?? "");
-      return text ? [{ id, role: "user", text, ts }] : [];
-    }
-    if (row.type === "user") {
-      const text = userText(textContent(row.message?.content));
-      return text ? [{ id, role: "user", text, ts }] : [];
-    }
-    if (row.type !== "assistant") return [];
-    const content = row.message?.content;
-    if (typeof content === "string") return content.trim() ? [{ id, role: "assistant", text: content.trim(), ts }] : [];
-    return array(content).flatMap((block, i): Message[] => {
-      if (block.type === "text" && string(block.text)) return [{ id: `${id}:${i}`, role: "assistant", text: block.text, ts }];
-      if (block.type === "tool_use" && string(block.name)) return [{ id: `${id}:${i}`, role: "tool", text: toolText(block.name, block.input), toolName: block.name, ts }];
-      return [];
-    });
-  }
-  if (row.type !== "response_item") return [];
-  const payload = object(row.payload);
-  const id = string(payload.id) ?? `line-${offset}`;
-  if (payload.type === "message" && ["user", "assistant"].includes(payload.role)) {
-    const text = textContent(payload.content);
-    const kinds = payload.internal_chat_message_metadata_passthrough?.content_item_kinds;
-    if (payload.role === "user" && (Array.isArray(kinds) ? !kinds.includes("user.text") : INJECTED.test(text))) return [];
-    // The chat view includes user-visible replies; provider analysis is not a message.
-    if (payload.role === "assistant" && payload.channel === "analysis") return [];
-    return text ? [{ id, role: payload.role, text, ts }] : [];
-  }
-  const name = string(payload.name) ?? "tool";
-  if (payload.type === "function_call") {
-    let input: unknown;
-    try { input = JSON.parse(payload.arguments); } catch { input = {}; }
-    return [{ id, role: "tool", text: toolText(name, input), toolName: name, ts }];
-  }
-  if (payload.type === "custom_tool_call") return [{ id, role: "tool", text: (string(payload.input) ?? name).slice(0, 2000), toolName: name, ts }];
-  return [];
-}
+const parseRecord = parseTranscriptRecord;
 
 /** Bounded, append-aware reads. The cursor includes a block index to avoid dropping
  * additional messages when one JSONL record crosses a page boundary. */

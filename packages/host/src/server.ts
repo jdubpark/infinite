@@ -1,4 +1,5 @@
 import express from "express";
+import { ProjectContexts, contextLinksRequest } from "./project-context.js";
 import { createServer } from "node:http";
 import { connectTerminals, terminalPages } from "./terminal-stream.js";
 import { connectNativeFrontends } from "./native-bridge.js";
@@ -6,7 +7,7 @@ import { proxyNativeHttp } from "./native-http.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { Manager } from "./manager.js";
 import { hashToken, validateLinearConfig } from "./config.js";
@@ -20,14 +21,22 @@ import { CmuxError } from "./cmux/client.js";
 import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
 import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
+import { MirroredProjects } from "./mirrored-projects.js";
+import { RepoEnrollmentService, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
+import { HandoffService } from "./handoffs.js";
+import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { TeamService, TeamError } from "./teams.js";
+import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
 import { GoalService } from "./goals.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
+import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt } from "./types.js";
+import { Summarizer, SummaryError } from "./summary.js";
+import { RepositoryBriefings } from "./repository-briefings.js";
 
 const id = z.uuid();
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
@@ -46,6 +55,7 @@ const createSchema = z
     nativeArgs: z.array(z.string().max(8192).refine((s) => !s.includes("\0")))
       .max(256).refine((args) => args.join("").length <= 32000).optional(),
     localUi: z.boolean().optional(),
+    cwd: z.string().max(4096).optional(),
     workspace: z.object({
       cwd: z.string().min(1).max(4096).refine(value => value.startsWith("/") && !value.includes("\0")),
       roots: z.array(z.string().min(1).max(4096).refine(value => value.startsWith("/") && !value.includes("\0"))).min(1).max(16),
@@ -93,15 +103,24 @@ export function createApp(config: Config, key: Buffer) {
     throw new Error("Machine access and cmux require a single-tenant host");
   validateLinearConfig(config);
   const app = express();
+  const mirroredProjects = runtimeSecurity(config.deployment).tenancy === "single-tenant" ? new MirroredProjects(config, key) : undefined;
+  const enrollment = new RepoEnrollmentService(config, key, { isBusy: async projectId =>
+    projectSync.applying(projectId) || await projectRunning(projectId, true) });
+  validateLinearConfig(config);
   const manager = new Manager(config, key);
   const projectSync = new ProjectSync(config, key);
+  const desktopFiles = new DesktopFiles(config);
   // Session starts admitted past the sync check that the session list may not show yet.
   const startsInFlight = new Map<string, number>();
+  const projectFileChanges = new Set<string>();
+  const projectConfigChanges = new Set<string>();
   /**
    * A sync commit or apply evaluates projectRunning only after `applying()` turns true.
    * A start either sees that flag and is refused, or is counted before the check runs.
    */
   const startInProject = async <T>(projectId: string, start: () => Promise<T>): Promise<T> => {
+    if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
+    if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
     if (projectSync.applying(projectId))
       throw new ProjectSyncError("A workspace sync is being applied to this project. Start the session after it finishes.", "sync-applying");
     startsInFlight.set(projectId, (startsInFlight.get(projectId) ?? 0) + 1);
@@ -118,6 +137,25 @@ export function createApp(config: Config, key: Buffer) {
   const goals = new GoalService(config, key, teams, linear);
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
+  const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
+    const sourcePath = realpathSync(manager.meta(sessionId).session.cwd);
+    // This callback owns one start reservation. Earlier admitted creates may not
+    // have a session row yet, especially while cmux returns a cached listing.
+    for (const project of config.projects) {
+      if (!handoffPathsOverlap(sourcePath, realpathSync(project.path))) continue;
+      if ((startsInFlight.get(project.id) ?? 0) > (project.id === projectId ? 1 : 0) ||
+          goals.activeForProject(project.id) || teams.activeForProject(project.id) ||
+          projectSync.applying(project.id) || projectFileChanges.has(project.id) || projectConfigChanges.has(project.id))
+        throw new TeamError(409, "project-busy", "Another operation may still be using this repository. Finish it before handing off work.");
+    }
+    const external = (await listSessions()).filter(session => session.backend === "cmux");
+    if (external.some(session => session.id !== sessionId && session.status !== "exited" &&
+        (session.projectId === projectId || handoffPathsOverlap(sourcePath, realpathSync(session.cwd)))))
+      throw new TeamError(409, "project-busy", "Another native session may still be using this project. Release it before handing off work.");
+  });
+  const assertNoHandoff = (projectId: string) => {
+    if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
+  };
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
   // Native records written before executionLocation existed carry only the hybrid workspace.
@@ -125,7 +163,11 @@ export function createApp(config: Config, key: Buffer) {
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
-    const native = (await manager.list()).map(session => ({ ...session, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id, resumable: resumable(session) }));
+    const native = (await manager.list()).map(session => {
+      const handoff = handoffs.view(session.id);
+      return { ...session, handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
+        resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
+    });
     // Provider conversation IDs survive restarts and can exist in several
     // recordings. Only a currently verified worker PID identifies this runtime.
     const known = new Set(native.filter(s => s.status === "running" && s.nativeSession && s.pid)
@@ -138,15 +180,36 @@ export function createApp(config: Config, key: Buffer) {
    * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
    * tools run elsewhere, and an exited session never counts. A session list that cannot be read counts as running.
    */
-  const projectRunning = async (projectId: string) => {
-    if (startsInFlight.has(projectId) || teams.activeForProject(projectId) || goals.activeForProject(projectId)) return true;
+  const projectRunning = async (projectId: string, ignoreConfigChange = false) => {
+    if (!ignoreConfigChange && projectConfigChanges.has(projectId)) return true;
+    if (startsInFlight.has(projectId) || handoffs.activeForProject(projectId) || teams.activeForProject(projectId) || goals.activeForProject(projectId)) return true;
     let sessions: Awaited<ReturnType<typeof listSessions>>;
     try { sessions = await listSessions(); } catch { return true; }
     return sessions.some(s => s.projectId === projectId && s.executionLocation !== "laptop" &&
       (["running", "starting"].includes(s.status) ||
         (["unavailable", "recording-error"].includes(s.status) && (alive(s.pid) || alive((s as { workerPid?: unknown }).workerPid)))));
   };
+  const desktopResources = new DesktopResources(config, listSessions);
+  const changeProjectFiles = async <T>(projectId: string, action: () => Promise<T>) => {
+    if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
+    projectFileChanges.add(projectId);
+    let held = false;
+    try {
+      if (await projectRunning(projectId)) throw new DesktopError("session-running", "Stop this project's running sessions before replacing files");
+      if (projectSync.applying(projectId)) throw new DesktopError("sync-applying", "A workspace sync is being applied. Retry after it finishes.");
+      // Fence sync after checking existing sessions, while new session admission is already closed.
+      startsInFlight.set(projectId, (startsInFlight.get(projectId) ?? 0) + 1); held = true;
+      return await action();
+    } finally {
+      if (held) { const left = startsInFlight.get(projectId)! - 1; if (left) startsInFlight.set(projectId, left); else startsInFlight.delete(projectId); }
+      projectFileChanges.delete(projectId);
+    }
+  };
   const pushStore = new PushStore(config.stateDir, key);
+  const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
+  const repositoryBriefings = config.repositoryBriefings
+    ? new RepositoryBriefings(config.repositoryBriefings, manager, config.projects, config.teams?.workspaceDir)
+    : undefined;
   async function inputAuthority(sessionId: string, res: express.Response) {
     // Retained workers from earlier releases hash the entire request. Adding
     // optional fields would make a pre-upgrade receipt impossible to retry.
@@ -275,15 +338,20 @@ export function createApp(config: Config, key: Buffer) {
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
-      teams: { enabled: Boolean(config.teams), maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
       providerLimits: teams.providerLimits(),
-      projects: config.projects.map(({ id, name, team, linear }) => ({ id, name, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
+      projects: config.projects.map(({ id, name, path, team, linear }) => ({ id, name, path, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
       capabilities: {
+        ...(mirroredProjects ? { workspaceMirror: 1, mirrorForget: 1 } : {}),
         signals: true,
         answer: ["owner", "controller"].includes(res.locals.role),
         push: Boolean(config.push?.enabled),
+        ...(repositoryBriefings || summarizer ? { summaries: { model: repositoryBriefings?.model ?? summarizer!.model } } : {}),
+        ...(repositoryBriefings ? { repositoryBriefings: { model: repositoryBriefings.model, automatic: config.repositoryBriefings!.automatic } } : {}),
+        ...(config.remote?.enabled ? { remoteTerminal: 1 } : {}),
+        desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: DESKTOP_LIMITS.chunkBytes, maxFileBytes: DESKTOP_LIMITS.maxFileBytes },
       },
     }),
   );
@@ -293,6 +361,7 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
     const body = createGoalSchema.parse(req.body);
+    assertNoHandoff(body.projectId);
     return res.json(await startInProject(body.projectId, () => goals.create(body)));
   });
   app.post("/api/goals/:id/steer", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.steer(id.parse(req.params.id), goalSteerSchema.parse(req.body))));
@@ -300,8 +369,43 @@ export function createApp(config: Config, key: Buffer) {
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  app.post("/api/teams/:id/permissions/revoke", requireRole(["owner"]), async (req, res) => res.json(await teams.revokePermissions(id.parse(req.params.id), teamActionSchema.parse(req.body))));
+  app.get("/api/teams/:id/bundle", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;
+    const stop = () => {
+      if (!child || finished) return;
+      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* Already exited. */ }
+    };
+    const disconnect = () => { if (!res.writableEnded) { stop(); finished = true; clearTimeout(timer); } };
+    req.once("aborted", disconnect);
+    res.once("close", disconnect);
+    const timer = setTimeout(() => { stop(); finished = true; res.destroy(); }, 10 * 60 * 1000);
+    timer.unref();
+    res.once("close", () => clearTimeout(timer));
+    const bundle = await teams.bundle(id.parse(req.params.id));
+    if (req.aborted || res.destroyed || res.writableEnded) return;
+    const limit = 512 * 1024 * 1024;
+    child = spawnTeamBundle(bundle.workspace, bundle.branch, config.teams?.commandPrefix);
+    res.status(200).set({ "Content-Type": "application/octet-stream", "X-Infinite-Branch": bundle.branch, "X-Infinite-Head": bundle.head });
+    let size = 0;
+    child.stdout.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) { stop(); finished = true; clearTimeout(timer); res.destroy(); return; }
+      if (!res.write(chunk)) child.stdout.pause();
+    });
+    res.on("drain", () => child.stdout.resume());
+    child.stderr.resume();
+    child.once("error", () => { finished = true; clearTimeout(timer); res.destroy(); });
+    child.once("close", code => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      if (code !== 0) res.destroy(); else res.end();
+    });
+  });
   app.post("/api/teams", requireRole(["owner"]), async (req, res) => {
     const body = createTeamSchema.parse(req.body);
+    assertNoHandoff(body.projectId);
     return res.json(await startInProject(body.projectId, () => teams.create(body)));
   });
   const standaloneTeam = (value: unknown) => {
@@ -319,6 +423,83 @@ export function createApp(config: Config, key: Buffer) {
     app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) =>
       res.json(await teams[action](standaloneTeam(req.params.id), teamActionSchema.parse(req.body))));
   }
+  app.get("/api/machine/resources", async (_req, res) => res.json(await desktopResources.sample()));
+  app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {
+    if (!mirroredProjects) return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
+    const { path } = z.object({ path: z.string().max(4096) }).strict().parse(req.body);
+    const project = mirroredProjects.resolve(path);
+    enrollment.restore(project.id);
+    res.json(project);
+  });
+  app.delete("/api/projects/:id/mirror", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    if (!mirroredProjects || runtimeSecurity(config.deployment).tenancy !== "single-tenant")
+      return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
+    const projectId = projectSchema.parse(req.params.id);
+    if (!mirroredProjects.isMirrored(projectId)) throw new TeamError(409, "project-not-mirrored", "Only mirrored projects can be forgotten.");
+    if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
+    // Holding the configuration lock refuses new sessions, teams and goals while the checks run.
+    projectConfigChanges.add(projectId);
+    try {
+      if (projectSync.applying(projectId)) throw new TeamError(409, "sync-applying", "A workspace sync is being applied to this project. Retry after it finishes.");
+      if (projectFileChanges.has(projectId)) throw new TeamError(409, "project-files-changing", "Project files are being changed. Retry after the transfer finishes.");
+      assertNoHandoff(projectId);
+      if (teams.list().some(team => team.projectId === projectId && !["ready-for-review", "no-change", "cancelled"].includes(team.status)))
+        throw new TeamError(409, "project-team-active", "A team run for this project is still active. Finish or cancel it before forgetting the mirror.");
+      if (goals.list().some(goal => goal.projectId === projectId && ["running", "needs-input", "paused"].includes(goal.status)))
+        throw new TeamError(409, "project-goal-active", "A goal for this project is still active. Finish or cancel it before forgetting the mirror.");
+      if (await projectRunning(projectId, true)) throw new TeamError(409, "session-running", "A session is running or starting in this project. Stop it before forgetting the mirror.");
+      res.json(mirroredProjects.forget(projectId));
+    } finally { projectConfigChanges.delete(projectId); }
+  });
+  app.get("/api/projects/:id/team", requireRole(["owner"]), requireOwnerCli, (req, res) => {
+    res.json(enrollment.get(projectSchema.parse(req.params.id)));
+  });
+  app.put("/api/projects/:id/team", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    const body = repoEnrollmentRequestSchema.parse(req.body);
+    if (runtimeSecurity(config.deployment).tenancy !== "single-tenant")
+      throw new TeamError(403, "single-tenant-required", "Repository enrollment requires a single-tenant host.");
+    if (projectConfigChanges.has(projectId) || projectFileChanges.has(projectId))
+      throw new TeamError(409, "project-busy", "Repository setup or files are being updated. Retry after the operation finishes.");
+    projectConfigChanges.add(projectId);
+    try { res.json(await enrollment.put(projectId, body)); }
+    finally { projectConfigChanges.delete(projectId); }
+  });
+  app.get("/api/projects/:id/files", async (req, res) => {
+    res.json(await desktopFiles.list(projectSchema.parse(req.params.id), z.string().max(4096).default("").parse(req.query.path),
+      z.coerce.number().int().min(1).max(200).default(100).parse(req.query.limit), z.string().max(512).optional().parse(req.query.cursor)));
+  });
+  app.get("/api/projects/:id/file", async (req, res) => {
+    res.json(await desktopFiles.download(projectSchema.parse(req.params.id), z.string().min(1).max(4096).parse(req.query.path),
+      z.coerce.number().int().min(0).max(DESKTOP_LIMITS.maxFileBytes).default(0).parse(req.query.offset),
+      z.coerce.number().int().min(0).max(DESKTOP_LIMITS.chunkBytes).default(DESKTOP_LIMITS.chunkBytes).parse(req.query.length),
+      z.string().regex(/^[a-f0-9]{64}$/).optional().parse(req.query.sha256)));
+  });
+  app.post("/api/projects/:id/uploads", requireRole(["owner"]), async (req, res) => {
+    const body = z.object({ path: z.string().min(1).max(4096), size: z.number().int().min(0).max(DESKTOP_LIMITS.maxFileBytes),
+      sha256: z.string().regex(/^[a-f0-9]{64}$/), expectedHash: z.string().regex(/^[a-f0-9]{64}$/).nullable() }).strict().parse(req.body);
+    res.json(await desktopFiles.begin(projectSchema.parse(req.params.id), String(res.locals.deviceId), body));
+  });
+  app.put("/api/projects/:id/uploads/:upload", requireRole(["owner"]), async (req, res) => {
+    const body = z.object({ offset: z.number().int().min(0).max(DESKTOP_LIMITS.maxFileBytes), base64: z.string().max(DESKTOP_LIMITS.chunkBytes / 3 * 4) }).strict().parse(req.body);
+    res.json(await desktopFiles.chunk(projectSchema.parse(req.params.id), String(res.locals.deviceId), id.parse(req.params.upload), body.offset, body.base64));
+  });
+  app.post("/api/projects/:id/uploads/:upload/commit", requireRole(["owner"]), async (req, res) => {
+    const project = projectSchema.parse(req.params.id);
+    res.json(await changeProjectFiles(project, () => desktopFiles.commit(project, String(res.locals.deviceId), id.parse(req.params.upload))));
+  });
+  app.delete("/api/projects/:id/uploads/:upload", requireRole(["owner"]), async (req, res) => {
+    res.json(await desktopFiles.abort(projectSchema.parse(req.params.id), String(res.locals.deviceId), id.parse(req.params.upload)));
+  });
+  app.delete("/api/projects/:id/file", requireRole(["owner"]), async (req, res) => {
+    const project = projectSchema.parse(req.params.id), path = z.string().min(1).max(4096).parse(req.query.path);
+    const { expectedHash } = z.object({ expectedHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(req.body);
+    res.json(await changeProjectFiles(project, () => desktopFiles.remove(project, path, expectedHash)));
+  });
+  app.post("/api/projects/:id/directories", requireRole(["owner"]), async (req, res) => {
+    const project = projectSchema.parse(req.params.id), { path } = z.object({ path: z.string().min(1).max(4096) }).strict().parse(req.body);
+    res.json(await changeProjectFiles(project, () => desktopFiles.directory(project, path)));
+  });
   app.post("/api/devices/push", (req, res) => {
     const body = z
       .object({
@@ -355,6 +536,7 @@ export function createApp(config: Config, key: Buffer) {
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) return void res.status(400).json({ code: "invalid-create", error: "Invalid session details", details: parsed.error.issues.map(issue => ({ path: issue.path.join("."), message: issue.message })) });
     const request = parsed.data;
+    assertNoHandoff(request.projectId);
     if (request.workspace && (!res.locals.bearer || runtimeSecurity(config.deployment).tenancy !== "single-tenant"))
       return void res.status(403).json({ error: "Laptop execution requires an owner device key and a single-tenant host" });
     if (request.backend === "cmux") {
@@ -388,6 +570,7 @@ export function createApp(config: Config, key: Buffer) {
       if (action === "/messages") return void res.json(await cmux.messages(sessionId,
         z.string().max(100).optional().parse(req.query.after), z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit)));
       if (action === "/file") return void res.json(await sessionFile(await cmux.get(sessionId), z.string().parse(req.query.path)));
+      if (action === "/summary" && req.query.status === "1") return void res.json({ state: "unavailable", error: "Repository briefing is unavailable for cmux sessions." });
       return void res.status(409).json({ error: "This action is unavailable for cmux sessions", code: "unsupported" });
     }
     if (req.method !== "POST") return void res.status(405).json({ error: "Unsupported method" });
@@ -424,12 +607,53 @@ export function createApp(config: Config, key: Buffer) {
       ...manager.meta(sessionId).session,
       ...(await manager.state(sessionId, true)),
     };
-    res.json({ ...session, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id, resumable: resumable(session) });
+    const handoff = handoffs.view(sessionId);
+    res.json({ ...session, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
+      resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) });
   });
-  app.get("/api/sessions/:id/messages", (req, res) => {
-    const session = manager.meta(id.parse(req.params.id)).session;
+  app.get("/api/sessions/:id/handoff", (req, res) => res.json(handoffs.view(id.parse(req.params.id))));
+  app.get("/api/sessions/:id/messages", async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    const session = manager.meta(sessionId).session;
+    const transcript = (await manager.state(sessionId)).capabilities?.transcript === 1;
     res.json(recordedMessages(manager, session, z.string().max(100).optional().parse(req.query.after),
-      z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit)));
+      z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit), transcript));
+  });
+  // A digest of the chat after a cursor. The text is the model's reading, labeled as such.
+  app.get("/api/sessions/:id/summary", async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    const session = manager.meta(sessionId).session;
+    if (req.query.status === "1") {
+      if (!repositoryBriefings) return void res.json({ state: "unavailable", error: "Repository briefings are not configured on this host." });
+      return void res.json(await repositoryBriefings.status(session));
+    }
+    if (req.query.status !== undefined) return void res.status(400).json({ error: "Use status=1 to read repository briefing status." });
+    const from = z.string().regex(/^\d{1,16}$/).default("0").parse(req.query.after);
+    if (!Number.isSafeInteger(Number(from))) return void res.status(400).json({ error: "Invalid message cursor" });
+    if (repositoryBriefings) {
+      try {
+        res.json(await repositoryBriefings.summarize(session, from));
+      } catch {
+        res.status(502).json({ code: "repository-briefing-failed", error: "The repository brief could not be generated." });
+      }
+      return;
+    }
+    const transcript = (await manager.state(sessionId)).capabilities?.transcript === 1;
+    const messages = [];
+    let cursor = from, pages = 0;
+    for (;;) {
+      const page = recordedMessages(manager, session, cursor, 200, transcript);
+      messages.push(...page.messages);
+      cursor = page.cursor;
+      if (!page.more || ++pages >= 10 || messages.length >= 1000) break;
+    }
+    if (!summarizer) return void res.status(503).json({ code: "summaries-unavailable", error: "This host has no summary model configured." });
+    try {
+      res.json(await summarizer.summarize(sessionId, messages, from, cursor));
+    } catch (error) {
+      if (error instanceof SummaryError) return void res.status(error.status).json({ code: "summary-failed", error: error.message });
+      throw error;
+    }
   });
   app.get("/api/sessions/:id/file", async (req, res) => {
     const sessionId = id.parse(req.params.id);
@@ -493,6 +717,7 @@ export function createApp(config: Config, key: Buffer) {
                   "input-result",
                   "signal",
                   "usage",
+                  "message",
                 ]),
               )
               .min(1)
@@ -652,7 +877,7 @@ export function createApp(config: Config, key: Buffer) {
     const projectId = projectSchema.parse(req.params.id);
     const project = config.projects.find(p => p.id === projectId);
     if (!project) return void res.status(404).json({ error: "Unknown project" });
-    res.json({ id: project.id, name: project.name, sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
+    res.json({ id: project.id, name: project.name, path: project.path, sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
   });
   // Sync moves whole checkouts, ignored files and credentials included, so it shares laptop execution's single-tenant gate.
   app.use("/api/projects/:id/sync", (_req, res, next) => runtimeSecurity(config.deployment).tenancy === "single-tenant" ? next()
@@ -686,6 +911,13 @@ export function createApp(config: Config, key: Buffer) {
   });
   app.get("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     res.json({ base64: await projectSync.readBlob(projectSchema.parse(req.params.id), String(req.params.hash)) });
+  });
+  const projectContexts = new ProjectContexts(config, key);
+  app.get("/api/projects/:id/context-links", (req, res) => {
+    return res.json(projectContexts.listLinks(String(req.params.id)));
+  });
+  app.put("/api/projects/:id/context-links", requireRole(["owner"]), (req, res) => {
+    return res.json(projectContexts.setLinks(String(req.params.id), contextLinksRequest.parse(req.body)));
   });
   app.get("/api/projects/:id/context", (req, res) => {
     if (!config.projects.some((p) => p.id === req.params.id))
@@ -730,6 +962,7 @@ export function createApp(config: Config, key: Buffer) {
       if (error instanceof ProjectSyncError)
         return res.status(error.status).json({ code: error.code, error: error.message, ...(error.category ? { category: error.category, message: error.message } : {}) });
       if (error instanceof ContentError) return res.status(error.status).json({ error: error.message });
+      if (error instanceof DesktopError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof z.ZodError)
         return res.status(400).json({
           error: "Invalid request",
@@ -742,6 +975,11 @@ export function createApp(config: Config, key: Buffer) {
         return res.status(413).json({ error: "Request body is too large" });
       if (error instanceof SyntaxError)
         return res.status(400).json({ error: "Invalid JSON" });
+      if (/^\/api\/projects\/[^/]+\/(?:files?|uploads|directories)(?:\/|$)/.test(req.path)) {
+        const code = (error as NodeJS.ErrnoException).code;
+        return res.status(code === "ENOENT" ? 404 : code === "EACCES" || code === "EPERM" ? 403 : 409)
+          .json({ code: "file-unavailable", error: "The file operation could not be completed. Refresh the project before retrying." });
+      }
       // Workspace sync failures are about the project tree, not a session; their category never names a path.
       if (/^\/api\/projects\/[^/]+\/sync\//.test(req.path)) {
         const failure = syncFailure(error);
@@ -772,13 +1010,17 @@ export function createApp(config: Config, key: Buffer) {
   server.once("listening", () => linear.start());
   server.once("listening", () => teams.start());
   server.once("listening", () => goals.start());
+  server.once("listening", () => handoffs.start());
+  if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });
   server.once("close", () => teams.close());
   server.once("close", () => usage.close());
   server.once("close", () => goals.close());
+  server.once("close", () => repositoryBriefings?.close());
   server.once("close", () => linear.close());
+  server.once("close", () => handoffs.close());
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { goals.close(); teams.close(); usage.close(); linear.close(); closeTerminals(); closeNative(); closeRemote(); cmux?.close(); server.closeAllConnections(); };
+  const closeConnections = () => { handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

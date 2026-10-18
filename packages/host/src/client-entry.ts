@@ -8,6 +8,7 @@ if (!((process.argv[2] === "--laptop-service" || process.argv[2] === "--sync-ser
   console.log(`Infinite — cloud sessions in your native terminal
 
 infinite pair https://HOST --token-file FILE
+infinite cmux [native workspace/terminal commands]
 infinite claude|codex|grok|opencode [native flags and prompt]
 infinite --project ID --title "Task" codex [native flags]
 infinite --detach codex [native flags]
@@ -15,12 +16,29 @@ infinite --laptop [--include DIR] codex ["Initial prompt"]
 infinite --local-ui codex [supported native flags] "Initial prompt"
 infinite --local-ui opencode [--model PROVIDER/MODEL] [--prompt "Task"]
 infinite list [--json]
+infinite resources [--watch] [--json]
+infinite close SESSION_ID [--yes] [--takeover] [--json]
 infinite projects
 infinite resume [session ID or unique prefix]
 infinite monitor [session ID or unique prefix]
 infinite recover SESSION_ID [--output NEW_DIRECTORY]
 infinite sync [--project ID] | --stop | --status | --apply [--force]
 infinite pull [PROJECT_ID] [--output NEW_DIRECTORY]
+infinite repo init [DIRECTORY] [--project ID] [--check-json JSON] [--delivery merge|review]
+  --delivery merge [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase]
+infinite repo init PARENT_DIRECTORY --linear-team UUID [--linear-project UUID]
+infinite repo link PROJECT_OR_DIRECTORY --relationship "Uses its API"
+infinite repo unlink PROJECT_OR_DIRECTORY | repo links
+infinite repo init --permissions coordinator [--permission-scope TEXT] [--permission-limit N]
+infinite repo init --permissions off        Disable delegation for future runs
+infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
+infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]
+infinite team status [ID] [--json] [--logs] | team watch ID [--logs] | team pull TEAM_ID [--json]
+  status ID prints open decisions and the Jevcode summary. Watch keeps it full screen.
+  l review logs · s summary · ←→ or n/p agent · ↑↓ j/k space scroll · a ask Jevcode · q quit
+  --logs starts in the review log. --json prints the team record.
+infinite team steer ID TEXT | team answer ID QUESTION_ID TEXT
+infinite team pause|resume|cancel ID
 
 Put Infinite options before the provider. Everything after it is passed unchanged.
 Sessions run on the cloud machine. --laptop runs Codex tools in this directory with background cloud handoff.
@@ -31,11 +49,16 @@ Ctrl+] detaches; Ctrl+G monitors; Enter in monitor mode enables input.
 Ctrl+E opens a local draft; Ctrl+S inserts it; Enter in the native UI submits it.
 Drafts recover after restart. Esc keeps the draft; Ctrl+X discards it.
 A viewer key remains read-only. Reconnecting never starts another agent.
+Closing requires confirmation; --yes confirms noninteractive use. --takeover explicitly replaces another client's control.
+Resources are timestamped; unavailable measurements remain unavailable. --watch refreshes every two seconds.
+cmux opens the same separate cmux workspace catalog as the Mac app, using the installed infinite-cmux launcher.
 Local UI supports Codex and OpenCode experimentally.
 Only cloud Codex with --local-ui requires an initial prompt.
 Resume reopens the existing cloud conversation in its local native interface.
 Use --takeover before resume to explicitly take control from another device.
 The Ctrl+] / Ctrl+G / Ctrl+E shortcuts above apply to streamed terminal mode.
+
+Repository delivery defaults to review-only. Configure --delivery merge per repository; a missing GitHub target must be supplied explicitly. --delivery review removes merge authorization.
 
 Client settings: ~/.config/infinite/client.json (or --client-config FILE).`);
   if (process.argv[2] && !["help", "--help", "-h"].includes(process.argv[2])) process.exitCode = 1;

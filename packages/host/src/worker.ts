@@ -1,5 +1,8 @@
+import { stopHandoffProcesses } from "./handoff-processes.js";
+import { handoffEnvelopeSchema, handoffObjective } from "./handoff-types.js";
+import { cleanTeamCheckpoint } from "./team-workspace.js";
 import { createServer } from "node:net";
-import { chmodSync, mkdirSync, unlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -34,8 +37,10 @@ import {
 } from "@infinite/attention";
 import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
-import { startHookServer, HookPayloadError, type HookRoute } from "./hooks.js";
-import { teamReportEnvelopeSchema } from "./team-types.js";
+import { startHookServer, HookPayloadError, type HookReply, type HookRoute } from "./hooks.js";
+import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
+import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
+import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
 import { buildLaunch } from "./launch.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
@@ -80,9 +85,11 @@ const terminal = new headless.Terminal({
 });
 const snapshots = new TerminalSnapshots(terminal);
 type AnswerRequest = Extract<WorkerRequest, { op: "answer" }>;
+type TeamAnswerRequest = Extract<WorkerRequest, { op: "team-answer" }>;
 type DeliveryRequest = Extract<WorkerRequest, { op: "input" | "raw" | "key" | "stop" }>;
 type StoredReceipt = Receipt & { digest: string; result?: AnswerResult };
 const receipts = new Map<string, StoredReceipt>();
+const invalidatedTeamPermissionDecisions = new Set<string>();
 /** The receipt a client sees: the request digest stays inside the worker. */
 const publicReceipt = ({ digest: _digest, ...receipt }: StoredReceipt) =>
   receipt;
@@ -296,7 +303,47 @@ function blockShown(open: Prompt) {
 
 let hooksReady = false;
 let teamReportReceipt: { requestId: string; digest: string } | undefined;
-function onHook(route: HookRoute, body: unknown) {
+// ---- Chat: the provider's own conversation record ------------------------------------------
+// The relay streams the transcript file from the worker's cursor; the worker never opens it.
+let transcript: { path: string; tail: TranscriptTail } | undefined;
+const MESSAGE_FIELDS = new Set(["id", "role", "text", "toolName", "ts"]);
+/** Journals one chat message exactly as the provider recorded it; text is bounded at ingest. */
+function recordMessage(message: TranscriptMessage) {
+  append("message", Object.fromEntries(Object.entries(message).filter(([key, value]) => MESSAGE_FIELDS.has(key) && value !== undefined)));
+  if (state.capabilities?.transcript !== 1) {
+    state = { ...state, capabilities: { ...state.capabilities, transcript: 1 } };
+    persist();
+  }
+}
+function onTranscript(body: unknown): HookReply | void {
+  const b = body as Record<string, unknown>;
+  if (!transcript || b.path !== transcript.path || typeof b.text !== "string") return;
+  // A chunk from elsewhere than the cursor is not applied; the reply tells the relay where to resume.
+  if (b.offset === transcript.tail.offset) for (const message of transcript.tail.ingest(b.text)) recordMessage(message);
+  return { after: transcript.tail.offset };
+}
+let handoffReceipt: string | undefined;
+let handoffStopping = false;
+let handoffInFlight = false;
+async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void> {
+  if (route === "team-handoff") {
+    const parsed = handoffEnvelopeSchema.safeParse(body);
+    if (!parsed.success || !session.handoff?.policy) throw new HookPayloadError(400);
+    if (parsed.data.sessionId !== session.id) throw new HookPayloadError(403);
+    const digest = createHash("sha256").update(JSON.stringify(parsed.data)).digest("hex");
+    if (handoffReceipt) { if (handoffReceipt !== digest) throw new HookPayloadError(409); return; }
+    if (state.status !== "running" || handoffInFlight) throw new HookPayloadError(409);
+    handoffInFlight = true;
+    try {
+      handoffObjective(session.handoff.policy, parsed.data.request);
+      await cleanTeamCheckpoint(session.handoff.policy.path, parsed.data.request.checkpointHead, session.handoff.policy.commandPrefix);
+      if (state.status !== "running") throw new HookPayloadError(409);
+      append("team-handoff", parsed.data);
+      handoffReceipt = digest;
+    } catch { throw new HookPayloadError(409); }
+    finally { handoffInFlight = false; }
+    return;
+  }
   if (route === "team-report") {
     const parsed = teamReportEnvelopeSchema.safeParse(body);
     if (!parsed.success || !session.team) throw new HookPayloadError(400);
@@ -314,6 +361,7 @@ function onHook(route: HookRoute, body: unknown) {
     return;
   }
   if (state.status !== "running") return;
+  if (route === "transcript") return onTranscript(body);
   const signals =
     route === "claude"
       ? mapClaudeHook(body)
@@ -330,11 +378,13 @@ function onHook(route: HookRoute, body: unknown) {
         : route;
   // Only the authenticated provider hook supplies its native identity. Subagent hooks do not
   // replace the primary conversation, and terminal text / transcript filenames are never guessed.
+  // The rehearsal provider speaks the Claude hook contract.
+  const hookProvider = provider === "demo" ? "claude" : provider;
   const nativeId = !b.agent_id && (
-    ((provider === "claude" && route === "claude") || (provider === "codex" && route === "codex")) &&
+    ((hookProvider === "claude" && route === "claude") || (hookProvider === "codex" && route === "codex")) &&
       typeof b.hook_event_name === "string"
       ? b.session_id
-      : provider === "codex" && route === "codex-notify" && b.type === "agent-turn-complete"
+      : hookProvider === "codex" && route === "codex-notify" && b.type === "agent-turn-complete"
         ? b["thread-id"]
         : undefined
   );
@@ -342,6 +392,14 @@ function onHook(route: HookRoute, body: unknown) {
       !/[\x00-\x20\x7f]/.test(nativeId) && nativeId !== state.nativeSession?.id) {
     state = { ...state, nativeSession: { id: nativeId, source: "hook" } };
     persist();
+  }
+  // The same authenticated primary hook names the conversation file; the reply asks the relay
+  // for its bytes from where the worker left off.
+  let reply: HookReply | void = undefined;
+  const path = b.transcript_path;
+  if (nativeId !== undefined && typeof path === "string" && path.startsWith("/") && path.endsWith(".jsonl") && path.length <= 4096 && !/[\x00-\x1f]/.test(path)) {
+    if (transcript?.path !== path) transcript = { path, tail: new TranscriptTail(route === "claude" ? "claude" : "codex") };
+    reply = { transcript: { path, after: transcript.tail.offset } };
   }
   if (!hooksReady) {
     hooksReady = true;
@@ -365,6 +423,7 @@ function onHook(route: HookRoute, body: unknown) {
     if (signal.kind === "provider-limit") recordLimitFromHook(signal, agent);
     else record(signal, "hook", agent);
   }
+  return reply;
 }
 
 let lastOutputAt = Date.now();
@@ -565,6 +624,7 @@ function serialize<T>(task: () => T | Promise<T>): Promise<T> {
 
 const CONTROL_TTL_MS = 30_000;
 let controller: { actorId: string; lease: ControlLease } | null = null;
+let controlChangeGeneration = 0;
 function currentControl(): ControlLease | null {
   if (controller && controller.lease.expiresAt <= Date.now()) {
     controller = null;
@@ -598,11 +658,14 @@ function changeControl(request: Extract<WorkerRequest, { op: "control" }>): Cont
         actorId: request.actor.id,
         lease: { id: randomUUID(), label: request.actor.label, expiresAt: Date.now() + CONTROL_TTL_MS },
       };
+      controlChangeGeneration++;
     } else controller!.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
   } else {
     if (!owns) throw new Refusal("control-lost");
-    if (request.action === "release") controller = null;
-    else controller!.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
+    if (request.action === "release") {
+      controller = null;
+      controlChangeGeneration++;
+    } else controller!.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
   }
   state = { ...state, control: controller?.lease ?? null };
   persist();
@@ -622,7 +685,7 @@ function refreshControl(request: InputControl) {
     controller.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
 }
 /** A retry identifies the intended input, not the client which currently holds control. */
-function requestDigest(request: (DeliveryRequest | AnswerRequest)) {
+function requestDigest(request: (DeliveryRequest | AnswerRequest | TeamAnswerRequest)) {
   const { actor: _actor, leaseId: _leaseId, ...input } = request;
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
@@ -638,6 +701,7 @@ function deliver(
     return publicReceipt(previous);
   }
   checkControl(request);
+  if (handoffReceipt && request.op !== "stop") throw new Error("This session yielded to a team; further input is disabled");
   if (state.status !== "running" || !child)
     throw new Error("Session is not running");
   // Text and Enter typed over an open dialog would pick its highlighted option. Only a
@@ -721,16 +785,39 @@ const arrow = (key: "up" | "down") =>
   (key === "up" ? "A" : "B");
 
 async function answer(
-  request: AnswerRequest,
+  request: AnswerRequest | TeamAnswerRequest,
 ): Promise<Receipt & { result?: AnswerResult }> {
+  const teamRequest = request.op === "team-answer" ? request : undefined;
+  const answerText = request.op === "answer" ? request.text : undefined;
   const digest = requestDigest(request);
   const previous = receipts.get(request.requestId);
   if (previous) {
-    if (previous.digest !== digest || previous.result === undefined)
+    if (previous.digest !== digest || (previous.result === undefined && !teamRequest))
       throw new Error("Request ID already belongs to different input");
     return publicReceipt(previous);
   }
-  checkControl(request);
+  if (teamRequest) {
+    if (invalidatedTeamPermissionDecisions.has(teamRequest.decisionId)) throw new Refusal("unsupported");
+    const actual = session.team;
+    const assigned = teamRequest.assignment;
+    let cwd: string;
+    try { cwd = realpathSync(session.cwd); }
+    catch { throw new Refusal("unsupported"); }
+    if (!actual || teamRequest.targetSessionId !== session.id ||
+        actual.runId !== assigned.runId || actual.memberId !== assigned.memberId ||
+        actual.revision !== assigned.revision || actual.role !== assigned.role || actual.taskId !== assigned.taskId ||
+        teamRequest.targetCwd !== cwd ||
+        session.runtime?.nativeUi || session.runtime?.transport !== "pty")
+      throw new Refusal("unsupported");
+    if (teamRequest.actor.id !== `team-permission:${teamRequest.decisionId}` ||
+        teamRequest.actor.label !== "Team permission" || !/^[a-f0-9-]{36}$/i.test(teamRequest.decisionId) ||
+        !/^[a-f0-9-]{36}$/i.test(teamRequest.coordinatorMemberId) ||
+        !/^[a-f0-9]{64}$/i.test(teamRequest.policyHash) ||
+        !Number.isFinite(Date.parse(teamRequest.expiresAt)) || Date.parse(teamRequest.expiresAt) <= Date.now())
+      throw new Refusal("prompt-changed");
+    checkControl(teamRequest);
+  } else checkControl(request);
+  const acceptedControlGeneration = controlChangeGeneration;
   const pty = child;
   if (state.status !== "running" || !pty)
     throw new Error("Session is not running");
@@ -745,10 +832,15 @@ async function answer(
   const current = screenPrompt();
   if (!current || hashOf(current.fingerprint) !== prompt.hash)
     throw new Refusal("prompt-changed");
+  if (teamRequest && (teamRequest.promptId !== prompt.id || teamRequest.promptHash !== prompt.hash ||
+      teamRequest.evidenceHash !== permissionEvidenceHash(prompt) ||
+      oneShotPermissionOption(prompt) !== teamRequest.option ||
+      !current.options.some(option => option.index === teamRequest.option && option.role === "accept")))
+    throw new Refusal("prompt-changed");
   if (prompt.multiSelect || current.multiSelect)
     throw new Refusal("unsupported");
   // Same hash, so the screen's options are the prompt's options.
-  if (request.option !== undefined && !current.options[request.option])
+  if (request.option !== undefined && !current.options.some(option => option.index === request.option))
     throw new Refusal("invalid-option");
   // Delivery follows the dialog on screen, not the hook's kind for it.
   const yesNo = current.kind === "yes-no";
@@ -756,13 +848,13 @@ async function answer(
     (o) => o.role === "reject-with-feedback",
   );
   if (
-    request.text !== undefined &&
+    answerText !== undefined &&
     // Free text only follows the "No, and tell … what to do differently" option.
     (!prompt.acceptsText ||
       yesNo ||
       !feedback ||
       (request.option !== undefined && request.option !== feedback.index) ||
-      (request.text.includes("\n") && !terminal.modes.bracketedPasteMode))
+      (answerText.includes("\n") && !terminal.modes.bracketedPasteMode))
   )
     throw new Refusal("text-not-accepted");
   const chosen =
@@ -784,29 +876,56 @@ async function answer(
     promptId: prompt.id,
     option: chosen.index,
     keys,
-    ...(request.text !== undefined ? { text: request.text } : {}),
+    ...(answerText !== undefined ? { text: answerText } : {}),
+    ...(teamRequest ? { delegation: {
+      decisionId: teamRequest.decisionId,
+      coordinatorMemberId: teamRequest.coordinatorMemberId,
+      targetSessionId: teamRequest.targetSessionId,
+      assignment: teamRequest.assignment,
+      targetCwd: teamRequest.targetCwd,
+      expiresAt: teamRequest.expiresAt,
+      policyHash: teamRequest.policyHash,
+      promptHash: teamRequest.promptHash,
+      evidenceHash: teamRequest.evidenceHash,
+    } } : {}),
   });
-  const receipt: StoredReceipt & { result: AnswerResult } = {
+  const receipt: StoredReceipt = {
     requestId: request.requestId,
     state: "uncertain",
     seq: intent.seq,
     digest,
-    result: "refused",
+    // Preserve the ordinary answer retry contract: an interrupted delivery has
+    // a refused result, while delegated answers remain explicitly uncertain.
+    ...(teamRequest ? {} : { result: "refused" as AnswerResult }),
   };
   receipts.set(request.requestId, receipt);
   const unchanged = () => {
     const now = screenPrompt();
     return now && hashOf(now.fingerprint) === prompt.hash ? now : null;
   };
+  const beforeWrite = () => {
+    if (teamRequest && invalidatedTeamPermissionDecisions.has(teamRequest.decisionId)) throw new Refusal("control-lost");
+    if (teamRequest && Date.parse(teamRequest.expiresAt) <= Date.now()) throw new Refusal("prompt-changed");
+    if (teamRequest) checkControl(teamRequest);
+    else if (controlChangeGeneration !== acceptedControlGeneration) throw new Refusal("control-lost");
+    if (state.status !== "running" || child !== pty) throw new Refusal("prompt-changed");
+    if (teamRequest && (!session.team || session.team.runId !== teamRequest.assignment.runId ||
+        session.team.memberId !== teamRequest.assignment.memberId || session.team.revision !== teamRequest.assignment.revision ||
+        session.team.role !== teamRequest.assignment.role || session.team.taskId !== teamRequest.assignment.taskId))
+      throw new Refusal("unsupported");
+  };
   answering = prompt.id;
   try {
     let result: AnswerResult = "still-open";
     if (yesNo) {
+      beforeWrite();
       pty.write(keys[0]);
       await sleep(40);
+      beforeWrite();
       pty.write("\r");
     } else {
       for (const key of keys.slice(0, -1)) {
+        beforeWrite();
         pty.write(arrow(key as "up" | "down"));
         await sleep(40);
       }
@@ -814,6 +933,7 @@ async function answer(
       let onTarget = false;
       for (const until = Date.now() + 500; ; ) {
         await sleep(40);
+        beforeWrite();
         const now = unchanged();
         if (!now) break;
         if (now.highlighted === undefined || now.highlighted === chosen.index) {
@@ -822,7 +942,7 @@ async function answer(
         }
         if (Date.now() >= until) break;
       }
-      if (onTarget) pty.write("\r");
+      if (onTarget) { beforeWrite(); pty.write("\r"); }
       else result = "changed";
     }
     if (result !== "changed")
@@ -845,13 +965,15 @@ async function answer(
           },
           "host",
         );
-      if (request.text !== undefined) {
+      if (answerText !== undefined) {
         await sleep(150);
+        beforeWrite();
         pty.write(
           terminal.modes.bracketedPasteMode
-            ? `\x1b[200~${request.text}\x1b[201~`
-            : request.text,
+            ? `\x1b[200~${answerText}\x1b[201~`
+            : answerText,
         );
+        beforeWrite();
         pty.write("\r");
       }
     }
@@ -861,7 +983,7 @@ async function answer(
         promptId: prompt.id,
         requestId: request.requestId,
         option: { index: chosen.index, label: chosen.label },
-        text: request.text !== undefined,
+        text: answerText !== undefined,
         result,
       },
       "host",
@@ -876,6 +998,11 @@ async function answer(
     receipt.result = result;
     refreshControl(request);
     return publicReceipt(receipt);
+  } catch (error) {
+    // The intent is durable, but control loss or a worker failure may stop delivery mid-answer.
+    // Retrying this decision returns the uncertain receipt and never presses another key.
+    if (teamRequest) return publicReceipt(receipt);
+    throw error;
   } finally {
     answering = undefined;
   }
@@ -896,6 +1023,26 @@ function validAnswer(request: AnswerRequest) {
         request.text.length <= 32000 &&
         !/[\x00-\x08\x0b-\x1f\x7f]/.test(request.text)))
   );
+}
+function validTeamAnswer(request: TeamAnswerRequest) {
+  const rawAssignment: unknown = request.assignment;
+  if (!rawAssignment || typeof rawAssignment !== "object" || Array.isArray(rawAssignment)) return false;
+  const assignment = rawAssignment as TeamAssignment;
+  return typeof request.requestId === "string" && request.requestId.length <= 80 &&
+    /^[a-f0-9-]{36}$/i.test(request.decisionId) &&
+    /^[a-f0-9-]{36}$/i.test(request.coordinatorMemberId) &&
+    request.targetSessionId === session.id &&
+    /^[a-f0-9-]{36}$/i.test(assignment.runId) &&
+    /^[a-f0-9-]{36}$/i.test(assignment.memberId) &&
+    Number.isInteger(assignment.revision) && assignment.revision > 0 &&
+    ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"].includes(assignment.role) &&
+    (assignment.taskId === undefined || typeof assignment.taskId === "string") &&
+    typeof request.targetCwd === "string" && request.targetCwd.length > 0 && request.targetCwd.length <= 4096 &&
+    Number.isInteger(Date.parse(request.expiresAt)) && /^[a-f0-9]{64}$/i.test(request.policyHash) &&
+    Number.isInteger(request.promptId) && request.promptId >= 1 &&
+    /^[a-f0-9]{64}$/i.test(request.promptHash) && /^[a-f0-9]{64}$/i.test(request.evidenceHash) &&
+    Number.isInteger(request.option) && request.option >= 0 && validActor(request.actor) &&
+    typeof request.leaseId === "string" && request.leaseId.length > 0 && request.leaseId.length <= 80;
 }
 
 const server = createServer((socket) => {
@@ -921,6 +1068,20 @@ const server = createServer((socket) => {
           seq: journal.seq,
           screen: request.screen ? screen() : "",
         };
+      } else if (request.op === "handoff-stop") {
+        result = await serialize(async () => {
+          if (!handoffReceipt || !session.handoff?.policy || !child || !/^[a-f0-9-]{36}$/.test(request.requestId)) throw new Refusal("unsupported");
+          checkControl({});
+          if (state.handoffQuiescence?.requestId === request.requestId) return state;
+          if (state.status !== "running") throw new Error("The source exited without a verified handoff process receipt");
+          handoffStopping = true;
+          try {
+            await stopHandoffProcesses(child.pid, processes => append("lifecycle", { handoffStopIntent: { requestId: request.requestId, processes } }));
+            state = { ...state, handoffQuiescence: { requestId: request.requestId, verifiedAt: new Date().toISOString(), scope: "process-group-and-observed-descendants" } };
+            append("lifecycle", { handoffQuiescence: state.handoffQuiescence }); persist();
+            return state;
+          } finally { handoffStopping = false; }
+        });
       } else if (request.op === "snapshot") {
         result = await serialize(snapshot);
       } else if (request.op === "native-info") {
@@ -940,7 +1101,18 @@ const server = createServer((socket) => {
           return native.connect(request);
         });
       } else if (request.op === "control") {
-        result = await serialize(() => changeControl(request));
+        // Control changes must be able to fence an answer between its awaited terminal writes.
+        result = changeControl(request);
+      } else if (request.op === "team-answer-invalidate") {
+        if (!/^[a-f0-9-]{36}$/i.test(request.decisionId)) throw new Error("Invalid delegated decision identity");
+        invalidatedTeamPermissionDecisions.add(request.decisionId);
+        if (controller?.actorId === `team-permission:${request.decisionId}`) {
+          controller = null;
+          controlChangeGeneration++;
+          state = { ...state, control: null };
+          persist();
+        }
+        result = { invalidated: true };
       } else if (request.op === "resize") {
         if (
           !Number.isInteger(request.cols) ||
@@ -960,6 +1132,9 @@ const server = createServer((socket) => {
         });
       } else if (request.op === "answer") {
         if (!validAnswer(request)) throw new Error("Invalid answer request");
+        result = await serialize(() => answer(request));
+      } else if (request.op === "team-answer") {
+        if (!validTeamAnswer(request)) throw new Error("Invalid delegated answer request");
         result = await serialize(() => answer(request));
       } else {
         if (
@@ -1011,11 +1186,11 @@ const server = createServer((socket) => {
 // ---- Launch ---------------------------------------------------------------------------------
 
 const hookToken = randomBytes(32).toString("hex");
-// A native CLI launch runs its exact argv: no hook listener, settings or relay environment.
+// Ordinary native arguments stay exact unless a scoped handoff policy was captured.
 const wantsHooks =
   !session.runtime?.nativeUi &&
-  session.nativeArgs === undefined &&
-  (Boolean(session.team) || provider === "demo" ||
+  (Boolean(session.handoff?.policy) || session.nativeArgs === undefined) &&
+  (Boolean(session.handoff?.policy) || Boolean(session.team) || provider === "demo" ||
     (provider === "claude" && config.attention.hooks.claude) ||
     (provider === "codex" && config.attention.hooks.codex));
 // Hooks only add precision; the screen heuristics still work if the listener cannot start.
@@ -1091,6 +1266,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       config.attention.hooks,
       Boolean(session.team),
       session.teamModelProfile,
+      session.handoff?.policy ? session.id : undefined,
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {
@@ -1140,6 +1316,7 @@ server.listen(socketPath(runDir, session.id), async () => {
         onSignal: (signal) => {
           if (signal.kind === "provider-limit") { limitWatch = undefined; recordLimit(signal, "protocol"); } else record(signal, "protocol");
         },
+        onMessage: (message) => { recordMessage(message); },
         record: (method) => { append("input-intent", { op: "native", method }); },
       });
       hybrid?.providerReady(native.supportsExecutionSelection);
@@ -1223,7 +1400,8 @@ server.listen(socketPath(runDir, session.id), async () => {
       } catch {
         recordingFailure();
       }
-      setTimeout(() => exitWorker(0), 1500);
+      const finish = () => { if (handoffStopping) setTimeout(finish, 100); else exitWorker(0); };
+      setTimeout(finish, 1500);
     };
     child.onExit(({ exitCode }) => {
       if (snapshotQueue) snapshotQueue.push(() => exited(exitCode));

@@ -133,3 +133,7 @@ test("codex reset time comes from the newest Try again at line", () => {
   ];
   assert.equal(detectLimit(lines, "codex", now)?.resetsAt, "2026-10-18T15:45:00.000Z");
 });
+
+test("an explicit same-weekday reset advances a week after its clock has passed", () => {
+  assert.equal(parseResetTime("resets Mon 12:00pm", new Date("2026-10-19T16:00:00Z")), "2026-10-26T12:00:00.000Z");
+});

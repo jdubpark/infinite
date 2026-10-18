@@ -1,6 +1,6 @@
 # Infinite
 
-A persistent agent host for Claude Code, Codex, Grok Build, and OpenCode. Agents run on the host; cmux, a browser, and the React Native phone app attach to the same sessions. Closing the laptop does not move or restart the agent.
+A persistent agent host for Claude Code, Codex, Grok Build, and OpenCode. Agents run on the host; cmux, the native Mac app, a browser, and the React Native phone app attach to the same sessions. Closing the laptop does not move or restart the agent.
 
 **Status: single-tenant cloud pilot with a paired laptop CLI.** Claude, Codex, Grok, and OpenCode have completed authenticated tool runs on the rented server. Cloud processes survive client disconnection and API restarts. Encrypted backup and data-restore checks are complete. Independent cloud backup storage, cold-boot recovery, and operator-confidential multi-tenant execution remain unfinished. See the [commissioning record](deploy/ubuntu/commissioning.md).
 
@@ -22,11 +22,16 @@ infinite codex --model MODEL
 infinite grok
 infinite opencode --model deepseek/deepseek-flash
 infinite list
+infinite resources --watch
 infinite resume
 infinite monitor
+infinite close SESSION_ID
+infinite cmux
 ```
 
 The CLI is installed and paired on the commissioning laptop. Every provider runs on the cloud host by default. `resume` attaches to the same process; `monitor` starts read-only. Press Enter to enable steering, Ctrl+G to monitor, or Ctrl+] to detach. Put wrapper options before the provider, for example `infinite --project PROJECT_ID --title "Task" codex`. See [installation, pairing, and CLI behavior](docs/cli.md).
+
+The Mac app can stay closed. `list` includes project and working directory, `resources --watch` shows server counters, and `close` asks before ending the selected provider process (`--yes` for scripts). `infinite cmux` opens the app's separate cmux workspace catalog through the independently installed and enrolled `infinite-cmux` launcher. Infinite's catalog and cmux's catalog retain their own IDs. An independent SSH tunnel can keep both connections available at login.
 
 Run `infinite sync` inside a checkout to keep the configured cloud project current with it, one way; `infinite pull` downloads the cloud tree into a new directory. See [workspace sync](docs/workspace-sync.md).
 
@@ -75,9 +80,25 @@ Search sessions by title, provider, project ID, or session ID. **Active** shows 
 
 Type a draft while monitoring or offline, then take control explicitly to send. **Cmd/Ctrl+Enter** sends; Enter adds a line. Switching sessions preserves drafts and recent views in this tab's memory. Reconnecting refreshes the view without sending the draft or reclaiming control. Reloading or closing the tab discards unsent drafts; they are not synchronized to other devices.
 
+## Mac app
+
+The personal macOS app embeds real terminal output, a native prompt editor,
+resource monitoring, session controls, and file transfer/sync preview. Enter sends
+a locally edited prompt; Shift-Enter adds a line. Direct terminal keys are an
+explicit mode. Server processes continue after the app closes.
+
+```sh
+npm run desktop:install
+```
+
+Requires macOS 14 or newer and Xcode command-line tools. Connect an Infinite host
+with `remote.enabled: true`, or enroll separately with a cmux server. The native
+connections are application-encrypted to the trusted server. See [build, pairing,
+file-safety rules, and verified limitations](docs/desktop.md).
+
 ## Phone
 
-The React Native app is in `apps/mobile`. It supports Android and has an iPhone build configuration. Pair it with an HTTPS Tailscale Serve address and a **controller** or **viewer** key. Keys go into Android Keystore/iOS Keychain through Expo SecureStore. Logs are kept in memory while the app is open and remain on the host for replay.
+The React Native app is in `apps/mobile`. It supports Android and has an iPhone build configuration. Pair it with an HTTPS Tailscale Serve address and a **controller** or **viewer** key, or, without a VPN on the phone, with a relay behind Cloudflare Access ([phone access guide](deploy/ubuntu/public-relay.md)). Enable `remote.enabled` on the host; direct and relay connections require the application-encrypted endpoint. Keys go into Android Keystore/iOS Keychain through Expo SecureStore. Logs are kept in memory while the app is open and remain on the host for replay.
 
 ```sh
 npm run android -w @infinite/mobile
@@ -85,6 +106,8 @@ npm run ios -w @infinite/mobile
 ```
 
 On hosts whose workers enforce input control, the phone sends nothing until you tap **Take control** (or **Take over** when another device holds the session). The lease lasts 30 seconds, renews while the session is on screen, and is released when you leave the session or background the app. Viewers stay read-only.
+
+The **Teams** and **Goals** tabs appear on hosts that support teams; a host without teams configured shows setup guidance there. They list each run with what it waits on, open its decisions, plan, members, checks, and review, and let an owner or controller answer and steer. Starting, pausing, resuming, and cancelling a run are owner actions. See [Goals and agent teams](docs/teams.md).
 
 Search the inbox or pull down to refresh it. The composer allows local drafting while monitoring or reconnecting, with a control action beside the draft when the host is ready. Taking control never sends the draft. Drafts remain in this app's memory across navigation; they are not shared with another device or retained after the app exits.
 
@@ -126,7 +149,7 @@ Push setup, in order:
 - Detached PTY workers; client and API lifetimes are independent of agent lifetimes.
 - Same-process terminal attachment, screen snapshots, full raw terminal recordings, and paginated replay by sequence number.
 - An encrypted record of session metadata, initial context, output, input intent, and delivery receipts. Records use AES-256-GCM with session/sequence authenticated data and a key outside the state directory.
-- Owner, controller, and viewer access. Creation is owner-only; the phone UI only monitors and steers. These are credential roles, not proof of a physical laptop's identity.
+- Owner, controller, and viewer access. Creating sessions, teams, and goals is owner-only on every client; controllers answer and steer; viewers read. These are credential roles, not proof of a physical laptop's identity.
 - Device input control: one renewable 30-second lease per session, enforced in the worker, with explicit takeover. A refused input journals nothing.
 - A laptop CLI that launches native provider CLIs with exact arguments, reattaches over one WebSocket, and starts from a bounded terminal snapshot.
 - Idempotent creation and input IDs. An ambiguous terminal write is not automatically repeated. A delivered receipt means bytes reached the PTY, not that the provider accepted or completed a task.
@@ -145,7 +168,7 @@ Project context is deliberately shared at session creation. Later changes must b
 
 The system does not upload the laptop's home directory, synchronize arbitrary credentials, replicate local apps, provision MCP dependencies, or automatically pull cloud file changes into a dirty checkout. The cloud workspace is authoritative; use Git or SSH-based file access for source changes. Those boundaries matter for both fidelity and privacy.
 
-Unattended work is limited by each provider's permissions, quotas, authentication expiry, and the task supplied. Infinite does not loop “continue” forever or silently approve tools. A machine that can execute a tool is not necessarily permitted to execute it unattended.
+Unattended work is limited by each provider's permissions, quotas, authentication expiry, and the task supplied. Infinite does not loop “continue” forever. Ordinary sessions do not silently approve tools. An owner can delegate bounded one-shot tool requests to the strong coordinator through repository enrollment. Workspace trust and persistent permission changes still require owner handling. A machine that can execute a tool is not necessarily permitted to execute it unattended.
 
 **An attacker controlling the active worker or guest root can read active files and memory.** Journal encryption does not change that. Workspace files, native CLI histories, swap, credentials, and backups need the separate storage/isolation controls described in [security](docs/security.md).
 

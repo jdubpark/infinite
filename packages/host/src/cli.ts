@@ -231,6 +231,15 @@ infinite --project ID --title "Task" codex [FLAGS]
 infinite list [--json]                      List cloud sessions
 infinite resume [SESSION_ID]                Reattach to a live process
 infinite monitor [SESSION_ID]               Watch; Enter enables interaction
+infinite repo init [DIRECTORY]              Enroll a repository or set parent-folder Linear defaults
+infinite repo init --permissions coordinator [--permission-scope TEXT] [--permission-limit N]
+infinite repo init --permissions off        Disable delegation for future runs
+infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
+infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
+infinite team status [ID] [--logs]          Show teams, or one team's Jevcode summary
+infinite team watch ID [--logs]             Follow the summary; l logs, n/p agents, b summary
+infinite team steer ID TEXT                 Steer an active team
+infinite team answer ID QUESTION_ID TEXT    Answer a pending question
 
 Ctrl+] detaches. Ctrl+G returns to monitor mode. Flags after a provider
 name belong to that provider and use cloud paths.
@@ -244,7 +253,7 @@ infinite device-add --role owner --name Phone --token-file FILE --config FILE
 infinite device-revoke DEVICE_ID --config FILE
 infinite install-service --config FILE       Start host at login (macOS/Linux)
 infinite uninstall-service --config FILE
-infinite relay-init --config FILE --port 4790
+infinite relay-init --config FILE --port 4790 [--proxy-socket PATH [--client-address-header cf-connecting-ip]]
 infinite relay-add --machine UUID --token-file KEY_FILE --config FILE
 infinite relay-serve --config FILE
 infinite connect-relay https://RELAY --token-file KEY_FILE --config FILE
@@ -326,11 +335,12 @@ else if (command === "plan-fleet") {
     });
     for (const signal of ["SIGTERM", "SIGINT"] as const)
       process.once(signal, () => {
-        server.close(() => {
+        const closing = closeConnections();
+        server.close(async () => {
+          await closing;
           unlock();
           process.exit(0);
         });
-        closeConnections();
       });
   } else {
     const manager = new Manager(config, key);

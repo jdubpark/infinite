@@ -1,11 +1,12 @@
 import type { Attention, Provider } from "@infinite/attention";
-import { createRemoteClient, RemoteError } from "@infinite/remote";
+import { createRemoteClient, RemoteError, type RemoteAccessToken } from "@infinite/remote";
 import * as Crypto from "expo-crypto";
 import { loadClientId } from "../store/connection";
+import type { TeamLineup, TeamProject, TeamRole } from "../features/teams/model";
 
-export type Connection = { id?: string; machineId?: string; label?: string; url: string; token: string; relay?: { machineId: string } };
+export type Connection = { id?: string; machineId?: string; label?: string; url: string; token: string; relay?: { machineId: string }; access?: RemoteAccessToken };
 export const connectionKey = (connection: Connection) => connection.id ?? `${connection.url}/${connection.relay?.machineId ?? "direct"}`;
-const remotes = new Map<string, { token: string; client: ReturnType<typeof createRemoteClient> }>();
+const remotes = new Map<string, { secrets: string; client: ReturnType<typeof createRemoteClient> }>();
 const remoteKey = (connection: Connection) => `${connectionKey(connection)}/${connection.url}/${connection.relay?.machineId ?? "direct"}`;
 export function closeConnection(connection: Connection) {
   remotes.get(remoteKey(connection))?.client.close();
@@ -14,9 +15,10 @@ export function closeConnection(connection: Connection) {
 function remote(connection: Connection) {
   const key = remoteKey(connection);
   let saved = remotes.get(key);
-  if (!saved || saved.token !== connection.token) {
+  const secrets = JSON.stringify([connection.token, connection.access?.clientId, connection.access?.clientSecret]);
+  if (!saved || saved.secrets !== secrets) {
     saved?.client.close();
-    saved = { token: connection.token, client: createRemoteClient(connection, { randomBytes: Crypto.getRandomBytes }) };
+    saved = { secrets, client: createRemoteClient(connection, { randomBytes: Crypto.getRandomBytes }) };
     remotes.set(key, saved);
   }
   return saved.client;
@@ -64,47 +66,19 @@ export async function api<T>(
       "X-Infinite-Client": await loadClientId(),
       ...(init.control ? { "X-Infinite-Control": init.control } : {}),
     };
-    if (connection.relay) {
-      try {
-        return await remote(connection).request<T>(path, { ...init, headers, signal: controller.signal });
-      } catch (error) {
-        if (error instanceof RemoteError) {
-          const value = error.body as { error?: string; code?: string; attention?: Attention } | undefined;
-          const code = value?.code ?? value?.error ?? error.code;
-          if (code === "control-busy" || code === "control-lost") throw new ControlRefusal(error.message, code);
-          throw new ApiError(error.message, error.status, code, value?.attention);
-        }
-        throw error;
+    // Both direct and relayed connections use the authenticated encrypted
+    // channel. An unavailable endpoint never falls back to plaintext API calls.
+    try {
+      return await remote(connection).request<T>(path, { ...init, headers, signal: controller.signal });
+    } catch (error) {
+      if (error instanceof RemoteError) {
+        const value = error.body as { error?: string; code?: string; attention?: Attention } | undefined;
+        const code = value?.code ?? value?.error ?? error.code;
+        if (code === "control-busy" || code === "control-lost") throw new ControlRefusal(error.message, code);
+        throw new ApiError(error.message, error.status, code, value?.attention);
       }
+      throw error;
     }
-    const response = await fetch(`${connection.url}/api${path}`, {
-      method: init.method ?? (init.body ? "POST" : "GET"),
-      headers: {
-        Authorization: `Bearer ${connection.token}`,
-        ...headers,
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
-      },
-      body: init.body ? JSON.stringify(init.body) : undefined,
-      signal: controller.signal,
-    });
-    const value = await response.json();
-    if (!response.ok) {
-      const message = value.error ?? "Host request failed";
-      // Control refusals carry `code` and a sentence; attention refusals carry the code as `error`.
-      if (value.code === "control-busy" || value.code === "control-lost")
-        throw new ControlRefusal(message, value.code);
-      throw new ApiError(
-        message,
-        response.status,
-        typeof value.code === "string"
-          ? value.code
-          : typeof value.error === "string"
-            ? value.error
-            : undefined,
-        value.attention,
-      );
-    }
-    return value as T;
   } catch (error) {
     if ((error as Error).name === "AbortError")
       throw new ApiError(
@@ -125,6 +99,8 @@ export type SessionRow = {
   executionLocation?: "cloud" | "laptop";
   backend?: "infinite" | "cmux";
   projectId?: string;
+  /** Present on a team member; the team scheduler owns its lifecycle. */
+  team?: { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string };
   resumable?: boolean;
   title: string;
   provider: Provider;
@@ -159,8 +135,10 @@ export type Me = {
   backends?: ("infinite" | "cmux")[];
   providers?: Provider[];
   backendProviders?: { infinite: Provider[]; cmux?: Provider[] };
-  projects?: { id: string; name: string }[];
+  projects?: TeamProject[];
   capabilities?: { signals: boolean; answer: boolean; push: boolean };
+  teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
+  goals?: { enabled: boolean };
 };
 export type LogEvent = {
   seq: number;

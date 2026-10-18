@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { startHost, waitFor, type Host } from "./helpers.js";
 import type { CreateGoal, ProductGoal } from "../packages/host/src/goal-types.js";
@@ -38,6 +38,7 @@ async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof star
   const apiKeyFile = join(root, "linear-key");
   if (linear) writeFileSync(apiKeyFile, linear.apiKey, { mode: 0o600 });
   let host: Host;
+  const bootstrapGoal = scenario === "bootstrap-goal";
   try {
     host = await startHost({ agents: {
       claude: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), scenario, receipts, "claude"] },
@@ -45,13 +46,15 @@ async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof star
     }, config: {
       teams: { workspaceDir: join(root, "teams"), lineup },
       ...(linear ? { linear: { apiKeyFile, endpoint: linear.endpoint } } : {}),
-      projects: [{ id: "rehearsal", name: "Rehearsal", path: source, team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] },
+      projects: [{ id: "rehearsal", name: "Rehearsal", path: source, team: bootstrapGoal
+        ? { checks: [], establishChecks: true }
+        : { checks: [{ command: process.execPath, args: ["check.mjs"] }], ...(scenario === "delivery" ? { delivery: { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}) },
         ...(linear ? { linear: { teamId: linear.teamId } } : {}) }],
     } });
   } catch (error) { rmSync(root, { recursive: true, force: true }); await linear?.close(); throw error; }
   const create = (): CreateGoal => ({ requestId: randomUUID(), projectId: "rehearsal", title: "Improve the progress flow",
     objective: "Build two small progress improvements using the existing data", successCriteria: "Two useful progress steps are available",
-    nonGoals: ["Publishing or changing files outside the feature directory"], allowedPaths: ["features"],
+    nonGoals: [scenario === "delivery" ? "Changing files outside the feature directory" : "Publishing or changing files outside the feature directory"], allowedPaths: ["features"],
     evidence: ["The fixture progress data starts at zero"], maxRuns: 2, maxMinutes: 5, maxMembers: 12, parallelism: 2 });
   const goal = async (id: string): Promise<ProductGoal> => {
     const response = await host.fetchApi(`/goals/${id}`); assert.equal(response.status, 200, JSON.stringify(response.body)); return response.body;
@@ -78,6 +81,15 @@ test("a goal reconciles lost Linear acknowledgements, gathers evidence, escalate
   const linear = await startLinearServer();
   const f = await fixture("cycles", linear);
   try {
+    // Serve the fixture's parent as the sync home and enroll a sibling teamwork folder through the API.
+    const teamworkRoot = join(dirname(f.source), "teamwork");
+    f.host.config.sync = { homeDir: dirname(f.source) };
+    await f.host.stopApi();
+    writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
+    await f.host.start();
+    const enrollment = (await f.host.fetchApi(`/projects/${f.host.config.projects[0].id}/team`, "owner")).body;
+    const enrolled = await f.host.fetchApi(`/projects/${f.host.config.projects[0].id}/team`, "owner", { requestId: randomUUID(), revision: enrollment.revision, team: enrollment.team, teamwork: "teamwork" }, {}, "PUT");
+    assert.equal(enrolled.status, 200, JSON.stringify(enrolled.body));
     const request = f.create();
     const me = await f.host.fetchApi("/me");
     assert.equal(me.status, 200);
@@ -122,6 +134,7 @@ test("a goal reconciles lost Linear acknowledgements, gathers evidence, escalate
     assert.equal(ready.outcomes.length, 0, "Code and review evidence cannot establish the product outcome");
     assert.equal(ready.cycles.length, 2);
     const runs = await Promise.all(ready.cycles.map(cycle => f.team(cycle.teamId)));
+    assert.ok(runs.every(run => run.workspace.startsWith(`${teamworkRoot}/`)), "Both the original run and goal continuation stay under the enrolled teamwork root");
     assert.ok(runs.every(run => run.status === "ready-for-review" && run.review?.verdict === "approved" && run.checks.length > 0 && run.checks.every(check => check.status === "passed")));
     assert.equal(runs[0].baseCommit, f.base);
     assert.equal(runs[1].baseCommit, runs[0].headCommit);
@@ -208,6 +221,41 @@ test("a goal with no justified change records evidence without starting implemen
     assert.equal(run.headCommit, f.base);
     assert.equal(git(run.workspace, "status", "--porcelain"), "");
     assert.equal((await f.host.fetchApi(`/goals/${stopped.id}/resume`, "owner", { requestId: randomUUID(), revision: stopped.revision })).status, 409);
+  } finally { await f.close(); }
+});
+
+test("goal cycles retain their accepted verification when project configuration changes before continuation", { timeout: 120000 }, async () => {
+  const f = await fixture("bootstrap-goal");
+  try {
+    const request = f.create();
+    const created = await f.host.fetchApi("/goals", "owner", request);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const held = await waitFor(async () => {
+      const goal = await f.goal(request.requestId);
+      const team = goal.activeTeamId ? await f.team(goal.activeTeamId) : undefined;
+      return { goal, team };
+    }, value => Boolean(value.team?.tasks.length && value.team.members.some(member => member.role === "implementer" && member.status === "running")), 30000);
+    const first = held.team!;
+    const accepted = first.verification;
+    assert.ok(accepted?.checks?.length);
+    assert.equal(first.establishChecks, true);
+
+    f.host.config.projects[0]!.team = { checks: [{ command: process.execPath, args: ["check.mjs"] }] };
+    writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
+    await f.host.stopApi(); await f.host.start();
+    assert.deepEqual((await f.team(first.id)).verification, accepted);
+    writeFileSync(join(f.receipts, "release-first-implementation"), "continue", { mode: 0o600 });
+
+    const finished = await f.settled(request.requestId);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.cycles.length, 2);
+    const runs = await Promise.all(finished.cycles.map(cycle => f.team(cycle.teamId)));
+    assert.deepEqual(runs[0].verification, accepted);
+    assert.deepEqual(runs[1].verification, accepted);
+    assert.equal(runs[1].establishChecks, true);
+    assert.ok(runs.every(run => run.status === "ready-for-review" && run.review?.verdict === "approved"
+      && run.checks.some(check => check.status === "passed")));
+    assert.equal(runs[1].goal?.parentRunId, runs[0].id);
   } finally { await f.close(); }
 });
 
@@ -399,4 +447,24 @@ test("goal budgets stop every worker and prevent further work when attempts are 
       assert.equal(git(f.source, "status", "--porcelain"), "");
     } finally { await f.close(); }
   }
+});
+
+
+test("a goal continues from merged feature receipts without claiming product achievement", { timeout: 120000 }, async () => {
+  const linear = await startLinearServer();
+  const f = await fixture("delivery", linear);
+  try {
+    const created = await f.host.fetchApi("/goals", "owner", f.create());
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const completed = await f.settled(created.body.id);
+    assert.equal(completed.status, "ready-for-review", JSON.stringify(completed));
+    assert.equal(completed.outcomes.length, 0);
+    assert.deepEqual(completed.cycles.map(cycle => cycle.status), ["merged", "merged"]);
+    const first = await f.team(completed.cycles[0].teamId), second = await f.team(completed.cycles[1].teamId);
+    assert.equal(second.baseCommit, first.deliveryReceipt?.mergeCommit);
+    assert.notEqual(second.baseCommit, first.headCommit);
+    assert.ok(first.deliveryReceipt && second.deliveryReceipt);
+    await waitFor(async () => [...linear.comments.values()], comments => comments.filter(comment => comment.body.includes("Delivery agent reported a merged pull request")).length === 2, 15000);
+    assert.ok([...linear.comments.values()].filter(comment => comment.body.includes("Delivery agent reported a merged pull request")).every(comment => comment.body.includes("agent-reported delivery evidence")));
+  } finally { await f.close(); await linear.close(); }
 });

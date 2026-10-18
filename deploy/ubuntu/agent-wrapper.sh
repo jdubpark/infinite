@@ -15,11 +15,15 @@ export SHELL=/bin/bash
 
 provider=$(basename "$0")
 case "$provider" in
-  claude)
-    export DISABLE_UPDATES=1
-    export DISABLE_AUTOUPDATER=1
+  claude) ;;
+  codex)
+    # The interactive CLI tries a background app-server daemon that cannot run in this
+    # account; the prepared app-server backend is launched separately through codex-app-server.
+    # Global npm installs land in this prefix, which is the binary launched below.
+    export npm_config_prefix=/opt/infinite-agents/v1
+    set -- --no-daemon "$@"
     ;;
-  codex|codex-app-server|grok|opencode) ;;
+  codex-app-server|grok|opencode) ;;
   demo)
     exec /usr/local/bin/node /opt/infinite/packages/host/dist/demo.js "$@"
     ;;

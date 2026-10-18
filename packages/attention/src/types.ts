@@ -19,7 +19,8 @@ export interface Prompt {
   acceptsText: boolean;
   multiSelect?: boolean;
   destructive?: { pattern: string };
-  tool?: { name: string; input: Record<string, unknown> };
+  /** Only true when the retained provider input is complete, without storage truncation. */
+  tool?: { name: string; input: Record<string, unknown>; inputComplete?: boolean };
   source: PromptSource;
   hash?: string;
 }

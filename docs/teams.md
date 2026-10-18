@@ -4,18 +4,217 @@ Open **Goals** in the web client to give the agents a product outcome, evidence,
 and limits. The coordinator investigates the project, selects a useful change,
 and sends bounded tasks to parallel workers. A successful cycle produces an
 isolated branch with check results and an independent agent review. The next cycle starts
-from that reviewed commit.
+from that reviewed commit, or its recorded merge commit when delivery is enabled.
 
 Use **Teams** for one feature request or pasted PRD. A team plans and implements
 that request without selecting a sequence of follow-up improvements. Both flows
 show member sessions, questions, steering, file ownership, and verification
 records. The web interface supports desktop and narrow phone browsers. The
-native phone app can open member sessions; it has no Goals or Teams dashboard.
+native phone app has **Teams** and **Goals** tabs beside its sessions. It
+starts, answers, steers, pauses, resumes, and cancels runs with the same roles
+and request rules as the web client, and records goal outcomes. It opens member
+sessions, and a member session links back to its team. The Mac app shows Teams
+only.
+
+A team opens on the same layout in the web client, the phone app, and
+`infinite team watch`. Open decisions come first. The Jevcode summary follows,
+in the briefing order: the outcome, system shape, ranked **Review first** items
+with their priority and question, what changed, check evidence, guidance for
+agents, and gaps. System shape and guidance start collapsed on the web and
+phone. **Review logs** shows one agent's terminal screen and recent control
+events. Each agent has a control, Previous and Next step through them, and
+**Back to summary** returns. On the web and phone, the plan, members,
+verification, and run history sit under **Run details**. The summary is the
+briefing agent's reading of recorded activity. It is not completion or approval.
 
 A Team marked **ready for your review** has explicit reports for its current revision,
 passing configured checks, and an approving reviewer report. It does not
 establish product impact or human acceptance. The host does not push, open pull
 requests, merge into the original checkout, or deploy.
+The paired CLI can bring a team's integrated branch into an ordinary local branch with `infinite team pull TEAM_ID`.
+
+## Start from a terminal
+
+The paired laptop CLI can enroll a repository and control the same Teams shown
+in the web client. See [CLI repository setup](cli.md) for command options.
+
+```sh
+cd /path/to/project
+infinite repo init
+infinite team start "Implement the checkout retry behavior described in the issue"
+infinite team start --prd docs/checkout-prd.md
+infinite team status
+infinite team status TEAM_ID
+infinite team status TEAM_ID --logs
+infinite team watch TEAM_ID
+infinite team steer TEAM_ID "Keep the existing checkout layout"
+infinite team answer TEAM_ID QUESTION_ID "Use the existing retry policy"
+```
+
+`infinite team status` without an ID lists each team's members, tasks, and open
+questions. `infinite team status TEAM_ID` prints that team's decisions and
+Jevcode summary, wrapped to the terminal width. Each open decision shows the
+`infinite team answer` command that answers it.
+
+`infinite team watch TEAM_ID` keeps that summary full screen and refreshes it
+every two seconds. The bottom line lists the keys for the current view:
+
+| Key | Action |
+| --- | --- |
+| `l` | Open the review log |
+| `s` or `b` | Return to the summary |
+| `←` `→`, or `n` `p` | Next or previous agent |
+| `↑` `↓`, or `j` `k` | Scroll one line |
+| Space, Page Up, Page Down | Scroll one page |
+| `g` `G`, Home, End | Jump to the top or bottom |
+| `a` | Ask Jevcode for a summary when it is empty or failed |
+| `q` or Ctrl+C | Detach |
+
+A refresh keeps your scroll position; switching view or agent starts at the
+top. A failed refresh keeps the last card on screen under a notice. A
+non-interactive watch prints again only when the visible text changes.
+`--logs` starts in the review log. `infinite team status TEAM_ID --logs` prints
+the current revision's review logs once. `--json` still prints the team record.
+Set `NO_COLOR` to drop bold headings and the highlighted key bar.
+
+Repository setup records a private binding between the local Git root and the
+selected host project. A new remote source receives a committed Git snapshot;
+ignored files and uncommitted changes are not included. Existing cloud sources
+are not replaced by enrollment. Setup and verification commands belong to that
+repository, while the coordinator, workers, and reviewer come from the host's
+configured lineup. Owners can delegate current one-shot tool requests to the
+strong coordinator under an explicit repository policy; see
+[Delegating permission decisions](#delegating-permission-decisions).
+
+A new empty repository can enroll immediately after `git init`. Its cloud source
+gets an empty baseline commit; local Git history and files stay unchanged. When
+no checks exist, enrollment records `checks: []` and `establishChecks: true`.
+This owner opt-in authorizes the coordinator to define verification commands.
+The first plan must include `verification` with one or more `checks` and an
+optional `setup` command, each using the existing command/argument format.
+
+The host saves those commands before implementation and retains them through
+steering, retries, restarts, and later goal cycles. A plan cannot replace existing
+configured checks or change accepted commands. Setup runs after integration so
+workers can create the project first. Failed checks enter bounded repair; the
+team cannot become ready for review without passing checks and an independent
+review of both the implementation and its verification. Check commands execute
+under the configured host command identity, with the same environment filtering,
+timeouts, and interruption handling as configured checks. This opt-in does not
+approve provider permissions or allow a denied tool to be bypassed.
+
+Add the repository's Linear team and project mapping during enrollment to track
+new runs. Supply the IDs once per parent folder to reuse them across its child
+repositories; each child can then run `infinite repo init` without Linear flags.
+Existing repository mappings remain in place when parent defaults change.
+A mapping is configuration, not proof of connectivity: each run shows
+whether Linear has confirmed its issue and execution evidence. Historical runs
+remain unchanged. Run status, verification, and human acceptance retain the
+separate meanings described below.
+
+## Optional provider-side delivery
+
+Repositories remain review-only until an owner configures delivery once during
+enrollment:
+
+```sh
+infinite repo init --delivery merge
+infinite repo init --delivery merge --repository OWNER/REPO --base-branch main --merge-method squash
+infinite repo init --delivery review
+```
+
+For `--delivery merge`, the CLI reads `origin` only when its URL is an HTTPS or
+SSH `github.com` repository without credentials. It reads the default branch
+from `origin/HEAD`; if that is missing, it uses the current local `main` or
+`master` branch. Otherwise, provide `--base-branch`. The CLI does not change
+the remote or local Git state. Existing enrollment keeps its delivery policy
+when `--delivery` is omitted; `--delivery review` removes that policy. New
+enrollments remain review-only by default. Delivery settings are per repository
+and are not inherited from parent-folder Linear defaults.
+
+The configured target authorizes the strong coordinator role to use its
+existing provider tools to merge its own work after configured checks pass and
+an independent reviewer approves the implementation and verification. The host
+checks that a delivery report identifies the reviewed head and configured
+repository. The provider's merge receipt remains agent evidence; the host does
+not independently verify the remote merge or grant GitHub tool permissions.
+Missing GitHub tools or authentication blocks delivery for review. It does not
+expand provider permissions, and a merge report does not establish human
+acceptance or product impact.
+
+## Project context and explicit relationships
+
+Each project keeps its own context, task history, and repository evidence. Parent
+folder enrollment and Linear mappings do not share context. An alias pointing to
+the same directory also keeps a separate context record.
+
+From an enrolled repository, explicitly name a source project or enrolled directory:
+
+```sh
+infinite repo link ../backend --relationship "Uses the backend API"
+infinite repo links
+infinite repo unlink ../backend
+```
+
+Use `--project ID` to select the consuming project without changing directories.
+Only an owner can change links. A link imports the source's owner-authored project
+context into future managed sessions, with its project ID, version, and relationship.
+It does not import transcripts, follow another link, or merge Linear projects.
+Existing sessions keep their snapshots after unlinking. Native CLI launches keep
+their existing no-injection behavior; team sessions receive the scoped context.
+
+The separately installed shared-brain skill also defaults to the requested
+repository alone. Its owner-managed knowledge links require an explicit linked
+search; `global` is not included automatically. An Infinite context link does not
+create a brain link. Each surface grants only its named kind of context, and
+neither grants filesystem or network permissions.
+
+## Let an ordinary session request a team
+
+`infinite repo init` enables automatic handoff for new sessions in that project.
+Use `--handoff off` during enrollment to keep them as individual sessions.
+Existing projects and already running sessions retain their settings.
+
+After enrollment, start normally with `infinite claude "Your task"` or
+`infinite codex "Your task"`. Both use the enrolled cloud project. Later local
+edits need an explicit sync; starting a session does not upload them.
+
+A supported Claude or Codex terminal session receives a scoped `handoff` tool.
+It can request a team when the current task benefits from parallel work and
+independent review. The request contains the remaining objective, the reason
+for delegation, and a summary of completed work. The coordinator can use one
+implementer if parallel work is unnecessary. It reports no change only when the
+task requires no further code changes, with evidence. No terminal-text heuristic
+makes this choice.
+
+Before yielding, the agent must stop its tool jobs, commit only its own changes,
+and supply the clean Git commit. Unrelated edits must remain untouched; a dirty
+checkout refuses the transfer. The host records the request, releases the source
+writer, checks its observable process group and descendants, and verifies the
+same commit before preparing an isolated team copy. A retry or host restart uses
+the recorded team identity. The yielded session cannot be resumed as another
+writer for the same task.
+
+The team inherits the source session's configured lineup, project checks and
+Linear mapping. It has at most two parallel implementers, sixteen member
+attempts, and sixty minutes from the accepted handoff. These are execution limits,
+not a token or currency cap. A recorded initial user request stays in its context.
+For an interactive session with no initial request, the agent's summary supplies
+the current task context and is labeled accordingly. It does not grant authority
+to expand the task, publish, deploy, or change provider permissions.
+
+The CLI releases its own terminal lease after an accepted handoff when it has no
+unsent local draft. A draft or another controlling device keeps the transfer
+waiting until that client detaches. Status and the resulting team ID are exposed
+at `GET /api/sessions/:id/handoff` and on the session record.
+
+Handoff currently covers new Claude and Codex PTY sessions at the configured
+repository root, with ordinary prompts and supported model flags. Native UI,
+laptop execution, resumed sessions, other providers, and unsupported native
+arguments retain their existing behavior and report handoff as unavailable.
+The process check is not a sandbox for arbitrary background services: the agent
+must stop jobs that detached or escaped its observed process tree before yielding.
+An uncertain stop or changed checkpoint blocks the transfer and preserves the work.
 
 ## Start and steer a goal
 
@@ -73,7 +272,15 @@ A project can map its Goals, feature cycles, and standalone Teams to Linear
 through private host configuration. On a mapped project, **New goal** offers an
 optional existing issue identifier or UUID. Leave it empty to create a goal issue. Each feature
 cycle gets a child issue under that goal. A standalone Team creates its own
-issue. Projects without a mapping keep the local Goal and Team workflow.
+issue. Configure `projects[].linear.teamId` and optionally `projectId` to place
+new issues in the selected Linear project. An explicitly linked issue must match
+that project. Changing the mapping blocks existing tracked work for review.
+Projects without a mapping keep the local Goal and Team workflow.
+
+Tracking intent is saved when a goal or team is created. Adding a mapping later
+does not publish historical runs, including through startup or list/get calls.
+Child teams inherit their goal's tracking intent. Already tracked identities
+continue to reconcile across restarts.
 
 The linked issue is the task record for scope and human workflow state. The host
 re-reads both the parent and child before starting another member and checks
@@ -284,10 +491,10 @@ for all roles. Goals always use a recorded lineup and require both coordinator
 and reviewer profiles to have `tier: "strong"`.
 
 This starting configuration uses Opus 5.5 at `xhigh` for coordination and repair,
-Astra 6 at `xhigh` for review, and Haiku 5.5 and GPT-6 Luna at `medium` for ordinary
-worker tasks. Strong profiles are available through the explicit escalation
-pool. Model IDs live in host configuration, rather than application routing
-code.
+Astra 6 at `high` for review, and Haiku 5.5 and GPT-6 Luna at `high` for ordinary
+worker tasks. Opus 5.5 `xhigh` and Astra 6 `xhigh` are available through the
+explicit escalation pool. Model IDs live in host configuration, rather than
+application routing code.
 
 ```json
 {
@@ -295,40 +502,40 @@ code.
     "coordinator": {
       "id": "opus-xhigh", "label": "Opus 5.5 xhigh",
       "provider": "claude", "model": "claude-opus-5-5", "effort": "xhigh",
-      "tier": "strong"
+      "tier": "strong", "dataUse": "standard"
     },
     "implementers": [
       {
-        "id": "haiku-medium", "label": "Haiku 5.5 medium",
-        "provider": "claude", "model": "claude-haiku-5-5", "effort": "medium",
-        "tier": "light"
+        "id": "haiku-high", "label": "Haiku 5.5 high",
+        "provider": "claude", "model": "claude-haiku-5-5", "effort": "high",
+        "tier": "light", "dataUse": "standard"
       },
       {
-        "id": "luna-medium", "label": "GPT-6 Luna medium",
-        "provider": "codex", "model": "gpt-6-luna", "effort": "medium",
-        "tier": "light"
+        "id": "luna-high", "label": "Luna 6 high",
+        "provider": "codex", "model": "gpt-6-luna", "effort": "high",
+        "tier": "light", "dataUse": "standard"
       }
     ],
     "integrator": {
       "id": "opus-xhigh", "label": "Opus 5.5 xhigh",
       "provider": "claude", "model": "claude-opus-5-5", "effort": "xhigh",
-      "tier": "strong"
+      "tier": "strong", "dataUse": "standard"
     },
     "reviewer": {
-      "id": "astra-xhigh", "label": "Astra 6 xhigh",
-      "provider": "codex", "model": "gpt-6-astra", "effort": "xhigh",
-      "tier": "strong"
+      "id": "astra-high", "label": "Astra 6 high",
+      "provider": "codex", "model": "gpt-6-astra", "effort": "high",
+      "tier": "strong", "dataUse": "standard"
     },
     "escalations": [
       {
         "id": "opus-xhigh", "label": "Opus 5.5 xhigh",
         "provider": "claude", "model": "claude-opus-5-5", "effort": "xhigh",
-        "tier": "strong"
+        "tier": "strong", "dataUse": "standard"
       },
       {
         "id": "astra-xhigh", "label": "Astra 6 xhigh",
         "provider": "codex", "model": "gpt-6-astra", "effort": "xhigh",
-        "tier": "strong"
+        "tier": "strong", "dataUse": "standard"
       }
     ]
   }
@@ -337,20 +544,20 @@ code.
 
 Optional OpenCode workers can be added to `implementers`. OpenCode uses a
 provider-qualified `model` and optional `variant`; it does not accept an
-`effort` field in these profiles. These examples request the `medium` variant
-for Meta Muse Spark Contributor and `low` for DeepSeek Flash:
+`effort` field in these profiles. These examples match the approved high-variant
+profiles for Meta Muse Spark Contributor and DeepSeek Flash:
 
 ```json
 [
   {
-    "id": "spark-medium", "label": "Muse Spark Contributor medium",
+    "id": "muse-spark-contributor-high", "label": "Muse Spark 1.3 Contributor high",
     "provider": "opencode", "model": "meta/muse-spark-1.3-contributor",
-    "variant": "medium", "tier": "light", "dataUse": "contributor"
+    "variant": "high", "tier": "light", "dataUse": "contributor"
   },
   {
-    "id": "deepseek-low", "label": "DeepSeek Flash low",
+    "id": "deepseek-flash-high", "label": "DeepSeek V4.1 Flash high",
     "provider": "opencode", "model": "deepseek/deepseek-flash",
-    "variant": "low", "tier": "light", "dataUse": "standard"
+    "variant": "high", "tier": "light", "dataUse": "standard"
   }
 ]
 ```
@@ -389,14 +596,84 @@ Ubuntu template. Before it, supported options are `-n`, `-H`, `-u USER`, and
 `-g GROUP` (or their separate-argument long forms). Other wrapper forms are
 refused so provider flags cannot become prompt text.
 
-The scheduler never approves a provider permission or sends forced terminal
-input. Interactive providers can show permission or trust dialogs in the member
-session. Headless OpenCode `run` rejects unmet permission requests; this adapter
-does not offer an interactive approval flow. A denied reporting tool or required
-tool can stop the member without an accepted report. Inspect the failure and the
-configured provider policy; retries do not grant permission.
+Team launches preserve configured provider permission modes and trust settings.
+A team assignment does not grant tool permission or accept a workspace trust
+dialog. Product questions reported by a member wait for `infinite team answer`.
+
+Headless OpenCode `run` rejects unmet permission requests; this adapter does
+not offer an interactive approval flow for that provider. A denied reporting
+tool or required tool can stop the member without an accepted report. Inspect
+the failure and the configured provider policy; retries do not grant permission.
+
+## Delegating permission decisions
+
+Enable delegation once in the enrolled repository:
+
+```sh
+infinite repo init --permissions coordinator
+```
+
+This pins an owner-approved scope and a limit of ten decisions to each new run.
+Use `--permission-scope TEXT` to set narrower boundaries and `--permission-limit N`
+to set a limit from one to twenty. Omitting these options on a later enrollment
+preserves the repository policy. Existing runs remain unchanged.
+
+A current one-shot tool prompt can start a separate turn on the run's strong
+Claude coordinator profile. The coordinator receives the task, owner scope and exact
+request, then reports approve-once or escalate. The host checks the assignment,
+workspace, prompt, policy, expiry and human input control before delivering the
+recorded choice. Workers cannot approve their own requests. The permission
+coordinator runs noninteractively with built-in tools disabled and only its
+assignment's report tool allowed. It escalates when the supplied evidence is
+insufficient. Worker provider modes, global trust settings and credentials
+remain unchanged. Other coordinator providers are not yet supported for this role.
+
+Workspace trust, persistent allow rules, ambiguous prompts and unsupported native
+requests still need owner handling. A coordinator that itself needs permission
+cannot approve its own prompt. Each decision is bounded; stale or uncertain
+answers are never replayed automatically. Run status and Linear retain the
+receipt separately from successful tool execution.
+
+```sh
+infinite team revoke-permissions TEAM_ID
+infinite repo init --permissions off
+```
+
+The first command revokes delegation for a current run. The second disables it
+for future runs. Both require an owner client. Pausing, cancelling or steering a
+run prevents its old pending decisions from being applied.
 
 ## Configuration
+
+Each new run gets a folder named from its UTC creation date, a slug of its
+title, and the first eight characters of its ID, such as
+`2026-01-15-add-export-3f2a9c1d/`, holding the `integration/` checkout and the
+`members/` copies. Its branch is `infinite/team-<slug>-<id8>`. The run ID remains its
+identity in the API, receipts, and Linear. Runs go under
+`teams.workspaceDir/<project-id>-<YYYY-MM-DD>-<slug>-<id8>/` unless the project has a teamwork folder, in which case it is `<teamworkDir>/<YYYY-MM-DD>-<slug>-<id8>/`.
+
+A teamwork folder keeps a product's runs beside its code under the server home.
+For a mirrored `Projects/sample/codebase`, run `infinite repo init --teamwork
+../teamwork` in that checkout; runs then go to `Projects/sample/teamwork/` on the
+host, next to `Projects/sample/codebase/`. The local path is resolved from the
+current directory, must be below the local home and outside the repository, and
+is stored as its home-relative path. The host refuses a folder equal to its sync
+home, reached through a symbolic link, or overlapping any project, the team
+workspace root, or host state and credential paths, and checks again when each
+run is prepared. `--teamwork none` returns new runs to the default root.
+Existing runs keep the folder and branch they were created with.
+
+The host owns every directory component from the sync home through the teamwork
+root. Each component below the sync home must be a real directory, owned by the
+host account or root, and not writable by group or others. Host-created teamwork
+and default workspace roots use mode `0750`, preserving inherited setgid. Run
+directories sit directly in these protected roots; run and member directories
+use mode `2770`, set through no-follow directory descriptors before the agent
+identity receives access. The default root is checked during preparation and
+whenever a run path is used, including for legacy records. Unsafe legacy roots
+leave their records preserved but prevent preparation, launch, and bundling.
+Stored roots outside `teams.workspaceDir` require a trusted teamwork anchor.
+Directories above each root must be owned by root or the API account and not writable by other accounts unless sticky.
 
 Enable teams in the private host configuration and define the project's
 verification commands. Commands use executable/argument arrays, without an
@@ -427,13 +704,23 @@ dependencies each isolated copy needs. The source checkout remains unchanged.
 The run shows its branch, base, integrated commit and workspace for inspection.
 
 If the API and provider use different Unix identities, provision the workspace
-root with the intended shared group, setgid/default ACL inheritance and private
-permissions. Configure `teams.commandPrefix` so **all** Git, setup and check
+root owned by the API account with the intended shared group and setgid/default
+ACL inheritance. The root itself must not be group- or other-writable (for
+example, mode `2750`); existing deployments with a group-writable root must
+remove group write before teams can run. Configure `teams.commandPrefix` so **all** Git, setup and check
 commands execute as the provider's unprivileged identity. For example, a
 root-owned, constrained launcher can run commands under that account. The prefix
 is an executable/argument array like the other commands. Do not run
 agent-controlled repository scripts or Git filters as the privileged API
 account. A sudo provider profile without a command prefix is refused.
+
+A constrained launcher must allow what the host runs through the prefix:
+Git clones, checkouts and integration inside each run directory under the team
+workspace root and every enrolled teamwork folder, branches named
+`infinite/team-*`, and, for `infinite team pull`, `git rev-parse --verify
+refs/heads/<branch>` and `git bundle create - refs/heads/<branch>` in a run's
+`integration/` checkout. Enrollment also runs `git rev-parse` and `git status`
+in the project source.
 
 The Ubuntu launcher must preserve `INFINITE_HOOK_URL`, `INFINITE_HOOK_TOKEN` and
 `INFINITE_TEAM_ASSIGNMENT`; the supplied sudoers template includes them. These
@@ -453,7 +740,12 @@ For a standalone team, steering records a new requirements revision. Earlier
 member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated
 workspace with the new direction. Completed earlier integration remains visible;
 unfinished member copies are preserved. Pause, resume and cancel are owner
-actions. Stopping an agent does not prove that arbitrary detached tool
+actions. A team blocked only because a member reached the one-hour runtime
+limit can resume with `infinite team resume ID`. That starts a fresh plan from
+the preserved integration commit and keeps the stopped member workspace.
+Resume waits until those members have stopped. Any other block, including an
+interrupted workspace or check operation, still requires inspection and a new
+team. Stopping an agent does not prove that arbitrary detached tool
 descendants have stopped, and a current human input lease can prevent the
 scheduler from stopping a member. Such conflicts remain visible.
 
@@ -463,9 +755,10 @@ Claude Code team members receive a scoped MCP tool, `mcp__infinite_team__report`
 that accepts a typed report as data. Other providers receive a reporting command
 that accepts JSON on standard input. Reports include `plan`, `explore`,
 `findings`, `no-change`, `escalate`, `result`, `review`, `question`, and `blocked`;
-each role has a permitted subset. The host does not automatically allow the MCP
-tool; its permission follows the configured provider profile. This keeps report JSON
-out of Claude's shell-command parsing while preserving its permission checks.
+each role has a permitted subset. The report tool follows the configured provider
+profile, except for the dedicated permission coordinator: its constrained launch
+allows only its assignment's authenticated report tool. This keeps report JSON
+out of Claude's shell-command parsing while preserving worker permission checks.
 The detached worker authenticates the report, validates its run,
 member and revision binding, and writes it to the encrypted journal before
 acknowledging it. A repeated identical report returns the same acceptance;

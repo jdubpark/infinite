@@ -1167,11 +1167,11 @@ function Context({
   connected: boolean;
 }) {
   const api = useApi();
-  const [context, setContext] = useState({ version: 0, text: "" });
+  const [context, setContext] = useState<{ version: number; text: string; binding?: "review-required" }>({ version: 0, text: "" });
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    api<{ version: number; text: string }>(
+    api<typeof context>(
       `/projects/${session.projectId}/context`,
     )
       .then(setContext)
@@ -1217,10 +1217,10 @@ function Context({
           <span className="quiet">v{context.version}</span>
         </label>
         <p className="quiet">
-          A deliberate handoff between agents: goals, constraints, decisions,
-          and relevant file paths. Saving does not rewrite running
-          conversations.
+          Context stays in this project unless the owner explicitly links another project.
+          Saving does not rewrite running conversations.
         </p>
+        {context.binding === "review-required" && <p role="status">The saved context belongs to an unverified or changed codebase. Enter context for this project and save it before starting a session.</p>}
         <textarea
           id="shared-context"
           rows={8}

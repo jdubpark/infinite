@@ -42,6 +42,7 @@ export interface ExecutionState {
   reconciliation?: "available";
 }
 export interface Session {
+  handoff?: { policy?: import("./handoff-types.js").HandoffPolicy; reason?: string };
   id: string;
   /** Host-owned assignment; ordinary session creation cannot supply this. */
   team?: import("./team-types.js").TeamAssignment;
@@ -60,6 +61,10 @@ export interface Session {
   status: Status;
   pid?: number;
   exitCode?: number;
+  /** Canonical source checkout at creation; never inferred from a Linear mapping. */
+  projectRoot?: string;
+  contextSources?: import("./project-context.js").ContextSource[];
+  contextLinksVersion?: number;
   contextVersion: number;
   context: string;
   initialPrompt: string;
@@ -70,7 +75,7 @@ export interface Session {
 export interface Event {
   seq: number;
   at: string;
-  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "usage";
+  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "team-handoff" | "usage" | "message";
   data: Record<string, unknown>;
 }
 export interface Project {
@@ -78,7 +83,9 @@ export interface Project {
   name: string;
   path: string;
   team?: import("./team-types.js").TeamProject;
-  linear?: { teamId: string };
+  linear?: { teamId: string; projectId?: string };
+  /** Absolute host directory that holds this project's team runs, outside every project root. */
+  teamworkDir?: string;
 }
 export interface AgentProfile {
   command: string;
@@ -101,8 +108,12 @@ export interface Config {
   /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */
   usage?: import("./config.js").UsageConfig;
   deployment?: import("./deployment.js").Deployment;
-  /** Workspace sync. `sharedGroup` makes applied trees group-writable for a separate agent account. */
-  sync?: { sharedGroup?: boolean };
+  /** Workspace sync. `homeDir` overrides the server home used for folder mapping; `sharedGroup` permits a separate agent account. */
+  sync?: { sharedGroup?: boolean; homeDir?: string };
+  /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
+  summaries?: { model: string; apiKeyFile: string; baseUrl: string };
+  /** Read-only repository briefs produced by an administrator-configured host wrapper. */
+  repositoryBriefings?: { command: string; args: string[]; runner?: "muse" | "deepseek" | "codex"; model?: string; automatic: boolean; intervalMs: number; cooldownMs: number; timeoutMs: number };
   port: number;
   origin: string;
   stateDir: string;
@@ -133,6 +144,7 @@ export interface Receipt {
   seq: number;
 }
 export interface WorkerState {
+  handoffQuiescence?: { requestId: string; verifiedAt: string; scope: "process-group-and-observed-descendants" };
   status: Status;
   pid?: number;
   /** Written to the sealed status only; a row carries it when the worker did not answer. */
@@ -141,7 +153,8 @@ export interface WorkerState {
   seq: number;
   screen: string;
   attention: Attention;
-  capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode" };
+  /** `transcript` means chat messages come from the provider's own conversation record. */
+  capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode"; transcript?: 1 };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
   nativeSession?: { id: string; source: "hook" | "protocol" };
@@ -158,6 +171,7 @@ export type WorkerRequest =
   | { op: "workspace-export"; method: "sync/export" | "sync/blob"; hash?: string }
   | ({ op: "native-connect" } & InputControl)
   | { op: "snapshot" }
+  | { op: "handoff-stop"; requestId: string }
   | {
       op: "control";
       action: "claim" | "renew" | "release";
@@ -186,6 +200,25 @@ export type WorkerRequest =
       option?: number;
       text?: string;
     } & InputControl)
+  | ({
+      /** Host-only delegated one-shot permission answer over the private worker socket. */
+      op: "team-answer";
+      requestId: string;
+      decisionId: string;
+      coordinatorMemberId: string;
+      targetSessionId: string;
+      assignment: import("./team-types.js").TeamAssignment;
+      targetCwd: string;
+      expiresAt: string;
+      policyHash: string;
+      promptId: number;
+      promptHash: string;
+      evidenceHash: string;
+      option: number;
+      actor: ControlActor;
+      leaseId: string;
+    })
+  | { op: "team-answer-invalidate"; decisionId: string }
   | ({ op: "resize"; cols: number; rows: number } & InputControl)
   | ({ op: "stop"; requestId: string } & InputControl);
 export interface Bootstrap {

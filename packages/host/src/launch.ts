@@ -1,3 +1,4 @@
+import { HANDOFF_INSTRUCTIONS } from "./handoff-types.js";
 import type { AgentProfile, Provider } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
@@ -62,6 +63,93 @@ export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile):
   ] };
 }
 
+/** Restrict the permission reviewer to its one report channel in a noninteractive run. */
+export function permissionCoordinatorLaunch(provider: Provider, profile: AgentProfile): AgentProfile {
+  if (provider !== "claude") throw new Error("Permission coordinator requires Claude Code.");
+  const sudo = /(^|\/)sudo$/.test(profile.command);
+  const args = [...profile.args];
+  let providerStart = 0;
+  const isClaude = (command: string) => /(^|\/)claude$/.test(command);
+  if (sudo) {
+    const boundary = args.indexOf("--");
+    const executable = args[boundary + 1];
+    if (boundary < 0 || !executable || !isClaude(executable))
+      throw new Error("Permission coordinator sudo profile must name Claude Code after its executable boundary.");
+    providerStart = boundary + 2;
+  } else if (!isClaude(profile.command)) {
+    throw new Error("Permission coordinator profile must launch Claude Code.");
+  }
+
+  const providerArgs = args.slice(providerStart);
+  const preserved: string[] = [];
+  const allowed: string[] = [];
+  const denied: string[] = [];
+  const valueFlags = new Set(["--output-format", "--permission-mode", "--tools"]);
+  const preservedValueFlags = new Set(["--model", "--effort", "--max-turns", "--max-budget-usd"]);
+  const booleanFlags = new Set(["--print", "-p", "--verbose", "--strict-mcp-config", "--disable-slash-commands"]);
+  const permissionFlags = new Map([
+    ["--allowedTools", allowed], ["--allowed-tools", allowed],
+    ["--disallowedTools", denied], ["--disallowed-tools", denied],
+  ]);
+  const forbiddenFlags = new Set([
+    "--mcp-config", "--plugin-dir", "--settings", "--setting-sources", "--agents",
+    "--permission-prompt-tool", "--permission-prompts",
+    "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+    "--resume", "--continue", "-c", "--bare", "--safe-mode",
+  ]);
+
+  for (let index = 0; index < providerArgs.length; index++) {
+    const arg = providerArgs[index];
+    const equals = arg.indexOf("=");
+    const flag = equals < 0 ? arg : arg.slice(0, equals);
+    const attached = equals < 0 ? undefined : arg.slice(equals + 1);
+    if (forbiddenFlags.has(flag))
+      throw new Error(`Permission coordinator profile cannot configure ${flag}.`);
+    const permissionValues = permissionFlags.get(flag);
+    if (permissionValues) {
+      if (attached !== undefined) {
+        if (!attached) throw new Error(`${flag} requires at least one permission rule.`);
+        permissionValues.push(attached);
+      } else {
+        let count = 0;
+        while (index + 1 < providerArgs.length && !providerArgs[index + 1].startsWith("-")) {
+          permissionValues.push(providerArgs[++index]);
+          count++;
+        }
+        if (!count) throw new Error(`${flag} requires at least one permission rule.`);
+      }
+      continue;
+    }
+    if (valueFlags.has(flag)) {
+      const value = attached ?? providerArgs[++index];
+      const expected = flag === "--output-format" ? "stream-json" : flag === "--permission-mode" ? "dontAsk" : "";
+      if (value !== expected) throw new Error(`Permission coordinator profile conflicts with required ${flag} ${JSON.stringify(expected)}.`);
+      continue;
+    }
+    if (preservedValueFlags.has(flag)) {
+      const value = attached ?? providerArgs[++index];
+      if (!value || value.startsWith("-")) throw new Error(`Permission coordinator profile requires a value for ${flag}.`);
+      preserved.push(attached === undefined ? flag : `${flag}=${value}`, ...(attached === undefined ? [value] : []));
+      continue;
+    }
+    if (booleanFlags.has(flag)) {
+      if (attached !== undefined && attached !== "true") throw new Error(`Permission coordinator profile has an invalid ${flag} value.`);
+      continue;
+    }
+    throw new Error(`Permission coordinator profile cannot configure ${flag}.`);
+  }
+
+  const fixed = [
+    "--print", "--verbose", "--output-format", "stream-json", "--tools", "",
+    "--strict-mcp-config", "--permission-mode", "dontAsk",
+    "--allowedTools", ...allowed, "mcp__infinite_team__report",
+    ...(denied.length ? ["--disallowedTools", ...denied] : []),
+    "--disable-slash-commands",
+  ];
+  const merged = [...args.slice(0, providerStart), ...preserved, ...fixed];
+  return { ...profile, args: merged };
+}
+
 const CLAUDE_EVENTS = [
   "UserPromptSubmit",
   "PreToolUse",
@@ -94,8 +182,22 @@ export function buildLaunch(
   enabled: { claude: boolean; codex: boolean },
   team = false,
   teamModelProfile?: TeamModelProfile,
+  handoffSessionId?: string,
 ): AgentProfile {
   const args = [...profile.args];
+  if (handoffSessionId) {
+    if (!hooks || !["claude", "codex"].includes(provider)) throw new Error("Handoff requires an authenticated provider channel");
+    const development = relayPath.endsWith(".ts");
+    const serverArgs = [...(development ? ["--import", import.meta.resolve("tsx")] : []), join(dirname(relayPath), development ? "team-mcp.ts" : "team-mcp.js")];
+    if (provider === "claude") args.push("--append-system-prompt", HANDOFF_INSTRUCTIONS, "--mcp-config", JSON.stringify({ mcpServers: { infinite_handoff: {
+      type: "stdio", command: process.execPath, args: serverArgs,
+      env: { INFINITE_HOOK_URL: "${INFINITE_HOOK_URL}", INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}", INFINITE_HANDOFF_SESSION: handoffSessionId },
+    } } }));
+    else {
+      for (const [key, value] of Object.entries({ command: process.execPath, args: serverArgs, env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN"], "env.INFINITE_HANDOFF_SESSION": handoffSessionId }))
+        args.push("-c", `mcp_servers.infinite_handoff.${key}=${JSON.stringify(value)}`);
+    }
+  }
   if (team && provider === "claude") {
     if (!hooks) throw new Error("Claude team reporting requires its authenticated report channel");
     const development = relayPath.endsWith(".ts");
@@ -110,14 +212,15 @@ export function buildLaunch(
       },
     } } }));
   }
+  // Dev runs the relay from TypeScript through tsx; builds run the compiled file. The tsx
+  // loader is passed as an absolute URL because the agent's cwd is the project, not this repo.
+  const relay = relayPath.endsWith(".ts")
+    ? ["node", "--import", import.meta.resolve("tsx"), relayPath]
+    : ["node", relayPath];
   if (hooks && provider === "claude" && enabled.claude) {
-    const handler = {
-      type: "http",
-      url: `${hooks.url}/claude`,
-      headers: { Authorization: "Bearer $INFINITE_HOOK_TOKEN" },
-      allowedEnvVars: ["INFINITE_HOOK_TOKEN"],
-      timeout: 5,
-    };
+    // A command hook, not an HTTP hook: the relay runs in the agent's account and is the only
+    // process that can read the transcript the worker asks for in its reply.
+    const handler = { type: "command", command: [...relay, "claude"].join(" "), timeout: 10 };
     const settings = {
       hooks: Object.fromEntries(
         CLAUDE_EVENTS.map((e) => [e, [{ hooks: [handler] }]]),
@@ -126,11 +229,6 @@ export function buildLaunch(
     args.push("--settings", JSON.stringify(settings));
   }
   if (hooks && provider === "codex" && enabled.codex) {
-    // Dev runs the relay from TypeScript through tsx; builds run the compiled file. The tsx
-    // loader is passed as an absolute URL because the agent's cwd is the project, not this repo.
-    const relay = relayPath.endsWith(".ts")
-      ? ["node", "--import", import.meta.resolve("tsx"), relayPath]
-      : ["node", relayPath];
     const command = [...relay, "codex"].join(" ");
     for (const event of CODEX_EVENTS)
       args.push(

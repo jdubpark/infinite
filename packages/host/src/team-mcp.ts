@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { HANDOFF_INSTRUCTIONS, handoffRequestSchema } from "./handoff-types.js";
+import { submitHandoff } from "./handoff-report-client.js";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -21,6 +23,10 @@ const isId = (value: unknown): value is RequestId => typeof value === "string" ?
 
 /** A narrow newline-delimited MCP transport. Awaiting each frame also bounds stdin backpressure. */
 export async function runTeamMcp() {
+  const handoff = Boolean(process.env.INFINITE_HANDOFF_SESSION);
+  const selectedTool = handoff ? { name: "handoff", description: HANDOFF_INSTRUCTIONS,
+    inputSchema: z.toJSONSchema(handoffRequestSchema, { target: "draft-7" }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } } : tool;
   let initialized = false;
   const send = async (message: unknown) => {
     const frame = JSON.stringify(message) + "\n";
@@ -50,7 +56,7 @@ export async function runTeamMcp() {
         protocolVersion: COMPATIBLE_VERSIONS.has(params.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "infinite-team", version: "1.0.0" },
-        instructions: "Use the report tool for the assigned member only. Tool permission decisions belong to the user. Stop on a denial; never attempt a shell workaround.",
+        instructions: handoff ? HANDOFF_INSTRUCTIONS : "Use the report tool for the assigned member only. Permission decisions require owner authorization; a delegated coordinator may report only its assigned decision. Never approve your own request or bypass a denial. Stop on a denial; never attempt a shell workaround.",
       });
       return;
     }
@@ -59,15 +65,20 @@ export async function runTeamMcp() {
       if (request.params !== undefined && (!isObject(request.params) || request.params.cursor !== undefined)) {
         await error(id, -32602, "This tool list has no pagination cursor."); return;
       }
-      await result(id, { tools: [tool] }); return;
+      await result(id, { tools: [selectedTool] }); return;
     }
     if (request.method !== "tools/call") { await error(id, -32601, "Unknown MCP method."); return; }
     const params = request.params;
     if (!isObject(params) || typeof params.name !== "string" || !isObject(params.arguments)) {
       await error(id, -32602, "A tool call requires a name and arguments object."); return;
     }
-    if (params.name !== "report") { await error(id, -32602, "Unknown tool. Only report is available."); return; }
+    if (params.name !== selectedTool.name) { await error(id, -32602, "Unknown tool. Only report is available."); return; }
     try {
+      if (handoff) {
+        const envelope = await submitHandoff(params.arguments);
+        await result(id, { content: [{ type: "text", text: "Handoff recorded. Stop work now; the host waits for client control to detach before transferring the clean checkpoint." }], structuredContent: { sessionId: envelope.sessionId }, isError: false });
+        return;
+      }
       const input = argumentsSchema.parse(params.arguments);
       const envelope = await submitTeamReport(input.report);
       await result(id, {

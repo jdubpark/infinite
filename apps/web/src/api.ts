@@ -64,7 +64,7 @@ export type Me = {
   backendProviders?: { infinite: string[]; cmux?: string[] };
   capabilities?: { signals: boolean; answer: boolean; push: boolean };
   providers: string[];
-  projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
+  projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { establishChecks?: true; checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
   teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
   goals?: { enabled: boolean };
   providerLimits?: ProviderLimit[];
@@ -87,9 +87,10 @@ export async function api<T>(
   body?: unknown,
   method?: string,
   controlId?: string,
+  timeoutMs = 12000,
 ): Promise<T> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`/api${path}`, {
     method: method ?? (body ? "POST" : "GET"),

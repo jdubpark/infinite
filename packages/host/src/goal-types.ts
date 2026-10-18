@@ -47,6 +47,7 @@ export interface GoalCycle {
   usage?: UsageTotals;
 }
 export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
+  linearTracking?: boolean;
   linear?: LinearTrackingView;
   id: string;
   revision: number;

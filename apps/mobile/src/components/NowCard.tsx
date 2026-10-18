@@ -1,8 +1,10 @@
 import { useState, type ReactNode } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { PROVIDER_NAMES, type Attention, type Provider } from "@infinite/attention";
+import { SESSION_KIND } from "../status";
 import { theme } from "../theme";
 import { Button } from "./Button";
+import { StatusIcon } from "./Icon";
 
 const PREVIEW_CHARS = 280;
 
@@ -36,16 +38,16 @@ export function NowCard({
     case "needs-you":
       if (attention.prompt) return null;
       return (
-        <Card heading="Needs you">
+        <Card state="needs-you" heading="Needs you">
           <Text style={s.body}>
             {attention.now || `${PROVIDER_NAMES[provider]} needs you`}
           </Text>
-          <Button title="Open terminal" secondary onPress={onOpenTerminal} />
+          <Button compact secondary glyph="terminal" title="Open terminal" onPress={onOpenTerminal} />
         </Card>
       );
     case "working":
       return (
-        <Card heading="Working">
+        <Card state="working" heading="Working">
           <Text style={s.body}>
             {attention.now || `${PROVIDER_NAMES[provider]} is working`}
           </Text>
@@ -56,10 +58,10 @@ export function NowCard({
       const message = attention.lastMessage?.trim() ?? "";
       const long = message.length > PREVIEW_CHARS;
       return (
-        <Card heading="Finished a turn">
+        <Card state="turn-finished" heading="Finished a turn">
           <Text selectable style={s.body}>
             {!message
-              ? "No closing message was recorded."
+              ? "No closing message."
               : long && !expanded
                 ? `${message.slice(0, PREVIEW_CHARS).trimEnd()}…`
                 : message}
@@ -82,13 +84,13 @@ export function NowCard({
     }
     case "idle":
       return (
-        <Card heading="Waiting for your direction.">
-          <Text style={s.meta}>Idle for {elapsed(attention.since)}</Text>
+        <Card state="idle" heading="Idle">
+          <Text style={s.meta}>{elapsed(attention.since)}</Text>
         </Card>
       );
     case "exited":
       return (
-        <Card heading="Process exited">
+        <Card state="exited" heading="Process exited">
           {exitCode !== undefined ? (
             <Text style={s.body}>Exit code {exitCode}.</Text>
           ) : null}
@@ -96,18 +98,17 @@ export function NowCard({
       );
     case "unavailable":
       return (
-        <Card heading="Unreachable">
+        <Card state="unavailable" heading="Unreachable">
           <Text style={s.body}>
-            The host cannot reach this session. Your agent may still be
-            running.
+            Host can’t reach it. It may still be running.
           </Text>
         </Card>
       );
     case "recording-error":
       return (
-        <Card heading="Recording error">
+        <Card state="recording-error" heading="Recording error">
           <Text style={s.body}>
-            Recording failed. The process was suspended to protect the record.
+            Recording failed; process suspended.
           </Text>
         </Card>
       );
@@ -115,15 +116,20 @@ export function NowCard({
 }
 
 function Card({
+  state,
   heading,
   children,
 }: {
+  state: Attention["state"];
   heading: string;
   children?: ReactNode;
 }) {
   return (
     <View style={s.card} accessibilityRole="summary">
-      <Text style={s.heading}>{heading}</Text>
+      <View style={s.head}>
+        <StatusIcon kind={SESSION_KIND[state]} size={16} />
+        <Text style={s.heading}>{heading}</Text>
+      </View>
       {children}
     </View>
   );
@@ -132,14 +138,15 @@ function Card({
 const s = StyleSheet.create({
   card: {
     backgroundColor: theme.colors.screenSurface,
-    borderRadius: theme.radius.panel,
-    padding: 18,
-    gap: 8,
+    borderRadius: theme.radius.card,
+    padding: 14,
+    gap: 6,
   },
-  heading: { fontSize: 18, fontWeight: "600", color: theme.colors.ink },
-  body: { fontSize: 15, lineHeight: 24, color: theme.colors.ink },
-  meta: { fontSize: 12, lineHeight: 18, color: theme.colors.mutedInk },
-  toggle: { minHeight: 48, justifyContent: "center", alignSelf: "flex-start" },
+  head: { flexDirection: "row", alignItems: "center", gap: 8 },
+  heading: { fontSize: 15, fontWeight: "600", color: theme.colors.ink },
+  body: { fontSize: 14, lineHeight: 21, color: theme.colors.ink },
+  meta: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
+  toggle: { minHeight: 40, justifyContent: "center", alignSelf: "flex-start" },
   pressed: { opacity: 0.6 },
   toggleText: { fontSize: 14, fontWeight: "600", color: theme.colors.forest },
 });

@@ -11,22 +11,22 @@ import { unseal, writeSealed } from "./vault.js";
 const endpoint = "https://api.linear.app/graphql";
 const freshnessMs = 30000;
 const maxResponseBytes = 1024 * 1024;
-const issueFields = "id identifier url title description updatedAt archivedAt team { id } parent { id } state { id name type }";
+const issueFields = "id identifier url title description updatedAt archivedAt team { id } project { id } parent { id } state { id name type }";
 const issueSchema = z.object({
   id: z.uuid(), identifier: z.string().min(1).max(100),
   url: z.url().max(2048).refine(value => new URL(value).origin === "https://linear.app"),
   title: z.string().min(1).max(512), description: z.string().max(64000).nullable(),
   updatedAt: z.iso.datetime(), archivedAt: z.iso.datetime().nullable(),
-  team: z.object({ id: z.uuid() }), parent: z.object({ id: z.uuid() }).nullable(),
+  team: z.object({ id: z.uuid() }), project: z.object({ id: z.uuid() }).nullable().optional(), parent: z.object({ id: z.uuid() }).nullable(),
   state: z.object({ id: z.uuid(), name: z.string().min(1).max(200), type: z.string().min(1).max(40) }),
 });
 const commentSchema = z.object({ id: z.uuid(), body: z.string().max(64000), issue: z.object({ id: z.uuid() }) });
 type Issue = z.infer<typeof issueSchema>;
 type Comment = { id: string; body: string; attempted: boolean; delivered: boolean };
 type Stored = {
-  kind: "goal" | "team"; id: string; projectId: string; teamId: string; endpoint: string;
+  kind: "goal" | "team"; id: string; projectId: string; teamId: string; linearProjectId?: string; endpoint: string;
   lookup: string; existing: boolean; parentKey?: string;
-  create: { id: string; title: string; description: string; teamId: string; parentId?: string };
+  create: { id: string; title: string; description: string; teamId: string; projectId?: string; parentId?: string };
   attempted: boolean; issue?: Issue; baseline?: string; checkedAt?: string;
   blocked?: string; error?: string; failures: number; retryAt: number;
   terminal: boolean; comments: Record<string, Comment>;
@@ -34,10 +34,11 @@ type Stored = {
 type Freshness = { requested: number; verified: number; queued: Set<string>; readRequested: boolean };
 const keyOf = (kind: Stored["kind"], id: string) => `${kind}:${id}`;
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-const terminalStatuses = new Set(["ready-for-review", "no-change", "no-opportunity", "blocked", "cancelled", "limit-reached", "achieved"]);
+const terminalStatuses = new Set(["ready-for-review", "merged", "no-change", "no-opportunity", "blocked", "cancelled", "limit-reached", "achieved"]);
 const evidenceStatuses = new Set([...terminalStatuses, "needs-input", "paused"]);
 const normalized = (value: string | null) => (value ?? "").replace(/\r\n/g, "\n").trim();
-const scopeHash = (issue: Issue) => hash({ title: issue.title, description: normalized(issue.description), teamId: issue.team.id, parentId: issue.parent?.id ?? null });
+const scopeHash = (issue: Issue, linearProjectId?: string) => hash({ title: issue.title, description: normalized(issue.description), teamId: issue.team.id,
+  ...(linearProjectId !== undefined ? { projectId: issue.project?.id ?? null } : {}), parentId: issue.parent?.id ?? null });
 
 // Only deliberately selected requirements and user directions leave the host.
 // Machine paths sometimes appear in those fields; never publish them as evidence.
@@ -84,13 +85,13 @@ export class LinearService {
   private force(stored: Stored) { this.clock(stored).requested++; }
   private configuration(stored: Stored): boolean {
     const project = this.config.projects.find(project => project.id === stored.projectId);
-    if (!this.config.linear || project?.linear?.teamId !== stored.teamId || (this.config.linear.endpoint ?? endpoint) !== stored.endpoint) {
+    if (!this.config.linear || project?.linear?.teamId !== stored.teamId || project?.linear?.projectId !== stored.linearProjectId || (this.config.linear.endpoint ?? endpoint) !== stored.endpoint) {
       stored.blocked ??= "This run's Linear configuration was removed or changed. Restore its binding or start a newly approved run.";
       this.save(stored); return false;
     }
     return true;
   }
-  private register(kind: Stored["kind"], value: { id: string; projectId: string; title: string; status: string }, description: string, existing?: string, parentKey?: string) {
+  private register(kind: Stored["kind"], value: { id: string; projectId: string; title: string; status: string }, description: string, optedInAtCreation: boolean, existing?: string, parentKey?: string) {
     const recordKey = keyOf(kind, value.id), prior = this.records.get(recordKey);
     if (prior) {
       this.configuration(prior);
@@ -98,13 +99,16 @@ export class LinearService {
         prior.blocked ??= "The Linear issue binding changed. Start a newly approved run with the intended issue.";
       prior.terminal = terminalStatuses.has(value.status); this.save(prior); return prior;
     }
+    // A current project mapping must never enroll an older local run. Only a
+    // run that persisted its creation-time choice can create a new outbox row.
+    if (!optedInAtCreation) return undefined;
     const project = this.config.projects.find(project => project.id === value.projectId);
     if (!project?.linear) return undefined;
     // Linear requires UUID v4 create IDs; older local IDs may use another UUID version.
     const createId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value.id) ? value.id : randomUUID();
-    const stored: Stored = { kind, id: value.id, projectId: value.projectId, teamId: project.linear.teamId,
+    const stored: Stored = { kind, id: value.id, projectId: value.projectId, teamId: project.linear.teamId, ...(project.linear.projectId ? { linearProjectId: project.linear.projectId } : {}),
       endpoint: this.config.linear?.endpoint ?? endpoint, lookup: existing ?? createId, existing: Boolean(existing),
-      ...(parentKey ? { parentKey } : {}), create: { id: createId, title: sharedText(value.title), description: sharedText(description), teamId: project.linear.teamId },
+      ...(parentKey ? { parentKey } : {}), create: { id: createId, title: sharedText(value.title), description: sharedText(description), teamId: project.linear.teamId, ...(project.linear.projectId ? { projectId: project.linear.projectId } : {}) },
       attempted: false, failures: 0, retryAt: 0, terminal: terminalStatuses.has(value.status), comments: {},
     };
     this.records.set(recordKey, stored); this.fresh.set(recordKey, { requested: 1, verified: 0, queued: new Set(), readRequested: false });
@@ -122,20 +126,20 @@ export class LinearService {
     stored.comments[eventKey] = { id: randomUUID(), body, attempted: false, delivered: false };
     this.save(stored);
   }
-  updateGoal(goal: ProductGoal): LinearTrackingView | undefined {
+  updateGoal(goal: ProductGoal, optedInAtCreation = false): LinearTrackingView | undefined {
     const description = [goal.objective, `Success criteria:\n${goal.successCriteria}`, `Non-goals:\n${goal.nonGoals.join("\n") || "None specified"}`,
       `Approved paths: ${goal.allowedPaths.join(", ")}`, `Limits: ${goal.maxRuns} feature runs; ${goal.maxMinutes} minutes; ${goal.maxMembers} agent attempts; ${goal.parallelism} parallel members.`,
       ...(goal.evidence.length ? [`Provided evidence:\n${goal.evidence.join("\n")}`] : [])].join("\n\n");
-    const stored = this.register("goal", goal, description, goal.linearIssueId);
+    const stored = this.register("goal", goal, description, optedInAtCreation, goal.linearIssueId);
     if (!stored) return goal.linearIssueId ? { status: "blocked", reason: "Configure Linear for this project before linking an existing issue." } : undefined;
     for (const direction of goal.steering) this.comment(stored, `direction:${direction.revision}`, `User direction for goal revision ${direction.revision}:\n\n${direction.text}\n\nThe approved scope and execution limits remain in force.`);
     for (const outcome of goal.outcomes) this.comment(stored, `outcome:${outcome.revision}`, `User-recorded product outcome: ${outcome.result}\n\n${outcome.summary}\n\nEvidence:\n${outcome.evidence}`);
     if (evidenceStatuses.has(goal.status)) this.comment(stored, `status:${goal.revision}:${goal.status}`, `Infinite goal execution\n\nStatus: ${goal.status}\nFeature runs: ${goal.cycles.length}\nAgent attempts: ${goal.memberCount}\n\nThis is local execution evidence. Linear's workflow status has not been changed.`);
     this.save(stored); return this.view(stored);
   }
-  updateTeam(run: TeamRun | TeamView): LinearTrackingView | undefined {
+  updateTeam(run: TeamRun | TeamView, optedInAtCreation = false): LinearTrackingView | undefined {
     const parentKey = run.goal ? keyOf("goal", run.goal.id) : undefined;
-    const stored = this.register("team", run, run.objective, undefined, parentKey);
+    const stored = this.register("team", run, run.objective, optedInAtCreation, undefined, parentKey);
     if (!stored) return undefined;
     const clock = this.clock(stored);
     for (const member of run.members.filter(member => member.status === "queued")) if (!clock.queued.has(member.memberId)) {
@@ -149,6 +153,15 @@ export class LinearService {
     }
     if (run.brief) this.comment(stored, `brief:${run.revision}`, [`Proposed feature: ${run.brief.title}`, run.brief.problem,
       `Acceptance criteria:\n${run.brief.acceptance.join("\n")}`, `Expected outcome:\n${run.brief.expectedOutcome}`].join("\n\n"));
+    if (run.deliveryReceipt) {
+      const receipt = run.deliveryReceipt;
+      this.comment(stored, `delivery:${receipt.revision}:${receipt.headCommit}`, `Delivery agent reported a merged pull request: ${receipt.pullRequestUrl}\n\nReviewed head: ${receipt.headCommit}\nReported merge commit: ${receipt.mergeCommit}\n\n${receipt.summary}\n\nThis is agent-reported delivery evidence, not independent host verification or a product outcome.`);
+    }
+    for (const decision of run.permissionDecisions ?? []) {
+      if (!["answered", "escalated", "stale", "uncertain"].includes(decision.status)) continue;
+      this.comment(stored, `permission:${decision.id}:${decision.status}`,
+        `Delegated permission decision ${decision.id}\n\nStatus: ${decision.status}\nRun revision: ${decision.revision}\nTarget member: ${decision.targetMemberId}\nTarget session: ${decision.targetSessionId}\nPrompt: ${decision.promptId}\nCoordinator member: ${decision.coordinatorMemberId ?? "not assigned"}\nAnswer request: ${decision.answerRequestId}\nDelivery: ${decision.receipt ? `${decision.receipt.state}; ${decision.receipt.result ?? "unconfirmed"}; journal sequence ${decision.receipt.seq}` : decision.status === "uncertain" ? "dispatch or result unconfirmed" : "no recorded dispatch"}\n\nThe owner delegated one-shot tool decisions under this run's pinned repository policy. Approval is separate from successful tool execution. This comment omits prompt content and the coordinator's summary.`);
+    }
     if (evidenceStatuses.has(run.status)) {
       const checks = run.checks.filter(check => check.revision === run.revision);
       this.comment(stored, `status:${run.revision}:${run.status}`, `Infinite feature execution\n\nStatus: ${run.status}\nAgent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`);
@@ -204,14 +217,15 @@ export class LinearService {
   }
   private accept(stored: Stored, issue: Issue, generation: number) {
     if (this.closed) return;
-    if (issue.team.id !== stored.teamId || (!stored.existing && (issue.id !== stored.create.id || (issue.parent?.id ?? undefined) !== stored.create.parentId)))
-      stored.blocked ??= "The Linear issue belongs to a different team or parent. Its execution binding cannot be used.";
+    if (issue.team.id !== stored.teamId || (stored.linearProjectId !== undefined && issue.project?.id !== stored.linearProjectId)
+      || (!stored.existing && (issue.id !== stored.create.id || (issue.parent?.id ?? undefined) !== stored.create.parentId)))
+      stored.blocked ??= "The Linear issue belongs to a different team, project, or parent. Its execution binding cannot be used.";
     if (!stored.baseline && !stored.existing && (issue.title !== stored.create.title || normalized(issue.description) !== normalized(stored.create.description)))
       stored.blocked ??= "The created Linear issue no longer matches the saved requirements. Start a newly approved run.";
-    if (stored.baseline && stored.baseline !== scopeHash(issue)) stored.blocked ??= "The Linear issue requirements or parent changed. Review the updated issue and start a newly approved run.";
+    if (stored.baseline && stored.baseline !== scopeHash(issue, stored.linearProjectId)) stored.blocked ??= "The Linear issue requirements or parent changed. Review the updated issue and start a newly approved run.";
     if (issue.archivedAt || !["triage", "backlog", "unstarted", "started"].includes(issue.state.type))
       stored.blocked ??= "The Linear issue is closed, archived, or uses an unsupported workflow state. Further execution is stopped.";
-    stored.issue = issue; stored.baseline ??= scopeHash(issue); stored.checkedAt = new Date().toISOString();
+    stored.issue = issue; stored.baseline ??= scopeHash(issue, stored.linearProjectId); stored.checkedAt = new Date().toISOString();
     this.clock(stored).verified = generation; this.clock(stored).readRequested = false; this.success(stored);
   }
   private async pump() {

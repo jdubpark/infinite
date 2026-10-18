@@ -12,7 +12,7 @@ import { connectRemoteAccess } from "../packages/host/src/remote-access.js";
 import { createRelayServer } from "../packages/host/src/relay.js";
 import { hashToken } from "../packages/host/src/config.js";
 import type { Config } from "../packages/host/src/types.js";
-import { startHost, waitFor } from "./helpers.js";
+import { inProcessHost, startHost, waitFor } from "./helpers.js";
 
 async function listen(server: Server) {
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -118,11 +118,81 @@ test("encrypted relay creates and steers real sessions while retaining roles and
     }
     const health = await fetch(`${relayUrl}/health`);
     assert.deepEqual(await health.json(), { ok: true });
-    assert.equal((await fetch(`${relayUrl}/api/sessions`)).status, 404, "the portal does not expose runner APIs");
+    assert.equal((await fetch(`${relayUrl}/api/sessions`)).status, 404, "the relay does not expose runner APIs");
+    for (const path of ["/", "/index.html"]) assert.equal((await fetch(`${relayUrl}${path}`)).status, 404, "the relay does not publish the web client");
   } finally {
     for (const client of clients) client.close();
     await host.stop(); proxy.close(); relay.close(); rmSync(privateFiles, { recursive: true, force: true });
   }
+});
+
+test("encrypted terminals carry real PTY output and receipts, enforce leases and roles, and stop on revocation", { timeout: 30000 }, async () => {
+  const host = await inProcessHost();
+  host.config.remote = { enabled: true };
+  const closeRemote = connectRemoteAccess(host.server, host.config);
+  const proxy = await wireProxy(host.origin);
+  const owner = createRemoteClient({ url: proxy.url, token: host.tokens.owner });
+  const viewer = createRemoteClient({ url: proxy.url, token: host.tokens.viewer });
+  type Page = {
+    events?: { data: { text?: string } }[];
+    state?: { status: string };
+    receipt?: { requestId: string; state: string };
+    refusal?: { requestId: string; code: string };
+    requestId?: string;
+    control?: { id: string };
+  };
+  const pages: Page[] = [], viewerPages: Page[] = [], closed: number[] = [], viewerClosed: number[] = [];
+  try {
+    const session = await owner.request<{ id: string }>("/sessions", { body: {
+      requestId: randomUUID(), provider: "demo", projectId: "rehearsal", title: "Encrypted terminal", prompt: "Terminal rehearsal",
+    } });
+    const clientId = randomUUID();
+    const terminal = await owner.openTerminal(session.id, { clientId, snapshot: false, onMessage: page => pages.push(page as Page), onClose: event => closed.push(event.code) });
+    await waitFor(async () => pages, value => value.some(page => page.events?.some(event => event.data.text?.includes("local continuity rehearsal"))));
+    const refused = randomUUID();
+    terminal.send({ op: "raw", requestId: refused, text: "must not arrive\r" });
+    await waitFor(async () => pages.find(page => page.refusal?.requestId === refused), value => value?.refusal?.code === "control-lost");
+    const claim = randomUUID();
+    terminal.send({ op: "control", requestId: claim, action: "claim" });
+    const control = await waitFor(async () => pages.find(page => page.requestId === claim), value => Boolean(value?.control?.id));
+    const leaseId = control!.control!.id;
+    const text = "encrypted terminal input sentinel", requestId = randomUUID();
+    terminal.send({ op: "raw", requestId, text: text + "\r", leaseId });
+    await waitFor(async () => pages.find(page => page.receipt?.requestId === requestId), value => value?.receipt?.state === "delivered");
+    await waitFor(async () => pages, value => value.some(page => page.events?.some(event => event.data.text?.includes(`You: ${text}`))));
+    const beforeReplay = (await owner.request<{ events: unknown[] }>(`/sessions/${session.id}/events?types=input-intent`)).events.length;
+    terminal.send({ op: "raw", requestId, text: text + "\r", leaseId });
+    await waitFor(async () => pages.filter(page => page.receipt?.requestId === requestId).length, value => value === 2);
+    assert.equal((await owner.request<{ events: unknown[] }>(`/sessions/${session.id}/events?types=input-intent`)).events.length, beforeReplay, "the gateway retains durable input deduplication through encryption");
+
+    const viewerTerminal = await viewer.openTerminal(session.id, { clientId: randomUUID(), snapshot: false, onMessage: page => viewerPages.push(page as Page), onClose: event => viewerClosed.push(event.code) });
+    await waitFor(async () => viewerPages, value => value.some(page => page.events?.some(event => event.data.text?.includes(text))));
+    viewerTerminal.send({ op: "raw", requestId: randomUUID(), text: "viewer must not type\r", leaseId });
+    await waitFor(async () => viewerClosed, value => value.includes(1008));
+    assert.equal((await owner.request<{ events: unknown[] }>(`/sessions/${session.id}/events?types=input-intent`)).events.length, beforeReplay, "viewer input never reaches the worker");
+
+    const otherId = randomUUID();
+    const takeover = await owner.request<{ control: { id: string } }>(`/sessions/${session.id}/control`, { headers: { "X-Infinite-Client": otherId }, body: { action: "claim", takeover: true } });
+    assert.notEqual(takeover.control.id, leaseId);
+    const stale = randomUUID();
+    terminal.send({ op: "raw", requestId: stale, text: "stale lease must not type\r", leaseId });
+    await waitFor(async () => pages.find(page => page.refusal?.requestId === stale), value => value?.refusal?.code === "control-lost");
+
+    const attachments = await Promise.all(Array.from({ length: 3 }, () => owner.openTerminal(session.id, {
+      clientId: randomUUID(), onMessage: () => {}, onClose: () => {},
+    })));
+    await assert.rejects(owner.openTerminal(session.id, { clientId: randomUUID(), onMessage: () => {}, onClose: () => {} }), (error: RemoteError) => error.code === "busy");
+    attachments.forEach(attachment => attachment.close());
+    assert.equal((await owner.request<{ status: string }>(`/sessions/${session.id}`)).status, "running", "closing a display does not stop the server process");
+    const visible = proxy.frames.join("\n");
+    for (const privateValue of [text, host.tokens.owner, session.id, leaseId, "terminal-open", "terminal-event"])
+      assert.equal(visible.includes(privateValue), false, "stream metadata and terminal contents remain encrypted");
+
+    host.config.tokens = host.config.tokens.filter(device => device.role !== "owner");
+    await waitFor(async () => closed, value => value.length === 1, 2500);
+    assert.throws(() => terminal.send({ op: "raw", requestId: randomUUID(), text: "revoked\r", leaseId }), (error: RemoteError) => error.code === "disconnected");
+    assert.equal((await viewer.request<{ status: string }>(`/sessions/${session.id}`)).status, "running", "device revocation closes its subscriptions without killing work");
+  } finally { owner.close(); viewer.close(); closeRemote(); proxy.close(); await host.stop(); }
 });
 
 async function httpRunner() {
@@ -248,9 +318,9 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
   } finally { for (const client of clients) client.close(); runner.close(); }
 });
 
-function openSocket(url: string, token?: string) {
+function openSocket(url: string, token?: string, headers: Record<string, string> = {}) {
   return new Promise<WebSocket>((resolve, reject) => {
-    const socket = new WebSocket(url.replace("http:", "ws:"), token ? { headers: { Authorization: `Bearer ${token}` } } : {});
+    const socket = new WebSocket(url.replace("http:", "ws:"), { headers: { ...headers, ...(token ? { Authorization: `Bearer ${token}` } : {}) } });
     socket.once("open", () => resolve(socket));
     socket.on("error", reject);
   });
@@ -278,4 +348,42 @@ test("relay registration, offline routing and machine channel ownership are enfo
     first.terminate(); await disconnected;
     await assert.rejects(openSocket(`${url}/relay/clients/${firstId}`), /503/);
   } finally { for (const socket of live) socket.terminate(); relay.close(); }
+});
+
+test("behind a local tunnel, clients enter only through its socket and one address cannot take every slot", { timeout: 15000 }, async () => {
+  const machineId = randomUUID(), token = randomBytes(32).toString("base64url");
+  const registrations = [{ machineId, tokenHash: hashToken(token) }];
+  const relay = createRelayServer({ registrations, maxClientsPerMachine: 8, maxClientsPerAddress: 1, proxy: { addressHeader: "CF-Connecting-IP" } });
+  const direct = createRelayServer({ registrations, maxClientsPerMachine: 8 });
+  const files = mkdtempSync(join(tmpdir(), "infinite-relay-")), socketPath = join(files, "proxy.sock");
+  await new Promise<void>(resolve => relay.proxy!.listen(socketPath, resolve));
+  const [url, directUrl] = [await listen(relay.server), await listen(direct.server)], live: WebSocket[] = [];
+  try {
+    live.push(await openSocket(`${url}/relay/hosts/${machineId}`, token));
+    const viaTunnel = (address: string) => openSocket(`ws+unix:${socketPath}:/relay/clients/${machineId}`, undefined, { "CF-Connecting-IP": address });
+    await assert.rejects(openSocket(`${url}/relay/clients/${machineId}`, undefined, { "CF-Connecting-IP": "192.0.2.30" }), /403/, "a local process cannot bypass the tunnel or choose its address");
+    live.push(await viaTunnel("192.0.2.10"));
+    await assert.rejects(viaTunnel("192.0.2.10"), /429/);
+    live.push(await viaTunnel("192.0.2.11"), await viaTunnel("2001:db8:0:1::1"));
+    await assert.rejects(viaTunnel("2001:db8:0:1:ffff::9"), /429/, "addresses in one IPv6 /64 share a limit");
+    live.push(await viaTunnel("not an address"));
+    await assert.rejects(viaTunnel("also not an address"), /429/, "malformed headers share one limit");
+    live.push(await openSocket(`${directUrl}/relay/hosts/${machineId}`, token));
+    live.push(await openSocket(`${directUrl}/relay/clients/${machineId}`), await openSocket(`${directUrl}/relay/clients/${machineId}`));
+  } finally { for (const socket of live) socket.terminate(); relay.close(); direct.close(); rmSync(files, { recursive: true, force: true }); }
+});
+
+test("a configured access token is sent as relay upgrade headers", { timeout: 15000 }, async () => {
+  const sockets = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+  await new Promise(resolve => sockets.once("listening", resolve));
+  const access = { clientId: `${randomBytes(16).toString("hex")}.access`, clientSecret: randomBytes(32).toString("hex") };
+  const seen = new Promise<{ id?: string; secret?: string; path?: string }>(resolve => sockets.once("connection", (_socket, req) =>
+    resolve({ id: req.headers["cf-access-client-id"] as string, secret: req.headers["cf-access-client-secret"] as string, path: req.url })));
+  const machineId = randomUUID();
+  const client = createRemoteClient({ url: `http://127.0.0.1:${(sockets.address() as { port: number }).port}`, token: randomBytes(32).toString("base64url"), relay: { machineId }, access });
+  try {
+    void client.request("/me").catch(() => {});
+    assert.deepEqual(await seen, { id: access.clientId, secret: access.clientSecret, path: `/relay/clients/${machineId}` });
+    assert.throws(() => createRemoteClient({ url: "https://relay.example", token: randomBytes(32).toString("base64url"), relay: { machineId }, access: { clientId: "short", clientSecret: access.clientSecret } }), /access token/);
+  } finally { client.close(); sockets.close(); }
 });

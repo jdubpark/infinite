@@ -145,3 +145,17 @@ test("claude quota_auto_resume_stale and _disabled add a corroborated provider-l
   const fired = mapClaudeHook({ ...base, hook_event_name: "Notification", notification_type: "quota_auto_resume_fired", message: "resumed" });
   assert.deepEqual(fired.map((s) => s.kind), ["notice"]);
 });
+
+test("permission evidence distinguishes complete input from omitted array items and command tails", () => {
+  const cases = [
+    { input: { command: "npm test" }, complete: true },
+    { input: { command: "x".repeat(5000) }, complete: false },
+    { input: { edits: Array.from({ length: 51 }, (_, n) => ({ old_string: String(n), new_string: "replacement" })) }, complete: false },
+  ];
+  for (const { input, complete } of cases) {
+    const [signal] = mapClaudeHook({ ...base, hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: input });
+    assert.equal(signal.kind, "prompt-open");
+    if (signal.kind !== "prompt-open") throw new Error("Expected a permission request");
+    assert.equal(signal.prompt.tool?.inputComplete, complete);
+  }
+});

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { MAX_RECORDED_MESSAGE, type TranscriptMessage } from "./transcript.js";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
@@ -52,6 +53,27 @@ function appServerLaunch(profile: AgentProfile) {
  * One cloud backend and one cloud observer TUI per Infinite session. Provider credentials
  * never leave this process. Every local frontend frame is fenced by the worker's lease.
  */
+/** A completed app-server item as one chat message; items without user-facing text yield none. */
+export function nativeItemMessage(item: unknown): TranscriptMessage | undefined {
+  if (!item || typeof item !== "object") return undefined;
+  const row = item as Record<string, unknown>;
+  const id = typeof row.id === "string" && row.id ? row.id : undefined;
+  if (!id) return undefined;
+  const text = (value: unknown) => typeof value === "string" ? value.trim()
+    : Array.isArray(value) ? value.map(block => block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string" ? (block as { text: string }).text : "").join("\n").trim() : "";
+  switch (row.type) {
+    case "agentMessage": { const body = text(row.text); return body ? { id, role: "assistant", text: body.slice(0, MAX_RECORDED_MESSAGE) } : undefined; }
+    case "userMessage": { const body = text(row.content ?? row.text); return body ? { id, role: "user", text: body.slice(0, MAX_RECORDED_MESSAGE) } : undefined; }
+    case "commandExecution": { const command = text(row.command); return command ? { id, role: "tool", toolName: "shell", text: command.slice(0, 2000) } : undefined; }
+    case "fileChange": {
+      const paths = Array.isArray(row.changes) ? row.changes.map(change => change && typeof change === "object" ? (change as { path?: unknown }).path : undefined).filter((p): p is string => typeof p === "string") : [];
+      return { id, role: "tool", toolName: "edit", text: (paths.join(", ") || "file change").slice(0, 2000) };
+    }
+    case "mcpToolCall": { const tool = text(row.tool) || text(row.name); return { id, role: "tool", toolName: tool || "tool", text: (tool || "tool").slice(0, 2000) }; }
+    default: return undefined;
+  }
+}
+
 export async function startNativeCodex(options: {
   profile: AgentProfile; cwd: string; env: Record<string, string>;
   execution?: Executor;
@@ -60,6 +82,8 @@ export async function startNativeCodex(options: {
   onThread: (id: string) => void;
   onExit: () => void;
   onSignal: (signal: Signal) => void;
+  /** Completed conversation items, as the provider reports them. */
+  onMessage?: (message: TranscriptMessage) => void;
   noAltScreen: boolean;
   record: (method: string) => void;
 }) {
@@ -222,6 +246,7 @@ export async function startNativeCodex(options: {
               if (message.method === "turn/started") { lastMessage = undefined; options.onSignal({ kind: "turn-start" }); }
               if (message.method === "item/completed" && message.params?.item?.type === "agentMessage" && typeof message.params.item.text === "string")
                 lastMessage = message.params.item.text.slice(0, 4000);
+              if (message.method === "item/completed") { const item = nativeItemMessage(message.params?.item); if (item) options.onMessage?.(item); }
               if (message.method === "turn/completed" && message.params?.turn?.status === "failed" && message.params.turn.error?.codexErrorInfo === "usageLimitExceeded")
                 options.onSignal({ kind: "provider-limit", limit: "usage", confidence: "corroborated", message: "Codex reported usageLimitExceeded" });
               if (message.method === "turn/completed") options.onSignal({ kind: "turn-end", message: message.params?.turn?.status === "interrupted" ? "Turn interrupted" : lastMessage, failed: message.params?.turn?.status === "failed" });

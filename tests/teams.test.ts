@@ -3,15 +3,258 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { createInterface } from "node:readline";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
+import { memberTimeLimitReason } from "../packages/host/src/teams.js";
 import type { CreateTeam, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
 import { retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
 
-import { git, mixedLineup, fixture } from "./team-fixture.js";
+// The shared fallback lineup used by delivery and permission tests; the limit tests below define their own.
+import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
+
+test("team runs use readable names and exact root permissions under a strict umask", { timeout: 120000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-team-modes-"));
+  const workspaceDir = join(root, "first", "second", "teams");
+  const previousUmask = process.umask(0o077);
+  let f: Awaited<ReturnType<typeof fixture>> | undefined;
+  try {
+    // The API subprocess inherits this umask, including after enrollment restarts it.
+    f = await fixture("success", undefined, { teams: { workspaceDir,
+      commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", root] },
+    } });
+    const firstRequest = f.create();
+    const firstCreated = await f.host.fetchApi("/teams", "owner", firstRequest);
+    const first = await f.settled(firstCreated.body.id);
+    assert.equal(first.status, "ready-for-review", JSON.stringify(first));
+    const firstName = `${first.createdAt.slice(0, 10)}-implement-a-small-feature-${first.id.slice(0, 8)}`;
+    assert.equal(realpathSync(first.workspace), realpathSync(join(f.host.config.teams!.workspaceDir, `rehearsal-${firstName}`, "integration")));
+    assert.equal(first.branch, `infinite/team-implement-a-small-feature-${first.id.slice(0, 8)}`);
+    for (const directory of [workspaceDir, dirname(workspaceDir), dirname(dirname(workspaceDir))])
+      assert.equal(statSync(directory).mode & 0o777, 0o750);
+
+    const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true }, "Projects/teamwork");
+    const secondRequest = f.create();
+    const secondCreated = await f.host.fetchApi("/teams", "owner", secondRequest);
+    const second = await f.settled(secondCreated.body.id);
+    assert.equal(second.status, "ready-for-review", JSON.stringify(second));
+    const secondName = `${second.createdAt.slice(0, 10)}-implement-a-small-feature-${second.id.slice(0, 8)}`;
+    assert.equal(realpathSync(second.workspace), realpathSync(join(teamworkRoot, secondName, "integration")));
+    assert.equal(second.branch, `infinite/team-implement-a-small-feature-${second.id.slice(0, 8)}`);
+    assert.equal(statSync(teamworkRoot).mode & 0o777, 0o750);
+    assert.equal(statSync(dirname(teamworkRoot)).mode & 0o777, 0o750);
+  } finally {
+    process.umask(previousUmask);
+    try { await f?.close(); } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+for (const unsafe of ["root", "parent"] as const)
+test(`default runs refuse a group-writable ${unsafe} until its permissions are repaired`, { timeout: 120000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-team-root-"));
+  const parent = join(root, "parent"), workspaceDir = join(parent, "teams");
+  mkdirSync(parent, { mode: 0o750 });
+  mkdirSync(workspaceDir, { mode: 0o750 });
+  chmodSync(parent, 0o750);
+  chmodSync(workspaceDir, 0o750);
+  const unsafeDirectory = unsafe === "root" ? workspaceDir : parent;
+  chmodSync(unsafeDirectory, 0o770);
+  let f: Awaited<ReturnType<typeof fixture>> | undefined;
+  try {
+    f = await fixture("success", undefined, { teams: { workspaceDir,
+      commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", root] },
+    } });
+    const refused = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.deepEqual([refused.status, refused.body.code], [409, "team-root-unsafe"]);
+    assert.deepEqual(readdirSync(workspaceDir), []);
+    assert.equal(statSync(unsafeDirectory).mode & 0o777, 0o770, "the host must not repair an existing unsafe directory");
+
+    chmodSync(unsafeDirectory, 0o750);
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+  } finally { try { await f?.close(); } finally { rmSync(root, { recursive: true, force: true }); } }
+});
+
+for (const unsafe of ["parent", "anchor"] as const)
+test(`teamwork preparation refuses a group-writable ${unsafe}`, { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const parent = join(dirname(f.source), "Projects");
+    mkdirSync(parent);
+    const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true }, "Projects/teamwork");
+    assert.ok(teamworkRoot);
+    chmodSync(unsafe === "parent" ? parent : dirname(f.source), 0o770);
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.deepEqual([created.status, created.body.code], [409, "team-root-unsafe"]);
+  } finally { await f.close(); }
+});
+
+test("a lifecycle run cannot be bundled before review", { timeout: 60000 }, async () => {
+  const f = await fixture("lifecycle");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status));
+    const checking = await waitFor(() => f.get(created.body.id), run => run.status === "verifying" && run.checks.some(check => check.status === "running"), 30000);
+    const response = await f.host.fetchApi(`/teams/${checking.id}/bundle`);
+    assert.deepEqual([response.status, response.body.code], [409, "team-not-ready"]);
+  } finally { await f.close(); }
+});
+
+test("legacy team records without a saved root retain their workspace and branch", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const finished = await f.settled(created.body.id);
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    const legacyDirectory = join(f.host.config.teams!.workspaceDir, finished.id);
+    renameSync(dirname(finished.workspace), legacyDirectory);
+    stored.run.workspace = join(legacyDirectory, "integration");
+    stored.run.branch = `infinite/team-${finished.id}`;
+    delete stored.root;
+    writeSealed(file, key, `team:${finished.id}`, stored);
+    await f.host.start();
+    const restored = await f.get(finished.id);
+    assert.equal(restored.workspace, join(legacyDirectory, "integration"));
+    assert.equal(restored.branch, `infinite/team-${finished.id}`);
+    assert.equal(restored.status, "ready-for-review");
+  } finally { await f.close(); }
+});
+
+test("team bundle route requires an owner CLI and a recorded result", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const finished = await f.settled(created.body.id);
+    const endpoint = `/teams/${finished.id}/bundle`;
+    for (const role of ["viewer", "controller"] as const)
+      assert.equal((await f.host.fetchApi(endpoint, role)).status, 403);
+    const login = await f.host.fetchApi("/login", null, { token: f.host.tokens.owner }, { Origin: f.host.config.origin });
+    assert.equal(login.status, 200);
+    const browser = { Cookie: login.headers.get("set-cookie")!.split(";")[0], Origin: f.host.config.origin };
+    assert.equal((await f.host.fetchApi(endpoint, null, undefined, browser)).status, 403);
+
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    delete stored.run.headCommit;
+    writeSealed(file, key, `team:${finished.id}`, stored);
+    await f.host.start();
+    const noResult = await f.host.fetchApi(endpoint);
+    assert.equal(noResult.status, 409);
+    assert.equal(noResult.body.code, "team-no-result");
+  } finally { await f.close(); }
+});
+
+test("an opted-in blank project accepts coordinator checks and reaches review only after verifying the implemented invariant", { timeout: 120000 }, async () => {
+  const f = await fixture("bootstrap");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.ok(finished.checks.some(check => check.phase === "setup" && check.status === "passed" && check.output.includes("Bootstrap setup completed")));
+    assert.ok(finished.checks.some(check => check.status === "passed" && check.phase !== "setup"));
+    assert.equal(readFileSync(join(finished.workspace, "a.txt"), "utf8"), readFileSync(join(finished.workspace, "b.txt"), "utf8"));
+  } finally { await f.close(); }
+});
+
+test("an opted-in blank project must receive checks before any implementer launches", { timeout: 60000 }, async () => {
+  const f = await fixture("bootstrap-missing");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const blocked = await f.settled(created.body.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.match(blocked.reason ?? "", /verification|check/i);
+    assert.equal(blocked.tasks.length, 0);
+    assert.deepEqual(blocked.members.map(member => member.role), ["project-manager"]);
+  } finally { await f.close(); }
+});
+
+test("a coordinator cannot replace checks configured by the project owner", { timeout: 60000 }, async () => {
+  const f = await fixture("bootstrap-override");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const blocked = await f.settled(created.body.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.match(blocked.reason ?? "", /verification|check|configured/i);
+    assert.equal(blocked.tasks.length, 0);
+    assert.deepEqual(blocked.members.map(member => member.role), ["project-manager"]);
+  } finally { await f.close(); }
+});
+
+test("failed coordinator checks stay blocked after the bounded repair attempts", { timeout: 120000 }, async () => {
+  const f = await fixture("bootstrap-fail");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const blocked = await f.settled(created.body.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.equal(blocked.review, undefined);
+    assert.ok(blocked.checks.some(check => check.status === "failed" && check.exitCode === 17));
+    assert.ok(blocked.members.filter(member => member.role === "integrator").length <= 2);
+  } finally { await f.close(); }
+});
+
+test("accepted coordinator verification survives restart and a later plan that omits it", { timeout: 120000 }, async () => {
+  const f = await fixture("bootstrap-replan");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const waiting = await waitFor(() => f.get(created.body.id), run => run.status === "needs-input" && run.decisions.length === 1, 30000);
+    const accepted = waiting.verification;
+    assert.ok(accepted?.checks?.length);
+    await f.host.stopApi(); await f.host.start();
+    const recovered = await f.get(waiting.id);
+    assert.deepEqual(recovered.verification, accepted);
+    const steer = { requestId: randomUUID(), revision: recovered.revision, text: "Keep the original acceptance criteria." };
+    let replanned = await f.host.fetchApi(`/teams/${waiting.id}/steer`, "controller", steer);
+    for (let attempt = 0; attempt < 40 && replanned.status === 409 && replanned.body.code === "team-operation-running"; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      replanned = await f.host.fetchApi(`/teams/${waiting.id}/steer`, "controller", steer);
+    }
+    assert.equal(replanned.status, 200, JSON.stringify(replanned.body));
+    const finished = await f.settled(waiting.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.deepEqual(finished.verification, accepted);
+    assert.ok(finished.checks.some(check => check.status === "passed"));
+  } finally { await f.close(); }
+});
+
+test("a replanned coordinator cannot change accepted verification commands", { timeout: 120000 }, async () => {
+  const f = await fixture("bootstrap-change");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const waiting = await waitFor(() => f.get(created.body.id), run => run.status === "needs-input" && run.decisions.length === 1, 30000);
+    const accepted = waiting.verification;
+    assert.ok(accepted?.checks?.length);
+    await f.host.stopApi(); await f.host.start();
+    const recovered = await f.get(waiting.id);
+    const steer = { requestId: randomUUID(), revision: recovered.revision, text: "Replan without changing accepted checks." };
+    let replanned = await f.host.fetchApi(`/teams/${waiting.id}/steer`, "controller", steer);
+    for (let attempt = 0; attempt < 40 && replanned.status === 409 && replanned.body.code === "team-operation-running"; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      replanned = await f.host.fetchApi(`/teams/${waiting.id}/steer`, "controller", steer);
+    }
+    assert.equal(replanned.status, 200, JSON.stringify(replanned.body));
+    const blocked = await f.settled(waiting.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.match(blocked.reason ?? "", /verification.*(changed|different)|commands/i);
+    assert.deepEqual(blocked.verification, accepted);
+    assert.equal(blocked.members.some(member => member.revision === 2 && member.role === "implementer"), false);
+  } finally { await f.close(); }
+});
 
 test("a team builds concurrently in isolated copies and produces checked, reviewed work without changing its source", { timeout: 120000 }, async () => {
   const f = await fixture();
@@ -592,6 +835,32 @@ test("a Claude member that hits a usage limit continues on its fallback with its
   } finally { await run.close(); }
 });
 
+test("a limited Claude integrator continues the same repair with its partial changes", { timeout: 120000 }, async () => {
+  const lineup = structuredClone(fallbackLineup);
+  lineup.integrator = {
+    id: "haiku-integrator", label: "Claude integrator", provider: "claude", model: "claude-haiku-5-5",
+    effort: "medium", tier: "light", limitFallback: "deepseek-light",
+  };
+  const run = await fixture("integrator-limit", lineup);
+  try {
+    const created = await run.host.fetchApi("/teams", "owner", run.create());
+    const team = await run.settled(created.body.id);
+    assert.equal(team.status, "ready-for-review", JSON.stringify(team));
+    assert.ok(team.checks.some(check => check.status === "failed"), "The integrator starts only after a failed verification run");
+    assert.ok(team.checks.some(check => check.status === "passed"), "The fallback finishes the repair and verification passes");
+    const original = team.members.find(member => member.role === "integrator" && member.modelProfile?.id === "haiku-integrator")!;
+    const fallback = team.members.find(member => member.role === "integrator" && member.modelProfile?.id === "deepseek-light")!;
+    assert.match(original.stoppedReason!, /usage limit/);
+    const receipts = readdirSync(run.receipts).filter(name => name.endsWith(".json")).map(name => JSON.parse(readFileSync(join(run.receipts, name), "utf8")));
+    const fallbackReceipt = receipts.find(receipt => receipt.memberId === fallback.memberId);
+    assert.ok(fallbackReceipt?.sawPartial === true, "The fallback sees the limited integrator's partial repair");
+    assert.match(fallbackReceipt.prompt, /Configured verification failed/, "The replacement receives the check feedback");
+    assert.match(fallbackReceipt.prompt, /team-report\.(?:ts|js)/, "The replacement receives the host's structured report helper");
+    assert.doesNotMatch(fallbackReceipt.prompt, /mcp__infinite_team__report/, "OpenCode must not inherit Claude's reporting instructions");
+    assert.ok(team.members.some(member => member.role === "reviewer"));
+  } finally { await run.close(); }
+});
+
 test("a usage limit with no configured fallback blocks the run with its reason and keeps the partial work", { timeout: 90000 }, async () => {
   const lineup = structuredClone(limitLineup);
   delete lineup.implementers[0].limitFallback;
@@ -619,4 +888,32 @@ test("retargeting a member prompt keeps its answers, swaps reporting and profile
   assert.notEqual(older, answered("codex", astra));
   assert.equal(retargetPrompt(older, { provider: "claude", profile: haiku }), answered("claude", haiku));
   assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek }), undefined);
+});
+
+test("a team blocked by the one-hour member limit resumes into a fresh plan", { timeout: 60000 }, async () => {
+  const f = await fixture("mcp");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const id = created.body.id;
+    await waitFor(() => f.get(id), run => run.members.some(member => member.status === "running" && member.startedAt), 30000);
+    await f.host.stopApi();
+    const key = readFileSync(f.host.config.keyFile);
+    const file = join(f.host.config.stateDir, "teams", `${id}.sealed`);
+    const stored = unseal<{ run: { members: { startedAt?: string }[] } }>(key, `team:${id}`, readFileSync(file, "utf8"));
+    const startedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    for (const member of stored.run.members) member.startedAt = startedAt;
+    writeSealed(file, key, `team:${id}`, stored);
+    await f.host.start();
+    const blocked = await waitFor(() => f.get(id), run => run.status === "blocked" && run.reason === memberTimeLimitReason && run.resumable === true && run.members.every(member => !["queued", "running", "reported", "unavailable"].includes(member.status)), 30000);
+    const head = blocked.headCommit;
+    const resumed = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
+    assert.equal(resumed.body.status, "planning");
+    assert.equal(resumed.body.revision, blocked.revision + 1);
+    assert.equal(resumed.body.reason, undefined);
+    assert.equal(resumed.body.resumable, false);
+    assert.equal(resumed.body.headCommit, head);
+    assert.equal(resumed.body.members.length, blocked.members.length);
+  } finally { await f.close(); }
 });

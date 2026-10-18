@@ -1,0 +1,88 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { startHost, waitFor } from "./helpers.js";
+import type { Config } from "../packages/host/src/types.js";
+import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
+
+export const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+
+export const mixedLineup: TeamLineup = {
+  coordinator: { id: "opus-coordinator", label: "Opus coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" },
+  implementers: [
+    { id: "spark-high", label: "Spark implementer", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "light", dataUse: "contributor" },
+    { id: "astra-xhigh", label: "Astra implementer", provider: "codex", model: "gpt-6-astra", effort: "xhigh" },
+  ],
+  integrator: { id: "astra-integrator", label: "Astra integrator", provider: "codex", model: "gpt-6-astra", effort: "high" },
+  reviewer: { id: "opus-reviewer", label: "Opus reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" },
+};
+
+export async function fixture(scenario = "success", lineup?: TeamLineup, config: Partial<Config> = {}) {
+  const root = realpathSync(mkdtempSync("/tmp/inf-team-"));
+  const source = join(root, "source");
+  const receipts = join(root, "receipts");
+  mkdirSync(source); mkdirSync(receipts, { mode: 0o700 });
+  const opencode = join(root, "opencode-fixture");
+  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+  writeFileSync(opencode, `#!/bin/sh\nexec ${[process.execPath, resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "opencode"].map(quote).join(" ")} "$@"\n`);
+  chmodSync(opencode, 0o700);
+  git(source, "init", "--initial-branch=main");
+  writeFileSync(join(source, "original.txt"), "The configured project remains unchanged.\n");
+  writeFileSync(join(source, "check.mjs"), [
+    'import assert from "node:assert/strict";',
+    'import { existsSync, readFileSync } from "node:fs";',
+    'assert.match(readFileSync("a.txt", "utf8"), /^revision [1-9][0-9]*\\n$/);',
+    'assert.equal(readFileSync("a.txt", "utf8"), readFileSync("b.txt", "utf8"));',
+    'if (process.argv.includes("--prefix")) assert.equal(process.env.INFINITE_TEST_COMMAND_IDENTITY, "team-prefix");',
+    'if (process.argv.includes("--fail")) { console.error("Configured verification failed"); process.exit(17); }',
+    ...(scenario === "mixed" ? ['if (!existsSync("repair.txt")) { console.error("Integration repair required"); process.exit(18); }'] : []),
+  ].join("\n"));
+  git(source, "add", "original.txt", "check.mjs");
+  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  const base = git(source, "rev-parse", "HEAD");
+  let host: Host;
+  try {
+    host = await startHost({
+      agents: {
+        demo: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), scenario, receipts] },
+        ...(lineup ? {
+          claude: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "claude"] },
+          codex: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "codex"] },
+          opencode: { command: opencode, args: [] },
+        } : {}),
+      },
+      config: {
+        teams: { workspaceDir: join(root, "teams"), ...(lineup ? { lineup } : {}), ...(scenario === "success" ? {
+          commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },
+        } : {}) },
+        remote: { enabled: true },
+        projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
+          team: { checks: [
+            { command: process.execPath, args: ["check.mjs", ...(scenario === "failed-check" ? ["--fail"] : []), ...(scenario === "success" ? ["--prefix"] : [])] },
+            ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
+          ] } }],
+        ...config,
+      },
+    });
+  } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
+  const create = (): CreateTeam => ({ requestId: randomUUID(), projectId: "rehearsal", provider: lineup?.coordinator.provider ?? "demo",
+    ...(lineup ? { useConfiguredLineup: true } : {}), title: "Implement a small feature",
+    objective: "Create two independent files and verify their integrated contents.", parallelism: 2 });
+  const get = async (id: string): Promise<TeamView> => {
+    const response = await host.fetchApi(`/teams/${id}`);
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    return response.body;
+  };
+  const settled = (id: string) => waitFor(() => get(id), run => ["ready-for-review", "blocked"].includes(run.status), 90000);
+  const close = async () => {
+    try {
+      const listed = await host.fetchApi("/teams");
+      for (const run of listed.body.teams ?? [])
+        if (!["ready-for-review", "cancelled"].includes(run.status))
+          await host.fetchApi(`/teams/${run.id}/cancel`, "owner", { requestId: randomUUID(), revision: run.revision });
+    } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+  };
+  return { host, source, receipts, base, create, get, settled, close };
+}

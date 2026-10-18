@@ -7,6 +7,7 @@ import { writeSealed, unseal } from "./vault.js";
 import { createTeamSchema, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
 import { teamPrompt } from "./team-prompts.js";
 import { teamModelLaunch } from "./launch.js";
+import type { UsageService } from "./usage-service.js";
 import type { LinearService } from "./linear.js";
 import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureMemberResult, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, validateTeamPlan } from "./team-workspace.js";
 export { TeamError } from "./team-workspace.js";
@@ -38,6 +39,7 @@ export class TeamService {
   private tickQueued = false;
   private readonly commands = new Map<string, AbortController>();
   private readonly directory: string;
+  private usage?: UsageService;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService) {
     this.directory = join(config.stateDir, "teams");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
@@ -56,6 +58,7 @@ export class TeamService {
       }
     }
   }
+  useUsage(service: UsageService) { this.usage = service; }
   private enqueue<T>(task: () => T | Promise<T>): Promise<T> {
     const next = this.serial.then(task); this.serial = next.catch(() => {}); return next;
   }

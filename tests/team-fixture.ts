@@ -103,7 +103,7 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
     } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
   };
   /** Serve the fixture's parent folder as the sync home and enroll a sibling teamwork folder through the API. */
-  const enrollTeamwork = async (sync: Partial<NonNullable<Config["sync"]>> = {}) => {
+  const enrollTeamwork = async (sync: Partial<NonNullable<Config["sync"]>> = {}, teamwork = "teamwork") => {
     const home = realpathSync(dirname(source));
     host.config.sync = { homeDir: home, ...sync };
     await host.stopApi();
@@ -111,10 +111,10 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
     await host.start();
     const current = await host.fetchApi("/projects/rehearsal/team", "owner");
     assert.equal(current.status, 200, JSON.stringify(current.body));
-    const saved = await host.fetchApi("/projects/rehearsal/team", "owner", { requestId: randomUUID(), revision: current.body.revision, team: current.body.team, teamwork: "teamwork" }, {}, "PUT");
+    const saved = await host.fetchApi("/projects/rehearsal/team", "owner", { requestId: randomUUID(), revision: current.body.revision, team: current.body.team, teamwork }, {}, "PUT");
     assert.equal(saved.status, 200, JSON.stringify(saved.body));
-    assert.equal(saved.body.teamwork, "teamwork");
-    return join(home, "teamwork");
+    assert.equal(saved.body.teamwork, teamwork);
+    return join(home, ...teamwork.split("/"));
   };
   return { host, source, receipts, base, create, get, settled, close, enrollTeamwork };
 }

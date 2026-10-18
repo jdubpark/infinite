@@ -255,23 +255,23 @@ export class RepoEnrollmentService {
   }
 
   private applyOverlays() {
-    for (const [projectId, enrollment] of Object.entries(this.store.projects)) {
-      const project = this.config.projects.find(item => item.id === projectId);
-      if (!project) continue;
-      try {
-        if (this.projectPath(project) !== enrollment.path) continue;
-        this.assertProjectPathAllowed(enrollment.path);
-        // Overlaps are checked when a run is prepared, so a later conflict refuses that run
-        // instead of silently dropping the project's team settings.
-        if (enrollment.teamwork) project.teamworkDir = this.teamworkPath(enrollment.teamwork);
-        else if (Object.hasOwn(enrollment, "teamwork")) delete project.teamworkDir;
-      }
-      catch { continue; }
-      project.team = enrollment.team as Project["team"];
-      if (Object.hasOwn(enrollment, "linear")) {
-        if (enrollment.linear) project.linear = enrollment.linear;
-        else delete project.linear;
-      }
+    for (const projectId of Object.keys(this.store.projects)) this.restore(projectId);
+  }
+
+  restore(projectId: string) {
+    const enrollment = this.store.projects[projectId];
+    const project = this.config.projects.find(item => item.id === projectId);
+    if (!project || !enrollment) return;
+    try {
+      if (this.projectPath(project) !== enrollment.path) return;
+      this.assertProjectPathAllowed(enrollment.path);
+      if (enrollment.teamwork) project.teamworkDir = this.teamworkPath(enrollment.teamwork);
+      else if (Object.hasOwn(enrollment, "teamwork")) delete project.teamworkDir;
+    } catch { return; }
+    project.team = enrollment.team as Project["team"];
+    if (Object.hasOwn(enrollment, "linear")) {
+      if (enrollment.linear) project.linear = enrollment.linear;
+      else delete project.linear;
     }
   }
 

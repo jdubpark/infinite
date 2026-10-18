@@ -14,14 +14,14 @@ import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team
 import { git, limitLineup, mixedLineup, fixture } from "./team-fixture.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 
-test("team runs use readable date, title slug, and ID names under the project teamwork root", { timeout: 120000 }, async () => {
+test("team runs use readable date, title slug, and ID names in default and teamwork roots", { timeout: 120000 }, async () => {
   const f = await fixture("success");
   try {
     const firstRequest = f.create();
     const firstCreated = await f.host.fetchApi("/teams", "owner", firstRequest);
     const first = await f.settled(firstCreated.body.id);
     const firstName = `${first.createdAt.slice(0, 10)}-implement-a-small-feature-${first.id.slice(0, 8)}`;
-    assert.equal(first.workspace, join(f.host.config.teams!.workspaceDir, "rehearsal", firstName, "integration"));
+    assert.equal(first.workspace, join(f.host.config.teams!.workspaceDir, `rehearsal-${firstName}`, "integration"));
     assert.equal(first.branch, `infinite/implement-a-small-feature-${first.id.slice(0, 8)}`);
 
     const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true });
@@ -31,8 +31,31 @@ test("team runs use readable date, title slug, and ID names under the project te
     const secondName = `${second.createdAt.slice(0, 10)}-implement-a-small-feature-${second.id.slice(0, 8)}`;
     assert.equal(second.workspace, join(teamworkRoot, secondName, "integration"));
     assert.equal(second.branch, `infinite/implement-a-small-feature-${second.id.slice(0, 8)}`);
-    // macOS clears setgid on directories whose group the owner does not belong to.
-    if (process.platform === "linux") assert.equal(statSync(teamworkRoot).mode & 0o2000, 0o2000, "a newly created shared teamwork root has setgid");
+    assert.equal(statSync(teamworkRoot).mode & 0o022, 0, "a host-created teamwork root is not group- or other-writable");
+  } finally { await f.close(); }
+});
+
+test("teamwork preparation refuses a group-writable root parent", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const parent = join(dirname(f.source), "Projects");
+    mkdirSync(parent);
+    chmodSync(parent, 0o770);
+    const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true }, "Projects/teamwork");
+    assert.ok(teamworkRoot);
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.deepEqual([created.status, created.body.code], [409, "team-root-unsafe"]);
+  } finally { await f.close(); }
+});
+
+test("a lifecycle run cannot be bundled before review", { timeout: 60000 }, async () => {
+  const f = await fixture("lifecycle");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status));
+    const checking = await waitFor(() => f.get(created.body.id), run => run.status === "verifying" && run.checks.some(check => check.status === "running"), 30000);
+    const response = await f.host.fetchApi(`/teams/${checking.id}/bundle`);
+    assert.deepEqual([response.status, response.body.code], [409, "team-not-ready"]);
   } finally { await f.close(); }
 });
 

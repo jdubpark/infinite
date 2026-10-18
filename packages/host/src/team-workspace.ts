@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, chmodSync, lstatSync, realpathSync } from "node:fs";
+import { constants } from "node:fs";
+import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import type { TeamCommand, TeamTaskPlan } from "./team-types.js";
 
@@ -56,6 +57,39 @@ async function git(cwd: string, args: string[], prefix?: TeamCommand, timeoutMs 
 }
 function lines(value: string) { return value.split("\0").filter(Boolean); }
 export function teamWorkspacePath(root: string, directoryName: string) { return join(root, directoryName, "integration"); }
+const hostOwned = (stat: ReturnType<typeof lstatSync>) => {
+  if (!stat) return false;
+  return typeof process.getuid !== "function" || stat.uid === process.getuid() || stat.uid === 0;
+};
+const unsafeTeamRoot = () => new TeamError(409, "team-root-unsafe", "Team roots must contain only host-owned real directories that are not writable by group or others.");
+/** Create/check each component below a trusted anchor without traversing an unsafe parent. */
+export function ensureHostDirectory(anchor: string, target: string, mode: number, create = true) {
+  const base = realpathSync(anchor), destination = resolve(target), rel = relative(base, destination);
+  if (!rel || rel === ".." || rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(rel)) throw unsafeTeamRoot();
+  let current = base;
+  for (const part of rel.split(/[\\/]/)) {
+    current = join(current, part);
+    let info;
+    try { info = lstatSync(current); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) throw unsafeTeamRoot();
+      try { mkdirSync(current, { mode }); } catch (mkdirError) { if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError; }
+      try { info = lstatSync(current); } catch { throw unsafeTeamRoot(); }
+    }
+    if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info) || (info.mode & 0o022) !== 0) throw unsafeTeamRoot();
+  }
+  return realpathSync(destination);
+}
+/** Change directory modes through an opened no-follow descriptor, never through a redirected path. */
+export function chmodDirectoryNoFollow(path: string, mode: number) {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    const info = fstatSync(fd);
+    if (!info.isDirectory() || !hostOwned(info)) throw unsafeTeamRoot();
+    fchmodSync(fd, mode);
+  } finally { if (fd !== undefined) closeSync(fd); }
+}
 /** A source handoff must preserve every tracked and untracked edit and pin the actual root. */
 export async function cleanTeamCheckpoint(source: string, expectedHead: string, prefix?: TeamCommand) {
   const canonical = realpathSync(source);
@@ -64,7 +98,7 @@ export async function cleanTeamCheckpoint(source: string, expectedHead: string, 
   await assertMemberReadOnly(canonical, expectedHead, prefix);
   return expectedHead;
 }
-export async function prepareTeamWorkspace(source: string, root: string, directoryName: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, expectedHead?: string, sharedGroup = false, teamworkRoot = false) {
+export async function prepareTeamWorkspace(source: string, root: string, directoryName: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, expectedHead?: string, anchor?: string) {
   let canonical: string, top: string;
   try { canonical = realpathSync(source); top = await git(canonical, ["rev-parse", "--show-toplevel"], prefix, 30000, signal); }
   catch { throw new TeamError(409, "project-not-git-root", "The configured team project must be an accessible Git repository with a committed HEAD."); }
@@ -74,12 +108,16 @@ export async function prepareTeamWorkspace(source: string, root: string, directo
   const baseCommit = await git(canonical, ["rev-parse", "HEAD"], prefix, 30000, signal);
   if (expectedHead !== undefined && baseCommit !== expectedHead)
     throw new TeamError(409, "parent-workspace-changed", "The previous goal run no longer matches its recorded integration commit. Its workspace must be reconciled before continuing.");
-  const rootExisted = existsSync(root);
-  mkdirSync(root, { recursive: true, mode: 0o770 });
-  if (teamworkRoot && sharedGroup && !rootExisted) chmodSync(root, 0o2770);
-  const directory = join(realpathSync(root), directoryName);
+  if (anchor) ensureHostDirectory(anchor, root, 0o750);
+  else mkdirSync(root, { recursive: true, mode: 0o770 });
+  const canonicalRoot = realpathSync(root);
+  const directory = join(canonicalRoot, directoryName);
   if (existsSync(directory)) throw new TeamError(409, "workspace-exists", "This team workspace already exists and needs explicit reconciliation.");
-  mkdirSync(directory, { mode: 0o770 }); chmodSync(directory, 0o2770);
+  mkdirSync(directory, { mode: 0o700 });
+  const members = join(directory, "members");
+  mkdirSync(members, { mode: 0o700 });
+  chmodDirectoryNoFollow(members, 0o2770);
+  chmodDirectoryNoFollow(directory, 0o2770);
   const workspace = join(directory, "integration");
   await git(directory, ["clone", "--no-local", "--no-hardlinks", "--", canonical, workspace], prefix, 120000, signal);
   await git(workspace, ["remote", "remove", "origin"], prefix, 30000, signal);
@@ -90,7 +128,12 @@ export async function prepareTeamWorkspace(source: string, root: string, directo
 }
 export async function prepareMemberWorkspace(workspace: string, memberId: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {
   const parent = join(workspace, "..", "members");
-  mkdirSync(parent, { recursive: true, mode: 0o770 }); chmodSync(parent, 0o2770);
+  let info;
+  try { info = lstatSync(parent); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; mkdirSync(parent, { mode: 0o700 }); }
+  try { info = lstatSync(parent); } catch { throw unsafeTeamRoot(); }
+  if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info)) throw unsafeTeamRoot();
+  chmodDirectoryNoFollow(parent, 0o2770);
   const cwd = join(parent, memberId);
   if (existsSync(cwd)) throw new TeamError(409, "workspace-exists", "A member workspace already exists and needs explicit reconciliation.");
   await git(parent, ["clone", "--no-local", "--no-hardlinks", "--", workspace, cwd], prefix, 120000, signal);

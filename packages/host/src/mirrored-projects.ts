@@ -3,6 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from "no
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ProjectSyncError } from "./project-sync.js";
+import { chmodDirectoryNoFollow } from "./team-workspace.js";
 import { unseal, writeSealed } from "./vault.js";
 import type { Config, Project } from "./types.js";
 
@@ -64,7 +65,10 @@ export class MirroredProjects {
       try { if (!lstatSync(current).isDirectory()) throw invalid(); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
-    const protectedPaths = [this.config.stateDir, this.config.runDir, this.config.keyFile];
+    // Refuse before persisting: a mapping that held a credential or the team root would fail startup validation.
+    const protectedPaths = [this.config.stateDir, this.config.runDir, this.config.keyFile, this.config.teams?.workspaceDir,
+      this.config.linear?.apiKeyFile, this.config.push?.accessTokenFile, this.config.remote?.relay?.tokenFile, this.config.summaries?.apiKeyFile]
+      .filter((value): value is string => Boolean(value));
     if (protectedPaths.some(value => inside(destination, this.canonical(resolve(value))) || inside(this.canonical(resolve(value)), destination))) throw invalid();
     return destination;
   }
@@ -103,6 +107,11 @@ export class MirroredProjects {
       mkdirSync(dirname(project.path), { recursive: true, mode: this.config.sync?.sharedGroup ? 0o2750 : 0o700 });
       mkdirSync(project.path, { recursive: true, mode: this.config.sync?.sharedGroup ? 0o2770 : 0o700 });
       const wasForgotten = entry?.forgotten;
+      if (wasForgotten && this.config.sync?.sharedGroup) {
+        const info = lstatSync(project.path);
+        if (!info.isDirectory() || info.isSymbolicLink()) throw invalid();
+        chmodDirectoryNoFollow(project.path, 0o2770);
+      }
       if (entry) delete entry.forgotten;
       else this.entries.push({ path, id: project.id });
       try { this.persist(); } catch (error) {
@@ -121,6 +130,12 @@ export class MirroredProjects {
     if (!entry) throw new ProjectSyncError("Only a mirrored project can be forgotten.", "unknown-project");
     const project = this.config.projects.find(value => value.id === id);
     if (!project) throw new ProjectSyncError("The mirrored project is not currently configured.", "unknown-project");
+    if (this.config.sync?.sharedGroup) {
+      try {
+        const info = lstatSync(project.path);
+        if (info.isDirectory() && !info.isSymbolicLink()) chmodDirectoryNoFollow(project.path, 0o2750);
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
     entry.forgotten = true;
     try { this.persist(); } catch (error) { delete entry.forgotten; throw error; }
     this.config.projects.splice(this.config.projects.indexOf(project), 1);

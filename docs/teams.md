@@ -466,7 +466,7 @@ title, and the first eight characters of its ID, such as
 `2026-01-15-add-export-3f2a9c1d/`, holding the `integration/` checkout and the
 `members/` copies. Its branch is `infinite/<slug>-<id8>`. The run ID remains its
 identity in the API, receipts, and Linear. Runs go under
-`teams.workspaceDir/<project-id>/` unless the project has a teamwork folder.
+`teams.workspaceDir/<project-id>-<YYYY-MM-DD>-<slug>-<id8>/` unless the project has a teamwork folder, in which case it is `<teamworkDir>/<YYYY-MM-DD>-<slug>-<id8>/`.
 
 A teamwork folder keeps a product's runs beside its code under the server home.
 For a mirrored `Projects/sample/codebase`, run `infinite repo init --teamwork
@@ -478,6 +478,12 @@ home, reached through a symbolic link, or overlapping any project, the team
 workspace root, or host state and credential paths, and checks again when each
 run is prepared. `--teamwork none` returns new runs to the default root.
 Existing runs keep the folder and branch they were created with.
+
+The host owns every directory component from the sync home through the teamwork
+root. Each component below the sync home must be a real directory, owned by the
+host account or root, and not writable by group or others. Teamwork roots use
+mode `0750`; run and member directories are changed through no-follow directory
+descriptors before the agent identity receives access.
 
 Enable teams in the private host configuration and define the project's
 verification commands. Commands use executable/argument arrays, without an

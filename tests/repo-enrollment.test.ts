@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Config } from "../packages/host/src/types.js";
 import { RepoEnrollmentService } from "../packages/host/src/repo-enrollment.js";
+import { validateLinearConfig } from "../packages/host/src/config.js";
 import { unseal } from "../packages/host/src/vault.js";
 import { startHost } from "./helpers.js";
 
@@ -121,6 +122,15 @@ test("teamwork enrollment persists a home-relative folder and rejects protected,
   await rejects("../outside", undefined);
 });
 
+test("Linear credentials cannot be stored inside a project's teamwork folder", () => {
+  const f = fixture();
+  try {
+    const config = f.config();
+    config.projects[0].teamworkDir = dirname(config.linear!.apiKeyFile);
+    assert.throws(() => validateLinearConfig(config), /Linear API key must be a nonempty private 0600 file outside runtime state and project workspaces/);
+  } finally { f.close(); }
+});
+
 test("repository enrollment rejects stale revisions, dirty worktrees, and in-flight changes", async () => {
   const f = fixture();
   try {
@@ -149,7 +159,7 @@ test("owner CLI enrolls a mirrored repository, while other roles and browser own
   const homeDir = join(external, "home");
   const teamWorkspace = join(external, "team-workspaces");
   mkdirSync(homeDir); mkdirSync(teamWorkspace);
-  const host = await startHost({ config: { sync: { homeDir }, teams: { workspaceDir: teamWorkspace } } });
+  const host = await startHost({ config: { sync: { homeDir, sharedGroup: true }, teams: { workspaceDir: teamWorkspace } } });
   try {
     const mapped = await host.fetchApi("/projects/resolve", "owner", { path: "Projects/sample" });
     assert.equal(mapped.status, 200, JSON.stringify(mapped.body));
@@ -173,6 +183,17 @@ test("owner CLI enrolls a mirrored repository, while other roles and browser own
     assert.equal(JSON.stringify(host.config.teams), teamsBefore);
     assert.equal(JSON.stringify(host.config.agents), agentsBefore);
     assert.equal(existsSync(join(projectPath, "route-check-ran")), false, "enrollment stores commands without executing them");
+
+    const forgotten = await host.fetchApi(`/projects/${mapped.body.id}/mirror`, "owner", undefined, {}, "DELETE");
+    assert.equal(forgotten.status, 200, JSON.stringify(forgotten.body));
+    assert.equal(statSync(projectPath).mode & 0o7777, 0o2750);
+    const resolved = await host.fetchApi("/projects/resolve", "owner", { path: "Projects/sample" });
+    assert.equal(resolved.status, 200, JSON.stringify(resolved.body));
+    assert.equal(resolved.body.id, mapped.body.id);
+    assert.equal(statSync(projectPath).mode & 0o7777, 0o2770);
+    const restored = await host.fetchApi(endpoint);
+    assert.equal(restored.body.revision, saved.body.revision);
+    assert.deepEqual(restored.body.team, saved.body.team, "resolve reapplies saved enrollment without an API restart");
 
     for (const role of ["controller", "viewer"] as const) {
       assert.equal((await host.fetchApi(endpoint, role)).status, 403);

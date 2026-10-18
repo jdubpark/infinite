@@ -363,29 +363,35 @@ export function createApp(config: Config, key: Buffer) {
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
   app.get("/api/teams/:id/bundle", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
-    const bundle = await teams.bundle(id.parse(req.params.id));
-    const limit = 512 * 1024 * 1024;
-    const child = spawnTeamBundle(bundle.workspace, bundle.branch, config.teams?.commandPrefix);
-    res.status(200).set({ "Content-Type": "application/octet-stream", "X-Infinite-Branch": bundle.branch, "X-Infinite-Head": bundle.head });
-    let size = 0, finished = false;
+    let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;
     const stop = () => {
-      if (finished) return;
+      if (!child || finished) return;
       try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* Already exited. */ }
     };
-    const disconnect = () => { if (!res.writableEnded) stop(); };
+    const disconnect = () => { if (!res.writableEnded) { stop(); finished = true; clearTimeout(timer); } };
     req.once("aborted", disconnect);
     res.once("close", disconnect);
+    const timer = setTimeout(() => { stop(); finished = true; res.destroy(); }, 10 * 60 * 1000);
+    timer.unref();
+    res.once("close", () => clearTimeout(timer));
+    const bundle = await teams.bundle(id.parse(req.params.id));
+    if (req.aborted || res.destroyed || res.writableEnded) return;
+    const limit = 512 * 1024 * 1024;
+    child = spawnTeamBundle(bundle.workspace, bundle.branch, config.teams?.commandPrefix);
+    res.status(200).set({ "Content-Type": "application/octet-stream", "X-Infinite-Branch": bundle.branch, "X-Infinite-Head": bundle.head });
+    let size = 0;
     child.stdout.on("data", (chunk: Buffer) => {
       size += chunk.length;
-      if (size > limit) { stop(); finished = true; res.destroy(); return; }
+      if (size > limit) { stop(); finished = true; clearTimeout(timer); res.destroy(); return; }
       if (!res.write(chunk)) child.stdout.pause();
     });
     res.on("drain", () => child.stdout.resume());
     child.stderr.resume();
-    child.once("error", () => { finished = true; res.destroy(); });
+    child.once("error", () => { finished = true; clearTimeout(timer); res.destroy(); });
     child.once("close", code => {
       if (finished) return;
       finished = true;
+      clearTimeout(timer);
       if (code !== 0) res.destroy(); else res.end();
     });
   });
@@ -413,7 +419,9 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {
     if (!mirroredProjects) return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
     const { path } = z.object({ path: z.string().max(4096) }).strict().parse(req.body);
-    res.json(mirroredProjects.resolve(path));
+    const project = mirroredProjects.resolve(path);
+    enrollment.restore(project.id);
+    res.json(project);
   });
   app.delete("/api/projects/:id/mirror", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     if (!mirroredProjects || runtimeSecurity(config.deployment).tenancy !== "single-tenant")

@@ -530,6 +530,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
   if (subcommand === "pull") {
     if (!id || rest.length) throw new Error("Usage: infinite team pull TEAM_ID [--json]");
     const team = await api.json<any>(`/teams/${id}`);
+    if (team.status !== "ready-for-review") throw new Error("This team is not ready to pull.");
     const localProject = boundTeamProject(config, configPath);
     if (localProject !== team.projectId)
       throw new Error(`This repository is bound to project ${localProject ?? "<unbound>"}, but team ${id} belongs to project ${clean(team.projectId)}.`);
@@ -567,6 +568,11 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       await pipeline(Readable.fromWeb(response.body as import("node:stream/web").ReadableStream), createWriteStream(bundlePath, { flags: "wx", mode: 0o600 }));
       try { execFileSync("git", ["-C", root, "bundle", "verify", bundlePath], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C" }) }); }
       catch (error) { throw new Error(`The downloaded team bundle failed verification: ${clean(String((error as NodeJS.ErrnoException & { stderr?: Buffer | string }).stderr ?? (error as Error).message))}.`); }
+      let heads = "";
+      try { heads = execFileSync("git", ["-C", root, "bundle", "list-heads", bundlePath, ref], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C" }) }); }
+      catch { throw new Error("The team result changed while it was being prepared. Refresh team status and retry."); }
+      if (heads.trim().split(/\r?\n/).length !== 1 || heads.trim() !== `${teamHead} ${ref}`)
+        throw new Error("The team result changed while it was being prepared. Refresh team status and retry.");
       try {
         execFileSync("git", ["-C", root, "fetch", "--no-tags", "--no-write-fetch-head", bundlePath, `${ref}:${ref}`], { encoding: "utf8", timeout: 120000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C" }) });
       } catch (error) {

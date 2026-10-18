@@ -113,6 +113,27 @@ test("team pull imports an integrated branch without changing the checkout and r
   } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
 });
 
+test("team pull refuses a lifecycle run before review", { timeout: 60000 }, async () => {
+  const run = await teamFixture("lifecycle");
+  const localRoot = mkdtempSync(join(tmpdir(), "infinite-team-pull-not-ready-"));
+  const checkout = join(localRoot, "checkout");
+  const clientFile = join(run.host.root, "pull-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  try {
+    await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
+    const checks = JSON.stringify([{ command: process.execPath, args: ["check.mjs"] }]);
+    await exec(entry[0], [...entry.slice(1), "repo", "init", "--project", "rehearsal", "--check-json", checks], { cwd: checkout });
+    const created = await run.host.fetchApi("/teams", "owner", run.create());
+    assert.ok([200, 201].includes(created.status));
+    await waitFor(() => run.host.fetchApi(`/teams/${created.body.id}`), response => response.body.status === "verifying" && response.body.checks.some((check: { status: string }) => check.status === "running"), 30000);
+    await assert.rejects(
+      exec(entry[0], [...entry.slice(1), "team", "pull", created.body.id], { cwd: checkout }),
+      (error: { stderr: string }) => /team is not ready to pull/i.test(error.stderr),
+    );
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
+});
+
 test("repo init configures an explicit project without resolving or replacing its checkout", { timeout: 120000 }, async () => {
   const run = await teamFixture("success", mixedLineup);
   const clientFile = join(run.host.root, "repo-client.json");

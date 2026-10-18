@@ -309,4 +309,5 @@ export type TeamView = Omit<TeamRun, "members" | "permissionDecisions"> & {
   members: Omit<TeamMember, "prompt" | "feedback" | "pendingLimit">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt">[];
   providerLimits: ProviderLimit[];
+  resumable: boolean;
 };

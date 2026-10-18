@@ -118,7 +118,8 @@ test("encrypted relay creates and steers real sessions while retaining roles and
     }
     const health = await fetch(`${relayUrl}/health`);
     assert.deepEqual(await health.json(), { ok: true });
-    assert.equal((await fetch(`${relayUrl}/api/sessions`)).status, 404, "the portal does not expose runner APIs");
+    assert.equal((await fetch(`${relayUrl}/api/sessions`)).status, 404, "the relay does not expose runner APIs");
+    for (const path of ["/", "/index.html"]) assert.equal((await fetch(`${relayUrl}${path}`)).status, 404, "the relay does not publish the web client");
   } finally {
     for (const client of clients) client.close();
     await host.stop(); proxy.close(); relay.close(); rmSync(privateFiles, { recursive: true, force: true });
@@ -317,9 +318,9 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
   } finally { for (const client of clients) client.close(); runner.close(); }
 });
 
-function openSocket(url: string, token?: string) {
+function openSocket(url: string, token?: string, headers: Record<string, string> = {}) {
   return new Promise<WebSocket>((resolve, reject) => {
-    const socket = new WebSocket(url.replace("http:", "ws:"), token ? { headers: { Authorization: `Bearer ${token}` } } : {});
+    const socket = new WebSocket(url.replace("http:", "ws:"), { headers: { ...headers, ...(token ? { Authorization: `Bearer ${token}` } : {}) } });
     socket.once("open", () => resolve(socket));
     socket.on("error", reject);
   });
@@ -347,4 +348,42 @@ test("relay registration, offline routing and machine channel ownership are enfo
     first.terminate(); await disconnected;
     await assert.rejects(openSocket(`${url}/relay/clients/${firstId}`), /503/);
   } finally { for (const socket of live) socket.terminate(); relay.close(); }
+});
+
+test("behind a local tunnel, clients enter only through its socket and one address cannot take every slot", { timeout: 15000 }, async () => {
+  const machineId = randomUUID(), token = randomBytes(32).toString("base64url");
+  const registrations = [{ machineId, tokenHash: hashToken(token) }];
+  const relay = createRelayServer({ registrations, maxClientsPerMachine: 8, maxClientsPerAddress: 1, proxy: { addressHeader: "CF-Connecting-IP" } });
+  const direct = createRelayServer({ registrations, maxClientsPerMachine: 8 });
+  const files = mkdtempSync(join(tmpdir(), "infinite-relay-")), socketPath = join(files, "proxy.sock");
+  await new Promise<void>(resolve => relay.proxy!.listen(socketPath, resolve));
+  const [url, directUrl] = [await listen(relay.server), await listen(direct.server)], live: WebSocket[] = [];
+  try {
+    live.push(await openSocket(`${url}/relay/hosts/${machineId}`, token));
+    const viaTunnel = (address: string) => openSocket(`ws+unix:${socketPath}:/relay/clients/${machineId}`, undefined, { "CF-Connecting-IP": address });
+    await assert.rejects(openSocket(`${url}/relay/clients/${machineId}`, undefined, { "CF-Connecting-IP": "192.0.2.30" }), /403/, "a local process cannot bypass the tunnel or choose its address");
+    live.push(await viaTunnel("192.0.2.10"));
+    await assert.rejects(viaTunnel("192.0.2.10"), /429/);
+    live.push(await viaTunnel("192.0.2.11"), await viaTunnel("2001:db8:0:1::1"));
+    await assert.rejects(viaTunnel("2001:db8:0:1:ffff::9"), /429/, "addresses in one IPv6 /64 share a limit");
+    live.push(await viaTunnel("not an address"));
+    await assert.rejects(viaTunnel("also not an address"), /429/, "malformed headers share one limit");
+    live.push(await openSocket(`${directUrl}/relay/hosts/${machineId}`, token));
+    live.push(await openSocket(`${directUrl}/relay/clients/${machineId}`), await openSocket(`${directUrl}/relay/clients/${machineId}`));
+  } finally { for (const socket of live) socket.terminate(); relay.close(); direct.close(); rmSync(files, { recursive: true, force: true }); }
+});
+
+test("a configured access token is sent as relay upgrade headers", { timeout: 15000 }, async () => {
+  const sockets = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+  await new Promise(resolve => sockets.once("listening", resolve));
+  const access = { clientId: `${randomBytes(16).toString("hex")}.access`, clientSecret: randomBytes(32).toString("hex") };
+  const seen = new Promise<{ id?: string; secret?: string; path?: string }>(resolve => sockets.once("connection", (_socket, req) =>
+    resolve({ id: req.headers["cf-access-client-id"] as string, secret: req.headers["cf-access-client-secret"] as string, path: req.url })));
+  const machineId = randomUUID();
+  const client = createRemoteClient({ url: `http://127.0.0.1:${(sockets.address() as { port: number }).port}`, token: randomBytes(32).toString("base64url"), relay: { machineId }, access });
+  try {
+    void client.request("/me").catch(() => {});
+    assert.deepEqual(await seen, { id: access.clientId, secret: access.clientSecret, path: `/relay/clients/${machineId}` });
+    assert.throws(() => createRemoteClient({ url: "https://relay.example", token: randomBytes(32).toString("base64url"), relay: { machineId }, access: { clientId: "short", clientSecret: access.clientSecret } }), /access token/);
+  } finally { client.close(); sockets.close(); }
 });

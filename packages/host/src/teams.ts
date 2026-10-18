@@ -34,6 +34,28 @@ const timestamp = () => new Date().toISOString();
 const activeMember = (member: TeamMember) => ["queued", "running", "reported", "unavailable"].includes(member.status);
 const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
 const runtimeUnavailableReason = "An agent runtime is unavailable; the team is waiting for confirmed state.";
+export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
+
+/** A one-hour member stop can replan. Interrupted workspace operations cannot. */
+export function blockedTeamCanResume(input: {
+  status: string;
+  reason?: string;
+  pending: boolean;
+  deliveryAttempt: boolean;
+  deliveryReceipt: boolean;
+  prepared: boolean;
+  stopReason?: string;
+  linearStatus?: string;
+}): boolean {
+  return input.status === "blocked"
+    && input.reason === memberTimeLimitReason
+    && input.prepared
+    && !input.pending
+    && !input.deliveryAttempt
+    && !input.deliveryReceipt
+    && !input.stopReason
+    && input.linearStatus !== "blocked";
+}
 const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runId, memberId: member.memberId, revision: member.revision, role: member.role, ...(member.taskId ? { taskId: member.taskId } : {}) });
 
 /** Durable orchestration; reports describe agent claims, configured checks describe host evidence. */
@@ -101,13 +123,30 @@ export class TeamService {
     const canonical = stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, create) : ensureDefaultTeamRoot(root, create);
     assertTeamPath(canonical, path);
   }
+  private canResume(stored: Stored, linearStatus = stored.run.linear?.status) {
+    const run = stored.run;
+    return blockedTeamCanResume({
+      status: run.status,
+      reason: run.reason,
+      pending: Boolean(stored.pending),
+      deliveryAttempt: Boolean(stored.deliveryAttempt),
+      deliveryReceipt: Boolean(run.deliveryReceipt),
+      prepared: stored.prepared,
+      stopReason: run.stopReason,
+      linearStatus,
+    });
+  }
   private view(stored: Stored): TeamView {
     const { members, ...run } = structuredClone(stored.run);
     // Queue evidence from this exact state before a goal can use its sync gate
     // to continue from a newly reviewed or no-change result.
     const tracking = this.linear?.updateTeam(stored.run, stored.run.linearTracking === true);
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
-    const safeRun = { ...run, ...(run.permissionDecisions ? { permissionDecisions: run.permissionDecisions.map(({ prompt: _prompt, ...decision }) => decision) } : {}) };
+    const safeRun = {
+      ...run,
+      resumable: this.canResume(stored, run.linear?.status),
+      ...(run.permissionDecisions ? { permissionDecisions: run.permissionDecisions.map(({ prompt: _prompt, ...decision }) => decision) } : {}),
+    };
     return { ...safeRun, ...(this.usage ? { usage: this.usage.aggregate(members) } : {}), providerLimits: this.limits.active(), members: members.map(({ prompt: _prompt, feedback: _feedback, pendingLimit: _pendingLimit, ...member }) => {
       const usage = this.usage?.session(member.sessionId);
       return { ...member, ...(usage?.measured ? { usage } : {}) };
@@ -208,7 +247,8 @@ export class TeamService {
       const slug = parsed.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/g, "") || "team";
       const suffix = parsed.requestId.slice(0, 8);
       const directoryName = `${project.teamworkDir ? "" : `${project.id}-`}${at.slice(0, 10)}-${slug}-${suffix}`;
-      const branch = `infinite/${slug}-${suffix}`;
+      // The `infinite/team-` prefix keeps constrained launchers that allow only team branches working.
+      const branch = `infinite/team-${slug}-${suffix}`;
       const root = project.teamworkDir ?? this.config.teams.workspaceDir;
       const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: structuredClone(project.team.permissions), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       if (project.team.delivery) {
@@ -347,12 +387,12 @@ export class TeamService {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, action, body)) return this.view(stored);
       if (action === "pause" && ["blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
-      if (action === "resume" && (stored.pending || stored.deliveryAttempt || run.deliveryReceipt || !stored.prepared || run.status === "blocked"))
+      if (action === "resume" && (stored.pending || stored.deliveryAttempt || run.deliveryReceipt || !stored.prepared || (run.status === "blocked" && !this.canResume(stored))))
         throw new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
       if (action === "resume" && stored.halt) throw new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
       if (!this.mutation(stored, action, body)) return this.view(stored);
       if (action === "resume") {
-        if (run.status !== "paused") { this.save(stored); return this.view(stored); }
+        if (run.status !== "paused" && !this.canResume(stored)) { this.save(stored); return this.view(stored); }
         // Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection.
         run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
         run.brief = undefined; run.noChange = undefined;
@@ -556,8 +596,8 @@ export class TeamService {
         await this.stopObsoletePermissionCoordinators(stored); return;
       }
       if (run.reason === providerInputReason || run.reason === runtimeUnavailableReason) {
-        const states = await Promise.all(run.members.filter(member => member.revision === run.revision && activeMember(member) && member.status !== "queued" && !member.report)
-          .map(member => this.manager.state(member.sessionId)));
+        const observedMembers = run.members.filter(member => member.revision === run.revision && activeMember(member) && member.status !== "queued" && !member.report);
+        const states = await Promise.all(observedMembers.map(member => this.manager.state(member.sessionId)));
         if (this.closed) return;
         const reason = states.some(state => ["unavailable", "recording-error"].includes(state.status)) ? runtimeUnavailableReason
           : states.some(state => state.status !== "exited" && state.attention.state === "needs-you") ? providerInputReason : undefined;
@@ -575,7 +615,7 @@ export class TeamService {
             catch { member.status = "unavailable"; }
             this.event(stored, "The permission coordinator exceeded its review window; the request remains with the user."); this.save(stored); continue;
           }
-          if (member.startedAt && Date.now() - Date.parse(member.startedAt) > 60 * 60 * 1000) { this.block(stored, new TeamError(409, "member-time-limit", "An agent exceeded its one-hour runtime limit. Its workspace was preserved.")); return; }
+          if (member.startedAt && Date.now() - Date.parse(member.startedAt) > 60 * 60 * 1000) { this.block(stored, new TeamError(409, "member-time-limit", memberTimeLimitReason)); return; }
           const page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
           member.cursor = page.cursor;
           for (const event of page.events) {

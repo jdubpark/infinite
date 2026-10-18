@@ -468,7 +468,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
   const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--relationship", "--delivery", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit"]);
-  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes"]);
+  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
   const option = () => {
     const name = args.shift()!;
     if (name === "--include" && args.length) includes.push(args.shift()!);
@@ -494,6 +494,8 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   if (command === "pull" && positional.length > 1) throw new Error("infinite pull takes at most one project ID");
   if (options["--watch"] && command !== "resources") throw new Error("--watch applies to infinite resources");
   if (options["--yes"] && command !== "close") throw new Error("--yes applies to infinite close");
+  if (options["--logs"] && command !== "team") throw new Error("--logs applies to infinite team status or infinite team watch");
+  if (options["--logs"] && options["--json"]) throw new Error("Use either --logs or --json");
   if (command === "resources" && positional.length) throw new Error("infinite resources takes no arguments");
   if (command === "close" && positional.length !== 1) throw new Error("Usage: infinite close SESSION_ID [--yes] [--takeover]");
   return { command, args: providers.has(command) ? args : positional, options, includes };

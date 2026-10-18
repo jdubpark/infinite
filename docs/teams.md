@@ -16,6 +16,17 @@ and request rules as the web client, and records goal outcomes. It opens member
 sessions, and a member session links back to its team. The Mac app shows Teams
 only.
 
+A team opens on the same layout in the web client, the phone app, and
+`infinite team watch`. Open decisions come first. The Jevcode summary follows,
+in the briefing order: the outcome, system shape, ranked **Review first** items
+with their priority and question, what changed, check evidence, guidance for
+agents, and gaps. System shape and guidance start collapsed on the web and
+phone. **Review logs** shows one agent's terminal screen and recent control
+events. Each agent has a control, Previous and Next step through them, and
+**Back to summary** returns. On the web and phone, the plan, members,
+verification, and run history sit under **Run details**. The summary is the
+briefing agent's reading of recorded activity. It is not completion or approval.
+
 A Team marked **ready for your review** has explicit reports for its current revision,
 passing configured checks, and an approving reviewer report. It does not
 establish product impact or human acceptance. The host does not push, open pull
@@ -33,17 +44,47 @@ infinite repo init
 infinite team start "Implement the checkout retry behavior described in the issue"
 infinite team start --prd docs/checkout-prd.md
 infinite team status
+infinite team status TEAM_ID
+infinite team status TEAM_ID --logs
 infinite team watch TEAM_ID
 infinite team steer TEAM_ID "Keep the existing checkout layout"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing retry policy"
 ```
+
+`infinite team status` without an ID lists each team's members, tasks, and open
+questions. `infinite team status TEAM_ID` prints that team's decisions and
+Jevcode summary, wrapped to the terminal width. Each open decision shows the
+`infinite team answer` command that answers it.
+
+`infinite team watch TEAM_ID` keeps that summary full screen and refreshes it
+every two seconds. The bottom line lists the keys for the current view:
+
+| Key | Action |
+| --- | --- |
+| `l` | Open the review log |
+| `s` or `b` | Return to the summary |
+| `←` `→`, or `n` `p` | Next or previous agent |
+| `↑` `↓`, or `j` `k` | Scroll one line |
+| Space, Page Up, Page Down | Scroll one page |
+| `g` `G`, Home, End | Jump to the top or bottom |
+| `a` | Ask Jevcode for a summary when it is empty or failed |
+| `q` or Ctrl+C | Detach |
+
+A refresh keeps your scroll position; switching view or agent starts at the
+top. A failed refresh keeps the last card on screen under a notice. A
+non-interactive watch prints again only when the visible text changes.
+`--logs` starts in the review log. `infinite team status TEAM_ID --logs` prints
+the current revision's review logs once. `--json` still prints the team record.
+Set `NO_COLOR` to drop bold headings and the highlighted key bar.
 
 Repository setup records a private binding between the local Git root and the
 selected host project. A new remote source receives a committed Git snapshot;
 ignored files and uncommitted changes are not included. Existing cloud sources
 are not replaced by enrollment. Setup and verification commands belong to that
 repository, while the coordinator, workers, and reviewer come from the host's
-configured lineup. Provider permissions remain under the owner's control.
+configured lineup. Owners can delegate current one-shot tool requests to the
+strong coordinator under an explicit repository policy; see
+[Delegating permission decisions](#delegating-permission-decisions).
 
 A new empty repository can enroll immediately after `git init`. Its cloud source
 gets an empty baseline commit; local Git history and files stay unchanged. When
@@ -513,12 +554,14 @@ Ubuntu template. Before it, supported options are `-n`, `-H`, `-u USER`, and
 `-g GROUP` (or their separate-argument long forms). Other wrapper forms are
 refused so provider flags cannot become prompt text.
 
-The scheduler never approves a provider permission or sends forced terminal
-input. Interactive providers can show permission or trust dialogs in the member
-session. Headless OpenCode `run` rejects unmet permission requests; this adapter
-does not offer an interactive approval flow. A denied reporting tool or required
-tool can stop the member without an accepted report. Inspect the failure and the
-configured provider policy; retries do not grant permission.
+Team launches preserve configured provider permission modes and trust settings.
+A team assignment does not grant tool permission or accept a workspace trust
+dialog. Product questions reported by a member wait for `infinite team answer`.
+
+Headless OpenCode `run` rejects unmet permission requests; this adapter does
+not offer an interactive approval flow for that provider. A denied reporting
+tool or required tool can stop the member without an accepted report. Inspect
+the failure and the configured provider policy; retries do not grant permission.
 
 ## Delegating permission decisions
 
@@ -563,7 +606,7 @@ run prevents its old pending decisions from being applied.
 Each new run gets a folder named from its UTC creation date, a slug of its
 title, and the first eight characters of its ID, such as
 `2026-01-15-add-export-3f2a9c1d/`, holding the `integration/` checkout and the
-`members/` copies. Its branch is `infinite/<slug>-<id8>`. The run ID remains its
+`members/` copies. Its branch is `infinite/team-<slug>-<id8>`. The run ID remains its
 identity in the API, receipts, and Linear. Runs go under
 `teams.workspaceDir/<project-id>-<YYYY-MM-DD>-<slug>-<id8>/` unless the project has a teamwork folder, in which case it is `<teamworkDir>/<YYYY-MM-DD>-<slug>-<id8>/`.
 
@@ -629,6 +672,14 @@ is an executable/argument array like the other commands. Do not run
 agent-controlled repository scripts or Git filters as the privileged API
 account. A sudo provider profile without a command prefix is refused.
 
+A constrained launcher must allow what the host runs through the prefix:
+Git clones, checkouts and integration inside each run directory under the team
+workspace root and every enrolled teamwork folder, branches named
+`infinite/team-*`, and, for `infinite team pull`, `git rev-parse --verify
+refs/heads/<branch>` and `git bundle create - refs/heads/<branch>` in a run's
+`integration/` checkout. Enrollment also runs `git rev-parse` and `git status`
+in the project source.
+
 The Ubuntu launcher must preserve `INFINITE_HOOK_URL`, `INFINITE_HOOK_TOKEN` and
 `INFINITE_TEAM_ASSIGNMENT`; the supplied sudoers template includes them. These
 are a member's scoped report capability and assignment, not owner API keys.
@@ -647,7 +698,12 @@ For a standalone team, steering records a new requirements revision. Earlier
 member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated
 workspace with the new direction. Completed earlier integration remains visible;
 unfinished member copies are preserved. Pause, resume and cancel are owner
-actions. Stopping an agent does not prove that arbitrary detached tool
+actions. A team blocked only because a member reached the one-hour runtime
+limit can resume with `infinite team resume ID`. That starts a fresh plan from
+the preserved integration commit and keeps the stopped member workspace.
+Resume waits until those members have stopped. Any other block, including an
+interrupted workspace or check operation, still requires inspection and a new
+team. Stopping an agent does not prove that arbitrary detached tool
 descendants have stopped, and a current human input lease can prevent the
 scheduler from stopping a member. Such conflicts remain visible.
 
@@ -657,9 +713,10 @@ Claude Code team members receive a scoped MCP tool, `mcp__infinite_team__report`
 that accepts a typed report as data. Other providers receive a reporting command
 that accepts JSON on standard input. Reports include `plan`, `explore`,
 `findings`, `no-change`, `escalate`, `result`, `review`, `question`, and `blocked`;
-each role has a permitted subset. The host does not automatically allow the MCP
-tool; its permission follows the configured provider profile. This keeps report JSON
-out of Claude's shell-command parsing while preserving its permission checks.
+each role has a permitted subset. The report tool follows the configured provider
+profile, except for the dedicated permission coordinator: its constrained launch
+allows only its assignment's authenticated report tool. This keeps report JSON
+out of Claude's shell-command parsing while preserving worker permission checks.
 The detached worker authenticates the report, validates its run,
 member and revision binding, and writes it to the encrypted journal before
 acknowledging it. A repeated identical report returns the same acceptance;

@@ -61,6 +61,8 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
       blockStart: start, blockEnd: end,
     };
   }
+  const trust = detectWorkspaceTrust(clean);
+  if (trust) return trust;
   const lastIndex = findLastIndex(clean, (l) => l !== "");
   if (lastIndex >= 0 && YES_NO.test(clean[lastIndex])) {
     const title = clean[lastIndex];
@@ -116,6 +118,51 @@ function lastOptionBlock(clean: string[], raw: string[]) {
     i = Math.max(j, i + 1);
   }
   return best;
+}
+
+const compact = (line: string) => line.replace(/[^a-z0-9]/gi, "").toLowerCase();
+
+/** Claude's first-run folder question is an unnumbered two-option menu, not `1. Yes`. */
+function detectWorkspaceTrust(clean: string[]): DetectedPrompt | null {
+  let yes = -1;
+  let no = -1;
+  for (let i = 0; i < clean.length; i++) {
+    const text = compact(clean[i]);
+    if (text === "yesitrustthisfolder") yes = i;
+    if (text === "noexit") no = i;
+  }
+  if (yes < 0 || no < 0) return null;
+  const question = findLastIndex(clean, (line) => compact(line).includes("isthisaprojectyoucreatedoroneyoutrust"));
+  if (question < 0) return null;
+  const start = Math.min(yes, no);
+  const end = Math.max(yes, no);
+  const paths = clean.slice(0, start).filter((line) => line.startsWith("/"));
+  const detail = paths.length ? paths.join("\n").slice(0, 2000) : undefined;
+  const noFirst = no < yes;
+  const options: PromptOption[] = noFirst
+    ? [
+        { index: 0, label: "No, exit", role: "reject" },
+        { index: 1, label: "Yes, I trust this folder", role: "accept" },
+      ]
+    : [
+        { index: 0, label: "Yes, I trust this folder", role: "accept" },
+        { index: 1, label: "No, exit", role: "reject" },
+      ];
+  const marked = clean[yes].includes("❯") || clean[yes].trimStart().startsWith(">") ? options.find((option) => option.role === "accept")!.index
+    : options.find((option) => option.role === "reject")!.index;
+  const title = clean[question];
+  return {
+    kind: "permission",
+    title,
+    detail,
+    options,
+    highlighted: marked,
+    acceptsText: false,
+    multiSelect: false,
+    fingerprint: [title, ...normalisedLines(detail), ...options.map((option) => option.label)].join("\n"),
+    blockStart: start,
+    blockEnd: end,
+  };
 }
 
 function findLastIndex<T>(items: T[], predicate: (item: T) => boolean): number {

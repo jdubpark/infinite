@@ -98,7 +98,7 @@ file-safety rules, and verified limitations](docs/desktop.md).
 
 ## Phone
 
-The React Native app is in `apps/mobile`. It supports Android and has an iPhone build configuration. Pair it with an HTTPS Tailscale Serve address and a **controller** or **viewer** key. Enable `remote.enabled` on the host; direct and relay connections require the application-encrypted endpoint. Keys go into Android Keystore/iOS Keychain through Expo SecureStore. Logs are kept in memory while the app is open and remain on the host for replay.
+The React Native app is in `apps/mobile`. It supports Android and has an iPhone build configuration. Pair it with an HTTPS Tailscale Serve address and a **controller** or **viewer** key, or, without a VPN on the phone, with a relay behind Cloudflare Access ([phone access guide](deploy/ubuntu/public-relay.md)). Enable `remote.enabled` on the host; direct and relay connections require the application-encrypted endpoint. Keys go into Android Keystore/iOS Keychain through Expo SecureStore. Logs are kept in memory while the app is open and remain on the host for replay.
 
 ```sh
 npm run android -w @infinite/mobile
@@ -168,7 +168,7 @@ Project context is deliberately shared at session creation. Later changes must b
 
 The system does not upload the laptop's home directory, synchronize arbitrary credentials, replicate local apps, provision MCP dependencies, or automatically pull cloud file changes into a dirty checkout. The cloud workspace is authoritative; use Git or SSH-based file access for source changes. Those boundaries matter for both fidelity and privacy.
 
-Unattended work is limited by each provider's permissions, quotas, authentication expiry, and the task supplied. Infinite does not loop “continue” forever or silently approve tools. A machine that can execute a tool is not necessarily permitted to execute it unattended.
+Unattended work is limited by each provider's permissions, quotas, authentication expiry, and the task supplied. Infinite does not loop “continue” forever. Ordinary sessions do not silently approve tools. A team member trusts its assigned workspace and accepts ordinary tool prompts there; dangerous prompts go to the coordinator. A machine that can execute a tool is not necessarily permitted to execute it unattended.
 
 **An attacker controlling the active worker or guest root can read active files and memory.** Journal encryption does not change that. Workspace files, native CLI histories, swap, credentials, and backups need the separate storage/isolation controls described in [security](docs/security.md).
 

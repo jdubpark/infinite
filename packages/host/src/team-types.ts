@@ -9,11 +9,26 @@ export const teamCommandSchema = z.object({
   args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]),
 }).strict();
 export type TeamCommand = z.infer<typeof teamCommandSchema>;
+const githubRepository = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/);
+const gitBranch = z.string().min(1).max(255).refine(value =>
+  value !== "@" && !value.startsWith("-") && !value.startsWith("/") && !value.endsWith("/") && !value.endsWith(".") && !value.includes("..") && !value.includes("@{") &&
+  !value.includes("//") && !value.includes("\\") && !/[~^:?*\s\x00-\x1f\x7f]/.test(value) &&
+  !value.includes("[") && !value.includes("]") &&
+  value.split("/").every(part => part.length > 0 && !part.startsWith(".") && !part.endsWith(".lock")),
+"Use a safe Git branch name");
+export const teamDeliverySchema = z.object({
+  mode: z.literal("merge"),
+  repository: githubRepository,
+  baseBranch: gitBranch,
+  mergeMethod: z.enum(["squash", "merge", "rebase"]).default("squash"),
+}).strict();
+export type TeamDelivery = z.infer<typeof teamDeliverySchema>;
 export const teamProjectSchema = z.object({
   handoff: z.enum(["auto", "off"]).optional(),
   setup: teamCommandSchema.optional(),
   checks: z.array(teamCommandSchema).max(8),
   establishChecks: z.literal(true).optional(),
+  delivery: teamDeliverySchema.optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -149,15 +164,18 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), reason: z.string().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("result"), summary: z.string().min(1).max(8000) }).strict(),
   z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional() }).strict(),
+  z.object({ kind: z.literal("delivery"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("delivery-repair"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]) }).strict(),
   z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000) }).strict(),
 ]);
 export type TeamReport = z.infer<typeof teamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: teamReportSchema }).strict();
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
-export type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer";
+export type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
 export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string };
-export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
+/** `merged` is set only from an explicit delivery report; it is not host verification. */
+export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export interface TeamMember extends TeamAssignment {
   /** Absent on legacy runs; their members use the run's original provider. */
   provider?: Provider;
@@ -215,6 +233,10 @@ export interface TeamRun {
   /** Owner opt-in is pinned at creation; accepted commands cannot change within this run. */
   establishChecks?: true;
   verification?: TeamVerification;
+  /** Owner-authorized repository delivery policy pinned when this run starts. */
+  delivery?: TeamDelivery;
+  /** Agent-reported delivery evidence; this is not independently verified by the host. */
+  deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
   linearTracking?: boolean;
   usage?: TeamUsage;
   linear?: LinearTrackingView;

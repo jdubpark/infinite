@@ -34,7 +34,7 @@ type Stored = {
 type Freshness = { requested: number; verified: number; queued: Set<string>; readRequested: boolean };
 const keyOf = (kind: Stored["kind"], id: string) => `${kind}:${id}`;
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-const terminalStatuses = new Set(["ready-for-review", "no-change", "no-opportunity", "blocked", "cancelled", "limit-reached", "achieved"]);
+const terminalStatuses = new Set(["ready-for-review", "merged", "no-change", "no-opportunity", "blocked", "cancelled", "limit-reached", "achieved"]);
 const evidenceStatuses = new Set([...terminalStatuses, "needs-input", "paused"]);
 const normalized = (value: string | null) => (value ?? "").replace(/\r\n/g, "\n").trim();
 const scopeHash = (issue: Issue, linearProjectId?: string) => hash({ title: issue.title, description: normalized(issue.description), teamId: issue.team.id,
@@ -153,6 +153,10 @@ export class LinearService {
     }
     if (run.brief) this.comment(stored, `brief:${run.revision}`, [`Proposed feature: ${run.brief.title}`, run.brief.problem,
       `Acceptance criteria:\n${run.brief.acceptance.join("\n")}`, `Expected outcome:\n${run.brief.expectedOutcome}`].join("\n\n"));
+    if (run.deliveryReceipt) {
+      const receipt = run.deliveryReceipt;
+      this.comment(stored, `delivery:${receipt.revision}:${receipt.headCommit}`, `Delivery agent reported a merged pull request: ${receipt.pullRequestUrl}\n\nReviewed head: ${receipt.headCommit}\nReported merge commit: ${receipt.mergeCommit}\n\n${receipt.summary}\n\nThis is agent-reported delivery evidence, not independent host verification or a product outcome.`);
+    }
     if (evidenceStatuses.has(run.status)) {
       const checks = run.checks.filter(check => check.revision === run.revision);
       this.comment(stored, `status:${run.revision}:${run.status}`, `Infinite feature execution\n\nStatus: ${run.status}\nAgent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`);

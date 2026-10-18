@@ -11,7 +11,7 @@ import { teamPrompt } from "./team-prompts.js";
 import { teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
 import type { LinearService } from "./linear.js";
-import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureMemberResult, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, validateTeamPlan } from "./team-workspace.js";
+import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureMemberResult, captureDeliveryBaseline, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, validateTeamPlan } from "./team-workspace.js";
 export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
@@ -21,8 +21,9 @@ type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean;
   pending?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number };
   halt?: "pause" | "cancel" | "steer" | "block";
+  deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
   checkHead?: string;
-  source?: { path: string; head?: string };
+  source?: { path: string; head?: string; startCommit?: string };
   handoffPolicy?: HandoffPolicy;
 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -95,7 +96,7 @@ export class TeamService {
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   get(id: string): TeamView { return this.view(this.record(id)); }
   activeForProject(projectId: string) {
-    return [...this.records.values()].some(({ run }) => run.projectId === projectId && !["cancelled", "ready-for-review", "no-change"].includes(run.status));
+    return [...this.records.values()].some(({ run }) => run.projectId === projectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status));
   }
   create(request: CreateTeam): Promise<TeamView> {
     const parsed = createTeamSchema.parse(request);
@@ -152,13 +153,18 @@ export class TeamService {
         catch { throw new TeamError(409, "team-model-profile-conflict", "Move model, effort, and fallback-model arguments from provider profiles into the team lineup before starting this team."); }
       }
       const parent = goal?.parentRunId ? this.record(goal.parentRunId).run : undefined;
-      if (parent && (parent.goal?.id !== goal!.id || parent.projectId !== parsed.projectId || parent.status !== "ready-for-review" || !parent.headCommit))
+      if (parent && (parent.goal?.id !== goal!.id || parent.projectId !== parsed.projectId || !["ready-for-review", "merged"].includes(parent.status) || !parent.headCommit))
         throw new TeamError(409, "invalid-goal-parent", "Continue only from a ready, recorded run of this goal and project.");
       if (parent) assertTeamPath(this.config.teams.workspaceDir, parent.workspace);
-      const source = { path: parent?.workspace ?? project.path, ...(parent ? { head: parent.headCommit! } : internal?.handoff ? { head: internal.handoff.checkpointHead } : {}) };
+      const source = { path: parent?.workspace ?? project.path, ...(parent ? { head: parent.headCommit!, ...(parent.status === "merged" ? { startCommit: parent.deliveryReceipt!.mergeCommit } : {}) } : internal?.handoff ? { head: internal.handoff.checkpointHead } : {}) };
       const parentRevision = parent?.revision;
       const at = timestamp();
       const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(this.config.teams.workspaceDir, parsed.requestId), branch: `infinite/team-${parsed.requestId}`, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      if (project.team.delivery) {
+        if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
+          throw new TeamError(409, "delivery-lineup-required", "Automatic merge requires a configured strong coordinator and independent strong reviewer.");
+        run.delivery = structuredClone(project.team.delivery);
+      }
       if (parent?.establishChecks || project.team.establishChecks) {
         run.establishChecks = true;
         if (parent?.verification) run.verification = structuredClone(parent.verification);
@@ -168,11 +174,11 @@ export class TeamService {
       this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
       this.operation(stored, "prepare", async signal => this.startInProject(run.projectId, async () => {
         const assertParent = () => {
-          if (parent && (parent.status !== "ready-for-review" || parent.revision !== parentRevision || parent.headCommit !== source.head))
+          if (parent && (!["ready-for-review", "merged"].includes(parent.status) || parent.revision !== parentRevision || parent.headCommit !== source.head))
             throw new TeamError(409, "parent-workspace-changed", "The previous goal run changed while its continuation was being prepared.");
         };
         assertParent();
-        const workspace = await prepareTeamWorkspace(source.path, this.config.teams!.workspaceDir, run.id, this.config.teams?.commandPrefix, signal, source.head);
+        const workspace = await prepareTeamWorkspace(source.path, this.config.teams!.workspaceDir, run.id, this.config.teams?.commandPrefix, signal, source.head, source.startCommit);
         assertParent();
         if (project.team?.setup) {
           const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
@@ -209,6 +215,7 @@ export class TeamService {
     return this.enqueue(() => {
       const stored = this.record(id);
       if (this.replay(stored, "steer", body)) return this.view(stored);
+      if (stored.deliveryAttempt || stored.run.deliveryReceipt) throw new TeamError(409, "delivery-reconciliation-required", "Inspect the recorded pull request before starting another run; steering cannot replay a started delivery.");
       if (stored.pending && !this.commands.has(id)) throw new TeamError(409, "team-reconciliation-required", "This team has an unresolved workspace or verification operation. Inspect its evidence and start a new team rather than replaying uncertain work.");
       if (stored.pending && stored.pending.kind !== "check") throw new TeamError(409, "team-operation-running", "A workspace operation is in progress. Retry steering after it settles.");
       if (Buffer.byteLength(stored.run.steering.map(item => item.text).join("")) + Buffer.byteLength(body.text) > 32 * 1024) throw new TeamError(409, "team-steering-limit", "This team reached its 32 KiB steering limit. Start a new team with consolidated requirements.");
@@ -248,8 +255,8 @@ export class TeamService {
     return this.enqueue(() => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, action, body)) return this.view(stored);
-      if (action === "pause" && ["blocked", "ready-for-review", "no-change"].includes(run.status)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
-      if (action === "resume" && (stored.pending || !stored.prepared || run.status === "blocked"))
+      if (action === "pause" && ["blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
+      if (action === "resume" && (stored.pending || stored.deliveryAttempt || run.deliveryReceipt || !stored.prepared || run.status === "blocked"))
         throw new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
       if (action === "resume" && stored.halt) throw new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
       if (!this.mutation(stored, action, body)) return this.view(stored);
@@ -362,6 +369,9 @@ export class TeamService {
       this.save(stored); return;
     }
     const limited = this.limits.limited(); limited.add(provider);
+    if (member.role === "delivery" && stored.deliveryAttempt) {
+      this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;
+    }
     const fallback = run.lineup && member.modelProfile ? resolveLimitFallback(run.lineup, member.modelProfile.id, limited) : undefined;
     const reason = `${provider} ${limit.limit} limit reached${limit.resetsAt ? `; resets ${limit.resetsAt}` : ""}`;
     member.stoppedReason = reason;
@@ -393,11 +403,11 @@ export class TeamService {
     try {
       const tracking = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
       if (JSON.stringify(run.linear) !== JSON.stringify(tracking)) { run.linear = tracking; this.save(stored); }
-      if (tracking?.status === "blocked" && !stored.halt && !["cancelled", "blocked", "ready-for-review", "no-change"].includes(run.status)) {
+      if (tracking?.status === "blocked" && !stored.halt && !["cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) {
         this.block(stored, new TeamError(409, "linear-issue-changed", tracking.reason ?? "The Linear issue no longer permits this work. Review its requirements before starting another team."));
       }
       const trackingReady = !tracking || tracking.status === "synced";
-      if (!stored.halt && !["paused", "cancelled", "blocked", "ready-for-review", "no-change"].includes(run.status)) this.assertBudget(run);
+      if (!stored.halt && !["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) this.assertBudget(run);
       if (stored.halt) {
         let all = true;
         for (const member of run.members.filter(activeMember)) {
@@ -410,7 +420,7 @@ export class TeamService {
         if (all && (!stored.pending || run.status === "blocked" || run.status === "cancelled")) { stored.halt = undefined; if (!["blocked", "cancelled"].includes(run.status)) run.reason = undefined; }
         this.save(stored); return;
       }
-      if (!stored.prepared || ["paused", "cancelled", "blocked", "ready-for-review", "no-change"].includes(run.status)) return;
+      if (!stored.prepared || ["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) return;
       if (run.reason === providerInputReason || run.reason === runtimeUnavailableReason) {
         const states = await Promise.all(run.members.filter(member => member.revision === run.revision && activeMember(member) && member.status !== "queued" && !member.report)
           .map(member => this.manager.state(member.sessionId)));
@@ -480,6 +490,8 @@ export class TeamService {
         if (prior.status !== "waiting") continue;
         const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, `${this.memberFeedback(run, prior)}\n\nUser answered: ${decision.answer}`, prior.modelProfile);
         prior.status = "stopped"; run.members.push(next);
+        if (prior.role === "delivery" && stored.deliveryAttempt?.memberId === prior.memberId)
+          stored.deliveryAttempt.memberId = next.memberId;
         const task = prior.role === "scout" ? run.discovery?.tasks.find(item => item.id === prior.taskId) : run.tasks.find(item => item.id === prior.taskId);
         if (task) { task.memberId = next.memberId; task.status = "running"; }
         this.save(stored);
@@ -519,8 +531,14 @@ export class TeamService {
       if (run.review.verdict === "approved") {
         await assertMemberReadOnly(run.workspace, run.headCommit!, this.config.teams?.commandPrefix);
         this.assertBudget(run);
-        run.status = "ready-for-review"; run.reason = undefined;
-        this.event(stored, "The reviewer approved the integrated change and configured checks passed. Ready for human review; nothing was published."); this.save(stored);
+        if (run.delivery) {
+          this.assertDelivery(stored);
+          if (stored.deliveryAttempt) throw new TeamError(409, "delivery-reconciliation-required", "Delivery started without a confirmed report. Inspect the recorded branch and pull request before retrying.");
+          this.prepareMember(stored, "delivery");
+        } else {
+          run.status = "ready-for-review"; run.reason = undefined;
+          this.event(stored, "The reviewer approved the integrated change and configured checks passed. Ready for human review; nothing was published."); this.save(stored);
+        }
       }
     } catch (error) { this.block(stored, error); }
   }
@@ -533,9 +551,16 @@ export class TeamService {
       }
     }
   }
+  private assertDelivery(stored: Stored) {
+    const run = stored.run, configured = this.config.projects.find(project => project.id === run.projectId)?.team?.delivery;
+    if (!run.delivery || !configured || digest(configured) !== digest(run.delivery))
+      throw new TeamError(409, "delivery-policy-changed", "The repository delivery policy changed or was removed; publication is blocked.");
+    if (!run.headCommit || stored.checkHead !== run.headCommit || run.review?.revision !== run.revision || run.review.verdict !== "approved")
+      throw new TeamError(409, "delivery-not-reviewed", "Delivery requires passing checks and independent approval for the current integration commit.");
+  }
   private memberProfile(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout): TeamModelProfile | undefined {
     if (!run.lineup) return undefined;
-    if (role === "project-manager") return run.lineup.coordinator;
+    if (role === "project-manager" || role === "delivery") return run.lineup.coordinator;
     if (role === "integrator") return run.lineup.integrator;
     if (role === "reviewer") return run.lineup.reviewer;
     if (!task) throw new TeamError(409, "invalid-agent-profile", "An implementer requires an assigned task and allowed model profile.");
@@ -572,7 +597,7 @@ export class TeamService {
   }
   private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string) {
     const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id, feedback);
-    run.status = role === "project-manager" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" ? "reviewing" : role === "integrator" ? "integrating" : "implementing";
+    run.status = role === "project-manager" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
     this.operation(stored, "member", async signal => {
       const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal);
       // Bootstrap dependencies exist only after the first implementation. A failed
@@ -604,6 +629,15 @@ export class TeamService {
       if (tracking && tracking.status !== "synced") return;
     }
     if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; }
+    if (member.role === "delivery") {
+      this.assertDelivery(stored);
+      const attempt = stored.deliveryAttempt;
+      if (attempt && (attempt.memberId !== member.memberId || attempt.revision !== member.revision || attempt.headCommit !== member.baseCommit))
+        throw new TeamError(409, "delivery-reconciliation-required", "A different delivery attempt is unresolved; inspect the remote pull request before continuing.");
+      await assertMemberReadOnly(stored.run.workspace, member.baseCommit, this.config.teams?.commandPrefix);
+      stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: member.baseCommit };
+      this.save(stored);
+    }
     // All launch fields were persisted with the queued member before this call.
     let result;
     try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession({ requestId: member.sessionId, provider: member.provider ?? stored.run.provider, projectId: stored.run.projectId, title: member.title, prompt: member.prompt }, assignment(member), member.cwd, member.modelProfile)); }
@@ -620,7 +654,7 @@ export class TeamService {
       const task = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId) : run.tasks.find(item => item.id === member.taskId); if (task) task.status = "waiting";
       run.status = "needs-input"; this.event(stored, `${member.title} requested a user decision.`); this.save(stored); return;
     }
-    const expected = member.role === "project-manager" ? ["plan", "explore", "no-change"] : member.role === "scout" ? ["findings"] : member.role === "reviewer" ? ["review"] : member.role === "implementer" ? ["result", "escalate"] : ["result"];
+    const expected = member.role === "project-manager" ? ["plan", "explore", "no-change"] : member.role === "scout" ? ["findings"] : member.role === "reviewer" ? ["review"] : member.role === "delivery" ? ["delivery", "delivery-repair"] : member.role === "implementer" ? ["result", "escalate"] : ["result"];
     if (!expected.includes(report.kind)) { this.block(stored, new TeamError(409, "wrong-agent-report", "An agent's report does not match its assigned role.")); return; }
     if (report.kind === "no-change") {
       if ((!run.goal && !run.handoff) || run.tasks.length) throw new TeamError(409, "invalid-no-change", "Only a goal coordinator can conclude that discovery found no justified change.");
@@ -690,6 +724,38 @@ export class TeamService {
         }
         run.status = "implementing";
         this.event(stored, `Project manager planned ${run.tasks.length} tasks.`);
+      }); return;
+    }
+    if (report.kind === "delivery" || report.kind === "delivery-repair") {
+      this.assertDelivery(stored);
+      if (report.headCommit !== run.headCommit || member.baseCommit !== run.headCommit || stored.deliveryAttempt?.memberId !== member.memberId)
+        throw new TeamError(409, "stale-delivery", "Delivery evidence must name the checked and independently reviewed commit for this attempt.");
+      if (report.kind === "delivery") {
+        let url: URL;
+        try { url = new URL(report.pullRequestUrl); } catch { throw new TeamError(409, "delivery-target-mismatch", "The delivery report must name a valid pull request URL."); }
+        const prefix = `/${run.delivery!.repository}/pull/`.toLowerCase();
+        if (url.origin !== "https://github.com" || url.username || url.password || url.search || url.hash || !url.pathname.toLowerCase().startsWith(prefix) || !/^[1-9][0-9]*$/.test(url.pathname.slice(prefix.length)))
+          throw new TeamError(409, "delivery-target-mismatch", "The pull request must belong to the configured repository.");
+      }
+      this.operation(stored, "result", async signal => {
+        await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+        await assertMemberReadOnly(run.workspace, member.baseCommit, this.config.teams?.commandPrefix, signal);
+        if (report.kind === "delivery") {
+          await this.enqueue(() => {
+            if (this.closed) return;
+            run.deliveryReceipt = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, mergeCommit: report.mergeCommit, summary: report.summary, reportedAt: timestamp() };
+            this.save(stored);
+          });
+          await captureDeliveryBaseline(run.workspace, member.cwd, member.baseCommit, report.mergeCommit, this.config.teams?.commandPrefix, signal);
+        }
+      }, () => {
+        stored.deliveryAttempt = undefined;
+        if (report.kind === "delivery-repair") {
+          this.repair(stored, `Delivery requires a scoped repair before checks and independent review run again. No merge was reported.\n${report.summary}`);
+        } else {
+          run.status = "merged"; run.reason = undefined;
+          this.event(stored, "The delivery agent reported a merged pull request for the reviewed commit. This is agent-reported delivery evidence, not proof of product impact.");
+        }
       }); return;
     }
     if (report.kind === "review") {

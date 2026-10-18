@@ -2,7 +2,7 @@
 const terminal = new Terminal({
   fontFamily: 'Menlo, ui-monospace, monospace', fontSize: 13, lineHeight: 1.15,
   cursorBlink: true, scrollback: 10000, allowProposedApi: false, disableStdin: true,
-  theme: { background: '#202923', foreground: '#e4e9de', cursor: '#e4e9de', selectionBackground: '#486751' }
+  theme: { background: '#0D1017', foreground: '#BFBDB6', cursor: '#E6B450', selectionBackground: '#273747' }
 });
 const fit = new FitAddon.FitAddon();
 terminal.loadAddon(fit); terminal.open(document.getElementById('terminal'));

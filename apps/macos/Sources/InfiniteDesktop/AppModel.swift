@@ -75,7 +75,9 @@ extension ISO8601DateFormatter {
     /// Team runs the host reports, ordered with the ones waiting on a person first.
     @Published var teams: [TeamRun] = []
     /// A selected team shows its dashboard in place of the session panes, which stay mounted.
-    @Published var selectedTeamID: String?
+    @Published var selectedTeamID: String? { didSet { if selectedTeamID != nil { showingHome = false } } }
+    /// Home, the project board, covers the session panes the same way; it is the first page after connecting.
+    @Published var showingHome = true
     @Published var showingCreateTeam = false
     @Published var pendingTeamCreation = DraftRecord()
     @Published private(set) var teamsFresh = false
@@ -99,6 +101,12 @@ extension ISO8601DateFormatter {
     var teamLineup: JSON { me["teams"]["lineup"] }
     var teamParallelismLimit: Int { let value = me["teams"]["maxParallelism"].int; return max(1, min(4, value == 0 ? 4 : value)) }
     func projectName(_ id: String) -> String { projects.first { $0["id"].string == id }?["name"].string ?? id }
+    /// Providers offered for a single-provider team, Claude Code first.
+    var teamProviders: [String] { let all = me["providers"].array.map(\.string); return all.contains("claude") ? ["claude"] + all.filter { $0 != "claude" } : all }
+    /// A team may only start in a workspace whose required checks the host configured.
+    func teamWorkspaceReady(_ id: String) -> Bool { !(projects.first { $0["id"].string == id }?["team"]["checks"].array.isEmpty ?? true) }
+    /// The workspace a new team starts in by default: the first one with checks configured.
+    var defaultTeamWorkspace: String { (projects.first { !$0["team"]["checks"].array.isEmpty } ?? projects.first)?["id"].string ?? "" }
     init() {
         if let data = UserDefaults.standard.data(forKey: "hostProfiles"), let value = try? JSONDecoder().decode([HostProfile].self, from: data) { profiles = value }
         activeID = UserDefaults.standard.string(forKey: "activeHost") ?? profiles.first?.id ?? ""
@@ -139,7 +147,7 @@ extension ISO8601DateFormatter {
         let previousTerminals = Array(terminals.values); terminals.removeAll()
         let previousClient = client; client = nil
         connected = false; connecting = true; sessions = []; resources = .null; me = .null
-        teams = []; selectedTeamID = nil; teamModels.removeAll(); teamsFresh = false
+        teams = []; selectedTeamID = nil; showingHome = true; teamModels.removeAll(); teamsFresh = false
         for terminal in previousTerminals { await terminal.detach() }
         await previousClient?.close()
         guard generation == connectionGeneration else { return }
@@ -223,7 +231,7 @@ extension ISO8601DateFormatter {
         teamModels[id] = model; return model
     }
     /// Leaving a team for one of its member sessions.
-    func openSession(_ id: String) { selectedTeamID = nil; selectedID = id }
+    func openSession(_ id: String) { selectedTeamID = nil; showingHome = false; selectedID = id }
     func createTeam(projectID: String, provider: String, useLineup: Bool, title: String, objective: String, parallelism: Int) async throws {
         guard let client else { throw DesktopError("Connect to a server first.") }
         let profileID = activeID

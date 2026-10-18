@@ -14,15 +14,31 @@ record below.
 
 ## Layout
 
-The main window is the session list and one session. The sidebar groups sessions
-into **Needs you**, **Running**, and **Not running**; a session whose attention
-state is exited, unreachable, or recording-error counts as not running whatever
-its stored status says. Each running row shows the host's one-line account of
-what the agent is doing. A session shows its title, provider, state, and working
-directory above its content, with the prompt editor below. The toolbar holds
-**New session** and a menu for everything else; a server picker appears only when
-more than one server is paired. Resources, Files & Sync, and cmux Workspaces open
-in their own windows from the Server menu, and Connections is the Settings window.
+The main window is a sidebar beside one page. The sidebar starts with **Home**
+and search, then **Projects** (team runs that are still open) and **Sessions**
+(the person's own running sessions), with ended sessions in a folded **Ended**
+group. Team agents and closed projects leave the sidebar; Home and search still
+reach them. A session whose attention state is exited, unreachable, or
+recording-error counts as ended whatever its stored status says. Rows carry a
+Linear-style status glyph and the title; the state in words is beside it when the
+row needs a person and in its tooltip otherwise. The footer names the connected
+server with its state in words, switches or adds servers, and opens Connections.
+A session shows its title, provider, state, and working directory above its
+content, with the prompt editor below. The toolbar holds a **New** menu (team
+project, team with options, session) and a menu for Resources, Files & Sync, and
+cmux Workspaces, which open in their own windows; ⌘1 returns to Home.
+
+The app follows Apple's Liquid Glass guidance: content (rows, records,
+terminals) stays flat, and controls that act on the whole page float as glass:
+the start box, composers, status chips, and the server footer. On
+macOS 26 and later these use the system glass; earlier systems get a thin
+material with a light rim. The app is always dark, after the ayu dark theme:
+near-black grounds (`#0D1017` pages, `#0B0E14` sidebar), warm text, and an amber
+accent (`#E6B450`). State colors follow ayu (amber for work in progress, cyan for
+review, green for a reported merge, orange for attention, violet for paused, red
+for stuck), and each stays beside its state in words. The embedded terminal uses
+the same ground. This replaces the web client's warm-paper palette on the Mac
+only; see `DESIGN.md` for the web and phone.
 
 **Chat** is the default view: the conversation as the provider recorded it, with
 prompts, replies, and one line per tool call, polled from the host's chat record
@@ -43,10 +59,27 @@ is not the agent's words; the digest attributes any claimed result to the agent
 and never marks work complete. Read positions are kept per server and session
 in this app's preferences, not sent anywhere.
 
-**Teams** appear at the top of the sidebar when the host has agent teams
-enabled (see [teams](teams.md)). A team row shows the run's state and either the
-number of decisions waiting on a person or how many planned tasks the host has
-integrated; runs that need input sort first. Selecting a run opens its dashboard
+**Home** is the first page after connecting. When the host has agent teams
+enabled (see [teams](teams.md)), it opens on one text box that starts a team:
+Return starts it in the workspace chosen beside the box, with the host's
+configured lineup (or its first provider) and two implementers. The slider
+opens the full form for a name, agents, and parallelism. Below the box, every
+run is one line (status glyph, name, state in words, age) in groups by what it
+needs next:
+
+| Group | Host states |
+| --- | --- |
+| Ongoing | planning, discovering, implementing, integrating, verifying, reviewing, delivering |
+| Pending | needs-input, ready-for-review, or any run with an open decision |
+| Stuck | blocked |
+| Paused | paused |
+| Complete | merged (an agent-reported delivery, labelled "Merge reported") |
+| Cancelled | cancelled |
+| Aborted | no-change (the coordinator stopped without proposing a change) |
+
+A run waiting for review is pending, never complete. Complete, Cancelled, and
+Aborted start folded. A row's tooltip adds the workspace, integrated tasks out
+of the plan, the stop reason, and the Linear issue. Selecting a run opens its dashboard
 in place of the session panes, which stay mounted underneath: the request, the
 decisions members asked with their options and a free-text answer, member
 sessions stopped on a provider permission prompt with a button to open them,
@@ -58,12 +91,12 @@ history. The composer at the bottom sends a direction, which records a new
 revision and makes the team replan; owners pause, resume or cancel from the
 run's menu. Every mutation carries the revision it was based on; a request the
 host refuses as stale refreshes the run, and one whose delivery is unconfirmed
-stays visible for a retry with the same request identity. Member sessions in
-the session list carry a team glyph, and the dashboard polls its run every two
-seconds while it is shown. **New team** in the toolbar and ⇧⌘N describe an
-outcome, choose a workspace with configured checks, and pick either the host's
-configured lineup or a single provider; a creation whose delivery is unconfirmed
-is kept for retry under the same request identity, like a session creation.
+stays visible for a retry with the same request identity. Member sessions found
+by search carry a team glyph, and the dashboard polls its run every two seconds
+while it is shown. The full form (**New team with options** and ⇧⌘N) also takes
+a name and a longer brief. A creation whose delivery is unconfirmed is kept for
+retry under the same request identity, like a session creation; Home shows it
+under the start box until it is confirmed or cleared after review.
 
 Recent sessions stay attached and rendered off-screen, so switching back is
 immediate and keeps scrollback. Up to three terminals stay mounted; opening a

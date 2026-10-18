@@ -39,6 +39,7 @@ struct WorkspaceCommands: Commands {
             Button("New Team…") { app.showingCreateTeam = true }.keyboardShortcut("n", modifiers: [.command, .shift]).disabled(!app.connected || !app.isOwner || !app.teamsEnabled)
         }
         CommandMenu("Server") {
+            Button("Home") { app.selectedTeamID = nil; app.showingHome = true }.keyboardShortcut("1").disabled(app.active == nil)
             Button("Refresh") { Task { if app.connected { await app.refresh() } else { await app.connect() } } }.keyboardShortcut("r")
             Divider()
             Button("Resources") { openWindow(id: "resources") }.keyboardShortcut("2")
@@ -54,6 +55,7 @@ struct WorkspaceCommands: Commands {
     weak var model: AppModel?
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        NSApp.appearance = NSAppearance(named: .darkAqua)
         NSApp.activate(ignoringOtherApps: true)
         showMainWindow()
     }
@@ -89,57 +91,60 @@ struct WorkspaceCommands: Commands {
 
 struct DesktopView: View {
     @ObservedObject var app: AppModel
-    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.openWindow) private var openWindow
     @State private var search = ""
     @State private var endID: String?
+    @State private var showEnded = false
+    private var searching: Bool { !search.isEmpty }
     private var filtered: [AgentSession] {
         app.sessions.filter { search.isEmpty || [$0.title, $0.path, providerName($0.provider)].joined(separator: " ").localizedCaseInsensitiveContains(search) }
     }
     private var filteredTeams: [TeamRun] {
         app.teams.filter { search.isEmpty || [$0.title, $0.objective].joined(separator: " ").localizedCaseInsensitiveContains(search) }
     }
-    /// One list selects either a team or a session; a team row carries a prefix so the two never collide.
+    /// One list selects Home, a team, or a session; a team row carries a prefix so the three never collide.
     private var selection: Binding<String?> {
-        Binding(get: { app.selectedTeamID.map { "team:" + $0 } ?? app.selectedID }, set: { value in
-            if let value, value.hasPrefix("team:") {
-                if app.selectedTeamID == nil, let current = app.selectedID { app.terminals[current]?.markRead() }
-                app.selectedTeamID = String(value.dropFirst(5))
-            } else { app.selectedTeamID = nil; app.selectedID = value }
+        Binding(get: { app.showingHome ? "home" : app.selectedTeamID.map { "team:" + $0 } ?? app.selectedID }, set: { value in
+            guard let value else { return }
+            let leavingSession = !app.showingHome && app.selectedTeamID == nil
+            if value == "home" || value.hasPrefix("team:"), leavingSession, let current = app.selectedID { app.terminals[current]?.markRead() }
+            if value == "home" { app.selectedTeamID = nil; app.showingHome = true }
+            else if value.hasPrefix("team:") { app.selectedTeamID = String(value.dropFirst(5)) }
+            else { app.selectedTeamID = nil; app.showingHome = false; app.selectedID = value }
         })
     }
-    private var teamModel: TeamModel? { app.selectedTeamID.flatMap(app.teamModel(for:)) }
+    private var teamModel: TeamModel? { app.showingHome ? nil : app.selectedTeamID.flatMap(app.teamModel(for:)) }
+    private var pageTitle: String {
+        if app.showingHome { return "Home" }
+        if let team = app.teams.first(where: { $0.id == app.selectedTeamID }) { return team.title }
+        return app.sessions.first { $0.id == app.selectedID }?.title ?? "Infinite"
+    }
     var body: some View {
         NavigationSplitView {
             sidebar.navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 380)
         } detail: {
             detail
         }
-        .navigationTitle(app.active?.label ?? "Infinite")
-        .tint(colorScheme == .dark ? Color(red: 0.46, green: 0.73, blue: 0.59) : Color(red: 0.14, green: 0.40, blue: 0.31))
+        .navigationTitle(pageTitle)
+        .quietWindow()
+        .tint(Palette.accent)
         .toolbar {
-            if app.profiles.count > 1 {
-                ToolbarItem(placement: .navigation) {
-                    Picker("Server", selection: $app.activeID) { ForEach(app.profiles) { Text($0.label).tag($0.id) } }
-                        .labelsHidden().onChange(of: app.activeID) { _, _ in Task { await app.connect() } }
-                }
-            }
             ToolbarItemGroup(placement: .primaryAction) {
                 if app.connecting { ProgressView().controlSize(.small) }
-                if app.teamsEnabled {
-                    Button { app.showingCreateTeam = true } label: { Label("New team", systemImage: "person.3") }
-                        .labelStyle(.titleAndIcon).disabled(!app.connected || !app.isOwner)
-                }
-                Button { app.showingCreate = true } label: { Label("New session", systemImage: "plus") }
-                    .labelStyle(.titleAndIcon).disabled(!app.connected || !app.isOwner)
+                Menu {
+                    if app.teamsEnabled {
+                        Button("New team project") { app.selectedTeamID = nil; app.showingHome = true }
+                        Button("New team with options…") { app.showingCreateTeam = true }
+                        Divider()
+                    }
+                    Button("New session…") { app.showingCreate = true }
+                } label: { Label("New", systemImage: "plus") }
+                    .disabled(!app.connected || !app.isOwner).help("Start a team project or a session")
                 Menu {
                     Button("Resources") { openWindow(id: "resources") }
                     Button("Files & Sync") { openWindow(id: "files") }
                     Button("cmux Workspaces") { openWindow(id: "cmux") }
-                    Divider()
-                    Button("Connect a Server…") { app.showingPair = true }
-                    SettingsLink { Text("Connections…") }
-                } label: { Label("More", systemImage: "ellipsis.circle") }
+                } label: { Label("More", systemImage: "ellipsis") }.help("Server tools")
             }
         }
         .sheet(isPresented: $app.showingPair) { PairView(app: app) }
@@ -151,47 +156,82 @@ struct DesktopView: View {
         } message: { Text("This stops the agent process on the server. Its recording stays available.") }
     }
 
+    /// Home and the open projects first, then the person's own sessions. Team agents and closed
+    /// projects leave the sidebar (Home and search still reach them), so the list stays short.
     private var sidebar: some View {
-        let needsYou = filtered.filter(\.needsYou)
-        let running = filtered.filter { $0.running && !$0.needsYou }
-        let idle = filtered.filter { !$0.running }
+        let teams = searching ? filteredTeams : filteredTeams.filter { !$0.projectState.closed }
+        let sessions = searching ? filtered : filtered.filter { $0.value["team"] == .null }
+        let live = sessions.filter(\.running)
+        let ended = sessions.filter { !$0.running }
+        let pending = app.teams.filter { $0.projectState == .pending }.count
         return List(selection: selection) {
-            if !filteredTeams.isEmpty {
-                Section("Teams") { ForEach(filteredTeams) { team in TeamRowView(team: team).tag("team:" + team.id) } }
+            if app.active != nil && !searching {
+                Label("Home", systemImage: "square.grid.2x2").tag("home").badge(pending)
             }
-            if !needsYou.isEmpty { Section("Needs you") { rows(needsYou) } }
-            if !running.isEmpty { Section("Running") { rows(running) } }
-            if !idle.isEmpty { Section("Not running") { rows(idle) } }
+            if !teams.isEmpty {
+                Section("Projects") { ForEach(teams) { team in TeamRowView(team: team).tag("team:" + team.id) } }
+            }
+            if !live.isEmpty { Section("Sessions") { rows(live) } }
+            if !ended.isEmpty {
+                if searching { Section("Ended") { rows(ended) } }
+                else { Section(isExpanded: $showEnded) { rows(ended) } header: { Text("Ended") } }
+            }
         }
         .listStyle(.sidebar)
-        .searchable(text: $search, placement: .sidebar, prompt: app.teamsEnabled ? "Find a session or team" : "Find a session")
+        .scrollContentBackground(.hidden)
+        .background(Palette.sidebar)
+        .searchable(text: $search, placement: .sidebar, prompt: app.teamsEnabled ? "Search" : "Find a session")
         .overlay {
-            if app.sessions.isEmpty && app.teams.isEmpty {
-                Text(app.active == nil ? "No server connected" : app.connecting ? "Connecting…" : "No sessions")
-                    .foregroundStyle(.secondary).font(.callout)
-            } else if filtered.isEmpty && filteredTeams.isEmpty {
+            if searching && filtered.isEmpty && filteredTeams.isEmpty {
                 Text("No matches").foregroundStyle(.secondary).font(.callout)
+            } else if app.active == nil {
+                Text("No server connected").foregroundStyle(.secondary).font(.callout)
             }
         }
+        .safeAreaInset(edge: .bottom, spacing: 0) { footer }
+    }
+    /// The connected server, its state in words, and the way to switch or add one.
+    private var footer: some View {
+        HStack(spacing: 10) {
+            Circle().fill(app.connected ? Palette.connected : app.connecting ? Palette.attention : Color.secondary).frame(width: 7, height: 7)
+            Menu {
+                ForEach(app.profiles) { profile in
+                    Button { app.activeID = profile.id; Task { await app.connect() } } label: {
+                        if profile.id == app.activeID { Label(profile.label, systemImage: "checkmark") } else { Text(profile.label) }
+                    }
+                }
+                if !app.profiles.isEmpty { Divider() }
+                Button("Connect a Server…") { app.showingPair = true }
+                Button(app.connected ? "Refresh" : "Reconnect") { Task { if app.connected { await app.refresh() } else { await app.connect() } } }.disabled(app.active == nil)
+            } label: { Text(app.active?.label ?? "No server").font(.callout.weight(.medium)).lineLimit(1) }
+            .menuStyle(.borderlessButton).tint(.primary).fixedSize()
+            Text(app.connected ? "Connected" : app.connecting ? "Connecting…" : app.active == nil ? "Not paired" : "Offline")
+                .font(.caption).foregroundStyle(app.connected || app.connecting ? Color.secondary : .orange).lineLimit(1)
+            Spacer(minLength: 4)
+            SettingsLink { Image(systemName: "gearshape") }.buttonStyle(.borderless).help("Connections")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+        .glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(10)
     }
     private func rows(_ sessions: [AgentSession]) -> some View {
         ForEach(sessions) { row in
             HStack(spacing: 9) {
-                Circle().fill(statusColor(row)).frame(width: 7, height: 7)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(row.title).lineLimit(1).foregroundStyle(row.running ? .primary : .secondary)
-                    Text(row.running && !row.now.isEmpty ? row.now : "\(providerName(row.provider)) · \(row.displayState)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-                if row.value["team"] != .null {
-                    Spacer(minLength: 4)
+                StatusGlyph(session: row, size: 12)
+                Text(row.title).lineLimit(1).foregroundStyle(row.running ? .primary : .secondary)
+                Spacer(minLength: 4)
+                if row.needsYou { Text("Needs you").font(.caption).foregroundStyle(Palette.attention) }
+                else if row.value["team"] != .null {
                     Image(systemName: "person.3").font(.caption2).foregroundStyle(.secondary)
                         .help("\(TeamRun.roleName(row.value["team"]["role"].string)) in team \(app.teams.first { $0.id == row.value["team"]["runId"].string }?.title ?? "run")")
                 }
             }
-            .padding(.vertical, 2)
+            .padding(.vertical, 1)
+            .help("\(providerName(row.provider)) · \(row.displayState)\(row.running && !row.now.isEmpty ? " · " + row.now : "")")
+            .accessibilityLabel("\(row.title), \(providerName(row.provider)), \(row.displayState)")
             .tag(row.id)
             .contextMenu {
-                Button("Open beside current") { app.secondaryID = row.id }.disabled(app.selectedID == row.id)
+                Button("Open beside current") { app.showingHome = false; app.selectedTeamID = nil; app.secondaryID = row.id }.disabled(app.selectedID == row.id)
                 if app.isOwner && row.running { Button("End session…", role: .destructive) { endID = row.id } }
             }
         }
@@ -206,28 +246,29 @@ struct DesktopView: View {
                     Button("Reconnect") { Task { await app.connect() } }.disabled(app.connecting)
                 }.font(.caption).padding(10).background(Color.orange.opacity(0.12))
             }
-            // Session panes stay mounted underneath a team dashboard, so switching back is instant.
+            // Session panes stay mounted underneath Home and team dashboards, so switching back is instant.
+            let covered = app.active == nil || app.showingHome || teamModel != nil
             ZStack {
                 Group {
-                    if app.active == nil { welcome }
-                    else if app.mounted.isEmpty {
+                    if app.mounted.isEmpty {
                         if app.connecting && app.sessions.isEmpty {
                             ProgressView("Connecting to \(app.active?.label ?? "server")…").frame(maxWidth: .infinity, maxHeight: .infinity)
                         } else {
                             ContentUnavailableView {
                                 Label(app.sessions.isEmpty ? "No sessions yet" : "Choose a session", systemImage: "terminal")
                             } description: {
-                                Text(app.sessions.isEmpty ? "Start Claude Code or Codex in one of your projects, or give a team an outcome." : "Pick a session or team from the sidebar.")
+                                Text(app.sessions.isEmpty ? "Start Claude Code or Codex in one of your projects, or give a team an outcome from Home." : "Pick a session from the sidebar.")
                             } actions: {
                                 Button("New session") { app.showingCreate = true }.disabled(!app.connected || !app.isOwner)
-                                if app.teamsEnabled { Button("New team") { app.showingCreateTeam = true }.disabled(!app.connected || !app.isOwner) }
                             }
                         }
                     } else { panes }
-                }.opacity(teamModel == nil ? 1 : 0).allowsHitTesting(teamModel == nil).accessibilityHidden(teamModel != nil)
-                if let teamModel { TeamDetailView(app: app, model: teamModel).id(teamModel.id) }
+                }.opacity(covered ? 0 : 1).allowsHitTesting(!covered).accessibilityHidden(covered)
+                if app.active == nil { welcome }
+                else if app.showingHome { HomeView(app: app) }
+                else if let teamModel { TeamDetailView(app: app, model: teamModel).id(teamModel.id) }
             }
-        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Palette.background)
     }
     private var welcome: some View {
         VStack(spacing: 14) {
@@ -297,7 +338,7 @@ struct SessionPane: View {
                 if let prompt = model.prompt, model.session.needsYou { PromptCard(model: model, prompt: prompt).id(prompt["id"].int) }
                 composer
             }.padding(12).fixedSize(horizontal: false, vertical: true).layoutPriority(1)
-        }.background(Color(nsColor: .windowBackgroundColor))
+        }.background(Palette.background)
         .task { await model.attach() }
         .alert("End this session?", isPresented: $confirmEnd) {
             Button("Cancel", role: .cancel) {}
@@ -310,7 +351,7 @@ struct SessionPane: View {
     }
     private var header: some View {
         HStack(spacing: 10) {
-            Circle().fill(statusColor(session)).frame(width: 8, height: 8)
+            StatusGlyph(session: session, size: 16)
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
                 HStack(spacing: 8) {
@@ -350,8 +391,8 @@ struct SessionPane: View {
     private var composer: some View {
         VStack(spacing: 8) {
             PromptEditor(text: Binding(get: { model.draft.text }, set: model.setDraft), placeholder: "Message \(providerName(session.provider))…",
-                         enabled: model.canSend && model.role != "viewer" && !promptBlocks, submit: { Task { await model.send() } })
-                .frame(height: 76).clipShape(RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.14)))
+                         enabled: model.canSend && model.role != "viewer" && !promptBlocks, transparent: true, submit: { Task { await model.send() } })
+                .frame(height: 76).glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             HStack(spacing: 12) {
                 Text(footer.text).font(.system(size: 11)).foregroundStyle(footer.color).lineLimit(2).help(footer.text).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)

@@ -4,6 +4,8 @@ import { createServer, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import type { Signal } from "@infinite/attention";
 import type { AgentProfile, InputControl } from "./types.js";
+import { usageFromStepFinish } from "./opencode-usage.js";
+import type { UsageRecord } from "./usage.js";
 import { nativeEvents, readNativeBody, readNativeResponse } from "./native-http.js";
 
 export function validateNativeOpenCodeArgs(args: string[], initialPrompt = "") {
@@ -26,7 +28,7 @@ export async function startNativeOpenCode(options: {
   settings: ReturnType<typeof validateNativeOpenCodeArgs>;
   checkControl: (authority: InputControl) => void;
   onThread: (id: string) => void; onExit: () => void;
-  onSignal: (signal: Signal) => number | undefined; record: (method: string) => void;
+  onSignal: (signal: Signal) => number | undefined; onUsage?: (record: UsageRecord) => void; record: (method: string) => void;
 }) {
   const password = randomBytes(32).toString("hex"), observerToken = randomBytes(32).toString("hex");
   const basic = (token: string) => `Basic ${Buffer.from(`infinite:${token}`).toString("base64")}`;
@@ -35,6 +37,7 @@ export async function startNativeOpenCode(options: {
   let child: ChildProcess | undefined, endpoint = "", sessionId = "", stopped = false;
   let working = false, failed = false, lastMessage: string | undefined;
   const roles = new Map<string, string>();
+  const models = new Map<string, { providerId: string; modelId: string }>();
   const prompts = new Map<string, number>();
   const server = createServer();
   const stop = () => {
@@ -61,6 +64,18 @@ export async function startNativeOpenCode(options: {
     }
     if (type === "message.updated" && p.info?.sessionID === sessionId) {
       roles.set(p.info.id, p.info.role); if (roles.size > 256) roles.delete(roles.keys().next().value!);
+      if (p.info.role === "assistant" && p.info.providerID && p.info.modelID) {
+        models.set(p.info.id, { providerId: String(p.info.providerID), modelId: String(p.info.modelID) });
+        if (models.size > 256) models.delete(models.keys().next().value!);
+      }
+    }
+    if (type === "message.part.updated" && p.part?.type === "step-finish" && p.part.sessionID === sessionId) {
+      const reported = models.get(p.part.messageID);
+      const requested = options.settings.model ?? "unknown/unknown", slash = requested.indexOf("/");
+      const usage = usageFromStepFinish(p.part, { completedAt: new Date().toISOString(),
+        ...(reported ? { ...reported, modelSource: "reported" as const }
+          : { providerId: slash < 0 ? requested : requested.slice(0, slash), modelId: slash < 0 ? requested : requested.slice(slash + 1), modelSource: options.settings.model ? "requested" as const : "unknown" as const }) });
+      if (usage) options.onUsage?.(usage);
     }
     if (type === "message.part.updated" && p.part?.type === "text" && roles.get(p.part.messageID) === "assistant") lastMessage = p.part.text?.slice(0, 4000);
     if (["permission.asked", "question.asked"].includes(type) && p.sessionID === sessionId && typeof p.id === "string" && !prompts.has(p.id)) {

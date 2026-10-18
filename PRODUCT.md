@@ -36,6 +36,24 @@ The target for managed workloads remains confidential VMs: the service operator 
 Support both deployment modes. **Single tenant** runs directly on the host with one user's context and no added tenant/VM isolation requirement. **Multi-tenant** assigns each user a separate execution environment and complete context bucket. The operator-confidentiality requirement applies to managed multi-tenant private workloads; the single-tenant owner explicitly controls and trusts their own execution host. Authentication, encrypted recordings, and device roles still apply in either mode.
 
 ## Capabilities and Constraints
+Goals accept a desired product outcome, success criteria, evidence, allowed
+paths, and execution limits. A strong coordinator selects scoped improvements;
+light workers investigate and implement in parallel, with explicit escalation
+to configured strong profiles. A cycle that produces reviewed changes has a
+short brief, host check results, and an independent review. Later cycles continue from a reviewed local commit.
+Teams remain available for a single feature request or PRD.
+
+Owners can start, pause, resume, and cancel goals; owners and controllers can
+steer and answer questions. Only an explicit user assessment with evidence can
+record a product outcome as achieved. Checked code is ready for human review,
+without automatic publication or deployment. See [Goals and agent teams](docs/teams.md)
+for the web flow, model routing, scope, limits, API, and recovery.
+
+Projects can map Goals and feature cycles to Linear issues. The host checks
+issue scope and workflow state before starting more work; unavailable or changed
+issues block progression. Linear workflow state is shown separately from local
+execution, and Infinite does not mark an issue Done automatically.
+
 Preserve native agent histories and workspaces. Show execution location, connection freshness, recording errors, and actual delivery receipts. Shared context must identify its version and source. Do not infer task completion from an idle terminal or automatically approve provider permissions.
 
 In the managed multi-tenant service, tenant contents must be confidential from other users and the service operator. This requires a supported, hardened confidential runtime, independently verified attestation bound to the live client channel, user-controlled keys and update policy, and no operator recovery bypass. Native phone credentials belong in platform secure storage. A compromised agent, trusted client, or selected model provider remains a separate threat boundary.

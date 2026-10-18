@@ -63,5 +63,8 @@ else if (mode === "merge") {
   await permission("rm -rf build");
   await sleep(300);
   await post({ hook_event_name: "PermissionDenied", tool_name: "Bash", tool_input: { command: "rm -rf build" }, reason: "Denied by policy" });
+} else if (mode === "rate-limit" || mode === "rate-limit-blip") {
+  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+  if (mode === "rate-limit") console.log("You've hit your session limit · resets 3:45pm");
 }
 setInterval(() => {}, 1000);

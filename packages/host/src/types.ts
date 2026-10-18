@@ -43,6 +43,9 @@ export interface ExecutionState {
 }
 export interface Session {
   id: string;
+  /** Host-owned assignment; ordinary session creation cannot supply this. */
+  team?: import("./team-types.js").TeamAssignment;
+  teamModelProfile?: import("./team-types.js").TeamModelProfile;
   backend?: "infinite" | "cmux";
   machineId?: string;
   /** Where this session's tools run. Laptop execution is the explicit --laptop mode. */
@@ -67,13 +70,15 @@ export interface Session {
 export interface Event {
   seq: number;
   at: string;
-  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "message";
+  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "usage" | "message";
   data: Record<string, unknown>;
 }
 export interface Project {
   id: string;
   name: string;
   path: string;
+  team?: import("./team-types.js").TeamProject;
+  linear?: { teamId: string; projectId?: string };
 }
 export interface AgentProfile {
   command: string;
@@ -86,9 +91,15 @@ export interface AgentProfile {
   sharedWorkspace?: boolean;
 }
 export interface Config {
+  /** Host-only credential; never copied into provider environment variables or prompts. */
+  linear?: { apiKeyFile: string; endpoint?: string };
+  /** Separate working copies, writable by the host and selected provider execution account. */
+  teams?: { workspaceDir: string; commandPrefix?: import("./team-types.js").TeamCommand; lineup?: import("./team-types.js").TeamLineup };
   machine?: { id: string; label: string };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
+  /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */
+  usage?: import("./config.js").UsageConfig;
   deployment?: import("./deployment.js").Deployment;
   /** Workspace sync. `homeDir` overrides the server home used for folder mapping; `sharedGroup` permits a separate agent account. */
   sync?: { sharedGroup?: boolean; homeDir?: string };

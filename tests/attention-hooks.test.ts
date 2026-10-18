@@ -58,6 +58,22 @@ test("claude PermissionRequest, PostToolUse, Stop, Notification", () => {
   assert.equal(mapClaudeHook({ nonsense: true }).length, 0);
 });
 
+test("Claude hook distinguishes a rate-limit observation from other provider failures", () => {
+  const rateLimit = mapClaudeHook({ ...base, hook_event_name: "StopFailure", error: "rate_limit" });
+  assert.equal(rateLimit.length, 3);
+  assert.equal(rateLimit[2].kind, "provider-limit");
+  if (rateLimit[2].kind !== "provider-limit") throw new Error();
+  assert.equal(rateLimit[2].confidence, "single-source");
+  assert.equal(rateLimit[2].limit, "usage");
+  const overloaded = mapClaudeHook({ ...base, hook_event_name: "StopFailure", error: "overloaded" });
+  assert.deepEqual(overloaded.map(signal => signal.kind), ["error", "turn-end"]);
+  const quota = mapClaudeHook({ ...base, hook_event_name: "Notification", notification_type: "quota_auto_resume_fired" });
+  const signal = quota.find(item => item.kind === "provider-limit");
+  assert.equal(signal?.kind, "provider-limit");
+  if (signal?.kind !== "provider-limit") throw new Error();
+  assert.equal(signal.confidence, "corroborated");
+});
+
 test("codex hooks and notify", () => {
   const [perm] = mapCodexHook({ session_id: "s", cwd: "/w", hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "rm -rf dist" }, tool_use_id: "c1" });
   assert.equal(perm.kind, "prompt-open");

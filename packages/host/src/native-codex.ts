@@ -247,7 +247,13 @@ export async function startNativeCodex(options: {
               if (message.method === "item/completed" && message.params?.item?.type === "agentMessage" && typeof message.params.item.text === "string")
                 lastMessage = message.params.item.text.slice(0, 4000);
               if (message.method === "item/completed") { const item = nativeItemMessage(message.params?.item); if (item) options.onMessage?.(item); }
-              if (message.method === "turn/completed") options.onSignal({ kind: "turn-end", message: message.params?.turn?.status === "interrupted" ? "Turn interrupted" : lastMessage, failed: message.params?.turn?.status === "failed" });
+              if (message.method === "turn/completed") {
+                const turn = message.params?.turn;
+                const codexErrorInfo = turn?.error?.codexErrorInfo;
+                if (turn?.status === "failed" && codexErrorInfo === "usageLimitExceeded")
+                  options.onSignal({ kind: "provider-limit", limit: "usage", confidence: "corroborated", message: "Codex reported usageLimitExceeded" });
+                options.onSignal({ kind: "turn-end", message: turn?.status === "interrupted" ? "Turn interrupted" : lastMessage, failed: turn?.status === "failed" });
+              }
             }
             const method = message.id === undefined ? undefined : pending.get(message.id);
             if (message.id !== undefined && !message.method) pending.delete(message.id);

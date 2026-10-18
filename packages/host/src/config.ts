@@ -1,24 +1,35 @@
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { resolve, relative, isAbsolute } from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { Config } from "./types.js";
 import { assertRunnerDeployment, parseDeployment } from "./deployment.js";
 import { machineIdentity } from "./machine.js";
+import { teamProjectSchema, teamCommandSchema, teamLineupSchema } from "./team-types.js";
 
 /**
  * Provider hooks injected at launch when the config does not say. Codex hooks stay off until
  * spike S2 confirms that `-c hooks.*` and `--dangerously-bypass-hook-trust` work as intended.
  */
 export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
+const nonNegative = z.number().min(0).finite();
+export const usageConfigSchema = z.object({
+  /** USD per million tokens, keyed `provider/model`. */
+  prices: z.record(z.string().min(1), z.object({ input: nonNegative, output: nonNegative, cacheRead: nonNegative.optional(), cacheWrite: nonNegative.optional() }).strict()).default({}),
+  budgets: z.partialRecord(z.enum(["claude", "codex", "grok", "opencode", "demo"]), z.object({ usd: nonNegative, period: z.enum(["day", "week", "month"]).default("month") }).strict()).default({}),
+}).strict();
+export type UsageConfig = z.infer<typeof usageConfigSchema>;
 export const machineLabelSchema = z.string().trim().min(1).max(80);
 
 const schema = z
   .object({
+    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional() }).strict().optional(),
+    teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),
+    usage: usageConfigSchema.optional(),
     sync: z.object({ sharedGroup: z.boolean().optional(), homeDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     // Model-written chat digests. The key file is read once at startup and never logged.
     summaries: z.object({
@@ -50,6 +61,8 @@ const schema = z
           id: z.string().regex(/^[a-z0-9-]+$/),
           name: z.string(),
           path: z.string(),
+          team: teamProjectSchema.optional(),
+          linear: z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict().optional(),
         }),
       )
       .min(1),
@@ -87,9 +100,32 @@ const schema = z
   .strict();
 export const hashToken = (token: string) =>
   createHash("sha256").update(token).digest("hex");
+export function validateLinearConfig(config: Config) {
+  if (config.projects.some(project => project.linear) && !config.linear)
+    throw new Error("Linear projects require a host credential configuration");
+  if (!config.linear) return;
+  const endpoint = new URL(config.linear.endpoint ?? "https://api.linear.app/graphql");
+  const local = config.environment === "local" && endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
+  if ((!local && endpoint.href !== "https://api.linear.app/graphql") || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== "/graphql")
+    throw new Error("Linear requires its official HTTPS endpoint; loopback HTTP is allowed for local development");
+  try {
+    const file = config.linear.apiKeyFile;
+    if (!isAbsolute(file) || (statSync(file).mode & 0o777) !== 0o600 || !statSync(file).isFile()) throw new Error();
+    const actual = realpathSync(file);
+    for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.map(project => project.path)].filter((value): value is string => Boolean(value))) {
+      let base: string;
+      try { base = realpathSync(directory); } catch { base = resolve(directory); }
+      const rel = relative(base, actual);
+      if (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel)) throw new Error();
+    }
+    const credential = readFileSync(file, "utf8").trim();
+    if (!credential || credential.length > 4096 || /\s/.test(credential)) throw new Error();
+  } catch { throw new Error("Linear API key must be a nonempty private 0600 file outside runtime state and project workspaces"); }
+}
 export function readConfig(file: string): { config: Config; key: Buffer } {
   const config = schema.parse(JSON.parse(readFileSync(file, "utf8"))) as Config;
   config.deployment = parseDeployment(config.deployment);
+  validateLinearConfig(config);
   assertRunnerDeployment(config);
   for (const path of [
     config.stateDir,

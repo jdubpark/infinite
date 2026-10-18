@@ -1,9 +1,12 @@
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
-export type HookRoute = "claude" | "codex" | "codex-notify" | "transcript";
-const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "transcript"]);
+export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "transcript";
+const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "transcript"]);
 const MAX_BODY = 256 * 1024;
+export class HookPayloadError extends Error {
+  constructor(readonly status: number) { super("Hook payload was refused"); }
+}
 
 /**
  * What the worker wants back from the relay. Only the relay reads this reply; the provider
@@ -68,8 +71,10 @@ export function startHookServer(opts: {
       let reply: HookReply | void = undefined;
       try {
         reply = opts.onPayload(route as HookRoute, parsed);
-      } catch {
+      } catch (error) {
         opts.onError();
+        res.writeHead(error instanceof HookPayloadError ? error.status : 500).end();
+        return;
       }
       if (reply && Object.keys(reply).length) res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(reply));
       else res.writeHead(204).end();

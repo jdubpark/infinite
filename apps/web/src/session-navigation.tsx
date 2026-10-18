@@ -3,12 +3,16 @@ import { ChevronRight, Search, X } from "lucide-react";
 import { names, type Session } from "./api";
 
 export type SessionTab = "chat" | "screen" | "terminal" | "files" | "context";
-type Location = { id: string | null; tab: SessionTab; creating: boolean };
+type Location = { id: string | null; tab: SessionTab; creating: boolean; teams: boolean; teamId: string | null; creatingTeam: boolean; goals: boolean; goalId: string | null; creatingGoal: boolean };
 
 function readLocation(machine: string): Location {
   const hash = window.location.hash.replace(new RegExp(`^#/machines/${machine}(?=/|$)`), "#");
   const match = hash.match(/^#\/sessions\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})(?:\/(chat|screen|terminal|files|context))?$/i);
-  return { id: match?.[1] ?? null, tab: (match?.[2] as SessionTab) ?? "chat", creating: hash === "#/new" };
+  const team = hash.match(/^#\/teams\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
+  const goal = hash.match(/^#\/goals\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
+  return { id: match?.[1] ?? null, tab: (match?.[2] as SessionTab) ?? "chat", creating: hash === "#/new",
+    teams: hash === "#/teams" || hash === "#/teams/new" || Boolean(team), teamId: team?.[1] ?? null, creatingTeam: hash === "#/teams/new",
+    goals: hash === "#/goals" || hash === "#/goals/new" || Boolean(goal), goalId: goal?.[1] ?? null, creatingGoal: hash === "#/goals/new" };
 }
 
 // Only the route lives in the URL. Drafts, output and credentials never do.
@@ -28,7 +32,11 @@ export function useSessionLocation(machine = "direct") {
     history.replaceState(null, "", `#${prefix}/sessions/${location.id}/${tab}`);
     setLocation(readLocation(machine));
   }
-  return { ...location, navigate, selectTab, create: () => { window.location.hash = `${prefix}/new`; } };
+  return { ...location, navigate, selectTab, create: () => { window.location.hash = `${prefix}/new`; },
+    navigateTeam: (id: string | null) => { window.location.hash = `${prefix}/teams${id ? `/${id}` : ""}`; },
+    createTeam: () => { window.location.hash = `${prefix}/teams/new`; },
+    navigateGoal: (id: string | null) => { window.location.hash = `${prefix}/goals${id ? `/${id}` : ""}`; },
+    createGoal: () => { window.location.hash = `${prefix}/goals/new`; } };
 }
 
 export const sessionStatus = (session: Session) => session.attention?.state === "needs-you"
@@ -36,6 +44,13 @@ export const sessionStatus = (session: Session) => session.attention?.state === 
 
 type Filter = "active" | "attention" | "all";
 const active = (session: Session) => session.status === "running" || session.status === "starting";
+function usagePreview(usage: Session["usage"]) {
+  if (!usage) return "";
+  if ("measured" in usage && !usage.measured) return "Unmeasured";
+  if (!usage.messages && !usage.pricing.unknown) return usage.incomplete ? "Usage unavailable" : "No measured usage";
+  const unknown = usage.pricing.unknown;
+  return `${usage.incomplete ? "Partial data · " : ""}${unknown ? `Known spend $${usage.cost.toFixed(usage.cost > 0 && usage.cost < 0.01 ? 6 : 2)} · ${unknown} costs unknown` : `Spend $${usage.cost.toFixed(usage.cost > 0 && usage.cost < 0.01 ? 6 : 2)}`} · configured price: ${usage.pricing.configured}, reported by OpenCode: ${usage.pricing.provider}`;
+}
 
 export function SessionPicker({ sessions, selected, loading, onSelect }: {
   sessions: Session[]; selected: string | null; loading: boolean; onSelect: (id: string) => void;
@@ -66,6 +81,7 @@ export function SessionPicker({ sessions, selected, loading, onSelect }: {
         className={`session-row ${selected === session.id ? "selected" : ""}`} onClick={() => onSelect(session.id)}>
         <div className="row-top"><span className={`dot ${needsYou(session) ? "needs-you" : session.status}`} /><strong>{session.title}</strong><ChevronRight size={16} /></div>
         <div className="row-meta"><span>{names[session.provider]}{session.backend === "cmux" ? " · cmux" : ""}</span><span>{sessionStatus(session)}</span></div>
+        {session.usage && <p className="row-preview">{usagePreview(session.usage)}</p>}
         {session.attention?.now && <p className="row-preview">{session.attention.now}</p>}
         <div className="row-meta session-id">{session.id.slice(0, 8)}</div>
       </button>)}

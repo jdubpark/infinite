@@ -90,9 +90,9 @@ if (args[0] === "exec-server") {
         else if (method === "turn/start") {
           const text = params.input.map(item => item.text ?? "").join(""); history.push(text);
           const turnId = randomUUID(); activeTurn = turnId; activeSelections = params.environments ?? selections;
-          const complete = (status = "completed") => {
+          const complete = (status = "completed", codexErrorInfo) => {
             if (activeTurn === turnId) activeTurn = undefined;
-            broadcast({ method: "turn/completed", params: { threadId, turn: { id: turnId, status } } });
+            broadcast({ method: "turn/completed", params: { threadId, turn: { id: turnId, status, ...(codexErrorInfo ? { error: { codexErrorInfo } } : {}) } } });
           };
           reply({ turn: { id: turnId, status: "inProgress" } });
           broadcast({ method: "turn/started", params: { threadId, turn: { id: turnId, status: "inProgress" } } });
@@ -105,6 +105,8 @@ if (args[0] === "exec-server") {
             } catch { complete("failed"); }
           }
           if (text === "work") setTimeout(() => { writeFileSync("work-complete", "done"); complete(); }, 1200);
+          if (text === "usage-limit") complete("failed", "usageLimitExceeded");
+          if (text === "rate-limit-transient") complete("failed", "rateLimitExceeded");
           if (text === "approval") broadcast({ id: "approval", method: "item/commandExecution/requestApproval", params: { threadId, command: "fixture" } });
         } else if (!method && id === "approval") writeFileSync("approval-result.json", JSON.stringify(message));
         else if (id !== undefined) reply({});

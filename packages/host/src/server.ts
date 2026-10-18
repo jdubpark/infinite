@@ -9,7 +9,7 @@ import { z } from "zod";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Manager } from "./manager.js";
-import { hashToken } from "./config.js";
+import { hashToken, validateLinearConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
 import { workerCall, type WorkerError } from "./ipc.js";
 import { PushStore, isExpoToken } from "./push.js";
@@ -22,6 +22,12 @@ import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { MirroredProjects } from "./mirrored-projects.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
+import { UsageService } from "./usage-service.js";
+import { TeamService, TeamError } from "./teams.js";
+import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
+import { GoalService } from "./goals.js";
+import { LinearService } from "./linear.js";
+import { createGoalSchema, goalActionSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
@@ -89,6 +95,7 @@ export function createApp(config: Config, key: Buffer) {
   config.machine = machineIdentity(config, key);
   if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
     throw new Error("Machine access and cmux require a single-tenant host");
+  validateLinearConfig(config);
   const app = express();
   const mirroredProjects = runtimeSecurity(config.deployment).tenancy === "single-tenant" ? new MirroredProjects(config, key) : undefined;
   const manager = new Manager(config, key);
@@ -111,15 +118,21 @@ export function createApp(config: Config, key: Buffer) {
       if (left) startsInFlight.set(projectId, left); else startsInFlight.delete(projectId);
     }
   };
+  const linear = new LinearService(config, key);
+  const teams = new TeamService(config, key, manager, startInProject, linear);
+  const usage = new UsageService(config, key, manager);
+  teams.useUsage(usage);
+  const goals = new GoalService(config, key, teams, linear);
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
-  const resumable = (session: { status: string; provider: string; workspace?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
-    session.status === "exited" && !session.workspace && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
+  const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
+    session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
   // Native records written before executionLocation existed carry only the hybrid workspace.
   const executionLocation = (session: { executionLocation?: "cloud" | "laptop"; workspace?: unknown }): "cloud" | "laptop" =>
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
+  const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
-    const native = (await manager.list()).map(session => ({ ...session, executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id, resumable: resumable(session) }));
+    const native = (await manager.list()).map(session => ({ ...session, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id, resumable: resumable(session) }));
     // Provider conversation IDs survive restarts and can exist in several
     // recordings. Only a currently verified worker PID identifies this runtime.
     const known = new Set(native.filter(s => s.status === "running" && s.nativeSession && s.pid)
@@ -133,7 +146,7 @@ export function createApp(config: Config, key: Buffer) {
    * tools run elsewhere, and an exited session never counts. A session list that cannot be read counts as running.
    */
   const projectRunning = async (projectId: string) => {
-    if (startsInFlight.has(projectId)) return true;
+    if (startsInFlight.has(projectId) || teams.activeForProject(projectId) || goals.activeForProject(projectId)) return true;
     let sessions: Awaited<ReturnType<typeof listSessions>>;
     try { sessions = await listSessions(); } catch { return true; }
     return sessions.some(s => s.projectId === projectId && s.executionLocation !== "laptop" &&
@@ -286,7 +299,11 @@ export function createApp(config: Config, key: Buffer) {
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
-      projects: config.projects.map(({ id, name, path }) => ({ id, name, path })),
+      providerLimits: teams.limits.active(),
+      teams: { enabled: Boolean(config.teams), maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      goals: { enabled: goals.enabled() },
+      usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
+      projects: config.projects.map(({ id, name, path, team, linear }) => ({ id, name, path, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
       capabilities: {
         ...(mirroredProjects ? { workspaceMirror: 1 } : {}),
         signals: true,
@@ -298,6 +315,38 @@ export function createApp(config: Config, key: Buffer) {
       },
     }),
   );
+  app.get("/api/usage", (_req, res) => res.json(usage.summary()));
+  app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
+  app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
+  app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
+  app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
+    const body = createGoalSchema.parse(req.body);
+    return res.json(await startInProject(body.projectId, () => goals.create(body)));
+  });
+  app.post("/api/goals/:id/steer", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.steer(id.parse(req.params.id), goalSteerSchema.parse(req.body))));
+  app.post("/api/goals/:id/outcome", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.outcome(id.parse(req.params.id), goalOutcomeSchema.parse(req.body))));
+  for (const action of ["pause", "resume", "cancel"] as const)
+    app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
+  app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  app.post("/api/teams", requireRole(["owner"]), async (req, res) => {
+    const body = createTeamSchema.parse(req.body);
+    return res.json(await startInProject(body.projectId, () => teams.create(body)));
+  });
+  const standaloneTeam = (value: unknown) => {
+    const teamId = id.parse(value);
+    if (teams.get(teamId).goal) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal. Team decisions can still be answered here.");
+    return teamId;
+  };
+  app.post("/api/teams/:id/steer", requireRole(["owner", "controller"]), async (req, res) =>
+    res.json(await teams.steer(standaloneTeam(req.params.id), teamMutationSchema.parse(req.body))));
+  app.post("/api/teams/:id/decisions/:decisionId/answer", requireRole(["owner", "controller"]), async (req, res) => {
+    const teamId = id.parse(req.params.id), decisionId = id.parse(req.params.decisionId), body = teamMutationSchema.parse(req.body);
+    res.json(await (teams.get(teamId).goal ? goals.answer(teamId, decisionId, body) : teams.answer(teamId, decisionId, body)));
+  });
+  for (const action of ["pause", "resume", "cancel"] as const) {
+    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) =>
+      res.json(await teams[action](standaloneTeam(req.params.id), teamActionSchema.parse(req.body))));
+  }
   app.get("/api/machine/resources", async (_req, res) => res.json(await desktopResources.sample()));
   app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {
     if (!mirroredProjects) return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
@@ -536,6 +585,7 @@ export function createApp(config: Config, key: Buffer) {
                   "input-intent",
                   "input-result",
                   "signal",
+                  "usage",
                   "message",
                 ]),
               )
@@ -770,6 +820,7 @@ export function createApp(config: Config, key: Buffer) {
       _next: express.NextFunction,
     ) => {
       // `error` carries the message every client displays; a failed sync operation also names its category.
+      if (error instanceof TeamError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof ProjectSyncError)
         return res.status(error.status).json({ code: error.code, error: error.message, ...(error.category ? { category: error.category, message: error.message } : {}) });
       if (error instanceof ContentError) return res.status(error.status).json({ error: error.message });
@@ -818,9 +869,17 @@ export function createApp(config: Config, key: Buffer) {
     },
   );
   const server = createServer(app);
+  server.once("listening", () => linear.start());
+  server.once("listening", () => teams.start());
+  server.once("listening", () => usage.start());
+  server.once("listening", () => goals.start());
+  server.once("close", () => teams.close());
+  server.once("close", () => usage.close());
+  server.once("close", () => goals.close());
+  server.once("close", () => linear.close());
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); };
-  return { app, manager, projectSync, sessions: { list: listSessions }, pushStore, server, closeConnections };
+  const closeConnections = () => { goals.close(); teams.close(); usage.close(); linear.close(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); };
+  return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

@@ -16,6 +16,9 @@ infinite opencode --model deepseek/deepseek-flash
 
 infinite list
 infinite list --json
+infinite usage
+infinite usage --json
+infinite resources
 infinite resources --watch
 infinite resources --json
 infinite resume             # choose a running session
@@ -29,6 +32,8 @@ infinite close SESSION_ID  # confirm before ending its provider process
 `resources` reports timestamped CPU, memory, swap, disk, network, and per-session provider-process counters. Missing measurements stay unavailable, including CPU usage and network rates before a second sample. Process counters do not include every descendant process. `--watch` refreshes every two seconds until Ctrl+C; combined with `--json`, it emits one JSON object per line.
 
 `close` requires an explicit session ID or unique prefix and an owner key. It shows the selected process and asks for confirmation; `--yes` confirms noninteractive use. Another client's active input lease blocks closing unless `--takeover` is explicitly supplied. A delivered receipt confirms the stop request reached the worker; check `list` for the resulting process status. An uncertain response is reported and never retried automatically. Closing ends the provider process; Ctrl+] only detaches the terminal client.
+
+`usage` shows per-provider spend for the current UTC budget period. It labels configured prices and costs reported by OpenCode separately, and reports sessions without a usage capture path as unmeasured. `--json` prints the host's raw `/api/usage` summary. Budgets are informational and do not block or reroute work.
 
 For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
 
@@ -157,7 +162,7 @@ In ordinary terminal mode, everything after the provider name is passed as an ar
 infinite projects
 infinite --project PROJECT_ID --title "Investigate tests" codex --model MODEL
 infinite --detach --project PROJECT_ID claude "Review this checkout"
-infinite --client-config /private/client.json monitor SESSION_ID
+infinite --client-config "$CLIENT_CONFIG_FILE" monitor SESSION_ID
 ```
 
 Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not translated. A launch without `--project` uploads the selected checkout through workspace sync. Use `--project ID` to select an existing server project without automatic upload. Sync scope includes ignored files, untracked files, and Git metadata; credentials inside that scope travel to the server.
@@ -174,7 +179,7 @@ Requires Node.js 22.14 or newer and access to the host through HTTPS or a separa
 
 ```sh
 make
-infinite pair https://YOUR-HOST.tailnet.ts.net --token-file /private/owner.key
+infinite pair https://HOST.YOUR-TAILNET.ts.net --token-file "$OWNER_KEY_FILE"
 ```
 
 `make` (or `make build`) installs dependencies when `node_modules` is missing or older than the lockfile, builds `@infinite/attention`, `@infinite/remote`, and `@infinite/host`, then runs `scripts/install-client.mjs`. The same steps by hand:
@@ -191,6 +196,6 @@ The installer places `infinite` in `~/.local/bin` and an independent, versioned 
 
 Pairing validates the host and device role before saving a mode-0600 `~/.config/infinite/client.json`. Use `--token-file -` to receive the key through stdin instead of a file. Do not put a key in command arguments or shell history. Remote pairing requires HTTPS; HTTP is accepted only for loopback addresses, including an SSH-forwarded local endpoint. Redirects are refused so credentials are not forwarded to another endpoint.
 
-For a tunnel that already forwards local port 4780 to the trusted server's API, use `infinite pair http://127.0.0.1:4780 --token-file /private/owner.key`. Keep the forward bound to loopback and verify the SSH host identity. SSH encrypts the network connection between laptop and server; the existing Infinite terminal CLI carries HTTP/WebSocket traffic inside that tunnel. It does not use the native Mac/phone application's encrypted WebSocket protocol or its public relay. Native provider gateways, `--laptop`, sync, and pull retain this direct connection path. The standalone tunnel can run at login and does not require the Mac app to be open.
+For a tunnel that already forwards local port 4780 to the trusted server's API, use `infinite pair http://127.0.0.1:4780 --token-file "$OWNER_KEY_FILE"`. Keep the forward bound to loopback and verify the SSH host identity. SSH encrypts the network connection between laptop and server; the existing Infinite terminal CLI carries HTTP/WebSocket traffic inside that tunnel. It does not use the native Mac/phone application's encrypted WebSocket protocol or its public relay. Native provider gateways, `--laptop`, sync, and pull retain this direct connection path. The standalone tunnel can run at login and does not require the Mac app to be open.
 
 This client currently connects directly to a trusted single-tenant runner. TLS pairing is not confidential-VM attestation and does not implement the future operator-private multi-tenant protocol.

@@ -156,6 +156,13 @@ Separate the API service Unix identity from native agent execution identities. T
 
 Authenticate providers on the server in their own protected home, with only the credentials needed for approved projects. An SSH-agent forwarded from the laptop stops being useful when the laptop disappears. Copying the entire laptop home would import excessive credentials and platform-specific paths. Inventory skills, AGENTS.md, MCP services, environment variables, tool versions, Git identity, and project dependencies explicitly.
 
+For unattended GitHub delivery, the optional [GitHub App renewal service](../deploy/ubuntu/github-app.md)
+keeps the app private key outside agent-readable storage and issues one-repository
+installation tokens. The Git/GitHub client refuses expired or mismatched tokens
+for configured repositories. Existing credentials for other repositories remain
+separate. Agents sharing a Unix identity can read that identity's token files;
+this does not add filesystem isolation or change provider approval controls.
+
 Workspace sync runs only on single-tenant hosts. Owner CLI launches without `--project` start or reuse it for the selected home-relative checkout; an explicit `infinite sync` can also start it. Folder registration accepts only an owner bearer key, persists in sealed host state, and refuses symlink aliases, overlapping projects, and protected host paths. It uploads the entire Git root of the selected checkout, including ignored and untracked files and its `.git` directory. For a linked Git worktree it also uploads Git metadata from outside the root: the common repository's objects, refs, ref logs, packed refs, `info/`, `shallow`, `description`, and a projected config, and the worktree's own `HEAD`, `index`, ref logs, refs, in-progress merge, rebase, cherry-pick, revert, and bisect state, and a projected `config.worktree`. A Git config can carry credentials such as a token in a remote URL. Keep credentials out of synced checkouts or accept that they reach the host. A forced apply replaces the cloud tree; one previous copy is kept beside the project directory. Received chunks are plaintext files under the host's private state directory, so that directory belongs on the encrypted storage above. See [workspace sync](workspace-sync.md).
 
 The owner pilot now has an age-encrypted laptop backup with file, SQLite, and journal restore verification. Its daily server timer creates encrypted snapshots; automatic upload to independent storage is still pending. See [backup operations](../deploy/ubuntu/backups.md).

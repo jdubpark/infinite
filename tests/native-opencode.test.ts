@@ -78,7 +78,7 @@ test("OpenCode CLI uses a local credential and rejoins history without starting 
       const child = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", config, ...args], { cols: 120, rows: 32, cwd: host.root, env: { ...process.env, PATH: bin + ":" + process.env.PATH } });
       children.push(child); let text = "", exited = false; child.onData(data => text += data); child.onExit(() => exited = true); return { child, text: () => text, exited: () => exited };
     };
-    const first = launch(["--local-ui", "opencode"]);
+    const first = launch(["--project", "rehearsal", "--local-ui", "opencode"]);
     await waitFor(async () => first.text(), text => text.includes("LOCAL OPENCODE READY"));
     const sessions = (await host.fetchApi("/sessions")).body.sessions; assert.equal(sessions.length, 1);
     const id = sessions[0].id, info = (await host.fetchApi(`/sessions/${id}/native`)).body;

@@ -2,7 +2,7 @@
 
 For web/phone creation across cloud and laptop machines, cmux discovery, and the outbound relay, see [remote machines](remote-machines.md). The commands below describe the separately installed terminal client. Host setup commands use `node packages/host/dist/cli.js`.
 
-The laptop CLI keeps provider conversations and tools on the cloud host. `infinite sync` keeps the configured cloud project current with this checkout, one way. Codex can instead run tools in the current laptop project with `--laptop`, which prepares automatic cloud handoff in the background. Detaching or losing the interface leaves the cloud conversation running.
+The laptop CLI works independently of the Mac app and keeps provider conversations and tools on the cloud host. A launch without `--project` mirrors the current checkout below the server home and keeps it synced one way, including ignored and untracked files. The first launch waits for that copy to be applied. The folder structure and the launch subdirectory stay the same beneath each home directory; see [folder mapping](workspace-sync.md#folder-mapping). Codex can instead run tools in the current laptop project with `--laptop`, which prepares automatic cloud handoff in the background. Detaching or losing the interface leaves the cloud conversation running.
 
 Launch and attach report their current stage immediately, with elapsed time during longer waits. These messages go to stderr; JSON listings and detached session IDs remain machine-readable on stdout. Progress stops when native output takes over.
 
@@ -18,16 +18,39 @@ infinite list
 infinite list --json
 infinite usage
 infinite usage --json
+infinite resources
+infinite resources --watch
+infinite resources --json
 infinite resume             # choose a running session
 infinite resume 5ba58d55    # a unique Infinite session ID prefix also works
 infinite monitor           # choose a session to watch
+infinite close SESSION_ID  # confirm before ending its provider process
 ```
 
-`list` ends each line with where the session's tools run: `tools on MACHINE` for the host, or `laptop tools` with the executor state for `--laptop` sessions.
+`list` includes each session's project and working directory, then where its tools run: `tools on MACHINE` for the host, or `laptop tools` with the executor state for `--laptop` sessions. The working directory is the recorded provider directory, or the selected laptop tool directory while laptop execution is active. It does not infer shell directory changes. JSON output retains the complete host session summary.
+
+`resources` reports timestamped CPU, memory, swap, disk, network, and per-session provider-process counters. Missing measurements stay unavailable, including CPU usage and network rates before a second sample. Process counters do not include every descendant process. `--watch` refreshes every two seconds until Ctrl+C; combined with `--json`, it emits one JSON object per line.
+
+`close` requires an explicit session ID or unique prefix and an owner key. It shows the selected process and asks for confirmation; `--yes` confirms noninteractive use. Another client's active input lease blocks closing unless `--takeover` is explicitly supplied. A delivered receipt confirms the stop request reached the worker; check `list` for the resulting process status. An uncertain response is reported and never retried automatically. Closing ends the provider process; Ctrl+] only detaches the terminal client.
 
 `usage` shows per-provider spend for the current UTC budget period. It labels configured prices and costs reported by OpenCode separately, and reports sessions without a usage capture path as unmeasured. `--json` prints the host's raw `/api/usage` summary. Budgets are informational and do not block or reroute work.
 
 For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
+
+## The app's cmux workspaces from a terminal
+
+The Mac app has two connections: Infinite sessions and a separate native cmux workspace server. `infinite list`, `resume`, and `close` address the Infinite catalog. The native cmux server keeps its own workspace and terminal IDs. Use `infinite cmux` for the same cmux catalog shown in the app:
+
+```sh
+infinite cmux                         # full native workspace TUI
+infinite cmux --json terminal list
+infinite cmux attach TERMINAL_ID      # one terminal, full viewport
+infinite cmux terminal TERMINAL_ID close
+```
+
+This dispatches arguments unchanged to the separately installed `infinite-cmux` launcher on PATH. The launcher must be enrolled with the intended persistent cmux server; Infinite device pairing does not enroll it. It does not start a replacement server when the existing one is unavailable. Press Ctrl+B, then D in the workspace TUI to detach while server processes continue. Native terminal close commands end the selected cmux process and follow cmux's own controls, independently of Infinite's input leases.
+
+The personal launcher uses the pinned cmux runtime and its encrypted remote connection. A standalone SSH forwarding service can supply its loopback route and the Infinite HTTP route without the app running. The launcher and tunnel are local provisioning artifacts; `make` installs the Infinite client and its dispatch, but does not provision those services. See [cmux enrollment and its trust boundary](desktop.md#connect-a-cmux-server).
 
 ## Laptop execution with `--laptop`
 
@@ -55,7 +78,8 @@ After cloud handoff, `infinite recover SESSION_ID --output NEW_DIRECTORY` downlo
 ## Workspace sync and pull
 
 ```sh
-infinite sync --project PROJECT_ID     # from inside the checkout; the Git root is synced
+infinite sync                          # mirror this checkout beneath the server home
+infinite sync --project PROJECT_ID     # sync into an explicitly configured project
 infinite sync --status
 infinite sync --apply [--force] --project PROJECT_ID
 infinite sync --stop --project PROJECT_ID
@@ -83,7 +107,7 @@ This opt-in mode runs the installed Codex interface on the laptop and keeps its 
 
 Both machines need a Codex version with authenticated `--remote` support. A paired **owner** key is required for the local native interface. The initial launch requires a nonempty prompt: the tested app server cannot attach a second client to an empty conversation. Infinite uses legacy provider history because the tested WebSocket server cannot hydrate the native TUI's paginated default. Existing terminal sessions stay attached to their original process.
 
-Supported launch options are `--model`, `--config`, `--ask-for-approval`, `--sandbox` (including their short forms), `--search`, and `--no-alt-screen`, plus one prompt. Other native arguments require ordinary terminal mode. Options retain their values; Infinite separates the prompt with `--` so prompt text cannot become a provider subcommand. The cloud owns model settings, credentials, working directory, tools, and history. Laptop files are not uploaded.
+Supported launch options are `--model`, `--config`, `--ask-for-approval`, `--sandbox` (including their short forms), `--search`, and `--no-alt-screen`, plus one prompt. Other native arguments require ordinary terminal mode. Options retain their values; Infinite separates the prompt with `--` so prompt text cannot become a provider subcommand. The cloud owns model settings, credentials, tools, and history. The launch uses the mirrored checkout unless `--project ID` selects an existing server project.
 
 `resume` opens a new local interface attached by the recorded provider conversation ID; it does not create another thread or resubmit the initial prompt. Native Codex shortcuts apply. Infinite's Ctrl+E, Ctrl+G, and Ctrl+] shortcuts apply only to streamed terminals. `monitor` uses the cloud terminal and remains read-only until control is requested. A phone can take over using the existing controls; the worker rejects stale native requests, including approval replies. Losing control detaches the local interface. Reopen with `resume`; use `--takeover` only when intentionally replacing another device's control.
 
@@ -138,10 +162,10 @@ In ordinary terminal mode, everything after the provider name is passed as an ar
 infinite projects
 infinite --project PROJECT_ID --title "Investigate tests" codex --model MODEL
 infinite --detach --project PROJECT_ID claude "Review this checkout"
-infinite --client-config /private/client.json monitor SESSION_ID
+infinite --client-config "$CLIENT_CONFIG_FILE" monitor SESSION_ID
 ```
 
-Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not uploaded or translated. The CLI does not silently copy the current laptop checkout or its secrets. Only `infinite sync` and `--laptop` background preparation upload a checkout, and only after the owner starts them.
+Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not translated. A launch without `--project` uploads the selected checkout through workspace sync. Use `--project ID` to select an existing server project without automatic upload. Sync scope includes ignored files, untracked files, and Git metadata; credentials inside that scope travel to the server.
 
 `--laptop` Codex launches use the laptop project and background cloud handoff described above. The earlier [SSH prototype](hybrid-execution.md#earlier-ssh-prototype) remains available for isolated protocol experiments and retains its original offline behavior.
 
@@ -151,11 +175,11 @@ Use separate configured worktrees for parallel writers. Multiple sessions launch
 
 ## Install and pair another laptop
 
-Requires Node.js 22.14 or newer and Tailscale access to the host.
+Requires Node.js 22.14 or newer and access to the host through HTTPS or a separately established SSH tunnel.
 
 ```sh
 make
-infinite pair https://YOUR-HOST.tailnet.ts.net --token-file /private/owner.key
+infinite pair https://HOST.YOUR-TAILNET.ts.net --token-file "$OWNER_KEY_FILE"
 ```
 
 `make` (or `make build`) installs dependencies when `node_modules` is missing or older than the lockfile, builds `@infinite/attention`, `@infinite/remote`, and `@infinite/host`, then runs `scripts/install-client.mjs`. The same steps by hand:
@@ -170,6 +194,8 @@ node scripts/install-client.mjs
 
 The installer places `infinite` in `~/.local/bin` and an independent, versioned client runtime in the user's application-data directory. Add `~/.local/bin` to PATH if the installer reports it missing. The runtime bundles its dependencies and does not require this checkout or its `node_modules` directory. It refuses to overwrite an unrelated existing command.
 
-Pairing validates the host and device role before saving a mode-0600 `~/.config/infinite/client.json`. Use `--token-file -` to receive the key through stdin instead of a file. Do not put a key in command arguments or shell history. Remote pairing requires HTTPS; HTTP is accepted only for literal loopback development addresses. Redirects are refused so credentials are not forwarded to another endpoint.
+Pairing validates the host and device role before saving a mode-0600 `~/.config/infinite/client.json`. Use `--token-file -` to receive the key through stdin instead of a file. Do not put a key in command arguments or shell history. Remote pairing requires HTTPS; HTTP is accepted only for loopback addresses, including an SSH-forwarded local endpoint. Redirects are refused so credentials are not forwarded to another endpoint.
+
+For a tunnel that already forwards local port 4780 to the trusted server's API, use `infinite pair http://127.0.0.1:4780 --token-file "$OWNER_KEY_FILE"`. Keep the forward bound to loopback and verify the SSH host identity. SSH encrypts the network connection between laptop and server; the existing Infinite terminal CLI carries HTTP/WebSocket traffic inside that tunnel. It does not use the native Mac/phone application's encrypted WebSocket protocol or its public relay. Native provider gateways, `--laptop`, sync, and pull retain this direct connection path. The standalone tunnel can run at login and does not require the Mac app to be open.
 
 This client currently connects directly to a trusted single-tenant runner. TLS pairing is not confidential-VM attestation and does not implement the future operator-private multi-tenant protocol.

@@ -20,6 +20,7 @@ import { CmuxError } from "./cmux/client.js";
 import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
 import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
+import { MirroredProjects } from "./mirrored-projects.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { TeamService, TeamError } from "./teams.js";
@@ -27,7 +28,9 @@ import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-t
 import { GoalService } from "./goals.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
+import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt } from "./types.js";
+import { Summarizer, SummaryError } from "./summary.js";
 
 const id = z.uuid();
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
@@ -46,6 +49,7 @@ const createSchema = z
     nativeArgs: z.array(z.string().max(8192).refine((s) => !s.includes("\0")))
       .max(256).refine((args) => args.join("").length <= 32000).optional(),
     localUi: z.boolean().optional(),
+    cwd: z.string().max(4096).optional(),
     workspace: z.object({
       cwd: z.string().min(1).max(4096).refine(value => value.startsWith("/") && !value.includes("\0")),
       roots: z.array(z.string().min(1).max(4096).refine(value => value.startsWith("/") && !value.includes("\0"))).min(1).max(16),
@@ -93,15 +97,19 @@ export function createApp(config: Config, key: Buffer) {
     throw new Error("Machine access and cmux require a single-tenant host");
   validateLinearConfig(config);
   const app = express();
+  const mirroredProjects = runtimeSecurity(config.deployment).tenancy === "single-tenant" ? new MirroredProjects(config, key) : undefined;
   const manager = new Manager(config, key);
   const projectSync = new ProjectSync(config, key);
+  const desktopFiles = new DesktopFiles(config);
   // Session starts admitted past the sync check that the session list may not show yet.
   const startsInFlight = new Map<string, number>();
+  const projectFileChanges = new Set<string>();
   /**
    * A sync commit or apply evaluates projectRunning only after `applying()` turns true.
    * A start either sees that flag and is refused, or is counted before the check runs.
    */
   const startInProject = async <T>(projectId: string, start: () => Promise<T>): Promise<T> => {
+    if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
     if (projectSync.applying(projectId))
       throw new ProjectSyncError("A workspace sync is being applied to this project. Start the session after it finishes.", "sync-applying");
     startsInFlight.set(projectId, (startsInFlight.get(projectId) ?? 0) + 1);
@@ -145,7 +153,24 @@ export function createApp(config: Config, key: Buffer) {
       (["running", "starting"].includes(s.status) ||
         (["unavailable", "recording-error"].includes(s.status) && (alive(s.pid) || alive((s as { workerPid?: unknown }).workerPid)))));
   };
+  const desktopResources = new DesktopResources(config, listSessions);
+  const changeProjectFiles = async <T>(projectId: string, action: () => Promise<T>) => {
+    if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
+    projectFileChanges.add(projectId);
+    let held = false;
+    try {
+      if (await projectRunning(projectId)) throw new DesktopError("session-running", "Stop this project's running sessions before replacing files");
+      if (projectSync.applying(projectId)) throw new DesktopError("sync-applying", "A workspace sync is being applied. Retry after it finishes.");
+      // Fence sync after checking existing sessions, while new session admission is already closed.
+      startsInFlight.set(projectId, (startsInFlight.get(projectId) ?? 0) + 1); held = true;
+      return await action();
+    } finally {
+      if (held) { const left = startsInFlight.get(projectId)! - 1; if (left) startsInFlight.set(projectId, left); else startsInFlight.delete(projectId); }
+      projectFileChanges.delete(projectId);
+    }
+  };
   const pushStore = new PushStore(config.stateDir, key);
+  const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
   async function inputAuthority(sessionId: string, res: express.Response) {
     // Retained workers from earlier releases hash the entire request. Adding
     // optional fields would make a pre-upgrade receipt impossible to retry.
@@ -278,11 +303,15 @@ export function createApp(config: Config, key: Buffer) {
       teams: { enabled: Boolean(config.teams), maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
-      projects: config.projects.map(({ id, name, team, linear }) => ({ id, name, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
+      projects: config.projects.map(({ id, name, path, team, linear }) => ({ id, name, path, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
       capabilities: {
+        ...(mirroredProjects ? { workspaceMirror: 1 } : {}),
         signals: true,
         answer: ["owner", "controller"].includes(res.locals.role),
         push: Boolean(config.push?.enabled),
+        ...(summarizer ? { summaries: { model: summarizer.model } } : {}),
+        ...(config.remote?.enabled ? { remoteTerminal: 1 } : {}),
+        desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: DESKTOP_LIMITS.chunkBytes, maxFileBytes: DESKTOP_LIMITS.maxFileBytes },
       },
     }),
   );
@@ -318,6 +347,47 @@ export function createApp(config: Config, key: Buffer) {
     app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) =>
       res.json(await teams[action](standaloneTeam(req.params.id), teamActionSchema.parse(req.body))));
   }
+  app.get("/api/machine/resources", async (_req, res) => res.json(await desktopResources.sample()));
+  app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {
+    if (!mirroredProjects) return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
+    const { path } = z.object({ path: z.string().max(4096) }).strict().parse(req.body);
+    res.json(mirroredProjects.resolve(path));
+  });
+  app.get("/api/projects/:id/files", async (req, res) => {
+    res.json(await desktopFiles.list(projectSchema.parse(req.params.id), z.string().max(4096).default("").parse(req.query.path),
+      z.coerce.number().int().min(1).max(200).default(100).parse(req.query.limit), z.string().max(512).optional().parse(req.query.cursor)));
+  });
+  app.get("/api/projects/:id/file", async (req, res) => {
+    res.json(await desktopFiles.download(projectSchema.parse(req.params.id), z.string().min(1).max(4096).parse(req.query.path),
+      z.coerce.number().int().min(0).max(DESKTOP_LIMITS.maxFileBytes).default(0).parse(req.query.offset),
+      z.coerce.number().int().min(0).max(DESKTOP_LIMITS.chunkBytes).default(DESKTOP_LIMITS.chunkBytes).parse(req.query.length),
+      z.string().regex(/^[a-f0-9]{64}$/).optional().parse(req.query.sha256)));
+  });
+  app.post("/api/projects/:id/uploads", requireRole(["owner"]), async (req, res) => {
+    const body = z.object({ path: z.string().min(1).max(4096), size: z.number().int().min(0).max(DESKTOP_LIMITS.maxFileBytes),
+      sha256: z.string().regex(/^[a-f0-9]{64}$/), expectedHash: z.string().regex(/^[a-f0-9]{64}$/).nullable() }).strict().parse(req.body);
+    res.json(await desktopFiles.begin(projectSchema.parse(req.params.id), String(res.locals.deviceId), body));
+  });
+  app.put("/api/projects/:id/uploads/:upload", requireRole(["owner"]), async (req, res) => {
+    const body = z.object({ offset: z.number().int().min(0).max(DESKTOP_LIMITS.maxFileBytes), base64: z.string().max(DESKTOP_LIMITS.chunkBytes / 3 * 4) }).strict().parse(req.body);
+    res.json(await desktopFiles.chunk(projectSchema.parse(req.params.id), String(res.locals.deviceId), id.parse(req.params.upload), body.offset, body.base64));
+  });
+  app.post("/api/projects/:id/uploads/:upload/commit", requireRole(["owner"]), async (req, res) => {
+    const project = projectSchema.parse(req.params.id);
+    res.json(await changeProjectFiles(project, () => desktopFiles.commit(project, String(res.locals.deviceId), id.parse(req.params.upload))));
+  });
+  app.delete("/api/projects/:id/uploads/:upload", requireRole(["owner"]), async (req, res) => {
+    res.json(await desktopFiles.abort(projectSchema.parse(req.params.id), String(res.locals.deviceId), id.parse(req.params.upload)));
+  });
+  app.delete("/api/projects/:id/file", requireRole(["owner"]), async (req, res) => {
+    const project = projectSchema.parse(req.params.id), path = z.string().min(1).max(4096).parse(req.query.path);
+    const { expectedHash } = z.object({ expectedHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(req.body);
+    res.json(await changeProjectFiles(project, () => desktopFiles.remove(project, path, expectedHash)));
+  });
+  app.post("/api/projects/:id/directories", requireRole(["owner"]), async (req, res) => {
+    const project = projectSchema.parse(req.params.id), { path } = z.object({ path: z.string().min(1).max(4096) }).strict().parse(req.body);
+    res.json(await changeProjectFiles(project, () => desktopFiles.directory(project, path)));
+  });
   app.post("/api/devices/push", (req, res) => {
     const body = z
       .object({
@@ -425,10 +495,34 @@ export function createApp(config: Config, key: Buffer) {
     };
     res.json({ ...session, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id, resumable: resumable(session) });
   });
-  app.get("/api/sessions/:id/messages", (req, res) => {
-    const session = manager.meta(id.parse(req.params.id)).session;
+  app.get("/api/sessions/:id/messages", async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    const session = manager.meta(sessionId).session;
+    const transcript = (await manager.state(sessionId)).capabilities?.transcript === 1;
     res.json(recordedMessages(manager, session, z.string().max(100).optional().parse(req.query.after),
-      z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit)));
+      z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit), transcript));
+  });
+  // A digest of the chat after a cursor. The text is the model's reading, labeled as such.
+  app.get("/api/sessions/:id/summary", async (req, res) => {
+    if (!summarizer) return void res.status(503).json({ code: "summaries-unavailable", error: "This host has no summary model configured." });
+    const sessionId = id.parse(req.params.id);
+    const session = manager.meta(sessionId).session;
+    const from = z.string().regex(/^\d{1,16}$/).default("0").parse(req.query.after);
+    const transcript = (await manager.state(sessionId)).capabilities?.transcript === 1;
+    const messages = [];
+    let cursor = from, pages = 0;
+    for (;;) {
+      const page = recordedMessages(manager, session, cursor, 200, transcript);
+      messages.push(...page.messages);
+      cursor = page.cursor;
+      if (!page.more || ++pages >= 10 || messages.length >= 1000) break;
+    }
+    try {
+      res.json(await summarizer.summarize(sessionId, messages, from, cursor));
+    } catch (error) {
+      if (error instanceof SummaryError) return void res.status(error.status).json({ code: "summary-failed", error: error.message });
+      throw error;
+    }
   });
   app.get("/api/sessions/:id/file", async (req, res) => {
     const sessionId = id.parse(req.params.id);
@@ -492,6 +586,7 @@ export function createApp(config: Config, key: Buffer) {
                   "input-result",
                   "signal",
                   "usage",
+                  "message",
                 ]),
               )
               .min(1)
@@ -651,7 +746,7 @@ export function createApp(config: Config, key: Buffer) {
     const projectId = projectSchema.parse(req.params.id);
     const project = config.projects.find(p => p.id === projectId);
     if (!project) return void res.status(404).json({ error: "Unknown project" });
-    res.json({ id: project.id, name: project.name, sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
+    res.json({ id: project.id, name: project.name, path: project.path, sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
   });
   // Sync moves whole checkouts, ignored files and credentials included, so it shares laptop execution's single-tenant gate.
   app.use("/api/projects/:id/sync", (_req, res, next) => runtimeSecurity(config.deployment).tenancy === "single-tenant" ? next()
@@ -729,6 +824,7 @@ export function createApp(config: Config, key: Buffer) {
       if (error instanceof ProjectSyncError)
         return res.status(error.status).json({ code: error.code, error: error.message, ...(error.category ? { category: error.category, message: error.message } : {}) });
       if (error instanceof ContentError) return res.status(error.status).json({ error: error.message });
+      if (error instanceof DesktopError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof z.ZodError)
         return res.status(400).json({
           error: "Invalid request",
@@ -741,6 +837,11 @@ export function createApp(config: Config, key: Buffer) {
         return res.status(413).json({ error: "Request body is too large" });
       if (error instanceof SyntaxError)
         return res.status(400).json({ error: "Invalid JSON" });
+      if (/^\/api\/projects\/[^/]+\/(?:files?|uploads|directories)(?:\/|$)/.test(req.path)) {
+        const code = (error as NodeJS.ErrnoException).code;
+        return res.status(code === "ENOENT" ? 404 : code === "EACCES" || code === "EPERM" ? 403 : 409)
+          .json({ code: "file-unavailable", error: "The file operation could not be completed. Refresh the project before retrying." });
+      }
       // Workspace sync failures are about the project tree, not a session; their category never names a path.
       if (/^\/api\/projects\/[^/]+\/sync\//.test(req.path)) {
         const failure = syncFailure(error);
@@ -779,6 +880,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { goals.close(); teams.close(); usage.close(); linear.close(); closeTerminals(); closeNative(); closeRemote(); cmux?.close(); server.closeAllConnections(); };
+  const closeConnections = () => { goals.close(); teams.close(); usage.close(); linear.close(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); };
   return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

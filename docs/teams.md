@@ -180,10 +180,10 @@ ones configured on your host:
 ```json
 {
   "implementers": [
-    { "id": "haiku-medium", "label": "Primary light model", "provider": "claude", "model": "claude-haiku-model", "effort": "medium", "tier": "light", "limitFallback": "deepseek-flash-medium" }
+    { "id": "haiku-high", "label": "Haiku 5.5 high", "provider": "claude", "model": "claude-haiku-5-5", "effort": "high", "tier": "light", "limitFallback": "deepseek-flash-high" }
   ],
   "fallbacks": [
-    { "id": "deepseek-flash-medium", "label": "DeepSeek Flash medium", "provider": "opencode", "model": "deepseek/deepseek-flash", "variant": "medium", "tier": "light" }
+    { "id": "deepseek-flash-high", "label": "DeepSeek V4.1 Flash high", "provider": "opencode", "model": "deepseek/deepseek-flash", "variant": "high", "tier": "light", "dataUse": "standard" }
   ]
 }
 ```
@@ -250,10 +250,10 @@ for all roles. Goals always use a recorded lineup and require both coordinator
 and reviewer profiles to have `tier: "strong"`.
 
 This starting configuration uses Opus 5.5 at `xhigh` for coordination and repair,
-Astra 6 at `xhigh` for review, and Haiku 5.5 and GPT-6 Luna at `medium` for ordinary
-worker tasks. Strong profiles are available through the explicit escalation
-pool. Model IDs live in host configuration, rather than application routing
-code.
+Astra 6 at `high` for review, and Haiku 5.5 and GPT-6 Luna at `high` for ordinary
+worker tasks. Opus 5.5 `xhigh` and Astra 6 `xhigh` are available through the
+explicit escalation pool. Model IDs live in host configuration, rather than
+application routing code.
 
 ```json
 {
@@ -261,40 +261,40 @@ code.
     "coordinator": {
       "id": "opus-xhigh", "label": "Opus 5.5 xhigh",
       "provider": "claude", "model": "claude-opus-5-5", "effort": "xhigh",
-      "tier": "strong"
+      "tier": "strong", "dataUse": "standard"
     },
     "implementers": [
       {
-        "id": "haiku-medium", "label": "Haiku 5.5 medium",
-        "provider": "claude", "model": "claude-haiku-5-5", "effort": "medium",
-        "tier": "light"
+        "id": "haiku-high", "label": "Haiku 5.5 high",
+        "provider": "claude", "model": "claude-haiku-5-5", "effort": "high",
+        "tier": "light", "dataUse": "standard"
       },
       {
-        "id": "luna-medium", "label": "GPT-6 Luna medium",
-        "provider": "codex", "model": "gpt-6-luna", "effort": "medium",
-        "tier": "light"
+        "id": "luna-high", "label": "Luna 6 high",
+        "provider": "codex", "model": "gpt-6-luna", "effort": "high",
+        "tier": "light", "dataUse": "standard"
       }
     ],
     "integrator": {
       "id": "opus-xhigh", "label": "Opus 5.5 xhigh",
       "provider": "claude", "model": "claude-opus-5-5", "effort": "xhigh",
-      "tier": "strong"
+      "tier": "strong", "dataUse": "standard"
     },
     "reviewer": {
-      "id": "astra-xhigh", "label": "Astra 6 xhigh",
-      "provider": "codex", "model": "gpt-6-astra", "effort": "xhigh",
-      "tier": "strong"
+      "id": "astra-high", "label": "Astra 6 high",
+      "provider": "codex", "model": "gpt-6-astra", "effort": "high",
+      "tier": "strong", "dataUse": "standard"
     },
     "escalations": [
       {
         "id": "opus-xhigh", "label": "Opus 5.5 xhigh",
         "provider": "claude", "model": "claude-opus-5-5", "effort": "xhigh",
-        "tier": "strong"
+        "tier": "strong", "dataUse": "standard"
       },
       {
         "id": "astra-xhigh", "label": "Astra 6 xhigh",
         "provider": "codex", "model": "gpt-6-astra", "effort": "xhigh",
-        "tier": "strong"
+        "tier": "strong", "dataUse": "standard"
       }
     ]
   }
@@ -303,20 +303,20 @@ code.
 
 Optional OpenCode workers can be added to `implementers`. OpenCode uses a
 provider-qualified `model` and optional `variant`; it does not accept an
-`effort` field in these profiles. These examples request the `medium` variant
-for Meta Muse Spark Contributor and `low` for DeepSeek Flash:
+`effort` field in these profiles. These examples match the approved high-variant
+profiles for Meta Muse Spark Contributor and DeepSeek Flash:
 
 ```json
 [
   {
-    "id": "spark-medium", "label": "Muse Spark Contributor medium",
+    "id": "muse-spark-contributor-high", "label": "Muse Spark 1.3 Contributor high",
     "provider": "opencode", "model": "meta/muse-spark-1.3-contributor",
-    "variant": "medium", "tier": "light", "dataUse": "contributor"
+    "variant": "high", "tier": "light", "dataUse": "contributor"
   },
   {
-    "id": "deepseek-low", "label": "DeepSeek Flash low",
+    "id": "deepseek-flash-high", "label": "DeepSeek V4.1 Flash high",
     "provider": "opencode", "model": "deepseek/deepseek-flash",
-    "variant": "low", "tier": "light", "dataUse": "standard"
+    "variant": "high", "tier": "light", "dataUse": "standard"
   }
 ]
 ```

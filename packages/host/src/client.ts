@@ -1,11 +1,11 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import type { Receipt, Session, Status, WorkerState } from "./types.js";
+import type { ControlLease, Receipt, Session, Status, WorkerState } from "./types.js";
 import { terminalConnection, TerminalAccessError, TerminalControlError, type TerminalPage } from "./client-transport.js";
 import { draftTerminal } from "./client-draft.js";
 import { localDraftStore } from "./client-draft-store.js";
@@ -16,9 +16,10 @@ import { validateNativeCodexArgs } from "./native-codex.js";
 import { checkLaptopExecutor, startLaptopService } from "./laptop-service.js";
 import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWorkspaceManifest } from "./workspace-checkpoint.js";
 import { readSyncState, startSyncService, stopSyncService, syncServiceRunning } from "./sync-service.js";
+import { localProjectPath } from "./mirrored-projects.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
-type Me = { role: string; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
+type Me = { role: string; capabilities?: { workspaceMirror?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
 const providerNames: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
 /** Project IDs name local sync files, so an ID from the host or the command line is checked before it becomes a path. */
@@ -53,10 +54,10 @@ function loadConfig(path: string): ClientConfig {
   return { ...config, origin: originOf(config.origin) };
 }
 function connection(config: ClientConfig, clientId = randomUUID()) {
-  const request = async (path: string, body?: unknown, signal?: AbortSignal) => {
+  const request = async (path: string, body?: unknown, signal?: AbortSignal, headers: Record<string, string> = {}) => {
     const response = await fetch(config.origin + "/api" + path, {
       method: body === undefined ? "GET" : "POST", redirect: "error",
-      headers: { Authorization: `Bearer ${config.token}`, "X-Infinite-Client": clientId, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+      headers: { Authorization: `Bearer ${config.token}`, "X-Infinite-Client": clientId, ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: signal ?? AbortSignal.timeout(15000),
     });
@@ -67,7 +68,10 @@ function connection(config: ClientConfig, clientId = randomUUID()) {
     }
     return response;
   };
-  return { request, json: async <T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> => (await request(path, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined)).json() as Promise<T> };
+  return { request, json: async <T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>): Promise<T> => (await request(path, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined, headers)).json() as Promise<T> };
+}
+function sessionCwd(session: Session & Partial<WorkerState>) {
+  return (session.execution?.location ?? session.executionLocation) === "laptop" ? session.workspace?.cwd : session.cwd;
 }
 /** One line per session, with where its tools run: the live executor when the session reports one, else its recorded location. */
 function printSessions(sessions: (Session & Partial<WorkerState>)[], machine: string) {
@@ -75,7 +79,83 @@ function printSessions(sessions: (Session & Partial<WorkerState>)[], machine: st
     const execution = s.execution;
     const where = (execution?.location ?? s.executionLocation) === "laptop" ? "laptop tools" : `tools on ${clean(machine)}`;
     const detail = execution ? ` · ${execution.state}${execution.checkpoint ? ` · checkpoint ${Math.max(0, Math.floor((Date.now() - Date.parse(execution.checkpoint.capturedAt)) / 1000))}s old` : ""}${execution.location === "laptop" ? execution.cloudReady ? " · cloud ready" : " · cloud preparing" : ""}` : "";
-    console.log(`${s.id}  ${s.provider.padEnd(8)}  ${s.status.padEnd(15)}  ${clean(s.title)}  · ${where}${detail}`);
+    console.log(`${s.id}  ${s.provider.padEnd(8)}  ${s.status.padEnd(15)}  ${clean(s.title)}  · project ${clean(s.projectId)} · cwd ${clean(sessionCwd(s) ?? "unavailable")} · ${where}${detail}`);
+  }
+}
+
+type ResourceSnapshot = {
+  capturedAt: string; sampleIntervalMs: number | null; uptimeSeconds: number;
+  cpu: { logicalCount: number; usagePercent: number | null; loadAverage: number[] | null };
+  memory: { totalBytes: number; availableBytes: number; availableKind: string };
+  swap: { totalBytes: number | null; usedBytes: number | null };
+  network: { receivedBytes: number | null; sentBytes: number | null; receiveBytesPerSecond: number | null; sendBytesPerSecond: number | null };
+  disks: { projectId: string; totalBytes: number | null; availableBytes: number | null }[];
+  sessions: { sessionId: string; pid: number | null; cpuPercent: number | null; rssBytes: number | null }[];
+  unavailable: { field: string; reason: string }[];
+};
+function printResources(value: ResourceSnapshot) {
+  const bytes = (n: number | null) => n === null ? "unavailable" : `${(n / 1048576).toFixed(1)} MiB`;
+  const percent = (n: number | null) => n === null ? "unavailable" : `${n.toFixed(1)}%`;
+  const rate = (n: number | null) => n === null ? "unavailable" : `${bytes(n)}/s`;
+  console.log(`Captured ${clean(value.capturedAt)} · uptime ${(value.uptimeSeconds / 3600).toFixed(1)} h · interval ${value.sampleIntervalMs === null ? "first sample" : `${value.sampleIntervalMs} ms`}`);
+  console.log(`CPU ${percent(value.cpu.usagePercent)} · ${value.cpu.logicalCount} logical CPUs · load ${value.cpu.loadAverage?.map(n => n.toFixed(2)).join(" / ") ?? "unavailable"}`);
+  console.log(`Memory ${bytes(value.memory.availableBytes)} ${clean(value.memory.availableKind)} / ${bytes(value.memory.totalBytes)} total · swap ${bytes(value.swap.usedBytes)} used / ${bytes(value.swap.totalBytes)} total`);
+  console.log(`Network received ${bytes(value.network.receivedBytes)} (${rate(value.network.receiveBytesPerSecond)}) · sent ${bytes(value.network.sentBytes)} (${rate(value.network.sendBytesPerSecond)})`);
+  for (const disk of value.disks) console.log(`Disk ${clean(disk.projectId)} · ${bytes(disk.availableBytes)} available / ${bytes(disk.totalBytes)} total`);
+  for (const session of value.sessions) console.log(`Session ${clean(session.sessionId)} · PID ${session.pid ?? "unavailable"} · CPU ${percent(session.cpuPercent)} · RSS ${bytes(session.rssBytes)} (provider process)`);
+  for (const item of value.unavailable) console.log(`Unavailable ${clean(item.field)}: ${clean(item.reason)}`);
+}
+async function resources(api: ReturnType<typeof connection>, options: Record<string, string | boolean>) {
+  const abort = new AbortController(), stop = () => abort.abort();
+  process.on("SIGINT", stop); process.on("SIGTERM", stop);
+  try {
+    do {
+      const value = await api.json<ResourceSnapshot>("/machine/resources", undefined, abort.signal);
+      if (options["--json"]) console.log(JSON.stringify(value, null, options["--watch"] ? undefined : 2));
+      else {
+        if (options["--watch"] && process.stdout.isTTY) process.stdout.write("\x1b[2J\x1b[H");
+        printResources(value);
+      }
+      if (!options["--watch"]) return;
+      await delay(2000, undefined, { signal: abort.signal });
+    } while (!abort.signal.aborted);
+  } catch (error) { if (!abort.signal.aborted) throw error; }
+  finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
+}
+
+async function closeSession(api: ReturnType<typeof connection>, me: Me, selected: Session, options: Record<string, string | boolean>) {
+  if (me.role !== "owner") throw new Error("Closing a session requires an owner device key");
+  const session = await api.json<Session & WorkerState>(`/sessions/${selected.id}`);
+  if (session.status !== "running") throw new Error(`Session is ${clean(session.status)}. Inspect it with infinite monitor ${selected.id}; no close was sent.`);
+  if (!options["--yes"]) {
+    if (!process.stdin.isTTY) throw new Error("Closing a session ends its provider process. Use --yes with an explicit session ID for noninteractive use.");
+    const input = createInterface({ input: process.stdin, output: process.stderr });
+    try {
+      const answer = await input.question(`Close ${clean(session.provider)} ${JSON.stringify(clean(session.title))} (${session.id}) in project ${clean(session.projectId)}, cwd ${clean(sessionCwd(session) ?? "unavailable")}? [y/N] `);
+      if (!/^(y|yes)$/i.test(answer.trim())) { console.error("[Infinite] Close cancelled. The session keeps running."); return; }
+    } finally { input.close(); }
+  }
+  let lease: ControlLease | undefined;
+  if (session.capabilities?.inputControl) {
+    try { lease = (await api.json<{ control: ControlLease }>(`/sessions/${session.id}/control`, { action: "claim", ...(options["--takeover"] ? { takeover: true } : {}) })).control; }
+    catch (error) {
+      if (error instanceof HttpError && error.status === 409) throw new Error("Session control is held by another client or changed. Release it there, or use close --takeover to replace its control explicitly. No close was sent.");
+      throw error;
+    }
+  }
+  const headers = lease ? { "X-Infinite-Control": lease.id } : undefined;
+  const requestId = randomUUID();
+  console.error(`[Infinite] Close ${requestId} · session ${session.id}`);
+  try {
+    const receipt = await api.json<Receipt>(`/sessions/${session.id}/stop`, { requestId }, undefined, headers);
+    if (receipt.requestId !== requestId || receipt.state !== "delivered") throw new Error("Unconfirmed close receipt");
+    if (options["--json"]) console.log(JSON.stringify({ sessionId: session.id, ...receipt }, null, 2));
+    else console.log(`Close delivered for ${session.id}. Use infinite list to check process status.`);
+  } catch (error) {
+    if (error instanceof HttpError && [401, 403, 409].includes(error.status)) throw error;
+    throw new Error(`Close delivery is unconfirmed for ${session.id} (request ${requestId}). Nothing was retried. Inspect infinite list or monitor before taking further action.`);
+  } finally {
+    if (lease) await api.json(`/sessions/${session.id}/control`, { action: "release", leaseId: lease.id }).catch(() => {});
   }
 }
 async function selectSession(sessions: Session[], requested: string | undefined, monitor: boolean) {
@@ -334,7 +414,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "usage", "sync", "pull"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "usage", "resources", "close", "sync", "pull"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
@@ -343,7 +423,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
   const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output"]);
-  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force"]);
+  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes"]);
   const option = () => {
     const name = args.shift()!;
     if (name === "--include" && args.length) includes.push(args.shift()!);
@@ -367,6 +447,10 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   if (options["--force"] && !options["--apply"]) throw new Error("--force applies to infinite sync --apply");
   if (command === "sync" && positional.length) throw new Error("infinite sync takes no arguments; run it inside the checkout and choose the project with --project ID");
   if (command === "pull" && positional.length > 1) throw new Error("infinite pull takes at most one project ID");
+  if (options["--watch"] && command !== "resources") throw new Error("--watch applies to infinite resources");
+  if (options["--yes"] && command !== "close") throw new Error("--yes applies to infinite close");
+  if (command === "resources" && positional.length) throw new Error("infinite resources takes no arguments");
+  if (command === "close" && positional.length !== 1) throw new Error("Usage: infinite close SESSION_ID [--yes] [--takeover]");
   return { command, args: providers.has(command) ? args : positional, options, includes };
 }
 
@@ -392,6 +476,19 @@ function gitRoot(cwd: string) {
   try { return realpathSync(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()); }
   catch { return cwd; }
 }
+/** A local sync record keeps offline stop and explicit apply/pull pointed at this checkout. */
+function localSyncProject(syncDir: string, origin: string): string | undefined {
+  if (!existsSync(syncDir)) return undefined;
+  const root = gitRoot(realpathSync(process.cwd()));
+  const matches = readdirSync(syncDir).flatMap(name => {
+    if (!/^[a-z0-9-]{1,80}\.json$/.test(name)) return [];
+    try {
+      const state = readSyncState(join(syncDir, name));
+      return state?.root === root && state.origin === origin ? [name.slice(0, -5)] : [];
+    } catch { return []; }
+  });
+  return matches.length === 1 ? matches[0] : undefined;
+}
 function age(iso?: string) {
   if (!iso) return "never";
   const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
@@ -413,6 +510,16 @@ function describeSync(sync: ProjectDetail["sync"]) {
 }
 
 export async function handleClientCommand(argv: string[]): Promise<boolean> {
+  if (argv[0] === "cmux") {
+    try {
+      const child = spawn("infinite-cmux", argv.slice(1), { stdio: "inherit" });
+      process.exitCode = await new Promise<number>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", code => resolve(code ?? 1));
+      });
+    } catch { console.error("[Infinite] The standalone infinite-cmux launcher is unavailable. Install and pair it before using infinite cmux."); process.exitCode = 1; }
+    return true;
+  }
   const progress = startupProgress();
   const args = [...argv];
   // Keep server administration commands and their --config semantics intact.
@@ -478,12 +585,13 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       }
       return true;
     }
+    if (command === "resources") { await resources(api, options); return true; }
     if (command === "sync" && (options["--stop"] || options["--status"])) {
       // The service is a local process: stopping or inspecting it must not depend on reaching the host.
       const syncDir = join(dirname(path), "sync");
       const recorded = existsSync(syncDir) ? readdirSync(syncDir).flatMap(name => /^([a-z0-9-]{1,80})\.json$/.exec(name)?.[1] ?? []) : [];
       if (options["--stop"]) {
-        const projectId = String(options["--project"] ?? config.projectId ?? (recorded.length === 1 ? recorded[0] : ""));
+        const projectId = String(options["--project"] ?? localSyncProject(syncDir, config.origin) ?? config.projectId ?? (recorded.length === 1 ? recorded[0] : ""));
         if (!PROJECT_ID.test(projectId)) throw new Error(`Choose a project with --project ID${recorded.length ? ` (recorded: ${recorded.join(", ")})` : ""}`);
         console.log(stopSyncService(join(syncDir, `${projectId}.json`)) ? "Sync service stopped. The cloud copy keeps its last applied generation." : "No sync service was running for this project.");
         return true;
@@ -503,6 +611,28 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command !== "projects") progress.start(`Connecting to ${new URL(config.origin).hostname}`);
     const me = await api.json<Me>("/me");
     progress.stop();
+    const mappedProject = async () => {
+      if (me.capabilities?.workspaceMirror !== 1) throw new Error("Upgrade the host for local folder mapping, or select a configured cloud project with --project ID.");
+      const cwd = realpathSync(process.cwd()), root = gitRoot(cwd);
+      const project = await api.json<{ id: string; name: string; path: string }>("/projects/resolve", { path: localProjectPath(root) });
+      if (!PROJECT_ID.test(project.id)) throw new Error("Invalid mirrored project response");
+      return { ...project, root, cwd: relative(root, cwd).split(sep).join("/") };
+    };
+    const syncProject = async (projectId: string, root: string, reuse: boolean) => {
+      const syncDir = join(dirname(path), "sync"), stateFile = join(syncDir, `${projectId}.json`);
+      const existing = readSyncState(stateFile);
+      if (reuse && existing && syncServiceRunning(existing)) {
+        if (existing.root !== root || existing.origin !== config.origin) throw new Error("A different checkout already syncs this cloud project. Stop its sync service before changing folders.");
+        if (!existing.lastCommitAt) throw new Error("Workspace sync is still preparing its first upload. Wait for it before launching a session.");
+        return { skipped: { count: existing.skipped ?? 0, paths: [] as string[] } };
+      }
+      return startSyncService({ origin: config.origin, token: config.token, projectId, root, stateFile, storeDir: join(syncDir, `${projectId}-store`) });
+    };
+    if (command === "close") {
+      const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
+      await closeSession(api, me, await selectSession(sessions, positional[0], true), options);
+      return true;
+    }
     if (command === "projects") {
       for (const p of me.projects) {
         const detail = await api.json<ProjectDetail>(`/projects/${p.id}`).catch(() => undefined);
@@ -536,10 +666,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     }
     if (command === "sync") {
       if (me.role !== "owner") throw new Error("Workspace sync requires an owner device key");
-      const syncDir = join(dirname(path), "sync");
-      const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
-      if (!PROJECT_ID.test(projectId) || !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
-      const stateFile = join(syncDir, `${projectId}.json`);
+      const mapped = !options["--project"] && !options["--apply"] ? await mappedProject() : undefined;
+      const projectId = String(mapped?.id ?? options["--project"] ?? localSyncProject(join(dirname(path), "sync"), config.origin) ?? config.projectId ?? me.projects[0]?.id ?? "");
+      if (!PROJECT_ID.test(projectId) || (!mapped && !me.projects.some(p => p.id === projectId))) throw new Error("Unknown project. Use infinite projects");
       if (options["--apply"]) {
         // A large tree can take minutes to publish; a refusal (409) leaves its reason in the pending marker.
         const applied = await api.request(`/projects/${projectId}/sync/apply`, options["--force"] ? { force: true } : {}, AbortSignal.timeout(300000)).catch(async (error: unknown) => {
@@ -548,19 +677,19 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         });
         console.log(describeSync(await applied.json() as ProjectDetail["sync"])); return true;
       }
-      const root = gitRoot(realpathSync(process.cwd()));
+      const root = mapped?.root ?? gitRoot(realpathSync(process.cwd()));
       if (root === realpathSync(homedir()) || root === dirname(root)) throw new Error("Run inside a project directory; selecting the entire home or filesystem is not supported");
       progress.start(`Uploading ${clean(root)} to project ${projectId}`);
-      const { skipped } = await startSyncService({ origin: config.origin, token: config.token, projectId, root, stateFile, storeDir: join(syncDir, `${projectId}-store`) });
+      const { skipped } = await syncProject(projectId, root, Boolean(mapped));
       progress.stop();
       if (skipped.count) console.error(`[Infinite] Left out ${skipped.count} socket, FIFO, or device file${skipped.count === 1 ? "" : "s"}, which sync cannot copy: ${skipped.paths.map(clean).join(", ")}${skipped.count > skipped.paths.length ? ", …" : ""}`);
       const detail = await api.json<ProjectDetail>(`/projects/${projectId}`);
-      console.error(`[Infinite] Sync service running for ${clean(root)} → ${projectId}. ${describeSync(detail.sync)}. It keeps running after this command exits; stop it with infinite sync --stop.`);
+      console.error(`[Infinite] Sync service running for ${clean(root)} → ${projectId}. ${describeSync(detail.sync)}. It keeps running after this command exits; stop it with infinite sync --stop --project ${projectId}.`);
       return true;
     }
     if (command === "pull") {
       if (me.role !== "owner") throw new Error("Workspace pull requires an owner device key");
-      const projectId = positional[0] ?? String(config.projectId ?? me.projects[0]?.id ?? "");
+      const projectId = positional[0] ?? String(localSyncProject(join(dirname(path), "sync"), config.origin) ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!PROJECT_ID.test(projectId) || !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
       const directory = join(dirname(path), "pulls", projectId), storeDir = join(directory, "objects");
       const output = options["--output"] === undefined ? undefined : resolve(String(options["--output"]));
@@ -608,8 +737,16 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         } else validateNativeOpenCodeArgs(nativeArgs);
         if (!options["--detach"]) await (command === "codex" ? checkNativeCodex : checkNativeOpenCode)();
       }
-      const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
-      if (!me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      const mapped = !workspace && !options["--project"] ? await mappedProject() : undefined;
+      const projectId = String(mapped?.id ?? options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
+      if (!mapped && !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      if (mapped) {
+        progress.start(`Syncing ${clean(mapped.root)} to ${clean(mapped.path)}`);
+        await syncProject(projectId, mapped.root, true);
+        const detail = await api.json<ProjectDetail>(`/projects/${projectId}`);
+        if (!detail.sync.appliedManifest) throw new Error(`The mirrored workspace has not been applied. Inspect infinite sync --status; apply it with infinite sync --apply --project ${projectId} before launching.`);
+        progress.stop();
+      }
       if (!workspace) {
         // A cloud session starts on the tree in place; laptop changes that wait for an apply are not in it.
         const pending = (await api.json<ProjectDetail>(`/projects/${projectId}`).catch(() => undefined))?.sync?.pendingGeneration;
@@ -618,7 +755,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const requestId = randomUUID();
       console.error(`[Infinite] Launch ${requestId} on ${config.origin} · project ${projectId}`);
       progress.start(`Starting ${providerNames[command]} on ${new URL(config.origin).hostname}`);
-      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs, ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
+      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs, ...(mapped?.cwd ? { cwd: mapped.cwd } : {}), ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
       if (workspace) {
         progress.start("Connecting the laptop executor");
         await startLaptopService({ ...config, sessionId: session.id, workspaceToken: workspace.token, cwd: workspace.cwd, roots: workspace.roots, configFile: path });

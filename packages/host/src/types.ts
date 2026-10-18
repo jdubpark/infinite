@@ -70,7 +70,7 @@ export interface Session {
 export interface Event {
   seq: number;
   at: string;
-  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "usage";
+  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "usage" | "message";
   data: Record<string, unknown>;
 }
 export interface Project {
@@ -101,8 +101,10 @@ export interface Config {
   /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */
   usage?: import("./config.js").UsageConfig;
   deployment?: import("./deployment.js").Deployment;
-  /** Workspace sync. `sharedGroup` makes applied trees group-writable for a separate agent account. */
-  sync?: { sharedGroup?: boolean };
+  /** Workspace sync. `homeDir` overrides the server home used for folder mapping; `sharedGroup` permits a separate agent account. */
+  sync?: { sharedGroup?: boolean; homeDir?: string };
+  /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
+  summaries?: { model: string; apiKeyFile: string; baseUrl: string };
   port: number;
   origin: string;
   stateDir: string;
@@ -140,7 +142,8 @@ export interface WorkerState {
   seq: number;
   screen: string;
   attention: Attention;
-  capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode" };
+  /** `transcript` means chat messages come from the provider's own conversation record. */
+  capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode"; transcript?: 1 };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
   nativeSession?: { id: string; source: "hook" | "protocol" };

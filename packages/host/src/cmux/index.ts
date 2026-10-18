@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative } from "node:path";
 import { applyLifecycle, initialAttention, type Attention, type Prompt } from "@infinite/attention";
-import type { CreateSession } from "../manager.js";
+import { projectCwd, type CreateSession } from "../manager.js";
 import type { Config, ControlActor, ControlLease, Event, InputControl, Receipt, Session, WorkerRequest, WorkerState } from "../types.js";
 import { Journal, readEvents, unseal, writeSealed } from "../vault.js";
 import { CmuxClient, CmuxError, array, string, type Json, type Surface } from "./client.js";
@@ -344,7 +344,7 @@ export class CmuxSessions {
 
   list() {
     const rows = () => [...this.records.values()].map((record) => {
-      const { context: _context, initialPrompt: _prompt, nativeArgs: _args, cwd: _cwd, ...session } = record.session;
+      const { context: _context, initialPrompt: _prompt, nativeArgs: _args, ...session } = record.session;
       const { screen: _screen, ...state } = this.state(record);
       return { ...session, ...state, attention: { ...state.attention, lastMessage: state.attention.lastMessage?.slice(0, 280) } };
     });
@@ -403,7 +403,7 @@ export class CmuxSessions {
       await this.refresh();
       if (!this.available) throw new CmuxError("cmux-unavailable");
       if ([...this.records.values()].filter((row) => ["running", "starting"].includes(row.session.status)).length >= this.config.maxSessions) throw new CmuxError("session-limit");
-      const record = this.newRecord(request.provider as CmuxProvider, project.path, request.title, request.requestId);
+      const record = this.newRecord(request.provider as CmuxProvider, projectCwd(project.path, request.cwd), request.title, request.requestId);
       if (!record) throw new CmuxError("unknown-project");
       record.session.initialPrompt = request.prompt;
       const contextFile = join(this.config.stateDir, "contexts", `${project.id}.sealed`);

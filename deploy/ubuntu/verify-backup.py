@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decrypt a backup into a fresh private directory, verify every file, and check SQLite."""
+"""Verify backup contents in a private directory; Linux ACLs and owners are not applied."""
 import argparse
 import hashlib
 import json
@@ -26,7 +26,10 @@ def main():
     # Never overwrite an existing project or restore over the live server.
     args.restore_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
     external_links = []
+    acl_records = 0
     def safe_member(member, destination):
+        nonlocal acl_records
+        acl_records += sum(key in member.pax_headers for key in ("SCHILY.acl.access", "SCHILY.acl.default"))
         if member.issym():
             target = Path(destination) / Path(member.name).parent / member.linkname
             if Path(member.linkname).is_absolute() or not target.resolve().is_relative_to(Path(destination).resolve()):
@@ -60,7 +63,9 @@ def main():
     if external_links:
         (args.restore_dir / "external-links.json").write_text(json.dumps(external_links, indent=2) + "\n")
     checked = 0
-    for path in (args.restore_dir / "data").rglob("*.db"):
+    for path in (args.restore_dir / "data").rglob("*"):
+        if path.suffix not in {".db", ".sqlite", ".sqlite3"} or not path.is_file():
+            continue
         if path.is_symlink():
             continue
         with path.open("rb") as source:
@@ -71,7 +76,8 @@ def main():
             if database.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
                 raise RuntimeError("A restored SQLite database failed integrity checking")
         checked += 1
-    print(json.dumps({"verifiedFiles": len(manifest["files"]), "sqliteDatabases": checked, "createdAt": manifest["createdAt"], "pauseSeconds": manifest["pauseSeconds"], "externalSymlinksSkipped": len(external_links), "restoreVerified": True}))
+    print(json.dumps({"verifiedFiles": len(manifest["files"]), "sqliteDatabases": checked, "createdAt": manifest["createdAt"], "pauseSeconds": manifest["pauseSeconds"], "externalSymlinksSkipped": len(external_links), "contentsVerified": True,
+                      "archiveACLRecords": acl_records, "posixACLsApplied": False, "numericOwnersApplied": False}))
 
 
 if __name__ == "__main__":

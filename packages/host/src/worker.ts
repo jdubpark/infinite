@@ -33,8 +33,9 @@ import {
 } from "@infinite/attention";
 import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
-import { startHookServer, HookPayloadError, type HookRoute } from "./hooks.js";
+import { startHookServer, HookPayloadError, type HookReply, type HookRoute } from "./hooks.js";
 import { teamReportEnvelopeSchema } from "./team-types.js";
+import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
 import { buildLaunch } from "./launch.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
@@ -293,7 +294,26 @@ function blockShown(open: Prompt) {
 
 let hooksReady = false;
 let teamReportReceipt: { requestId: string; digest: string } | undefined;
-function onHook(route: HookRoute, body: unknown) {
+// ---- Chat: the provider's own conversation record ------------------------------------------
+// The relay streams the transcript file from the worker's cursor; the worker never opens it.
+let transcript: { path: string; tail: TranscriptTail } | undefined;
+const MESSAGE_FIELDS = new Set(["id", "role", "text", "toolName", "ts"]);
+/** Journals one chat message exactly as the provider recorded it; text is bounded at ingest. */
+function recordMessage(message: TranscriptMessage) {
+  append("message", Object.fromEntries(Object.entries(message).filter(([key, value]) => MESSAGE_FIELDS.has(key) && value !== undefined)));
+  if (state.capabilities?.transcript !== 1) {
+    state = { ...state, capabilities: { ...state.capabilities, transcript: 1 } };
+    persist();
+  }
+}
+function onTranscript(body: unknown): HookReply | void {
+  const b = body as Record<string, unknown>;
+  if (!transcript || b.path !== transcript.path || typeof b.text !== "string") return;
+  // A chunk from elsewhere than the cursor is not applied; the reply tells the relay where to resume.
+  if (b.offset === transcript.tail.offset) for (const message of transcript.tail.ingest(b.text)) recordMessage(message);
+  return { after: transcript.tail.offset };
+}
+function onHook(route: HookRoute, body: unknown): HookReply | void {
   if (route === "team-report") {
     const parsed = teamReportEnvelopeSchema.safeParse(body);
     if (!parsed.success || !session.team) throw new HookPayloadError(400);
@@ -311,6 +331,7 @@ function onHook(route: HookRoute, body: unknown) {
     return;
   }
   if (state.status !== "running") return;
+  if (route === "transcript") return onTranscript(body);
   const signals =
     route === "claude"
       ? mapClaudeHook(body)
@@ -327,11 +348,13 @@ function onHook(route: HookRoute, body: unknown) {
         : route;
   // Only the authenticated provider hook supplies its native identity. Subagent hooks do not
   // replace the primary conversation, and terminal text / transcript filenames are never guessed.
+  // The rehearsal provider speaks the Claude hook contract.
+  const hookProvider = provider === "demo" ? "claude" : provider;
   const nativeId = !b.agent_id && (
-    ((provider === "claude" && route === "claude") || (provider === "codex" && route === "codex")) &&
+    ((hookProvider === "claude" && route === "claude") || (hookProvider === "codex" && route === "codex")) &&
       typeof b.hook_event_name === "string"
       ? b.session_id
-      : provider === "codex" && route === "codex-notify" && b.type === "agent-turn-complete"
+      : hookProvider === "codex" && route === "codex-notify" && b.type === "agent-turn-complete"
         ? b["thread-id"]
         : undefined
   );
@@ -339,6 +362,14 @@ function onHook(route: HookRoute, body: unknown) {
       !/[\x00-\x20\x7f]/.test(nativeId) && nativeId !== state.nativeSession?.id) {
     state = { ...state, nativeSession: { id: nativeId, source: "hook" } };
     persist();
+  }
+  // The same authenticated primary hook names the conversation file; the reply asks the relay
+  // for its bytes from where the worker left off.
+  let reply: HookReply | void = undefined;
+  const path = b.transcript_path;
+  if (nativeId !== undefined && typeof path === "string" && path.startsWith("/") && path.endsWith(".jsonl") && path.length <= 4096 && !/[\x00-\x1f]/.test(path)) {
+    if (transcript?.path !== path) transcript = { path, tail: new TranscriptTail(route === "claude" ? "claude" : "codex") };
+    reply = { transcript: { path, after: transcript.tail.offset } };
   }
   if (!hooksReady) {
     hooksReady = true;
@@ -368,6 +399,7 @@ function onHook(route: HookRoute, body: unknown) {
     }
     record(signal, "hook", agent);
   }
+  return reply;
 }
 
 let lastOutputAt = Date.now();
@@ -1075,6 +1107,7 @@ server.listen(socketPath(runDir, session.id), async () => {
         },
         onExit: () => { child?.kill("SIGTERM"); },
         onSignal: (signal) => { record(signal, "protocol"); },
+        onMessage: (message) => { recordMessage(message); },
         record: (method) => { append("input-intent", { op: "native", method }); },
       });
       hybrid?.providerReady(native.supportsExecutionSelection);

@@ -20,7 +20,7 @@ a product goal achieved. That state requires an explicit user assessment.
 Existing provider permissions and session input leases remain authoritative;
 headless OpenCode workers can reject a permission request without a dialog.
 
-Every provider runs on the selected machine by default; `Session.executionLocation` records `cloud` or `laptop`. Codex accepts `--laptop`, which keeps the invoking laptop project as the executor while its conversation backend stays in the cloud, with background preparation and automatic handoff as described in [laptop execution mode](hybrid-execution.md). The configured cloud project directory is kept current by the one-way [workspace sync](workspace-sync.md) service. Reconnecting keeps the same conversation and placement.
+Every provider runs on the selected machine by default; `Session.executionLocation` records `cloud` or `laptop`. Codex accepts `--laptop`, which keeps the invoking laptop project as the executor while its conversation backend stays in the cloud, with background preparation and automatic handoff as described in [laptop execution mode](hybrid-execution.md). Native CLI launches without `--project` resolve the local home-relative checkout path into a persistent cloud project and retain the relative launch directory. That cloud project is kept current by the one-way [workspace sync](workspace-sync.md) service. Reconnecting keeps the same conversation and placement.
 
 ```mermaid
 flowchart LR
@@ -69,6 +69,7 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | List / inspect sessions | `GET /api/sessions`, `GET /api/sessions/:id` | Any |
 | Create session | `POST /api/sessions` | Owner |
 | Read chat / preview a project file | `GET /api/sessions/:id/messages`, `/file?path=` | Any |
+| Read a model-written digest of the chat | `GET /api/sessions/:id/summary?after=` | Any, when `summaries` is configured |
 | Explicitly resume an exited conversation | `POST /api/sessions/:id/resume` | Owner |
 | Replay logs | `GET /api/sessions/:id/events`, optionally filtered with `?types=` | Any |
 | Answer an on-screen dialog | `POST /api/sessions/:id/answer` | Owner, controller |
@@ -79,14 +80,15 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | Resize / terminate | `POST /api/sessions/:id/resize`, `/stop` | Owner |
 | Read project context | `GET /api/projects/:id/context` | Any |
 | Replace context with version check | `PUT /api/projects/:id/context` | Owner |
+| Resolve a home-relative project | `POST /api/projects/resolve` | Owner CLI |
 | Project detail and sync state | `GET /api/projects/:id` | Any |
 | Receive a laptop generation | `POST /api/projects/:id/sync/{begin,has,commit}`, `PUT /api/projects/:id/sync/blob/:hash` | Owner CLI |
 | Apply a pending generation | `POST /api/projects/:id/sync/apply` | Owner |
 | Export the cloud tree | `POST /api/projects/:id/sync/export`, `GET /api/projects/:id/sync/blob/:hash` | Owner CLI |
 
-**Owner CLI** routes accept only a paired owner bearer key; a browser session is refused. While a sync commit or apply holds a project, Infinite-managed session creation and resume in that project answer `409` with code `sync-applying`; cmux sessions are not refused. [Workspace sync](workspace-sync.md) defines the transfer limits, apply rules, and pending reasons.
+**Owner CLI** routes accept only a paired owner bearer key; a browser session is refused. While a sync commit or apply holds a project, Infinite-managed session creation and resume in that project answer `409` with code `sync-applying`; this includes cmux sessions. [Workspace sync](workspace-sync.md) defines the transfer limits, apply rules, and pending reasons.
 
-Session IDs and project IDs are validated. Executables and project working directories come from private host configuration. The owner-only native CLI launch accepts an argument array, including provider flags that may access other files available to the agent account; this is not a sandbox boundary within a tenant. Web and phone creation use configured provider arguments. Infinite workers pass prompts and native arguments directly to the executable. The cmux adapter quotes each configured argument before launching in the chosen workspace shell. Active-host process inspection can see launch arguments.
+Session IDs and project IDs are validated. Executables come from private host configuration. Project roots come from that configuration or owner-created folder mappings in sealed host state. A session can select an existing relative directory within its project; traversal and symlink escapes are refused, and native resumption retains that directory. The owner-only native CLI launch accepts an argument array, including provider flags that may access other files available to the agent account; this is not a sandbox boundary within a tenant. Web and phone creation use configured provider arguments. Infinite workers pass prompts and native arguments directly to the executable. The cmux adapter quotes each configured argument before launching in the chosen workspace shell. Active-host process inspection can see launch arguments.
 
 The maximum concurrency defaults to 24; it is a count limit, not CPU, memory, spend, or per-provider quota enforcement. Resource limits and isolated worktrees belong to commissioning. Do not run multiple editors against one configured checkout until those directories are separated.
 
@@ -100,7 +102,13 @@ Each session reports one attention state: `working`, `needs-you`, `turn-finished
 
 A hook prompt is merged into the on-screen dialog only when it correlates line-for-line with it. Otherwise it is journaled as a `prompt-mismatch` notice and the on-screen dialog stands. The merged prompt always shows the on-screen detail.
 
-`POST /api/sessions/:id/answer` answers a dialog the terminal already shows. The client sends only the prompt id. The worker checks that it is still the open prompt and that the hash it stored for that prompt matches the dialog on the live screen. The worker sends keystrokes that navigate to the chosen option and presses Enter only after re-checking that the marker is on that option. A post-check reports `closed`, `still-open` or `changed`. Hooks never decide anything: the worker answers hooks with an empty `204`, so the laptop's dialog always appears and can still be answered there.
+`POST /api/sessions/:id/answer` answers a dialog the terminal already shows. The client sends only the prompt id. The worker checks that it is still the open prompt and that the hash it stored for that prompt matches the dialog on the live screen. The worker sends keystrokes that navigate to the chosen option and presses Enter only after re-checking that the marker is on that option. A post-check reports `closed`, `still-open` or `changed`. Hooks never decide anything: the worker's reply to a hook is read only by Infinite's relay process, which prints nothing to the provider, so the laptop's dialog always appears and can still be answered there.
+
+### Chat from the provider's own record
+
+Claude Code and Codex hooks are command hooks that run Infinite's relay inside the agent's account. The authenticated primary hook names the provider's transcript file (`transcript_path`; Codex rollouts are located by thread id under its sessions directory). The worker replies with the byte offset it has already seen, and the relay streams the file from there in bounded chunks to the `transcript` hook route. The worker never opens the file itself, which keeps the agent's home private to its account. Each complete transcript record becomes a journaled event with `type = "message"` carrying the provider's own message id, role, text and tool name; injected context, subagent records and model reasoning are dropped, text is bounded, and a repeated chunk cannot duplicate a message. Native Codex sessions journal the same events from the app-server's completed items. Once a session has transcript messages its state carries `capabilities.transcript = 1`, and `GET /api/sessions/:id/messages` returns only those (`source: "transcript"`); otherwise it returns delivered prompts and hook-reported replies from the recording (`source: "recording"`) and never fabricates an assistant message from terminal output.
+
+`GET /api/sessions/:id/summary?after=<cursor>` asks the configured model (`summaries.model`, an OpenAI-compatible Responses API) for a plain-text digest of the chat messages after that cursor. The response names the model and the cursor range it covers, and is cached per range. The instructions tell the model to attribute any claimed result to the agent; clients label the text as a summary, and nothing in the host acts on it.
 
 `POST /api/sessions/:id/input` refuses text while the open prompt's dialog is on screen, with `409 { error: "prompt-open", attention }`, because text and Enter would select the dialog's highlighted option. Nothing is typed or journaled. A request with `force: true` is delivered anyway; only terminal surfaces, where the person sees the dialog, send it.
 

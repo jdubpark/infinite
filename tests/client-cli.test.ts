@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -13,6 +13,7 @@ import { hashToken } from "../packages/host/src/config.js";
 import { workerCall } from "../packages/host/src/ipc.js";
 import type { Config } from "../packages/host/src/types.js";
 import { tmpdir } from "node:os";
+import { claimControl, startHost, waitFor } from "./helpers.js";
 
 const exec = promisify(execFile);
 const wait = async (predicate: () => boolean | Promise<boolean>, timeout = 10000) => {
@@ -20,6 +21,19 @@ const wait = async (predicate: () => boolean | Promise<boolean>, timeout = 10000
   while (Date.now() < until) { if (await predicate()) return; await new Promise(r => setTimeout(r, 80)); }
   throw new Error("Timed out waiting for CLI behavior");
 };
+
+test("CLI cmux delegates exact arguments without pairing Infinite and preserves the launcher's exit status", async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-cmux-cli-"));
+  const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "cmux"];
+  writeFileSync(join(root, "infinite-cmux"), "#!/usr/bin/env node\nconsole.log(JSON.stringify(process.argv.slice(2))); process.exit(7);\n", { mode: 0o700 });
+  try {
+    const args = ["--json", "workspace", "run", "--", "literal $HOME; `command`", "two\nlines"];
+    await assert.rejects(exec(process.execPath, [...cli, ...args], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, INFINITE_CLIENT_CONFIG: join(root, "unpaired.json") } }),
+      (error: { code: number; stdout: string }) => error.code === 7 && JSON.stringify(JSON.parse(error.stdout)) === JSON.stringify(args));
+    await assert.rejects(exec(process.execPath, cli, { env: { ...process.env, PATH: root + "/missing" } }),
+      (error: { stderr: string }) => /standalone infinite-cmux launcher is unavailable/.test(error.stderr));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("local draft recovery isolates pairings and runtimes, preserves concurrent drafts, and refuses tampered ciphertext", async () => {
   const { localDraftStore } = await import("../packages/host/src/client-draft-store.js");
@@ -57,7 +71,7 @@ test("CLI reports each startup wait before the host responds and leaves native o
   const server = createServer((req, res) => { req.resume(); requests.set(req.url!, res); });
   await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
   writeFileSync(config, JSON.stringify({ origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: randomBytes(32).toString("base64url"), projectId: "project" }), { mode: 0o600 });
-  const child = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", config, "grok"], { stdio: "pipe" });
+  const child = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", config, "--project", "project", "grok"], { stdio: "pipe" });
   let stdout = "", stderr = "", exited = false;
   child.stdout.on("data", s => stdout += s); child.stderr.on("data", s => stderr += s); child.on("exit", () => exited = true);
   const reply = (path: string, body: unknown) => requests.get(path)!.end(JSON.stringify(body));
@@ -66,7 +80,7 @@ test("CLI reports each startup wait before the host responds and leaves native o
     assert.match(stderr, /Connecting to 127\.0\.0\.1/, "connecting is visible before authentication completes");
     reply("/api/me", { role: "owner", terminal: { stream: true, raw: true }, projects: [{ id: "project", name: "Project" }] });
     await wait(() => requests.has("/api/projects/project"));
-    reply("/api/projects/project", { sync: {} });
+    reply("/api/projects/project", { id: "project", name: "Project", sync: {} });
     await wait(() => requests.has("/api/sessions"));
     assert.match(stderr, /Starting Grok/, "launch progress precedes session creation");
     reply("/api/sessions", { id: sessionId, provider: "grok", status: "running", title: "Grok", projectId: "project" });
@@ -84,6 +98,84 @@ test("CLI reports each startup wait before the host responds and leaves native o
     await wait(() => exited);
     assert.equal(stdout, "NATIVE READY\n");
   } finally { child.kill(); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("CLI resources preserve unavailable measurements and close requires confirmation, owner authority, and session control", { timeout: 45000 }, async () => {
+  const host = await startHost();
+  const clientFile = join(host.root, "client.json"), viewerFile = join(host.root, "viewer.json");
+  const entry = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts")];
+  const cli = [...entry, "--client-config", clientFile];
+  for (const [file, token] of [[clientFile, host.tokens.owner], [viewerFile, host.tokens.viewer]])
+    writeFileSync(file, JSON.stringify({ origin: host.origin, token, projectId: "rehearsal" }), { mode: 0o600 });
+  const ids = [randomUUID(), randomUUID()];
+  const clients: IPty[] = [];
+  let watch: ReturnType<typeof spawn> | undefined;
+  let proxy: ReturnType<typeof createServer> | undefined;
+  try {
+    for (const id of ids) {
+      assert.equal((await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "CLI close rehearsal", prompt: "" })).status, 201);
+      await waitFor(() => host.fetchApi(`/sessions/${id}`), response => response.body.status === "running");
+    }
+    const listing = await exec(process.execPath, [...cli, "list"]);
+    const cwd = realpathSync(host.config.projects[0].path);
+    assert.ok(listing.stdout.includes(`project rehearsal · cwd ${cwd}`));
+    const json = JSON.parse((await exec(process.execPath, [...cli, "list", "--json"])).stdout);
+    assert.equal(json.find((s: { id: string }) => s.id === ids[0]).cwd, cwd);
+    const resource = JSON.parse((await exec(process.execPath, [...entry, "--client-config", viewerFile, "resources", "--json"])).stdout);
+    assert.ok(Number.isFinite(Date.parse(resource.capturedAt)));
+    assert.equal(resource.cpu.usagePercent, null, "the first sample is unknown rather than zero");
+    assert.equal(resource.network.receiveBytesPerSecond, null);
+    assert.ok(resource.sessions.some((s: { sessionId: string }) => s.sessionId === ids[0]));
+    assert.match((await exec(process.execPath, [...cli, "resources"])).stdout, /Memory .* available|Memory .* free/);
+    watch = spawn(process.execPath, [...cli, "resources", "--watch", "--json"], { stdio: "pipe" });
+    let samples = ""; watch.stdout!.on("data", chunk => samples += chunk);
+    await wait(() => samples.trim().split("\n").length >= 2);
+    const frames = samples.trim().split("\n").map(line => JSON.parse(line));
+    assert.ok(frames[1].sampleIntervalMs > 0);
+    assert.equal(typeof frames[1].cpu.usagePercent, "number");
+    const stopped = new Promise<number | null>(resolve => watch!.once("exit", resolve)); watch.kill("SIGINT");
+    assert.equal(await stopped, 0); watch = undefined;
+
+    await assert.rejects(exec(process.execPath, [...cli, "close", ids[0]]), (error: { stderr: string }) => /Use --yes/.test(error.stderr));
+    await assert.rejects(exec(process.execPath, [...cli, "close", "--yes"]), (error: { stderr: string }) => /Usage: infinite close SESSION_ID/.test(error.stderr));
+    await assert.rejects(exec(process.execPath, [...entry, "--client-config", viewerFile, "close", ids[0], "--yes"]), (error: { stderr: string }) => /owner device key/.test(error.stderr));
+    const cancelled = ptySpawn(process.execPath, [...cli, "close", ids[0]], { cols: 160, rows: 30, cwd: host.root, env: { ...process.env } });
+    clients.push(cancelled); let output = ""; let cancelledExit = false;
+    cancelled.onData(value => output += value); cancelled.onExit(() => cancelledExit = true);
+    await wait(() => output.includes("[y/N]")); cancelled.write("n\r"); await wait(() => cancelledExit);
+    assert.match(output, /Close cancelled/);
+    assert.equal((await host.fetchApi(`/sessions/${ids[0]}`)).body.status, "running");
+
+    await claimControl(host, ids[0], "owner");
+    await assert.rejects(exec(process.execPath, [...cli, "close", ids[0], "--yes"]), (error: { stderr: string }) => /control is held by another client or changed/.test(error.stderr));
+    assert.equal((await host.fetchApi(`/sessions/${ids[0]}`)).body.status, "running");
+    const receipt = JSON.parse((await exec(process.execPath, [...cli, "close", ids[0].slice(0, 8), "--yes", "--takeover", "--json"])).stdout);
+    assert.equal(receipt.sessionId, ids[0]); assert.equal(receipt.state, "delivered");
+    await waitFor(() => host.fetchApi(`/sessions/${ids[0]}`), response => response.body.status === "exited");
+    assert.equal((await host.fetchApi(`/sessions/${ids[1]}`)).body.status, "running", "closing one session preserves its neighbor");
+
+    let stops = 0;
+    proxy = createServer((req, res) => {
+      const drop = req.url?.endsWith("/stop"); if (drop) stops++;
+      const upstream = httpRequest(host.origin + req.url, { method: req.method, headers: { ...req.headers, host: new URL(host.origin).host } }, response => {
+        response.on("error", () => res.destroy());
+        if (drop) { response.resume(); response.on("end", () => res.destroy()); }
+        else { res.writeHead(response.statusCode!, response.headers); response.pipe(res); }
+      });
+      upstream.on("error", () => res.destroy()); req.pipe(upstream);
+    });
+    await new Promise<void>(resolve => proxy!.listen(0, "127.0.0.1", resolve));
+    const droppedConfig = join(host.root, "dropped-receipt.json");
+    writeFileSync(droppedConfig, JSON.stringify({ origin: `http://127.0.0.1:${(proxy.address() as { port: number }).port}`, token: host.tokens.owner }), { mode: 0o600 });
+    await assert.rejects(exec(process.execPath, [...entry, "--client-config", droppedConfig, "close", ids[1], "--yes"]),
+      (error: { stderr: string }) => /Close delivery is unconfirmed/.test(error.stderr) && /Nothing was retried/.test(error.stderr));
+    await waitFor(() => host.fetchApi(`/sessions/${ids[1]}`), response => response.body.status === "exited");
+    assert.equal(stops, 1, "a lost stop receipt never replays the mutation");
+  } finally {
+    watch?.kill(); for (const child of clients) { try { child.kill(); } catch {} }
+    if (proxy) { proxy.closeAllConnections(); await new Promise<void>(resolve => proxy!.close(() => resolve())); }
+    await host.stop();
+  }
 });
 
 test("native cloud CLI preserves argv, enforces monitor mode, and reconnects without duplicating a process or input", { timeout: 45000 }, async () => {
@@ -150,7 +242,7 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     await exec(process.execPath, [...cli, "pair", clientOrigin, "--token-file", tokenFile]);
     app.manager.setContext("project", "Do not append me to native argv", 0);
     const nativeArgs = ["--model", "example/model", "--config", "literal=value", "--", "spaces, $HOME and `printf literal`", "line\nbreak"];
-    const launched = await exec(process.execPath, [...cli, "--cloud", "--detach", "codex", ...nativeArgs]);
+    const launched = await exec(process.execPath, [...cli, "--project", "project", "--cloud", "--detach", "codex", ...nativeArgs]);
     const sid = launched.stdout.trim(); assert.match(sid, /^[a-f0-9-]{36}$/);
     await wait(() => { try { return JSON.parse(readFileSync(join(workspace, "argv.json"), "utf8")).length === nativeArgs.length; } catch { return false; } });
     assert.deepEqual(JSON.parse(readFileSync(join(workspace, "argv.json"), "utf8")), nativeArgs, "all provider args are exact, including --config and --");
@@ -254,7 +346,7 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     uncertainDraft.process.write("\x18"); await wait(() => saved().length === 0);
     uncertainDraft.process.write("\x1d"); await wait(uncertainDraft.exited);
     assert.equal((await app.manager.list()).length, 1);
-    const oneShot = await exec(process.execPath, [...cli, "--cloud", "codex", "--version"]);
+    const oneShot = await exec(process.execPath, [...cli, "--project", "project", "--cloud", "codex", "--version"]);
     assert.match(oneShot.stdout, /native-version-1/);
     await workerCall(config.runDir, sid, { op: "stop", requestId: randomUUID() });
     await wait(async () => (await app.manager.state(sid)).status === "exited");

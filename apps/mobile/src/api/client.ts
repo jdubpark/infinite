@@ -64,47 +64,19 @@ export async function api<T>(
       "X-Infinite-Client": await loadClientId(),
       ...(init.control ? { "X-Infinite-Control": init.control } : {}),
     };
-    if (connection.relay) {
-      try {
-        return await remote(connection).request<T>(path, { ...init, headers, signal: controller.signal });
-      } catch (error) {
-        if (error instanceof RemoteError) {
-          const value = error.body as { error?: string; code?: string; attention?: Attention } | undefined;
-          const code = value?.code ?? value?.error ?? error.code;
-          if (code === "control-busy" || code === "control-lost") throw new ControlRefusal(error.message, code);
-          throw new ApiError(error.message, error.status, code, value?.attention);
-        }
-        throw error;
+    // Both direct and relayed connections use the authenticated encrypted
+    // channel. An unavailable endpoint never falls back to plaintext API calls.
+    try {
+      return await remote(connection).request<T>(path, { ...init, headers, signal: controller.signal });
+    } catch (error) {
+      if (error instanceof RemoteError) {
+        const value = error.body as { error?: string; code?: string; attention?: Attention } | undefined;
+        const code = value?.code ?? value?.error ?? error.code;
+        if (code === "control-busy" || code === "control-lost") throw new ControlRefusal(error.message, code);
+        throw new ApiError(error.message, error.status, code, value?.attention);
       }
+      throw error;
     }
-    const response = await fetch(`${connection.url}/api${path}`, {
-      method: init.method ?? (init.body ? "POST" : "GET"),
-      headers: {
-        Authorization: `Bearer ${connection.token}`,
-        ...headers,
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
-      },
-      body: init.body ? JSON.stringify(init.body) : undefined,
-      signal: controller.signal,
-    });
-    const value = await response.json();
-    if (!response.ok) {
-      const message = value.error ?? "Host request failed";
-      // Control refusals carry `code` and a sentence; attention refusals carry the code as `error`.
-      if (value.code === "control-busy" || value.code === "control-lost")
-        throw new ControlRefusal(message, value.code);
-      throw new ApiError(
-        message,
-        response.status,
-        typeof value.code === "string"
-          ? value.code
-          : typeof value.error === "string"
-            ? value.error
-            : undefined,
-        value.attention,
-      );
-    }
-    return value as T;
   } catch (error) {
     if ((error as Error).name === "AbortError")
       throw new ApiError(

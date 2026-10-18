@@ -69,6 +69,11 @@ export function applySignal(att: Attention, event: SignalEvent): Attention {
       next = { ...enter(next, "turn-finished", source, at), prompt: undefined, lastTool: undefined, sawTurnEnd: true };
       next.lastMessage = data.message;
       break;
+    case "provider-limit":
+      if (!(next.limit?.limit === data.limit && next.limit.confidence === "corroborated" && data.confidence === "single-source")) {
+        next.limit = { limit: data.limit, confidence: data.confidence, resetsAt: data.resetsAt, since: at, message: data.message };
+      }
+      break;
     case "error":
       if (data.where === "hooks") next.hookErrors += 1;
       break;

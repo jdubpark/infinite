@@ -124,3 +124,22 @@ test("truncateInput enforces the 16 KiB UTF-8 cap", () => {
   const wide = truncateInput({ a: "日".repeat(4000), b: "日".repeat(4000), c: "日".repeat(4000) });
   assert.ok(bytes(wide) <= 16384, `multibyte case was ${bytes(wide)}`);
 });
+
+test("claude StopFailure rate_limit adds a single-source provider-limit; other errors do not", () => {
+  const limited = mapClaudeHook({ ...base, hook_event_name: "StopFailure", error: "rate_limit", error_details: "5-hour limit" });
+  assert.equal(limited.length, 3);
+  assert.deepEqual(limited[2], { kind: "provider-limit", limit: "usage", confidence: "single-source", message: "5-hour limit" });
+  const plain = mapClaudeHook({ ...base, hook_event_name: "StopFailure", error: "rate_limit" });
+  assert.equal(plain[2].kind === "provider-limit" && plain[2].message, "Claude Code reported a usage limit");
+  const overloaded = mapClaudeHook({ ...base, hook_event_name: "StopFailure", error: "overloaded" });
+  assert.deepEqual(overloaded.map((s) => s.kind), ["error", "turn-end"]);
+});
+
+test("claude quota_auto_resume notifications add a corroborated provider-limit", () => {
+  for (const type of ["quota_auto_resume_fired", "quota_auto_resume_stale", "quota_auto_resume_disabled"]) {
+    const out = mapClaudeHook({ ...base, hook_event_name: "Notification", notification_type: type, message: "waiting" });
+    const last = out[out.length - 1];
+    assert.equal(last.kind, "provider-limit");
+    assert.equal(last.kind === "provider-limit" && last.confidence, "corroborated");
+  }
+});

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -277,8 +277,11 @@ test("the agent-side Claude trust entry records only the folder it is launched i
   try {
     const home = join(root, "home"), member = join(root, "member"), other = join(root, "other");
     for (const folder of [home, member, other]) mkdirSync(folder);
+    // Wrappers call the entry through the release symlink, as /opt/infinite does on Ubuntu.
+    const release = join(root, "release");
+    symlinkSync(resolve("packages/host/src"), release);
     const run = (env: Record<string, string>, ...args: string[]) => spawnSync(process.execPath,
-      ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/workspace-trust.ts"), ...args],
+      ["--import", import.meta.resolve("tsx"), join(release, "workspace-trust.ts"), ...args],
       { cwd: member, env: { PATH: process.env.PATH ?? "", HOME: home, ...env }, encoding: "utf8" });
     assert.equal(run({ INFINITE_TRUSTED_WORKSPACE: other }, "claude").status, 65);
     assert.equal(run({}, "claude").status, 64);

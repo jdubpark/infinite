@@ -74,8 +74,10 @@ export function recordClaudeTrust(configPath: string, cwd: string, lockWaitMs = 
 }
 
 // Agent-side entry for wrappers that run providers in a separate account. It records trust
-// only for the folder this launch runs in, in that account's own Claude config.
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// only for the folder this launch runs in, in that account's own Claude config. Wrappers
+// name it through the release symlink, while the module URL is the resolved file.
+const entry = process.argv[1] ? resolve(process.argv[1]) : undefined;
+if (entry && existsSync(entry) && realpathSync(entry) === fileURLToPath(import.meta.url)) {
   const requested = process.env.INFINITE_TRUSTED_WORKSPACE;
   const home = process.env.HOME;
   if (process.argv[2] !== "claude" || process.argv.length !== 3 || !requested || !home) {

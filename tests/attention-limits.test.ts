@@ -48,6 +48,12 @@ test("claude session limit line is detected anywhere on the screen", () => {
   assert.equal(detectLimit(screen("claude-usage-limit"), "grok", now), null);
 });
 
+test("the Claude notice matches with a straight or a curly apostrophe", () => {
+  for (const line of ["You've hit your session limit · resets 3:45pm", "You\u2019ve hit your session limit · resets 3:45pm"])
+    assert.equal(detectLimit([line], "claude", now)?.resetsAt, "2026-10-18T15:45:00.000Z", line);
+  assert.equal(detectLimit(["You`ve hit your session limit"], "claude", now), null);
+});
+
 const att = (): Attention => ({
   state: "working", since: "t0", source: "hook", now: "", lastActivityAt: "t0", hooks: "active", hookErrors: 0, sawTurnEnd: false,
 });

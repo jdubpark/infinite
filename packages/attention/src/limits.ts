@@ -60,7 +60,8 @@ export function parseResetTime(text: string, now: Date): string | undefined {
 export function detectLimit(lines: string[], provider: Provider, now: Date): DetectedLimit | null {
   const clean = lines.map(cleanLine);
   if (provider === "claude") {
-    const line = clean.find((l) => /You've hit your .* limit/.test(l));
+    // The notice may be typeset with a straight or a curly apostrophe.
+    const line = clean.find((l) => /You['’]ve hit your .* limit/.test(l));
     if (!line) return null;
     return { limit: "usage", resetsAt: parseResetTime(line, now), message: line.slice(0, 300) };
   }

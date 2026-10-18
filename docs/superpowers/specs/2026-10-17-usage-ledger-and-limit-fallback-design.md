@@ -44,7 +44,7 @@ Confirmed from the installed binaries and the vendors' own documentation on 2026
 
 **Codex.** Team members run the interactive TUI in a PTY with hooks configured. On a limit the TUI stays open, prints "Usage limit reached. You've reached your usage limit." or "You're out of credits.", optionally followed by " Try again at <date>", and shows "usage limited" in its status line. No hook or exit code reports it. The app-server protocol, which the host uses only for local-UI sessions, reports `turn/completed` with `turn.error.codexErrorInfo` of `usageLimitExceeded` or `rateLimitExceeded`, and notifies `account/rateLimits/updated`.
 
-Still unobserved on the live host, and to be confirmed during implementation before the detectors are trusted: that a subscription quota hit delivers `error: "rate_limit"` in StopFailure; that the Codex TUI's "usage limited" indicator sits in its bottom status row at the configured terminal size, and what that row looks like; whether OpenCode's `cost` is non-zero for the providers actually configured there. A builder confirmed locally that `opencode run --format json` writes raw JSON lines when stdout is a PTY.
+Still unobserved on the live host, and to be confirmed during implementation before the detectors are trusted: that a subscription quota hit delivers `error: "rate_limit"` in StopFailure; that the Codex TUI's "usage limited" indicator sits in its bottom status row at the configured terminal size, and what that row looks like; whether OpenCode's `cost` is non-zero for the providers actually configured there; whether Codex emits a `Stop` hook, notify, or OSC 9 turn end when a turn ends on a limit; and whether the Claude Code notice uses a straight or a curly apostrophe (the detector accepts both). A builder confirmed locally that `opencode run --format json` writes raw JSON lines when stdout is a PTY.
 
 ## Part 1: usage ledger
 
@@ -138,7 +138,7 @@ Two failure modes shape the rules below. A transient API 429 that exhausts Claud
 Each observation is **single-source** or **corroborated**:
 
 - Claude Code: the hook signal alone is single-source. It is corroborated when the screen shows the limit notice in the same check or within the next two, or when a `quota_auto_resume_*` notification follows.
-- Codex: the status-row indicator is single-source when first seen. It is corroborated when it persists across at least three consecutive screen checks spanning at least 30 seconds with no other output change. The screen loop only acts on the status row, so transcript text, including this repository's own test fixtures scrolled through the body, cannot trigger a switch.
+- Codex: the status-row indicator is single-source when first seen. It is corroborated when it persists across at least three consecutive screen checks spanning `attention.limitConfirmMs` (30 seconds by default) with no other output change. The screen loop only acts on the status row, so transcript text, including this repository's own test fixtures scrolled through the body, cannot trigger a switch.
 - Codex app server `usageLimitExceeded` and Claude `quota_auto_resume_*` notifications are corroborated on arrival; they are the provider's typed statement.
 
 What an observation may do:

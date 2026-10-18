@@ -198,7 +198,7 @@ Clock times in a notice, such as `resets 3:45pm`, are read as UTC because the ho
 Each observation is single-source or corroborated.
 
 - Claude Code: the hook alone is single-source. It is corroborated when the screen shows the notice in the same check or the next two, or when a `quota_auto_resume_*` notification follows.
-- Codex terminal: the status row is single-source when first seen. It is corroborated when it persists across at least three consecutive screen checks spanning at least 30 seconds with no other output change.
+- Codex terminal: the status row is single-source when first seen. It is corroborated when it persists across at least three consecutive screen checks spanning `attention.limitConfirmMs`, 30 seconds by default, with no other output change.
 - Codex app-server `usageLimitExceeded` and Claude `quota_auto_resume_*` notifications are corroborated on arrival.
 
 Observations are grouped into an episode held in the worker. An episode starts at the first observation. It ends after three consecutive screen checks with no match and no armed corroboration, after a notification that the limit lifted, or when the agent completes a turn that did not fail. Only a source that can report a failed turn counts: a Claude Code `Stop` hook, as distinct from `StopFailure`, or a native adapter's turn status. A Codex terminal turn end, from its `Stop` hook, notify, or OSC notification, cannot say the turn failed, so it ends nothing. An episode journals at most one single-source and one corroborated signal, in either order. A reset time stated by any observation carries onto the later ones. A successful turn also clears the session's displayed limit, and screen matching stays suppressed until a check sees no match.
@@ -221,13 +221,15 @@ Observations are grouped into an episode held in the worker. An episode starts a
 
 A fallback onto a contributor-data profile shows the same data-use disclosure as any other profile. The operator decides whether to configure one.
 
-### Live confirmations still owed
+### Operator preconditions
 
-Before the detectors are relied on for unattended goals, the operator confirms on a live host and records privately:
+Before relying on the detectors unattended, confirm on the target host:
 
 1. A subscription quota hit delivers `error: "rate_limit"` in `StopFailure`.
 2. The Codex terminal's `usage limited` indicator sits in its bottom status row at the configured terminal size.
 3. OpenCode's reported cost is non-zero for the providers actually configured.
+4. Whether Codex emits a `Stop` hook, a notify `agent-turn-complete`, or an OSC 9 turn-complete notification when a turn ends on a limit. None of them ends a limit episode, but each one moves the session to a finished turn.
+5. Whether the Claude Code limit notice uses a straight or a curly apostrophe in "You've hit your … limit". The detector accepts both.
 
 ## Roles and execution
 

@@ -3,6 +3,7 @@ import type { Provider } from "./types.js";
 import type { LinearTrackingView } from "./linear-types.js";
 import type { UsageTotals } from "./usage.js";
 import type { UsageRollup } from "./team-usage.js";
+import type { ProviderLimit } from "./provider-limits.js";
 
 export const teamCommandSchema = z.object({
   command: z.string().min(1).max(4096).refine(value => !value.includes("\0")),
@@ -162,6 +163,8 @@ export interface TeamMember extends TeamAssignment {
   report?: TeamReport;
   cursor: number;
   stopRequestId: string;
+  /** Why the host stopped this member without a report, such as a provider usage limit. */
+  stoppedReason?: string;
   /** Computed on read for members whose provider reports usage; never stored. */
   usage?: UsageTotals;
 }
@@ -171,6 +174,8 @@ export interface TeamTask extends TeamTaskPlan {
   commit?: string;
   summary?: string;
   escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string };
+  /** Each provider-limit switch of this task's member; a replacement can itself be switched. */
+  limitSwitches?: { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string }[];
 }
 export interface TeamScout extends TeamScoutPlan {
   status: "pending" | "running" | "waiting" | "complete";
@@ -230,4 +235,5 @@ export interface TeamRun {
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
   round: number;
 }
-export type TeamView = Omit<TeamRun, "members"> & { members: Omit<TeamMember, "prompt">[]; usage: UsageRollup };
+/** `providerLimits` is the host's active limit memory at read time, shared by every run. */
+export type TeamView = Omit<TeamRun, "members"> & { members: Omit<TeamMember, "prompt">[]; usage: UsageRollup; providerLimits: ProviderLimit[] };

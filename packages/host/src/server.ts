@@ -277,6 +277,7 @@ export function createApp(config: Config, key: Buffer) {
       teams: { enabled: Boolean(config.teams), maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
+      providerLimits: teams.providerLimits(),
       projects: config.projects.map(({ id, name, team, linear }) => ({ id, name, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
       capabilities: {
         signals: true,

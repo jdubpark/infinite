@@ -4,17 +4,20 @@ import { join } from "node:path";
 import type { Config } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
-import { createTeamSchema, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
-import { teamPrompt } from "./team-prompts.js";
+import { PROVIDER_NAMES } from "@infinite/attention";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
+import { retargetPrompt, teamPrompt } from "./team-prompts.js";
 import { teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
 import { teamUsage } from "./team-usage.js";
+import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
 import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureMemberResult, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, validateTeamPlan } from "./team-workspace.js";
 export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
 type Action = { requestId: string; revision: number };
+type LimitSwitch = LimitObservation & { at: string; seq: number };
 type StartInProject = <T>(projectId: string, start: () => Promise<T>) => Promise<T>;
 type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean;
@@ -28,6 +31,11 @@ const timestamp = () => new Date().toISOString();
 const activeMember = (member: TeamMember) => ["queued", "running", "reported", "unavailable"].includes(member.status);
 const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
 const runtimeUnavailableReason = "An agent runtime is unavailable; the team is waiting for confirmed state.";
+const clock = (iso: string) => iso.slice(11, 16);
+const runEvent = (run: TeamRun, text: string) => {
+  run.events.push({ at: timestamp(), text });
+  if (run.events.length > 300) run.events.splice(0, run.events.length - 300);
+};
 const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runId, memberId: member.memberId, revision: member.revision, role: member.role, ...(member.taskId ? { taskId: member.taskId } : {}) });
 
 /** Durable orchestration; reports describe agent claims, configured checks describe host evidence. */
@@ -41,8 +49,11 @@ export class TeamService {
   private readonly commands = new Map<string, AbortController>();
   private readonly directory: string;
   private usage?: UsageService;
+  private readonly limits: ProviderLimits;
+  private reconciledAt = 0;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService) {
     this.directory = join(config.stateDir, "teams");
+    this.limits = new ProviderLimits(join(config.stateDir, "provider-limits.sealed"), key);
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     for (const file of readdirSync(this.directory).filter(name => /^[a-f0-9-]{36}\.sealed$/.test(name))) {
       const id = file.slice(0, -7);
@@ -60,6 +71,8 @@ export class TeamService {
     }
   }
   useUsage(service: UsageService) { this.usage = service; }
+  /** Active host-level provider limits; new members of a limited provider launch on their fallback. */
+  providerLimits() { return this.limits.active(); }
   private enqueue<T>(task: () => T | Promise<T>): Promise<T> {
     const next = this.serial.then(task); this.serial = next.catch(() => {}); return next;
   }
@@ -75,16 +88,13 @@ export class TeamService {
     const tracking = this.linear?.updateTeam(stored.run);
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
     const withUsage = teamUsage(members.map(({ prompt: _prompt, ...member }) => member), run.provider, this.usage);
-    return { ...run, members: withUsage.members, usage: withUsage.rollup };
+    return { ...run, members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active() };
   }
   private save(stored: Stored) {
     stored.run.updatedAt = timestamp();
     writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored);
   }
-  private event(stored: Stored, text: string) {
-    stored.run.events.push({ at: timestamp(), text });
-    if (stored.run.events.length > 300) stored.run.events.splice(0, stored.run.events.length - 300);
-  }
+  private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   get(id: string): TeamView { return this.view(this.record(id)); }
   activeForProject(projectId: string) {
@@ -115,7 +125,7 @@ export class TeamService {
       if (useConfiguredLineup && !lineup) throw new TeamError(409, "team-lineup-not-configured", "The requested team lineup is not configured on this host.");
       if (lineup && parsed.provider !== lineup.coordinator.provider)
         throw new TeamError(409, "team-provider-mismatch", "The selected provider must match the configured coordinator provider.");
-      const profiles = lineup ? [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? [])] : [];
+      const profiles = lineup ? lineupProfiles(lineup) : [];
       const providers = new Set(lineup ? profiles.map(profile => profile.provider) : [parsed.provider]);
       for (const provider of providers) {
         const profile = this.config.agents[provider];
@@ -248,7 +258,11 @@ export class TeamService {
       if (this.tickQueued || !this.running) return;
       this.tickQueued = true;
       void this.enqueue(async () => {
-        try { for (const stored of this.records.values()) await this.step(stored); }
+        try {
+          // Limit memory follows every session on the host, not only team members.
+          if (Date.now() - this.reconciledAt >= 2000) { this.reconciledAt = Date.now(); await this.limits.reconcile(this.manager).catch(() => {}); }
+          for (const stored of this.records.values()) await this.step(stored);
+        }
         finally { this.tickQueued = false; }
       }).catch(() => { this.tickQueued = false; });
     };
@@ -343,14 +357,27 @@ export class TeamService {
         if (member.status === "queued") { await this.launch(stored, member); continue; }
         if (!member.report) {
           if (member.startedAt && Date.now() - Date.parse(member.startedAt) > 60 * 60 * 1000) { this.block(stored, new TeamError(409, "member-time-limit", "An agent exceeded its one-hour runtime limit. Its workspace was preserved.")); return; }
-          const page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report"]));
+          const page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
           member.cursor = page.cursor;
+          let limit: LimitSwitch | undefined;
           for (const event of page.events) {
+            if (event.type === "signal") {
+              const data = event.data;
+              // Prefer a corroborated observation; a later successful turn means the member recovered.
+              if (switchesMember(data)) { if (!limit || (limit.confidence !== "corroborated" && data.confidence === "corroborated")) limit = { ...data, at: event.at, seq: event.seq }; }
+              else if ((data.kind === "turn-end" && !data.failed) || (data.kind === "notice" && data.type === "quota_auto_resume_fired")) limit = undefined;
+              continue;
+            }
             const parsed = teamReportEnvelopeSchema.safeParse(event.data);
             if (!parsed.success) continue;
             const envelope = parsed.data;
             if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
             member.report = envelope.report; member.status = "reported"; break;
+          }
+          if (!member.report && limit) {
+            await this.switchLimitedMember(stored, member, limit);
+            if (stored.pending || run.status === "blocked") return;
+            continue;
           }
           if (!member.report) {
             const state = await this.manager.state(member.sessionId);
@@ -379,7 +406,8 @@ export class TeamService {
         const prior = run.members.find(member => member.memberId === decision.memberId)!;
         if (prior.status !== "waiting") continue;
         const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, `${prior.prompt}\n\nUser answered: ${decision.answer}`, prior.modelProfile);
-        next.provider = prior.provider ?? prior.modelProfile?.provider ?? run.provider;
+        // A limit substitution may have pinned a fallback profile on another provider.
+        next.provider = next.modelProfile?.provider ?? prior.provider ?? run.provider;
         prior.status = "stopped"; run.members.push(next);
         const task = prior.role === "scout" ? run.discovery?.tasks.find(item => item.id === prior.taskId) : run.tasks.find(item => item.id === prior.taskId);
         if (task) { task.memberId = next.memberId; task.status = "running"; }
@@ -445,12 +473,55 @@ export class TeamService {
     this.assertBudget(run, true);
     const memberId = randomUUID();
     const task = role === "scout" ? run.discovery?.tasks.find(task => task.id === taskId) : run.tasks.find(task => task.id === taskId);
-    const selected = pinnedProfile ?? this.memberProfile(run, role, task);
+    let selected = pinnedProfile ?? this.memberProfile(run, role, task);
+    const limit = selected && this.limits.active().find(item => item.provider === selected!.provider);
+    const fallback = limit && run.lineup ? resolveLimitFallback(run.lineup, selected!.id, this.limits.limited()) : undefined;
+    if (selected && limit && fallback) {
+      // Without a resolvable fallback the launch proceeds: the limit may have lifted.
+      runEvent(run, `${selected.label} launched on ${fallback.label}: ${PROVIDER_NAMES[limit.provider]} is limited until ${clock(limit.expiresAt)}`);
+      if (prompt) prompt = retargetPrompt(prompt, { provider: selected.provider, profile: selected }, { provider: fallback.provider, profile: fallback });
+      selected = fallback;
+    }
     const modelProfile = selected ? structuredClone(selected) : undefined;
     const provider = modelProfile?.provider ?? run.provider;
     const instructions = prompt ?? teamPrompt(run, role, task, undefined, provider, modelProfile);
     if (Buffer.byteLength(instructions) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
     return { runId: run.id, memberId, revision: run.revision, role, provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, cursor: 0, stopRequestId: randomUUID() };
+  }
+  /**
+   * Stops a member whose provider hit a limit and continues its assignment on the profile's limit
+   * fallback in the same working copy. The host only stops the member; it never sends it input.
+   */
+  private async switchLimitedMember(stored: Stored, member: TeamMember, limit: LimitSwitch) {
+    const run = stored.run, provider = member.provider ?? run.provider, name = PROVIDER_NAMES[provider];
+    const kind = limit.limit === "credits" ? "credit limit" : "usage limit", resets = limit.resetsAt ? clock(limit.resetsAt) : undefined;
+    if (limit.confidence === "corroborated") this.limits.observe({ provider, detectedAt: limit.at, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}), sessionId: member.sessionId, runId: run.id, confidence: "corroborated" });
+    // Until the member's exit is confirmed, the next tick reads this observation again.
+    try { if (!await this.stopped(member)) { member.cursor = limit.seq - 1; this.save(stored); return; } }
+    catch { member.cursor = limit.seq - 1; member.status = "unavailable"; run.reason = "An agent could not be stopped. Release its input control or inspect its terminal before integration."; this.save(stored); return; }
+    member.stoppedReason = `${name} ${kind}${resets ? `, resets ${resets}` : ""}`;
+    const from = member.modelProfile, fallback = from && run.lineup ? resolveLimitFallback(run.lineup, from.id, this.limits.limited()) : undefined;
+    if (!from || !fallback) {
+      this.block(stored, new TeamError(409, "provider-limit", `${name} ${kind} reached at ${clock(limit.at)}${resets ? `, resets ${resets}` : ""}; no fallback profile is configured for ${from?.id ?? provider}.`));
+      return;
+    }
+    const task = member.role === "implementer" ? run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
+    if (member.role === "implementer" && !task) throw new TeamError(409, "invalid-task", "The implementer has no current task assignment.");
+    const scout = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
+    const prefix = this.config.teams?.commandPrefix, editing = member.role === "implementer" || member.role === "integrator";
+    // Editing roles keep in-scope partial work; read-only roles must have left their copy unchanged.
+    this.operation(stored, "result", signal => editing ? assertMemberScope(member.cwd, member.baseCommit, task ? task.paths : run.goal?.allowedPaths, prefix, signal) : assertMemberReadOnly(member.cwd, member.baseCommit, prefix, signal), () => {
+      const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId,
+        task ? undefined : retargetPrompt(member.prompt, { provider, profile: from }, { provider: fallback.provider, profile: fallback }), fallback);
+      if (task) {
+        next.prompt = teamPrompt(run, "implementer", task, `The previous implementer stopped at a ${name} ${kind}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`, next.provider ?? run.provider, next.modelProfile);
+        (task.limitSwitches ??= []).push({ fromProfileId: from.id, toProfileId: fallback.id, reason: limit.message, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}), memberId: member.memberId, at: timestamp() });
+        task.memberId = next.memberId; task.status = "running";
+      }
+      if (scout) scout.memberId = next.memberId;
+      run.members.push(next);
+      this.event(stored, `${from.label} hit a ${name} ${kind}${resets ? ` (resets ${resets})` : ""}; ${task?.title ?? member.title} continues on ${fallback.label}${editing ? " with partial work preserved" : ""}.`);
+    });
   }
   private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string) {
     const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id);

@@ -51,6 +51,8 @@ if (receipt.provider === "opencode") {
   }
   receipt.prompt = args[boundary + 1];
 }
+// A limit fallback must start in the limited member's working copy, partial file included.
+if (scenario.startsWith("limit")) receipt.sawPartial = existsSync("a.txt");
 writeFileSync(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
 
 async function report(value, overrides = {}) {
@@ -123,6 +125,9 @@ async function main() {
     } else if (scenario === "mixed") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "astra-xhigh";
+    } else if (scenario.startsWith("limit")) {
+      tasks[0].agentProfileId = "haiku";
+      tasks[1].agentProfileId = "astra-light";
     } else if (scenario === "mixed-invalid") {
       // The first task is valid: rejection must inspect the whole plan before
       // dispatching any member, including work preceding the invalid choice.
@@ -136,6 +141,21 @@ async function main() {
     if (scenario === "mixed" && assignment.taskId === "b" && !existsSync(asked)) {
       writeFileSync(asked, "asked", { mode: 0o600 });
       await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"] });
+      return;
+    }
+    if (scenario.startsWith("limit") && receipt.provider === "claude" && receipt.argv[receipt.argv.indexOf("--model") + 1] === "claude-haiku-5-5") {
+      // Partial work, then Claude Code's limit notice and its StopFailure hook. The notice comes
+      // first so the hook arrives as its corroboration: a hook alone switches the member before a
+      // later notice could record the host-level limit. The member idles without reporting.
+      writeFileSync("a.txt", "partial\n");
+      process.stdout.write("You've hit your session limit · resets 3:45pm\n");
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit" }),
+      });
+      if (response.status !== 204) throw new Error(`StopFailure hook was refused with status ${response.status}`);
       return;
     }
     if (scenario === "question") {

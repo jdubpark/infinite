@@ -510,9 +510,19 @@ export class TeamService {
         decision.status = "escalated";
         decision.reason = "The target request or team stage changed while the read-only permission review was running.";
       }
-      try { if (!await this.stopped(member)) member.status = "unavailable"; }
-      catch { member.status = "unavailable"; }
-      this.event(stored, "An obsolete permission coordinator was stopped; it cannot authorize a later request."); this.save(stored);
+      const wasUnavailable = member.status === "unavailable";
+      let stopConfirmed = false;
+      try { stopConfirmed = await this.stopped(member); }
+      catch { /* Keep the member visible as unavailable until its process is confirmed stopped. */ }
+      if (!stopConfirmed) {
+        member.status = "unavailable";
+        if (!wasUnavailable) {
+          this.event(stored, "The obsolete permission coordinator could not be confirmed stopped and remains unavailable for inspection.");
+          this.save(stored);
+        }
+        continue;
+      }
+      this.event(stored, "The obsolete permission coordinator was confirmed stopped; it cannot authorize a later request."); this.save(stored);
     }
   }
   private async switchLimitedMember(stored: Stored, member: TeamMember) {

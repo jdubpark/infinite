@@ -458,6 +458,20 @@ test("a screen notice that came first is corroborated by the hook, and a repeate
   }
 });
 
+test("a notice still on screen after a successful turn does not start a new limit episode", { timeout: 60000 }, async () => {
+  const host = await limitHost("hook-agent.mjs", "claude");
+  try {
+    const id = await startLimitSession(host, "claude", "rate-limit-then-stop");
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention.state === "turn-finished" && r.body.attention.limit === undefined, 20000);
+    await sleepMs(5000);
+    const rows = await limitsOf(host, id);
+    assert.deepEqual(rows.map((e) => e.data.confidence), ["single-source", "corroborated"]);
+    assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.limit, undefined);
+  } finally {
+    await host.stop();
+  }
+});
+
 test("a Codex status row is corroborated only after it persists, once per episode", { timeout: 60000 }, async () => {
   const host = await limitHost("codex-limit-agent.mjs", "codex");
   try {
@@ -467,7 +481,8 @@ test("a Codex status row is corroborated only after it persists, once per episod
     // The limitConfirmMs gate (2000 ms) holds between the two journal events.
     assert.ok(Date.parse(rows[1].at) - Date.parse(rows[0].at) >= 1900, `${rows[0].at} -> ${rows[1].at}`);
     // An unrelated line printed while the row persists neither resets nor re-earns corroboration.
-    await sleepMs(3000);
+    // (the fixture prints it at 4.5 s, after corroboration; wait past it, before the 9 s clear)
+    await sleepMs(2500);
     assert.equal((await limitsOf(host, id)).length, 2);
     // The row disappears for five seconds, ending the episode; its return starts a new one.
     const all = await waitFor(() => limitsOf(host, id), (r) => r.length >= 4, 25000);

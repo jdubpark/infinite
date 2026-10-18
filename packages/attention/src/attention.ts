@@ -71,6 +71,10 @@ export function applySignal(att: Attention, event: SignalEvent): Attention {
       // A successful turn proves the provider works again; a failed one keeps the observation.
       if (!data.failed) next.limit = undefined;
       break;
+    case "notice":
+      // The wait ended and the limit lifted.
+      if (data.type === "quota_auto_resume_fired") next.limit = undefined;
+      break;
     case "provider-limit":
       if (!(next.limit?.limit === data.limit && next.limit.confidence === "corroborated" && data.confidence === "single-source")) {
         next.limit = { limit: data.limit, confidence: data.confidence, resetsAt: data.resetsAt, since: at, message: data.message };

@@ -238,9 +238,11 @@ function record(
     data as unknown as Record<string, unknown>,
   ) as unknown as SignalEvent;
   publish(applySignal(attention, event));
-  if (signal.kind === "turn-end" && !signal.failed) {
+  // A successful turn, or the end of a quota wait, lifts the limit; the notice may stay on screen.
+  if ((signal.kind === "turn-end" && !signal.failed) || (signal.kind === "notice" && signal.type === "quota_auto_resume_fired")) {
     limitEpisode = undefined;
     limitWatch = undefined;
+    screenLimitSuppressed = true;
   }
   return event;
 }
@@ -378,6 +380,8 @@ let answering: number | undefined;
  * only by persisting for three checks and `limitConfirmMs` without new output.
  */
 let limitWatch: { source: "hook" | "screen"; firstAt: number; checks: number; corroborated: boolean } | undefined;
+/** Set when a limit lifted; screen matches are ignored until the screen stops showing one. */
+let screenLimitSuppressed = false;
 let limitEpisode: { single?: "hook" | "screen"; corroborated: boolean; misses: number } | undefined;
 type LimitSignal = Extract<Signal, { kind: "provider-limit" }>;
 function recordLimit(signal: LimitSignal, source: SignalData["source"], agent?: { id: string; type: string }) {
@@ -412,11 +416,13 @@ function watchLimit(lines: string[], nowMs: number, freshOutput: boolean) {
   const found = detectLimit(lines, provider, new Date(nowMs));
   const watch = limitWatch;
   if (!found) {
+    screenLimitSuppressed = false;
     // A hook watch gets two checks after the one that armed it; a screen watch ends with its match.
     if (watch?.source === "screen" || (watch && ++watch.checks > 2)) limitWatch = undefined;
     if (!limitWatch && limitEpisode && ++limitEpisode.misses >= 3) limitEpisode = undefined;
     return;
   }
+  if (screenLimitSuppressed) return;
   if (limitEpisode) limitEpisode.misses = 0;
   const observed = { kind: "provider-limit" as const, limit: found.limit, message: found.message, ...(found.resetsAt ? { resetsAt: found.resetsAt } : {}) };
   if (watch?.source === "hook") {

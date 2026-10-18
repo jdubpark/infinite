@@ -135,11 +135,13 @@ test("claude StopFailure rate_limit adds a single-source provider-limit; other e
   assert.deepEqual(overloaded.map((s) => s.kind), ["error", "turn-end"]);
 });
 
-test("claude quota_auto_resume notifications add a corroborated provider-limit", () => {
-  for (const type of ["quota_auto_resume_fired", "quota_auto_resume_stale", "quota_auto_resume_disabled"]) {
+test("claude quota_auto_resume_stale and _disabled add a corroborated provider-limit; _fired is a notice only", () => {
+  for (const type of ["quota_auto_resume_stale", "quota_auto_resume_disabled"]) {
     const out = mapClaudeHook({ ...base, hook_event_name: "Notification", notification_type: type, message: "waiting" });
     const last = out[out.length - 1];
     assert.equal(last.kind, "provider-limit");
     assert.equal(last.kind === "provider-limit" && last.confidence, "corroborated");
   }
+  const fired = mapClaudeHook({ ...base, hook_event_name: "Notification", notification_type: "quota_auto_resume_fired", message: "resumed" });
+  assert.deepEqual(fired.map((s) => s.kind), ["notice"]);
 });

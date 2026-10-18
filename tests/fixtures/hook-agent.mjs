@@ -65,6 +65,11 @@ else if (mode === "merge") {
   await post({ hook_event_name: "StopFailure", error: "rate_limit" });
   await sleep(1500);
   await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+} else if (mode === "rate-limit-then-stop") {
+  console.log("You've hit your session limit · resets 3:45pm");
+  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+  await sleep(1500);
+  await post({ hook_event_name: "Stop" });
 } else if (mode === "rate-limit" || mode === "rate-limit-blip") {
   // The hook reports the limit; only `rate-limit` also prints the notice that corroborates it.
   await post({ hook_event_name: "StopFailure", error: "rate_limit" });

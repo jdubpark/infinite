@@ -78,6 +78,16 @@ test("a successful turn-end clears attention.limit; a failed one keeps it", () =
   assert.equal(applySignal(limited, end()).limit, undefined);
 });
 
+test("a quota_auto_resume_fired notice clears attention.limit; other notices keep it", () => {
+  const limited = applySignal(att(), limitEvent("corroborated", "t1"));
+  const notice = (type: string): SignalEvent => ({
+    seq: 2, at: "t2", type: "signal",
+    data: { kind: "notice", type, source: "hook", provider: "claude" },
+  });
+  assert.equal(applySignal(limited, notice("quota_auto_resume_fired")).limit, undefined);
+  assert.equal(applySignal(limited, notice("idle_prompt")).limit?.confidence, "corroborated");
+});
+
 test("codex phrase outside the status row segment never triggers", () => {
   assert.equal(detectLimit(["› why does the footer say usage limited?", "  gpt-5-codex · ~/workspace"], "codex", now), null);
   assert.equal(detectLimit(["$ cat docs/teams.md", "Codex shows usage limited in its status row", "$"], "codex", now), null);

@@ -506,7 +506,8 @@ export class TeamService {
         } catch { obsolete = true; }
       }
       if (!obsolete) continue;
-      if (decision && decision.status === "reviewing") {
+      const decisionChanged = decision?.status === "reviewing";
+      if (decision && decisionChanged) {
         decision.status = "escalated";
         decision.reason = "The target request or team stage changed while the read-only permission review was running.";
       }
@@ -518,8 +519,8 @@ export class TeamService {
         member.status = "unavailable";
         if (!wasUnavailable) {
           this.event(stored, "The obsolete permission coordinator could not be confirmed stopped and remains unavailable for inspection.");
-          this.save(stored);
         }
+        if (decisionChanged || !wasUnavailable) this.save(stored);
         continue;
       }
       this.event(stored, "The obsolete permission coordinator was confirmed stopped; it cannot authorize a later request."); this.save(stored);

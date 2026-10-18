@@ -41,7 +41,10 @@ repository, while the coordinator, workers, and reviewer come from the host's
 configured lineup. Provider permissions remain under the owner's control.
 
 Add the repository's Linear team and project mapping during enrollment to track
-new runs. A mapping is configuration, not proof of connectivity: each run shows
+new runs. Supply the IDs once per parent folder to reuse them across its child
+repositories; each child can then run `infinite repo init` without Linear flags.
+Existing repository mappings remain in place when parent defaults change.
+A mapping is configuration, not proof of connectivity: each run shows
 whether Linear has confirmed its issue and execution evidence. Historical runs
 remain unchanged. Run status, verification, and human acceptance retain the
 separate meanings described below.

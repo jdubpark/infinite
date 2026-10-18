@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema } from "./team-types.js";
@@ -20,6 +20,10 @@ const commandSchema = z.object({ command: z.string().min(1).max(4096).refine(val
 const projectConfigSchema = z.object({ setup: commandSchema.optional(), checks: z.array(commandSchema).min(1).max(8) }).strict();
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const projectIdPattern = /^[a-z0-9-]{1,80}$/;
+const directoryDefaultsSchema = z.object({
+  version: z.literal(1),
+  directories: z.record(z.string(), z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict()),
+}).strict();
 
 function privateJson(path: string, value: unknown) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -42,6 +46,83 @@ function canonicalRoot(directory: string) {
   const root = realpathSync(git(path, ["rev-parse", "--show-toplevel"]));
   if (root === realpathSync(homedir()) || root === dirname(root)) throw new Error("Run this inside a project repository; the home directory and filesystem root are not supported.");
   return root;
+}
+function canonicalDirectory(directory: string) {
+  const path = realpathSync(directory);
+  if (!statSync(path).isDirectory()) throw new Error("Choose a directory.");
+  if (path === realpathSync(homedir()) || path === dirname(path)) throw new Error("The home directory and filesystem root are not supported.");
+  return path;
+}
+function gitRootOrNonGit(directory: string): { root: string } | { nonGit: true } {
+  let stderr = "";
+  let reportedRoot = "";
+  try {
+    reportedRoot = execFileSync("git", ["-C", directory, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" } }).trim();
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException & { stderr?: Buffer | string };
+    stderr = String(failure.stderr ?? "");
+    if (!/not a git repository/i.test(stderr))
+      throw new Error(`Could not inspect Git metadata for ${directory}: ${clean(stderr || failure.message)}.`);
+  }
+  if (reportedRoot) {
+    let root: string;
+    try { root = realpathSync(reportedRoot); }
+    catch (error) { throw new Error(`Git reported an inaccessible repository root: ${clean((error as Error).message)}.`); }
+    if (!statSync(root).isDirectory()) throw new Error("Git reported a repository root that is not a directory.");
+    if (root === realpathSync(homedir()) || root === dirname(root)) throw new Error("The home directory and filesystem root are not supported.");
+    return { root };
+  }
+  // Git can describe a broken or inaccessible repository as "not a git repository".
+  // A .git marker anywhere on the ancestor chain means the directory is not a plain folder.
+  for (let current = directory; ; current = dirname(current)) {
+    try {
+      const marker = join(current, ".git");
+      const markerStat = lstatSync(marker);
+      if (markerStat) throw new Error(`Git metadata exists at ${marker}, but Git cannot read it. Repair or remove that metadata before continuing.`);
+    } catch (error) {
+      if (error instanceof Error && /Git metadata exists/.test(error.message)) throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw new Error(`Could not inspect Git metadata in ${current}: ${clean((error as Error).message)}.`);
+    }
+    if (current === dirname(current)) break;
+  }
+  return { nonGit: true };
+}
+function readDirectoryDefaults(path: string) {
+  const raw = readPrivateJson(path, { version: 1, directories: {} });
+  const parsed = directoryDefaultsSchema.safeParse(raw);
+  if (!parsed.success || Object.keys(parsed.data?.directories ?? {}).some(directory => !isAbsolute(directory) || resolve(directory) !== directory || directory === dirname(directory) || directory === realpathSync(homedir())))
+    throw new Error("Saved directory Linear defaults are invalid; preserve private team CLI state and inspect it before retrying.");
+  return parsed.data;
+}
+async function saveDirectoryDefault(path: string, directory: string, value: { teamId: string; projectId?: string }) {
+  const lockPath = `${path}.lock`;
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  let locked = false;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try { mkdirSync(lockPath, { mode: 0o700 }); locked = true; break; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      await delay(100);
+    }
+  }
+  if (!locked) throw new Error("Timed out waiting for directory Linear defaults to be updated. Retry after the other repo init finishes.");
+  try {
+    const current = readDirectoryDefaults(path);
+    current.directories[directory] = value;
+    privateJson(path, current);
+  } finally {
+    try { rmdirSync(lockPath); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+}
+function nearestDirectoryDefault(defaults: z.infer<typeof directoryDefaultsSchema>, directory: string) {
+  for (let current = directory; ; current = dirname(current)) {
+    const value = defaults.directories[current];
+    if (value) return { ...value, origin: current };
+    if (current === dirname(current)) break;
+  }
+  return undefined;
 }
 export function boundTeamProject(config: ClientConfig, configPath: string, directory = process.cwd()): string | undefined {
   let root: string;
@@ -159,15 +240,39 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
   const mappingsPath = join(stateDir, "repo-mappings.json"), receiptsPath = join(stateDir, "receipts.json");
   if (command === "repo") {
     if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--setup-json JSON] [--check-json JSON] [--linear-team UUID] [--linear-project UUID]");
-    const root = canonicalRoot(positional[1] ?? process.cwd());
+    const requestedDirectory = canonicalDirectory(positional[1] ?? process.cwd());
+    const gitResult = gitRootOrNonGit(requestedDirectory);
+    const defaultsPath = join(stateDir, "directory-defaults.json");
+    const directoryDefaults = readDirectoryDefaults(defaultsPath);
+    const inheritedDefault = nearestDirectoryDefault(directoryDefaults, requestedDirectory);
+    const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
+    const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
+    if ("nonGit" in gitResult) {
+      const unsupported = ["--project", "--setup-json", "--check-json", "--handoff", "--request-id"].filter(flag => options[flag] !== undefined);
+      if (unsupported.length) throw new Error(`This directory is not a Git repository, so ${unsupported.join(", ")} cannot be used here. Run repo init in a Git repository for enrollment, or use only --linear-team and --linear-project to save directory defaults.`);
+      if (!explicitLinearTeam && explicitLinearProject && !inheritedDefault?.teamId)
+        throw new Error("--linear-project requires --linear-team or an inherited directory Linear team.");
+      if (!explicitLinearTeam && !explicitLinearProject && !inheritedDefault)
+        throw new Error("This directory has no inherited Linear defaults. Set them once with --linear-team UUID and --linear-project UUID.");
+      const teamId = explicitLinearTeam ?? inheritedDefault!.teamId;
+      const projectId = explicitLinearProject ?? (inheritedDefault?.teamId === teamId ? inheritedDefault.projectId : undefined);
+      await saveDirectoryDefault(defaultsPath, requestedDirectory, { teamId, ...(projectId ? { projectId } : {}) });
+      const inheritedUsed = (!explicitLinearTeam && !explicitLinearProject)
+        || (!explicitLinearTeam && Boolean(explicitLinearProject) && inheritedDefault?.teamId === teamId)
+        || (Boolean(explicitLinearTeam) && !explicitLinearProject && Boolean(inheritedDefault?.projectId) && inheritedDefault?.teamId === teamId && inheritedDefault.projectId === projectId);
+      const defaultsFrom = inheritedUsed && inheritedDefault ? inheritedDefault.origin : requestedDirectory;
+      console.log(JSON.stringify({ kind: "directory", path: requestedDirectory, linear: { teamId, ...(projectId ? { projectId } : {}) }, defaultsFrom }, null, 2));
+      return true;
+    }
+    const root = gitResult.root;
     const status = git(root, ["status", "--porcelain", "--untracked-files=all"]);
     if (status) throw new Error("Repository must be clean before onboarding. Commit or remove tracked and untracked changes first.");
     const commit = git(root, ["rev-parse", "HEAD"]);
     if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new Error("Git did not report a valid commit.");
     const repoConfig = inferredProjectConfig(root, options);
     const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
-    const linearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
-    const linearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
+    const linearTeam = explicitLinearTeam;
+    const linearProject = explicitLinearProject;
     const handoff = String(options["--handoff"] ?? "auto");
     if (handoff !== "auto" && handoff !== "off") throw new Error("--handoff must be auto or off.");
     const me = await api.json<any>("/me");
@@ -204,9 +309,30 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       if (state && syncServiceRunning(state) && state.origin === config.origin && state.root === root)
         throw new Error("Continuous sync is active for this checkout. Stop it before one-time team source capture.");
     }
-    if (linearProject && !linearTeam && !target.linear?.teamId) throw new Error("--linear-project requires --linear-team unless Linear is already configured for this project.");
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...repoConfig, handoff }, ...(linearTeam ? { linear: { teamId: linearTeam, ...(linearProject ? { projectId: linearProject } : {}) } } : linearProject ? { linear: { teamId: target.linear?.teamId, projectId: linearProject } } : {}) };
-    requireSamePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(prior.linear ?? null) === JSON.stringify(body.linear ?? null), options["--request-id"] === undefined ? undefined : requestId, rawArgs);
+    const rootDefault = nearestDirectoryDefault(directoryDefaults, root);
+    const targetLinear = target.linear?.teamId ? { teamId: target.linear.teamId, ...(target.linear.projectId ? { projectId: target.linear.projectId } : {}) } : undefined;
+    let effectiveLinear = targetLinear;
+    let linearDefaultsFrom: string | undefined;
+    if (linearTeam) {
+      const retainedProject = linearTeam === targetLinear?.teamId ? targetLinear.projectId : linearTeam === rootDefault?.teamId ? rootDefault.projectId : undefined;
+      effectiveLinear = { teamId: linearTeam, ...(linearProject ? { projectId: linearProject } : retainedProject ? { projectId: retainedProject } : {}) };
+      if (!linearProject && !targetLinear?.projectId && rootDefault?.teamId === linearTeam && retainedProject) linearDefaultsFrom = rootDefault.origin;
+    } else if (linearProject) {
+      const teamId = targetLinear?.teamId ?? rootDefault?.teamId;
+      if (!teamId) throw new Error("--linear-project requires an existing target Linear team or inherited directory Linear team.");
+      effectiveLinear = { teamId, projectId: linearProject };
+      if (!targetLinear?.teamId) linearDefaultsFrom = rootDefault?.origin;
+    } else if (!targetLinear && rootDefault) {
+      effectiveLinear = { teamId: rootDefault.teamId, ...(rootDefault.projectId ? { projectId: rootDefault.projectId } : {}) };
+      linearDefaultsFrom = rootDefault.origin;
+    }
+    const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...repoConfig, handoff }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}) };
+    // After a lost reply, inherited settings may already be the host's mapping.
+    // An omitted mapping preserves that value; compare that intent while replay
+    // still sends the original receipt body and request ID unchanged.
+    const linearIntent = (request: Record<string, any>) => request.linear === undefined ? targetLinear ?? null : request.linear;
+    requireSamePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)), options["--request-id"] === undefined ? undefined : requestId, rawArgs);
     if (uploadSource) {
       process.stderr.write(`[Infinite] Request ${requestId}\n`);
       const temp = mkdtempSync(join(tmpdir(), "infinite-team-blobs-"));
@@ -240,8 +366,11 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     await postMutation(api, receiptsPath, `${key}:repo-init:${requestId}`, `/projects/${selected}/team`, body, "PUT", !uploadSource);
     const output = await api.json<any>(`/projects/${selected}/team`);
     mappings[key] = { projectId: selected, source: sourceKind }; privateJson(mappingsPath, mappings);
+    if (output.linear?.teamId) {
+      await saveDirectoryDefault(defaultsPath, root, { teamId: z.uuid().parse(output.linear.teamId), ...(output.linear.projectId ? { projectId: z.uuid().parse(output.linear.projectId) } : {}) });
+    }
     if (explicitProject || uploadSource) { config.projectId = selected; privateJson(configPath, config); }
-    console.log(JSON.stringify({ id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, revision: output.revision, execution: output.execution, source: uploadSource ? `local commit ${commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout" }, null, 2));
+    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, revision: output.revision, execution: output.execution, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source: uploadSource ? `local commit ${commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout" }, null, 2));
     return true;
   }
   const [subcommand, id, ...rest] = positional;

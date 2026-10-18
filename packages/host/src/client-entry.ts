@@ -25,6 +25,7 @@ infinite recover SESSION_ID [--output NEW_DIRECTORY]
 infinite sync [--project ID] | --stop | --status | --apply [--force]
 infinite pull [PROJECT_ID] [--output NEW_DIRECTORY]
 infinite repo init [DIRECTORY] [--project ID] [--check-json JSON]
+infinite repo init PARENT_DIRECTORY --linear-team UUID [--linear-project UUID]
 infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]
 infinite team status [ID] [--json] | team watch ID
 infinite team steer ID TEXT | team answer ID QUESTION_ID TEXT

@@ -87,6 +87,219 @@ test("repo init configures an explicit project without resolving or replacing it
   } finally { await run.close(); }
 });
 
+test("repo init keeps directory Linear defaults local, inherits the nearest mapping, and persists enrollment precedence", { timeout: 120000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-defaults-"));
+  const localRoot = mkdtempSync(join(homedir(), "infinite-linear-defaults-"));
+  const hostRepos = join(root, "host-repositories"); mkdirSync(hostRepos);
+  const cloudHome = join(root, "cloud-home"); mkdirSync(cloudHome);
+  const apiKeyFile = join(root, "linear-key"); writeFileSync(apiKeyFile, "fixture-credential\n", { mode: 0o600 });
+  const makeGitRepo = async (path: string) => {
+    mkdirSync(path, { recursive: true });
+    await exec("git", ["init", "--initial-branch=main"], { cwd: path });
+    writeFileSync(join(path, "package.json"), JSON.stringify({ scripts: { check: "node -e process.exit(0)" } }));
+    await exec("git", ["-C", path, "add", "package.json"]);
+    await exec("git", ["-C", path, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture"]);
+  };
+  const existing = { teamId: randomUUID(), projectId: randomUUID() };
+  const hostProjects = [
+    { id: "existing-target", name: "Existing target", path: join(hostRepos, "existing"), team: { checks: [{ command: "node", args: ["-e", "process.exit(0)"] }] }, linear: existing },
+    { id: "explicit-target", name: "Explicit target", path: join(hostRepos, "explicit"), team: { checks: [{ command: "node", args: ["-e", "process.exit(0)"] }] } },
+    { id: "descendant-target", name: "Descendant target", path: join(hostRepos, "descendant"), team: { checks: [{ command: "node", args: ["-e", "process.exit(0)"] }] } },
+    { id: "isolated-target", name: "Isolated target", path: join(hostRepos, "isolated"), team: { checks: [{ command: "node", args: ["-e", "process.exit(0)"] }] } },
+  ];
+  for (const project of hostProjects) await makeGitRepo(project.path);
+
+  const run = await teamFixture("success", undefined, {
+    projects: hostProjects,
+    linear: { apiKeyFile },
+    sync: { homeDir: cloudHome },
+  });
+  const ownerConfig = join(run.host.root, "owner-client.json");
+  const otherPairingConfig = join(run.host.root, "other-pairing-client.json");
+  writeFileSync(ownerConfig, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  writeFileSync(otherPairingConfig, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.viewer }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts")];
+  const invoke = (config: string, args: string[], cwd?: string) => exec(entry[0], [...entry.slice(1), "--client-config", config, "repo", "init", ...args], cwd ? { cwd } : undefined);
+  const parent = join(localRoot, "checkout"); mkdirSync(parent);
+  const nested = join(parent, "nested"); mkdirSync(nested);
+  const childInherits = join(nested, "inherited-child");
+  const childExisting = join(nested, "existing-child");
+  const childExplicit = join(nested, "explicit-child");
+  const childDescendant = join(childInherits, "descendant");
+  const isolatedParent = join(localRoot, "other-pairing"); mkdirSync(isolatedParent);
+  const isolatedChild = join(isolatedParent, "child");
+  const checks = ["--check-json", JSON.stringify([{ command: "node", args: ["-e", "process.exit(0)"] }])];
+  const parentTeam = randomUUID(), parentProject = randomUUID();
+  const nestedTeam = randomUUID(), nestedProject = randomUUID();
+  const explicitTeam = randomUUID();
+  const otherPairingTeam = randomUUID(), otherPairingProject = randomUUID();
+  let hostStopped = false;
+  try {
+    // Both defaults are saved while the host is unreachable. A parent folder must not resolve,
+    // upload, or enroll anything on the host.
+    await run.host.stopApi(); hostStopped = true;
+    const parentResult = JSON.parse((await invoke(ownerConfig, [parent, "--linear-team", parentTeam, "--linear-project", parentProject])).stdout);
+    assert.equal(parentResult.kind, "directory");
+    assert.deepEqual(parentResult.linear, { teamId: parentTeam, projectId: parentProject });
+    const nestedResult = JSON.parse((await invoke(ownerConfig, [nested, "--linear-team", nestedTeam, "--linear-project", nestedProject])).stdout);
+    assert.deepEqual(nestedResult.linear, { teamId: nestedTeam, projectId: nestedProject });
+    const isolatedResult = JSON.parse((await invoke(otherPairingConfig, [isolatedParent, "--linear-team", otherPairingTeam, "--linear-project", otherPairingProject])).stdout);
+    assert.deepEqual(isolatedResult.linear, { teamId: otherPairingTeam, projectId: otherPairingProject });
+    await run.host.start(); hostStopped = false;
+
+    for (const path of [childInherits, childExisting, childExplicit, isolatedChild]) await makeGitRepo(path);
+    const inheritedOutput = JSON.parse((await invoke(ownerConfig, [childInherits, ...checks])).stdout);
+    const inheritedTarget = inheritedOutput.id as string;
+    assert.deepEqual(inheritedOutput.linear, { teamId: nestedTeam, projectId: nestedProject }, "the nearest directory default applies when the target has no mapping");
+    assert.equal(inheritedOutput.linearDefaultsFrom, realpathSync(nested));
+
+    await makeGitRepo(childDescendant);
+
+    const existingOutput = JSON.parse((await invoke(ownerConfig, [childExisting, "--project", "existing-target", ...checks])).stdout);
+    assert.deepEqual(existingOutput.linear, existing, "the target project's saved mapping takes precedence over its parent defaults");
+
+    const explicitOutput = JSON.parse((await invoke(ownerConfig, [childExplicit, "--project", "explicit-target", "--linear-team", explicitTeam, ...checks])).stdout);
+    assert.deepEqual(explicitOutput.linear, { teamId: explicitTeam }, "an explicit different team does not keep the inherited project");
+
+    const descendantOutput = JSON.parse((await invoke(ownerConfig, [childDescendant, "--project", "descendant-target", ...checks])).stdout);
+    assert.deepEqual(descendantOutput.linear, { teamId: nestedTeam, projectId: nestedProject }, "an enrolled Git repository supplies defaults to its own descendant");
+    assert.equal(descendantOutput.linearDefaultsFrom, realpathSync(childInherits));
+
+    const isolatedOutput = JSON.parse((await invoke(ownerConfig, [isolatedChild, "--project", "isolated-target", ...checks])).stdout);
+    assert.equal(isolatedOutput.linear, undefined, "defaults saved under another pairing do not cross into this pairing");
+
+    const inheritedApi = await run.host.fetchApi(`/projects/${inheritedTarget}/team`);
+    assert.deepEqual(inheritedApi.body.linear, { teamId: nestedTeam, projectId: nestedProject });
+    assert.deepEqual((await run.host.fetchApi("/projects/existing-target/team")).body.linear, existing);
+    assert.deepEqual((await run.host.fetchApi("/projects/explicit-target/team")).body.linear, { teamId: explicitTeam });
+    assert.deepEqual((await run.host.fetchApi("/projects/descendant-target/team")).body.linear, { teamId: nestedTeam, projectId: nestedProject });
+    assert.equal((await run.host.fetchApi("/projects/isolated-target/team")).body.linear, undefined);
+
+    // Editing the directory default later does not rebind an already-enrolled repository.
+    const changedParentProject = randomUUID();
+    await invoke(ownerConfig, [nested, "--linear-team", nestedTeam, "--linear-project", changedParentProject]);
+    rmSync(childDescendant, { recursive: true, force: true });
+    const unchangedChild = JSON.parse((await invoke(ownerConfig, [childInherits, ...checks])).stdout);
+    assert.deepEqual(unchangedChild.linear, { teamId: nestedTeam, projectId: nestedProject });
+
+    await run.host.stopApi(); hostStopped = true;
+    await run.host.start(); hostStopped = false;
+    assert.deepEqual((await run.host.fetchApi(`/projects/${inheritedTarget}/team`)).body.linear, { teamId: nestedTeam, projectId: nestedProject }, "the effective mapping survives host restart");
+    assert.deepEqual((await run.host.fetchApi("/projects/descendant-target/team")).body.linear, { teamId: nestedTeam, projectId: nestedProject });
+  } finally {
+    if (hostStopped) await run.host.start();
+    await run.close(); rmSync(root, { recursive: true, force: true }); rmSync(localRoot, { recursive: true, force: true });
+  }
+});
+
+test("a lost child enrollment receipt preserves concurrent defaults and requires exact-ID replay", { timeout: 60000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-default-race-"));
+  const apiKeyFile = join(root, "linear-key"); writeFileSync(apiKeyFile, "fixture-credential\n", { mode: 0o600 });
+  const hostRepos = join(root, "host-repositories"); mkdirSync(hostRepos);
+  const hostProjects = ["race-target", "lost-target"].map(id => ({ id, name: id, path: join(hostRepos, id), team: { checks: [{ command: "node", args: ["-e", "process.exit(0)"] }] } }));
+  const run = await teamFixture("success", undefined, { linear: { apiKeyFile }, projects: hostProjects });
+  const proxy = createServer();
+  let announcePut!: () => void;
+  const putReceived = new Promise<void>(resolve => announcePut = resolve);
+  let releasePut: (() => void) | undefined;
+  let holdNextPut = false, dropNextPut = false, putCount = 0;
+  let enrollmentChild: ReturnType<typeof spawn> | undefined;
+  const clientFile = join(run.host.root, "race-client.json");
+  const parent = join(root, "parent"); mkdirSync(parent);
+  const childRepo = join(parent, "child"); mkdirSync(childRepo);
+  const lostChild = join(parent, "lost-child"); mkdirSync(lostChild);
+  const teamBefore = randomUUID(), projectBefore = randomUUID();
+  const teamAfter = randomUUID(), projectAfter = randomUUID();
+  const makeRepo = async (path: string) => {
+    mkdirSync(path, { recursive: true });
+    await exec("git", ["init", "--initial-branch=main"], { cwd: path });
+    writeFileSync(join(path, "package.json"), JSON.stringify({ scripts: { check: "node -e process.exit(0)" } }));
+    await exec("git", ["-C", path, "add", "package.json"]);
+    await exec("git", ["-C", path, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture"]);
+  };
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts")];
+  const invoke = (args: string[]) => exec(entry[0], [...entry.slice(1), "--client-config", clientFile, "repo", "init", ...args]);
+  let proxyOrigin = "";
+  try {
+    for (const project of hostProjects) await makeRepo(project.path);
+    await makeRepo(childRepo); await makeRepo(lostChild);
+    proxy.on("request", (req, res) => {
+      const upstream = httpRequest(run.host.origin + req.url, { method: req.method, headers: { ...req.headers, host: new URL(run.host.origin).host } }, response => {
+        if (req.method === "PUT" && /^\/api\/projects\/(?:race-target|lost-target)\/team$/.test(req.url ?? "")) {
+          const chunks: Buffer[] = [];
+          response.on("data", chunk => chunks.push(Buffer.from(chunk)));
+          response.on("end", () => {
+            putCount++;
+            if (dropNextPut) { dropNextPut = false; res.destroy(); }
+            else if (holdNextPut) {
+              holdNextPut = false;
+              releasePut = () => { res.writeHead(response.statusCode ?? 500, response.headers); res.end(Buffer.concat(chunks)); };
+              announcePut();
+            }
+            else {
+              res.writeHead(response.statusCode ?? 500, response.headers); res.end(Buffer.concat(chunks));
+            }
+          });
+        } else {
+          res.writeHead(response.statusCode ?? 500, response.headers); response.pipe(res);
+        }
+      });
+      upstream.on("error", () => res.destroy());
+      req.pipe(upstream);
+    });
+    await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+    proxyOrigin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
+    writeFileSync(clientFile, JSON.stringify({ origin: proxyOrigin, token: run.host.tokens.owner }), { mode: 0o600 });
+
+    await invoke([parent, "--linear-team", teamBefore, "--linear-project", projectBefore]);
+    const startEnrollment = (path: string, projectId: string) => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      enrollmentChild = spawn(entry[0], [...entry.slice(1), "--client-config", clientFile, "repo", "init", path, "--project", projectId, "--check-json", JSON.stringify([{ command: "node", args: ["-e", "process.exit(0)"] }])], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "";
+      enrollmentChild.stdout.on("data", value => stdout += value); enrollmentChild.stderr.on("data", value => stderr += value);
+      enrollmentChild.once("error", reject);
+      enrollmentChild.once("exit", code => resolve({ code, stdout, stderr }));
+    });
+    holdNextPut = true;
+    const pending = startEnrollment(childRepo, "race-target");
+    await wait(() => releasePut !== undefined, 20000);
+    await putReceived;
+    await invoke([parent, "--linear-team", teamAfter, "--linear-project", projectAfter]);
+    releasePut!(); releasePut = undefined;
+    const result = await pending;
+    enrollmentChild = undefined;
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout).linear, { teamId: teamBefore, projectId: projectBefore });
+    const currentParent = JSON.parse((await invoke([parent])).stdout);
+    assert.deepEqual(currentParent.linear, { teamId: teamAfter, projectId: projectAfter }, "the successful child save merges with the latest parent defaults");
+    assert.deepEqual((await run.host.fetchApi("/projects/race-target/team")).body.linear, { teamId: teamBefore, projectId: projectBefore });
+
+    // A first inherited request can commit even though its response is lost. Natural retry must
+    // preserve that uncertain request instead of creating another mutation.
+    const lostArgs = [lostChild, "--project", "lost-target", "--check-json", JSON.stringify([{ command: "node", args: ["-e", "process.exit(0)"] }])];
+    dropNextPut = true;
+    let lostError: { stderr?: string } | undefined;
+    try { await invoke(lostArgs); assert.fail("the proxy dropped the committed response"); }
+    catch (error) { lostError = error as { stderr?: string }; }
+    const requestId = /\[Infinite\] Request ([a-f0-9-]{36})/.exec(lostError?.stderr ?? "")?.[1];
+    assert.ok(requestId, "the request ID is recorded before the uncertain mutation");
+    const saved = await run.host.fetchApi("/projects/lost-target/team");
+    assert.deepEqual(saved.body.linear, { teamId: teamAfter, projectId: projectAfter });
+    assert.equal(saved.body.revision, 1);
+    await assert.rejects(invoke(lostArgs), (error: { stderr: string }) => /earlier request has an uncertain result/.test(error.stderr) && error.stderr.includes(requestId));
+    assert.equal(putCount, 2, "the natural retry is stopped before another host mutation");
+    const replay = JSON.parse((await invoke([...lostArgs, "--request-id", requestId])).stdout);
+    assert.deepEqual(replay.linear, { teamId: teamAfter, projectId: projectAfter });
+    const afterReplay = await run.host.fetchApi("/projects/lost-target/team");
+    assert.equal(afterReplay.body.revision, saved.body.revision, "exact-ID replay returns the committed enrollment without a new revision");
+    assert.deepEqual(afterReplay.body.linear, { teamId: teamAfter, projectId: projectAfter });
+    assert.equal(putCount, 3, "only explicit replay sends another request, and the host deduplicates it");
+  } finally {
+    releasePut?.(); enrollmentChild?.kill();
+    proxy.closeAllConnections(); await new Promise<void>(resolve => proxy.close(() => resolve()));
+    await run.close(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("repo init refuses to enroll a source snapshot while its sync generation is pending", { timeout: 120000 }, async () => {
   const localRoot = mkdtempSync(join(homedir(), "infinite-cli-pending-repo-"));
   const cloudHome = mkdtempSync(join(tmpdir(), "infinite-cli-cloud-home-"));

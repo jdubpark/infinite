@@ -231,7 +231,7 @@ infinite --project ID --title "Task" codex [FLAGS]
 infinite list [--json]                      List cloud sessions
 infinite resume [SESSION_ID]                Reattach to a live process
 infinite monitor [SESSION_ID]               Watch; Enter enables interaction
-infinite repo init [DIRECTORY]              Enroll a clean Git repository for team work
+infinite repo init [DIRECTORY]              Enroll a repository or set parent-folder Linear defaults
 infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
 infinite team status [ID]                   Show teams or one team
 infinite team watch ID                      Poll team status; Ctrl+C detaches

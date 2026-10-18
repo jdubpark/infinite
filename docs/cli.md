@@ -55,7 +55,30 @@ infinite team resume TEAM_ID
 infinite team cancel TEAM_ID
 ```
 
-`repo init` binds the canonical Git root to its cloud project in private client state. It requires a committed, clean checkout. The command infers `npm ci` when an npm lockfile exists and `npm run check` when `package.json` defines a `check` script. If it cannot identify checks, provide `--check-json` as a JSON array of `{ "command": "...", "args": [...] }` objects; `--setup-json` accepts one setup command in the same format. For a newly resolved local project, it uploads a one-time source snapshot from an isolated clone of the current commit. It does not start continuous sync or include ignored and untracked files. An explicit `--project` or existing directory binding configures the selected project without uploading local source. A pending cloud generation is refused; an already applied generation is retained without replacement.
+Linear IDs are saved during enrollment; team commands do not need them again.
+To reuse them across repositories, initialize their parent folder once:
+
+```sh
+infinite repo init /path/to/work --linear-team TEAM_UUID --linear-project PROJECT_UUID
+cd /path/to/work/my-repo
+infinite repo init
+infinite team start "Add a feature"
+```
+
+A parent folder outside Git stores only local Linear defaults. It does not upload
+the folder or create a host project. Each child repository still needs its own
+enrollment and verification commands. An enrolled Git repository also supplies
+its saved Linear mapping to repositories nested beneath it.
+
+Enrollment uses explicit Linear flags first, an existing host project mapping
+second, and the nearest parent default third. Parent changes affect future
+enrollments; they do not rewrite enrolled repositories or historical runs. A
+different explicit team never retains a project from the previous team.
+Paths are resolved before looking up parents, so a symlink outside the parent
+does not inherit its defaults. Defaults stay in private client storage for the
+paired host and device key; another pairing needs its own setup.
+
+For a repository, `repo init` binds the canonical Git root to its cloud project in private client state and requires a committed, clean checkout. The command infers `npm ci` when an npm lockfile exists and `npm run check` when `package.json` defines a `check` script. If it cannot identify checks, provide `--check-json` as a JSON array of `{ "command": "...", "args": [...] }` objects; `--setup-json` accepts one setup command in the same format. For a newly resolved local project, it uploads a one-time source snapshot from an isolated clone of the current commit. It does not start continuous sync or include ignored and untracked files. An explicit `--project` or existing directory binding configures the selected project without uploading local source. A pending cloud generation is refused; an already applied generation is retained without replacement.
 
 The host must have team workspace storage configured, and the project must have required checks, before `team start` can run. The host's configured lineup is used by default. `--provider PROVIDER` requests a single-provider team explicitly. `team start` uses the current directory's saved project binding, or an explicit `--project PROJECT_ID`. `team status` without an ID lists teams on the paired host; the other commands address a team by ID. `--linear-team` and `--linear-project` configure the optional project issue mapping during initialization. `--handoff auto|off` defaults to `auto` for this onboarding path.
 

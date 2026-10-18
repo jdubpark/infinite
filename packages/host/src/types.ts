@@ -80,6 +80,8 @@ export interface Project {
   path: string;
   team?: import("./team-types.js").TeamProject;
   linear?: { teamId: string; projectId?: string };
+  /** Absolute host directory that holds this project's team runs, outside every project root. */
+  teamworkDir?: string;
 }
 export interface AgentProfile {
   command: string;

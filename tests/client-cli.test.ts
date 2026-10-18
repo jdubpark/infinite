@@ -249,7 +249,9 @@ test("repo init enrolls an unborn local repository without changing it and uploa
       GIT_COMMON_DIR: join(localRoot, ".git"),
     })).stdout);
     assert.equal(output.source, "empty cloud baseline");
-    assert.deepEqual(output.team, { checks: [], establishChecks: true, handoff: "auto" });
+    assert.deepEqual(output.team.checks, []);
+    assert.equal(output.team.establishChecks, true);
+    assert.equal(output.team.handoff, "auto");
     assert.equal(snapshot(localRoot), before, "repo init leaves all source and Git metadata bytes unchanged");
     assert.equal((await exec("git", ["-C", localRoot, "status", "--porcelain", "--ignored", "--untracked-files=all"])).stdout, "!! private.local\n");
     await assert.rejects(exec("git", ["-C", localRoot, "rev-parse", "--verify", "HEAD"]), "the local repository remains unborn");

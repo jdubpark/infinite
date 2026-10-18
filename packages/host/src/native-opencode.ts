@@ -4,7 +4,7 @@ import { createServer, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import type { Signal } from "@infinite/attention";
 import type { AgentProfile, InputControl } from "./types.js";
-import { usageFromMessageUpdated } from "./opencode-usage.js";
+import { usageFromStepFinish } from "./opencode-usage.js";
 import type { UsageRecord } from "./usage.js";
 import { nativeEvents, readNativeBody, readNativeResponse } from "./native-http.js";
 
@@ -37,6 +37,7 @@ export async function startNativeOpenCode(options: {
   let child: ChildProcess | undefined, endpoint = "", sessionId = "", stopped = false;
   let working = false, failed = false, lastMessage: string | undefined;
   const roles = new Map<string, string>();
+  const models = new Map<string, { providerId: string; modelId: string }>();
   const prompts = new Map<string, number>();
   const server = createServer();
   const stop = () => {
@@ -63,7 +64,17 @@ export async function startNativeOpenCode(options: {
     }
     if (type === "message.updated" && p.info?.sessionID === sessionId) {
       roles.set(p.info.id, p.info.role); if (roles.size > 256) roles.delete(roles.keys().next().value!);
-      const usage = usageFromMessageUpdated(event.payload ?? event);
+      if (p.info.role === "assistant" && p.info.providerID && p.info.modelID) {
+        models.set(p.info.id, { providerId: String(p.info.providerID), modelId: String(p.info.modelID) });
+        if (models.size > 256) models.delete(models.keys().next().value!);
+      }
+    }
+    if (type === "message.part.updated" && p.part?.type === "step-finish" && p.part.sessionID === sessionId) {
+      const reported = models.get(p.part.messageID);
+      const requested = options.settings.model ?? "unknown/unknown", slash = requested.indexOf("/");
+      const usage = usageFromStepFinish(p.part, { completedAt: new Date().toISOString(),
+        ...(reported ? { ...reported, modelSource: "reported" as const }
+          : { providerId: slash < 0 ? requested : requested.slice(0, slash), modelId: slash < 0 ? requested : requested.slice(slash + 1), modelSource: "requested" as const }) });
       if (usage) options.onUsage?.(usage);
     }
     if (type === "message.part.updated" && p.part?.type === "text" && roles.get(p.part.messageID) === "assistant") lastMessage = p.part.text?.slice(0, 4000);

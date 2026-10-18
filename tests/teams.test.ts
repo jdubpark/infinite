@@ -570,7 +570,7 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
   }
 });
 
-test("OpenCode team members journal each completed message announcement, ending with the final tokens and cost", { timeout: 120000 }, async () => {
+test("OpenCode team members journal each step with its tokens and cost", { timeout: 120000 }, async () => {
   const lineup = structuredClone(mixedLineup);
   lineup.implementers = [
     lineup.implementers[0],
@@ -595,13 +595,14 @@ test("OpenCode team members journal each completed message announcement, ending 
         usage.push(...page.body.events.filter((event: any) => event.type === "usage"));
         ({ cursor: after, more } = page.body);
       }
-      assert.equal(usage.length, 2, "Every completed announcement is journaled; streaming updates are not");
-      const last = usage[usage.length - 1].data;
-      assert.equal(last.messageId, `msg_${member.taskId}`);
-      assert.equal(last.reportedCost, 0.5);
-      assert.equal(last.tokens.input, 1000);
-      assert.equal(last.tokens.output, 500);
-      assert.equal(last.modelId, member.modelProfile!.model.split("/")[1]);
+      assert.equal(usage.length, 2, "Each step-finish is journaled once; text and plain lines are not");
+      assert.equal(new Set(usage.map(event => event.data.partId)).size, 2);
+      assert.ok(usage.every(event => event.data.messageId === `msg_${member.taskId}` && event.data.modelSource === "requested"));
+      const [providerId, modelId] = member.modelProfile!.model.split("/");
+      assert.ok(usage.every(event => event.data.providerId === providerId && event.data.modelId === modelId));
+      assert.equal(usage.reduce((sum, event) => sum + event.data.tokens.input, 0), 1000);
+      assert.equal(usage.reduce((sum, event) => sum + event.data.tokens.output, 0), 500);
+      assert.ok(Math.abs(usage.reduce((sum, event) => sum + event.data.reportedCost, 0) - 0.5) < 1e-9);
     }
   } finally { await f.close(); }
 });

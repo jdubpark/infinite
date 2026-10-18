@@ -39,7 +39,7 @@ import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
-import { JsonLineAssembler, usageFromMessageUpdated } from "./opencode-usage.js";
+import { JsonLineAssembler, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
 import type {
   Bootstrap,
@@ -1090,7 +1090,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       pending += data;
       try {
         if (usageLines) for (const event of usageLines.push(data)) {
-          const usage = usageFromMessageUpdated(event);
+          const usage = session.teamModelProfile ? usageFromRunLine(event, session.teamModelProfile.model) : undefined;
           if (usage) append("usage", { ...usage });
         }
         snapshots.observe(data);

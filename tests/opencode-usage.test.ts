@@ -1,32 +1,38 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { JsonLineAssembler, usageFromMessageUpdated } from "../packages/host/src/opencode-usage.js";
+import { JsonLineAssembler, usageFromRunLine, usageFromStepFinish } from "../packages/host/src/opencode-usage.js";
 
-const completed = { type: "message.updated", properties: { info: { id: "msg_1", sessionID: "ses_1", role: "assistant", providerID: "deepseek", modelID: "deepseek-flash", cost: 0.0123,
-  tokens: { input: 1200, output: 300, reasoning: 50, cache: { read: 100, write: 0 } }, time: { created: 1, completed: 2 } } } };
+const context = { completedAt: "2026-10-17T12:00:00.000Z", providerId: "deepseek", modelId: "deepseek-flash", modelSource: "requested" as const };
+const step = { type: "step-finish", id: "prt_1", messageID: "msg_1", sessionID: "ses_1", reason: "stop", cost: 0.0123,
+  tokens: { input: 1200, output: 300, reasoning: 50, cache: { read: 100, write: 0 } } };
+const completed = { type: "step_finish", timestamp: 2, sessionID: "ses_1", part: step };
 
-test("completed assistant messages become usage records; streaming and user messages do not", () => {
-  assert.deepEqual(usageFromMessageUpdated(completed), { provider: "opencode", providerId: "deepseek", modelId: "deepseek-flash", messageId: "msg_1", completedAt: new Date(2).toISOString(),
+test("a step-finish part becomes a usage record; other parts do not", () => {
+  assert.deepEqual(usageFromStepFinish(step, context), { provider: "opencode", providerId: "deepseek", modelId: "deepseek-flash", modelSource: "requested",
+    messageId: "msg_1", partId: "prt_1", completedAt: context.completedAt,
     tokens: { input: 1200, output: 300, reasoning: 50, cacheRead: 100, cacheWrite: 0 }, reportedCost: 0.0123 });
-  assert.equal(usageFromMessageUpdated({ ...completed, properties: { info: { ...completed.properties.info, time: { created: 1 } } } }), undefined);
-  assert.equal(usageFromMessageUpdated({ type: "message.updated", properties: { info: { id: "u", role: "user", time: { created: 1, completed: 2 } } } }), undefined);
-  assert.equal(usageFromMessageUpdated({ ...completed, type: "message.part.updated" }), undefined);
-  assert.equal(usageFromMessageUpdated(null), undefined);
+  assert.equal(usageFromStepFinish({ ...step, type: "text" }, context), undefined);
+  assert.equal(usageFromStepFinish({ ...step, id: undefined }, context), undefined);
+  assert.equal(usageFromStepFinish({ ...step, messageID: "" }, context), undefined);
+  assert.equal(usageFromStepFinish(null, context), undefined);
 });
 
 test("missing, negative, and non-finite numbers never reach pricing", () => {
-  const info = { ...completed.properties.info, cost: null, tokens: { input: 7.9, output: -3, reasoning: Number.NaN, cache: undefined } };
-  const record = usageFromMessageUpdated({ ...completed, properties: { info } });
+  const record = usageFromStepFinish({ ...step, cost: null, tokens: { input: 7.9, output: -3, reasoning: Number.NaN, cache: undefined } }, context);
   assert.deepEqual(record?.tokens, { input: 7, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 });
   assert.equal(record?.reportedCost, 0);
-  const noTokens = usageFromMessageUpdated({ ...completed, properties: { info: { ...info, tokens: undefined, cost: -1 } } });
+  const noTokens = usageFromStepFinish({ ...step, tokens: undefined, cost: -1 }, context);
   assert.deepEqual(noTokens?.tokens, { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 });
   assert.equal(noTokens?.reportedCost, 0);
 });
 
-test("a completed message without identifiers or a valid completion time is ignored", () => {
-  for (const patch of [{ id: undefined }, { providerID: undefined }, { modelID: undefined }, { time: { created: 1, completed: "x" } }])
-    assert.equal(usageFromMessageUpdated({ ...completed, properties: { info: { ...completed.properties.info, ...patch } } }), undefined);
+test("run output lines map to usage by the requested model, and text lines are ignored", () => {
+  const record = usageFromRunLine(completed, "deepseek/deepseek-flash", new Date(5));
+  assert.equal(record?.completedAt, new Date(2).toISOString());
+  assert.deepEqual([record?.providerId, record?.modelId, record?.modelSource], ["deepseek", "deepseek-flash", "requested"]);
+  assert.equal(usageFromRunLine({ ...completed, type: "text", part: { type: "text", id: "p", messageID: "m" } }, "a/b"), undefined);
+  assert.equal(usageFromRunLine({ ...completed, timestamp: "x" }, "a/b/c", new Date(5))?.completedAt, new Date(5).toISOString());
+  assert.equal(usageFromRunLine({ ...completed, timestamp: "x" }, "a/b/c", new Date(5))?.modelId, "b/c");
 });
 
 test("the assembler reassembles a JSON line split across chunks and drops other output", () => {

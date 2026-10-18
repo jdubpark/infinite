@@ -6,26 +6,37 @@ const count = (value: unknown): number => typeof value === "number" && Number.is
 const amount = (value: unknown): number => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 const text = (value: unknown): string | undefined => typeof value === "string" && value ? value : undefined;
 
+export interface UsageContext { completedAt: string; providerId: string; modelId: string; modelSource: "requested" | "reported" }
+
 /**
- * Turns an OpenCode `message.updated` event into a usage record. Only a completed assistant
- * message counts, because streaming updates carry partial totals. Numbers are coerced to finite
+ * Turns an OpenCode `step-finish` part into a usage record. Each step reports its own tokens and
+ * cost, so one assistant message yields several records. Numbers are coerced to finite
  * non-negative values so malformed provider data cannot reach pricing.
  */
-export function usageFromMessageUpdated(event: unknown): UsageRecord | undefined {
-  const root = event as { type?: unknown; properties?: { info?: Record<string, any> } } | null;
-  if (root?.type !== "message.updated") return undefined;
-  const info = root.properties?.info;
-  if (!info || info.role !== "assistant") return undefined;
-  const completed = info.time?.completed;
-  const messageId = text(info.id), providerId = text(info.providerID), modelId = text(info.modelID);
-  if (typeof completed !== "number" || !Number.isFinite(completed) || !messageId || !providerId || !modelId) return undefined;
-  const completedAt = new Date(completed);
-  if (Number.isNaN(completedAt.getTime())) return undefined;
-  const tokens = info.tokens ?? {};
-  return { provider: "opencode", providerId, modelId, messageId, completedAt: completedAt.toISOString(),
+export function usageFromStepFinish(part: unknown, context: UsageContext): UsageRecord | undefined {
+  const step = part as Record<string, any> | null;
+  if (!step || step.type !== "step-finish") return undefined;
+  const partId = text(step.id), messageId = text(step.messageID);
+  if (!partId || !messageId) return undefined;
+  const tokens = step.tokens ?? {};
+  return { provider: "opencode", providerId: context.providerId, modelId: context.modelId, modelSource: context.modelSource,
+    messageId, partId, completedAt: context.completedAt,
     tokens: { input: count(tokens.input), output: count(tokens.output), reasoning: count(tokens.reasoning),
       cacheRead: count(tokens.cache?.read), cacheWrite: count(tokens.cache?.write) },
-    reportedCost: amount(info.cost) };
+    reportedCost: amount(step.cost) };
+}
+
+/**
+ * Usage record for one line of `opencode run --format json` output, or undefined for any other
+ * line. The model comes from the requested `provider/model` selection.
+ */
+export function usageFromRunLine(line: unknown, model: string, now = new Date()): UsageRecord | undefined {
+  const event = line as { type?: unknown; timestamp?: unknown; part?: unknown } | null;
+  if (event?.type !== "step_finish") return undefined;
+  const slash = model.indexOf("/");
+  const stamp = typeof event.timestamp === "number" && Number.isFinite(event.timestamp) ? new Date(event.timestamp) : now;
+  return usageFromStepFinish(event.part, { completedAt: (Number.isNaN(stamp.getTime()) ? now : stamp).toISOString(), modelSource: "requested",
+    providerId: slash < 0 ? model : model.slice(0, slash), modelId: slash < 0 ? model : model.slice(slash + 1) });
 }
 
 /**

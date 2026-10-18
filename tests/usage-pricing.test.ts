@@ -4,7 +4,7 @@ import { periodStart, priceUsage, sumUsage, type UsageRecord } from "../packages
 import type { UsageConfig } from "../packages/host/src/config.js";
 
 const base: UsageRecord = {
-  provider: "opencode", providerId: "deepseek", modelId: "deepseek-flash", messageId: "m1", completedAt: "2026-10-17T12:00:00.000Z",
+  provider: "opencode", providerId: "deepseek", modelId: "deepseek-flash", messageId: "m1", partId: "p1", modelSource: "reported", completedAt: "2026-10-17T12:00:00.000Z",
   tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0,
 };
 

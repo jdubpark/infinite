@@ -148,17 +148,16 @@ async function main() {
     const name = scenario === "scope-escape" && assignment.taskId === "a" ? " a.txt" : `${assignment.taskId}.txt`;
     writeFileSync(name, `revision ${assignment.revision}\n`);
     if (scenario === "usage" && receipt.provider === "opencode") {
-      // The `opencode run --format json` stream: a streaming update, two completions of the
-      // same message (the second holds the final totals), and unrelated plain text.
-      const [providerID, modelID] = receipt.model.split("/");
-      const message = (tokens, cost, completed) => JSON.stringify({ type: "message.updated", properties: { info: {
-        id: `msg_${assignment.taskId}`, sessionID: "ses_fixture", role: "assistant", providerID, modelID, cost, tokens,
-        time: completed ? { created: 1, completed } : { created: 1 } } } });
-      const none = { read: 0, write: 0 };
+      // The `opencode run --format json` stream: one line per part event, with a step-finish
+      // part for each step of the assistant message, then unrelated plain text.
+      const line = (type, part) => JSON.stringify({ type, timestamp: Date.now(), sessionID: "ses_fixture", part });
+      const step = (n, cost, input, output) => line("step_finish", { type: "step-finish", id: `prt_${assignment.taskId}_${n}`,
+        messageID: `msg_${assignment.taskId}`, sessionID: "ses_fixture", reason: "tool-calls", cost,
+        tokens: { input, output, reasoning: 0, cache: { read: 0, write: 0 } } });
       process.stdout.write([
-        message({ input: 50, output: 10, reasoning: 0, cache: none }, 0.01),
-        message({ input: 400, output: 100, reasoning: 0, cache: none }, 0.1, 1_700_000_000_000),
-        message({ input: 1000, output: 500, reasoning: 0, cache: none }, 0.5, 1_700_000_001_000),
+        line("text", { type: "text", id: `prt_${assignment.taskId}_0`, messageID: `msg_${assignment.taskId}`, sessionID: "ses_fixture", text: "Working." }),
+        step(1, 0.1, 400, 100),
+        step(2, 0.4, 600, 400),
         "Implementation notes follow.",
       ].join("\n") + "\n");
     }

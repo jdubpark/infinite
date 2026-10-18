@@ -106,7 +106,7 @@ function TaskModel({ task, team }: { task: TeamTask; team: TeamView }) {
 }
 function SetupNotice({ me }: { me: Me }) {
   if (!me.teams?.enabled) return <div className="team-notice" role="status"><strong>Teams need host setup.</strong><p>Enable teams in the host configuration, then configure a workspace with its required checks. The host runs those checks before a team can be ready for review.</p></div>;
-  if (!me.projects.some(project => project.team?.checks.length)) return <div className="team-notice" role="status"><strong>No workspace is ready for a team.</strong><p>Add required team checks to a workspace in the host configuration. Add a setup command if its isolated workspace needs dependencies.</p></div>;
+  if (!me.projects.some(project => (project.team?.checks.length || project.team?.establishChecks))) return <div className="team-notice" role="status"><strong>No workspace is ready for a team.</strong><p>Add required team checks to a workspace in the host configuration. Add a setup command if its isolated workspace needs dependencies.</p></div>;
   return null;
 }
 
@@ -158,13 +158,13 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
   const lineup = me.teams?.lineup;
   const [useConfiguredLineup, setUseConfiguredLineup] = useState(pending ? pending.useConfiguredLineup === true : Boolean(lineup));
   const [provider, setProvider] = useState(pending?.provider ?? providers.find(value => value !== "demo") ?? providers[0] ?? "");
-  const [projectId, setProjectId] = useState(pending?.projectId ?? me.projects.find(project => project.team?.checks.length)?.id ?? me.projects[0]?.id ?? "");
+  const [projectId, setProjectId] = useState(pending?.projectId ?? me.projects.find(project => (project.team?.checks.length || project.team?.establishChecks))?.id ?? me.projects[0]?.id ?? "");
   const [title, setTitle] = useState(pending?.title ?? "");
   const [objective, setObjective] = useState(pending?.objective ?? "");
   const [parallelism, setParallelism] = useState(pending?.parallelism ?? 2);
   const [busy, setBusy] = useState(false);
   const project = me.projects.find(value => value.id === projectId);
-  const configured = Boolean(me.teams?.enabled && project?.team?.checks.length);
+  const configured = Boolean(me.teams?.enabled && (project?.team?.checks.length || project?.team?.establishChecks));
   const maxParallelism = Math.max(1, Math.min(4, me.teams?.maxParallelism ?? 4));
   const selectedProvider = useConfiguredLineup ? lineup?.coordinator.provider : provider;
   const allowed = connected && me.role === "owner" && (Boolean(pending) || (configured && Boolean(selectedProvider)));
@@ -190,16 +190,16 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
         <label htmlFor="team-objective">Feature request or PRD</label><textarea id="team-objective" rows={8} required maxLength={24000} value={objective} onChange={event => setObjective(event.target.value)} placeholder="Describe the outcome, who it is for, and what should happen…" />
         <label htmlFor="team-title">Team name <span className="quiet">(optional)</span></label><input id="team-title" maxLength={100} value={title} onChange={event => setTitle(event.target.value)} placeholder="Uses the first line of your request" />
         <div className="team-form-grid">
-          <div><label htmlFor="team-project">Workspace</label><select id="team-project" value={projectId} onChange={event => setProjectId(event.target.value)}>{me.projects.map(value => <option key={value.id} value={value.id}>{value.name}{value.team?.checks.length ? "" : " · setup required"}</option>)}</select></div>
+          <div><label htmlFor="team-project">Workspace</label><select id="team-project" value={projectId} onChange={event => setProjectId(event.target.value)}>{me.projects.map(value => <option key={value.id} value={value.id}>{value.name}{(value.team?.checks.length || value.team?.establishChecks) ? "" : " · setup required"}</option>)}</select></div>
           <div>{lineup || useConfiguredLineup ? <><label htmlFor="team-agent-setup">Agent setup</label><select id="team-agent-setup" value={useConfiguredLineup ? "configured" : "single"} onChange={event => setUseConfiguredLineup(event.target.value === "configured")}><option value="configured" disabled={!lineup}>Configured lineup</option><option value="single">Single provider</option></select></> : <><label htmlFor="team-provider">Agent provider</label><select id="team-provider" value={provider} onChange={event => setProvider(event.target.value)}>{providers.map(value => <option key={value} value={value}>{names[value] ?? value}</option>)}</select></>}</div>
         </div>
         {lineup && !useConfiguredLineup && <><label htmlFor="team-provider">Agent provider</label><select id="team-provider" value={provider} onChange={event => setProvider(event.target.value)}>{providers.map(value => <option key={value} value={value}>{names[value] ?? value}</option>)}</select><p className="form-note">All roles use this provider with its host settings.</p></>}
         {useConfiguredLineup && <div className="team-lineup-preview"><h2>Configured lineup</h2><p className="quiet">The coordinator assigns each task to a profile from this implementer pool. These are requested model settings; provider policy may override them.</p>{lineup ? <Lineup lineup={lineup} /> : <p className="team-notice">The host’s current lineup is unavailable. Retrying will preserve the original creation request.</p>}</div>}
         <label htmlFor="team-parallelism">Parallel implementers</label><select id="team-parallelism" value={Math.min(parallelism, maxParallelism)} onChange={event => setParallelism(Number(event.target.value))}>{Array.from({ length: maxParallelism }, (_, index) => index + 1).map(value => <option key={value} value={value}>{value} {value === 1 ? "implementer" : "implementers"}</option>)}</select>
       </fieldset>
-      {me.teams?.enabled && !project?.team?.checks.length && <p className="team-notice">This workspace needs required team checks in the host configuration.</p>}
+      {me.teams?.enabled && !(project?.team?.checks.length || project?.team?.establishChecks) && <p className="team-notice">This workspace needs required team checks in the host configuration.</p>}
       {project?.linear?.enabled && <p className="form-note">This workspace tracks team work in Linear. Starting the team creates an issue; its workflow state remains under your control.</p>}
-      {project?.team && <details className="team-check-config"><summary>Required workspace checks</summary><ul>{project.team.checks.map((check, index) => <li key={index}><code>{[check.command, ...check.args].join(" ")}</code></li>)}</ul>{project.team.setup && <p className="quiet">Workspace setup: <code>{[project.team.setup.command, ...project.team.setup.args].join(" ")}</code></p>}</details>}
+      {project?.team && <details className="team-check-config"><summary>Required workspace checks</summary>{project.team.establishChecks && <p className="quiet">The coordinator will define build and test commands before implementation. The host must run them successfully before review.</p>}<ul>{project.team.checks.map((check, index) => <li key={index}><code>{[check.command, ...check.args].join(" ")}</code></li>)}</ul>{project.team.setup && <p className="quiet">Workspace setup: <code>{[project.team.setup.command, ...project.team.setup.args].join(" ")}</code></p>}</details>}
       <p className="form-note">Work runs on the selected host in isolated workspaces. The team uses the provider permissions already configured there. A refused tool can stop a member; inspect its session before continuing.</p>
       {!useConfiguredLineup && provider === "demo" && <p className="team-notice">Rehearsal uses a local test process. It does not call an AI model or implement a real feature.</p>}
       {creation.message && <p className="error" role="alert">{creation.message}{pending && " Delivery is unconfirmed. Retry keeps the same creation request."}</p>}

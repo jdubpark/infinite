@@ -40,6 +40,23 @@ are not replaced by enrollment. Setup and verification commands belong to that
 repository, while the coordinator, workers, and reviewer come from the host's
 configured lineup. Provider permissions remain under the owner's control.
 
+A new empty repository can enroll immediately after `git init`. Its cloud source
+gets an empty baseline commit; local Git history and files stay unchanged. When
+no checks exist, enrollment records `checks: []` and `establishChecks: true`.
+This owner opt-in authorizes the coordinator to define verification commands.
+The first plan must include `verification` with one or more `checks` and an
+optional `setup` command, each using the existing command/argument format.
+
+The host saves those commands before implementation and retains them through
+steering, retries, restarts, and later goal cycles. A plan cannot replace existing
+configured checks or change accepted commands. Setup runs after integration so
+workers can create the project first. Failed checks enter bounded repair; the
+team cannot become ready for review without passing checks and an independent
+review of both the implementation and its verification. Check commands execute
+under the configured host command identity, with the same environment filtering,
+timeouts, and interruption handling as configured checks. This opt-in does not
+approve provider permissions or allow a denied tool to be bypassed.
+
 Add the repository's Linear team and project mapping during enrollment to track
 new runs. Supply the IDs once per parent folder to reuse them across its child
 repositories; each child can then run `infinite repo init` without Linear flags.

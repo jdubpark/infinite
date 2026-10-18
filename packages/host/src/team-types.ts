@@ -12,9 +12,18 @@ export type TeamCommand = z.infer<typeof teamCommandSchema>;
 export const teamProjectSchema = z.object({
   handoff: z.enum(["auto", "off"]).optional(),
   setup: teamCommandSchema.optional(),
+  checks: z.array(teamCommandSchema).max(8),
+  establishChecks: z.literal(true).optional(),
+}).strict().superRefine((project, context) => {
+  if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
+    context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
+});
+export type TeamProject = z.infer<typeof teamProjectSchema>;
+export const teamVerificationSchema = z.object({
+  setup: teamCommandSchema.optional(),
   checks: z.array(teamCommandSchema).min(1).max(8),
 }).strict();
-export type TeamProject = z.infer<typeof teamProjectSchema>;
+export type TeamVerification = z.infer<typeof teamVerificationSchema>;
 const modelProfileFields = {
   id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/),
   label: z.string().trim().min(1).max(100),
@@ -133,7 +142,7 @@ export const teamTaskPlanSchema = z.object({
 }).strict();
 export type TeamTaskPlan = z.infer<typeof teamTaskPlanSchema>;
 export const teamReportSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("plan"), summary: z.string().min(1).max(4000), brief: teamBriefSchema.optional(), tasks: z.array(teamTaskPlanSchema).min(1).max(12) }).strict(),
+  z.object({ kind: z.literal("plan"), summary: z.string().min(1).max(4000), brief: teamBriefSchema.optional(), tasks: z.array(teamTaskPlanSchema).min(1).max(12), verification: teamVerificationSchema.optional() }).strict(),
   z.object({ kind: z.literal("explore"), summary: z.string().min(1).max(4000), tasks: z.array(teamScoutPlanSchema).min(1).max(3) }).strict(),
   z.object({ kind: z.literal("findings"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("no-change"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
@@ -194,6 +203,7 @@ export interface TeamDecision {
 }
 export interface TeamCheck {
   command: TeamCommand;
+  phase?: "setup";
   status: "running" | "passed" | "failed" | "interrupted";
   startedAt: string;
   finishedAt?: string;
@@ -202,6 +212,9 @@ export interface TeamCheck {
   revision: number;
 }
 export interface TeamRun {
+  /** Owner opt-in is pinned at creation; accepted commands cannot change within this run. */
+  establishChecks?: true;
+  verification?: TeamVerification;
   linearTracking?: boolean;
   usage?: TeamUsage;
   linear?: LinearTrackingView;

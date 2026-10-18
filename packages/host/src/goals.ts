@@ -98,7 +98,7 @@ export class GoalService {
       if (!this.enabled()) throw new TeamError(409, "goals-not-configured", "Configure a team lineup with a strong coordinator and reviewer before starting a goal.");
       if (Buffer.byteLength(JSON.stringify(request)) > 40000) throw new TeamError(409, "goal-too-large", "Keep the goal and evidence below 40 KiB. Link to longer source material.");
       const project = this.config.projects.find(value => value.id === request.projectId);
-      if (!project?.team?.checks.length) throw new TeamError(409, "goal-project-not-configured", "This project needs required team checks before a goal can start.");
+      if (!project?.team || (!project.team.checks.length && !project.team.establishChecks)) throw new TeamError(409, "goal-project-not-configured", "Configure required checks or authorize the team to establish them before a goal can start.");
       if (request.linearIssueId && !project.linear) throw new TeamError(409, "linear-not-configured", "Configure Linear for this project before linking an issue.");
       const { requestId, ...fields } = request;
       const createdAt = now();

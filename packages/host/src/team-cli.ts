@@ -17,7 +17,7 @@ type Api = {
 };
 type Options = Record<string, string | boolean>;
 const commandSchema = z.object({ command: z.string().min(1).max(4096).refine(value => !value.includes("\0")), args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]) }).strict();
-const projectConfigSchema = z.object({ setup: commandSchema.optional(), checks: z.array(commandSchema).min(1).max(8) }).strict();
+const projectConfigSchema = z.object({ setup: commandSchema.optional(), checks: z.array(commandSchema).max(8), establishChecks: z.literal(true).optional() }).strict();
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const projectIdPattern = /^[a-z0-9-]{1,80}$/;
 const directoryDefaultsSchema = z.object({
@@ -37,8 +37,43 @@ function readPrivateJson(path: string, fallback: unknown) {
     throw new Error("Private CLI state is unreadable; preserve it and inspect the file before retrying.");
   }
 }
+function gitEnv(overrides: NodeJS.ProcessEnv = {}) {
+  return { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))), ...overrides };
+}
+function isolatedGitEnv(overrides: NodeJS.ProcessEnv = {}) {
+  return gitEnv({ GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0", ...overrides });
+}
 function git(cwd: string, args: string[], timeout = 10000) {
-  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } }).trim();
+  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout, stdio: ["ignore", "pipe", "ignore"], env: gitEnv({ GIT_OPTIONAL_LOCKS: "0" }) }).trim();
+}
+function inspectSourceHead(root: string): { commit: string; branch?: string } {
+  try {
+    const commit = execFileSync("git", ["-C", root, "rev-parse", "--verify", "HEAD^{commit}"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"], env: gitEnv({ GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" }) }).trim();
+    if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new Error("Git did not report a valid commit.");
+    return { commit };
+  } catch (headError) {
+    const headFailure = headError as NodeJS.ErrnoException & { status?: number; stderr?: Buffer | string };
+    const headErrorText = String(headFailure.stderr ?? headFailure.message);
+    if (headFailure.status !== 128 || !/Needed a single revision/i.test(headErrorText))
+      throw new Error(`Could not inspect Git HEAD: ${clean(headErrorText)}.`);
+    let branch: string;
+    try { branch = git(root, ["symbolic-ref", "--quiet", "HEAD"]); }
+    catch { throw new Error(`Could not inspect Git HEAD: ${clean(headErrorText)}.`); }
+    let validBranch = branch.startsWith("refs/heads/");
+    if (validBranch) {
+      try { execFileSync("git", ["-C", root, "check-ref-format", branch], { stdio: "ignore", timeout: 10000, env: gitEnv({ GIT_OPTIONAL_LOCKS: "0" }) }); }
+      catch { validBranch = false; }
+    }
+    if (!validBranch)
+      throw new Error("Git HEAD is not a valid unborn branch reference.");
+    let found = false, failure: unknown;
+    try { execFileSync("git", ["-C", root, "show-ref", "--verify", "--quiet", branch], { stdio: "ignore", timeout: 10000, env: gitEnv({ GIT_OPTIONAL_LOCKS: "0" }) }); found = true; }
+    catch (error) { failure = error; }
+    if (found) throw new Error("Git HEAD names a branch with an unreadable commit; repair the repository before onboarding.");
+    if ((failure as NodeJS.ErrnoException & { status?: number } | undefined)?.status !== 1)
+      throw new Error(`Could not verify the unborn Git branch: ${clean((failure as Error | undefined)?.message ?? "Git inspection failed")}.`);
+    return { commit: "", branch };
+  }
 }
 function canonicalRoot(directory: string) {
   const path = realpathSync(directory);
@@ -57,7 +92,7 @@ function gitRootOrNonGit(directory: string): { root: string } | { nonGit: true }
   let stderr = "";
   let reportedRoot = "";
   try {
-    reportedRoot = execFileSync("git", ["-C", directory, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" } }).trim();
+    reportedRoot = execFileSync("git", ["-C", directory, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"], env: gitEnv({ GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" }) }).trim();
   } catch (error) {
     const failure = error as NodeJS.ErrnoException & { stderr?: Buffer | string };
     stderr = String(failure.stderr ?? "");
@@ -143,7 +178,7 @@ function commandArray(text: string, flag: string) {
   if (!Array.isArray(value)) throw new Error(`${flag} must contain a JSON command array.`);
   return value.map(item => commandSchema.parse(item));
 }
-function inferredProjectConfig(root: string, options: Options) {
+function inferredProjectConfig(root: string, options: Options, allowUnconfiguredChecks = false) {
   const pkgFile = join(root, "package.json");
   let pkg: { scripts?: Record<string, unknown> } | undefined;
   try { pkg = JSON.parse(readFileSync(pkgFile, "utf8")); } catch (error) {
@@ -152,9 +187,9 @@ function inferredProjectConfig(root: string, options: Options) {
   const hasLock = ["package-lock.json", "npm-shrinkwrap.json"].some(name => { try { return statSync(join(root, name)).isFile(); } catch { return false; } });
   const setup = options["--setup-json"] !== undefined ? commandArray(String(options["--setup-json"]), "--setup-json") : hasLock ? [{ command: "npm", args: ["ci"] }] : [];
   const checks = options["--check-json"] !== undefined ? commandArray(String(options["--check-json"]), "--check-json") : pkg?.scripts?.check ? [{ command: "npm", args: ["run", "check"] }] : [];
-  if (!checks.length) throw new Error("No package check script was found. Supply --check-json with a JSON array of command objects.");
+  if (!checks.length && !allowUnconfiguredChecks) throw new Error("No package check script was found. Supply --check-json with a JSON array of command objects.");
   if (setup.length > 1) throw new Error("--setup-json contains one setup command at most.");
-  return projectConfigSchema.parse({ ...(setup[0] ? { setup: setup[0] } : {}), checks });
+  return projectConfigSchema.parse({ ...(setup[0] ? { setup: setup[0] } : {}), checks, ...(!checks.length ? { establishChecks: true } : {}) });
 }
 function outputTeam(team: any, json: boolean) {
   if (json) { console.log(JSON.stringify(team, null, 2)); return; }
@@ -209,9 +244,10 @@ async function uploadCommit(api: Api, projectId: string, root: string, commit: s
   rmSync(cloned, { recursive: true, force: true });
   const source = join(cloned, "repo");
   try {
-    execFileSync("git", ["clone", "--no-local", "--no-hardlinks", "--no-checkout", root, source], { encoding: "utf8", timeout: 120000, stdio: ["ignore", "ignore", "pipe"] });
-    execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-C", source, "checkout", "--detach", commit], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "ignore", "pipe"] });
-    try { execFileSync("git", ["-C", source, "remote", "remove", "origin"], { stdio: "ignore", timeout: 5000 }); } catch { /* No remote is safe. */ }
+    const env = isolatedGitEnv();
+    execFileSync("git", ["clone", "--template=", "--no-local", "--no-hardlinks", "--no-checkout", root, source], { encoding: "utf8", timeout: 120000, stdio: ["ignore", "ignore", "pipe"], env });
+    execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-C", source, "checkout", "--detach", commit], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "ignore", "pipe"], env });
+    try { execFileSync("git", ["-C", source, "remote", "remove", "origin"], { stdio: "ignore", timeout: 5000, env }); } catch { /* No remote is safe. */ }
     const cwd = realpathSync(source);
     const manifest = await captureWorkspace({ roots: [cwd], cwd, storeDir: tempStore });
     captured(manifest.id);
@@ -232,6 +268,26 @@ async function uploadCommit(api: Api, projectId: string, root: string, commit: s
     const current = await api.json<any>(`/projects/${projectId}`);
     return { manifestId: manifest.id, committed, sync: current.sync };
   } finally { rmSync(cloned, { recursive: true, force: true }); }
+}
+
+async function uploadEmptyBaseline(api: Api, projectId: string, sourceRoot: string, tempStore: string, captured: (manifestId: string) => void) {
+  const baseline = mkdtempSync(join(tmpdir(), "infinite-team-empty-baseline-"));
+  try {
+    const objectFormat = git(sourceRoot, ["rev-parse", "--show-object-format=storage"]);
+    if (objectFormat !== "sha1" && objectFormat !== "sha256") throw new Error("Git reported an unsupported object format.");
+    const neutralEnv = isolatedGitEnv({
+      GIT_AUTHOR_NAME: "Infinite",
+      GIT_AUTHOR_EMAIL: "baseline@infinite.invalid",
+      GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+      GIT_COMMITTER_NAME: "Infinite",
+      GIT_COMMITTER_EMAIL: "baseline@infinite.invalid",
+      GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+    });
+    execFileSync("git", ["init", "--quiet", "--template=", "--initial-branch=main", `--object-format=${objectFormat}`], { cwd: baseline, stdio: "ignore", timeout: 10000, env: neutralEnv });
+    execFileSync("git", ["-c", "user.name=Infinite", "-c", "user.email=baseline@infinite.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "-C", baseline, "commit", "--allow-empty", "-m", "Initial empty cloud baseline"], { encoding: "utf8", stdio: ["ignore", "ignore", "pipe"], timeout: 10000, env: neutralEnv });
+    const commit = execFileSync("git", ["-C", baseline, "rev-parse", "--verify", "HEAD^{commit}"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"], env: neutralEnv }).trim();
+    return await uploadCommit(api, projectId, baseline, commit, tempStore, captured);
+  } finally { rmSync(baseline, { recursive: true, force: true }); }
 }
 
 export async function handleTeamClientCommand(command: "repo" | "team", positional: string[], options: Options, config: ClientConfig, api: Api, configPath: string, rawArgs: string[]): Promise<boolean> {
@@ -267,9 +323,9 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const root = gitResult.root;
     const status = git(root, ["status", "--porcelain", "--untracked-files=all"]);
     if (status) throw new Error("Repository must be clean before onboarding. Commit or remove tracked and untracked changes first.");
-    const commit = git(root, ["rev-parse", "HEAD"]);
-    if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new Error("Git did not report a valid commit.");
-    const repoConfig = inferredProjectConfig(root, options);
+    const head = inspectSourceHead(root);
+    const sourceRevision = head.commit || "unborn";
+    const repoConfig = inferredProjectConfig(root, options, !head.commit && options["--check-json"] === undefined);
     const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
     const linearTeam = explicitLinearTeam;
     const linearProject = explicitLinearProject;
@@ -290,7 +346,20 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     if (!target.hostSetup?.ready) throw new Error(`Host team configuration is incomplete: ${clean((target.hostSetup?.missing ?? ["teams.workspaceDir"]).join(", "))}. Configure the host before enrolling a repository.`);
     const detail = await api.json<any>(`/projects/${selected}`);
     const sourceKind = explicitProject ? "project" : localSource ? "local" : (stored as { source?: string } | undefined)?.source ?? "project";
-    const uploadKey = `${key}:source-upload:${selected}:${commit}`;
+    const preserveTargetChecks = Boolean(repoConfig.establishChecks && target.team?.checks?.length);
+    const projectConfig = projectConfigSchema.parse(preserveTargetChecks
+      ? { ...(options["--setup-json"] !== undefined ? (repoConfig.setup ? { setup: repoConfig.setup } : {}) : target.team.setup ? { setup: target.team.setup } : {}), checks: target.team.checks }
+      : repoConfig);
+    if (projectConfig.establishChecks && me.teams?.establishChecks !== 1)
+      throw new Error("This host does not support establishing team checks for an empty repository. Upgrade the host before running repo init.");
+    const uploadKey = `${key}:source-upload:${selected}:${sourceRevision}`;
+    const assertSourceUnchanged = () => {
+      if (git(root, ["status", "--porcelain", "--untracked-files=all"]) !== status)
+        throw new Error("The source repository changed during onboarding. No team configuration was written; inspect it and retry.");
+      const current = inspectSourceHead(root);
+      if (current.commit !== head.commit || current.branch !== head.branch)
+        throw new Error("Git HEAD changed during onboarding. No team configuration was written; inspect it and retry.");
+    };
     const records = readPrivateJson(receiptsPath, {}) as Record<string, any>;
     let sourceReceipt = records[uploadKey];
     if (sourceKind === "local" && sourceReceipt?.state === "pending-apply") {
@@ -327,13 +396,14 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       linearDefaultsFrom = rootDefault.origin;
     }
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...repoConfig, handoff }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}) };
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.
     const linearIntent = (request: Record<string, any>) => request.linear === undefined ? targetLinear ?? null : request.linear;
     requireSamePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)), options["--request-id"] === undefined ? undefined : requestId, rawArgs);
     if (uploadSource) {
+      assertSourceUnchanged();
       process.stderr.write(`[Infinite] Request ${requestId}\n`);
       const temp = mkdtempSync(join(tmpdir(), "infinite-team-blobs-"));
       sourceReceipt = readPrivateJson(receiptsPath, {})[uploadKey];
@@ -342,14 +412,17 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
         throw new Error("A prior source upload has an uncertain result. Inspect the cloud project before attempting another capture.");
       }
       const alreadyUploaded = sourceReceipt?.state === "confirmed";
-      if (!alreadyUploaded) receipt(receiptsPath, uploadKey, { requestId, projectId: selected, commit });
+      if (!alreadyUploaded) receipt(receiptsPath, uploadKey, { requestId, projectId: selected, commit: sourceRevision });
       try {
         if (!alreadyUploaded) {
-          const result = await uploadCommit(api, selected, root, commit, join(temp, "objects"), manifestId => {
+          const captured = (manifestId: string) => {
             const prepared = readPrivateJson(receiptsPath, {}) as Record<string, any>;
             prepared[uploadKey] = { ...prepared[uploadKey], manifestId };
             privateJson(receiptsPath, prepared);
-          });
+          };
+          const result = head.commit
+            ? await uploadCommit(api, selected, root, head.commit, join(temp, "objects"), captured)
+            : await uploadEmptyBaseline(api, selected, root, join(temp, "objects"), captured);
           if (result.committed.pendingGeneration || result.committed.appliedManifest !== result.manifestId || result.sync?.pendingGeneration || result.sync?.appliedManifest !== result.manifestId) {
             const reason = clean(result.sync?.pendingGeneration?.reason ?? result.committed.pendingGeneration?.reason ?? "not-applied");
             const pending = readPrivateJson(receiptsPath, {}) as Record<string, any>;
@@ -363,6 +436,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
         }
       } finally { rmSync(temp, { recursive: true, force: true }); }
     }
+    assertSourceUnchanged();
     await postMutation(api, receiptsPath, `${key}:repo-init:${requestId}`, `/projects/${selected}/team`, body, "PUT", !uploadSource);
     const output = await api.json<any>(`/projects/${selected}/team`);
     mappings[key] = { projectId: selected, source: sourceKind }; privateJson(mappingsPath, mappings);
@@ -370,7 +444,8 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       await saveDirectoryDefault(defaultsPath, root, { teamId: z.uuid().parse(output.linear.teamId), ...(output.linear.projectId ? { projectId: z.uuid().parse(output.linear.projectId) } : {}) });
     }
     if (explicitProject || uploadSource) { config.projectId = selected; privateJson(configPath, config); }
-    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, revision: output.revision, execution: output.execution, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source: uploadSource ? `local commit ${commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout" }, null, 2));
+    const source = uploadSource && !head.commit ? "empty cloud baseline" : uploadSource ? `local commit ${head.commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout";
+    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, revision: output.revision, execution: output.execution, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source }, null, 2));
     return true;
   }
   const [subcommand, id, ...rest] = positional;
@@ -387,7 +462,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     if (!projectIdPattern.test(projectId)) throw new Error("No repository project is bound to this directory. Run infinite repo init or use --project ID.");
     const project = await api.json<any>(`/projects/${projectId}/team`);
     if (!project.hostSetup?.ready) throw new Error(`Host team configuration is incomplete: ${clean((project.hostSetup?.missing ?? ["teams.workspaceDir"]).join(", "))}. Configure the host before starting a team.`);
-    if (!project.team?.checks?.length) throw new Error("Team setup is missing. Run infinite repo init with setup/check commands before starting a team.");
+    if (!project.team?.checks?.length && project.team?.establishChecks !== true) throw new Error("Team setup is missing. Run infinite repo init with setup/check commands before starting a team.");
     const me = await api.json<any>("/me");
     const provider = String(options["--provider"] ?? me.teams?.lineup?.coordinator?.provider ?? "");
     if (!provider) throw new Error("The host has no configured team lineup. Set one up on the host or use --provider PROVIDER for a single-provider team.");

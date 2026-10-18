@@ -87,6 +87,97 @@ test("repo init configures an explicit project without resolving or replacing it
   } finally { await run.close(); }
 });
 
+test("repo init enrolls an unborn local repository without changing it and uploads an empty cloud baseline", { timeout: 120000 }, async () => {
+  const localRoot = mkdtempSync(join(homedir(), "infinite-cli-unborn-repo-"));
+  const cloudHome = mkdtempSync(join(tmpdir(), "infinite-cli-unborn-cloud-"));
+  const run = await teamFixture("success", undefined, { sync: { homeDir: cloudHome } });
+  const clientFile = join(run.host.root, "unborn-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const invoke = (args: string[], gitEnv: NodeJS.ProcessEnv = {}) => exec(entry[0], [...entry.slice(1), "repo", "init", ...args], { env: { ...process.env, ...gitEnv } });
+  const snapshot = (path: string): string => {
+    const hash = createHash("sha256");
+    const visit = (current: string, prefix = "") => {
+      for (const name of readdirSync(current).sort()) {
+        const child = join(current, name), relativePath = prefix ? `${prefix}/${name}` : name;
+        const info = statSync(child);
+        hash.update(`${relativePath}\0${info.mode}\0`);
+        if (info.isDirectory()) visit(child, relativePath);
+        else hash.update(readFileSync(child));
+      }
+    };
+    visit(path);
+    return hash.digest("hex");
+  };
+  try {
+    await exec("git", ["init", "--initial-branch=main"], { cwd: localRoot });
+    mkdirSync(join(localRoot, ".git", "info"), { recursive: true });
+    writeFileSync(join(localRoot, ".git", "info", "exclude"), "private.local\n");
+    writeFileSync(join(localRoot, "private.local"), "ignored local content\n");
+    const before = snapshot(localRoot);
+    const output = JSON.parse((await invoke([localRoot, "--json"], {
+      GIT_DIR: join(localRoot, ".git"),
+      GIT_WORK_TREE: localRoot,
+      GIT_INDEX_FILE: join(localRoot, ".git", "index"),
+      GIT_OBJECT_DIRECTORY: join(localRoot, ".git", "objects"),
+      GIT_COMMON_DIR: join(localRoot, ".git"),
+    })).stdout);
+    assert.equal(output.source, "empty cloud baseline");
+    assert.deepEqual(output.team, { checks: [], establishChecks: true, handoff: "auto" });
+    assert.equal(snapshot(localRoot), before, "repo init leaves all source and Git metadata bytes unchanged");
+    assert.equal((await exec("git", ["-C", localRoot, "status", "--porcelain", "--ignored", "--untracked-files=all"])).stdout, "!! private.local\n");
+    await assert.rejects(exec("git", ["-C", localRoot, "rev-parse", "--verify", "HEAD"]), "the local repository remains unborn");
+
+    const detail = (await run.host.fetchApi(`/projects/${output.id}`)).body;
+    assert.ok(detail.sync?.appliedManifest, "the temporary baseline is applied to the cloud project");
+    assert.equal(readdirSync(detail.path).some(name => name !== ".git"), false, "ignored local content is never uploaded");
+    assert.equal((await exec("git", ["-C", detail.path, "status", "--porcelain", "--untracked-files=all"])).stdout, "");
+    const remoteLog = (await exec("git", ["-C", detail.path, "log", "--format=%H %P", "-1"])).stdout.trim().split(" ");
+    assert.match(remoteLog[0], /^[a-f0-9]{40,64}$/);
+    assert.equal(remoteLog.length, 1, "the cloud baseline has no parent commit");
+    assert.equal((await exec("git", ["-C", detail.path, "ls-tree", "-r", "--name-only", "HEAD"])).stdout, "", "the cloud baseline has an empty tree");
+
+    const cloudNote = join(detail.path, "cloud-note.txt");
+    writeFileSync(cloudNote, "cloud-side change\n");
+    await exec("git", ["-C", detail.path, "add", "cloud-note.txt"]);
+    await exec("git", ["-C", detail.path, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Cloud-side change"]);
+    const cloudHead = (await exec("git", ["-C", detail.path, "rev-parse", "HEAD"])).stdout.trim();
+    const repeated = JSON.parse((await invoke([localRoot, "--json"])).stdout);
+    assert.equal(repeated.id, output.id);
+    assert.equal(repeated.source, "existing cloud checkout retained");
+    assert.equal((await exec("git", ["-C", detail.path, "rev-parse", "HEAD"])).stdout.trim(), cloudHead, "repeated init does not replace the existing cloud snapshot");
+    assert.equal(readFileSync(cloudNote, "utf8"), "cloud-side change\n");
+
+    const configured = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
+    const explicit = JSON.parse((await invoke([localRoot, "--project", "rehearsal", "--json"])).stdout);
+    assert.deepEqual(explicit.team.checks, configured.checks, "an explicit target keeps its configured checks");
+    assert.equal(explicit.team.establishChecks, undefined, "an explicit target with checks does not enable check establishment");
+    assert.equal(explicit.source, "configured project checkout", "an explicit target retains its checkout");
+    assert.equal(snapshot(localRoot), before, "an explicit target does not replace the source checkout");
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); rmSync(cloudHome, { recursive: true, force: true }); }
+});
+
+test("repo init refuses dirty unborn repositories and damaged Git HEAD metadata", { timeout: 120000 }, async () => {
+  const dirtyRoot = mkdtempSync(join(homedir(), "infinite-cli-dirty-unborn-"));
+  const damagedRoot = mkdtempSync(join(homedir(), "infinite-cli-damaged-head-"));
+  const run = await teamFixture("success");
+  const clientFile = join(run.host.root, "unborn-refusal-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const invoke = (path: string) => exec(entry[0], [...entry.slice(1), "repo", "init", path]);
+  try {
+    await exec("git", ["init", "--initial-branch=main"], { cwd: dirtyRoot });
+    writeFileSync(join(dirtyRoot, "untracked.txt"), "must remain local\n");
+    await assert.rejects(invoke(dirtyRoot), (error: { stderr: string }) => /Repository must be clean/.test(error.stderr));
+
+    await exec("git", ["init", "--initial-branch=main"], { cwd: damagedRoot });
+    writeFileSync(join(damagedRoot, ".git", "HEAD"), "not-a-symbolic-ref\n");
+    await assert.rejects(invoke(damagedRoot), (error: { stderr: string }) => /Git|git|HEAD/.test(error.stderr));
+    assert.equal(readFileSync(join(dirtyRoot, "untracked.txt"), "utf8"), "must remain local\n");
+    assert.equal(readFileSync(join(damagedRoot, ".git", "HEAD"), "utf8"), "not-a-symbolic-ref\n");
+  } finally { await run.close(); rmSync(dirtyRoot, { recursive: true, force: true }); rmSync(damagedRoot, { recursive: true, force: true }); }
+});
+
 test("repo init keeps directory Linear defaults local, inherits the nearest mapping, and persists enrollment precedence", { timeout: 120000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-linear-defaults-"));
   const localRoot = mkdtempSync(join(homedir(), "infinite-linear-defaults-"));

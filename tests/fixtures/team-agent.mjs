@@ -11,6 +11,14 @@ if (process.argv[2] === "--command-prefix") {
   child.once("exit", code => process.exit(code ?? 128));
   await new Promise(() => {});
 }
+if (process.argv[2] === "--bootstrap-setup") {
+  if (!existsSync("check.mjs")) throw new Error("The implemented check file is missing");
+  const check = readFileSync("check.mjs", "utf8");
+  if (process.argv[3] !== "bootstrap-fail" && !check.includes("a.txt"))
+    throw new Error("The implemented check does not cover the requested files");
+  process.stdout.write("Bootstrap setup completed.\n");
+  process.exit(0);
+}
 if (process.argv[2] === "--hold-check") {
   const receiptDir = process.argv[3];
   writeFileSync(join(receiptDir, "check-ready.json"), JSON.stringify({ pid: process.pid }), { mode: 0o600 });
@@ -121,6 +129,7 @@ async function main() {
       { id: "a", title: "Build the first file", instructions: "Write a.txt with the current revision", paths: ["a.txt"], dependsOn: [] },
       { id: "b", title: "Build the second file", instructions: "Write b.txt with the current revision", paths: ["b.txt"], dependsOn: [] },
     ];
+    if (scenario.startsWith("bootstrap")) tasks[0].paths.push("check.mjs");
     if (scenario === "usage") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "deepseek-high";
@@ -136,11 +145,16 @@ async function main() {
       tasks[0].agentProfileId = "spark-high";
       Object.assign(tasks[1], JSON.parse(readFileSync(join(receiptDir, "invalid-profile.json"), "utf8")));
     }
-    await report({ kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks });
+    const verification = { setup: { command: process.execPath, args: [process.argv[1], "--bootstrap-setup", scenario] },
+      checks: [{ command: process.execPath, args: ["check.mjs"] }] };
+    if (scenario === "bootstrap-change" && assignment.revision > 1)
+      verification.checks[0].args.push("--different");
+    await report({ kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
+      ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) });
   } else if (assignment.role === "implementer") {
     await waitForPeer();
     const asked = join(receiptDir, `${assignment.runId}.${assignment.taskId}.asked`);
-    if (scenario === "mixed" && assignment.taskId === "b" && !existsSync(asked)) {
+    if ((scenario === "mixed" || (scenario === "bootstrap-replan" || scenario === "bootstrap-change") && assignment.revision === 1) && assignment.taskId === "b" && !existsSync(asked)) {
       writeFileSync(asked, "asked", { mode: 0o600 });
       await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"] });
       return;
@@ -148,6 +162,16 @@ async function main() {
     if (scenario === "question") {
       while (!existsSync(join(receiptDir, `${assignment.runId}.release`)))
         await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    if (scenario.startsWith("bootstrap") && assignment.taskId === "a") {
+      const check = scenario === "bootstrap-fail"
+        ? 'console.error("Coordinator check failed"); process.exit(17);'
+        : [
+          'import assert from "node:assert/strict";',
+          'import { readFileSync } from "node:fs";',
+          'assert.equal(readFileSync("a.txt", "utf8"), readFileSync("b.txt", "utf8"));',
+        ].join("\n");
+      writeFileSync("check.mjs", check + "\n");
     }
     // Keep both processes alive after the barrier so overlap can be measured
     // independently of the member states returned by the API.

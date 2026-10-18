@@ -7,7 +7,7 @@ export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
 export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean }
-/** Commands are configured argv arrays, never model-produced shell text. */
+/** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
     const env: NodeJS.ProcessEnv = {};

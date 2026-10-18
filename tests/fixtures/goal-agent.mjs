@@ -64,7 +64,9 @@ async function main() {
       dataShape: "The progress object contains a numeric completed field", acceptance: [`The completed field is ${target}`],
       expectedOutcome: "The next progress step is available; product impact needs user evidence", uiChanges: scenario === "ui-evidence",
     }, tasks: [{ id: "progress", title: `Add progress step ${target}`, instructions: `Set completed to ${target} and leave no draft field`,
-      agentProfileId: "light", paths: [scenario === "scope" ? "outside.txt" : "features/progress.json"], dependsOn: [] }] });
+      agentProfileId: "light", paths: [scenario === "scope" ? "outside.txt" : "features/progress.json"], dependsOn: [] }],
+    ...(scenario === "bootstrap-goal" && progress.completed === 0
+      ? { verification: { checks: [{ command: process.execPath, args: ["check.mjs"] }] } } : {}) });
   } else if (assignment.role === "scout") {
     await until(() => readdirSync(receipts).filter(name => name.endsWith(".json"))
       .map(name => JSON.parse(readFileSync(join(receipts, name), "utf8")))
@@ -76,6 +78,8 @@ async function main() {
       evidence: [{ source: checks ? "check.mjs" : "features/progress.json",
         observation: checks ? "check.mjs validates progress" : `progress starts at ${progress.completed}` }] });
   } else if (assignment.role === "implementer") {
+    if (scenario === "bootstrap-goal" && progress.completed === 0)
+      await until(() => existsSync(join(receipts, "release-first-implementation")));
     const model = process.argv[process.argv.indexOf("--model") + 1];
     if (scenario === "cycles" && progress.completed === 0 && model !== "gpt-6-astra") {
       writeFileSync("features/progress.json", JSON.stringify({ completed: 0, draft: "Step prepared by the light worker" }) + "\n");

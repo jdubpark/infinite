@@ -41,7 +41,7 @@ import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
 import { buildLaunch } from "./launch.js";
-import { recordClaudeTrust } from "./workspace-trust.js";
+import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
@@ -1189,7 +1189,7 @@ server.listen(socketPath(runDir, session.id), async () => {
         // this account reads this account's config, so the worker records it here.
         env.INFINITE_TRUSTED_WORKSPACE = session.cwd;
         if (provider === "claude" && env.HOME && !/(^|\/)sudo$/.test(profile.command))
-          try { recordClaudeTrust(join(env.HOME, ".claude.json"), session.cwd); }
+          try { recordClaudeTrust(claudeConfigPath(env.HOME), session.cwd); }
           catch (error) { journal.append("lifecycle", { workspaceTrust: "unrecorded", reason: error instanceof Error ? error.message : String(error) }); }
       }
     }

@@ -703,8 +703,12 @@ Every member launched afterwards, in `teams.workspaceDir` or an enrolled
 teamwork folder, starts trusted in its own folder. The host records the
 decision with the member session, so restarts keep it. Codex receives a
 per-launch `projects` override and nothing is written to its configuration.
-Claude Code reads trust only from its account's `.claude.json`, so each member
-folder gains a `hasTrustDialogAccepted` entry there. The worker writes it when
+Claude Code reads trust only from its account's global config (`.claude.json`, or
+a legacy `.claude/.config.json` it still prefers), so each member folder gains a
+`hasTrustDialogAccepted` entry there. The entry is written under Claude's own
+`<file>.lock` lock, so a running Claude session and the host never overwrite
+each other's update; a lock held past five seconds leaves the prompt instead.
+The worker writes it when
 Claude runs in the host's own account. For a sudo profile, the agent wrapper
 writes it in the agent account, for the current folder only, from
 `INFINITE_TRUSTED_WORKSPACE`. A wrapper or sudoers file without that support

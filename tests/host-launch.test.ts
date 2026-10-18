@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
 import { buildLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
-import { recordClaudeTrust } from "../packages/host/src/workspace-trust.js";
+import { claudeConfigPath, recordClaudeTrust } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
@@ -213,6 +213,53 @@ test("Claude trust adds one exact folder entry and leaves the rest of its config
     assert.throws(() => recordClaudeTrust(config, memberFolder));
     assert.equal(readFileSync(config, "utf8"), "{ not json");
     assert.throws(() => recordClaudeTrust(config, "members/relative"), /absolute folder/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Claude trust takes Claude's own config lock and keeps a concurrent Claude write", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-claude-lock-")));
+  try {
+    const home = join(root, "home"), member = join(root, "member"), config = join(home, ".claude.json"), lock = `${config}.lock`;
+    mkdirSync(home); mkdirSync(member);
+    writeFileSync(config, JSON.stringify({ numStartups: 1 }));
+    mkdirSync(lock);
+    assert.throws(() => recordClaudeTrust(config, member, 100), /locked/);
+    assert.deepEqual(JSON.parse(readFileSync(config, "utf8")), { numStartups: 1 });
+    assert.ok(existsSync(lock), "Another writer's lock must stay in place");
+    // The agent-side entry waits while a running Claude session holds the lock and saves.
+    const child = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/workspace-trust.ts"), "claude"],
+      { cwd: member, env: { PATH: process.env.PATH ?? "", HOME: home, INFINITE_TRUSTED_WORKSPACE: member }, stdio: "ignore" });
+    const exited = new Promise<number | null>(done => child.once("exit", done));
+    const early = await Promise.race([exited, new Promise(done => setTimeout(() => done("waiting"), 1500))]);
+    assert.equal(early, "waiting", "Trust must not be written while Claude holds its config lock");
+    const claudeSave = { numStartups: 2, projects: { "/srv/other": { allowedTools: ["Read"] } } };
+    writeFileSync(config, JSON.stringify(claudeSave));
+    rmSync(lock, { recursive: true });
+    assert.equal(await exited, 0);
+    assert.deepEqual(JSON.parse(readFileSync(config, "utf8")), { ...claudeSave, projects: { ...claudeSave.projects, [member]: { hasTrustDialogAccepted: true } } });
+    assert.ok(!existsSync(lock));
+    // A lock abandoned past proper-lockfile's ten-second staleness is reclaimed.
+    mkdirSync(lock);
+    const old = new Date(Date.now() - 60000);
+    utimesSync(lock, old, old);
+    assert.equal(recordClaudeTrust(config, "/srv/stale-lock-member", 100), true);
+    assert.ok(!existsSync(lock));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Claude trust targets the config file Claude reads, including its legacy location", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-claude-path-")));
+  try {
+    const home = join(root, "home"), legacy = join(home, ".claude", ".config.json"), primary = join(home, ".claude.json");
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    assert.equal(claudeConfigPath(home), primary);
+    writeFileSync(legacy, "", { mode: 0o600 });
+    assert.equal(claudeConfigPath(home), legacy, "An empty, writable legacy file is used when the primary file is absent");
+    writeFileSync(primary, "{}");
+    assert.equal(claudeConfigPath(home), primary);
+    writeFileSync(legacy, JSON.stringify({ projects: {} }));
+    assert.equal(claudeConfigPath(home), legacy, "A non-empty legacy file still wins");
+    assert.equal(claudeConfigPath(home, join(root, "custom")), join(root, "custom", ".claude.json"));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

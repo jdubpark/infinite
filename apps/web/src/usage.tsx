@@ -2,7 +2,11 @@ import { useEffect, useState } from "react";
 import { useApi, type Me, type UsageSummary, type UsageTotals, type TeamUsage } from "./api";
 
 const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
-const money = (usd: number) => usd.toFixed(2) + " USD";
+/** Mirrors formatUsd in the host: four decimals below one cent, "0.00" only for a true zero. */
+const amount = (usd: number) => usd === 0 ? "0.00" : usd >= 0.01 ? usd.toFixed(2) : usd < 0.0001 ? "<0.0001" : usd.toFixed(4);
+/** Fully unpriced totals carry no figure; partly unpriced ones are a lower bound. */
+export const cost = (totals: UsageTotals) => totals.messages > 0 && totals.pricing.unknown === totals.messages ? "No price available"
+  : (totals.pricing.unknown > 0 ? "At least " : "") + amount(totals.cost) + " USD";
 const day = (value: string) => new Date(value).toLocaleDateString([], { month: "short", day: "numeric", timeZone: "UTC" });
 
 /** Where each figure comes from: a configured price, the cost OpenCode reported, or no price at all. */
@@ -15,7 +19,7 @@ export function usageProvenance(totals: UsageTotals): string {
 /** Cost with its provenance. A total with unpriced steps says so rather than presenting a complete figure. */
 export function UsageFigure({ usage }: { usage?: UsageTotals }) {
   if (!usage) return <span className="quiet">Unmeasured</span>;
-  return <span>{money(usage.cost)} <span className="quiet">· {usageProvenance(usage)}</span></span>;
+  return <span>{cost(usage)} <span className="quiet">· {usageProvenance(usage)}</span></span>;
 }
 
 export const usageEnabled = (me: Me) => me.usage?.enabled === true;
@@ -56,7 +60,7 @@ export function SpendBlock({ me }: { me: Me }) {
       const period = entry.budget?.period, over = entry.spent && entry.budget && entry.spent.cost > entry.budget.usd;
       return <FragmentProvider key={name} name={names(name)}>
         {!entry.measured || !entry.spent ? <span className="quiet">Unmeasured{entry.unmeasuredSessions ? ` · ${plural(entry.unmeasuredSessions, "session")}` : ""}</span>
-          : <span>{entry.spent.cost.toFixed(2)}{entry.budget ? ` / ${entry.budget.usd.toFixed(2)}` : ""} USD{over && <strong> · over budget</strong>} <span className="quiet">· {period ? `${period} budget, ` : ""}{day(entry.period.start)} to {day(new Date(Date.parse(entry.period.end) - 1).toISOString())} UTC · {usageProvenance(entry.spent)}{entry.unmeasuredSessions ? ` · ${plural(entry.unmeasuredSessions, "session")} unmeasured` : ""}</span></span>}
+          : <span>{entry.spent.messages > 0 && entry.spent.pricing.unknown === entry.spent.messages ? "No price available" : (entry.spent.pricing.unknown > 0 ? "At least " : "") + amount(entry.spent.cost)}{entry.budget ? ` / ${amount(entry.budget.usd)}` : ""} USD{over && <strong> · over budget</strong>} <span className="quiet">· {period ? `${period} budget, ` : ""}{day(entry.period.start)} to {day(new Date(Date.parse(entry.period.end) - 1).toISOString())} UTC · {usageProvenance(entry.spent)}{entry.unmeasuredSessions ? ` · ${plural(entry.unmeasuredSessions, "session")} unmeasured` : ""}</span></span>}
       </FragmentProvider>;
     })}</dl>}
   </section>;

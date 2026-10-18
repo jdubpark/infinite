@@ -52,3 +52,10 @@ export function sumUsage(rows: { cost: number; pricing: Pricing; tokens: UsageTo
   }
   return { cost: Math.round(dollars * MICRO_DOLLARS_PER_DOLLAR) / MICRO_DOLLARS_PER_DOLLAR, tokens, messages: rows.length, pricing };
 }
+
+/** USD for display: two decimals from one cent, four below it, and "0.00" only for a true zero. */
+export function formatUsd(usd: number): string {
+  if (usd === 0) return "0.00";
+  if (usd >= 0.01) return usd.toFixed(2);
+  return usd < 0.0001 ? "<0.0001" : usd.toFixed(4);
+}

@@ -1,3 +1,4 @@
+import { formatUsd } from "./usage.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -422,7 +423,9 @@ export function usageLines(summary: import("./usage-service.js").UsageSummary): 
     const word = entry.budget?.period ?? (days <= 1 ? "day" : days <= 7 ? "week" : "month");
     const unpriced = entry.spent.pricing.unknown;
     const detail = [`${entry.spent.messages} steps`, ...(unpriced ? [`${unpriced} unpriced`] : []), `${entry.unmeasuredSessions} unmeasured sessions`].join(", ");
-    const spent = `spent $${entry.spent.cost.toFixed(2)}${entry.budget ? ` of $${entry.budget.usd.toFixed(2)}` : ""}`;
+    const { messages, pricing } = entry.spent, noPrice = messages > 0 && pricing.unknown === messages;
+    const figure = noPrice ? "— (no price available)" : `${pricing.unknown > 0 ? "at least " : ""}$${formatUsd(entry.spent.cost)}`;
+    const spent = `spent ${figure}${entry.budget ? ` of $${formatUsd(entry.budget.usd)}` : ""}`;
     return `${label}  ${spent} for ${word} from ${entry.period.start.slice(0, 10)} (${detail})${entry.budget && entry.spent.cost > entry.budget.usd ? " OVER BUDGET" : ""}`;
   });
 }

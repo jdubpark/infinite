@@ -96,3 +96,23 @@ test("OpenCode CLI uses a local credential and rejoins history without starting 
     assert.equal((await host.fetchApi("/sessions")).body.sessions.length, 1);
   } finally { for (const child of children) { try { child.kill("SIGKILL"); } catch {} } await host.stop(); }
 });
+
+test("OpenCode step-finish parts in the native event stream are journaled as usage with the reported model", { timeout: 30000 }, async () => {
+  const host = await startHost({ agents: { opencode: { command: process.execPath, args: [fixture] } } });
+  const id = randomUUID(), path = `/sessions/${id}`;
+  try {
+    assert.equal((await host.fetchApi("/sessions", "owner", { requestId: id, provider: "opencode", title: "Native usage", projectId: "rehearsal", localUi: true, nativeArgs: [] })).status, 201);
+    const info = await waitFor(async () => (await host.fetchApi(path + "/native")).body, body => !!body?.sessionId);
+    const owner = await claimControl(host, id, "owner");
+    const prompt = await fetch(host.origin + "/api" + path + `/opencode/session/${info.sessionId}/prompt_async`, { method: "POST", headers: { Authorization: `Bearer ${host.tokens.owner}`, ...owner.headers, "Content-Type": "application/json" }, body: JSON.stringify({ parts: [{ type: "text", text: "usage" }] }) });
+    assert.equal(prompt.status, 204);
+    const usage = await waitFor(async () => (await host.fetchApi(path + "/events?types=usage")).body.events, events => events.length > 0);
+    assert.equal(usage.length, 1);
+    assert.equal(usage[0].data.partId, "prt_native_1");
+    assert.equal(usage[0].data.providerId, "deepseek");
+    assert.equal(usage[0].data.modelId, "deepseek-flash");
+    assert.equal(usage[0].data.modelSource, "reported");
+    assert.equal(usage[0].data.reportedCost, 0.25);
+    assert.equal(usage[0].data.tokens.input, 100);
+  } finally { await host.stop(); }
+});

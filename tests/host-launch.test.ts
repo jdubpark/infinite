@@ -1,10 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { buildLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
+import { recordClaudeTrust } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
@@ -173,6 +175,63 @@ test("codex dev relay runs the TypeScript file through an absolute tsx loader", 
   assert.match(loader, /^file:\/\/\/.+\/tsx\//);
   const notify = JSON.parse(launch.args.find((a) => a.startsWith("notify="))!.slice("notify=".length));
   assert.deepEqual(notify, ["node", "--import", loader, "/repo/packages/host/src/hook-relay.ts", "codex-notify"]);
+});
+
+// A readable teamwork run path long enough that a terminal wraps it across lines.
+const memberFolder = `/srv/data/workspaces/Projects/sample/teamwork/2026-01-15-${"stop-ringing-once-i-am-up-".repeat(2)}3f2a9c1d/members/${randomUUID()}`;
+
+test("a trusted member folder reaches Codex as one per-launch override for that exact folder", () => {
+  const trusted = buildLaunch("codex", { command: "codex", args: [] }, "do it", hooks, relay, enabled, true, undefined, undefined, memberFolder);
+  const index = trusted.args.indexOf(`projects={${JSON.stringify(memberFolder)}={trust_level="trusted"}}`);
+  assert.ok(index > 0 && trusted.args[index - 1] === "-c", trusted.args.join(" "));
+  assert.equal(trusted.args.at(-1), "do it");
+  const quoted = buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, true, undefined, undefined, '/srv/a "b"\\c');
+  assert.deepEqual(quoted.args, ["-c", 'projects={"/srv/a \\"b\\"\\\\c"={trust_level="trusted"}}']);
+  for (const folder of ["relative/member", "/srv/a\nb", "/srv/a/../b", "/"])
+    assert.throws(() => buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, true, undefined, undefined, folder), /absolute folder/);
+  // Claude has no per-launch trust flag, and untrusted launches carry no override.
+  assert.ok(!buildLaunch("claude", { command: "claude", args: [] }, "p", hooks, relay, enabled, true, undefined, undefined, memberFolder).args.some(arg => arg.includes("trust_level")));
+  assert.ok(!buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true).args.some(arg => arg.startsWith("projects=")));
+});
+
+test("Claude trust adds one exact folder entry and leaves the rest of its config unchanged", () => {
+  const root = mkdtempSync(join(tmpdir(), "inf-claude-trust-"));
+  try {
+    const config = join(root, ".claude.json");
+    assert.equal(recordClaudeTrust(config, memberFolder), true);
+    assert.equal(statSync(config).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(readFileSync(config, "utf8")), { projects: { [memberFolder]: { hasTrustDialogAccepted: true } } });
+    const parent = memberFolder.slice(0, memberFolder.indexOf("/members/"));
+    const existing = { numStartups: 7, projects: { [parent]: { allowedTools: ["Read"] }, [memberFolder]: { allowedTools: [], hasTrustDialogAccepted: false } } };
+    writeFileSync(config, JSON.stringify(existing));
+    assert.equal(recordClaudeTrust(config, memberFolder), true);
+    assert.deepEqual(JSON.parse(readFileSync(config, "utf8")), { ...existing, projects: { ...existing.projects, [memberFolder]: { allowedTools: [], hasTrustDialogAccepted: true } } });
+    const recorded = readFileSync(config, "utf8");
+    assert.equal(recordClaudeTrust(config, memberFolder), false);
+    assert.equal(readFileSync(config, "utf8"), recorded);
+    writeFileSync(config, "{ not json");
+    assert.throws(() => recordClaudeTrust(config, memberFolder));
+    assert.equal(readFileSync(config, "utf8"), "{ not json");
+    assert.throws(() => recordClaudeTrust(config, "members/relative"), /absolute folder/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the agent-side Claude trust entry records only the folder it is launched in", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-agent-trust-")));
+  try {
+    const home = join(root, "home"), member = join(root, "member"), other = join(root, "other");
+    for (const folder of [home, member, other]) mkdirSync(folder);
+    const run = (env: Record<string, string>, ...args: string[]) => spawnSync(process.execPath,
+      ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/workspace-trust.ts"), ...args],
+      { cwd: member, env: { PATH: process.env.PATH ?? "", HOME: home, ...env }, encoding: "utf8" });
+    assert.equal(run({ INFINITE_TRUSTED_WORKSPACE: other }, "claude").status, 65);
+    assert.equal(run({}, "claude").status, 64);
+    assert.equal(run({ INFINITE_TRUSTED_WORKSPACE: member }, "codex").status, 64);
+    assert.throws(() => readFileSync(join(home, ".claude.json")), { code: "ENOENT" });
+    const recorded = run({ INFINITE_TRUSTED_WORKSPACE: member }, "claude");
+    assert.equal(recorded.status, 0, recorded.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")).projects, { [member]: { hasTrustDialogAccepted: true } });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("disabled hooks or no hook server leave the profile untouched", () => {

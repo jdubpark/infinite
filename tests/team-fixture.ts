@@ -32,8 +32,11 @@ export const limitLineup: TeamLineup = {
   ],
 };
 
-export async function fixture(scenario = "success", lineup?: TeamLineup, config: Partial<Config> = {}) {
+/** `trustWorkspaces` also gives the host its own HOME, where a Claude member's trust is recorded. */
+export async function fixture(scenario = "success", lineup?: TeamLineup, config: Partial<Config> = {}, options: { trustWorkspaces?: boolean } = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-team-"));
+  const home = join(root, "home");
+  if (options.trustWorkspaces) mkdirSync(home, { mode: 0o700 });
   const source = join(root, "source");
   const receipts = join(root, "receipts");
   mkdirSync(source); mkdirSync(receipts, { mode: 0o700 });
@@ -75,7 +78,7 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
         } : {}),
       },
       config: {
-        teams: { workspaceDir: join(root, "teams"), ...(lineup ? { lineup } : {}), ...(scenario === "success" ? {
+        teams: { workspaceDir: join(root, "teams"), ...(lineup ? { lineup } : {}), ...(options.trustWorkspaces ? { trustWorkspaces: true } : {}), ...(scenario === "success" ? {
           commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },
         } : {}) },
         remote: { enabled: true },
@@ -86,6 +89,7 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
           ] }) } }],
         ...config,
       },
+      ...(options.trustWorkspaces ? { env: { HOME: home } } : {}),
     });
   } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
   const create = (): CreateTeam => ({ requestId: randomUUID(), projectId: "rehearsal", provider: lineup?.coordinator.provider ?? "demo",
@@ -119,5 +123,5 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
     assert.equal(saved.body.teamwork, teamwork);
     return join(home, ...teamwork.split("/"));
   };
-  return { host, source, receipts, base, create, get, settled, close, enrollTeamwork };
+  return { host, source, receipts, home, base, create, get, settled, close, enrollTeamwork };
 }

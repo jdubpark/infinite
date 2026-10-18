@@ -22,7 +22,10 @@ identity. Workspace files remain plaintext runtime data. Provider permissions
 remain with the owner unless an explicit repository policy delegates bounded
 one-shot requests to the strong coordinator. Guarded delivery checks the current
 assignment, workspace, prompt, policy, expiry and human input control. Workspace
-trust and persistent allow rules remain outside delegation. Headless OpenCode
+trust and persistent allow rules remain outside delegation. An owner who sets
+`teams.trustWorkspaces` trusts every team root: members then start trusted in
+their own folders and may load repository provider settings that earlier
+members edited. Headless OpenCode
 rejects unmet permissions instead of providing an interactive approval flow. Profile `dataUse` labels disclose
 configured contributor use without changing provider terms or retention. See
 [Goals and agent teams](teams.md) for scope, routing, limits, and recovery.

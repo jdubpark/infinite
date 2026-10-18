@@ -44,6 +44,7 @@ if (!assignment || !process.env.INFINITE_HOOK_URL || !process.env.INFINITE_HOOK_
 const receiptFile = join(receiptDir, `${assignment.memberId}.json`);
 const providerIndex = process.argv.indexOf("--fixture-provider");
 const receipt = { ...assignment, cwd: process.cwd(), pid: process.pid, startedAt: Date.now(),
+  ...(process.env.INFINITE_TRUSTED_WORKSPACE ? { trustedWorkspace: process.env.INFINITE_TRUSTED_WORKSPACE } : {}),
   ...(providerIndex >= 0 ? { provider: process.argv[providerIndex + 1], argv: process.argv.slice(2) } : {}) };
 if (receipt.provider === "opencode") {
   const args = process.argv.slice(providerIndex + 2), boundary = args.indexOf("--");

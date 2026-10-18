@@ -554,9 +554,10 @@ Ubuntu template. Before it, supported options are `-n`, `-H`, `-u USER`, and
 `-g GROUP` (or their separate-argument long forms). Other wrapper forms are
 refused so provider flags cannot become prompt text.
 
-Team launches preserve configured provider permission modes and trust settings.
-A team assignment does not grant tool permission or accept a workspace trust
-dialog. Product questions reported by a member wait for `infinite team answer`.
+Team launches preserve configured provider permission modes. A team assignment
+does not grant tool permission. Folder trust prompts wait for the owner unless
+the owner trusts the team roots (see [Workspace trust](#workspace-trust)).
+Product questions reported by a member wait for `infinite team answer`.
 
 Headless OpenCode `run` rejects unmet permission requests; this adapter does
 not offer an interactive approval flow for that provider. A denied reporting
@@ -587,7 +588,8 @@ insufficient. Worker provider modes, global trust settings and credentials
 remain unchanged. Other coordinator providers are not yet supported for this role.
 
 Workspace trust, persistent allow rules, ambiguous prompts and unsupported native
-requests still need owner handling. A coordinator that itself needs permission
+requests are never delegated; trust prompts disappear only when the owner trusts
+the team roots. A coordinator that itself needs permission
 cannot approve its own prompt. Each decision is bounded; stale or uncertain
 answers are never replayed automatically. Run status and Linear retain the
 receipt separately from successful tool execution.
@@ -680,11 +682,41 @@ refs/heads/<branch>` and `git bundle create - refs/heads/<branch>` in a run's
 `integration/` checkout. Enrollment also runs `git rev-parse` and `git status`
 in the project source.
 
-The Ubuntu launcher must preserve `INFINITE_HOOK_URL`, `INFINITE_HOOK_TOKEN` and
-`INFINITE_TEAM_ASSIGNMENT`; the supplied sudoers template includes them. These
-are a member's scoped report capability and assignment, not owner API keys.
-Verify executable access, workspace permissions, report delivery and configured
-checks under the actual deployment identities before using a production host.
+The Ubuntu launcher must preserve `INFINITE_HOOK_URL`, `INFINITE_HOOK_TOKEN`,
+`INFINITE_TEAM_ASSIGNMENT` and `INFINITE_TRUSTED_WORKSPACE`; the supplied sudoers
+template includes them. These are a member's scoped report capability,
+assignment and trusted folder, not owner API keys. Verify executable access,
+workspace permissions, report delivery and configured checks under the actual
+deployment identities before using a production host.
+
+### Workspace trust
+
+Claude Code and Codex ask whether to trust each new folder. They key that trust
+by the folder's own Git root, and every member is a separate clone, so trusting
+a parent folder never covers a member. To trust the team roots once, set:
+
+```json
+{ "teams": { "workspaceDir": "/srv/infinite-data/team-workspaces", "trustWorkspaces": true } }
+```
+
+Every member launched afterwards, in `teams.workspaceDir` or an enrolled
+teamwork folder, starts trusted in its own folder. The host records the
+decision with the member session, so restarts keep it. Codex receives a
+per-launch `projects` override and nothing is written to its configuration.
+Claude Code reads trust only from its account's `.claude.json`, so each member
+folder gains a `hasTrustDialogAccepted` entry there. The worker writes it when
+Claude runs in the host's own account. For a sudo profile, the agent wrapper
+writes it in the agent account, for the current folder only, from
+`INFINITE_TRUSTED_WORKSPACE`. A wrapper or sudoers file without that support
+leaves the prompt for the owner. The setting is off by default. Turning it off
+affects members launched afterwards; existing Claude entries stay until removed.
+
+Trust lets each provider apply the repository's own provider settings in member
+folders, such as Claude hooks, permission rules and MCP configuration, or a
+project Codex configuration. Team members can edit those files, and later
+members load the integrated result. Review them like the rest of a run's
+changes. Tool permission prompts, delegation limits and the root ownership rules
+above are unchanged; sessions outside team runs never receive this trust.
 
 ## Team questions and steering
 

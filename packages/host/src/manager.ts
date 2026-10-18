@@ -239,7 +239,7 @@ export class Manager {
     return operation;
   }
   /** The team scheduler owns cwd selection, below the root its run was created under. Public create requests never accept this override. */
-  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string): Promise<Session & WorkerState> {
+  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
     const selection = modelProfile ? teamModelProfileSchema.parse(modelProfile) : undefined;
@@ -248,7 +248,8 @@ export class Manager {
     const canonical = realpathSync(cwd);
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
-    const operation = this.serial.then(() => this.createOnce({ ...request, team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}) }));
+    // Trust is outside the request fingerprint: a replay returns the session as first created.
+    const operation = this.serial.then(() => this.createOnce({ ...request, team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}) }, workspaceTrusted));
     this.serial = operation.catch(() => {});
     return operation;
   }
@@ -418,7 +419,7 @@ export class Manager {
     // Use the same admission queue as create, without re-entering it.
     return remember(await this.createOnce(request));
   }
-  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile }) {
+  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile }, workspaceTrusted = false) {
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -460,6 +461,7 @@ export class Manager {
       id,
       ...(request.team ? { team: request.team } : {}),
       ...(request.teamModelProfile ? { teamModelProfile: request.teamModelProfile } : {}),
+      ...(request.team && workspaceTrusted ? { workspaceTrusted: true as const } : {}),
       backend: "infinite",
       machineId: this.config.machine?.id,
       executionLocation: request.workspace ? "laptop" : "cloud",

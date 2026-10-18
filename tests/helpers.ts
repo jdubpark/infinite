@@ -94,7 +94,7 @@ export async function stopSessionWorkers(config: Config) {
 }
 
 /** Boots a real API (`cli.ts serve`) on a free port with owner, controller and viewer device keys. */
-export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config> } = {}): Promise<Host> {
+export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
   // Unix socket paths are short-limited, so the state lives under /tmp rather than os.tmpdir().
   const root = mkdtempSync("/tmp/inf-test-");
   const port = await freePort();
@@ -138,6 +138,7 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
   const start = async () => {
     const api = spawn(process.execPath, ["--import", "tsx", resolve("packages/host/src/cli.ts"), "serve", "--config", configFile], {
       stdio: ["ignore", "pipe", "pipe"],
+      ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
     });
     child = api;
     let diagnostics = "";

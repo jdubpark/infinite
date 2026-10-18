@@ -568,11 +568,13 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const permissionMode = options["--permissions"];
     if (permissionMode !== undefined && permissionMode !== "coordinator" && permissionMode !== "off")
       throw new Error("--permissions must be coordinator or off.");
+    const defaultCoordinatorPermissions = permissionMode === undefined && target.revision === 0 && target.team?.permissions === undefined;
+    const configureCoordinatorPermissions = permissionMode === "coordinator" || defaultCoordinatorPermissions;
     if (permissionMode !== "coordinator" && (options["--permission-scope"] !== undefined || options["--permission-limit"] !== undefined))
       throw new Error("Permission scope and limit require --permissions coordinator.");
-    if (permissionMode !== undefined && me.teams?.permissionDelegation !== 1)
-      throw new Error("This host does not support delegated permissions. Upgrade it before changing this policy.");
-    const permissions = permissionMode === "off" ? undefined : permissionMode === "coordinator" ? teamPermissionsSchema.parse({
+    if (configureCoordinatorPermissions && me.teams?.permissionDelegation !== 1)
+      throw new Error("This host does not support delegated permissions. Upgrade it or use --permissions off before running repo init.");
+    const permissions = permissionMode === "off" ? undefined : configureCoordinatorPermissions ? teamPermissionsSchema.parse({
       mode: "coordinator",
       scope: String(options["--permission-scope"] ?? "Approve one-time repository read, edit, build and test operations required by the accepted task within its assigned workspace. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, permission bypasses and unclear effects."),
       maxDecisions: Number(options["--permission-limit"] ?? 10),

@@ -2,6 +2,7 @@ import { HANDOFF_INSTRUCTIONS } from "./handoff-types.js";
 import type { AgentProfile, Provider } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
+import { codexTrustArgs } from "./workspace-trust.js";
 
 /** Only model controls are added here; the configured provider permissions remain unchanged. */
 export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile): AgentProfile {
@@ -183,6 +184,7 @@ export function buildLaunch(
   team = false,
   teamModelProfile?: TeamModelProfile,
   handoffSessionId?: string,
+  trustedCwd?: string,
 ): AgentProfile {
   const args = [...profile.args];
   if (handoffSessionId) {
@@ -247,6 +249,7 @@ export function buildLaunch(
     args.push("-c", `tui.notification_method="osc9"`);
     args.push("-c", `tui.notification_condition="always"`);
   }
+  if (trustedCwd && provider === "codex") args.push(...codexTrustArgs(trustedCwd));
   if (prompt)
     args.push(...(provider === "opencode"
       ? [team && teamModelProfile?.provider === "opencode" ? "--" : "--prompt", prompt]

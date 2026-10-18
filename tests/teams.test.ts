@@ -302,7 +302,7 @@ test("a team builds concurrently in isolated copies and produces checked, review
 });
 
 test("mixed teams pin real worker launches across configuration changes, restart, and a question retry", { timeout: 120000 }, async () => {
-  const f = await fixture("mixed", mixedLineup);
+  const f = await fixture("mixed", mixedLineup, {}, { trustWorkspaces: true });
   try {
     const request = f.create();
     const created = await f.host.fetchApi("/teams", "owner", request);
@@ -386,7 +386,18 @@ test("mixed teams pin real worker launches across configuration changes, restart
       const session = await f.host.fetchApi(`/sessions/${member.sessionId}`);
       assert.equal(session.status, 200);
       assert.equal(session.body.provider, expected.provider);
+      // A trusted root covers each member's own clone: the exact folder, never a parent.
+      assert.equal(session.body.workspaceTrusted, true);
+      assert.equal(worker.trustedWorkspace, worker.cwd);
+      const override = args.indexOf(`projects={${JSON.stringify(worker.cwd)}={trust_level="trusted"}}`);
+      assert.equal(override > 0 && args[override - 1] === "-c", expected.provider === "codex");
     }
+    const claudeConfig = JSON.parse(readFileSync(join(f.home, ".claude.json"), "utf8"));
+    const claudeFolders = finished.members.filter(member => member.provider === "claude").map(member =>
+      JSON.parse(readFileSync(join(f.receipts, `${member.memberId}.json`), "utf8")).cwd);
+    assert.ok(claudeFolders.length >= 2);
+    assert.deepEqual(Object.keys(claudeConfig.projects).sort(), [...new Set(claudeFolders)].sort());
+    for (const folder of claudeFolders) assert.equal(claudeConfig.projects[folder].hasTrustDialogAccepted, true);
     assert.equal(git(f.source, "rev-parse", "HEAD"), f.base);
     assert.equal(git(f.source, "status", "--porcelain"), "");
   } finally { await f.close(); }
@@ -827,6 +838,8 @@ test("a Claude member that hits a usage limit continues on its fallback with its
     assert.ok(prompt.includes("Pipe a JSON object matching the above schema to this command:") && !prompt.includes("mcp__infinite_team__report"), "The fallback reports the OpenCode way");
     assert.ok(prompt.includes(`Requested runtime profile: ${JSON.stringify(attempts[2].modelProfile)}.`) && !prompt.includes('Requested runtime profile: {"id":"haiku"'));
     assert.equal(readFileSync(join(team.workspace, "a.txt"), "utf8"), "revision 1\n");
+    assert.ok(receipts.every(receipt => receipt.trustedWorkspace === undefined && !(receipt.argv ?? []).some((arg: string) => arg.startsWith("projects="))),
+      "Without owner trust in the team roots, members must keep their providers' folder prompts");
 
     const second = await run.settled((await run.host.fetchApi("/teams", "owner", run.create())).body.id);
     assert.ok(second.events.some(e => e.text === `Haiku implementer launched on DeepSeek Flash: Claude Code is limited until ${hhmm}`), JSON.stringify(second.events));

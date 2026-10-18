@@ -29,7 +29,8 @@ infinite repo init [DIRECTORY] [--project ID] [--check-json JSON] [--delivery me
 infinite repo init PARENT_DIRECTORY --linear-team UUID [--linear-project UUID]
 infinite repo link PROJECT_OR_DIRECTORY --relationship "Uses its API"
 infinite repo unlink PROJECT_OR_DIRECTORY | repo links
-infinite repo init --permissions coordinator [--permission-scope TEXT] [--permission-limit N]
+infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--permission-limit N]
+                                          First enrollment delegates to coordinator by default
 infinite repo init --permissions off        Disable delegation for future runs
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]

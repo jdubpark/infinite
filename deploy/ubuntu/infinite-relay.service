@@ -7,10 +7,10 @@ Wants=network-online.target
 Type=simple
 User=infinite-relay
 Group=infinite-relay
-WorkingDirectory=/opt/infinite
+WorkingDirectory=/opt/infinite-relay
 Environment=NODE_ENV=production
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/local/bin/node /opt/infinite/packages/host/dist/cli.js relay-serve --config /etc/infinite-relay/relay.json
+ExecStart=/usr/local/bin/node /opt/infinite-relay/packages/host/dist/cli.js relay-serve --config /etc/infinite-relay/relay.json
 Restart=on-failure
 RestartSec=3
 # Holds proxy.sock (mode 0600). Only root's cloudflared can connect; agent accounts cannot.

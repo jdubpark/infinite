@@ -20,7 +20,7 @@ The server opens no inbound port for this. cloudflared makes outbound connection
 ## Requirements
 
 - A domain whose DNS is on Cloudflare, and a Cloudflare Zero Trust team (the free plan covers this).
-- The host built from a release whose `relay-init` accepts `--proxy-socket`.
+- A build whose `relay-init` accepts `--proxy-socket`, installed root-owned at `/opt/infinite-relay` the same way as `/opt/infinite`. A separate install lets the public relay and the host upgrade independently; the host itself needs no change beyond `connect-relay`.
 - A phone app build that has the **Access client ID** pairing fields.
 
 The laptop CLI keeps using the private Tailscale address; it does not use the relay. The browser client cannot send upgrade headers and is for local development only.
@@ -32,7 +32,7 @@ Create a dedicated, login-less account and a private config directory:
 ```sh
 sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin infinite-relay
 sudo install -d -o infinite-relay -g infinite-relay -m 0700 /etc/infinite-relay
-sudo -u infinite-relay node /opt/infinite/packages/host/dist/cli.js relay-init \
+sudo -u infinite-relay node /opt/infinite-relay/packages/host/dist/cli.js relay-init \
   --config /etc/infinite-relay/relay.json --port 4790 \
   --proxy-socket /run/infinite-relay/proxy.sock --client-address-header cf-connecting-ip
 ```
@@ -41,7 +41,7 @@ Register the runner's machine ID (`machine-info` prints it). The registration ke
 
 ```sh
 sudo -u infinite-host node /opt/infinite/packages/host/dist/cli.js machine-info --config /etc/infinite/config.json
-sudo node /opt/infinite/packages/host/dist/cli.js relay-add --machine MACHINE_UUID \
+sudo node /opt/infinite-relay/packages/host/dist/cli.js relay-add --machine MACHINE_UUID \
   --token-file /etc/infinite/relay-registration.key --config /etc/infinite-relay/relay.json
 sudo chown infinite-relay:infinite-relay /etc/infinite-relay/relay.json
 sudo chown infinite-host:infinite-host /etc/infinite/relay-registration.key

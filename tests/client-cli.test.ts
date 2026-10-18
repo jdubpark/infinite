@@ -515,8 +515,7 @@ test("infinite usage prints the host summary as JSON and readable output", { tim
     assert.equal(summary.providers.opencode.budget.usd, 10);
     assert.equal(summary.providers.opencode.budget.period, "month");
     const readable = await exec(process.execPath, ["--import", "tsx", cli, "--client-config", config, "usage"]);
-    assert.match(readable.stdout, /OpenCode  no measured usage/);
-    assert.match(readable.stdout, /OpenCode.*budget \$10\.00 per month/);
-    assert.match(readable.stdout, /Codex  unmeasured/);
+    assert.match(readable.stdout, /^OpenCode  \S+ to \S+ · no measured usage · budget \$10\.00 per month$/m);
+    assert.match(readable.stdout, /^Codex  \S+ to \S+ · unmeasured · no budget configured$/m);
   } finally { await host.stop(); }
 });

@@ -164,7 +164,7 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
     let child: ChildProcess;
     try { child = spawn(command, args, { cwd: options.cwd, stdio: ["pipe", "pipe", "ignore"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("spawn")); return; }
-    let stdout = Buffer.alloc(0), stopped: string | undefined, killTimer: NodeJS.Timeout | undefined;
+    let stdout = Buffer.alloc(0), stopped: string | undefined;
     let closeCode: number | null | undefined, closeHandled = false, escalationDone = false;
     const finish = () => {
       if (closeHandled || closeCode === undefined || (stopped && !escalationDone)) return;
@@ -178,7 +178,7 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
       if (stopped) return;
       stopped = reason;
       try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM"); else child.kill("SIGTERM"); } catch { /* already exited */ }
-      killTimer = setTimeout(() => {
+      setTimeout(() => {
         try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* already exited */ }
         escalationDone = true;
         finish();

@@ -249,7 +249,9 @@ test("repo init enrolls an unborn local repository without changing it and uploa
       GIT_COMMON_DIR: join(localRoot, ".git"),
     })).stdout);
     assert.equal(output.source, "empty cloud baseline");
-    assert.deepEqual(output.team, { checks: [], establishChecks: true, handoff: "auto" });
+    assert.deepEqual(output.team.checks, []);
+    assert.equal(output.team.establishChecks, true);
+    assert.equal(output.team.handoff, "auto");
     assert.equal(snapshot(localRoot), before, "repo init leaves all source and Git metadata bytes unchanged");
     assert.equal((await exec("git", ["-C", localRoot, "status", "--porcelain", "--ignored", "--untracked-files=all"])).stdout, "!! private.local\n");
     await assert.rejects(exec("git", ["-C", localRoot, "rev-parse", "--verify", "HEAD"]), "the local repository remains unborn");
@@ -1133,6 +1135,12 @@ test("repository CLI pins, preserves and removes owner permission delegation", {
   const enroll = (...extra: string[]) => exec(process.execPath, [...args, ...extra], { cwd: checkout });
   try {
     await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
+    const first = JSON.parse((await enroll()).stdout);
+    assert.deepEqual(first.team.permissions, {
+      mode: "coordinator",
+      scope: "Approve one-time repository read, edit, build and test operations required by the accepted task within its assigned workspace. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, permission bypasses and unclear effects.",
+      maxDecisions: 10,
+    });
     const delegated = JSON.parse((await enroll("--permissions", "coordinator", "--permission-scope", "Read files and run the configured check only.", "--permission-limit", "3")).stdout);
     assert.deepEqual(delegated.team.permissions, { mode: "coordinator", scope: "Read files and run the configured check only.", maxDecisions: 3 });
     const retained = JSON.parse((await enroll()).stdout);
@@ -1145,5 +1153,7 @@ test("repository CLI pins, preserves and removes owner permission delegation", {
     assert.equal(forbidden.status, 403);
     const removed = JSON.parse((await enroll("--permissions", "off")).stdout);
     assert.equal(removed.team.permissions, undefined);
+    const retainedOff = JSON.parse((await enroll()).stdout);
+    assert.equal(retainedOff.team.permissions, undefined, "plain repo init preserves an explicitly saved off policy");
   } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
 });

@@ -274,12 +274,13 @@ This client currently connects directly to a trusted single-tenant runner. TLS p
 
 ### Delegated team permissions
 
-Run `infinite repo init --permissions coordinator` once to delegate supported
-one-shot tool prompts to the strong Claude coordinator for future runs. The default
+The first `infinite repo init` enables coordinator delegation by default. Supported
+one-shot tool prompts go to the strong Claude coordinator for future runs. The
 scope covers the accepted task and assigned workspace; delivery still needs its
-separate repository policy. Use `--permission-scope TEXT` and
-`--permission-limit N` to narrow the scope or change the ten-decision default
-(maximum twenty).
+separate repository policy. Later enrollments preserve the saved policy,
+including an opt-out. Use `--permissions coordinator` to enable delegation on an
+existing enrollment. Add `--permission-scope TEXT` or `--permission-limit N` to
+that explicit command to change the scope or ten-decision limit (maximum twenty).
 
 `infinite team revoke-permissions TEAM_ID` revokes an active run's delegation.
 `infinite repo init --permissions off` disables it for future runs. Workspace

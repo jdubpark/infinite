@@ -42,8 +42,10 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
   writeFileSync(opencode, `#!/bin/sh\nexec ${[process.execPath, resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "opencode"].map(quote).join(" ")} "$@"\n`);
   chmodSync(opencode, 0o700);
   git(source, "init", "--initial-branch=main");
-  writeFileSync(join(source, "original.txt"), "The configured project remains unchanged.\n");
-  writeFileSync(join(source, "check.mjs"), [
+  const bootstrap = scenario.startsWith("bootstrap");
+  if (!bootstrap)
+    writeFileSync(join(source, "original.txt"), "The configured project remains unchanged.\n");
+  if (!bootstrap) writeFileSync(join(source, "check.mjs"), [
     'import assert from "node:assert/strict";',
     'import { existsSync, readFileSync } from "node:fs";',
     'assert.match(readFileSync("a.txt", "utf8"), /^revision [1-9][0-9]*\\n$/);',
@@ -52,8 +54,11 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
     'if (process.argv.includes("--fail")) { console.error("Configured verification failed"); process.exit(17); }',
     ...(scenario === "mixed" || scenario === "integrator-limit" ? ['if (!existsSync("repair.txt")) { console.error("Integration repair required"); process.exit(18); }'] : []),
   ].join("\n"));
-  git(source, "add", "original.txt", "check.mjs");
-  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  if (bootstrap) {
+    git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "Empty project");
+  } else git(source, "add", "original.txt", "check.mjs");
+  if (!bootstrap)
+    git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
   const base = git(source, "rev-parse", "HEAD");
   let host: Host;
   try {
@@ -72,10 +77,10 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
         } : {}) },
         remote: { enabled: true },
         projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
-          team: { checks: [
+          team: { checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
             { command: process.execPath, args: ["check.mjs", ...(scenario === "failed-check" ? ["--fail"] : []), ...(scenario === "success" ? ["--prefix"] : [])] },
             ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
-          ] } }],
+          ] }) } }],
         ...config,
       },
     });

@@ -38,6 +38,7 @@ async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof star
   const apiKeyFile = join(root, "linear-key");
   if (linear) writeFileSync(apiKeyFile, linear.apiKey, { mode: 0o600 });
   let host: Host;
+  const bootstrapGoal = scenario === "bootstrap-goal";
   try {
     host = await startHost({ agents: {
       claude: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), scenario, receipts, "claude"] },
@@ -45,7 +46,9 @@ async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof star
     }, config: {
       teams: { workspaceDir: join(root, "teams"), lineup },
       ...(linear ? { linear: { apiKeyFile, endpoint: linear.endpoint } } : {}),
-      projects: [{ id: "rehearsal", name: "Rehearsal", path: source, team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] },
+      projects: [{ id: "rehearsal", name: "Rehearsal", path: source, team: bootstrapGoal
+        ? { checks: [], establishChecks: true }
+        : { checks: [{ command: process.execPath, args: ["check.mjs"] }] },
         ...(linear ? { linear: { teamId: linear.teamId } } : {}) }],
     } });
   } catch (error) { rmSync(root, { recursive: true, force: true }); await linear?.close(); throw error; }
@@ -205,6 +208,41 @@ test("a goal with no justified change records evidence without starting implemen
     assert.equal(run.headCommit, f.base);
     assert.equal(git(run.workspace, "status", "--porcelain"), "");
     assert.equal((await f.host.fetchApi(`/goals/${stopped.id}/resume`, "owner", { requestId: randomUUID(), revision: stopped.revision })).status, 409);
+  } finally { await f.close(); }
+});
+
+test("goal cycles retain their accepted verification when project configuration changes before continuation", { timeout: 120000 }, async () => {
+  const f = await fixture("bootstrap-goal");
+  try {
+    const request = f.create();
+    const created = await f.host.fetchApi("/goals", "owner", request);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const held = await waitFor(async () => {
+      const goal = await f.goal(request.requestId);
+      const team = goal.activeTeamId ? await f.team(goal.activeTeamId) : undefined;
+      return { goal, team };
+    }, value => Boolean(value.team?.tasks.length && value.team.members.some(member => member.role === "implementer" && member.status === "running")), 30000);
+    const first = held.team!;
+    const accepted = first.verification;
+    assert.ok(accepted?.checks?.length);
+    assert.equal(first.establishChecks, true);
+
+    f.host.config.projects[0]!.team = { checks: [{ command: process.execPath, args: ["check.mjs"] }] };
+    writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
+    await f.host.stopApi(); await f.host.start();
+    assert.deepEqual((await f.team(first.id)).verification, accepted);
+    writeFileSync(join(f.receipts, "release-first-implementation"), "continue", { mode: 0o600 });
+
+    const finished = await f.settled(request.requestId);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.cycles.length, 2);
+    const runs = await Promise.all(finished.cycles.map(cycle => f.team(cycle.teamId)));
+    assert.deepEqual(runs[0].verification, accepted);
+    assert.deepEqual(runs[1].verification, accepted);
+    assert.equal(runs[1].establishChecks, true);
+    assert.ok(runs.every(run => run.status === "ready-for-review" && run.review?.verdict === "approved"
+      && run.checks.some(check => check.status === "passed")));
+    assert.equal(runs[1].goal?.parentRunId, runs[0].id);
   } finally { await f.close(); }
 });
 

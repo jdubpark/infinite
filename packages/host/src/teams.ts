@@ -130,7 +130,7 @@ export class TeamService {
       }
       const project = this.config.projects.find(item => item.id === parsed.projectId);
       if (!project) throw new TeamError(404, "unknown-project", "The selected project is not configured.");
-      if (!this.config.teams || !project.team?.checks.length) throw new TeamError(409, "teams-not-configured", "Configure a team workspace directory and project verification commands before starting a team.");
+      if (!this.config.teams || !project.team || (!project.team.checks.length && !project.team.establishChecks)) throw new TeamError(409, "teams-not-configured", "Configure a team workspace directory and required checks, or authorize the team to establish checks, before starting a team.");
       const goal = internal ? structuredClone(internal.goal) : undefined;
       const lineup = internal ? structuredClone(internal.lineup) : useConfiguredLineup ? structuredClone(this.config.teams.lineup) : undefined;
       if (useConfiguredLineup && !lineup) throw new TeamError(409, "team-lineup-not-configured", "The requested team lineup is not configured on this host.");
@@ -156,6 +156,10 @@ export class TeamService {
       const parentRevision = parent?.revision;
       const at = timestamp();
       const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(this.config.teams.workspaceDir, parsed.requestId), branch: `infinite/team-${parsed.requestId}`, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      if (parent?.establishChecks || project.team.establishChecks) {
+        run.establishChecks = true;
+        if (parent?.verification) run.verification = structuredClone(parent.verification);
+      }
       this.assertBudget(run);
       const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
       this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
@@ -505,6 +509,8 @@ export class TeamService {
         this.save(stored); return;
       }
       if (activeCount) return;
+      if (run.establishChecks && !run.verification?.checks.length)
+        throw new TeamError(409, "verification-required", "Required verification commands have not been established; review cannot start.");
       if (stored.checkHead !== run.headCommit) { this.check(stored); return; }
       if (!run.review || run.review.revision !== run.revision) { this.prepareMember(stored, "reviewer"); return; }
       if (run.review.verdict === "approved") {
@@ -566,7 +572,11 @@ export class TeamService {
     run.status = role === "project-manager" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" ? "reviewing" : role === "integrator" ? "integrating" : "implementing";
     this.operation(stored, "member", async signal => {
       const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal);
-      const setup = this.config.projects.find(project => project.id === run.projectId)!.team!.setup;
+      // Bootstrap dependencies exist only after the first implementation. A failed
+      // setup must not prevent the integrator from repairing the project.
+      const setup = run.establishChecks
+        ? role === "reviewer" ? run.verification?.setup : undefined
+        : this.config.projects.find(project => project.id === run.projectId)!.team!.setup;
       if (setup) {
         const result = await teamCommand(setup, cwd, signal, 600000, this.config.teams?.commandPrefix);
         if (result.exitCode !== 0 || result.interrupted) throw new TeamError(409, "team-setup-failed", "A member's configured setup command failed. Its isolated workspace was preserved.");
@@ -654,6 +664,12 @@ export class TeamService {
     if (report.kind === "plan") {
       validateTeamPlan(report.tasks);
       this.taskProfiles(run, report.tasks);
+      if (report.verification && !run.establishChecks)
+        throw new TeamError(409, "verification-not-authorized", "A plan cannot replace the project's configured checks.");
+      if (run.establishChecks && !run.verification && !report.verification)
+        throw new TeamError(409, "verification-required", "The first plan must establish project verification commands before implementation.");
+      if (run.verification && report.verification && digest(run.verification) !== digest(report.verification))
+        throw new TeamError(409, "verification-changed", "The accepted verification commands cannot change during this run or its goal continuation.");
       if (run.goal && !report.brief) throw new TeamError(409, "goal-brief-required", "A goal plan must include an evidence-backed brief with acceptance criteria.");
       if (run.goal && report.tasks.some(task => task.paths.some(path => !teamPathAllowed(path, run.goal!.allowedPaths))))
         throw new TeamError(409, "goal-scope-violation", "The plan proposes paths outside the approved goal scope.");
@@ -665,6 +681,10 @@ export class TeamService {
           run.tasks.push({ ...remaining.splice(index, 1)[0], status: "pending" });
         }
         run.brief = report.brief;
+        if (report.verification && !run.verification) {
+          run.verification = structuredClone(report.verification);
+          this.event(stored, "The coordinator established verification commands under the owner's project opt-in.");
+        }
         run.status = "implementing";
         this.event(stored, `Project manager planned ${run.tasks.length} tasks.`);
       }); return;
@@ -702,14 +722,17 @@ export class TeamService {
   }
   private check(stored: Stored) {
     const run = stored.run, revision = run.revision, head = run.headCommit!;
-    const commands = run.handoff?.project.checks ?? this.config.projects.find(project => project.id === run.projectId)!.team!.checks;
+    const required = run.establishChecks ? run.verification?.checks : run.handoff?.project.checks ?? this.config.projects.find(project => project.id === run.projectId)!.team!.checks;
+    if (!required?.length) throw new TeamError(409, "verification-required", "Required verification commands have not been established; the team cannot be ready for review.");
+    const setup = run.establishChecks ? run.verification?.setup : undefined;
+    const commands = [...(setup ? [{ command: setup, phase: "setup" as const }] : []), ...required.map(command => ({ command }))];
     run.status = "verifying";
     this.operation(stored, "check", async signal => {
       const results: typeof run.checks = [];
-      for (const command of commands) {
-        const check: TeamRun["checks"][number] = { command, status: "running", startedAt: timestamp(), output: "", revision };
+      for (const entry of commands) {
+        const check: TeamRun["checks"][number] = { ...entry, status: "running", startedAt: timestamp(), output: "", revision };
         await this.enqueue(() => { if (!this.closed) { run.checks.push(check); this.save(stored); } });
-        const result = await teamCommand(command, run.workspace, signal, 600000, this.config.teams?.commandPrefix);
+        const result = await teamCommand(entry.command, run.workspace, signal, 600000, this.config.teams?.commandPrefix);
         Object.assign(check, { status: result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output });
         results.push(check);
         await this.enqueue(() => { if (!this.closed) this.save(stored); });

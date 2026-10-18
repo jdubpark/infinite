@@ -8,7 +8,7 @@ import { teamProjectSchema, type TeamCommand } from "./team-types.js";
 import { TeamError, teamCommand } from "./team-workspace.js";
 import { unseal, writeSealed } from "./vault.js";
 
-const enrollmentTeamSchema = teamProjectSchema.extend({ handoff: z.enum(["auto", "off"]).optional() }).strict();
+const enrollmentTeamSchema = teamProjectSchema;
 const enrollmentLinearSchema = z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict();
 export const repoEnrollmentRequestSchema = z.object({
   requestId: z.uuid(),

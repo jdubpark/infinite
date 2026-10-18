@@ -26,6 +26,15 @@ export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTa
     `Original source commit: ${run.baseCommit}. Current integration commit: ${run.headCommit}. Reviewers must inspect the full git diff from the original source commit to the current integration commit.`,
     run.steering.length ? `User steering:\n${run.steering.map(item => item.text).join("\n\n")}` : "",
     roleInstructions,
+    run.establishChecks && role === "project-manager" && !run.verification
+      ? `The owner authorized this team to establish checks for a new project. Your plan MUST include verification: {"setup":{"command":"npm","args":["ci"]},"checks":[{"command":"npm","args":["run","check"]}]}. This is a format example, not a required stack. Choose commands for the actual project; omit setup when unnecessary. Include tasks that create the build/test scripts and meaningful integration or end-to-end coverage. Commands run under the host's configured execution identity after integration. They must verify the objective, not simply exit successfully. Do not use them to bypass a provider refusal, publish, deploy, or change permissions. The host will freeze these commands before implementation; later plans cannot weaken them.`
+      : "",
+    run.verification
+      ? `Accepted verification commands (retained across retries, steering, and goal continuation):\n${JSON.stringify(run.verification)}\nThese commands execute after integration. Implement their scripts and dependencies in the assigned paths. The coordinator may omit verification from subsequent plans or repeat this exact value; it cannot replace it. Agents arrange any tools needed in their own workspace under their existing provider permissions. The host runs setup for the reviewer only after integration succeeds.`
+      : "",
+    role === "reviewer" && run.establishChecks
+      ? `Review both the accepted commands and the test implementations. Confirm that they exercise the requested behavior and could detect a credible regression. Passing an empty test suite or a no-op command does not justify approval. Assess UI behavior on its real surface when the objective changes the UI; describe any unavailable verification.`
+      : "",
     role === "project-manager" && run.goal
       ? `A goal plan MUST include brief: {"title":"...","problem":"Observed user or product problem","evidence":[{"source":"Inspected source","observation":"Relevant fact or clearly marked hypothesis"}],"dataShape":"Entities and fields that the change reads or writes, or why no data change is needed","acceptance":["Observable acceptance criterion"],"expectedOutcome":"Expected product effect and how it could be checked","uiChanges":false}. Base the brief on evidence; do not invent usage metrics or customer demand. If no change is justified within this goal, report {"kind":"no-change","summary":"Why implementation is not justified","evidence":[{"source":"...","observation":"..."}]} and stop. This does not declare the goal achieved.`
       : "",

@@ -407,8 +407,8 @@ export class Manager {
       if (project.team?.handoff === "auto") {
         reason = "Handoff requires a new Claude or Codex PTY session at the project root, a supported prompt up to 12000 characters, and only supported model flags.";
         if (!request.localUi && !request.workspace && !request.resumedFrom && ["claude", "codex"].includes(request.provider) && userRequest !== undefined && userRequest.length <= 12000 && session.cwd === realpathSync(project.path)) {
-          reason = "Handoff requires configured checks and a reviewed model lineup.";
-          if (this.config.teams?.lineup && project.team.checks.length) session.handoff = { policy: structuredClone({
+          reason = "Handoff requires configured checks or authorization to establish them, and a reviewed model lineup.";
+          if (this.config.teams?.lineup && (project.team.checks.length || project.team.establishChecks)) session.handoff = { policy: structuredClone({
             sourceSessionId: id, projectId: project.id, path: session.cwd, userRequest,
             lineup: this.config.teams.lineup, project: project.team, linear: project.linear,
             commandPrefix: this.config.teams.commandPrefix, workspaceDir: this.config.teams.workspaceDir,

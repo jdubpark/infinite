@@ -13,6 +13,108 @@ import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team
 
 import { git, limitLineup, mixedLineup, fixture } from "./team-fixture.js";
 
+test("an opted-in blank project accepts coordinator checks and reaches review only after verifying the implemented invariant", { timeout: 120000 }, async () => {
+  const f = await fixture("bootstrap");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.ok(finished.checks.some(check => check.phase === "setup" && check.status === "passed" && check.output.includes("Bootstrap setup completed")));
+    assert.ok(finished.checks.some(check => check.status === "passed" && check.phase !== "setup"));
+    assert.equal(readFileSync(join(finished.workspace, "a.txt"), "utf8"), readFileSync(join(finished.workspace, "b.txt"), "utf8"));
+  } finally { await f.close(); }
+});
+
+test("an opted-in blank project must receive checks before any implementer launches", { timeout: 60000 }, async () => {
+  const f = await fixture("bootstrap-missing");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const blocked = await f.settled(created.body.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.match(blocked.reason ?? "", /verification|check/i);
+    assert.equal(blocked.tasks.length, 0);
+    assert.deepEqual(blocked.members.map(member => member.role), ["project-manager"]);
+  } finally { await f.close(); }
+});
+
+test("a coordinator cannot replace checks configured by the project owner", { timeout: 60000 }, async () => {
+  const f = await fixture("bootstrap-override");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const blocked = await f.settled(created.body.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.match(blocked.reason ?? "", /verification|check|configured/i);
+    assert.equal(blocked.tasks.length, 0);
+    assert.deepEqual(blocked.members.map(member => member.role), ["project-manager"]);
+  } finally { await f.close(); }
+});
+
+test("failed coordinator checks stay blocked after the bounded repair attempts", { timeout: 120000 }, async () => {
+  const f = await fixture("bootstrap-fail");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const blocked = await f.settled(created.body.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.equal(blocked.review, undefined);
+    assert.ok(blocked.checks.some(check => check.status === "failed" && check.exitCode === 17));
+    assert.ok(blocked.members.filter(member => member.role === "integrator").length <= 2);
+  } finally { await f.close(); }
+});
+
+test("accepted coordinator verification survives restart and a later plan that omits it", { timeout: 120000 }, async () => {
+  const f = await fixture("bootstrap-replan");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const waiting = await waitFor(() => f.get(created.body.id), run => run.status === "needs-input" && run.decisions.length === 1, 30000);
+    const accepted = waiting.verification;
+    assert.ok(accepted?.checks?.length);
+    await f.host.stopApi(); await f.host.start();
+    const recovered = await f.get(waiting.id);
+    assert.deepEqual(recovered.verification, accepted);
+    const steer = { requestId: randomUUID(), revision: recovered.revision, text: "Keep the original acceptance criteria." };
+    let replanned = await f.host.fetchApi(`/teams/${waiting.id}/steer`, "controller", steer);
+    for (let attempt = 0; attempt < 40 && replanned.status === 409 && replanned.body.code === "team-operation-running"; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      replanned = await f.host.fetchApi(`/teams/${waiting.id}/steer`, "controller", steer);
+    }
+    assert.equal(replanned.status, 200, JSON.stringify(replanned.body));
+    const finished = await f.settled(waiting.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.deepEqual(finished.verification, accepted);
+    assert.ok(finished.checks.some(check => check.status === "passed"));
+  } finally { await f.close(); }
+});
+
+test("a replanned coordinator cannot change accepted verification commands", { timeout: 120000 }, async () => {
+  const f = await fixture("bootstrap-change");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const waiting = await waitFor(() => f.get(created.body.id), run => run.status === "needs-input" && run.decisions.length === 1, 30000);
+    const accepted = waiting.verification;
+    assert.ok(accepted?.checks?.length);
+    await f.host.stopApi(); await f.host.start();
+    const recovered = await f.get(waiting.id);
+    const steer = { requestId: randomUUID(), revision: recovered.revision, text: "Replan without changing accepted checks." };
+    let replanned = await f.host.fetchApi(`/teams/${waiting.id}/steer`, "controller", steer);
+    for (let attempt = 0; attempt < 40 && replanned.status === 409 && replanned.body.code === "team-operation-running"; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      replanned = await f.host.fetchApi(`/teams/${waiting.id}/steer`, "controller", steer);
+    }
+    assert.equal(replanned.status, 200, JSON.stringify(replanned.body));
+    const blocked = await f.settled(waiting.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.match(blocked.reason ?? "", /verification.*(changed|different)|commands/i);
+    assert.deepEqual(blocked.verification, accepted);
+    assert.equal(blocked.members.some(member => member.revision === 2 && member.role === "implementer"), false);
+  } finally { await f.close(); }
+});
+
 test("a team builds concurrently in isolated copies and produces checked, reviewed work without changing its source", { timeout: 120000 }, async () => {
   const f = await fixture();
   const owner = createRemoteClient({ url: f.host.origin, token: f.host.tokens.owner });

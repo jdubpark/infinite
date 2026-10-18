@@ -57,7 +57,7 @@ export type Me = {
   backendProviders?: { infinite: string[]; cmux?: string[] };
   capabilities?: { signals: boolean; answer: boolean; push: boolean };
   providers: string[];
-  projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
+  projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { establishChecks?: true; checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
   teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
   goals?: { enabled: boolean };
   usage?: { enabled: boolean; budgets: Partial<Record<string, { usd: number; period: "day" | "week" | "month" }>> };

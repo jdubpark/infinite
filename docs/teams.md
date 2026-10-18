@@ -4,7 +4,7 @@ Open **Goals** in the web client to give the agents a product outcome, evidence,
 and limits. The coordinator investigates the project, selects a useful change,
 and sends bounded tasks to parallel workers. A successful cycle produces an
 isolated branch with check results and an independent agent review. The next cycle starts
-from that reviewed commit.
+from that reviewed commit, or its recorded merge commit when delivery is enabled.
 
 Use **Teams** for one feature request or pasted PRD. A team plans and implements
 that request without selecting a sequence of follow-up improvements. Both flows
@@ -69,6 +69,36 @@ A mapping is configuration, not proof of connectivity: each run shows
 whether Linear has confirmed its issue and execution evidence. Historical runs
 remain unchanged. Run status, verification, and human acceptance retain the
 separate meanings described below.
+
+## Optional provider-side delivery
+
+Repositories remain review-only until an owner configures delivery once during
+enrollment:
+
+```sh
+infinite repo init --delivery merge
+infinite repo init --delivery merge --repository OWNER/REPO --base-branch main --merge-method squash
+infinite repo init --delivery review
+```
+
+For `--delivery merge`, the CLI reads `origin` only when its URL is an HTTPS or
+SSH `github.com` repository without credentials. It reads the default branch
+from `origin/HEAD`; if that is missing, it uses the current local `main` or
+`master` branch. Otherwise, provide `--base-branch`. The CLI does not change
+the remote or local Git state. Existing enrollment keeps its delivery policy
+when `--delivery` is omitted; `--delivery review` removes that policy. New
+enrollments remain review-only by default. Delivery settings are per repository
+and are not inherited from parent-folder Linear defaults.
+
+The configured target authorizes the strong coordinator role to use its
+existing provider tools to merge its own work after configured checks pass and
+an independent reviewer approves the implementation and verification. The host
+checks that a delivery report identifies the reviewed head and configured
+repository. The provider's merge receipt remains agent evidence; the host does
+not independently verify the remote merge or grant GitHub tool permissions.
+Missing GitHub tools or authentication blocks delivery for review. It does not
+expand provider permissions, and a merge report does not establish human
+acceptance or product impact.
 
 ## Project context and explicit relationships
 

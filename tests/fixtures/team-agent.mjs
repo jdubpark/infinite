@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 
 if (process.argv[2] === "--command-prefix") {
   const [, receiptDir, command, ...args] = process.argv.slice(2);
@@ -136,7 +136,7 @@ async function main() {
     } else if (scenario === "mixed") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "astra-xhigh";
-    } else if (scenario === "limit" || scenario === "limit-no-fallback" || scenario === "limit-other-failed" || scenario === "integrator-limit") {
+    } else if (scenario.startsWith("delivery") || scenario === "limit" || scenario === "limit-no-fallback" || scenario === "limit-other-failed" || scenario === "integrator-limit") {
       tasks[0].agentProfileId = "haiku";
       tasks[1].agentProfileId = scenario === "limit-other-failed" ? "haiku-b" : "codex-light";
     } else if (scenario === "mixed-invalid") {
@@ -230,6 +230,23 @@ async function main() {
     }
     writeFileSync("repair.txt", `${assignment.memberId}\n`);
     await report({ kind: "result", summary: "Applied a local repair for verification" });
+  } else if (assignment.role === "delivery") {
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const base = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim().split("\n")[0];
+    const mergeCommit = execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", `${scenario === "delivery-baseline-changed" ? base : head}^{tree}`, "-p", base, "-m", "Synthetic squash delivery"], { encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/heads/synthetic-merge", mergeCommit]);
+    writeFileSync(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }), { mode: 0o600 });
+    if (scenario === "delivery-hold" || scenario === "delivery-unreported") {
+      while (!existsSync(join(receiptDir, "delivery-release"))) await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    if (scenario === "delivery-unreported") process.exit(0);
+    if (scenario === "delivery-repair" && !existsSync("repair.txt")) {
+      await report({ kind: "delivery-repair", headCommit: head, summary: "CI requires a scoped repair before another review." }); return;
+    }
+    if (scenario === "delivery-dirty") writeFileSync("unreviewed.txt", "This was not reviewed.\n");
+    await report({ kind: "delivery", headCommit: scenario === "delivery-stale" ? "0".repeat(40) : head,
+      pullRequestUrl: scenario === "delivery-foreign" ? "https://github.com/example/other/pull/1" : "https://github.com/example/app/pull/1",
+      mergeCommit: scenario === "delivery-baseline-tree" ? execFileSync("git", ["rev-parse", `${head}^{tree}`], { encoding: "utf8" }).trim() : mergeCommit, summary: "Synthetic delivery report exercising host binding; no GitHub request was made." });
   } else if (assignment.role === "reviewer") {
     for (const name of ["a.txt", "b.txt"])
       if (!readFileSync(name, "utf8").startsWith("revision ")) throw new Error("The review checkout lacks integrated work");

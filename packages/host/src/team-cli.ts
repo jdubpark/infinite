@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
-import { createTeamSchema } from "./team-types.js";
+import { createTeamSchema, teamDeliverySchema, type TeamDelivery } from "./team-types.js";
 import { captureWorkspace, readWorkspaceBlob } from "./workspace-checkpoint.js";
 import { localProjectPath } from "./mirrored-projects.js";
 import { readSyncState, syncServiceRunning } from "./sync-service.js";
@@ -45,6 +45,62 @@ function isolatedGitEnv(overrides: NodeJS.ProcessEnv = {}) {
 }
 function git(cwd: string, args: string[], timeout = 10000) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout, stdio: ["ignore", "pipe", "ignore"], env: gitEnv({ GIT_OPTIONAL_LOCKS: "0" }) }).trim();
+}
+function inferGitHubRepository(root: string): string {
+  let remote: string;
+  try { remote = git(root, ["config", "--get", "remote.origin.url"]); }
+  catch { throw new Error("Could not infer a GitHub repository from origin; supply --repository OWNER/REPO."); }
+  let ownerRepo: string | undefined;
+  if (/^git@github\.com:[^/?#]+\/[^/?#]+$/.test(remote)) ownerRepo = remote.slice("git@github.com:".length);
+  else {
+    try {
+      const url = new URL(remote);
+      if ((url.protocol === "https:" || url.protocol === "ssh:") && url.hostname === "github.com" && !url.port && !url.search && !url.hash &&
+        !url.password && (url.protocol === "https:" ? !url.username : url.username === "git")) {
+        const parts = url.pathname.split("/").filter(Boolean);
+        if (parts.length === 2) ownerRepo = parts.join("/");
+      }
+    } catch { /* The bounded error below avoids echoing remote URLs or credentials. */ }
+  }
+  if (ownerRepo?.endsWith(".git")) ownerRepo = ownerRepo.slice(0, -4);
+  const parsed = teamDeliverySchema.shape.repository.safeParse(ownerRepo);
+  if (!parsed.success) throw new Error("Git origin must be an HTTPS or SSH github.com OWNER/REPO URL without credentials; supply --repository OWNER/REPO.");
+  return parsed.data;
+}
+function inferBaseBranch(root: string): string {
+  let ref: string | undefined;
+  try { ref = git(root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]); } catch { /* Fall back only to a local main/master branch. */ }
+  if (ref !== undefined) {
+    const prefix = "refs/remotes/origin/";
+    if (!ref.startsWith(prefix) || ref.length === prefix.length)
+      throw new Error("origin/HEAD does not name an origin branch; supply --base-branch BRANCH.");
+    const branch = ref.slice(prefix.length);
+    return teamDeliverySchema.shape.baseBranch.parse(branch);
+  }
+  let branch: string | undefined;
+  try { branch = git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]); } catch { /* Detached HEAD requires explicit configuration. */ }
+  if (branch === "main" || branch === "master") return branch;
+  throw new Error("Could not infer the default branch from origin/HEAD or a local main/master branch; supply --base-branch BRANCH.");
+}
+function requestedDelivery(root: string, options: Options, current: { revision: number; team?: { delivery?: TeamDelivery } }): TeamDelivery | undefined {
+  const suppliedTarget = ["--repository", "--base-branch", "--merge-method"].some(flag => options[flag] !== undefined);
+  const mode = options["--delivery"] === undefined ? undefined : String(options["--delivery"]);
+  if (mode === undefined) {
+    if (suppliedTarget) throw new Error("--repository, --base-branch, and --merge-method require --delivery merge.");
+    return current.revision > 0 ? current.team?.delivery : undefined;
+  }
+  if (mode !== "merge" && mode !== "review") throw new Error("--delivery must be merge or review.");
+  if (mode === "review") {
+    if (suppliedTarget) throw new Error("--repository, --base-branch, and --merge-method apply only to --delivery merge.");
+    return undefined;
+  }
+  const retained = current.revision > 0 ? current.team?.delivery : undefined;
+  return teamDeliverySchema.parse({
+    mode,
+    repository: options["--repository"] === undefined ? retained?.repository ?? inferGitHubRepository(root) : String(options["--repository"]),
+    baseBranch: options["--base-branch"] === undefined ? retained?.baseBranch ?? inferBaseBranch(root) : String(options["--base-branch"]),
+    mergeMethod: options["--merge-method"] === undefined ? retained?.mergeMethod : String(options["--merge-method"]),
+  });
 }
 function inspectSourceHead(root: string): { commit: string; branch?: string } {
   try {
@@ -319,7 +375,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       console.log(JSON.stringify(result, null, 2));
       return true;
     }
-    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--setup-json JSON] [--check-json JSON] [--linear-team UUID] [--linear-project UUID]");
+    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--setup-json JSON] [--check-json JSON] [--delivery merge|review] [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase] [--linear-team UUID] [--linear-project UUID]");
     const requestedDirectory = canonicalDirectory(positional[1] ?? process.cwd());
     const gitResult = gitRootOrNonGit(requestedDirectory);
     const defaultsPath = join(stateDir, "directory-defaults.json");
@@ -328,7 +384,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
     const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
     if ("nonGit" in gitResult) {
-      const unsupported = ["--project", "--setup-json", "--check-json", "--handoff", "--request-id"].filter(flag => options[flag] !== undefined);
+      const unsupported = ["--project", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method"].filter(flag => options[flag] !== undefined);
       if (unsupported.length) throw new Error(`This directory is not a Git repository, so ${unsupported.join(", ")} cannot be used here. Run repo init in a Git repository for enrollment, or use only --linear-team and --linear-project to save directory defaults.`);
       if (!explicitLinearTeam && explicitLinearProject && !inheritedDefault?.teamId)
         throw new Error("--linear-project requires --linear-team or an inherited directory Linear team.");
@@ -374,6 +430,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const projectConfig = projectConfigSchema.parse(preserveTargetChecks
       ? { ...(options["--setup-json"] !== undefined ? (repoConfig.setup ? { setup: repoConfig.setup } : {}) : target.team.setup ? { setup: target.team.setup } : {}), checks: target.team.checks }
       : repoConfig);
+    const delivery = requestedDelivery(root, options, target);
     if (projectConfig.establishChecks && me.teams?.establishChecks !== 1)
       throw new Error("This host does not support establishing team checks for an empty repository. Upgrade the host before running repo init.");
     const uploadKey = `${key}:source-upload:${selected}:${sourceRevision}`;
@@ -420,7 +477,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       linearDefaultsFrom = rootDefault.origin;
     }
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}) };
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}) }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.

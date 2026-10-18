@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -90,6 +91,12 @@ async function main() {
       throw new Error("Escalation discarded the first worker's partial edit");
     writeFileSync("features/progress.json", JSON.stringify({ completed: progress.completed + 1 }) + "\n");
     await report({ kind: "result", summary: "Implemented the next scoped progress step" });
+  } else if (assignment.role === "delivery") {
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const base = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim().split("\n")[0];
+    const mergeCommit = execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", `${head}^{tree}`, "-p", base, "-m", "Synthetic squash delivery"], { encoding: "utf8" }).trim();
+    execFileSync("git", ["update-ref", "refs/heads/synthetic-merge", mergeCommit]);
+    await report({ kind: "delivery", headCommit: head, pullRequestUrl: "https://github.com/example/app/pull/1", mergeCommit, summary: "Synthetic merge report for goal lifecycle verification; no external GitHub operation." });
   } else if (assignment.role === "reviewer") {
     if (!Number.isInteger(progress.completed) || progress.completed < 1 || progress.draft)
       throw new Error("The reviewed implementation is incomplete");

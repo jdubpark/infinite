@@ -6,8 +6,8 @@ import { useLiveRefresh } from "./live-refresh";
 import { requestStore } from "./requests";
 import { LinearTracking } from "./linear";
 
-type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
-type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer";
+type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
+type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
 type TeamCommand = { command: string; args: string[] };
 type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string }[] };
 type TeamScout = { id: string; title: string; instructions: string; agentProfileId: string; status: "pending" | "running" | "waiting" | "complete"; memberId?: string; summary?: string; evidence?: TeamEvidence[] };
@@ -20,6 +20,7 @@ export type TeamView = {
   decisions: TeamDecision[]; checks: { command: TeamCommand; status: "running" | "passed" | "failed" | "interrupted"; startedAt: string; finishedAt?: string; exitCode?: number | null; output: string; revision: number }[];
   steering: { text: string; revision: number; at: string }[]; events: { at: string; text: string }[];
   reason?: string; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string }; round: number;
+  deliveryReceipt?: { pullRequestUrl: string; headCommit: string; mergeCommit: string; summary: string };
   lineup?: TeamLineup;
   usage?: TeamUsage;
   providerLimits?: ProviderLimit[];
@@ -37,16 +38,17 @@ const mutations = requestStore<MutationRequest, { id: string }>();
 const inFlight = new Set<string>();
 export function clearTeamRequests(machine: string) { creations.clearMachine(machine); mutations.clearMachine(machine); }
 const rejected = (error: unknown) => error instanceof ApiError && error.status >= 400 && error.status < 500;
-const labels: Record<TeamStatus, string> = { planning: "Planning", discovering: "Investigating", implementing: "Implementing", integrating: "Integrating", verifying: "Running checks", reviewing: "Reviewing", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-change": "No change proposed", cancelled: "Cancelled" };
+const labels: Record<TeamStatus, string> = { planning: "Planning", discovering: "Investigating", implementing: "Implementing", integrating: "Integrating", verifying: "Running checks", reviewing: "Reviewing", delivering: "Delivering", merged: "Merge reported", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-change": "No change proposed", cancelled: "Cancelled" };
 const roles: Record<TeamRole, { name: string; description: string }> = {
   "project-manager": { name: "Coordinator", description: "Plans tasks, assigns implementers, and asks for decisions." },
   scout: { name: "Scout", description: "Investigates the project and reports evidence before implementation." },
   implementer: { name: "Implementers", description: "Build independent tasks in separate workspaces." },
   integrator: { name: "Integrator", description: "Repairs failed checks and review findings." },
+  delivery: { name: "Delivery", description: "Publishes and merges reviewed changes under the repository policy." },
   reviewer: { name: "Reviewer", description: "Reviews the result against your request." },
 };
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"].includes(status) ? "waiting" : status === "ready-for-review" ? "ready" : ["cancelled", "no-change"].includes(status) ? "inactive" : "";
+const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"].includes(status) ? "waiting" : ["ready-for-review", "merged"].includes(status) ? "ready" : ["cancelled", "no-change"].includes(status) ? "inactive" : "";
 function Status({ status }: { status: TeamStatus }) { return <span className={"team-status " + statusClass(status)}><span className="dot" />{labels[status]}</span>; }
 function RoleGuide() { return <div className="team-roles" aria-label="Team responsibilities">{Object.entries(roles).map(([id, role]) => <div key={id}><strong>{role.name}</strong><p>{role.description}</p></div>)}</div>; }
 const leadLabel = (team: TeamView) => team.lineup ? "Coordinator: " + team.lineup.coordinator.label : names[team.provider] ?? team.provider;
@@ -227,7 +229,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
     catch (error) { if (current()) setLoadError((error as Error).message); throw error; }
   }, 1800, key);
   const fresh = connected && view.fresh;
-  const canSteer = fresh && me.role !== "viewer" && team?.status !== "cancelled";
+  const canSteer = fresh && me.role !== "viewer" && team?.status !== "cancelled" && team?.status !== "delivering" && !team?.deliveryReceipt;
   const canOwn = fresh && me.role === "owner";
   async function mutate(path: string, label: string, text?: string) {
     if (!team || busy || !fresh || me.role === "viewer") return;
@@ -257,6 +259,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
     <div className="team-detail-body">
       {team.reason && <p className="team-notice" role="status">{team.reason}</p>}
       <LinearTracking tracking={team.linear} fresh={fresh} />
+      {team.deliveryReceipt && <p className="team-notice team-ready"><Check size={18} /><span>The delivery agent reports that <a href={team.deliveryReceipt.pullRequestUrl} target="_blank" rel="noreferrer">the pull request merged</a>. The host records this report; it does not independently verify GitHub or product impact.</span></p>}
       {team.status === "ready-for-review" && <p className="team-notice team-ready"><Check size={18} />The team reports that this run is ready for your review. Inspect the changes and evidence below before merging or publishing.</p>}
       {team.goal && <p className="goal-team-origin"><a href={goalHref}>Open goal</a> · cycle {team.goal.cycle} · goal revision {team.goal.revision}</p>}
       {team.noChange && <section className="team-section"><h2>No change proposed</h2><p className="team-prose">{team.noChange.summary}</p><EvidenceList evidence={team.noChange.evidence} /></section>}
@@ -273,12 +276,12 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       <section className="team-section"><h2>Review the changes</h2><dl className="team-output"><dt><GitBranch size={15} />Branch</dt><dd><code>{team.branch}</code></dd><dt>Workspace</dt><dd><code>{team.workspace}</code></dd><dt>Base commit</dt><dd><code>{team.baseCommit}</code></dd>{team.headCommit && <><dt>Head commit</dt><dd><code>{team.headCommit}</code></dd></>}</dl></section>
       {(team.steering.length > 0 || team.decisions.some(decision => decision.answer !== undefined)) && <section className="team-section"><h2>Your directions and decisions</h2>{team.steering.map((entry, index) => <div className="team-record" key={entry.at + "/" + index}><small>Direction · revision {entry.revision} · {date(entry.at)}</small><p className="team-prose">{entry.text}</p></div>)}{team.decisions.filter(decision => decision.answer !== undefined).map(decision => <div className="team-record" key={decision.id}><small>Decision · revision {decision.revision}</small><p className="team-prose">{decision.question}</p><p className="team-prose"><strong>Your answer: </strong>{decision.answer}</p></div>)}</section>}
       {team.events.length > 0 && <section className="team-section"><details className="team-history"><summary>Run history</summary><ol>{team.events.map((event, index) => <li key={event.at + "/" + index}><time>{date(event.at)}</time><p>{event.text}</p></li>)}</ol></details></section>}
-      {me.role === "owner" && !team.goal && team.status !== "cancelled" && <div className="team-actions">{team.status !== "blocked" && team.status !== "ready-for-review" && team.status !== "no-change" && <button className="text-button" disabled={!canOwn || busy || Boolean(pending)} onClick={() => action(team.status === "paused" ? "resume" : "pause", team.status === "paused" ? "Resume" : "Pause")}>{team.status === "paused" ? "Resume team" : "Pause team"}</button>}<button className="text-button team-cancel" disabled={!canOwn || busy || Boolean(pending)} onClick={() => { if (window.confirm("Cancel this team run? This stops its agent sessions and keeps the recorded work.")) action("cancel", "Cancellation"); }}>Cancel team</button></div>}
+      {me.role === "owner" && !team.goal && team.status !== "cancelled" && <div className="team-actions">{team.status !== "blocked" && team.status !== "ready-for-review" && team.status !== "merged" && team.status !== "no-change" && <button className="text-button" disabled={!canOwn || busy || Boolean(pending)} onClick={() => action(team.status === "paused" ? "resume" : "pause", team.status === "paused" ? "Resume" : "Pause")}>{team.status === "paused" ? "Resume team" : "Pause team"}</button>}<button className="text-button team-cancel" disabled={!canOwn || busy || Boolean(pending)} onClick={() => { if (window.confirm("Cancel this team run? This stops its agent sessions and keeps the recorded work.")) action("cancel", "Cancellation"); }}>Cancel team</button></div>}
     </div>
     <div className="team-composer-area">
       {request.message && <p className={request.result ? "quiet" : "error"} role="status">{request.message}</p>}
       {pending && <div className="team-pending"><span>{busy ? "Sending " : "Unconfirmed request: "}{pending.label.toLowerCase()} · revision {pending.revision}</span>{!busy && <button className="text-button" disabled={!fresh || me.role === "viewer" || (me.role !== "owner" && !pending.path.endsWith("/steer") && !pending.path.endsWith("/answer"))} onClick={() => void mutate(pending.path, pending.label, pending.text)}>Retry same request</button>}</div>}
-      {me.role === "viewer" ? <p className="quiet">This device can view the team. An owner or controller can answer decisions and send direction.</p> : team.goal ? <p className="quiet goal-team-origin">Answer this cycle’s decisions above. <a href={goalHref}>Open the goal</a> to steer, pause, resume, or cancel its work.</p> : team.status === "cancelled" ? <p className="quiet">This run is cancelled. Its work and evidence remain available above.</p> : <form onSubmit={event => { event.preventDefault(); if (direction.trim()) void mutate("/teams/" + id + "/steer", "Direction", direction.trim()); }}><label className="sr-only" htmlFor="team-direction">Steer this team</label><textarea id="team-direction" rows={2} maxLength={8000} placeholder="Give the team a direction or change the requirements…" value={direction} onChange={event => setDirection(event.target.value)} disabled={busy || Boolean(pending)} /><button className="primary" disabled={!canSteer || busy || Boolean(pending) || !direction.trim()}>Send direction <Send size={17} /></button></form>}
+      {me.role === "viewer" ? <p className="quiet">This device can view the team. An owner or controller can answer decisions and send direction.</p> : team.goal ? <p className="quiet goal-team-origin">Answer this cycle’s decisions above. <a href={goalHref}>Open the goal</a> to steer, pause, resume, or cancel its work.</p> : team.status === "cancelled" ? <p className="quiet">This run is cancelled. Its work and evidence remain available above.</p> : team.status === "delivering" || team.deliveryReceipt ? <p className="quiet">Delivery has started. Inspect its PR and recorded evidence before starting further work.</p> : <form onSubmit={event => { event.preventDefault(); if (direction.trim()) void mutate("/teams/" + id + "/steer", "Direction", direction.trim()); }}><label className="sr-only" htmlFor="team-direction">Steer this team</label><textarea id="team-direction" rows={2} maxLength={8000} placeholder="Give the team a direction or change the requirements…" value={direction} onChange={event => setDirection(event.target.value)} disabled={busy || Boolean(pending)} /><button className="primary" disabled={!canSteer || busy || Boolean(pending) || !direction.trim()}>Send direction <Send size={17} /></button></form>}
     </div>
   </div>;
 }

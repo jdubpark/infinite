@@ -24,7 +24,8 @@ infinite monitor [session ID or unique prefix]
 infinite recover SESSION_ID [--output NEW_DIRECTORY]
 infinite sync [--project ID] | --stop | --status | --apply [--force]
 infinite pull [PROJECT_ID] [--output NEW_DIRECTORY]
-infinite repo init [DIRECTORY] [--project ID] [--check-json JSON]
+infinite repo init [DIRECTORY] [--project ID] [--check-json JSON] [--delivery merge|review]
+  --delivery merge [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase]
 infinite repo init PARENT_DIRECTORY --linear-team UUID [--linear-project UUID]
 infinite repo link PROJECT_OR_DIRECTORY --relationship "Uses its API"
 infinite repo unlink PROJECT_OR_DIRECTORY | repo links
@@ -50,6 +51,8 @@ Only cloud Codex with --local-ui requires an initial prompt.
 Resume reopens the existing cloud conversation in its local native interface.
 Use --takeover before resume to explicitly take control from another device.
 The Ctrl+] / Ctrl+G / Ctrl+E shortcuts above apply to streamed terminal mode.
+
+Repository delivery defaults to review-only. Configure --delivery merge per repository; a missing GitHub target must be supplied explicitly. --delivery review removes merge authorization.
 
 Client settings: ~/.config/infinite/client.json (or --client-config FILE).`);
   if (process.argv[2] && !["help", "--help", "-h"].includes(process.argv[2])) process.exitCode = 1;

@@ -46,7 +46,8 @@ Teams remain available for a single feature request or PRD.
 Owners can start, pause, resume, and cancel goals; owners and controllers can
 steer and answer questions. Only an explicit user assessment with evidence can
 record a product outcome as achieved. Checked code is ready for human review,
-without automatic publication or deployment. See [Goals and agent teams](docs/teams.md)
+or for automatic PR merge when the owner configured a repository delivery policy.
+Deployment requires its own existing authorization. See [Goals and agent teams](docs/teams.md)
 for the web flow, model routing, scope, limits, API, and recovery.
 
 Projects can map Goals and feature cycles to Linear issues. The host checks
@@ -79,3 +80,14 @@ accept their first real input through the persistent terminal. OpenCode also has
 an experimental local UI adapter and supports empty conversations. Claude/Grok
 native UI adapters, automatic conflict application, platform-specific dependency
 provisioning and worker reboot recovery remain unfinished.
+
+### Autonomous delivery
+
+An owner may configure a GitHub repository and base branch for automatic merge.
+A separate strong delivery agent may publish and merge the exact integration
+commit only after required checks and independent strong review pass. Repository
+protections and provider permissions remain in force. Repairs return through
+integration, checks, and review; uncertain publication is preserved for remote
+reconciliation instead of blindly repeated. The host labels a merge as an agent
+report and records the PR, reviewed head, and reported merge commit. A reported
+merge does not establish a product goal's outcome.

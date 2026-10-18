@@ -217,3 +217,68 @@ test("owner CLI enrolls a mirrored repository, while other roles and browser own
     assert.equal((await host.fetchApi(endpoint, "owner", request, {}, "PUT")).body.revision, 1, "the durable request receipt is replayed after host restart");
   } finally { await host.stop(); rmSync(external, { recursive: true, force: true }); }
 });
+
+test("repo init stores an explicit delivery target, retains it when omitted, and keeps new repositories review-only", { timeout: 90000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-delivery-enrollment-"));
+  const primaryPath = join(root, "primary"), siblingPath = join(root, "sibling");
+  mkdirSync(primaryPath); mkdirSync(siblingPath);
+  for (const path of [primaryPath, siblingPath]) {
+    git(path, "init", "--initial-branch=main");
+    writeFileSync(join(path, "tracked.txt"), "committed\n");
+    git(path, "add", "tracked.txt");
+    git(path, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  }
+  git(primaryPath, "remote", "add", "origin", "https://github.com/Example/primary.git");
+  git(primaryPath, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main");
+  const primaryRemote = git(primaryPath, "config", "--get", "remote.origin.url");
+  const primaryDefault = git(primaryPath, "symbolic-ref", "refs/remotes/origin/HEAD");
+  const checks = JSON.stringify([{ command: "git", args: ["status", "--short"] }]);
+  const linearKeyFile = join(root, "linear-key");
+  writeFileSync(linearKeyFile, "fixture-key", { mode: 0o600 });
+  const host = await startHost({ config: {
+    projects: [
+      { id: "primary", name: "Primary", path: primaryPath, team: { checks: [{ command: "git", args: ["status", "--short"] }] } },
+      { id: "sibling", name: "Sibling", path: siblingPath, team: { checks: [{ command: "git", args: ["status", "--short"] }] } },
+    ],
+    teams: { workspaceDir: join(root, "team-workspaces") },
+    linear: { apiKeyFile: linearKeyFile, endpoint: "http://127.0.0.1:9999/graphql" },
+  } });
+  const clientFile = join(host.root, "delivery-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
+  const cli = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const invoke = (project: string, args: string[]) => execFileSync(cli[0], [...cli.slice(1), "repo", "init", project === "primary" ? primaryPath : siblingPath, "--project", project, "--check-json", checks, ...args, "--json"], { encoding: "utf8" });
+  try {
+    const linearTeam = "11111111-1111-4111-8111-111111111111";
+    JSON.parse(execFileSync(cli[0], [...cli.slice(1), "repo", "init", root, "--linear-team", linearTeam], { cwd: root, encoding: "utf8" }));
+    const enrolled = JSON.parse(invoke("primary", ["--delivery", "merge"]));
+    assert.deepEqual(enrolled.team.delivery, { mode: "merge", repository: "Example/primary", baseBranch: "main", mergeMethod: "squash" });
+    assert.equal(git(primaryPath, "config", "--get", "remote.origin.url"), primaryRemote);
+    assert.equal(git(primaryPath, "symbolic-ref", "refs/remotes/origin/HEAD"), primaryDefault);
+    await host.stopApi(); await host.start();
+    assert.deepEqual((await host.fetchApi("/projects/primary/team")).body.team.delivery, enrolled.team.delivery, "the delivery policy survives a host restart");
+
+    assert.throws(() => invoke("primary", ["--delivery", "merge", "--repository", "https://github.com/Example/primary.git"]));
+    assert.equal((await host.fetchApi("/projects/primary/team")).body.revision, 1, "a malformed repository target is rejected before enrollment changes");
+
+    const retained = JSON.parse(invoke("primary", []));
+    assert.deepEqual(retained.team.delivery, enrolled.team.delivery, "omitting delivery flags retains the existing policy");
+    const reviewed = JSON.parse(invoke("primary", ["--delivery", "review"]));
+    assert.equal(Object.hasOwn(reviewed.team, "delivery"), false, "review removes merge authorization");
+
+    git(siblingPath, "remote", "add", "origin", "https://OWNER@github.com/Example/sibling.git");
+    const credentialRemote = git(siblingPath, "config", "--get", "remote.origin.url");
+    assert.throws(() => invoke("sibling", ["--delivery", "merge"]), (error: { stderr?: string }) => /without credentials/.test(error.stderr ?? "") && !String(error.stderr).includes("OWNER@github.com"));
+    assert.equal(git(siblingPath, "config", "--get", "remote.origin.url"), credentialRemote);
+    git(siblingPath, "remote", "set-url", "origin", "https://github.com.example.invalid/Example/sibling.git");
+    const otherHostRemote = git(siblingPath, "config", "--get", "remote.origin.url");
+    assert.throws(() => invoke("sibling", ["--delivery", "merge"]), /github\.com/);
+    assert.equal(git(siblingPath, "config", "--get", "remote.origin.url"), otherHostRemote);
+    const sibling = JSON.parse(invoke("sibling", []));
+    assert.equal(sibling.linear.teamId, linearTeam, "the parent Linear default remains independent from delivery authorization");
+    assert.equal(Object.hasOwn(sibling.team, "delivery"), false, "a new repository does not inherit another repository's delivery policy");
+    assert.equal((await host.fetchApi("/projects/primary/team")).body.revision, 3);
+    assert.equal((await host.fetchApi("/projects/sibling/team")).body.revision, 1);
+    assert.equal(git(primaryPath, "config", "--get", "remote.origin.url"), primaryRemote);
+    assert.equal(git(primaryPath, "symbolic-ref", "refs/remotes/origin/HEAD"), primaryDefault);
+  } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});

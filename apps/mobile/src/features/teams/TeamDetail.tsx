@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ActivityIndicator, Alert, KeyboardAvoidingView, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, KeyboardAvoidingView, Linking, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me, type SessionRow } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
@@ -72,6 +72,14 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       {team.reason ? <Text style={t.warning}>{team.reason}</Text> : null}
       <LinearLine tracking={team.linear} fresh={fresh} />
       {team.status === "ready-for-review" ? <Text style={t.body}>The team reports this run is ready for your review. Inspect the changes and evidence below before merging or publishing.</Text> : null}
+      {team.deliveryReceipt ? <Section title="Delivery receipt">
+        <Text style={t.body}>The delivery agent reports that the pull request merged. The host records this report; it does not independently verify GitHub or product impact.</Text>
+        {/^https:\/\//.test(team.deliveryReceipt.pullRequestUrl) ? <Pressable accessibilityRole="link" onPress={() => void Linking.openURL(team.deliveryReceipt!.pullRequestUrl)}><Text style={s.link}>Open pull request</Text></Pressable> : null}
+        <Clamp text={team.deliveryReceipt.summary} lines={4} />
+        <Text style={t.note}>Reported for revision {team.deliveryReceipt.revision} · {shortDate(team.deliveryReceipt.reportedAt)}</Text>
+        <Text style={t.note}>Reviewed head commit</Text><Text selectable style={t.mono}>{team.deliveryReceipt.headCommit}</Text>
+        <Text style={t.note}>Reported merge commit</Text><Text selectable style={t.mono}>{team.deliveryReceipt.mergeCommit}</Text>
+      </Section> : null}
       {team.goal ? <View style={s.metaRow}>
         <Text style={t.note}>Part of a goal · cycle {team.goal.cycle} · goal revision {team.goal.revision}</Text>
         <Button title="Open goal" secondary onPress={() => router.push({ pathname: "/goal/[id]", params: { id: team.goal!.id, machine } })} />
@@ -173,8 +181,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </Disclosure> : null}
 
       {me?.role === "owner" && !team.goal && team.status !== "cancelled" ? <View style={s.actions}>
-        {team.status === "paused" ? <Button title="Resume team" secondary disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
-          : !["blocked", "ready-for-review", "no-change"].includes(team.status) ? <Button title="Pause team" secondary disabled={!controls.pause || locked} onPress={() => send("/pause", "Pause")} /> : null}
+        {team.status === "paused" ? team.deliveryReceipt ? null : <Button title="Resume team" secondary disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
+          : controls.pause ? <Button title="Pause team" secondary disabled={locked} onPress={() => send("/pause", "Pause")} /> : null}
         <Button title="Cancel team…" secondary disabled={!controls.cancel || locked} onPress={() => Alert.alert("Cancel this team?", "This stops its agent sessions and keeps the recorded work and evidence.", [
           { text: "Keep running", style: "cancel" },
           { text: "Cancel team", style: "destructive", onPress: () => send("/cancel", "Cancellation") },
@@ -185,7 +193,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       <RequestStatus request={request} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|answer)$/.test(request.pending?.path ?? ""))} subject="team" />
       <SteerBox value={direction} onChange={setDirection} placeholder="Give the team a direction or change the requirements…"
         enabled={controls.steer && !locked} busy={request.busy}
-        note={me?.role === "viewer" ? "This device can view the team. An owner or controller can answer decisions and send direction."
+        note={team.status === "delivering" || team.status === "merged" || team.deliveryReceipt ? "Delivery has started or been reported. Inspect its pull request and recorded evidence before starting further work."
+          : me?.role === "viewer" ? "This device can view the team. An owner or controller can answer decisions and send direction."
           : team.goal ? "Answer this cycle’s decisions here. Open the goal to steer, pause, resume, or cancel its work."
             : team.status === "cancelled" ? "This run is cancelled. Its work and evidence remain available above." : undefined}
         onSend={() => { const text = direction.trim(); if (text) send("/steer", "Direction", { text }); }} />
@@ -230,6 +239,7 @@ const s = StyleSheet.create({
   spread: { flexDirection: "row", alignItems: "flex-start", gap: theme.space.compact },
   body: { padding: theme.space.section, paddingTop: 10, gap: 10, paddingBottom: 40 },
   record: { gap: 4, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: theme.colors.rule },
+  link: { fontSize: 13, lineHeight: 20, color: theme.colors.forest, textDecorationLine: "underline" },
   actions: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: theme.space.section },
   answer: { minHeight: 70, textAlignVertical: "top", backgroundColor: theme.colors.white },
   dock: { gap: 8, paddingHorizontal: theme.space.inset, paddingVertical: theme.space.label, borderTopWidth: 1, borderTopColor: theme.colors.rule, backgroundColor: theme.colors.paper },

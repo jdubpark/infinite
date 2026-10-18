@@ -130,15 +130,17 @@ export async function cleanTeamCheckpoint(source: string, expectedHead: string, 
   await assertMemberReadOnly(canonical, expectedHead, prefix);
   return expectedHead;
 }
-export async function prepareTeamWorkspace(source: string, root: string, directoryName: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, expectedHead?: string, anchor?: string) {
+export async function prepareTeamWorkspace(source: string, root: string, directoryName: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, expectedHead?: string, anchor?: string, startCommit?: string) {
   let canonical: string, top: string;
   try { canonical = realpathSync(source); top = await git(canonical, ["rev-parse", "--show-toplevel"], prefix, 30000, signal); }
   catch { throw new TeamError(409, "project-not-git-root", "The configured team project must be an accessible Git repository with a committed HEAD."); }
   if (realpathSync(top) !== canonical) throw new TeamError(409, "project-not-git-root", "The configured team project must be a Git repository root.");
   if (await git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"], prefix, 30000, signal))
     throw new TeamError(409, "project-dirty", "Commit or separately preserve the configured project's changes before starting a team.");
-  const baseCommit = await git(canonical, ["rev-parse", "HEAD"], prefix, 30000, signal);
-  if (expectedHead !== undefined && baseCommit !== expectedHead)
+  const sourceHead = await git(canonical, ["rev-parse", "HEAD"], prefix, 30000, signal);
+  const baseCommit = startCommit ?? sourceHead;
+  if (startCommit && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(startCommit)) throw new TeamError(409, "invalid-delivery-baseline", "The recorded merge baseline is invalid.");
+  if (expectedHead !== undefined && sourceHead !== expectedHead)
     throw new TeamError(409, "parent-workspace-changed", "The previous goal run no longer matches its recorded integration commit. Its workspace must be reconciled before continuing.");
   if (anchor) ensureHostDirectory(anchor, root, 0o750);
   else ensureDefaultTeamRoot(root, true);
@@ -153,8 +155,9 @@ export async function prepareTeamWorkspace(source: string, root: string, directo
   const workspace = join(directory, "integration");
   await git(directory, ["clone", "--no-local", "--no-hardlinks", "--", canonical, workspace], prefix, 120000, signal);
   await git(workspace, ["remote", "remove", "origin"], prefix, 30000, signal);
+  if (startCommit) await git(workspace, ["fetch", "--no-tags", "--", canonical, startCommit], prefix, 30000, signal);
   await git(workspace, ["checkout", "-b", branch, baseCommit], prefix, 30000, signal);
-  if (await git(canonical, ["rev-parse", "HEAD"], prefix, 30000, signal) !== baseCommit || await git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"], prefix, 30000, signal))
+  if (await git(canonical, ["rev-parse", "HEAD"], prefix, 30000, signal) !== sourceHead || await git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"], prefix, 30000, signal))
     throw new TeamError(409, "project-changed", "The source project changed during capture. The team remains blocked with its isolated copy preserved.");
   return { workspace, branch, baseCommit };
 }
@@ -172,6 +175,17 @@ export async function prepareMemberWorkspace(workspace: string, memberId: string
   await git(cwd, ["remote", "remove", "origin"], prefix, 30000, signal);
   await git(cwd, ["checkout", "--detach", baseCommit], prefix, 30000, signal);
   return realpathSync(cwd);
+}
+/** Retain the reported merge object without changing the reviewed working tree. */
+export async function captureDeliveryBaseline(workspace: string, memberCwd: string, reviewedHead: string, mergeCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {
+  await git(workspace, ["fetch", "--no-tags", "--", memberCwd, mergeCommit], prefix, 30000, signal);
+  if (await git(workspace, ["cat-file", "-t", mergeCommit], prefix, 30000, signal) !== "commit")
+    throw new TeamError(409, "invalid-delivery-baseline", "The reported merge must identify a commit. Its receipt is retained for reconciliation.");
+  const reviewedTree = await git(workspace, ["rev-parse", `${reviewedHead}^{tree}`], prefix, 30000, signal);
+  const mergedTree = await git(workspace, ["rev-parse", `${mergeCommit}^{tree}`], prefix, 30000, signal);
+  if (reviewedTree !== mergedTree)
+    throw new TeamError(409, "delivery-baseline-changed", "The reported merge includes changes beyond the reviewed tree. Its receipt is retained; inspect the merged baseline before another goal cycle.");
+  await git(workspace, ["update-ref", "refs/infinite/delivery", mergeCommit], prefix, 30000, signal);
 }
 export async function teamHead(cwd: string, prefix?: TeamCommand, signal?: AbortSignal) { return git(cwd, ["rev-parse", "HEAD"], prefix, 30000, signal); }
 export async function assertMemberReadOnly(cwd: string, base: string, prefix?: TeamCommand, signal?: AbortSignal) {

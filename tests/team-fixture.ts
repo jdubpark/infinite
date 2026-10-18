@@ -77,8 +77,8 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
         } : {}) },
         remote: { enabled: true },
         projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
-          team: { checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
-            { command: process.execPath, args: ["check.mjs", ...(scenario === "failed-check" ? ["--fail"] : []), ...(scenario === "success" ? ["--prefix"] : [])] },
+          team: { ...(scenario.startsWith("delivery") ? { delivery: { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}), checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
+            { command: process.execPath, args: ["check.mjs", ...(scenario.endsWith("failed-check") ? ["--fail"] : []), ...(scenario === "success" ? ["--prefix"] : [])] },
             ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
           ] }) } }],
         ...config,
@@ -93,12 +93,12 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
     assert.equal(response.status, 200, JSON.stringify(response.body));
     return response.body;
   };
-  const settled = (id: string) => waitFor(() => get(id), run => ["ready-for-review", "blocked"].includes(run.status), 90000);
+  const settled = (id: string) => waitFor(() => get(id), run => ["ready-for-review", "merged", "blocked"].includes(run.status), 90000);
   const close = async () => {
     try {
       const listed = await host.fetchApi("/teams");
       for (const run of listed.body.teams ?? [])
-        if (!["ready-for-review", "cancelled"].includes(run.status))
+        if (!["ready-for-review", "merged", "cancelled"].includes(run.status))
           await host.fetchApi(`/teams/${run.id}/cancel`, "owner", { requestId: randomUUID(), revision: run.revision });
     } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
   };

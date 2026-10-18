@@ -1,7 +1,8 @@
 import type { UsageConfig } from "./config.js";
 
 export interface UsageTokens { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
-export interface UsageRecord { provider: "opencode"; providerId: string; modelId: string; messageId: string; partId: string; modelSource: "requested" | "reported"; completedAt: string; tokens: UsageTokens; reportedCost: number }
+/** `modelSource: "unknown"` means neither OpenCode nor the launch named a model; its ids are then "unknown". */
+export interface UsageRecord { provider: "opencode"; providerId: string; modelId: string; messageId: string; partId: string; modelSource: "requested" | "reported" | "unknown"; completedAt: string; tokens: UsageTokens; reportedCost: number }
 export type Pricing = "configured" | "provider" | "unknown";
 export interface UsageTotals { cost: number; tokens: UsageTokens; messages: number; pricing: Record<Pricing, number> }
 
@@ -10,9 +11,11 @@ const MICRO_DOLLARS_PER_DOLLAR = 1_000_000;
 /**
  * Prices one record. A configured price table wins over the reported cost. Prices are USD per
  * million tokens, so tokens times price gives micro-dollars directly. Reasoning tokens bill at
- * the output rate.
+ * the output rate. A record whose model was never observed cannot be priced or attributed, so it
+ * is unknown whatever its reported cost; its tokens still count.
  */
 export function priceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined): { cost: number; pricing: Pricing } {
+  if (record.modelSource === "unknown") return { cost: 0, pricing: "unknown" };
   const price = prices?.[`${record.providerId}/${record.modelId}`];
   if (price) {
     const { tokens } = record;

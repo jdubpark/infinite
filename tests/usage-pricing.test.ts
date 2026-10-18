@@ -27,6 +27,12 @@ test("reported cost is used without a table, and zero without a table is unknown
   assert.deepEqual(priceUsage({ ...base, reportedCost: 0 }, {}), { cost: 0, pricing: "unknown" });
 });
 
+test("a record whose model was never observed is unknown, whatever its reported cost or the price table", () => {
+  const unknown = { ...base, providerId: "unknown", modelId: "unknown", modelSource: "unknown" as const, reportedCost: 0.5, tokens: { ...base.tokens, input: 1_000_000 } };
+  assert.deepEqual(priceUsage(unknown, undefined), { cost: 0, pricing: "unknown" });
+  assert.deepEqual(priceUsage(unknown, { "unknown/unknown": { input: 1, output: 1 } }), { cost: 0, pricing: "unknown" });
+});
+
 test("period starts are UTC day, Monday week, and month", () => {
   const now = new Date("2026-10-17T15:00:00Z"); // a Saturday
   assert.equal(periodStart("day", now).toISOString(), "2026-10-17T00:00:00.000Z");

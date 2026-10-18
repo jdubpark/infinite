@@ -53,7 +53,7 @@ Still unobserved on the live host, and to be confirmed during implementation bef
 OpenCode team members launch with `--format json` added by the host (the launch builder already owns the `run` argument list). The worker parses each stdout line that is a JSON object with `type: "step_finish"` and records a journal event of kind `usage` from its `part`:
 
 ```
-{ provider: "opencode", providerId, modelId, modelSource: "requested" | "reported",
+{ provider: "opencode", providerId, modelId, modelSource: "requested" | "reported" | "unknown",
   messageId, partId, completedAt,
   tokens: { input, output, reasoning, cacheRead, cacheWrite },
   reportedCost }
@@ -61,7 +61,7 @@ OpenCode team members launch with `--format json` added by the host (the launch 
 
 One record per step. Lines that are not JSON or not `step_finish` are ignored. Headless lines carry no model id, so a team member's `providerId` and `modelId` come from its requested lineup profile and are labelled `modelSource: "requested"`. The worker appends every record immediately; the journal is append-only and the ledger, not the worker, enforces one row per `(sessionId, messageId, partId)`. The member's terminal shows the JSON event stream; these members accept no interactive input anyway, and the web chat view continues to come from the provider's own record.
 
-OpenCode sessions driven through the local-UI adapter already subscribe to `/event`; the same handler records a `usage` event from each `message.part.updated` whose part is a `step-finish`, taking the provider and model from the `message.updated` it saw for that message (`modelSource: "reported"`). Terminal-mode `infinite opencode` sessions run the TUI and have no structured output; the ledger records nothing for them and the API says so rather than showing zero.
+OpenCode sessions driven through the local-UI adapter already subscribe to `/event`; the same handler records a `usage` event from each `message.part.updated` whose part is a `step-finish`, taking the provider and model from the `message.updated` it saw for that message (`modelSource: "reported"`). Without one, it uses the session's requested `--model` (`modelSource: "requested"`). With neither, the record keeps its tokens with `providerId` and `modelId` of `"unknown"` and `modelSource: "unknown"`. (Added 2026-10-18 after final review.) Terminal-mode `infinite opencode` sessions run the TUI and have no structured output; the ledger records nothing for them and the API says so rather than showing zero.
 
 Claude Code and Codex sessions record no `usage` events in this change.
 
@@ -85,7 +85,7 @@ Host configuration gains an optional `usage` block:
 
 Prices are USD per million tokens; `cacheRead` and `cacheWrite` are optional and default to the input price. `budgets` is keyed by provider (`claude`, `codex`, `grok`, `opencode`); `period` is `day`, `week`, or `month`, in UTC, defaulting to `month`. A budget is informational.
 
-Each `usage` record is priced at read time, not at capture: `cost` is computed from the configured price for `providerId/modelId` when one exists, otherwise it is `reportedCost`. The record exposes `pricing: "configured" | "provider" | "unknown"`, where `unknown` means no configured price and a reported cost of 0. Changing the price table re-prices history, which is the intended behaviour for a tally.
+Each `usage` record is priced at read time, not at capture: `cost` is computed from the configured price for `providerId/modelId` when one exists, otherwise it is `reportedCost`. The record exposes `pricing: "configured" | "provider" | "unknown"`, where `unknown` means no configured price and a reported cost of 0, or a record with `modelSource: "unknown"`, which is never priced because its model was not observed. Changing the price table re-prices history, which is the intended behaviour for a tally.
 
 ### Aggregation and durability
 

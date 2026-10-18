@@ -97,7 +97,7 @@ test("OpenCode CLI uses a local credential and rejoins history without starting 
   } finally { for (const child of children) { try { child.kill("SIGKILL"); } catch {} } await host.stop(); }
 });
 
-test("OpenCode step-finish parts in the native event stream are journaled as usage with the reported model", { timeout: 30000 }, async () => {
+test("OpenCode step-finish parts in the native event stream are journaled as usage with the reported model, or an unknown one", { timeout: 30000 }, async () => {
   const host = await startHost({ agents: { opencode: { command: process.execPath, args: [fixture] } } });
   const id = randomUUID(), path = `/sessions/${id}`;
   try {
@@ -114,5 +114,16 @@ test("OpenCode step-finish parts in the native event stream are journaled as usa
     assert.equal(usage[0].data.modelSource, "reported");
     assert.equal(usage[0].data.reportedCost, 0.25);
     assert.equal(usage[0].data.tokens.input, 100);
+    // A step that finishes before OpenCode names its model, in a session started without --model.
+    await waitFor(async () => (await host.fetchApi(path)).body.attention, a => a.lastMessage === "Reply to usage");
+    const early = await fetch(host.origin + "/api" + path + `/opencode/session/${info.sessionId}/prompt_async`, { method: "POST", headers: { Authorization: `Bearer ${host.tokens.owner}`, ...owner.headers, "Content-Type": "application/json" }, body: JSON.stringify({ parts: [{ type: "text", text: "usage-early" }] }) });
+    assert.equal(early.status, 204);
+    const both = await waitFor(async () => (await host.fetchApi(path + "/events?types=usage")).body.events, events => events.length > 1);
+    assert.deepEqual([both[1].data.partId, both[1].data.providerId, both[1].data.modelId, both[1].data.modelSource], ["prt_native_early", "unknown", "unknown", "unknown"]);
+    assert.equal(both[1].data.tokens.input, 70, "The tokens are kept");
+    // An unobserved model is never priced, even with a reported cost.
+    const row = await waitFor(async () => (await host.fetchApi("/sessions")).body.sessions.find((s: any) => s.id === id), s => s?.usage?.messages === 2);
+    assert.deepEqual(row.usage.pricing, { configured: 0, provider: 1, unknown: 1 });
+    assert.equal(row.usage.cost, 0.25);
   } finally { await host.stop(); }
 });

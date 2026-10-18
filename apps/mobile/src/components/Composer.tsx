@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { StyleSheet, Text, TextInput, View } from "react-native";
 import { theme } from "../theme";
 import { Button } from "./Button";
+import { GlassButton } from "./Glass";
 
 /**
  * The docked text composer. The caller owns `text`, so a draft outlives the
@@ -81,11 +82,20 @@ export function Composer({
           maxLength={32000}
         />
         {onTakeControl ? <Button
+          compact
           title={controlBusy ? "Requesting…" : controlLabel}
           onPress={onTakeControl}
           disabled={busy || controlBusy}
-        /> : <Button
-          title={busy ? "Sending…" : pending ? "Retry" : "Send"}
+        /> : pending ? <Button
+          compact
+          title={busy ? "Sending…" : "Retry"}
+          onPress={onSend}
+          disabled={!canType || busy || !text.trim()}
+        /> : <GlassButton
+          primary
+          glyph="send"
+          size={40}
+          label={busy ? "Sending" : "Send"}
           onPress={onSend}
           disabled={!canType || busy || !text.trim()}
         />}
@@ -97,6 +107,7 @@ export function Composer({
         <View style={s.keys}>
           {onInterrupt ? (
             <Button
+              compact
               title="Interrupt"
               secondary
               onPress={onInterrupt}
@@ -112,9 +123,8 @@ export function Composer({
 
 const s = StyleSheet.create({
   area: {
-    borderTopWidth: 1,
-    borderTopColor: theme.colors.rule,
-    padding: 15,
+    paddingHorizontal: 12,
+    paddingTop: 6,
     paddingBottom: 8,
   },
   error: {
@@ -141,23 +151,32 @@ const s = StyleSheet.create({
     color: theme.colors.forest,
     marginBottom: theme.space.compact,
   },
-  row: { flexDirection: "row", alignItems: "flex-end", gap: 10 },
-  draftNote: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk, marginTop: 6 },
+  row: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 8,
+    padding: 5,
+    paddingLeft: 6,
+    borderRadius: 26,
+    backgroundColor: theme.colors.glass,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: theme.colors.glassRim,
+    ...theme.lift,
+  },
+  draftNote: { fontSize: 11, lineHeight: 16, color: theme.colors.mutedInk, marginTop: 6, paddingHorizontal: 12 },
   message: {
     flex: 1,
-    minHeight: 60,
+    minHeight: 40,
     maxHeight: 150,
-    borderWidth: 1,
-    borderColor: theme.colors.fieldRule,
-    borderRadius: theme.radius.message,
-    padding: 12,
-    fontSize: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 15,
     color: theme.colors.ink,
   },
   keys: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: theme.space.compact,
-    paddingTop: 10,
+    gap: 6,
+    paddingTop: 6,
   },
 });

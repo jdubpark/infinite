@@ -3,6 +3,7 @@
  * has no React Native imports so its rules can be tested under Node. The host enforces roles and
  * revisions; these helpers only decide which controls to offer.
  */
+import type { StatusKind } from "../../status";
 
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
@@ -61,18 +62,12 @@ export const GOAL_LABELS: Record<GoalStatus, string> = {
 export const OUTCOME_LABELS: Record<GoalResult, string> = { achieved: "Achieved", "not-achieved": "Not achieved", inconclusive: "Inconclusive" };
 export const ROLE_NAMES: Record<TeamRole, string> = { "project-manager": "Coordinator", scout: "Scout", implementer: "Implementer", integrator: "Integrator", reviewer: "Reviewer", delivery: "Delivery" };
 
-/** The StatePill tones: amber waits on a person, forest is working or ready, error is stuck. */
+/** RunPill tones: amber waits on a person, forest is working or ready, error is stuck. */
 export type Tone = "amber" | "forest" | "muted" | "error";
 export function teamTone(status: TeamStatus): Tone {
   if (status === "needs-input" || status === "paused") return "amber";
   if (status === "blocked") return "error";
   if (status === "cancelled" || status === "no-change") return "muted";
-  return "forest";
-}
-export function goalTone(status: GoalStatus): Tone {
-  if (status === "needs-input" || status === "paused" || status === "limit-reached") return "amber";
-  if (status === "blocked") return "error";
-  if (status === "cancelled" || status === "no-opportunity") return "muted";
   return "forest";
 }
 
@@ -87,29 +82,103 @@ export function openDecisions(team: TeamView) {
   return team.decisions.filter(decision => decision.revision === team.revision && decision.answer == null);
 }
 
-/** Members of the current revision whose agent sessions are live. */
-export function activeMembers(team: TeamView) {
-  return team.members.filter(member => member.revision === team.revision && ["running", "waiting"].includes(member.status));
+/** Integrated tasks out of the current plan. */
+export function teamProgress(team: TeamView) {
+  return { done: team.tasks.filter(task => task.status === "integrated").length, total: team.tasks.length };
 }
 
-/** One line under a list row's status pill: what the run waits on, why it stopped, or how far the plan got. */
-export function teamRowLine(team: TeamView) {
-  const open = openDecisions(team).length;
-  if (open) return open === 1 ? "1 decision waits for you" : `${open} decisions wait for you`;
-  const finished = ["ready-for-review", "cancelled", "no-change"].includes(team.status);
-  if (team.reason && !finished) return team.reason;
-  const integrated = team.tasks.filter(task => task.status === "integrated").length;
-  if (team.tasks.length && !finished) return `${integrated}/${team.tasks.length} tasks integrated`;
-  return team.objective.split("\n")[0];
+/** How far each working phase has carried the run at least, so a ring never reads empty once work starts. */
+const PHASE_FLOOR: Partial<Record<TeamStatus, number>> = {
+  planning: 0.25, discovering: 0.25, implementing: 0.25, integrating: 0.5, verifying: 0.75, reviewing: 0.75, delivering: 1,
+};
+
+/** The run's status icon. Words beside it carry the meaning; a filled ring is not completion. */
+export function teamKind(team: TeamView): { kind: StatusKind; fraction: number } {
+  if (team.status === "cancelled") return { kind: "cancelled", fraction: 0 };
+  if (team.status === "no-change") return { kind: "stopped", fraction: 0 };
+  if (team.status === "paused") return { kind: "paused", fraction: 0 };
+  if (team.status === "blocked") return { kind: "blocked", fraction: 0 };
+  if (team.status === "needs-input" || openDecisions(team).length) return { kind: "attention", fraction: 0 };
+  if (team.status === "ready-for-review" || team.status === "merged") return { kind: "review", fraction: 1 };
+  const { done, total } = teamProgress(team);
+  return { kind: "progress", fraction: Math.max(PHASE_FLOOR[team.status] ?? 0.25, total ? done / total : 0) };
+}
+
+export function goalKind(goal: ProductGoal): { kind: StatusKind; fraction: number } {
+  switch (goal.status) {
+    case "needs-input": return { kind: "attention", fraction: 0 };
+    case "paused": case "limit-reached": return { kind: "paused", fraction: 0 };
+    case "blocked": return { kind: "blocked", fraction: 0 };
+    case "ready-for-review": return { kind: "review", fraction: 1 };
+    case "achieved": return { kind: "done", fraction: 1 };
+    case "cancelled": return { kind: "cancelled", fraction: 0 };
+    case "no-opportunity": return { kind: "stopped", fraction: 0 };
+    default: return { kind: "progress", fraction: Math.max(0.25, goal.maxRuns ? goal.cycles.length / goal.maxRuns : 0) };
+  }
+}
+
+/** List groups, in the order a person should look at them. */
+export type RunGroup = "attention" | "active" | "review" | "closed";
+export const RUN_GROUPS: { group: RunGroup; title: string; kind: StatusKind }[] = [
+  { group: "attention", title: "Needs you", kind: "attention" },
+  { group: "active", title: "In progress", kind: "progress" },
+  { group: "review", title: "For review", kind: "review" },
+  { group: "closed", title: "Closed", kind: "cancelled" },
+];
+
+/** Stopped runs are closed even with unanswered questions, since those can no longer be answered. */
+export function teamGroup(team: TeamView): RunGroup {
+  if (team.status === "cancelled" || team.status === "no-change") return "closed";
+  if (team.status === "needs-input" || team.status === "blocked" || openDecisions(team).length) return "attention";
+  if (team.status === "ready-for-review" || team.status === "merged") return "review";
+  return "active";
+}
+
+export function goalGroup(goal: ProductGoal): RunGroup {
+  if (["cancelled", "no-opportunity", "achieved"].includes(goal.status)) return "closed";
+  if (["needs-input", "blocked", "limit-reached"].includes(goal.status)) return "attention";
+  if (goal.status === "ready-for-review") return "review";
+  return "active";
+}
+
+/** Non-empty groups in RUN_GROUPS order; each keeps the incoming order. */
+export function groupRuns<T>(items: T[], groupOf: (item: T) => RunGroup) {
+  return RUN_GROUPS.map(entry => ({ ...entry, items: items.filter(item => groupOf(item) === entry.group) })).filter(entry => entry.items.length);
+}
+
+export const TASK_LABELS: Record<TeamTask["status"], string> = { pending: "To do", running: "In progress", waiting: "Waiting", integrated: "Integrated", blocked: "Blocked" };
+const TASK_ORDER: TeamTask["status"][] = ["blocked", "running", "waiting", "pending", "integrated"];
+
+/** A pending task whose dependencies are not all integrated is backlog; otherwise it is ready to start. */
+export function taskKind(task: TeamTask, tasks: TeamTask[]): StatusKind {
+  switch (task.status) {
+    case "running": return "progress";
+    case "waiting": return "paused";
+    case "integrated": return "done";
+    case "blocked": return "blocked";
+    default: return task.dependsOn.some(id => tasks.find(other => other.id === id)?.status !== "integrated") ? "backlog" : "todo";
+  }
+}
+
+export function taskGroups(tasks: TeamTask[]) {
+  return TASK_ORDER.map(status => ({ status, title: TASK_LABELS[status], tasks: tasks.filter(task => task.status === status) })).filter(group => group.tasks.length);
+}
+
+export const MEMBER_LABELS: Record<string, string> = { queued: "Queued", running: "Working", waiting: "Waiting", reported: "Reported", stopped: "Stopped", unavailable: "Unreachable" };
+export function memberKind(status: string): StatusKind {
+  switch (status) {
+    case "running": return "progress";
+    case "waiting": return "paused";
+    case "reported": return "review";
+    case "stopped": return "stopped";
+    case "unavailable": return "error";
+    default: return "todo";
+  }
 }
 
 /** A workspace can run a team once it has required checks or authorizes the team to establish them. */
 export function teamReady(project?: TeamProject) {
   return Boolean(project?.team?.checks.length || project?.team?.establishChecks);
-}
-
-export function leadLabel(team: TeamView, providerName: (provider: string) => string) {
-  return team.lineup ? `Coordinator: ${team.lineup.coordinator.label}` : providerName(team.provider);
 }
 
 export function profileSetting(profile: ModelProfile) {

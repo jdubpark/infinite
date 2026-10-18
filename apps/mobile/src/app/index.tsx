@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, StyleSheet } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams } from "expo-router";
 import { api, closeConnection, connectionKey, type Connection, type Me } from "../api/client";
@@ -9,7 +9,6 @@ import { clearDrafts } from "../store/drafts";
 import { creations, goalCreations, lifecycles, runRequests, teamCreations } from "../store/requests";
 import { Pair } from "../features/pair/Pair";
 import { Inbox, type InboxView } from "../features/inbox/Inbox";
-import { Button } from "../components/Button";
 import { theme } from "../theme";
 
 export default function Home() {
@@ -71,19 +70,9 @@ export default function Home() {
       initialError={error}
       onCancel={profiles.length ? () => setPairing(false) : undefined}
       onPaired={next => { setError(""); setPairing(false); void reload(connectionKey(next)); }}
-    /> : <>
-      <View style={s.machines}>
-        <Text style={s.label}>MACHINES</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.choices}>
-          {profiles.map(profile => <Button key={connectionKey(profile)} title={profile.label || new URL(profile.url).host}
-            secondary={connectionKey(profile) !== active} onPress={() => void select(connectionKey(profile))} />)}
-          <Button title="Add machine" secondary onPress={() => setPairing(true)} />
-        </ScrollView>
-      </View>
-      <Inbox key={active} connection={connection} onDisconnect={() => void disconnect()}
-        initialView={view === "teams" || view === "goals" ? view as InboxView : undefined}
-        pushNote={push[active] ? PUSH_NOTES[push[active]] : undefined} />
-    </>}
+    /> : <Inbox key={active} connection={connection} machines={profiles} onSelectMachine={id => void select(id)} onAddMachine={() => setPairing(true)}
+      onDisconnect={() => void disconnect()} initialView={view === "teams" || view === "goals" ? view as InboxView : undefined}
+      pushNote={push[active] ? PUSH_NOTES[push[active]] : undefined} />}
   </SafeAreaView>;
 }
 
@@ -95,7 +84,4 @@ const PUSH_NOTES: Record<PushState, string> = {
 const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.colors.paper },
   loading: { marginTop: 100 },
-  machines: { paddingHorizontal: 20, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: theme.colors.rule },
-  label: { fontSize: 10, color: theme.colors.mutedInk, marginBottom: 8, letterSpacing: 1 },
-  choices: { gap: 8 },
 });

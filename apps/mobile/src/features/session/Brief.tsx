@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -17,14 +18,15 @@ import {
   type SessionDetail,
 } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
-import { Button } from "../../components/Button";
+import { Avatar } from "../../components/Avatar";
 import { Composer } from "../../components/Composer";
 import { ControlBar } from "../../components/ControlBar";
 import { DecisionCard } from "../../components/DecisionCard";
 import { MomentRow } from "../../components/MomentRow";
 import { NowCard } from "../../components/NowCard";
 import { OfflineBanner } from "../../components/OfflineBanner";
-import { SourceTag } from "../../components/SourceTag";
+import { Chip, GlassButton, LiveStatus, Segmented, TopBar } from "../../components/Glass";
+import { Glyph } from "../../components/Icon";
 import { StatePill } from "../../components/StatePill";
 import { theme } from "../../theme";
 import { ROLE_NAMES } from "../teams/model";
@@ -132,57 +134,48 @@ export function Brief({
     router.push({ pathname: "/session/[id]/terminal", params: { id, machine: connectionKey(connection) } });
   }
 
+  const toolsOn = (session?.execution?.location ?? session?.executionLocation) === "laptop" ? "your laptop" : me?.machine?.label || connection.label || "this machine";
+  const execution = session?.execution;
+  const tools = execution ? [
+    `${online ? "" : "Last received: "}${execution.location === "cloud" ? "Cloud" : "Laptop"} ${execution.state === "online" ? "connected" : execution.state}`,
+    execution.location === "cloud" ? "Cloud handoff complete" : execution.cloudReady ? "Ready for cloud handoff" : "Preparing cloud handoff",
+    execution.checkpoint ? `Checkpoint ${Math.max(0, Math.floor(((poll?.receivedAt ?? 0) - Date.parse(execution.checkpoint.capturedAt)) / 1000))}s ago` : "",
+    execution.reason ?? "",
+    execution.reconciliation ? "Laptop edits preserved; cloud copy available for reconciliation" : "",
+  ].filter(Boolean).join(" · ") : "";
+
   return (
     // Android runs edge-to-edge, so the window no longer resizes for the keyboard.
     <KeyboardAvoidingView style={s.fill} behavior="padding">
-      <View style={s.header}>
-        <Button title="Sessions" secondary onPress={back} />
-        <Text style={[s.small, !online && s.offlineText]}>
-          {online ? "Up to date" : "Reconnecting"}
-        </Text>
-        <Button title="Terminal" secondary onPress={openTerminal} />
-      </View>
+      <TopBar backLabel="Sessions" onBack={back} right={<>
+        <LiveStatus online={online} seen={seen} />
+        <GlassButton glyph="terminal" label="Open terminal" onPress={openTerminal} />
+      </>} />
       {!session ? (
         <View style={s.empty}>
           <ActivityIndicator />
-          <Text style={s.body}>Waiting for this session…</Text>
+          <Text style={s.small}>Waiting for this session…</Text>
         </View>
       ) : (
         <>
-          <View style={s.titleBlock}>
+          <View style={s.head}>
             <Text style={s.title} numberOfLines={2}>
               {session.title}
             </Text>
-            <View style={s.metaRow}>
-              <Text style={s.small}>{PROVIDER_NAMES[session.provider]}</Text>
+            <View style={s.chips}>
               <StatePill state={session.attention.state} />
-              <SourceTag hooks={session.attention.hooks} source={session.attention.source} />
+              <Chip icon={<Avatar label={PROVIDER_NAMES[session.provider]} provider={session.provider} size={16} />}
+                label={`${PROVIDER_NAMES[session.provider]}${session.backend === "cmux" ? " · cmux" : ""}`} />
+              {session.team ? <Chip icon={<Glyph name="people" size={13} color={theme.colors.mutedInk} />} label={`${ROLE_NAMES[session.team.role]} · rev ${session.team.revision}`}
+                accessibilityLabel={`${ROLE_NAMES[session.team.role]} in a team. Open team`}
+                onPress={() => router.push({ pathname: "/team/[id]", params: { id: session.team!.runId, machine: connectionKey(connection) } })} /> : null}
+              <Chip label={sourceLabel(session.attention.hooks, session.attention.source)} accessibilityLabel={`Status source: ${sourceLabel(session.attention.hooks, session.attention.source)}`} />
+              {me?.role === "viewer" ? <Chip label="View only" /> : null}
             </View>
-            <Text style={s.small}>
-              {connection.label || new URL(connection.url).host} ·{" "}
-              {online
-                ? `Updated ${seen}`
-                : seen
-                  ? `Cached view from ${seen}`
-                  : "Waiting for a fresh response…"}
+            <Text style={s.small} numberOfLines={1}>
+              Tools on {toolsOn} · {online ? `updated ${seen}` : seen ? `cached view from ${seen}` : "waiting for a fresh response…"}
             </Text>
-            {session.team ? (
-              <View style={s.metaRow}>
-                <Text style={s.small}>{ROLE_NAMES[session.team.role]} in a team · revision {session.team.revision}</Text>
-                <Button title="Open team" secondary onPress={() => router.push({ pathname: "/team/[id]", params: { id: session.team!.runId, machine: connectionKey(connection) } })} />
-              </View>
-            ) : null}
-            <Text style={s.small}>Tools run on {(session.execution?.location ?? session.executionLocation) === "laptop" ? "your laptop" : me?.machine?.label || connection.label || "this machine"}</Text>
-            {session.execution ? (
-              <Text style={s.small}>
-                {online ? "Tools: " : "Last received tools: "}{session.execution.location === "cloud" ? "Cloud" : "Laptop"} ·{" "}
-                {session.execution.state === "online" ? "connected" : session.execution.state} ·{" "}
-                {session.execution.location === "cloud" ? "Cloud handoff complete" : session.execution.cloudReady ? "Ready for cloud handoff" : "Preparing cloud handoff"}
-                {session.execution.checkpoint ? ` · Checkpoint ${Math.max(0, Math.floor(((poll?.receivedAt ?? 0) - Date.parse(session.execution.checkpoint.capturedAt)) / 1000))}s ago` : ""}
-                {session.execution.reason ? ` · ${session.execution.reason}` : ""}
-                {session.execution.reconciliation ? " · Laptop edits preserved; cloud copy available for reconciliation" : ""}
-              </Text>
-            ) : null}
+            {tools ? <Text style={s.small} numberOfLines={2}>{tools}</Text> : null}
           </View>
           <OfflineBanner
             online={online}
@@ -202,12 +195,12 @@ export function Brief({
               control.forget(true);
               refresh();
             }}
-            onRefresh={refresh}
           />
           <ScrollView
             style={s.fill}
             contentContainerStyle={s.scrollBody}
             keyboardShouldPersistTaps="handled"
+            refreshControl={<RefreshControl refreshing={false} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}
           >
             {answering.notice ? (
               <Text
@@ -240,16 +233,12 @@ export function Brief({
                 onOpenTerminal={openTerminal}
               />
             )}
-            <View style={s.metaRow}>
-              {(["chat", "activity", "files"] as const).map(value => <Button key={value} title={value[0].toUpperCase() + value.slice(1)} secondary={tab !== value} onPress={() => setTab(value)} />)}
-            </View>
+            <Segmented style={s.tabs} value={tab} onChange={setTab} options={[
+              { value: "chat", label: "Chat" },
+              { value: "activity", label: "Activity", count: moments.length },
+              { value: "files", label: "Files" },
+            ]} />
             {tab === "chat" ? <Conversation connection={connection} id={id} /> : tab === "files" ? <Files connection={connection} id={id} online={online} /> : <>
-            <Text style={s.label}>
-              So far
-              {moments.length ? (
-                <Text style={s.count}>{`  ${moments.length}`}</Text>
-              ) : null}
-            </Text>
             {moments.length ? (
               <View>
                 {moments.map((m) => (
@@ -310,51 +299,21 @@ export function Brief({
   );
 }
 
+/** The source of the current status, independent of the terminal recording. */
+function sourceLabel(hooks: SessionDetail["attention"]["hooks"], source: SessionDetail["attention"]["source"]) {
+  return source === "protocol" ? "Provider events" : source === "screen" ? "From screen" : hooks === "active" ? "Hooks active" : "Screen only";
+}
+
 const s = StyleSheet.create({
   fill: { flex: 1 },
-  header: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: theme.space.compact,
-    paddingHorizontal: theme.space.inset,
-    paddingVertical: theme.space.label,
-  },
-  small: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk },
-  offlineText: { color: theme.colors.warningInk },
-  empty: { padding: 30, gap: 15 },
-  body: {
-    fontSize: 15,
-    lineHeight: 24,
-    color: theme.colors.mutedInk,
-    marginBottom: 20,
-  },
-  titleBlock: {
-    paddingHorizontal: theme.space.section,
-    paddingBottom: theme.space.label,
-    gap: 6,
-  },
-  title: {
-    fontSize: 26,
-    fontWeight: "500",
-    color: theme.colors.ink,
-    letterSpacing: -0.7,
-  },
-  metaRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    alignItems: "center",
-    gap: theme.space.compact,
-  },
-  scrollBody: { padding: theme.space.section, paddingTop: 10, gap: 10 },
+  small: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
+  empty: { padding: 30, gap: 15, alignItems: "center" },
+  head: { paddingHorizontal: 16, paddingBottom: 10, gap: 7 },
+  title: { fontSize: 22, lineHeight: 27, fontWeight: "600", color: theme.colors.ink, letterSpacing: -0.4 },
+  chips: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
+  scrollBody: { paddingHorizontal: 16, paddingTop: 4, paddingBottom: 16, gap: 10 },
+  tabs: { marginTop: 4 },
   notice: { fontSize: 12, lineHeight: 18, color: theme.colors.warningInk },
-  label: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: theme.colors.ink,
-    marginTop: 17,
-  },
-  count: { fontWeight: "400", color: theme.colors.mutedInk },
-  emptyTimeline: { gap: 4 },
+  emptyTimeline: { gap: 4, paddingVertical: 8 },
   placeholder: { fontSize: 13, lineHeight: 20, color: theme.colors.mutedInk },
 });

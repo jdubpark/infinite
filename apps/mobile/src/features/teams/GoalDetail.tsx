@@ -1,15 +1,17 @@
 import { useState } from "react";
-import { ActivityIndicator, Alert, KeyboardAvoidingView, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, KeyboardAvoidingView, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
+import { Card, Chip, GlassButton, LiveStatus, ProgressBar, Sheet, SheetRow, TopBar } from "../../components/Glass";
+import { StatusIcon } from "../../components/Icon";
 import { theme } from "../../theme";
 import {
-  GOAL_LABELS, goalControls, goalStopped, goalTone, newer, openDecisions, OUTCOME_LABELS, shortDate, TEAM_LABELS, teamTone,
+  GOAL_LABELS, goalControls, goalKind, goalStopped, newer, openDecisions, OUTCOME_LABELS, shortDate, TEAM_LABELS, teamKind, teamTone,
   type GoalResult, type ProductGoal, type TeamStatus, type TeamView,
 } from "./model";
-import { Choices, Clamp, Disclosure, LineupView, LinearLine, RequestStatus, RunPill, Section, SteerBox, t } from "./parts";
+import { Choices, Clamp, Disclosure, LinearChip, LineupView, RequestStatus, RunPill, Section, SteerBox, t } from "./parts";
 import { useRunRequest } from "./useRunRequest";
 
 /** One product goal: its outcome, limits, active cycle, earlier cycles, and the person's assessment. */
@@ -25,6 +27,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   const active = usePoll(() => activeId ? api<TeamView>(connection, `/teams/${activeId}`) : Promise.resolve(null), 4000, [connection, activeId]);
   const activeTeam = active.data?.id === activeId ? active.data : null;
   const [direction, setDirection] = useState("");
+  const [actions, setActions] = useState(false);
   const request = useRunRequest<ProductGoal>(connection, `${machine}/goal/${id}`, {
     accepted: (result, sent) => { setRecorded(result); if (sent.path.endsWith("/steer")) setDirection(""); poll.refresh(); },
     refused: poll.refresh,
@@ -35,11 +38,11 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
     else router.replace({ pathname: "/", params: { machine, view: "goals" } });
   }
   const openTeam = (teamId: string) => router.push({ pathname: "/team/[id]", params: { id: teamId, machine } });
-  const header = <View style={s.header}>
-    <Button title="Goals" secondary onPress={back} />
-    <Text style={[t.note, !fresh && s.offline]}>{fresh ? "Up to date" : poll.loading ? "Connecting" : "Reconnecting"}</Text>
-    <Button title={poll.refreshing ? "Checking…" : "Refresh"} secondary disabled={poll.refreshing} onPress={poll.refresh} />
-  </View>;
+  const owns = me?.role === "owner" && goal && !["cancelled", "achieved"].includes(goal.status);
+  const header = <TopBar backLabel="Goals" onBack={back} right={<>
+    <LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} />
+    {owns ? <GlassButton glyph="more" label="Goal actions" onPress={() => setActions(true)} /> : null}
+  </>} />;
   if (!goal) return <View style={s.fill}>{header}<View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading goal…" : "The goal could not be loaded. Check the machine and try again."}</Text></View></View>;
 
   const controls = goalControls(goal, me?.role, fresh, poll.data?.receivedAt);
@@ -53,31 +56,39 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
 
   return <KeyboardAvoidingView style={s.fill} behavior="padding">
     {header}
-    <View style={s.titleBlock}>
-      <Text style={t.note}>{project} · Product goal</Text>
-      <Text style={t.title} numberOfLines={3}>{goal.title}</Text>
-      <View style={s.metaRow}>
-        <RunPill label={GOAL_LABELS[goal.status]} tone={goalTone(goal.status)} />
-        <Text style={t.note}>Revision {goal.revision}</Text>
-      </View>
-      <Text style={t.note}>{fresh ? `Updated ${poll.seen}` : poll.seen ? `Last received ${poll.seen}` : "Waiting for a fresh response…"}</Text>
-    </View>
     {!fresh ? <Text style={t.banner}>Last received goal state. Controls are paused until the host reconnects. Its team may still be working.</Text> : null}
-    <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
-      {goal.reason ? <Text style={t.warning}>{goal.reason}</Text> : null}
-      <LinearLine tracking={goal.linear} fresh={fresh} />
+    <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled"
+      refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
+      <View style={s.titleBlock}>
+        <Text style={t.note}>{project} · Product goal</Text>
+        <Text style={t.title} numberOfLines={3}>{goal.title}</Text>
+        <View style={s.metaRow}>
+          <Chip kind={goalKind(goal).kind} fraction={goalKind(goal).fraction} label={GOAL_LABELS[goal.status]} accessibilityLabel={`State: ${GOAL_LABELS[goal.status]}`}
+            tone={goalKind(goal).kind === "attention" || goalKind(goal).kind === "paused" ? "attention" : goalKind(goal).kind === "blocked" ? "error" : undefined} />
+          <Chip icon={<ProgressBar done={goal.cycles.length} total={goal.maxRuns} width={30} />} label={`${goal.cycles.length}/${goal.maxRuns} cycles`} />
+          <Chip label={`${goal.memberCount}/${goal.maxMembers} agents`} />
+          <Chip label={`Due ${shortDate(goal.deadlineAt)}`} />
+          <LinearChip tracking={goal.linear} fresh={fresh} />
+          <Chip label={`Rev ${goal.revision}`} accessibilityLabel={`Revision ${goal.revision}`} />
+        </View>
+        {goal.linear?.reason ? <Text style={t.warning}>{goal.linear.reason}</Text> : null}
+      </View>
+      {goal.reason ? <Card attention><Text style={t.warning}>{goal.reason}</Text></Card> : null}
 
       {goal.activeTeamId ? <Section title="Active cycle">
-        <View style={[t.card, decisions.length ? t.attention : null]}>
-          <Text style={t.strong}>{activeTeam?.title ?? "Team cycle"}</Text>
-          {activeTeam ? <RunPill label={TEAM_LABELS[activeTeam.status]} tone={teamTone(activeTeam.status)} /> : null}
+        <Card attention={decisions.length > 0}>
+          <View style={s.metaRow}>
+            {activeTeam ? <StatusIcon kind={teamKind(activeTeam).kind} fraction={teamKind(activeTeam).fraction} size={16} /> : null}
+            <Text style={[t.strong, s.fill]}>{activeTeam?.title ?? "Team cycle"}</Text>
+          </View>
+          {activeTeam ? <Text style={t.note}>{TEAM_LABELS[activeTeam.status]}</Text> : null}
           {!active.online ? <Text style={t.note}>Team details may be out of date. Open the team for its current state.</Text> : null}
           {decisions.length ? <>
             <Text style={t.warning}>{decisions.length === 1 ? "1 decision needs" : `${decisions.length} decisions need`} your input.</Text>
             {decisions.map(decision => <Text key={decision.id} style={t.body} numberOfLines={3}>{decision.question}</Text>)}
           </> : null}
-          <Button title={decisions.length ? "Answer in the team" : "Open team"} secondary={!decisions.length} onPress={() => openTeam(goal.activeTeamId!)} />
-        </View>
+          <Button compact title={decisions.length ? "Answer in the team" : "Open team"} secondary={!decisions.length} onPress={() => openTeam(goal.activeTeamId!)} />
+        </Card>
       </Section> : null}
 
       <Section title="Desired outcome">
@@ -88,11 +99,8 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
       </Section>
 
       <Section title="Work limits">
-        <Text style={t.body}>Cycles started {goal.cycles.length} / {goal.maxRuns}</Text>
-        <Text style={t.body}>Agent members {goal.memberCount} / {goal.maxMembers}</Text>
-        <Text style={t.body}>Up to {goal.parallelism} parallel {goal.parallelism === 1 ? "worker" : "workers"}</Text>
-        <Text style={t.body}>Deadline {shortDate(goal.deadlineAt)}</Text>
-        <Text style={t.note}>{goal.maxMinutes} minutes from creation. Pausing does not extend it.</Text>
+        <Text style={t.body}>{goal.cycles.length}/{goal.maxRuns} cycles · {goal.memberCount}/{goal.maxMembers} agents · up to {goal.parallelism} parallel</Text>
+        <Text style={t.note}>Deadline {shortDate(goal.deadlineAt)}: {goal.maxMinutes} minutes from creation. Pausing does not extend it.</Text>
       </Section>
 
       <Section title="Previous cycles" count={previous.length}>
@@ -102,7 +110,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
           <Text style={t.note}>Goal revision {cycle.goalRevision} · {cycle.memberCount} members · {shortDate(cycle.startedAt)}</Text>
           {cycle.reason ? <Clamp text={cycle.reason} lines={3} /> : null}
           {cycle.branch ? <Text selectable style={t.mono}>{cycle.branch}</Text> : null}
-          <Button title="Review team" secondary onPress={() => openTeam(cycle.teamId)} />
+          <Button compact title="Review team" secondary onPress={() => openTeam(cycle.teamId)} />
         </View>) : <Text style={t.note}>No earlier cycles recorded.</Text>}
       </Section>
 
@@ -136,14 +144,6 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
         {[...goal.events].reverse().map((event, index) => <Text key={`${event.at}/${index}`} style={t.note}>{shortDate(event.at)} · {event.text}</Text>)}
       </Disclosure> : null}
 
-      {me?.role === "owner" && !["cancelled", "achieved"].includes(goal.status) ? <View style={s.actions}>
-        {goal.status === "paused" && !expired ? <Button title="Resume goal" secondary disabled={!controls.resume || locked} onPress={() => send("resume", "Resume")} />
-          : ["running", "needs-input"].includes(goal.status) ? <Button title="Pause goal" secondary disabled={!controls.pause || locked} onPress={() => send("pause", "Pause")} /> : null}
-        <Button title="Cancel goal…" secondary disabled={!controls.cancel || locked} onPress={() => Alert.alert("Cancel this goal?", "Active work will stop. Its recorded cycles remain available.", [
-          { text: "Keep goal", style: "cancel" },
-          { text: "Cancel goal", style: "destructive", onPress: () => send("cancel", "Cancellation") },
-        ])} />
-      </View> : null}
     </ScrollView>
     <View style={s.dock}>
       <RequestStatus request={request} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|outcome)$/.test(request.pending?.path ?? ""))} subject="goal" />
@@ -154,6 +154,15 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
             : !["running", "needs-input"].includes(goal.status) ? goal.status === "achieved" ? "The achieved outcome was recorded by a person." : "This goal will start no further cycles. Start a new goal to approve further changes." : undefined}
         onSend={() => { const text = direction.trim(); if (text) send("steer", "Direction", { text }); }} />
     </View>
+    <Sheet visible={actions} onClose={() => setActions(false)} title="Goal">
+      {goal.status === "paused" && !expired ? <SheetRow glyph="play" label="Resume goal" disabled={!controls.resume || locked} onPress={() => { setActions(false); send("resume", "Resume"); }} />
+        : ["running", "needs-input"].includes(goal.status) ? <SheetRow glyph="pause" label="Pause goal" disabled={!controls.pause || locked} onPress={() => { setActions(false); send("pause", "Pause"); }} /> : null}
+      <SheetRow glyph="close" destructive label="Cancel goal…" detail="Stops active work; keeps recorded cycles" disabled={!controls.cancel || locked}
+        onPress={() => Alert.alert("Cancel this goal?", "Active work will stop. Its recorded cycles remain available.", [
+          { text: "Keep goal", style: "cancel" },
+          { text: "Cancel goal", style: "destructive", onPress: () => { setActions(false); send("cancel", "Cancellation"); } },
+        ])} />
+    </Sheet>
   </KeyboardAvoidingView>;
 }
 
@@ -169,19 +178,16 @@ function OutcomeForm({ disabled, onSubmit }: { disabled: boolean; onSubmit: (val
     <Text style={t.label}>Evidence for your assessment</Text>
     <TextInput accessibilityLabel="Evidence for your assessment" value={evidence} onChangeText={setEvidence} editable={!disabled} multiline maxLength={8000}
       placeholder="Measured results, review notes, or links supporting your conclusion…" placeholderTextColor={theme.colors.placeholder} style={[t.input, t.multiline]} />
-    <Button title="Record assessment" disabled={disabled || !summary.trim() || !evidence.trim()} onPress={() => onSubmit({ result, summary: summary.trim(), evidence: evidence.trim() })} />
+    <Button compact title="Record assessment" disabled={disabled || !summary.trim() || !evidence.trim()} onPress={() => onSubmit({ result, summary: summary.trim(), evidence: evidence.trim() })} />
   </Disclosure>;
 }
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
-  header: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: theme.space.compact, paddingHorizontal: theme.space.inset, paddingVertical: theme.space.label },
-  offline: { color: theme.colors.warningInk },
-  empty: { padding: 30, gap: 15 },
-  titleBlock: { paddingHorizontal: theme.space.section, paddingBottom: theme.space.label, gap: 6 },
-  metaRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: theme.space.compact },
-  body: { padding: theme.space.section, paddingTop: 10, gap: 10, paddingBottom: 40 },
-  record: { gap: 4, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: theme.colors.rule },
-  actions: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: theme.space.section },
-  dock: { gap: 8, paddingHorizontal: theme.space.inset, paddingVertical: theme.space.label, borderTopWidth: 1, borderTopColor: theme.colors.rule, backgroundColor: theme.colors.paper },
+  empty: { padding: 30, gap: 15, alignItems: "center" },
+  titleBlock: { paddingBottom: 4, gap: 8 },
+  metaRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
+  body: { paddingHorizontal: 16, paddingTop: 2, gap: 10, paddingBottom: 24 },
+  record: { gap: 4, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },
+  dock: { gap: 6, paddingHorizontal: 12, paddingTop: 6, paddingBottom: 10 },
 });

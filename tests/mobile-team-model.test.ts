@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { goalControls, newer, openDecisions, teamControls, type ProductGoal, type TeamView } from "../apps/mobile/src/features/teams/model.ts";
+import { goalControls, goalGroup, groupRuns, newer, openDecisions, taskKind, teamControls, teamGroup, teamKind, type ProductGoal, type TeamTask, type TeamView } from "../apps/mobile/src/features/teams/model.ts";
+import { age, initials } from "../apps/mobile/src/status.ts";
 import { runRequests } from "../apps/mobile/src/store/requests.ts";
 
 const team = (overrides: Partial<TeamView> = {}) => ({
@@ -83,4 +84,47 @@ test("an unconfirmed run request stays pending for an identical retry until the 
   runRequests.fail(key, "third", "This team is not running and cannot be paused.", true);
   assert.equal(runRequests.read(key).pending, undefined);
   runRequests.clearMachine("machine");
+});
+
+const task = (id: string, status: TeamTask["status"], dependsOn: string[] = []) => ({ id, title: id, instructions: "", paths: [], dependsOn, status }) as TeamTask;
+const question = { id: "q", memberId: "m", revision: 2, question: "Which?", options: [], createdAt: "2026-01-01T00:00:00.000Z" };
+
+test("phone run lists put work waiting on a person first and fold stopped runs together", () => {
+  assert.equal(teamGroup(team({ status: "needs-input" })), "attention");
+  assert.equal(teamGroup(team({ status: "blocked" })), "attention");
+  // An open question pulls a working run into Needs you; a cancelled run's questions can no longer be answered.
+  assert.equal(teamGroup(team({ decisions: [question] })), "attention");
+  assert.equal(teamGroup(team({ status: "cancelled", decisions: [question] })), "closed");
+  assert.equal(teamGroup(team({ status: "no-change" })), "closed");
+  assert.equal(teamGroup(team({ status: "merged" })), "review");
+  assert.equal(teamGroup(team({ status: "paused" })), "active");
+  assert.equal(goalGroup(goal({ status: "limit-reached" })), "attention");
+  assert.equal(goalGroup(goal({ status: "achieved" })), "closed");
+  const runs = [team({ id: "a", status: "cancelled" }), team({ id: "b" }), team({ id: "c", status: "needs-input" }), team({ id: "d" })];
+  assert.deepEqual(groupRuns(runs, teamGroup).map(group => [group.group, group.items.map(item => item.id)]), [["attention", ["c"]], ["active", ["b", "d"]], ["closed", ["a"]]]);
+});
+
+test("phone status icons show plan progress without reading a full ring as completion", () => {
+  assert.deepEqual(teamKind(team({ tasks: [task("t1", "integrated"), task("t2", "integrated"), task("t3", "running"), task("t4", "pending")] })), { kind: "progress", fraction: 0.5 });
+  // Planning has no tasks yet, but started work still shows a quarter.
+  assert.deepEqual(teamKind(team({ status: "planning" })), { kind: "progress", fraction: 0.25 });
+  assert.equal(teamKind(team({ status: "ready-for-review" })).kind, "review");
+  assert.equal(teamKind(team({ status: "paused", decisions: [question] })).kind, "paused");
+  assert.equal(teamKind(team({ decisions: [question] })).kind, "attention");
+  const tasks = [task("t1", "integrated"), task("t2", "pending", ["t1"]), task("t3", "pending", ["t2"]), task("t4", "waiting")];
+  assert.deepEqual(tasks.map(item => taskKind(item, tasks)), ["done", "todo", "backlog", "paused"]);
+});
+
+test("phone avatars and ages stay short and stable", () => {
+  assert.equal(initials("Opus 5.5 xhigh"), "O5");
+  assert.equal(initials("DeepSeek V4.1 Flash high"), "DS");
+  assert.equal(initials("Muse Spark 1.3 Contributor"), "MS");
+  assert.equal(initials("Codex"), "Co");
+  assert.equal(initials("  "), "?");
+  const now = Date.parse("2026-01-01T12:00:00.000Z");
+  assert.equal(age("2026-01-01T11:59:30.000Z", now), "now");
+  assert.equal(age("2026-01-01T11:15:00.000Z", now), "45m");
+  assert.equal(age("2026-01-01T09:00:00.000Z", now), "3h");
+  assert.equal(age("2025-12-30T12:00:00.000Z", now), "2d");
+  assert.equal(age("not a date", now), "");
 });

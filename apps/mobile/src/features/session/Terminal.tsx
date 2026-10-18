@@ -19,6 +19,7 @@ import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { Composer } from "../../components/Composer";
 import { ControlBar } from "../../components/ControlBar";
+import { LiveStatus, TopBar } from "../../components/Glass";
 import { OfflineBanner } from "../../components/OfflineBanner";
 import { theme } from "../../theme";
 import { useControlSync, useSessionControl } from "./useSessionControl";
@@ -76,12 +77,7 @@ export function Terminal({
   return (
     // Android runs edge-to-edge, so the window no longer resizes for the keyboard.
     <KeyboardAvoidingView style={s.fill} behavior="padding">
-      <View style={s.header}>
-        <Button title={backLabel} secondary onPress={back} />
-        <Text style={[s.small, !online && s.offlineText]}>
-          {online ? "Up to date" : "Reconnecting"}
-        </Text>
-      </View>
+      <TopBar backLabel={backLabel} onBack={back} title="Terminal" right={<LiveStatus online={online} seen={seen} />} />
       {!session ? (
         <View style={s.empty}>
           <ActivityIndicator />
@@ -125,7 +121,6 @@ export function Terminal({
               control.forget(true);
               refresh();
             }}
-            onRefresh={refresh}
           />
           <ScrollView style={s.fill} contentContainerStyle={s.scrollBody}>
             <Text style={s.label}>Current screen</Text>
@@ -155,6 +150,7 @@ export function Terminal({
               {KEYS.map((key) => (
                 <Button
                   key={key}
+                  compact
                   title={key[0].toUpperCase() + key.slice(1)}
                   onPress={() => steering.sendKey(key)}
                   secondary
@@ -171,15 +167,7 @@ export function Terminal({
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
-  header: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    paddingHorizontal: theme.space.inset,
-    paddingVertical: theme.space.label,
-  },
   small: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk },
-  offlineText: { color: theme.colors.warningInk },
   empty: { padding: 30, gap: 15 },
   body: {
     fontSize: 15,
@@ -187,15 +175,16 @@ const s = StyleSheet.create({
     color: theme.colors.mutedInk,
     marginBottom: 20,
   },
-  titleBlock: { paddingHorizontal: theme.space.section, paddingVertical: 16 },
+  titleBlock: { paddingHorizontal: 16, paddingBottom: 10, gap: 2 },
   title: {
-    fontSize: 30,
-    fontWeight: "500",
+    fontSize: 20,
+    lineHeight: 25,
+    fontWeight: "600",
     color: theme.colors.ink,
-    letterSpacing: -0.8,
-    marginVertical: 10,
+    letterSpacing: -0.3,
+    marginBottom: 4,
   },
-  scrollBody: { padding: theme.space.section, paddingTop: 10 },
+  scrollBody: { paddingHorizontal: 16, paddingTop: 4 },
   label: {
     fontSize: 14,
     fontWeight: "600",

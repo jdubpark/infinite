@@ -525,7 +525,7 @@ configured provider policy; retries do not grant permission.
 Each new run gets a folder named from its UTC creation date, a slug of its
 title, and the first eight characters of its ID, such as
 `2026-01-15-add-export-3f2a9c1d/`, holding the `integration/` checkout and the
-`members/` copies. Its branch is `infinite/<slug>-<id8>`. The run ID remains its
+`members/` copies. Its branch is `infinite/team-<slug>-<id8>`. The run ID remains its
 identity in the API, receipts, and Linear. Runs go under
 `teams.workspaceDir/<project-id>-<YYYY-MM-DD>-<slug>-<id8>/` unless the project has a teamwork folder, in which case it is `<teamworkDir>/<YYYY-MM-DD>-<slug>-<id8>/`.
 
@@ -590,6 +590,14 @@ root-owned, constrained launcher can run commands under that account. The prefix
 is an executable/argument array like the other commands. Do not run
 agent-controlled repository scripts or Git filters as the privileged API
 account. A sudo provider profile without a command prefix is refused.
+
+A constrained launcher must allow what the host runs through the prefix:
+Git clones, checkouts and integration inside each run directory under the team
+workspace root and every enrolled teamwork folder, branches named
+`infinite/team-*`, and, for `infinite team pull`, `git rev-parse --verify
+refs/heads/<branch>` and `git bundle create - refs/heads/<branch>` in a run's
+`integration/` checkout. Enrollment also runs `git rev-parse` and `git status`
+in the project source.
 
 The Ubuntu launcher must preserve `INFINITE_HOOK_URL`, `INFINITE_HOOK_TOKEN` and
 `INFINITE_TEAM_ASSIGNMENT`; the supplied sudoers template includes them. These

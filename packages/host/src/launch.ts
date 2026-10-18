@@ -111,6 +111,8 @@ export function buildLaunch(
         args.push("-c", `mcp_servers.infinite_handoff.${key}=${JSON.stringify(value)}`);
     }
   }
+  if (team && provider === "claude" && !args.some((arg) => arg === "--permission-mode" || arg.startsWith("--permission-mode=")))
+    args.push("--permission-mode", "auto");
   if (team && provider === "claude") {
     if (!hooks) throw new Error("Claude team reporting requires its authenticated report channel");
     const development = relayPath.endsWith(".ts");

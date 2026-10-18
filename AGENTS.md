@@ -49,7 +49,7 @@ If you find existing private information while working, remove or replace it and
 - Run `npm run check` (typecheck, tests, builds) before declaring host or shared-package work complete.
 - For the phone app, also run `npm run lint -w @infinite/mobile` and `npx tsc --noEmit` in `apps/mobile`.
 - Product, design, and protocol context: `PRODUCT.md`, `DESIGN.md`, `docs/architecture.md`, `docs/security.md`.
-- Do not weaken the honesty rules in `PRODUCT.md`: the host never infers task completion and never approves a provider permission on its own.
+- Do not weaken the honesty rules in `PRODUCT.md`: the host never infers task completion. It approves a provider permission on its own only for a team member in its assigned workspace, as `docs/teams.md` describes.
 
 ## Repository summaries and architecture review
 

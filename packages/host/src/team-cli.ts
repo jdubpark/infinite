@@ -11,6 +11,7 @@ import { createTeamSchema, teamDeliverySchema, type TeamDelivery } from "./team-
 import { captureWorkspace, readWorkspaceBlob } from "./workspace-checkpoint.js";
 import { localProjectPath } from "./mirrored-projects.js";
 import { readSyncState, syncServiceRunning } from "./sync-service.js";
+import { canAskForBrief, chooseTeamBrief, orderedTeamMembers, summaryMember, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, wrapText, type TeamBriefStatus, type TeamWatchCommand } from "./team-watch.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
 type Api = {
@@ -283,6 +284,99 @@ function inferredProjectConfig(root: string, options: Options, allowUnconfigured
   if (setup.length > 1) throw new Error("--setup-json contains one setup command at most.");
   return projectConfigSchema.parse({ ...(setup[0] ? { setup: setup[0] } : {}), checks, ...(!checks.length ? { establishChecks: true } : {}) });
 }
+type BriefRow = { sessionId: string; status: TeamBriefStatus };
+
+function eventLine(event: { type?: string; data?: Record<string, unknown> }) {
+  const data = event.data ?? {};
+  const label = event.type === "signal" ? String(data.kind ?? "Signal")
+    : event.type === "input-result" ? (data.state === "delivered" ? "Input delivered" : "Input")
+    : event.type === "lifecycle" ? String(data.status ?? "Session updated")
+    : String(event.type ?? "Event");
+  const detail = data.message ?? data.text ?? data.error;
+  return typeof detail === "string" && detail.trim() ? `${label}: ${detail}` : label;
+}
+
+async function teamBriefRows(api: Api, team: any, signal: AbortSignal): Promise<BriefRow[]> {
+  const ordered = orderedTeamMembers(team).filter(member => member?.sessionId);
+  const current = ordered.filter(member => member?.revision === team?.revision);
+  const targets = (current.length ? current : ordered).slice(0, 6);
+  return Promise.all(targets.map(async member => {
+    const sessionId = String(member.sessionId);
+    try {
+      return { sessionId, status: await api.json<TeamBriefStatus>(`/sessions/${sessionId}/summary?status=1`, undefined, signal) };
+    } catch (error) {
+      if (signal.aborted) throw error;
+      return { sessionId, status: { state: "unknown", error: clean((error as Error).message) } };
+    }
+  }));
+}
+
+async function memberLog(api: Api, member: any, signal: AbortSignal) {
+  const sessionId = String(member.sessionId);
+  const detail = await api.json<{ screen?: string; seq?: number }>(`/sessions/${sessionId}`, undefined, signal);
+  const after = Math.max(0, Number(detail?.seq ?? 0) - 80);
+  const page = await api.json<{ events?: { at?: string; type?: string; data?: Record<string, unknown> }[] }>(
+    `/sessions/${sessionId}/events?after=${after}&types=lifecycle,signal,input-result&limit=80`,
+    undefined,
+    signal,
+  );
+  return { screen: detail?.screen, events: (page.events ?? []).map(event => ({ at: event.at, text: eventLine(event) })) };
+}
+
+function shiftMember(members: any[], memberId: string, direction: 1 | -1) {
+  const index = members.findIndex(member => member?.memberId === memberId);
+  if (index < 0) return String(members[0]?.memberId ?? "");
+  return String(members[(index + direction + members.length) % members.length]?.memberId ?? "");
+}
+
+function preferredMember(team: any, memberId: string, followRunning: boolean) {
+  const ordered = orderedTeamMembers(team).filter(member => member?.sessionId);
+  const current = ordered.filter(member => member?.revision === team?.revision);
+  const pool = current.length ? current : ordered;
+  if (!followRunning && memberId) {
+    const selected = ordered.find(member => member?.memberId === memberId);
+    if (selected) return selected;
+  }
+  return pool.find(member => member?.status === "running" || member?.status === "waiting") ?? pool[0];
+}
+
+async function printTeamLogs(api: Api, team: any, signal: AbortSignal) {
+  const current = orderedTeamMembers(team).filter(member => member?.revision === team?.revision && member?.sessionId);
+  const shown = current.slice(0, 8);
+  if (!shown.length) {
+    console.log(`${clean(team?.id)} · review logs\n\nNo agents are in this revision.\n`);
+    return;
+  }
+  const recorded = await Promise.all(shown.map(async member => {
+    try { return { member, ...(await memberLog(api, member, signal)) }; }
+    catch (error) {
+      if (signal.aborted) throw error;
+      return { member, screen: `Log unavailable: ${clean((error as Error).message)}`, events: [] as { at?: string; text?: string }[] };
+    }
+  }));
+  for (const item of recorded) console.log(`${teamLogsText(team, shown, item.member, item.screen, item.events)}\n`);
+  if (current.length > shown.length) console.log(`+ ${current.length - shown.length} more agents. Follow one with infinite team watch ${clean(team?.id)} --logs\n`);
+}
+
+async function askForBrief(api: Api, team: any, rows: BriefRow[], signal: AbortSignal, show: (text: string) => void, checkedAt: string): Promise<BriefRow[]> {
+  const chosen = chooseTeamBrief(rows, summaryMember(team)?.sessionId);
+  if (!chosen || !canAskForBrief(team, rows)) return rows;
+  const card = teamSummaryText(team, rows, checkedAt, true, Date.now()).split("\n");
+  const footer = card.pop() ?? "";
+  show([...card, "", "Asking Jevcode for a summary. This can take a few minutes.", "", footer].join("\n"));
+  try {
+    // json() caps every call at 15 seconds. A repository brief can take longer, so this uses request().
+    const response = await api.request(`/sessions/${chosen.sessionId}/summary?after=0`, undefined, AbortSignal.any([signal, AbortSignal.timeout(180000)]));
+    const summary = await response.json() as TeamBriefStatus["summary"];
+    const ready = Boolean(summary?.repository?.brief?.summary || summary?.text);
+    const next: BriefRow = { sessionId: chosen.sessionId, status: { state: ready ? "ready" : "empty", summary, ...(ready ? {} : { error: "No recorded chat is available for a repository brief." }) } };
+    return [...rows.filter(row => row.sessionId !== chosen.sessionId), next];
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return [...rows.filter(row => row.sessionId !== chosen.sessionId), { sessionId: chosen.sessionId, status: { state: "failed", error: clean((error as Error).message) } }];
+  }
+}
+
 function outputTeam(team: any, json: boolean) {
   if (json) { console.log(JSON.stringify(team, null, 2)); return; }
   console.log(`${clean(team.id)}  ${clean(team.status)}  ${clean(team.title)}`);
@@ -592,20 +686,137 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     outputTeam(team, Boolean(options["--json"])); return true;
   }
   if (subcommand === "status" || subcommand === "watch") {
-    if (subcommand === "watch" && !id) throw new Error("Usage: infinite team watch ID");
-    if (id && rest.length) throw new Error(`Usage: infinite team ${subcommand} [ID]`);
+    if (subcommand === "watch" && !id) throw new Error("Usage: infinite team watch ID [--logs]");
+    if (options["--logs"] && !id) throw new Error("Usage: infinite team status ID --logs");
+    if (id && rest.length) throw new Error(`Usage: infinite team ${subcommand} ${subcommand === "watch" ? "ID" : "[ID]"} [--logs]`);
     const abort = new AbortController(), stop = () => abort.abort();
+    const json = Boolean(options["--json"]);
+    const logs = Boolean(options["--logs"]);
+    const tty = subcommand === "watch" && Boolean(process.stdout.isTTY) && !json;
+    const interactive = tty && Boolean(process.stdin.isTTY && process.stdin.setRawMode);
+    let mode: "summary" | "logs" = logs ? "logs" : "summary";
+    let memberId = "";
+    let previous: string | null = null;
+    let pending: ReturnType<typeof teamWatchCommand> = null;
+    let wake = new AbortController();
+    // A full-screen watch keeps the last card so scrolling and resizing repaint without a request.
+    let card = "";
+    let notice = "";
+    let view = "";
+    let offset = 0;
+    let page = 1;
+    const paint = () => {
+      if (!card) return;
+      const screen = teamWatchScreen(notice ? `${notice}\n\n${card}` : card, { rows: process.stdout.rows || 24, columns: process.stdout.columns || 80, offset, color: !process.env.NO_COLOR });
+      offset = screen.offset;
+      page = screen.page;
+      process.stdout.write(screen.frame);
+    };
+    const scrolls: Partial<Record<TeamWatchCommand, () => number>> = {
+      up: () => offset - 1, down: () => offset + 1, pageUp: () => offset - page, pageDown: () => offset + page,
+      top: () => 0, bottom: () => Number.MAX_SAFE_INTEGER,
+    };
+    const onData = (data: string | Buffer) => {
+      const command = teamWatchCommand(String(data));
+      if (command === "detach") { stop(); return; }
+      if (!command) return;
+      const scroll = scrolls[command];
+      if (scroll) { offset = scroll(); paint(); return; }
+      pending = command;
+      wake.abort();
+    };
+    const clock = () => tty ? new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+    const show = (text: string) => {
+      if (subcommand !== "watch") console.log(`${process.stdout.isTTY ? wrapText(text, process.stdout.columns || 80).join("\n") : text}\n`);
+      else if (!tty) {
+        const frame = teamWatchFrame(previous, text, false);
+        if (frame) process.stdout.write(frame);
+        previous = text;
+      } else {
+        // Switching view or agent starts at the top; a refresh of the same view keeps the reader's place.
+        const key = `${mode}/${mode === "logs" ? memberId : ""}`;
+        if (key !== view) { view = key; offset = 0; }
+        card = text;
+        notice = "";
+        paint();
+      }
+    };
     process.once("SIGINT", stop);
+    if (tty) {
+      process.stdout.write("\x1b[?1049h\x1b[?25l");
+      process.stdout.on("resize", paint);
+    }
+    if (interactive) {
+      process.stdin.setRawMode(true);
+      process.stdin.setEncoding("utf8");
+      process.stdin.resume();
+      process.stdin.on("data", onData);
+    }
     try {
       do {
-        const teams = id ? [await api.json<any>(`/teams/${id}`, undefined, abort.signal)] : (await api.json<{ teams: any[] }>("/teams", undefined, abort.signal)).teams;
-        if (options["--json"]) console.log(JSON.stringify(id ? teams[0] : teams, null, subcommand === "watch" ? undefined : 2));
-        else for (const team of teams) outputTeam(team, false);
+        try {
+          const teams = id ? [await api.json<any>(`/teams/${id}`, undefined, abort.signal)] : (await api.json<{ teams: any[] }>("/teams", undefined, abort.signal)).teams;
+          if (json) {
+            const text = JSON.stringify(id ? teams[0] : teams, null, subcommand === "watch" ? undefined : 2);
+            if (subcommand !== "watch" || text !== previous) console.log(text);
+            previous = text;
+          } else if (!id) {
+            for (const team of teams) console.log(`${teamMonitorText(team)}\n`);
+            if (teams.length) console.log("Open one team for the Jevcode summary: infinite team status ID\n");
+          } else {
+            const team = teams[0];
+            const action = pending;
+            pending = null;
+            if (action === "logs") mode = "logs";
+            else if (action === "summary") mode = "summary";
+            else if (action === "next" || action === "prev") {
+              mode = "logs";
+              const ordered = orderedTeamMembers(team).filter(member => member?.sessionId);
+              const known = ordered.some(member => member?.memberId === memberId);
+              memberId = known ? shiftMember(ordered, memberId, action === "next" ? 1 : -1) : String(ordered[0]?.memberId ?? "");
+            }
+            if (subcommand === "status" && logs) await printTeamLogs(api, team, abort.signal);
+            else if (mode === "logs") {
+              const member = preferredMember(team, memberId, !interactive);
+              if (member?.memberId) memberId = String(member.memberId);
+              if (!member) show(`${clean(team?.id)} · review logs\n\nNo agent session is available.\n\n${interactive ? "s summary · q quit" : "Summary: infinite team status " + clean(team?.id)}`);
+              else {
+                const recorded = await memberLog(api, member, abort.signal);
+                show(teamLogsText(team, orderedTeamMembers(team).filter(item => item?.sessionId), member, recorded.screen, recorded.events, clock(), interactive));
+              }
+            } else {
+              let rows = await teamBriefRows(api, team, abort.signal);
+              if (action === "ask" && interactive) rows = await askForBrief(api, team, rows, abort.signal, show, clock());
+              show(teamSummaryText(team, rows, clock(), interactive, interactive ? Date.now() : undefined));
+            }
+          }
+        } catch (error) {
+          if (abort.signal.aborted || subcommand !== "watch") throw error;
+          const failure = `Update failed: ${clean((error as Error).message)}`;
+          if (tty && card) { notice = `${failure}. Showing the last received card.`; paint(); }
+          else show(`${failure}\n\n${interactive ? "q quit" : "Ctrl+C detaches"}`);
+        }
         if (subcommand !== "watch") break;
-        await delay(2000, undefined, { signal: abort.signal });
+        if (wake.signal.aborted) wake = new AbortController();
+        else {
+          try { await delay(2000, undefined, { signal: AbortSignal.any([abort.signal, wake.signal]) }); }
+          catch { if (abort.signal.aborted) break; }
+          if (wake.signal.aborted) wake = new AbortController();
+        }
       } while (!abort.signal.aborted);
     } catch (error) { if (!abort.signal.aborted) throw error; }
-    finally { process.off("SIGINT", stop); }
+    finally {
+      if (interactive) {
+        process.stdin.off("data", onData);
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+      }
+      if (tty) {
+        process.stdout.off("resize", paint);
+        process.stdout.write("\x1b[?25h\x1b[?1049l");
+      }
+      process.off("SIGINT", stop);
+    }
     return true;
   }
   if (subcommand === "pull") {

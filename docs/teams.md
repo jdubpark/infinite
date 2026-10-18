@@ -16,6 +16,17 @@ and request rules as the web client, and records goal outcomes. It opens member
 sessions, and a member session links back to its team. The Mac app shows Teams
 only.
 
+A team opens on the same layout in the web client, the phone app, and
+`infinite team watch`. Open decisions come first. The Jevcode summary follows,
+in the briefing order: the outcome, system shape, ranked **Review first** items
+with their priority and question, what changed, check evidence, guidance for
+agents, and gaps. System shape and guidance start collapsed on the web and
+phone. **Review logs** shows one agent's terminal screen and recent control
+events. Each agent has a control, Previous and Next step through them, and
+**Back to summary** returns. On the web and phone, the plan, members,
+verification, and run history sit under **Run details**. The summary is the
+briefing agent's reading of recorded activity. It is not completion or approval.
+
 A Team marked **ready for your review** has explicit reports for its current revision,
 passing configured checks, and an approving reviewer report. It does not
 establish product impact or human acceptance. The host does not push, open pull
@@ -33,17 +44,47 @@ infinite repo init
 infinite team start "Implement the checkout retry behavior described in the issue"
 infinite team start --prd docs/checkout-prd.md
 infinite team status
+infinite team status TEAM_ID
+infinite team status TEAM_ID --logs
 infinite team watch TEAM_ID
 infinite team steer TEAM_ID "Keep the existing checkout layout"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing retry policy"
 ```
+
+`infinite team status` without an ID lists each team's members, tasks, and open
+questions. `infinite team status TEAM_ID` prints that team's decisions and
+Jevcode summary, wrapped to the terminal width. Each open decision shows the
+`infinite team answer` command that answers it.
+
+`infinite team watch TEAM_ID` keeps that summary full screen and refreshes it
+every two seconds. The bottom line lists the keys for the current view:
+
+| Key | Action |
+| --- | --- |
+| `l` | Open the review log |
+| `s` or `b` | Return to the summary |
+| `←` `→`, or `n` `p` | Next or previous agent |
+| `↑` `↓`, or `j` `k` | Scroll one line |
+| Space, Page Up, Page Down | Scroll one page |
+| `g` `G`, Home, End | Jump to the top or bottom |
+| `a` | Ask Jevcode for a summary when it is empty or failed |
+| `q` or Ctrl+C | Detach |
+
+A refresh keeps your scroll position; switching view or agent starts at the
+top. A failed refresh keeps the last card on screen under a notice. A
+non-interactive watch prints again only when the visible text changes.
+`--logs` starts in the review log. `infinite team status TEAM_ID --logs` prints
+the current revision's review logs once. `--json` still prints the team record.
+Set `NO_COLOR` to drop bold headings and the highlighted key bar.
 
 Repository setup records a private binding between the local Git root and the
 selected host project. A new remote source receives a committed Git snapshot;
 ignored files and uncommitted changes are not included. Existing cloud sources
 are not replaced by enrollment. Setup and verification commands belong to that
 repository, while the coordinator, workers, and reviewer come from the host's
-configured lineup. Provider permissions remain under the owner's control.
+configured lineup. Ordinary tool prompts in a member's assigned workspace are
+approved by the host. Dangerous tool prompts are decided by the coordinator
+model. The owner does not type those answers.
 
 A new empty repository can enroll immediately after `git init`. Its cloud source
 gets an empty baseline commit; local Git history and files stay unchanged. When
@@ -513,12 +554,28 @@ Ubuntu template. Before it, supported options are `-n`, `-H`, `-u USER`, and
 `-g GROUP` (or their separate-argument long forms). Other wrapper forms are
 refused so provider flags cannot become prompt text.
 
-The scheduler never approves a provider permission or sends forced terminal
-input. Interactive providers can show permission or trust dialogs in the member
-session. Headless OpenCode `run` rejects unmet permission requests; this adapter
-does not offer an interactive approval flow. A denied reporting tool or required
-tool can stop the member without an accepted report. Inspect the failure and the
-configured provider policy; retries do not grant permission.
+A Claude team member trusts only its assigned workspace. Before launch, the host
+sets that directory's `hasTrustDialogAccepted` flag in the agent account's
+Claude config. If the trust dialog still appears and names that same directory,
+the member process selects "Yes, I trust this folder". A dialog for any other
+path is left unanswered.
+
+Claude team launches use `--permission-mode auto` unless the provider profile
+already sets `--permission-mode`. That mode approves ordinary edits and commands.
+It does not add `--dangerously-skip-permissions`. When a permission dialog still
+appears, the member process accepts a non-destructive "Yes". Destructive
+commands, `sudo`, `git push`, publication, credential paths, and permission
+bypasses are sent to a separate print-mode coordinator process. The coordinator
+replies allow or deny, and the host presses that option. Two failed reviews
+stop retrying, and the run then reports that the provider still needs input.
+A person holding the input lease is not overridden. The member retries an
+ordinary accept twice. Product questions reported by a member still wait for
+`infinite team answer`.
+
+Headless OpenCode `run` rejects unmet permission requests; this adapter does
+not offer an interactive approval flow for that provider. A denied reporting
+tool or required tool can stop the member without an accepted report. Inspect
+the failure and the configured provider policy; retries do not grant permission.
 
 ## Configuration
 
@@ -609,7 +666,12 @@ For a standalone team, steering records a new requirements revision. Earlier
 member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated
 workspace with the new direction. Completed earlier integration remains visible;
 unfinished member copies are preserved. Pause, resume and cancel are owner
-actions. Stopping an agent does not prove that arbitrary detached tool
+actions. A team blocked only because a member reached the one-hour runtime
+limit can resume with `infinite team resume ID`. That starts a fresh plan from
+the preserved integration commit and keeps the stopped member workspace.
+Resume waits until those members have stopped. Any other block, including an
+interrupted workspace or check operation, still requires inspection and a new
+team. Stopping an agent does not prove that arbitrary detached tool
 descendants have stopped, and a current human input lease can prevent the
 scheduler from stopping a member. Such conflicts remain visible.
 

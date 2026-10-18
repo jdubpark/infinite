@@ -262,6 +262,13 @@ export class Manager {
     await workerCall(this.config.runDir, sessionId, { op: "stop", requestId });
     return this.state(sessionId);
   }
+  /** Answer one of this assignment's prompts when nobody holds the input lease. */
+  async answerTeamPrompt(sessionId: string, requestId: string, promptId: number, option: number, team: TeamAssignment): Promise<void> {
+    const stored = this.meta(sessionId).session.team;
+    if (!stored || stored.runId !== team.runId || stored.memberId !== team.memberId || stored.revision !== team.revision)
+      throw new ContentError("This session does not belong to the team assignment", 403);
+    await workerCall(this.config.runDir, sessionId, { op: "answer", requestId, promptId, option });
+  }
   resume(sessionId: string, requestId: string): Promise<Session & WorkerState> {
     const operation = this.serial.then(() => this.resumeOnce(sessionId, requestId));
     this.serial = operation.catch(() => {});

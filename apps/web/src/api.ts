@@ -80,9 +80,10 @@ export async function api<T>(
   body?: unknown,
   method?: string,
   controlId?: string,
+  timeoutMs = 12000,
 ): Promise<T> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`/api${path}`, {
     method: method ?? (body ? "POST" : "GET"),

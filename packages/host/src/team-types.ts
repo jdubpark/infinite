@@ -272,4 +272,4 @@ export interface TeamRun {
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
   round: number;
 }
-export type TeamView = Omit<TeamRun, "members"> & { members: Omit<TeamMember, "prompt" | "feedback" | "pendingLimit">[]; providerLimits: ProviderLimit[] };
+export type TeamView = Omit<TeamRun, "members"> & { members: Omit<TeamMember, "prompt" | "feedback" | "pendingLimit">[]; providerLimits: ProviderLimit[]; resumable: boolean };

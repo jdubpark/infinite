@@ -55,11 +55,11 @@ Selected-root files, content-addressed blobs and materialized checkpoints are pl
 
 A provider-limit observation and a usage total are records of what the host
 saw. Neither carries a credential, and neither is an inference about completion
-or product impact. They never substitute for a member's report. The host acts on
-a limit only by stopping the affected member, and it never answers a provider
-dialog or sends input to clear one. Price tables and budgets stay in private
-host configuration, and only aggregated numbers and limit observations reach
-clients.
+or product impact. They never substitute for a member's report. The host's only
+action toward a limited member is stopping it. It never sends that member input
+or answers a provider dialog, and the relaunch on a fallback is a new member.
+Price tables stay in private host configuration. Budget amounts, aggregated
+totals, and limit observations reach clients.
 
 ## Remote machine transport
 

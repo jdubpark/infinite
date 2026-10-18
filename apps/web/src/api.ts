@@ -54,8 +54,8 @@ export type UsageSummary = {
 /** A host-level record that a provider's account was seen at its limit. The reset time is the provider's own statement. */
 export type ProviderLimit = { provider: string; detectedAt: string; resetsAt?: string; expiresAt: string; sessionId: string; runId?: string; confidence: "corroborated" };
 export type LimitSwitch = { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string };
-/** Clock time as HH:MM in the viewer's time zone. */
-export const clock = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+/** Clock time as HH:MM with a zone abbreviation, in the viewer's time zone. */
+export const clock = (iso: string) => new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit", hour12: false, timeZoneName: "short" }).format(new Date(iso));
 export type Me = {
   role: "owner" | "controller" | "viewer";
   environment: "cloud" | "local";

@@ -47,6 +47,28 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(TeamRun.roleName("auditor"), "Auditor")
     }
 
+    /// Waiting for review is never complete; only a reported merge is, and an unknown state still counts as ongoing.
+    func testHomeBoardGroupsEveryHostState() {
+        let expected: [String: ProjectState] = [
+            "planning": .ongoing, "discovering": .ongoing, "implementing": .ongoing, "integrating": .ongoing, "verifying": .ongoing,
+            "reviewing": .ongoing, "delivering": .ongoing, "some-new-state": .ongoing,
+            "needs-input": .pending, "ready-for-review": .pending, "blocked": .stuck, "paused": .paused,
+            "merged": .complete, "cancelled": .cancelled, "no-change": .aborted,
+        ]
+        for (status, state) in expected { XCTAssertEqual(run(["status": .string(status)]).projectState, state, status) }
+        XCTAssertEqual(run(["decisions": .array([decision("open", revision: 2)])]).projectState, .pending)
+        XCTAssertEqual(run(["status": .string("paused"), "decisions": .array([decision("open", revision: 2)])]).projectState, .paused)
+        XCTAssertEqual(ProjectState.allCases.filter(\.closed), [.complete, .cancelled, .aborted])
+    }
+
+    func testStatusRingNeverDropsBelowThePhase() {
+        let tasks: [JSON] = [["id": "a", "status": "integrated"], ["id": "b", "status": "running"], ["id": "c", "status": "running"], ["id": "d", "status": "pending"]].map { fields in .object(fields.mapValues { .string($0) }) }
+        XCTAssertEqual(run([:]).progressFraction, 0.25)
+        XCTAssertEqual(run(["status": .string("verifying"), "tasks": .array(tasks)]).progressFraction, 0.75)
+        XCTAssertEqual(run(["status": .string("ready-for-review")]).progressFraction, 1)
+        XCTAssertEqual(run(["linear": .object(["issue": .object(["identifier": .string("INF-7")])])]).linearIssue, "INF-7")
+    }
+
     func testFinishedRunsAndLineup() {
         XCTAssertTrue(run(["status": .string("cancelled")]).finished)
         XCTAssertFalse(run(["status": .string("paused")]).finished)

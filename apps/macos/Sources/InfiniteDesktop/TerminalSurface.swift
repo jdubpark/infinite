@@ -161,6 +161,8 @@ struct PromptEditor: NSViewRepresentable {
     @Binding var text: String
     var placeholder = ""
     var enabled: Bool
+    /// Inside a glass container the editor draws no fill of its own.
+    var transparent = false
     var submit: () -> Void
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeNSView(context: Context) -> NSScrollView {
@@ -168,13 +170,13 @@ struct PromptEditor: NSViewRepresentable {
         textView.font = .systemFont(ofSize: 14); textView.isRichText = false
         textView.isAutomaticQuoteSubstitutionEnabled = false; textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false; textView.isAutomaticSpellingCorrectionEnabled = false
-        textView.backgroundColor = NSColor.textBackgroundColor
+        textView.backgroundColor = NSColor.textBackgroundColor; textView.drawsBackground = !transparent
         textView.textContainerInset = NSSize(width: 10, height: 12)
         textView.autoresizingMask = [.width]; textView.isVerticallyResizable = true
         textView.textContainer?.widthTracksTextView = true
         textView.onSubmit = { context.coordinator.parent.submit() }
         let scroll = NSScrollView(); scroll.documentView = textView; scroll.hasVerticalScroller = true
-        scroll.drawsBackground = true; scroll.borderType = .noBorder
+        scroll.drawsBackground = !transparent; scroll.borderType = .noBorder
         return scroll
     }
     func updateNSView(_ scroll: NSScrollView, context: Context) {

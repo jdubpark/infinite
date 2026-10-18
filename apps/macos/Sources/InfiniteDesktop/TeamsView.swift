@@ -2,22 +2,34 @@ import SwiftUI
 import InfiniteCore
 
 func teamColor(_ team: TeamRun) -> Color {
-    team.needsYou || team.status == "blocked" ? .orange : team.working ? .green : team.status == "ready-for-review" ? .blue : .secondary
+    switch team.projectState {
+    case .pending: return team.status == "ready-for-review" ? Palette.review : Palette.attention
+    case .stuck: return Palette.error
+    case .ongoing: return Palette.running
+    case .paused: return Palette.paused
+    case .complete: return Palette.done
+    case .cancelled, .aborted: return .secondary
+    }
 }
 private let teamClock: DateFormatter = { let f = DateFormatter(); f.dateStyle = .short; f.timeStyle = .short; return f }()
 private func teamDate(_ value: String) -> String { ISO8601DateFormatter.flexible.date(from: value).map(teamClock.string(from:)) ?? value }
 
-/// A sidebar row: the run's name and what it is waiting on or how far its plan got.
+/// A sidebar row: the run's status glyph and name; its state in words is in the tooltip and on Home.
 struct TeamRowView: View {
     let team: TeamRun
     var body: some View {
         HStack(spacing: 9) {
-            Circle().fill(teamColor(team)).frame(width: 7, height: 7)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(team.title).lineLimit(1).foregroundStyle(team.finished ? .secondary : .primary)
-                Text(team.summaryLine).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            StatusGlyph(team: team, size: 12)
+            Text(team.title).lineLimit(1).foregroundStyle(team.projectState.closed ? .secondary : .primary)
+            Spacer(minLength: 4)
+            if team.projectState == .pending || team.projectState == .stuck {
+                Text(team.projectState == .stuck ? "Stuck" : team.status == "ready-for-review" ? "Review" : "Needs you")
+                    .font(.caption).foregroundStyle(team.projectState == .stuck ? Palette.error : Palette.attention)
             }
-        }.padding(.vertical, 2)
+        }
+        .padding(.vertical, 1)
+        .help(team.summaryLine)
+        .accessibilityLabel("\(team.title), \(team.summaryLine)")
     }
 }
 
@@ -48,7 +60,7 @@ struct TeamDetailView: View {
             Divider()
             composer.padding(12)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(Palette.background)
         .onAppear { model.startPolling() }
         .onDisappear { model.stopPolling() }
         .alert("Cancel this team run?", isPresented: $confirmCancel) {
@@ -63,7 +75,7 @@ struct TeamDetailView: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            Circle().fill(teamColor(team)).frame(width: 8, height: 8)
+            StatusGlyph(team: team, size: 16)
             VStack(alignment: .leading, spacing: 2) {
                 Text(team.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
                 Text("\(app.projectName(team.projectID)) · \(lead) · Revision \(team.revision) · up to \(team.parallelism) implementer\(team.parallelism == 1 ? "" : "s")")
@@ -71,8 +83,8 @@ struct TeamDetailView: View {
             }
             Spacer(minLength: 8)
             if !model.fresh { Text("Updates unavailable").font(.caption).foregroundStyle(.orange) }
-            Text(team.statusLabel).font(.caption.weight(.medium)).padding(.horizontal, 8).padding(.vertical, 3)
-                .background(teamColor(team).opacity(0.16), in: Capsule())
+            Text(team.statusLabel).font(.caption.weight(.medium)).padding(.horizontal, 9).padding(.vertical, 4)
+                .glassSurface(in: Capsule(), tint: teamColor(team))
             if model.role == "owner" && team.status != "cancelled" {
                 Menu {
                     if !["blocked", "ready-for-review"].contains(team.status) {
@@ -241,8 +253,8 @@ struct TeamDetailView: View {
             else if team.status == "cancelled" { Text("This run is cancelled. Its work and evidence remain available above.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
             else {
                 PromptEditor(text: Binding(get: { model.direction }, set: { model.direction = $0 }), placeholder: "Give the team a direction or change the requirements…",
-                             enabled: model.canSteer, submit: { Task { await model.steer() } })
-                    .frame(height: 64).clipShape(RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.14)))
+                             enabled: model.canSteer, transparent: true, submit: { Task { await model.steer() } })
+                    .frame(height: 64).glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 HStack(spacing: 12) {
                     Text(model.notice.isEmpty ? "A direction records a new revision; the team replans from its integrated work." : model.notice)
                         .font(.system(size: 11)).foregroundStyle(model.noticeIsError ? Color.orange : .secondary).lineLimit(2).textSelection(.enabled)
@@ -386,9 +398,9 @@ struct TeamCreateView: View {
     @State private var busy = false
     @State private var error = ""
     @State private var clearPending = false
-    private var providers: [String] { let all = app.me["providers"].array.map(\.string); return all.contains("claude") ? ["claude"] + all.filter { $0 != "claude" } : all }
+    private var providers: [String] { app.teamProviders }
     private var selectedProject: JSON? { app.projects.first { $0["id"].string == project } }
-    private var projectReady: Bool { !(selectedProject?["team"]["checks"].array.isEmpty ?? true) }
+    private var projectReady: Bool { app.teamWorkspaceReady(project) }
     private var pending: Bool { app.pendingTeamCreation.pendingID != nil }
     private var effectiveProvider: String { useLineup ? app.teamLineup["coordinator"]["provider"].string : provider }
     private var canStart: Bool { !busy && !project.isEmpty && (pending || (app.teamsEnabled && projectReady && !effectiveProvider.isEmpty && !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)) }
@@ -450,7 +462,7 @@ struct TeamCreateView: View {
             Button("I checked the teams") { app.clearTeamCreation() }
         } message: { Text("The server may already have started this team. Clearing does not stop it.") }
         .onAppear {
-            project = (app.projects.first { !$0["team"]["checks"].array.isEmpty } ?? app.projects.first)?["id"].string ?? ""
+            project = app.defaultTeamWorkspace
             useLineup = app.teamLineup != .null
             if !providers.contains(provider) { provider = providers.first { $0 != "demo" } ?? providers.first ?? "" }
         }

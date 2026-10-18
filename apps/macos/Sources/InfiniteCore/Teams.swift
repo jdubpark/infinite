@@ -36,16 +36,39 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
     /// Members of the current revision whose agent sessions are live.
     public var activeMembers: [JSON] { members.filter { $0["revision"].int == revision && ["running", "waiting"].contains($0["status"].string) } }
     public var needsYou: Bool { status == "needs-input" }
-    /// The run is over: either ready for a person's review or cancelled.
-    public var finished: Bool { ["ready-for-review", "cancelled"].contains(status) }
-    /// Agents are working or the host is integrating, checking, or reviewing.
-    public var working: Bool { ["planning", "implementing", "integrating", "verifying", "reviewing"].contains(status) }
+    /// The agents have stopped: the run waits for a person's review, reported a merge, proposed no change, or was cancelled.
+    public var finished: Bool { ["ready-for-review", "merged", "no-change", "cancelled"].contains(status) }
+    /// Agents are working or the host is integrating, checking, reviewing, or delivering.
+    public var working: Bool { ["planning", "discovering", "implementing", "integrating", "verifying", "reviewing", "delivering"].contains(status) }
     public var statusLabel: String { Self.labels[status] ?? status.replacingOccurrences(of: "-", with: " ").capitalizedFirstLetter }
     public static let labels: [String: String] = [
-        "planning": "Planning", "implementing": "Implementing", "integrating": "Integrating", "verifying": "Running checks",
-        "reviewing": "Reviewing", "needs-input": "Needs your input", "paused": "Paused", "blocked": "Blocked",
-        "ready-for-review": "Ready for your review", "cancelled": "Cancelled",
+        "planning": "Planning", "discovering": "Investigating", "implementing": "Implementing", "integrating": "Integrating",
+        "verifying": "Running checks", "reviewing": "Reviewing", "delivering": "Delivering", "merged": "Merge reported",
+        "needs-input": "Needs your input", "paused": "Paused", "blocked": "Blocked",
+        "ready-for-review": "Ready for your review", "no-change": "No change proposed", "cancelled": "Cancelled",
     ]
+    /// The home board's group for this run. A run waiting for review is pending, not complete; a reported
+    /// merge is the only complete state, and it remains an agent report rather than host verification.
+    public var projectState: ProjectState {
+        switch status {
+        case "cancelled": return .cancelled
+        case "no-change": return .aborted
+        case "merged": return .complete
+        case "paused": return .paused
+        case "blocked": return .stuck
+        case "needs-input", "ready-for-review": return .pending
+        default: return openDecisions.isEmpty ? .ongoing : .pending
+        }
+    }
+    /// How full the status ring draws: the plan's integrated share, never below the current phase's floor.
+    public var progressFraction: Double {
+        if ["ready-for-review", "merged"].contains(status) { return 1 }
+        let floor = ["integrating": 0.5, "verifying": 0.75, "reviewing": 0.75, "delivering": 1.0][status] ?? 0.25
+        let (done, total) = progress
+        return max(floor, total > 0 ? Double(done) / Double(total) : 0)
+    }
+    /// The Linear issue the host syncs this run to, when it tracks one.
+    public var linearIssue: String { value["linear"]["issue"]["identifier"].string }
     public static func roleName(_ role: String) -> String {
         ["project-manager": "Coordinator", "implementer": "Implementer", "integrator": "Integrator", "reviewer": "Reviewer"][role] ?? role.capitalizedFirstLetter
     }
@@ -63,6 +86,24 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
     }
     public func member(_ id: String) -> JSON? { members.first { $0["memberId"].string == id } }
     public func task(_ id: String) -> JSON? { tasks.first { $0["id"].string == id } }
+}
+
+/// Where a run sits on the home board, in the order the board lists them.
+public enum ProjectState: String, CaseIterable, Sendable {
+    case ongoing, pending, stuck, paused, complete, cancelled, aborted
+    public var title: String {
+        switch self {
+        case .ongoing: return "Ongoing"
+        case .pending: return "Pending"
+        case .stuck: return "Stuck"
+        case .paused: return "Paused"
+        case .complete: return "Complete"
+        case .cancelled: return "Cancelled"
+        case .aborted: return "Aborted"
+        }
+    }
+    /// The agents stopped for good; the board folds these groups until opened.
+    public var closed: Bool { [.complete, .cancelled, .aborted].contains(self) }
 }
 
 extension String {

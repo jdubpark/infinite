@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { goalControls, goalGroup, groupRuns, newer, openDecisions, taskKind, teamControls, teamGroup, teamKind, type ProductGoal, type TeamTask, type TeamView } from "../apps/mobile/src/features/teams/model.ts";
+import { approvalOwner, goalControls, goalGroup, groupRuns, newer, openDecisions, pendingApprovals, taskKind, teamControls, teamGroup, teamKind, teamPhases, type PermissionDecision, type ProductGoal, type TeamMember, type TeamTask, type TeamView } from "../apps/mobile/src/features/teams/model.ts";
 import { age, initials } from "../apps/mobile/src/status.ts";
 import { runRequests } from "../apps/mobile/src/store/requests.ts";
 
@@ -127,4 +127,50 @@ test("phone avatars and ages stay short and stable", () => {
   assert.equal(age("2026-01-01T09:00:00.000Z", now), "3h");
   assert.equal(age("2025-12-30T12:00:00.000Z", now), "2d");
   assert.equal(age("not a date", now), "");
+});
+
+const member = (memberId: string, status = "running") => ({ memberId, sessionId: `s-${memberId}`, role: "implementer", revision: 2, title: memberId, status }) as TeamMember;
+const waiting = (memberId: string, prompt: { id: number; kind: string; destructive?: unknown }) => ({ id: `s-${memberId}`, attention: { state: "needs-you", prompt } });
+const decided = (memberId: string, promptId: number, status: PermissionDecision["status"]) =>
+  ({ id: `d-${memberId}-${promptId}`, revision: 2, targetMemberId: memberId, targetSessionId: `s-${memberId}`, promptId, expiresAt: "2026-01-01T00:05:00.000Z", status }) as PermissionDecision;
+const delegated = { permissions: { mode: "coordinator" as const, scope: "Read access", maxDecisions: 3 } };
+
+test("agent prompts reach a person only when the coordinator cannot or did not decide them", () => {
+  const permission = { id: 7, kind: "permission" };
+  // Without delegation every open agent prompt waits on a person.
+  assert.equal(approvalOwner(team(), "s-a", permission), "person");
+  // A delegated one-shot permission is the coordinator's, until it escalates or its decision goes stale.
+  assert.equal(approvalOwner(team(delegated), "s-a", permission), "coordinator");
+  assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: [decided("a", 7, "reviewing")] }), "s-a", permission), "coordinator");
+  assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: [decided("a", 7, "escalated")] }), "s-a", permission), "person");
+  assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: [decided("a", 7, "stale")] }), "s-a", permission), "person");
+  // A decision about an earlier prompt does not cover a new one.
+  assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: [decided("a", 6, "answered")] }), "s-a", permission), "coordinator");
+  // Questions, destructive commands, revoked delegation, and a spent decision budget stay with a person.
+  assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "question" }), "person");
+  assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "permission", destructive: { pattern: "rm-rf" } }), "person");
+  assert.equal(approvalOwner(team({ ...delegated, permissionsRevokedAt: "2026-01-01T00:00:00.000Z" }), "s-a", permission), "person");
+  const spent = ["x", "y", "z"].map((id, index) => decided(id, index, "answered"));
+  assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: spent }), "s-a", permission), "person");
+
+  const run = team({ ...delegated, members: [member("a"), member("b"), member("c", "stopped"), { ...member("d"), revision: 1 }], permissionDecisions: [decided("b", 9, "escalated")] });
+  const sessions = [waiting("a", permission), waiting("b", { id: 9, kind: "permission" }), waiting("c", { id: 1, kind: "question" }), waiting("d", { id: 2, kind: "question" })];
+  // Only live members of the current revision count; a's prompt is the coordinator's, b's was escalated.
+  assert.deepEqual(pendingApprovals(run, sessions).map(item => item.member.memberId), ["b"]);
+  assert.equal(teamGroup(run, 1), "attention");
+  assert.equal(teamKind(run, 1).kind, "attention");
+  assert.equal(teamGroup(team({ status: "cancelled" }), 1), "closed");
+});
+
+test("the coordinator card's phase track follows the recorded work, with delivery only when configured", () => {
+  const states = (run: TeamView) => teamPhases(run).map(phase => `${phase.label}:${phase.state}`).join(" ");
+  assert.equal(states(team({ status: "planning" })), "Plan:current Build:todo Integrate:todo Check:todo Review:todo");
+  assert.equal(states(team({ status: "verifying", tasks: [task("t1", "integrated")] })), "Plan:done Build:done Integrate:done Check:current Review:todo");
+  // A run waiting on a person keeps the step its work reached.
+  assert.equal(states(team({ status: "needs-input", tasks: [task("t1", "integrated"), task("t2", "running")] })), "Plan:done Build:current Integrate:todo Check:todo Review:todo");
+  const review = { verdict: "approved" as const, summary: "Looks right", revision: 2 };
+  assert.equal(states(team({ status: "ready-for-review", review })), "Plan:done Build:done Integrate:done Check:done Review:done");
+  const delivery = { mode: "merge" as const, repository: "owner/app", baseBranch: "main" };
+  assert.equal(states(team({ status: "delivering", review, delivery })), "Plan:done Build:done Integrate:done Check:done Review:done Deliver:current");
+  assert.equal(states(team({ status: "merged", review, delivery })), "Plan:done Build:done Integrate:done Check:done Review:done Deliver:done");
 });

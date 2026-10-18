@@ -61,7 +61,7 @@ export function NowCard({
         <Card state="turn-finished" heading="Finished a turn">
           <Text selectable style={s.body}>
             {!message
-              ? "No closing message was recorded."
+              ? "No closing message."
               : long && !expanded
                 ? `${message.slice(0, PREVIEW_CHARS).trimEnd()}…`
                 : message}
@@ -84,8 +84,8 @@ export function NowCard({
     }
     case "idle":
       return (
-        <Card state="idle" heading="Waiting for your direction.">
-          <Text style={s.meta}>Idle for {elapsed(attention.since)}</Text>
+        <Card state="idle" heading="Idle">
+          <Text style={s.meta}>{elapsed(attention.since)}</Text>
         </Card>
       );
     case "exited":
@@ -100,8 +100,7 @@ export function NowCard({
       return (
         <Card state="unavailable" heading="Unreachable">
           <Text style={s.body}>
-            The host cannot reach this session. Your agent may still be
-            running.
+            Host can’t reach it. It may still be running.
           </Text>
         </Card>
       );
@@ -109,7 +108,7 @@ export function NowCard({
       return (
         <Card state="recording-error" heading="Recording error">
           <Text style={s.body}>
-            Recording failed. The process was suspended to protect the record.
+            Recording failed; process suspended.
           </Text>
         </Card>
       );

@@ -296,6 +296,10 @@ The desktop session rail identifies each record with title, provider, text state
 
 Native home has no machine bar. The active machine's name, with a small toggle, opens a sheet to switch, add, or remove machines; removal asks for confirmation. Sessions, Teams, and Goals sit in a floating capsule with counts of items waiting on a person, beside a round control for creating one. Lists are grouped by state with counts, and stopped groups start folded. A session row shows its status icon, title, age, provider avatar, and one line of activity. A team row reads like a Linear project: status, integrated tasks out of the plan, the assigned agents as model avatars with live or waiting dots, and the Linear issue.
 
+A person runs a team through its coordinator, not its agents. Team agents leave the Sessions list (search still finds them). An agent's session view replaces the composer and stop controls with a link to its team. An agent prompt that needs a person appears on the team as an approval, beside the coordinator's escalation reason. Prompts the coordinator is deciding under the run's delegation show only as a count. Team Overview opens on a coordinator card: a plan-to-review phase track, task, agent, and check counts, the latest activity, and pause, resume, and cancel.
+
+Native copy stays terse. Icons, counts, and chips carry state; sentences remain only where a decision or an honesty qualifier needs them, shortened to markers such as "agent claim", "not approval", and "Offline · last received".
+
 Web detail exposes Catch up, Full terminal, and Context. Native session detail exposes Chat, Activity, and Files; native team detail exposes Overview, Tasks, Agents, and Activity, with tasks as issue rows carrying an assignee avatar. Selected web tabs use the primary color and underline; the selected native segment is a raised lens. Labels stay in sentence case. The back control returns to the list.
 
 ### Session Record and Composer

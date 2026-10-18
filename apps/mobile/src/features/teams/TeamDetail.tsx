@@ -1,20 +1,21 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { ActivityIndicator, Alert, KeyboardAvoidingView, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me, type SessionRow } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
-import { Card, Chip, GlassButton, GroupHeader, LiveStatus, ProgressBar, Segmented, Sheet, SheetRow, TopBar } from "../../components/Glass";
+import { Card, Chip, GlassButton, GroupHeader, LiveStatus, ProgressBar, Segmented, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import type { StatusKind } from "../../status";
 import { theme } from "../../theme";
 import {
-  MEMBER_LABELS, memberKind, newer, openDecisions, ROLE_NAMES, shortDate, TEAM_LABELS, taskGroups, taskKind, teamControls, teamKind, teamProgress,
-  type ModelProfile, type TeamCheck, type TeamDecision, type TeamMember, type TeamTask, type TeamView,
+  MEMBER_LABELS, memberKind, newer, openDecisions, pendingApprovals, ROLE_NAMES, shortDate, TEAM_LABELS, taskGroups, taskKind, teamControls, teamKind, teamPhases, teamProgress,
+  type ModelProfile, type PhaseState, type TeamCheck, type TeamDecision, type TeamMember, type TeamTask, type TeamView,
 } from "./model";
 import { Clamp, Disclosure, LinearChip, LineupView, ProfileLine, providerName, RequestStatus, Section, SteerBox, t } from "./parts";
 import { useRunRequest } from "./useRunRequest";
+import { AgentApproval } from "./TeamApprovals";
 import { AgentLog, JevcodeSummary } from "./TeamSummary";
 import { orderedMembers } from "./summary";
 
@@ -23,9 +24,11 @@ const CHECK_KIND: Record<TeamCheck["status"], StatusKind> = { running: "progress
 const live = (member: TeamMember) => member.status === "running" || member.status === "waiting";
 
 /**
- * One team run, tracked the way Linear tracks a project: its state, plan progress, lead and agents
- * up top; Overview opens on what needs you and the Jevcode summary, Tasks lists the plan with its
- * assignees, Agents shows what each one is doing, and Activity holds the evidence.
+ * One team run, tracked the way Linear tracks a project and run through its coordinator. Overview
+ * opens on the coordinator card (phase, progress, latest activity, and the run's controls), then
+ * what needs a person: the team's questions and agent requests the coordinator escalated or was not
+ * delegated. Members are monitored, not steered: Tasks lists the plan with its assignees, Agents
+ * shows what each one is doing, and Activity holds the evidence.
  */
 export function TeamDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
@@ -40,7 +43,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const [tab, setTab] = useState<Tab>("overview");
   const [agentId, setAgentId] = useState("");
   const [taskId, setTaskId] = useState("");
-  const [actions, setActions] = useState(false);
   const request = useRunRequest<TeamView>(connection, `${machine}/team/${id}`, {
     accepted: (result, sent) => { setRecorded(result); if (sent.path.endsWith("/steer")) setDirection(""); poll.refresh(); },
     refused: poll.refresh,
@@ -52,11 +54,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   }
   const openSession = (sessionId: string) => router.push({ pathname: "/session/[id]", params: { id: sessionId, machine } });
   const owns = me?.role === "owner" && team && !team.goal && team.status !== "cancelled";
-  const top = <TopBar backLabel="Teams" onBack={back} right={<>
-    <LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} />
-    {team && (owns || team.goal) ? <GlassButton glyph="more" label="Team actions" onPress={() => setActions(true)} /> : null}
-  </>} />;
-  if (!team) return <View style={s.fill}>{top}<View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading team…" : "The team could not be loaded. Check the machine and try again."}</Text></View></View>;
+  const top = <TopBar backLabel="Teams" onBack={back} right={<LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} />} />;
+  if (!team) return <View style={s.fill}>{top}<View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading…" : "Could not load the team."}</Text></View></View>;
 
   const controls = teamControls(team, me?.role, fresh);
   const locked = request.busy || Boolean(request.pending);
@@ -67,9 +66,16 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const members = orderedMembers(team.members, team.revision);
   const current = members.filter(member => member.revision === team.revision);
   const earlier = members.filter(member => member.revision !== team.revision);
-  const needsYou = current.filter(member => live(member) && listed.get(member.sessionId)?.attention.state === "needs-you");
+  const approvals = pendingApprovals(team, sessions ?? []);
+  // Open agent prompts the coordinator is deciding under the run's delegation; nothing for a person to do.
+  const coordinatorHandling = current.filter(member => live(member) && listed.get(member.sessionId)?.attention.state === "needs-you").length - approvals.length;
   const working = current.filter(live);
-  const { kind, fraction } = teamKind(team);
+  const { kind, fraction } = teamKind(team, approvals.length);
+  const coordinator = current.find(member => member.role === "project-manager");
+  // The coordinator's own activity when its session reports one; otherwise the run's latest recorded event.
+  const coordinatorNow = coordinator ? listed.get(coordinator.sessionId)?.attention.now : undefined;
+  const latest = coordinatorNow || team.events.at(-1)?.text;
+  const checksNow = team.checks.filter(check => check.revision === team.revision);
   const { done, total } = teamProgress(team);
   const profileOf = (member?: TeamMember, task?: TeamTask): ModelProfile | undefined => member?.modelProfile
     ?? [...(team.lineup?.implementers ?? []), ...(team.lineup?.escalations ?? [])].find(value => value.id === task?.agentProfileId);
@@ -113,7 +119,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
 
   return <KeyboardAvoidingView style={s.fill} behavior="padding">
     {top}
-    {!fresh ? <Text style={t.banner}>Last received team state. Controls are paused until the host reconnects. The team may still be working.</Text> : null}
+    {!fresh ? <Text style={t.banner}>Offline · last received state. Controls paused.</Text> : null}
     <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled" stickyHeaderIndices={[1]}
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View style={s.head}>
@@ -121,17 +127,14 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
         <Text style={t.title} numberOfLines={3}>{team.title}</Text>
         <View style={s.chips}>
           <Chip kind={kind} fraction={fraction} label={TEAM_LABELS[team.status]} tone={kind === "attention" || kind === "paused" ? "attention" : kind === "blocked" ? "error" : undefined} accessibilityLabel={`State: ${TEAM_LABELS[team.status]}`} />
-          {total ? <Chip icon={<ProgressBar done={done} total={total} width={30} />} label={`${done}/${total} tasks`} accessibilityLabel={`${done} of ${total} tasks integrated`} /> : null}
-          <Chip icon={<Avatar label={lead?.label ?? providerName(team.provider)} provider={lead?.provider ?? team.provider} size={16} />} label={lead?.label ?? providerName(team.provider)} accessibilityLabel={`Lead: ${lead?.label ?? providerName(team.provider)}`} />
-          <Chip icon={<Glyph name="people" size={13} color={theme.colors.mutedInk} />} label={`${working.length}/${current.length} active`} onPress={() => setTab("agents")} accessibilityLabel={`${working.length} of ${current.length} agents active. Show agents`} />
+                    <Chip icon={<Avatar label={lead?.label ?? providerName(team.provider)} provider={lead?.provider ?? team.provider} size={16} />} label={lead?.label ?? providerName(team.provider)} accessibilityLabel={`Lead: ${lead?.label ?? providerName(team.provider)}`} />
           <LinearChip tracking={team.linear} fresh={fresh} />
-          <Chip label={`Rev ${team.revision} · ≤${team.parallelism} parallel`} accessibilityLabel={`Revision ${team.revision}, up to ${team.parallelism} parallel implementers`} />
         </View>
         {team.linear?.reason ? <Text style={t.warning}>{team.linear.reason}</Text> : null}
       </View>
       <View style={s.sticky}>
         <Segmented value={tab} onChange={setTab} options={[
-          { value: "overview", label: "Overview", count: decisions.length + needsYou.length, attention: true },
+          { value: "overview", label: "Overview", count: decisions.length + approvals.length, attention: true },
           { value: "tasks", label: "Tasks", count: team.tasks.length },
           { value: "agents", label: "Agents", count: current.length },
           { value: "activity", label: "Activity" },
@@ -139,14 +142,37 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </View>
 
       {tab === "overview" ? <View>
-        {team.reason ? <Card attention style={s.gapTop}><Text style={t.warning}>{team.reason}</Text></Card> : null}
+        <Card style={s.console}>
+          <PhaseTrack phases={teamPhases(team)} kind={kind} />
+          <View style={s.stats}>
+            <Stat icon={<ProgressBar done={done} total={total} width={34} />} value={total ? `${done}/${total}` : "—"} label={`${done} of ${total} tasks integrated`} />
+            <Stat icon={<Glyph name="people" size={14} color={theme.colors.mutedInk} />} value={`${working.length}/${current.length}`} label={`${working.length} of ${current.length} agents working`} onPress={() => setTab("agents")} />
+            {checksNow.length ? <Stat icon={<StatusIcon kind={checksNow.some(check => check.status === "failed") ? "blocked" : "done"} size={13} />} value={`${checksNow.filter(check => check.status === "passed").length}/${checksNow.length}`} label="checks passed" onPress={() => setTab("activity")} /> : null}
+            <Text style={s.rev}>rev {team.revision}</Text>
+          </View>
+          {latest ? <View style={s.lead}>
+            <Avatar label={lead?.label ?? providerName(team.provider)} provider={lead?.provider ?? team.provider} size={22} state={coordinator && live(coordinator) ? "live" : undefined} />
+            <Text style={[t.body, s.fill]} numberOfLines={2}>{latest}</Text>
+          </View> : null}
+          {/* The host's reason for an open agent prompt points at the member session; the approvals below answer it here. */}
+          {team.reason && !approvals.length ? <Text style={kind === "blocked" ? t.error : t.warning}>{team.reason}</Text> : null}
+          {owns ? <View style={s.controls}>
+            {(team.status === "paused" || team.resumable) && !team.deliveryReceipt ? <Button compact glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
+              : controls.pause ? <Button compact secondary glyph="pause" title="Pause" disabled={locked} onPress={() => send("/pause", "Pause")} /> : null}
+            <Button compact secondary glyph="close" title="Cancel…" disabled={!controls.cancel || locked} onPress={() => Alert.alert("Cancel this team?", "Stops its agents. Work and evidence stay.", [
+              { text: "Keep running", style: "cancel" },
+              { text: "Cancel team", style: "destructive", onPress: () => send("/cancel", "Cancellation") },
+            ])} />
+          </View> : team.goal ? <View style={s.controls}>
+            <Button compact secondary glyph="target" title={`Goal cycle ${team.goal.cycle}`} onPress={() => router.push({ pathname: "/goal/[id]", params: { id: team.goal!.id, machine } })} />
+                      </View> : null}
+        </Card>
         {team.status === "ready-for-review" ? <Card style={s.gapTop}>
-          <View style={s.line}><StatusIcon kind="review" size={16} /><Text style={t.strong}>Ready for your review</Text></View>
-          <Text style={t.note}>The team reports this run is ready. Inspect the changes and evidence before merging or publishing.</Text>
+          <View style={s.line}><StatusIcon kind="review" size={16} /><Text style={[t.strong, s.fill]}>Ready for your review</Text><Text style={t.note}>team report</Text></View>
+          <Button compact secondary title="Evidence" onPress={() => setTab("activity")} />
         </Card> : null}
         {team.deliveryReceipt ? <Card style={s.gapTop}>
-          <View style={s.line}><StatusIcon kind="review" size={16} /><Text style={[t.strong, s.fill]}>Merge reported · agent claim</Text></View>
-          <Text style={t.note}>The host records the delivery agent’s report. It does not verify GitHub or product impact.</Text>
+          <View style={s.line}><StatusIcon kind="review" size={16} /><Text style={[t.strong, s.fill]}>Merge reported</Text><Text style={t.note}>agent claim · unverified</Text></View>
           <Clamp text={team.deliveryReceipt.summary} lines={3} />
           <Text style={t.note}>Revision {team.deliveryReceipt.revision} · {shortDate(team.deliveryReceipt.reportedAt)}</Text>
           <Text selectable style={t.mono} numberOfLines={1} ellipsizeMode="middle">head {team.deliveryReceipt.headCommit}</Text>
@@ -154,23 +180,16 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           {/^https:\/\//.test(team.deliveryReceipt.pullRequestUrl) ? <Button compact secondary title="Open pull request" onPress={() => void Linking.openURL(team.deliveryReceipt!.pullRequestUrl)} /> : null}
         </Card> : null}
 
-        {decisions.length ? <Section title="Decisions for you" count={decisions.length}>
+        {decisions.length || approvals.length ? <Section title="Needs you" count={decisions.length + approvals.length}>
           {decisions.map(decision => <DecisionCard key={decision.id} decision={decision} member={team.members.find(member => member.memberId === decision.memberId)}
             disabled={!controls.answer || locked} onAnswer={text => send(`/decisions/${decision.id}/answer`, "Answer", { text })} />)}
-          {team.status === "paused" ? <Text style={t.note}>Resume the team before answering.</Text> : null}
+          {team.status === "paused" && decisions.length ? <Text style={t.note}>Resume to answer.</Text> : null}
+          {approvals.map(({ member, session }) => <AgentApproval key={`${member.memberId}/${session.attention.prompt?.id ?? "open"}`} connection={connection} member={member} me={me ?? null}
+            agent={agentLabel(member)} provider={member.modelProfile?.provider ?? member.provider ?? team.provider}
+            decision={[...(team.permissionDecisions ?? [])].reverse().find(item => item.targetSessionId === member.sessionId && item.promptId === session.attention.prompt?.id)}
+            onOpenSession={() => openSession(member.sessionId)} />)}
         </Section> : null}
-
-        {needsYou.length ? <Section title="Agents waiting on a prompt" count={needsYou.length}>
-          {needsYou.map(member => <Pressable key={member.memberId} accessibilityRole="button" accessibilityLabel={`Open ${ROLE_NAMES[member.role]} session to respond`}
-            onPress={() => openSession(member.sessionId)} style={({ pressed }) => [s.prompt, pressed && s.pressed]}>
-            <Avatar label={agentLabel(member)} provider={member.modelProfile?.provider ?? member.provider ?? team.provider} size={26} state="attention" />
-            <View style={s.main}>
-              <Text style={t.strong}>{ROLE_NAMES[member.role]}</Text>
-              <Text style={s.now} numberOfLines={2}>{listed.get(member.sessionId)?.attention.now || "Respond in the session."}</Text>
-            </View>
-            <Glyph name="forward" size={12} color={theme.colors.warningInk} />
-          </Pressable>)}
-        </Section> : null}
+        {coordinatorHandling > 0 ? <Text style={[t.note, s.gapTop]}>Coordinator reviewing {coordinatorHandling === 1 ? "1 request" : `${coordinatorHandling} requests`}</Text> : null}
 
         {team.noChange ? <Section title="No change proposed">
           <Clamp text={team.noChange.summary} lines={4} />
@@ -224,21 +243,21 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
               </View> : null}
             </View>;
           })}
-        </View>) : <Text style={[t.note, s.gapTop]}>The coordinator has not reported a plan for this revision yet.</Text>}
+        </View>) : <Text style={[t.note, s.gapTop]}>No plan yet.</Text>}
       </View> : null}
 
       {tab === "agents" ? <View>
-        {current.length ? current.map(agentRow) : <Text style={[t.note, s.gapTop]}>No agents have started for this revision.</Text>}
+        {current.length ? current.map(agentRow) : <Text style={[t.note, s.gapTop]}>No agents yet.</Text>}
         {earlier.length ? <Disclosure title={`Earlier revisions · ${earlier.length}`}>{earlier.map(agentRow)}</Disclosure> : null}
         {team.lineup ? <Disclosure title="Recorded lineup">
-          <Text style={t.note}>Requested model settings recorded when the run started; provider policy may override them.</Text>
+          <Text style={t.note}>Requested; providers may override.</Text>
           <LineupView lineup={team.lineup} />
         </Disclosure> : null}
       </View> : null}
 
       {tab === "activity" ? <View>
         <Section title="Checks" count={team.checks.length}>
-          {team.checks.length ? team.checks.map((check, index) => <CheckRow key={`${check.startedAt}/${index}`} check={check} />) : <Text style={t.note}>No check results recorded yet.</Text>}
+          {team.checks.length ? team.checks.map((check, index) => <CheckRow key={`${check.startedAt}/${index}`} check={check} />) : <Text style={t.note}>None yet.</Text>}
         </Section>
         <Section title="Review">
           {team.review ? <>
@@ -246,8 +265,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
               label={`${team.review.verdict === "approved" ? "Approved" : "Changes requested"} · rev ${team.review.revision} · agent claim`} />
             <Clamp text={team.review.summary} lines={4} />
             {team.review.uiEvidence ? <Disclosure title="Interface evidence"><Text style={t.body}>{team.review.uiEvidence}</Text></Disclosure> : null}
-          </> : <Text style={t.note}>No review recorded for this revision.</Text>}
-          <Text style={t.note}>Host checks and the reviewer’s assessment are recorded separately.</Text>
+          </> : <Text style={t.note}>None yet.</Text>}
         </Section>
         <Section title="Changes">
           <Card style={s.keys}>
@@ -281,25 +299,43 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     </ScrollView>
     <View style={s.dock}>
       <RequestStatus request={request} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|answer)$/.test(request.pending?.path ?? ""))} subject="team" />
-      <SteerBox value={direction} onChange={setDirection} placeholder="Direct the team or change requirements…"
+      <SteerBox value={direction} onChange={setDirection} placeholder="Direct the team…"
         enabled={controls.steer && !locked} busy={request.busy}
-        note={team.status === "delivering" || team.status === "merged" || team.deliveryReceipt ? "Delivery has started or been reported. Inspect its pull request and evidence before starting further work."
-          : me?.role === "viewer" ? "This device can view the team. An owner or controller can answer decisions and send direction."
-          : team.goal ? "Answer this cycle’s decisions here. Steer, pause, or cancel from its goal."
-            : team.status === "cancelled" ? "This run is cancelled. Its work and evidence remain available." : undefined}
+        note={team.status === "delivering" || team.status === "merged" || team.deliveryReceipt ? "Delivery started · check its PR first."
+          : me?.role === "viewer" ? "View only."
+          : team.goal ? "Steer from its goal."
+            : team.status === "cancelled" ? "Cancelled." : undefined}
         onSend={() => { const text = direction.trim(); if (text) send("/steer", "Direction", { text }); }} />
     </View>
-    <Sheet visible={actions} onClose={() => setActions(false)} title="Team">
-      {team.goal ? <SheetRow glyph="target" label="Open goal" detail={`Cycle ${team.goal.cycle} · steer, pause, or cancel there`} onPress={() => { setActions(false); router.push({ pathname: "/goal/[id]", params: { id: team.goal!.id, machine } }); }} /> : null}
-      {owns && (team.status === "paused" || team.resumable) && !team.deliveryReceipt ? <SheetRow glyph="play" label="Resume team" disabled={!controls.resume || locked} onPress={() => { setActions(false); send("/resume", "Resume"); }} /> : null}
-      {owns && controls.pause && !(team.status === "paused" || team.resumable) ? <SheetRow glyph="pause" label="Pause team" disabled={locked} onPress={() => { setActions(false); send("/pause", "Pause"); }} /> : null}
-      {owns ? <SheetRow glyph="close" destructive label="Cancel team…" detail="Stops its agents; keeps work and evidence" disabled={!controls.cancel || locked}
-        onPress={() => Alert.alert("Cancel this team?", "This stops its agent sessions and keeps the recorded work and evidence.", [
-          { text: "Keep running", style: "cancel" },
-          { text: "Cancel team", style: "destructive", onPress: () => { setActions(false); send("/cancel", "Cancellation"); } },
-        ])} /> : null}
-    </Sheet>
   </KeyboardAvoidingView>;
+}
+
+/** An icon and a number, with the full meaning for screen readers; tapping opens its tab. */
+function Stat({ icon, value, label, onPress }: { icon: ReactNode; value: string; label: string; onPress?: () => void }) {
+  const body = <>{icon}<Text style={s.statValue}>{value}</Text></>;
+  return onPress
+    ? <Pressable accessibilityRole="button" accessibilityLabel={label} onPress={onPress} hitSlop={10} style={s.stat}>{body}</Pressable>
+    : <View accessible accessibilityLabel={label} style={s.stat}>{body}</View>;
+}
+
+const PHASE_TONE: Partial<Record<string, string>> = { attention: theme.colors.warningInk, paused: theme.colors.warningInk, blocked: theme.colors.error, cancelled: theme.colors.placeholder, stopped: theme.colors.placeholder };
+
+/** Plan to review (and delivery) as one track; the current step takes the run's state colour. */
+function PhaseTrack({ phases, kind }: { phases: { label: string; state: PhaseState }[]; kind: string }) {
+  const tone = PHASE_TONE[kind] ?? theme.colors.running;
+  const now = phases.find(phase => phase.state === "current");
+  return <View accessible accessibilityLabel={`Phase: ${now?.label ?? "complete"}. ${phases.filter(phase => phase.state === "done").map(phase => phase.label).join(", ") || "Nothing"} done.`} style={s.track}>
+    {phases.map((phase, index) => <View key={phase.label} style={s.step}>
+      <View style={s.stepLine}>
+        <View style={[s.rail, index === 0 && s.railHidden, phase.state !== "todo" && s.railDone]} />
+        <View style={[s.node, phase.state === "done" && s.nodeDone, phase.state === "current" && { borderColor: tone, backgroundColor: theme.colors.white }]}>
+          {phase.state === "done" ? <Glyph name="check" size={9} color={theme.colors.white} /> : phase.state === "current" ? <View style={[s.nodeCore, { backgroundColor: tone }]} /> : null}
+        </View>
+        <View style={[s.rail, index === phases.length - 1 && s.railHidden, phase.state === "done" && s.railDone]} />
+      </View>
+      <Text style={[s.stepLabel, phase.state === "current" && { color: tone, fontWeight: "700" }, phase.state === "done" && s.stepDone]} numberOfLines={1}>{phase.label}</Text>
+    </View>)}
+  </View>;
 }
 
 /** A member's question. The team records the answer and continues in a new attempt. */
@@ -386,4 +422,22 @@ const s = StyleSheet.create({
   answer: { flexDirection: "row", alignItems: "flex-end", gap: 8, padding: 4, paddingLeft: 4, borderRadius: 22, backgroundColor: theme.colors.white },
   answerInput: { flex: 1, minHeight: 38, maxHeight: 120, paddingHorizontal: 10, paddingVertical: 8, fontSize: 14, color: theme.colors.ink },
   dock: { gap: 6, paddingHorizontal: 12, paddingTop: 6, paddingBottom: 10 },
+  console: { gap: 10, marginTop: 8 },
+  stats: { flexDirection: "row", alignItems: "center", gap: 16 },
+  stat: { flexDirection: "row", alignItems: "center", gap: 6, minHeight: 28 },
+  statValue: { fontSize: 13, fontWeight: "600", color: theme.colors.ink, fontVariant: ["tabular-nums"] },
+  rev: { marginLeft: "auto", fontSize: 12, color: theme.colors.mutedInk },
+  lead: { flexDirection: "row", alignItems: "flex-start", gap: 8 },
+  controls: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 },
+  track: { flexDirection: "row" },
+  step: { flex: 1, alignItems: "center", gap: 4 },
+  stepLine: { flexDirection: "row", alignItems: "center", alignSelf: "stretch" },
+  rail: { flex: 1, height: 2, backgroundColor: theme.colors.rule },
+  railDone: { backgroundColor: theme.colors.running },
+  railHidden: { opacity: 0 },
+  node: { width: 16, height: 16, borderRadius: 8, borderWidth: 2, borderColor: theme.colors.fieldRule, alignItems: "center", justifyContent: "center" },
+  nodeDone: { backgroundColor: theme.colors.running, borderColor: theme.colors.running },
+  nodeCore: { width: 6, height: 6, borderRadius: 3 },
+  stepLabel: { fontSize: 11, color: theme.colors.mutedInk },
+  stepDone: { color: theme.colors.secondaryInk },
 });

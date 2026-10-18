@@ -8,7 +8,7 @@ import { StatusIcon } from "../../components/Icon";
 import { age } from "../../status";
 import { theme } from "../../theme";
 import {
-  GOAL_LABELS, goalGroup, goalKind, groupRuns, openDecisions, shortDate, TEAM_LABELS, teamGroup, teamKind, teamProgress, teamReady,
+  GOAL_LABELS, goalGroup, goalKind, groupRuns, openDecisions, pendingApprovals, shortDate, TEAM_LABELS, teamGroup, teamKind, teamProgress, teamReady,
   type ProductGoal, type RunGroup, type TeamView,
 } from "./model";
 import { providerName } from "./parts";
@@ -30,19 +30,23 @@ export function TeamList({ connection, me, teams, sessions, now }: { connection:
   const folds = useFolds();
   const project = (id: string) => me.projects?.find(value => value.id === id)?.name ?? id;
   const attention = new Set(sessions.filter(session => session.attention.state === "needs-you").map(session => session.id));
+  // Agent prompts the coordinator escalated or was not delegated; prompts it is deciding stay off the list.
+  const approvals = new Map(teams.map(team => [team.id, pendingApprovals(team, sessions).length]));
   return <View>
-    {!me.teams?.enabled ? <Text style={s.notice}>Teams need host setup. Enable teams in the host configuration and give a workspace its required checks.</Text>
-      : !me.projects?.some(teamReady) ? <Text style={s.notice}>No workspace is ready for a team. Add required team checks to a workspace in the host configuration.</Text> : null}
-    {groupRuns(teams, teamGroup).map(group => {
+    {!me.teams?.enabled ? <Text style={s.notice}>Teams need host setup.</Text>
+      : !me.projects?.some(teamReady) ? <Text style={s.notice}>No workspace has team checks yet.</Text> : null}
+    {groupRuns(teams, team => teamGroup(team, approvals.get(team.id))).map(group => {
       const folded = folds.folded(group.group);
       return <View key={group.group}>
         <GroupHeader kind={group.kind} title={group.title} count={group.items.length} collapsed={folded} onToggle={() => folds.toggle(group.group, folded)} />
         {folded ? null : group.items.map(team => {
-          const { kind, fraction } = teamKind(team);
+          const { kind, fraction } = teamKind(team, approvals.get(team.id));
           const { done, total } = teamProgress(team);
           const open = openDecisions(team).length;
+          const asks = approvals.get(team.id) ?? 0;
           const finished = ["ready-for-review", "cancelled", "no-change", "merged"].includes(team.status);
-          const alert = !finished && team.reason ? team.reason : "";
+          // Approvals are answered from the team, so they replace the host's pointer at the member session.
+          const note = !asks && !finished && team.reason ? team.reason : "";
           const agents = orderedMembers(team.members.filter(member => member.revision === team.revision), team.revision);
           return <Pressable key={team.id} accessibilityRole="button" accessibilityLabel={`Open team ${team.title}, ${TEAM_LABELS[team.status]}${total ? `, ${done} of ${total} tasks integrated` : ""}`}
             onPress={() => router.push({ pathname: "/team/[id]", params: { id: team.id, machine } })} style={({ pressed }) => [s.row, pressed && s.pressed]}>
@@ -53,7 +57,7 @@ export function TeamList({ connection, me, teams, sessions, now }: { connection:
                 <Text style={s.age}>{age(team.updatedAt, now)}</Text>
               </View>
               <View style={s.line}>
-                <Text style={[s.state, (kind === "attention" || kind === "paused") && s.attentionText, kind === "blocked" && s.errorText]} numberOfLines={1}>{TEAM_LABELS[team.status]}{open ? ` · ${open} ${open === 1 ? "decision" : "decisions"}` : ""}</Text>
+                <Text style={[s.state, (kind === "attention" || kind === "paused") && s.attentionText, kind === "blocked" && s.errorText]} numberOfLines={1}>{TEAM_LABELS[team.status]}{open ? ` · ${open} ${open === 1 ? "decision" : "decisions"}` : ""}{asks ? ` · ${asks} ${asks === 1 ? "approval" : "approvals"}` : ""}</Text>
                 {total ? <><ProgressBar done={done} total={total} width={40} /><Text style={s.meta}>{done}/{total}</Text></> : null}
                 <View style={s.fill} />
                 <AvatarStack size={20} people={agents.map(member => ({
@@ -61,16 +65,16 @@ export function TeamList({ connection, me, teams, sessions, now }: { connection:
                   state: attention.has(member.sessionId) ? "attention" as const : member.status === "running" ? "live" as const : undefined,
                 }))} />
               </View>
-              {alert ? <Text style={s.alert} numberOfLines={2}>{alert}</Text>
-                : <Text style={s.meta} numberOfLines={1}>{[project(team.projectId), team.linear?.issue?.identifier, team.lineup ? `Lead ${team.lineup.coordinator.label}` : providerName(team.provider), team.goal ? `Goal cycle ${team.goal.cycle}` : ""].filter(Boolean).join(" · ")}</Text>}
+              {note ? <Text style={s.alert} numberOfLines={1}>{note}</Text>
+                : <Text style={s.meta} numberOfLines={1}>{[project(team.projectId), team.linear?.issue?.identifier, team.goal ? `Goal cycle ${team.goal.cycle}` : ""].filter(Boolean).join(" · ")}</Text>}
             </View>
           </Pressable>;
         })}
       </View>;
     })}
     {!teams.length ? <View style={s.empty}>
-      <Text style={s.emptyTitle}>No team runs yet</Text>
-      <Text style={s.meta}>{me.role === "owner" ? "Describe a feature or paste a PRD. A coordinator plans it and implementers build it in parallel." : "Team runs appear here when an owner starts one on this machine."}</Text>
+      <Text style={s.emptyTitle}>No teams</Text>
+      <Text style={s.meta}>{me.role === "owner" ? "Start one with +." : "None yet."}</Text>
     </View> : null}
   </View>;
 }
@@ -82,7 +86,7 @@ export function GoalList({ connection, me, goals, now }: { connection: Connectio
   const folds = useFolds();
   const project = (id: string) => me.projects?.find(value => value.id === id)?.name ?? id;
   return <View>
-    {!me.goals?.enabled ? <Text style={s.notice}>Goals need a configured team lineup with strong coordinator and reviewer profiles, and a workspace with required checks.</Text> : null}
+    {!me.goals?.enabled ? <Text style={s.notice}>Goals need a strong lineup and team checks.</Text> : null}
     {groupRuns(goals, goalGroup).map(group => {
       const folded = folds.folded(group.group);
       return <View key={group.group}>
@@ -103,16 +107,16 @@ export function GoalList({ connection, me, goals, now }: { connection: Connectio
                 <ProgressBar done={goal.cycles.length} total={goal.maxRuns} width={40} />
                 <Text style={s.meta}>{goal.cycles.length}/{goal.maxRuns} cycles</Text>
               </View>
-              {alert ? <Text style={s.alert} numberOfLines={2}>{alert}</Text>
-                : <Text style={s.meta} numberOfLines={1}>{[project(goal.projectId), goal.linear?.issue?.identifier, `${goal.memberCount}/${goal.maxMembers} agents`, `due ${shortDate(goal.deadlineAt)}`].filter(Boolean).join(" · ")}</Text>}
+              {alert ? <Text style={s.alert} numberOfLines={1}>{alert}</Text>
+                : <Text style={s.meta} numberOfLines={1}>{[project(goal.projectId), goal.linear?.issue?.identifier, `due ${shortDate(goal.deadlineAt)}`].filter(Boolean).join(" · ")}</Text>}
             </View>
           </Pressable>;
         })}
       </View>;
     })}
     {!goals.length ? <View style={s.empty}>
-      <Text style={s.emptyTitle}>No goals yet</Text>
-      <Text style={s.meta}>{me.role === "owner" ? "Set a product outcome with evidence and limits. Agents choose and build reviewed improvements." : "Goals appear here when an owner starts one on this machine."}</Text>
+      <Text style={s.emptyTitle}>No goals</Text>
+      <Text style={s.meta}>{me.role === "owner" ? "Start one with +." : "None yet."}</Text>
     </View> : null}
   </View>;
 }

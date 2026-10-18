@@ -95,9 +95,9 @@ export function JevcodeSummary({ connection, team }: { connection: Connection; t
       <Text style={[t.note, s.fill]} numberOfLines={1}>{source}</Text>
     </View>
     {!text ? <Text style={t.note}>{
-      !poll.online && !poll.loading && !rows.length ? "The Jevcode summary could not be loaded."
-        : !rows.length ? (targets ? "Loading the Jevcode summary…" : "No agent session is available for a summary.")
-          : updating ? "Jevcode is writing the summary." : chosen?.status.error || "No Jevcode summary yet."
+      !poll.online && !poll.loading && !rows.length ? "Could not load."
+        : !rows.length ? (targets ? "Loading…" : "No agent to summarize.")
+          : updating ? "Writing…" : chosen?.status.error || "No summary yet."
     }</Text> : <>
       <Clamp text={brief?.summary || text} lines={5} />
       {brief?.review?.length ? <View style={s.group}>
@@ -121,10 +121,10 @@ export function JevcodeSummary({ connection, team }: { connection: Connection; t
       {brief?.guidance?.length ? <Disclosure title={`Guidance for agents · ${brief.guidance.length}`}>
         {brief.guidance.map((item, index) => <Text key={index} selectable style={t.body}>• {[item.basis, item.text].filter(Boolean).join(": ")}</Text>)}
       </Disclosure> : null}
-      <Text style={t.note}>Jevcode’s reading of recorded activity and the repository. Not completion or approval.</Text>
+      <Text style={t.note}>Not completion or approval.</Text>
     </>}
     {askError ? <Text accessibilityRole="alert" style={t.error}>{askError}</Text> : null}
-    {canAsk && chosen ? <Button compact secondary title={asking ? "Asking Jevcode… a few minutes" : "Ask Jevcode for a summary"} disabled={asking} onPress={() => void ask(chosen.sessionId)} /> : null}
+    {canAsk && chosen ? <Button compact secondary title={asking ? "Writing… a few minutes" : "Summarize"} disabled={asking} onPress={() => void ask(chosen.sessionId)} /> : null}
   </Card>;
 }
 
@@ -138,14 +138,14 @@ export function AgentLog({ connection, member, live, onOpen }: { connection: Con
   const log = poll.data?.sessionId === member.sessionId ? poll.data : null;
   const screen = log ? plainScreen(log.screen, 30) : "";
   return <View style={s.log}>
-    {!poll.online && !poll.loading ? <Text style={t.warning}>This agent’s log could not be refreshed. Showing the last received screen.</Text> : null}
+    {!poll.online && !poll.loading ? <Text style={t.warning}>Offline · last received screen.</Text> : null}
     <ScrollView horizontal style={s.screen} contentContainerStyle={s.screenContent}>
-      <Text selectable style={s.screenText}>{log ? screen || (live ? "Waiting for output…" : "No screen is recorded for this agent.") : "Loading the screen…"}</Text>
+      <Text selectable style={s.screenText}>{log ? screen || (live ? "Waiting for output…" : "No screen recorded.") : "Loading…"}</Text>
     </ScrollView>
     {log?.events.length ? [...log.events].slice(-5).reverse().map(event => <View key={event.seq} style={s.event}>
       <Text style={s.eventTime} numberOfLines={1}>{new Date(event.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</Text>
       <Text selectable style={[t.note, s.fill]} numberOfLines={2}>{controlEventText(event)}</Text>
-    </View>) : log ? <Text style={t.note}>No recent control events.</Text> : null}
+    </View>) : log ? <Text style={t.note}>No recent events.</Text> : null}
     <Button compact secondary glyph="terminal" title="Open session" onPress={onOpen} />
   </View>;
 }

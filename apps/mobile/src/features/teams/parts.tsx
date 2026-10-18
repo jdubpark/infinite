@@ -105,7 +105,7 @@ export function RequestStatus({ request, canRetry, subject }: { request: RunRequ
       <Text style={t.note} numberOfLines={2}>{request.busy ? "Sending" : "Unconfirmed"} {pending.label.toLowerCase()} · revision {pending.revision}{pending.fields.text ? ` · “${pending.fields.text}”` : ""}</Text>
       {!request.busy ? <View style={s.row}>
         <Button compact title="Retry same request" disabled={!canRetry} onPress={request.retry} />
-        <Button compact title="Clear…" secondary onPress={() => Alert.alert("Clear the unconfirmed request?", `The host may already have applied it. Check the ${subject} first; clearing only forgets it on this phone.`, [
+        <Button compact title="Clear…" secondary onPress={() => Alert.alert("Clear the unconfirmed request?", `The host may have applied it. Clearing only forgets it here.`, [
           { text: "Keep pending", style: "cancel" },
           { text: "Clear", style: "destructive", onPress: request.discard },
         ])} />

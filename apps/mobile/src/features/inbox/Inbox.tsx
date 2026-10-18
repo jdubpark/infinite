@@ -16,7 +16,7 @@ import { Glyph, StatusIcon } from "../../components/Icon";
 import { OfflineBanner } from "../../components/OfflineBanner";
 import { age, SESSION_KIND, SESSION_LABELS, type StatusKind } from "../../status";
 import { theme } from "../../theme";
-import { goalGroup, ROLE_NAMES, teamGroup, type ProductGoal, type TeamView } from "../teams/model";
+import { goalGroup, pendingApprovals, ROLE_NAMES, teamGroup, type ProductGoal, type TeamView } from "../teams/model";
 import { GoalList, listStyles, TeamList } from "../teams/RunLists";
 
 export type InboxView = "sessions" | "teams" | "goals";
@@ -81,23 +81,21 @@ export function Inbox({
   const shown = hasTeams ? view : "sessions";
   const refreshAll = () => { refresh(); teamsPoll.refresh(); goalsPoll.refresh(); };
   const runs = shown === "goals" ? goalsPoll : teamsPoll;
-  const sessions = data?.sessions ?? [];
+  const all = data?.sessions ?? [];
+  // Team agents are the coordinator's to steer; they appear under their team and in search.
+  const sessions = all.filter(session => !session.team);
+  const teamAgents = all.length - sessions.length;
   const now = data?.at ?? 0;
   const waiting = {
     sessions: sessions.filter(session => session.attention.state === "needs-you").length,
-    teams: teams.filter(team => teamGroup(team) === "attention").length,
+    teams: teams.filter(team => teamGroup(team, pendingApprovals(team, all).length) === "attention").length,
     goals: goals.filter(goal => goalGroup(goal) === "attention").length,
   };
-  const matches = sessions.filter(session => [session.title, session.id, PROVIDER_NAMES[session.provider]]
+  const matches = (query.trim() ? all : sessions).filter(session => [session.title, session.id, PROVIDER_NAMES[session.provider]]
     .some(value => value.toLowerCase().includes(query.trim().toLowerCase())));
   const owner = data?.me.role === "owner";
   const canCreate = owner && online && (shown === "sessions" || (shown === "teams" ? data?.me.teams?.enabled : data?.me.goals?.enabled));
   const create = () => router.push({ pathname: shown === "sessions" ? "/new" : shown === "teams" ? "/team/new" : "/goal/new", params: { machine: connectionKey(connection) } });
-  const active = (list: { status: string }[], states: string[]) => list.filter(item => states.includes(item.status)).length;
-  const summary = shown === "sessions"
-    ? `${sessions.filter(session => session.status === "running").length} running${waiting.sessions ? ` · ${waiting.sessions} need you` : ""}`
-    : shown === "teams" ? `${teams.length - active(teams, ["cancelled", "no-change"])} open of ${teams.length}${waiting.teams ? ` · ${waiting.teams} need you` : ""}`
-      : `${goals.length - active(goals, ["cancelled", "no-opportunity", "achieved"])} open of ${goals.length}${waiting.goals ? ` · ${waiting.goals} need you` : ""}`;
 
   return (
     <View style={s.fill}>
@@ -110,16 +108,15 @@ export function Inbox({
       </View>
       <OfflineBanner
         online={online || loading}
-        message="This view may be stale. Your agents may still be running. Check the machine and your network connection."
+        message="Offline · showing the last received view. Agents may still be running."
       />
-      {shown !== "sessions" ? <OfflineBanner online={runs.online || runs.loading} message="Team and goal updates are unavailable. Showing the last received state." /> : null}
+      {shown !== "sessions" ? <OfflineBanner online={runs.online || runs.loading} message="Teams offline · last received state." /> : null}
       <ScrollView contentContainerStyle={s.list} keyboardShouldPersistTaps="handled"
         refreshControl={<RefreshControl refreshing={refreshing || runs.refreshing} onRefresh={refreshAll} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
         <Text style={s.title} accessibilityRole="header">{shown === "teams" ? "Teams" : shown === "goals" ? "Goals" : "Sessions"}</Text>
-        <Text style={s.summary}>{summary}</Text>
-        {shown === "teams" && data ? <TeamList connection={connection} me={data.me} teams={teams} sessions={sessions} now={now} />
+        {shown === "teams" && data ? <TeamList connection={connection} me={data.me} teams={teams} sessions={all} now={now} />
           : shown === "goals" && data ? <GoalList connection={connection} me={data.me} goals={goals} now={now} /> : <>
-            {sessions.length > 4 || query ? <View style={s.search}>
+            {all.length > 4 || query ? <View style={s.search}>
               <Glyph name="search" size={15} color={theme.colors.placeholder} />
               <TextInput accessibilityLabel="Find a session" placeholder="Find a session" value={query} onChangeText={setQuery}
                 autoCorrect={false} autoCapitalize="none" placeholderTextColor={theme.colors.placeholder} style={s.searchInput} />
@@ -127,7 +124,7 @@ export function Inbox({
                 <Glyph name="close" size={13} color={theme.colors.mutedInk} />
               </Pressable> : null}
             </View> : null}
-            {!matches.length && query ? <Text style={s.summary}>No sessions match this search.</Text> : null}
+            {!matches.length && query ? <Text style={s.summary}>No matches.</Text> : null}
             {groupSessions(matches).map((group) => {
               const folded = group.title === "Exited" && !exitedOpen && !query;
               return <View key={group.title}>
@@ -160,9 +157,14 @@ export function Inbox({
                 ))}
               </View>;
             })}
-            {!sessions.length && online ? <View style={listStyles.empty}>
-              <Text style={listStyles.emptyTitle}>A session that stays</Text>
-              <Text style={listStyles.meta}>{owner ? "Start a session on this machine with +." : "Sessions appear here when an owner creates one on this machine."}</Text>
+            {teamAgents && !query ? <Pressable accessibilityRole="button" onPress={() => setView("teams")} style={s.agents} hitSlop={6}>
+              <Glyph name="people" size={14} color={theme.colors.mutedInk} />
+              <Text style={[listStyles.meta, s.fill]}>{teamAgents} team {teamAgents === 1 ? "agent" : "agents"} · in Teams</Text>
+              <Glyph name="forward" size={11} color={theme.colors.mutedInk} />
+            </Pressable> : null}
+            {!all.length && online ? <View style={listStyles.empty}>
+              <Text style={listStyles.emptyTitle}>No sessions</Text>
+              <Text style={listStyles.meta}>{owner ? "Start one with +." : "None yet."}</Text>
             </View> : null}
           </>}
       </ScrollView>
@@ -179,13 +181,13 @@ export function Inbox({
         {machines.map(machine => {
           const key = connectionKey(machine);
           const current = key === connectionKey(connection);
-          return <SheetRow key={key} selected={current} label={machineName(machine)} detail={current ? (online ? "Connected" : "Not responding") : "Switch to this machine"}
+          return <SheetRow key={key} selected={current} label={machineName(machine)} detail={current ? (online ? "Connected" : "Offline") : undefined}
             icon={<Avatar label={machineName(machine)} size={26} />} onPress={() => { setMachineSheet(false); if (!current) onSelectMachine(key); }} />;
         })}
-        <SheetRow glyph="plus" label="Add machine" detail="Pair this phone with another machine" onPress={() => { setMachineSheet(false); onAddMachine(); }} />
+        <SheetRow glyph="plus" label="Add machine" onPress={() => { setMachineSheet(false); onAddMachine(); }} />
         {pushNote ? <Text style={s.push}>{pushNote}</Text> : null}
-        <SheetRow glyph="close" destructive label={`Remove ${machineName(connection)}…`} detail="Forget this machine on this phone"
-          onPress={() => Alert.alert(`Remove ${machineName(connection)}?`, "This phone forgets the machine, its drafts, and its notifications. Agents on the machine keep running.", [
+        <SheetRow glyph="close" destructive label={`Remove ${machineName(connection)}…`}
+          onPress={() => Alert.alert(`Remove ${machineName(connection)}?`, "Forgets it on this phone. Its agents keep running.", [
             { text: "Keep", style: "cancel" },
             { text: "Remove", style: "destructive", onPress: () => { setMachineSheet(false); onDisconnect(); } },
           ])} />
@@ -211,4 +213,5 @@ const s = StyleSheet.create({
   dock: { position: "absolute", left: 12, right: 12, bottom: 10, flexDirection: "row", alignItems: "center", gap: 10 },
   tabs: { flex: 1, backgroundColor: theme.colors.glass, borderWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.glassRim, padding: 4, ...theme.lift },
   push: { fontSize: 12, color: theme.colors.mutedInk, paddingHorizontal: 50, paddingBottom: 6 },
+  agents: { flexDirection: "row", alignItems: "center", gap: 8, minHeight: 44, marginTop: 8 },
 });

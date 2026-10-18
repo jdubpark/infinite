@@ -19,6 +19,7 @@ import {
 } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Avatar } from "../../components/Avatar";
+import { Button } from "../../components/Button";
 import { Composer } from "../../components/Composer";
 import { ControlBar } from "../../components/ControlBar";
 import { DecisionCard } from "../../components/DecisionCard";
@@ -26,7 +27,7 @@ import { MomentRow } from "../../components/MomentRow";
 import { NowCard } from "../../components/NowCard";
 import { OfflineBanner } from "../../components/OfflineBanner";
 import { Chip, GlassButton, LiveStatus, Segmented, TopBar } from "../../components/Glass";
-import { Glyph } from "../../components/Icon";
+import { Glyph, StatusIcon } from "../../components/Icon";
 import { StatePill } from "../../components/StatePill";
 import { theme } from "../../theme";
 import { ROLE_NAMES } from "../teams/model";
@@ -173,15 +174,15 @@ export function Brief({
               {me?.role === "viewer" ? <Chip label="View only" /> : null}
             </View>
             <Text style={s.small} numberOfLines={1}>
-              Tools on {toolsOn} · {online ? `updated ${seen}` : seen ? `cached view from ${seen}` : "waiting for a fresh response…"}
+              {toolsOn} · {online ? seen : seen ? `cached ${seen}` : "waiting…"}
             </Text>
             {tools ? <Text style={s.small} numberOfLines={2}>{tools}</Text> : null}
           </View>
           <OfflineBanner
             online={online}
-            message="Last received view. Answers and input are paused until the host reconnects."
+            message="Offline · last received view. Input paused."
           />
-          <ControlBar
+          {session.team ? null : <ControlBar
             role={me?.role}
             requiresControl={requiresControl}
             running={running}
@@ -195,7 +196,7 @@ export function Brief({
               control.forget(true);
               refresh();
             }}
-          />
+          />}
           <ScrollView
             style={s.fill}
             contentContainerStyle={s.scrollBody}
@@ -211,7 +212,16 @@ export function Brief({
                 {answering.notice}
               </Text>
             ) : null}
-            {prompt ? (
+            {prompt && session.team ? (
+              // A member's open prompt is approved from its team, beside the coordinator's review.
+              <View style={s.pointer}>
+                <View style={s.pointerHead}>
+                  <StatusIcon kind="attention" size={16} />
+                  <Text style={[s.pointerTitle, s.fill]}>Waiting on approval</Text>
+                </View>
+                <Button compact title="Open team" onPress={() => router.push({ pathname: "/team/[id]", params: { id: session.team!.runId, machine: connectionKey(connection) } })} />
+              </View>
+            ) : prompt ? (
               <DecisionCard
                 key={prompt.id}
                 prompt={prompt}
@@ -258,9 +268,16 @@ export function Brief({
               </View>
             )}
             </>}
-            <Lifecycle connection={connection} session={session} role={me?.role} online={online} control={control.lease?.id} refresh={refresh} />
+            {session.team ? null : <Lifecycle connection={connection} session={session} role={me?.role} online={online} control={control.lease?.id} refresh={refresh} />}
           </ScrollView>
-          {me && me.role !== "viewer" ? (
+          {session.team ? (
+            // A team member is the coordinator's to steer, pause, or stop; direction goes to the team.
+            <View style={s.managed}>
+              <Glyph name="people" size={16} color={theme.colors.secondaryInk} />
+              <Text style={s.managedText}>Run by the coordinator</Text>
+              <Button compact title="Team" onPress={() => router.push({ pathname: "/team/[id]", params: { id: session.team!.runId, machine: connectionKey(connection) } })} />
+            </View>
+          ) : me && me.role !== "viewer" ? (
             <Composer
               canSteer={canSteer}
               onTakeControl={online && running && !controlled ? () => void takeControl(Boolean(control.holder)) : undefined}
@@ -316,4 +333,24 @@ const s = StyleSheet.create({
   notice: { fontSize: 12, lineHeight: 18, color: theme.colors.warningInk },
   emptyTimeline: { gap: 4, paddingVertical: 8 },
   placeholder: { fontSize: 13, lineHeight: 20, color: theme.colors.mutedInk },
+  managed: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginHorizontal: 12,
+    marginBottom: 10,
+    marginTop: 6,
+    paddingVertical: 6,
+    paddingLeft: 14,
+    paddingRight: 6,
+    borderRadius: 26,
+    backgroundColor: theme.colors.glass,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: theme.colors.glassRim,
+    ...theme.lift,
+  },
+  managedText: { flex: 1, fontSize: 13, lineHeight: 18, color: theme.colors.secondaryInk },
+  pointer: { gap: 8, padding: 14, borderRadius: theme.radius.card, backgroundColor: theme.colors.warningSurface, alignItems: "flex-start" },
+  pointerHead: { flexDirection: "row", alignItems: "center", gap: 8 },
+  pointerTitle: { fontSize: 15, fontWeight: "600", color: theme.colors.ink },
 });

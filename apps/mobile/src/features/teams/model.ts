@@ -16,6 +16,8 @@ export type TeamBrief = { title: string; problem: string; evidence: TeamEvidence
 export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { toProfileId: string; reason: string } };
 export type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string };
 export type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string };
+/** The coordinator's recorded decision about one member's open provider prompt; the prompt itself stays host-private. */
+export type PermissionDecision = { id: string; revision: number; targetMemberId: string; targetSessionId: string; promptId: number; expiresAt: string; status: "pending" | "reviewing" | "approved" | "answering" | "answered" | "escalated" | "stale" | "uncertain"; reason?: string };
 export type TeamCheck = { command: TeamCommand; phase?: "setup"; status: "running" | "passed" | "failed" | "interrupted"; startedAt: string; finishedAt?: string; exitCode?: number | null; output: string; revision: number };
 export type TeamView = {
   id: string; projectId: string; provider: string; title: string; objective: string; parallelism: number;
@@ -31,6 +33,12 @@ export type TeamView = {
   noChange?: { summary: string; evidence: TeamEvidence[] };
   /** The host can start a fresh plan from the preserved integration commit, as after a member's runtime limit. */
   resumable?: boolean;
+  /** Owner-authorized merge after review, pinned at creation; absent runs are review-only. */
+  delivery?: { mode: "merge"; repository: string; baseBranch: string };
+  /** Owner delegation of routine one-shot permissions to the coordinator, pinned at creation. */
+  permissions?: { mode: "coordinator"; scope: string; maxDecisions: number };
+  permissionsRevokedAt?: string;
+  permissionDecisions?: PermissionDecision[];
 };
 
 export type GoalStatus = "running" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-opportunity" | "limit-reached" | "cancelled" | "achieved";
@@ -93,12 +101,12 @@ const PHASE_FLOOR: Partial<Record<TeamStatus, number>> = {
 };
 
 /** The run's status icon. Words beside it carry the meaning; a filled ring is not completion. */
-export function teamKind(team: TeamView): { kind: StatusKind; fraction: number } {
+export function teamKind(team: TeamView, approvals = 0): { kind: StatusKind; fraction: number } {
   if (team.status === "cancelled") return { kind: "cancelled", fraction: 0 };
   if (team.status === "no-change") return { kind: "stopped", fraction: 0 };
   if (team.status === "paused") return { kind: "paused", fraction: 0 };
   if (team.status === "blocked") return { kind: "blocked", fraction: 0 };
-  if (team.status === "needs-input" || openDecisions(team).length) return { kind: "attention", fraction: 0 };
+  if (team.status === "needs-input" || openDecisions(team).length || approvals) return { kind: "attention", fraction: 0 };
   if (team.status === "ready-for-review" || team.status === "merged") return { kind: "review", fraction: 1 };
   const { done, total } = teamProgress(team);
   return { kind: "progress", fraction: Math.max(PHASE_FLOOR[team.status] ?? 0.25, total ? done / total : 0) };
@@ -127,9 +135,9 @@ export const RUN_GROUPS: { group: RunGroup; title: string; kind: StatusKind }[] 
 ];
 
 /** Stopped runs are closed even with unanswered questions, since those can no longer be answered. */
-export function teamGroup(team: TeamView): RunGroup {
+export function teamGroup(team: TeamView, approvals = 0): RunGroup {
   if (team.status === "cancelled" || team.status === "no-change") return "closed";
-  if (team.status === "needs-input" || team.status === "blocked" || openDecisions(team).length) return "attention";
+  if (team.status === "needs-input" || team.status === "blocked" || openDecisions(team).length || approvals) return "attention";
   if (team.status === "ready-for-review" || team.status === "merged") return "review";
   return "active";
 }
@@ -174,6 +182,52 @@ export function memberKind(status: string): StatusKind {
     case "unavailable": return "error";
     default: return "todo";
   }
+}
+
+/** The parts of a member session's open prompt that decide who answers it. */
+export type WaitingSession = { id: string; attention: { state: string; prompt?: { id: number; kind: string; destructive?: unknown; multiSelect?: boolean } } };
+
+/**
+ * Who answers a member's open provider prompt. The coordinator owns it while its recorded decision
+ * is in flight, and owns a fresh one-shot permission when the run delegated permissions and has
+ * decisions left. Everything else waits on a person: escalations, stale or uncertain decisions,
+ * questions, destructive or multi-select prompts, and runs without delegation.
+ */
+export function approvalOwner(team: TeamView, sessionId: string, prompt?: WaitingSession["attention"]["prompt"]): "coordinator" | "person" {
+  const decision = [...(team.permissionDecisions ?? [])].reverse().find(item => item.targetSessionId === sessionId && item.promptId === prompt?.id);
+  if (decision) return ["pending", "reviewing", "approved", "answering"].includes(decision.status) ? "coordinator" : "person";
+  const delegated = Boolean(team.permissions) && !team.permissionsRevokedAt && (team.permissionDecisions?.length ?? 0) < (team.permissions?.maxDecisions ?? 0);
+  return delegated && prompt?.kind === "permission" && !prompt.destructive && !prompt.multiSelect ? "coordinator" : "person";
+}
+
+/** Live members of the current revision whose open prompt waits on a person rather than the coordinator. */
+export function pendingApprovals<S extends WaitingSession>(team: TeamView, sessions: S[]) {
+  const listed = new Map(sessions.map(session => [session.id, session]));
+  return team.members.flatMap(member => {
+    const session = listed.get(member.sessionId);
+    if (member.revision !== team.revision || !["running", "waiting"].includes(member.status) || session?.attention.state !== "needs-you") return [];
+    return approvalOwner(team, member.sessionId, session.attention.prompt) === "person" ? [{ member, session }] : [];
+  });
+}
+
+export type PhaseState = "done" | "current" | "todo";
+/**
+ * Where the run stands on its way from plan to review (and delivery when the owner configured it).
+ * Waiting, paused, and stopped runs keep the step their recorded work reached.
+ */
+export function teamPhases(team: TeamView): { label: string; state: PhaseState }[] {
+  const labels = ["Plan", "Build", "Integrate", "Check", "Review", ...(team.delivery || team.status === "delivering" || team.status === "merged" || team.deliveryReceipt ? ["Deliver"] : [])];
+  const byStatus: Partial<Record<TeamStatus, number>> = { planning: 0, discovering: 0, implementing: 1, integrating: 2, verifying: 3, reviewing: 4, delivering: 5 };
+  const reviewed = team.review?.revision === team.revision && team.review.verdict === "approved";
+  const finished = team.status === "merged" || Boolean(team.deliveryReceipt) || (team.status === "ready-for-review" && reviewed && labels.length === 5);
+  let current = byStatus[team.status]
+    ?? (team.status === "ready-for-review" ? labels.length - 1
+      : !team.tasks.length ? 0
+        : team.tasks.some(task => task.status !== "integrated") ? 1
+          : team.review?.revision === team.revision ? 4
+            : team.checks.some(check => check.revision === team.revision) ? 3 : 2);
+  current = Math.min(current, labels.length - 1);
+  return labels.map((label, index) => ({ label, state: finished || index < current ? "done" : index === current ? "current" : "todo" }));
 }
 
 /** A workspace can run a team once it has required checks or authorizes the team to establish them. */

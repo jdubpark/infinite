@@ -4,7 +4,7 @@ import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
-import { Card, Chip, GlassButton, LiveStatus, ProgressBar, Sheet, SheetRow, TopBar } from "../../components/Glass";
+import { Card, Chip, LiveStatus, ProgressBar, TopBar } from "../../components/Glass";
 import { StatusIcon } from "../../components/Icon";
 import { theme } from "../../theme";
 import {
@@ -27,7 +27,6 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   const active = usePoll(() => activeId ? api<TeamView>(connection, `/teams/${activeId}`) : Promise.resolve(null), 4000, [connection, activeId]);
   const activeTeam = active.data?.id === activeId ? active.data : null;
   const [direction, setDirection] = useState("");
-  const [actions, setActions] = useState(false);
   const request = useRunRequest<ProductGoal>(connection, `${machine}/goal/${id}`, {
     accepted: (result, sent) => { setRecorded(result); if (sent.path.endsWith("/steer")) setDirection(""); poll.refresh(); },
     refused: poll.refresh,
@@ -39,10 +38,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   }
   const openTeam = (teamId: string) => router.push({ pathname: "/team/[id]", params: { id: teamId, machine } });
   const owns = me?.role === "owner" && goal && !["cancelled", "achieved"].includes(goal.status);
-  const header = <TopBar backLabel="Goals" onBack={back} right={<>
-    <LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} />
-    {owns ? <GlassButton glyph="more" label="Goal actions" onPress={() => setActions(true)} /> : null}
-  </>} />;
+  const header = <TopBar backLabel="Goals" onBack={back} right={<LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} />} />;
   if (!goal) return <View style={s.fill}>{header}<View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading goal…" : "The goal could not be loaded. Check the machine and try again."}</Text></View></View>;
 
   const controls = goalControls(goal, me?.role, fresh, poll.data?.receivedAt);
@@ -56,7 +52,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
 
   return <KeyboardAvoidingView style={s.fill} behavior="padding">
     {header}
-    {!fresh ? <Text style={t.banner}>Last received goal state. Controls are paused until the host reconnects. Its team may still be working.</Text> : null}
+    {!fresh ? <Text style={t.banner}>Offline · last received state. Controls paused.</Text> : null}
     <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View style={s.titleBlock}>
@@ -72,6 +68,14 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
           <Chip label={`Rev ${goal.revision}`} accessibilityLabel={`Revision ${goal.revision}`} />
         </View>
         {goal.linear?.reason ? <Text style={t.warning}>{goal.linear.reason}</Text> : null}
+        {owns ? <View style={s.metaRow}>
+          {goal.status === "paused" && !expired ? <Button compact glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("resume", "Resume")} />
+            : ["running", "needs-input"].includes(goal.status) ? <Button compact secondary glyph="pause" title="Pause" disabled={!controls.pause || locked} onPress={() => send("pause", "Pause")} /> : null}
+          <Button compact secondary glyph="close" title="Cancel…" disabled={!controls.cancel || locked} onPress={() => Alert.alert("Cancel this goal?", "Stops active work. Cycles stay.", [
+            { text: "Keep goal", style: "cancel" },
+            { text: "Cancel goal", style: "destructive", onPress: () => send("cancel", "Cancellation") },
+          ])} />
+        </View> : null}
       </View>
       {goal.reason ? <Card attention><Text style={t.warning}>{goal.reason}</Text></Card> : null}
 
@@ -82,7 +86,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
             <Text style={[t.strong, s.fill]}>{activeTeam?.title ?? "Team cycle"}</Text>
           </View>
           {activeTeam ? <Text style={t.note}>{TEAM_LABELS[activeTeam.status]}</Text> : null}
-          {!active.online ? <Text style={t.note}>Team details may be out of date. Open the team for its current state.</Text> : null}
+          {!active.online ? <Text style={t.note}>May be out of date.</Text> : null}
           {decisions.length ? <>
             <Text style={t.warning}>{decisions.length === 1 ? "1 decision needs" : `${decisions.length} decisions need`} your input.</Text>
             {decisions.map(decision => <Text key={decision.id} style={t.body} numberOfLines={3}>{decision.question}</Text>)}
@@ -95,7 +99,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
         <Clamp text={goal.objective} />
         <Text style={t.label}>Success criteria</Text>
         <Clamp text={goal.successCriteria} lines={4} />
-        <Text style={t.note}>Reviewed code and passing checks are implementation evidence. Only a recorded human assessment establishes the product outcome.</Text>
+        <Text style={t.note}>Only your assessment sets the outcome.</Text>
       </Section>
 
       <Section title="Work limits">
@@ -130,10 +134,10 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
           <Clamp text={outcome.summary} lines={3} />
           <Text style={t.note}>Evidence</Text>
           <Clamp text={outcome.evidence} lines={3} />
-        </View>) : <Text style={t.note}>No human outcome assessment has been recorded.</Text>}
+        </View>) : <Text style={t.note}>Not assessed yet.</Text>}
         {me && me.role !== "viewer" ? goalStopped(goal)
           ? <OutcomeForm key={goal.outcomes.length} disabled={!controls.outcome || locked} onSubmit={value => send("outcome", "Your outcome assessment", value)} />
-          : <Text style={t.note}>Let the goal finish, or cancel it and wait for active work to stop, before recording an outcome.</Text> : null}
+          : <Text style={t.note}>Assess once the goal stops.</Text> : null}
       </Section>
 
       {goal.steering.length ? <Section title="Your directions">
@@ -149,20 +153,11 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
       <RequestStatus request={request} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|outcome)$/.test(request.pending?.path ?? ""))} subject="goal" />
       <SteerBox value={direction} onChange={setDirection} placeholder="Update the goal’s direction or add evidence…"
         enabled={controls.steer && !locked} busy={request.busy}
-        note={me?.role === "viewer" ? "This device can view the goal. An owner or controller can send direction and record outcomes."
-          : goal.status === "paused" ? !expired ? "Resume the goal to send direction. The original scope, limits, and deadline still apply." : "This goal’s time limit has expired. Start a new goal to approve more time."
+        note={me?.role === "viewer" ? "View only."
+          : goal.status === "paused" ? !expired ? "Resume to steer." : "This goal’s time limit has expired. Start a new goal to approve more time."
             : !["running", "needs-input"].includes(goal.status) ? goal.status === "achieved" ? "The achieved outcome was recorded by a person." : "This goal will start no further cycles. Start a new goal to approve further changes." : undefined}
         onSend={() => { const text = direction.trim(); if (text) send("steer", "Direction", { text }); }} />
     </View>
-    <Sheet visible={actions} onClose={() => setActions(false)} title="Goal">
-      {goal.status === "paused" && !expired ? <SheetRow glyph="play" label="Resume goal" disabled={!controls.resume || locked} onPress={() => { setActions(false); send("resume", "Resume"); }} />
-        : ["running", "needs-input"].includes(goal.status) ? <SheetRow glyph="pause" label="Pause goal" disabled={!controls.pause || locked} onPress={() => { setActions(false); send("pause", "Pause"); }} /> : null}
-      <SheetRow glyph="close" destructive label="Cancel goal…" detail="Stops active work; keeps recorded cycles" disabled={!controls.cancel || locked}
-        onPress={() => Alert.alert("Cancel this goal?", "Active work will stop. Its recorded cycles remain available.", [
-          { text: "Keep goal", style: "cancel" },
-          { text: "Cancel goal", style: "destructive", onPress: () => { setActions(false); send("cancel", "Cancellation"); } },
-        ])} />
-    </Sheet>
   </KeyboardAvoidingView>;
 }
 

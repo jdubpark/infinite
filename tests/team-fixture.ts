@@ -41,6 +41,9 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
   const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
   writeFileSync(opencode, `#!/bin/sh\nexec ${[process.execPath, resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "opencode"].map(quote).join(" ")} "$@"\n`);
   chmodSync(opencode, 0o700);
+  const claude = join(root, "claude");
+  writeFileSync(claude, `#!/bin/sh\nexec ${[process.execPath, resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "claude"].map(quote).join(" ")} "$@"\n`);
+  chmodSync(claude, 0o700);
   git(source, "init", "--initial-branch=main");
   const bootstrap = scenario.startsWith("bootstrap");
   if (!bootstrap)
@@ -66,7 +69,7 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
       agents: {
         demo: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), scenario, receipts] },
         ...(lineup ? {
-          claude: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "claude"] },
+          claude: { command: claude, args: scenario === "permissions-launch-invalid" ? ["--dangerously-skip-permissions"] : [] },
           codex: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "codex"] },
           opencode: { command: opencode, args: [] },
         } : {}),
@@ -77,7 +80,7 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
         } : {}) },
         remote: { enabled: true },
         projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
-          team: { ...(scenario.startsWith("delivery") ? { delivery: { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}), checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
+          team: { ...(scenario.startsWith("delivery") ? { delivery: { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}), ...(scenario.startsWith("permissions") ? { setup: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--permission-setup", receipts] } } : {}), ...(scenario.startsWith("permissions") && scenario !== "permissions-off" ? { permissions: { mode: "coordinator" as const, scope: "Approve only read access needed to inspect this project for the stated objective.", maxDecisions: 2 } } : {}), checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
             { command: process.execPath, args: ["check.mjs", ...(scenario.endsWith("failed-check") ? ["--fail"] : []), ...(scenario === "success" ? ["--prefix"] : [])] },
             ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
           ] }) } }],

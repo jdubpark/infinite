@@ -157,6 +157,11 @@ export class LinearService {
       const receipt = run.deliveryReceipt;
       this.comment(stored, `delivery:${receipt.revision}:${receipt.headCommit}`, `Delivery agent reported a merged pull request: ${receipt.pullRequestUrl}\n\nReviewed head: ${receipt.headCommit}\nReported merge commit: ${receipt.mergeCommit}\n\n${receipt.summary}\n\nThis is agent-reported delivery evidence, not independent host verification or a product outcome.`);
     }
+    for (const decision of run.permissionDecisions ?? []) {
+      if (!["answered", "escalated", "stale", "uncertain"].includes(decision.status)) continue;
+      this.comment(stored, `permission:${decision.id}:${decision.status}`,
+        `Delegated permission decision ${decision.id}\n\nStatus: ${decision.status}\nRun revision: ${decision.revision}\nTarget member: ${decision.targetMemberId}\nTarget session: ${decision.targetSessionId}\nPrompt: ${decision.promptId}\nCoordinator member: ${decision.coordinatorMemberId ?? "not assigned"}\nAnswer request: ${decision.answerRequestId}\nDelivery: ${decision.receipt ? `${decision.receipt.state}; ${decision.receipt.result ?? "unconfirmed"}; journal sequence ${decision.receipt.seq}` : decision.status === "uncertain" ? "dispatch or result unconfirmed" : "no recorded dispatch"}\n\nThe owner delegated one-shot tool decisions under this run's pinned repository policy. Approval is separate from successful tool execution. This comment omits prompt content and the coordinator's summary.`);
+    }
     if (evidenceStatuses.has(run.status)) {
       const checks = run.checks.filter(check => check.revision === run.revision);
       this.comment(stored, `status:${run.revision}:${run.status}`, `Infinite feature execution\n\nStatus: ${run.status}\nAgent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`);

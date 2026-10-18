@@ -7,13 +7,14 @@ import { ProviderLimits } from "./provider-limits.js";
 import type { Config } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamPermissionDecision, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
 import { teamPrompt } from "./team-prompts.js";
-import { teamModelLaunch } from "./launch.js";
+import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
 import type { LinearService } from "./linear.js";
 import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
+import { oneShotPermissionOption, permissionEvidenceHash } from "./team-permissions.js";
 export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
@@ -58,10 +59,26 @@ export class TeamService {
       this.records.set(id, stored);
       if (stored.pending) {
         for (const check of stored.run.checks) if (check.status === "running") { check.status = "interrupted"; check.finishedAt = timestamp(); }
-        stored.run.status = "blocked"; stored.halt = "block";
-        stored.run.reason = "The host restarted during a workspace or verification operation. Inspect the isolated workspace before starting a new team; the operation will not be replayed.";
-        this.event(stored, stored.run.reason);
+        if (stored.run.status === "cancelled") {
+          stored.halt = "cancel";
+          this.event(stored, "The host restarted with an unresolved operation from a cancelled team. The intent remains retained and will not be replayed.");
+        } else {
+          stored.run.status = "blocked"; stored.halt = "block";
+          stored.run.reason = "The host restarted during a workspace or verification operation. Inspect the isolated workspace before starting a new team; the operation will not be replayed.";
+          this.event(stored, stored.run.reason);
+        }
         // Retain the intent so resume cannot disguise an ambiguous operation.
+        this.save(stored);
+      }
+      for (const decision of stored.run.permissionDecisions ?? []) if (decision.status === "answering") {
+        decision.status = "uncertain";
+        decision.reason = "The host restarted while an answer was in flight. Inspect the target session before taking any further action.";
+        this.event(stored, decision.reason);
+        this.save(stored);
+      }
+      if (stored.pending) for (const decision of stored.run.permissionDecisions ?? []) if (["pending", "reviewing", "approved"].includes(decision.status)) {
+        decision.status = "stale";
+        decision.reason = "The host restarted during a team operation. Review this request with the user.";
         this.save(stored);
       }
     }
@@ -90,7 +107,8 @@ export class TeamService {
     // to continue from a newly reviewed or no-change result.
     const tracking = this.linear?.updateTeam(stored.run, stored.run.linearTracking === true);
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
-    return { ...run, ...(this.usage ? { usage: this.usage.aggregate(members) } : {}), providerLimits: this.limits.active(), members: members.map(({ prompt: _prompt, feedback: _feedback, pendingLimit: _pendingLimit, ...member }) => {
+    const safeRun = { ...run, ...(run.permissionDecisions ? { permissionDecisions: run.permissionDecisions.map(({ prompt: _prompt, ...decision }) => decision) } : {}) };
+    return { ...safeRun, ...(this.usage ? { usage: this.usage.aggregate(members) } : {}), providerLimits: this.limits.active(), members: members.map(({ prompt: _prompt, feedback: _feedback, pendingLimit: _pendingLimit, ...member }) => {
       const usage = this.usage?.session(member.sessionId);
       return { ...member, ...(usage?.measured ? { usage } : {}) };
     }) };
@@ -177,6 +195,9 @@ export class TeamService {
         try { teamModelLaunch(this.config.agents[selection.provider]!, selection); }
         catch { throw new TeamError(409, "team-model-profile-conflict", "Move model, effort, and fallback-model arguments from provider profiles into the team lineup before starting this team."); }
       }
+      if (project.team.permissions && (!lineup || lineup.coordinator.tier !== "strong" ||
+          lineup.coordinator.limitFallback !== undefined && lineupProfiles(lineup).find(profile => profile.id === lineup.coordinator.limitFallback)?.tier !== "strong"))
+        throw new TeamError(409, "permission-lineup-required", "Delegated permissions require a strong coordinator and any configured coordinator fallback must also be strong.");
       const parent = goal?.parentRunId ? this.record(goal.parentRunId).run : undefined;
       if (parent && (parent.goal?.id !== goal!.id || parent.projectId !== parsed.projectId || !["ready-for-review", "merged"].includes(parent.status) || !parent.headCommit))
         throw new TeamError(409, "invalid-goal-parent", "Continue only from a ready, recorded run of this goal and project.");
@@ -189,7 +210,7 @@ export class TeamService {
       const directoryName = `${project.teamworkDir ? "" : `${project.id}-`}${at.slice(0, 10)}-${slug}-${suffix}`;
       const branch = `infinite/${slug}-${suffix}`;
       const root = project.teamworkDir ?? this.config.teams.workspaceDir;
-      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: structuredClone(project.team.permissions), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
           throw new TeamError(409, "delivery-lineup-required", "Automatic merge requires a configured strong coordinator and independent strong reviewer.");
@@ -249,7 +270,7 @@ export class TeamService {
   }
   steer(id: string, input: Mutation) {
     const body = teamMutationSchema.parse(input);
-    return this.enqueue(() => {
+    return this.enqueue(async () => {
       const stored = this.record(id);
       if (this.replay(stored, "steer", body)) return this.view(stored);
       if (stored.deliveryAttempt || stored.run.deliveryReceipt) throw new TeamError(409, "delivery-reconciliation-required", "Inspect the recorded pull request before starting another run; steering cannot replay a started delivery.");
@@ -259,6 +280,7 @@ export class TeamService {
       if (stored.run.steering.length >= 20) throw new TeamError(409, "team-steering-limit", "This team reached its steering limit. Start a new team from the reviewed integration branch.");
       if (!this.mutation(stored, "steer", body)) return this.view(stored);
       this.commands.get(id)?.abort();
+      await this.invalidatePermissionDecisions(stored, "The team revision changed before the permission request could be answered.");
       stored.run.revision++; stored.run.steering.push({ text: body.text, revision: stored.run.revision, at: timestamp() });
       stored.run.status = "planning"; stored.halt = "steer"; stored.run.reason = "Stopping earlier members before planning the updated request.";
       stored.run.tasks = []; stored.run.review = undefined; stored.run.round = 0; stored.checkHead = undefined;
@@ -270,7 +292,7 @@ export class TeamService {
   }
   answer(id: string, decisionId: string, input: Mutation, authorizeNewAnswer?: () => void) {
     const body = teamMutationSchema.parse(input);
-    return this.enqueue(() => {
+    return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, `answer:${decisionId}`, body)) return this.view(stored);
       authorizeNewAnswer?.();
@@ -285,11 +307,43 @@ export class TeamService {
       return this.view(stored);
     });
   }
+  revokePermissions(id: string, input: Action) {
+    const body = teamActionSchema.parse(input);
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (!run.permissions) throw new TeamError(409, "permissions-not-enabled", "This team has no delegated permission policy to revoke.");
+      if (this.replay(stored, "revoke-permissions", body)) return this.view(stored);
+      if (!this.mutation(stored, "revoke-permissions", body)) return this.view(stored);
+      run.permissionsRevokedAt ??= timestamp();
+      await this.invalidatePermissionDecisions(stored, "The owner revoked delegated permission decisions.");
+      this.event(stored, "Delegated permission decisions were revoked by the owner.");
+      this.save(stored);
+      return this.view(stored);
+    });
+  }
+  private async invalidatePermissionDecisions(stored: Stored, reason: string) {
+    const inFlight: TeamPermissionDecision[] = [];
+    for (const decision of stored.run.permissionDecisions ?? []) if (["pending", "reviewing", "approved", "answering"].includes(decision.status)) {
+      if (decision.status === "answering") { decision.status = "uncertain"; inFlight.push(decision); }
+      else decision.status = "stale";
+      decision.reason = reason;
+    }
+    if (inFlight.length) this.save(stored);
+    let uncertain = false;
+    for (const decision of inFlight) {
+      try {
+        const fence = await this.manager.invalidateTeamPermission(decision.targetSessionId, decision.id);
+        if (fence !== "invalidated") uncertain = true;
+      } catch { uncertain = true; }
+    }
+    if (uncertain) this.event(stored, "An in-flight delegated permission answer could not be conclusively fenced. Its decision remains uncertain; inspect the target session.");
+    this.save(stored);
+  }
   pause(id: string, input: Action) { return this.action(id, "pause", teamActionSchema.parse(input)); }
   resume(id: string, input: Action) { return this.action(id, "resume", teamActionSchema.parse(input)); }
   cancel(id: string, input: Action) { return this.action(id, "cancel", teamActionSchema.parse(input)); }
   private action(id: string, action: "pause" | "resume" | "cancel", body: Action) {
-    return this.enqueue(() => {
+    return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, action, body)) return this.view(stored);
       if (action === "pause" && ["blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
@@ -303,9 +357,11 @@ export class TeamService {
         run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
         run.brief = undefined; run.noChange = undefined;
         if (run.discovery && !run.discovery.completedAt) run.discovery.completedAt = timestamp();
+        await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
         run.status = "planning"; run.reason = undefined;
       } else {
         run.status = action === "pause" ? "paused" : "cancelled"; stored.halt = action;
+        await this.invalidatePermissionDecisions(stored, `The team was ${action} before the permission request could be answered.`);
         run.reason = "Stopping active team members; any human input lease remains authoritative.";
         this.commands.get(id)?.abort();
       }
@@ -365,6 +421,7 @@ export class TeamService {
   }
   private block(stored: Stored, error: unknown) {
     this.commands.get(stored.run.id)?.abort();
+    void this.invalidatePermissionDecisions(stored, "The team became blocked before the permission request could be answered.");
     if (!["paused", "cancelled"].includes(stored.run.status)) { stored.run.status = "blocked"; stored.halt = "block"; }
     stored.run.reason = stored.run.stopReason === "deadline" ? "The goal reached its deadline. Active work is being stopped and retained for inspection."
       : stored.run.stopReason === "member-limit" ? "The goal reached this run's agent attempt limit. Active work is being stopped and retained for inspection."
@@ -393,6 +450,31 @@ export class TeamService {
         this.limits.clear(session.provider, session.attention.lastSuccessfulTurnAt);
     }
   }
+  private async stopObsoletePermissionCoordinators(stored: Stored) {
+    const run = stored.run;
+    for (const member of run.members.filter(item => item.revision === run.revision && item.role === "permission-coordinator" && activeMember(item))) {
+      const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
+      const target = decision && run.members.find(item => item.memberId === decision.targetMemberId && item.sessionId === decision.targetSessionId);
+      let obsolete = !decision || decision.status !== "reviewing" || run.permissionsRevokedAt || !run.permissions ||
+        ["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status) || !target || !activeMember(target);
+      if (!obsolete && decision && target) {
+        try {
+          const state = await this.manager.state(target.sessionId, true), prompt = state.attention.prompt;
+          obsolete = state.status !== "running" || state.attention.state !== "needs-you" || !prompt ||
+            prompt.id !== decision.promptId || prompt.hash !== decision.promptHash ||
+            permissionEvidenceHash(prompt) !== decision.evidenceHash;
+        } catch { obsolete = true; }
+      }
+      if (!obsolete) continue;
+      if (decision && decision.status === "reviewing") {
+        decision.status = "escalated";
+        decision.reason = "The target request or team stage changed while the read-only permission review was running.";
+      }
+      try { if (!await this.stopped(member)) member.status = "unavailable"; }
+      catch { member.status = "unavailable"; }
+      this.event(stored, "An obsolete permission coordinator was stopped; it cannot authorize a later request."); this.save(stored);
+    }
+  }
   private async switchLimitedMember(stored: Stored, member: TeamMember) {
     const run = stored.run, limit = member.pendingLimit!;
     const provider = member.provider ?? run.provider;
@@ -409,10 +491,18 @@ export class TeamService {
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;
     }
-    const fallback = run.lineup && member.modelProfile ? resolveLimitFallback(run.lineup, member.modelProfile.id, limited) : undefined;
+    const selectedFallback = run.lineup && member.modelProfile ? resolveLimitFallback(run.lineup, member.modelProfile.id, limited) : undefined;
+    const fallback = member.role === "permission-coordinator" && selectedFallback?.provider !== "claude" ? undefined : selectedFallback;
     const reason = `${provider} ${limit.limit} limit reached${limit.resetsAt ? `; resets ${limit.resetsAt}` : ""}`;
     member.stoppedReason = reason;
     if (!fallback) {
+      if (member.role === "permission-coordinator") {
+        const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
+        if (decision) { decision.status = "escalated"; decision.reason = "The coordinator provider reached a limit and no eligible strong fallback is available."; }
+        member.status = "stopped"; this.save(stored);
+        this.event(stored, "The permission review could not continue on an eligible coordinator profile; the request remains with the user.");
+        return;
+      }
       this.block(stored, new TeamError(409, "provider-limit", `${reason}; no fallback profile is configured for ${member.modelProfile?.id ?? provider}.`)); return;
     }
     this.assertBudget(run, true);
@@ -425,6 +515,10 @@ export class TeamService {
       const feedback = [this.memberFeedback(run, member), "The previous member stopped at a provider usage limit. Its partial edits, if any, are present and passed the role's path check. Inspect them and finish the same assignment."].filter(Boolean).join("\n\n");
       const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, feedback, fallback);
       run.members.push(next); member.pendingLimit = undefined;
+      if (member.role === "permission-coordinator") {
+        const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
+        if (decision && decision.status === "reviewing") decision.coordinatorMemberId = next.memberId;
+      }
       if (task) { task.memberId = next.memberId; task.status = "running"; }
       if (member.role === "implementer" && task) {
         const implementation = task as TeamTask;
@@ -457,7 +551,10 @@ export class TeamService {
         if (all && (!stored.pending || run.status === "blocked" || run.status === "cancelled")) { stored.halt = undefined; if (!["blocked", "cancelled"].includes(run.status)) run.reason = undefined; }
         this.save(stored); return;
       }
-      if (!stored.prepared || ["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) return;
+      if (!stored.prepared) return;
+      if (["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) {
+        await this.stopObsoletePermissionCoordinators(stored); return;
+      }
       if (run.reason === providerInputReason || run.reason === runtimeUnavailableReason) {
         const states = await Promise.all(run.members.filter(member => member.revision === run.revision && activeMember(member) && member.status !== "queued" && !member.report)
           .map(member => this.manager.state(member.sessionId)));
@@ -471,6 +568,13 @@ export class TeamService {
       for (const member of run.members.filter(item => item.revision === run.revision && activeMember(item))) {
         if (member.status === "queued") { await this.launch(stored, member); continue; }
         if (!member.report) {
+          if (member.role === "permission-coordinator" && member.startedAt && Date.now() - Date.parse(member.startedAt) > 5 * 60 * 1000) {
+            const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
+            if (decision && decision.status === "reviewing") { decision.status = "escalated"; decision.reason = "The five-minute review window expired without a decision."; }
+            try { if (!await this.stopped(member)) member.status = "unavailable"; }
+            catch { member.status = "unavailable"; }
+            this.event(stored, "The permission coordinator exceeded its review window; the request remains with the user."); this.save(stored); continue;
+          }
           if (member.startedAt && Date.now() - Date.parse(member.startedAt) > 60 * 60 * 1000) { this.block(stored, new TeamError(409, "member-time-limit", "An agent exceeded its one-hour runtime limit. Its workspace was preserved.")); return; }
           const page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
           member.cursor = page.cursor;
@@ -502,7 +606,18 @@ export class TeamService {
             }
             const state = await this.manager.state(member.sessionId);
             if (state.status === "exited" && (page.more || member.cursor < state.seq)) { this.save(stored); continue; }
-            if (state.status === "exited") { member.status = "stopped"; this.block(stored, new TeamError(409, "missing-agent-report", "An agent exited without a valid structured report. Its task is unresolved.")); return; }
+            if (state.status === "exited") {
+              member.status = "stopped";
+              if (member.role === "permission-coordinator") {
+                const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
+                if (decision && ["pending", "reviewing"].includes(decision.status)) {
+                  decision.status = "escalated"; decision.reason = "The permission coordinator exited without its assigned decision report.";
+                }
+                this.event(stored, "The permission coordinator exited without a decision; the provider request remains with the user."); this.save(stored); continue;
+              }
+              this.block(stored, new TeamError(409, "missing-agent-report", "An agent exited without a valid structured report. Its task is unresolved.")); return;
+            }
+            if (state.attention.state === "needs-you" && await this.maybeStartPermissionReview(stored, member)) return;
             if (["unavailable", "recording-error"].includes(state.status)) { member.status = "unavailable"; run.reason = runtimeUnavailableReason; }
             else if (state.attention.state === "needs-you") run.reason = providerInputReason;
             else member.status = "running";
@@ -520,6 +635,7 @@ export class TeamService {
         this.consume(stored, member);
         if (stored.pending || run.status === "blocked" || run.status === "no-change") return;
       }
+      await this.stopObsoletePermissionCoordinators(stored);
       if (!trackingReady) return;
       // A recorded answer creates one replacement only after the original has confirmed exit.
       for (const decision of run.decisions.filter(item => item.revision === run.revision && item.answer)) {
@@ -546,14 +662,14 @@ export class TeamService {
           this.save(stored); return;
         }
       }
-      if (run.members.some(member => member.revision === run.revision && activeMember(member) && member.role !== "implementer")) return;
-      if (run.members.some(member => member.revision === run.revision && member.status === "waiting" && member.role !== "implementer")) { run.status = "needs-input"; this.save(stored); return; }
+      if (run.members.some(member => member.revision === run.revision && activeMember(member) && member.role !== "implementer" && member.role !== "permission-coordinator")) return;
+      if (run.members.some(member => member.revision === run.revision && member.status === "waiting" && member.role !== "implementer" && member.role !== "permission-coordinator")) { run.status = "needs-input"; this.save(stored); return; }
       if (!run.tasks.length) {
         if (run.members.some(member => member.revision === run.revision && member.role === "project-manager" && member.status === "waiting")) { run.status = "needs-input"; this.save(stored); return; }
         this.prepareMember(stored, "project-manager"); return;
       }
       const pendingTasks = run.tasks.filter(task => task.status === "pending");
-      const activeCount = run.members.filter(member => member.revision === run.revision && activeMember(member)).length;
+      const activeCount = run.members.filter(member => member.revision === run.revision && activeMember(member) && member.role !== "permission-coordinator").length;
       const nextTask = pendingTasks.find(task => task.dependsOn.every(id => run.tasks.find(item => item.id === id)?.status === "integrated"));
       if (nextTask && activeCount < run.parallelism) { this.prepareMember(stored, "implementer", nextTask); return; }
       if (run.tasks.some(task => task.status !== "integrated")) {
@@ -579,6 +695,167 @@ export class TeamService {
       }
     } catch (error) { this.block(stored, error); }
   }
+  private async maybeStartPermissionReview(stored: Stored, target: TeamMember) {
+    const run = stored.run;
+    if (!run.permissions || run.permissionsRevokedAt || target.role === "permission-coordinator" || target.status !== "running" ||
+        stored.halt || ["paused", "cancelled", "blocked"].includes(run.status) || target.revision !== run.revision)
+      return false;
+    if (run.members.some(member => member.revision === run.revision && member.role === "permission-coordinator" && activeMember(member))) return false;
+    if (run.permissionDecisions?.length && run.permissionDecisions.length >= run.permissions.maxDecisions) return false;
+
+    const state = await this.manager.state(target.sessionId, true);
+    const prompt = state.attention.prompt;
+    if (state.status !== "running" || state.attention.state !== "needs-you" || !prompt || oneShotPermissionOption(prompt) === undefined) return false;
+    const evidenceHash = permissionEvidenceHash(prompt);
+    const existing = (run.permissionDecisions ?? []).find(decision => decision.targetMemberId === target.memberId &&
+      decision.targetSessionId === target.sessionId && decision.promptId === prompt.id && decision.promptHash === prompt.hash &&
+      decision.evidenceHash === evidenceHash);
+    if (existing) return false;
+    if (!run.lineup || run.lineup.coordinator.tier !== "strong") return false;
+    if (!this.config.agents[run.lineup.coordinator.provider]) return false;
+
+    let targetCwd: string;
+    try { targetCwd = realpathSync(target.cwd); }
+    catch { return false; }
+    const decision: TeamPermissionDecision = {
+      id: randomUUID(), revision: run.revision, policyHash: digest(run.permissions), targetMemberId: target.memberId,
+      targetSessionId: target.sessionId, targetCwd, promptId: prompt.id, promptHash: prompt.hash!,
+      evidenceHash, prompt: structuredClone(prompt), option: oneShotPermissionOption(prompt)!,
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(), answerRequestId: randomUUID(), status: "pending",
+    };
+    (run.permissionDecisions ??= []).push(decision);
+    try { this.assertBudget(run, true); }
+    catch (error) {
+      decision.status = "escalated";
+      decision.reason = error instanceof TeamError ? error.message : "The team has no remaining agent or deadline budget for a permission review.";
+      this.event(stored, "A permission request remains with the user because the team has no review budget.");
+      this.save(stored);
+      return false;
+    }
+    if (run.lineup.coordinator.provider !== "claude") {
+      decision.status = "escalated";
+      decision.reason = "The pinned permission coordinator provider is not qualified for report-only permission review.";
+      this.event(stored, "The permission request remains with the user because the selected coordinator provider is not qualified for report-only review.");
+      this.save(stored);
+      return false;
+    }
+
+    const task = target.role === "scout" ? run.discovery?.tasks.find(item => item.id === target.taskId) : run.tasks.find(item => item.id === target.taskId);
+    const feedback = JSON.stringify({ decisionId: decision.id, ownerScope: run.permissions.scope, objective: run.objective,
+      targetAssignment: assignment(target), targetCwd: decision.targetCwd, targetTask: task ?? null, prompt: decision.prompt });
+    if (Buffer.byteLength(feedback, "utf8") > 16_000) {
+      decision.status = "escalated";
+      decision.reason = "The recorded permission evidence exceeds the coordinator prompt limit and cannot be reviewed without truncation.";
+      this.event(stored, "The permission request remains with the user because its complete evidence exceeds the review limit.");
+      this.save(stored);
+      return false;
+    }
+    const member = this.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, feedback, run.lineup.coordinator);
+    decision.coordinatorMemberId = member.memberId;
+    const selectedProfile = this.config.agents[member.provider ?? run.provider];
+    if (member.provider !== "claude" || !selectedProfile) {
+      decision.status = "escalated";
+      decision.reason = "The selected permission coordinator provider is not qualified for report-only review.";
+      this.event(stored, "The permission request remains with the user because the selected coordinator provider is not qualified for report-only review.");
+      this.save(stored);
+      return false;
+    }
+    try {
+      permissionCoordinatorLaunch("claude", teamModelLaunch(selectedProfile, member.modelProfile!));
+    } catch (error) {
+      decision.status = "escalated";
+      decision.reason = error instanceof Error ? error.message : "The selected coordinator profile cannot launch in report-only mode.";
+      this.event(stored, "The permission request remains with the user because the pinned coordinator profile cannot launch safely in report-only mode.");
+      this.save(stored);
+      return false;
+    }
+    this.save(stored);
+    this.operation(stored, "member", async signal => {
+      this.assertRunPath(stored, run.workspace);
+      const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal);
+      await assertMemberReadOnly(cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+      return cwd;
+    }, cwd => {
+      member.cwd = cwd; run.members.push(member); decision.status = "reviewing";
+      this.event(stored, "A screen-verified one-shot permission request was assigned to the pinned strong coordinator for read-only review.");
+    });
+    return true;
+  }
+  private async permissionAnswerInvalidReason(stored: Stored, decision: TeamPermissionDecision, coordinator: TeamMember) {
+    const run = stored.run;
+    if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status)) return "The team is paused, stopped, blocked, or its permission policy was revoked.";
+    if (decision.status !== "approved" || decision.revision !== run.revision || coordinator.revision !== run.revision ||
+        decision.coordinatorMemberId !== coordinator.memberId || decision.targetMemberId === coordinator.memberId)
+      return "The decision or coordinator assignment is no longer current.";
+    if (decision.policyHash !== digest(run.permissions))
+      return "The pinned permission policy no longer matches this decision.";
+    if (Date.now() >= Date.parse(decision.expiresAt)) return "The five-minute permission review window expired.";
+    if (!run.lineup || run.lineup.coordinator.tier !== "strong") return "The pinned coordinator profile is no longer eligible.";
+    try {
+      this.assertBudget(run);
+      const target = run.members.find(member => member.memberId === decision.targetMemberId && member.sessionId === decision.targetSessionId);
+      if (!target || target.revision !== run.revision || target.status === "stopped" || !activeMember(target) || target.role === "permission-coordinator")
+        return "The target member assignment is no longer active.";
+      const canonicalCwd = realpathSync(target.cwd);
+      if (canonicalCwd !== decision.targetCwd) return "The target working directory changed.";
+      this.assertRunPath(stored, canonicalCwd);
+      const metadata = this.manager.meta(target.sessionId).session;
+      const sessionAssignment = metadata.team;
+      if (!sessionAssignment || sessionAssignment.runId !== run.id || sessionAssignment.memberId !== target.memberId ||
+          sessionAssignment.revision !== target.revision || sessionAssignment.role !== target.role || metadata.cwd !== canonicalCwd)
+        return "The target session no longer matches its recorded assignment and working directory.";
+      const state = await this.manager.state(target.sessionId, true);
+      if (state.status !== "running" || state.control && state.control.expiresAt > Date.now()) return "The target is unavailable or a human control lease is active.";
+      const prompt = state.attention.prompt;
+      if (!prompt || state.attention.state !== "needs-you" || prompt.id !== decision.promptId || prompt.hash !== decision.promptHash ||
+          permissionEvidenceHash(prompt) !== decision.evidenceHash || oneShotPermissionOption(prompt) !== decision.option)
+        return "The target permission prompt or its one-shot option changed.";
+    } catch (error) {
+      return error instanceof TeamError ? error.message : "The current target session could not be verified.";
+    }
+    return undefined;
+  }
+  private consumePermissionCoordinator(stored: Stored, member: TeamMember) {
+    const run = stored.run, report = member.report!;
+    const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId && item.revision === member.revision);
+    if (!decision) { this.block(stored, new TeamError(409, "invalid-permission-decision", "The permission coordinator has no recorded decision assignment.")); return; }
+    const verdict = report.kind === "permission-decision" && report.decisionId === decision.id ? report.verdict : "escalate";
+    const summary = report.kind === "permission-decision" ? report.summary : report.kind === "blocked" ? report.summary
+      : report.kind === "question" ? report.question : "The coordinator did not submit the assigned permission decision report.";
+    this.operation(stored, "result", async signal => {
+      await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+      if (verdict !== "approve-once") return { status: "escalated" as const, reason: summary };
+      decision.status = "approved";
+      decision.reason = summary;
+      this.save(stored);
+      const reason = await this.permissionAnswerInvalidReason(stored, decision, member);
+      if (reason) return { status: "escalated" as const, reason };
+      if (decision.status !== "approved" || !run.permissions || run.permissionsRevokedAt || stored.halt ||
+          ["paused", "cancelled", "blocked"].includes(run.status) || decision.revision !== run.revision ||
+          decision.coordinatorMemberId !== member.memberId || decision.policyHash !== digest(run.permissions) ||
+          Date.now() >= Date.parse(decision.expiresAt))
+        return { status: "escalated" as const, reason: "The permission decision changed while the target session was being checked." };
+      decision.status = "answering";
+      decision.reason = summary;
+      this.save(stored);
+      try {
+        const receipt = await this.manager.answerTeamPermission(decision.targetSessionId, decision.answerRequestId,
+          assignment(run.members.find(target => target.memberId === decision.targetMemberId)!), decision);
+        return receipt.state === "delivered" && receipt.result === "closed"
+          ? { status: "answered" as const, receipt }
+          : receipt.state === "uncertain" ? { status: "uncertain" as const, receipt, reason: "The host could not confirm whether the target prompt closed. Inspect the target session before acting." }
+            : { status: "escalated" as const, receipt, reason: `The target prompt did not close (${receipt.result ?? receipt.state}). The request remains with the user.` };
+      } catch {
+        return { status: "uncertain" as const, reason: "The host could not confirm whether the target prompt was answered. Inspect the target session before acting." };
+      }
+    }, result => {
+      if (["reviewing", "approved", "answering"].includes(decision.status)) { decision.status = result.status; decision.reason = result.reason ?? summary; }
+      else decision.reason = "The decision changed while the answer was in flight. Inspect the target session before acting.";
+      if ("receipt" in result) decision.receipt = result.receipt;
+      member.status = "stopped";
+      this.event(stored, result.status === "answered" ? "A one-shot permission option was delivered and the prompt closed." : "The permission request remains with the user.");
+    });
+  }
   private taskProfiles(run: TeamRun, tasks: { agentProfileId?: string }[]) {
     for (const task of tasks) {
       if (!run.lineup) {
@@ -597,7 +874,7 @@ export class TeamService {
   }
   private memberProfile(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout): TeamModelProfile | undefined {
     if (!run.lineup) return undefined;
-    if (role === "project-manager" || role === "delivery") return run.lineup.coordinator;
+    if (role === "project-manager" || role === "delivery" || role === "permission-coordinator") return run.lineup.coordinator;
     if (role === "integrator") return run.lineup.integrator;
     if (role === "reviewer") return run.lineup.reviewer;
     if (!task) throw new TeamError(409, "invalid-agent-profile", "An implementer requires an assigned task and allowed model profile.");
@@ -634,13 +911,13 @@ export class TeamService {
   }
   private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string) {
     const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id, feedback);
-    run.status = role === "project-manager" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
+    if (role !== "permission-coordinator") run.status = role === "project-manager" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
     this.operation(stored, "member", async signal => {
       this.assertRunPath(stored, run.workspace);
       const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal);
       // Bootstrap dependencies exist only after the first implementation. A failed
       // setup must not prevent the integrator from repairing the project.
-      const setup = run.establishChecks
+      const setup = role === "permission-coordinator" ? undefined : run.establishChecks
         ? role === "reviewer" ? run.verification?.setup : undefined
         : this.config.projects.find(project => project.id === run.projectId)!.team!.setup;
       if (setup) {
@@ -684,6 +961,7 @@ export class TeamService {
   }
   private consume(stored: Stored, member: TeamMember) {
     const run = stored.run, report = member.report!;
+    if (member.role === "permission-coordinator") { this.consumePermissionCoordinator(stored, member); return; }
     if (report.kind === "blocked") { this.block(stored, new TeamError(409, "agent-blocked", report.summary)); return; }
     if (report.kind === "question") {
       if (run.decisions.length >= 40) { this.block(stored, new TeamError(409, "team-decision-limit", "The team reached its limit of 40 decisions. Review its evidence before starting another team.")); return; }

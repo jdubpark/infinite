@@ -20,9 +20,10 @@ export function toolTarget(tool: string, input: Body): string | undefined {
 }
 
 export function hookPrompt(kind: Prompt["kind"], title: string, tool: string | undefined, input: Body, detail?: string): Prompt {
+  const retained = truncateInput(input);
   return {
     id: 0, kind, title, detail: detail ?? (tool ? toolTarget(tool, input) : undefined), options: [], acceptsText: false, source: "hook",
-    tool: tool ? { name: tool, input: truncateInput(input) } : undefined,
+    tool: tool ? { name: tool, input: retained, inputComplete: JSON.stringify(retained) === JSON.stringify(input) } : undefined,
     destructive: destructiveOf(input),
   };
 }

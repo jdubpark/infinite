@@ -7,7 +7,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
-import { createTeamSchema, teamDeliverySchema, type TeamDelivery } from "./team-types.js";
+import { createTeamSchema, teamDeliverySchema, teamPermissionsSchema, type TeamDelivery } from "./team-types.js";
 import { captureWorkspace, readWorkspaceBlob } from "./workspace-checkpoint.js";
 import { localProjectPath } from "./mirrored-projects.js";
 import { readSyncState, syncServiceRunning } from "./sync-service.js";
@@ -290,6 +290,9 @@ function outputTeam(team: any, json: boolean) {
   if (team.linear?.issue?.url) console.log(`Linear ${clean(team.linear.issue.url)}`);
   else if (team.linear?.url) console.log(`Linear ${clean(team.linear.url)}`);
   if (team.reason) console.log(`Reason: ${clean(team.reason)}`);
+  if (team.permissions) console.log(`Permissions: ${team.permissionsRevokedAt ? "revoked" : "delegated to coordinator"} · ${(team.permissionDecisions ?? []).length}/${team.permissions.maxDecisions} decisions`);
+  for (const decision of (team.permissionDecisions ?? []).slice(-5))
+    console.log(`Permission ${clean(decision.id)}: ${clean(decision.status)} · member ${clean(decision.targetMemberId)}${decision.receipt ? ` · ${clean(decision.receipt.state)}/${clean(decision.receipt.result ?? "unconfirmed")}` : ""}`);
   for (const question of team.decisions ?? []) if (!question.answer) console.log(`Question ${clean(question.id)}: ${clean(question.question)}`);
 }
 function receipt(path: string, key: string, body: unknown) {
@@ -420,7 +423,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
     const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
     if ("nonGit" in gitResult) {
-      const unsupported = ["--project", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method"].filter(flag => options[flag] !== undefined);
+      const unsupported = ["--project", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit"].filter(flag => options[flag] !== undefined);
       if (unsupported.length) throw new Error(`This directory is not a Git repository, so ${unsupported.join(", ")} cannot be used here. Run repo init in a Git repository for enrollment, or use only --linear-team and --linear-project to save directory defaults.`);
       if (!explicitLinearTeam && explicitLinearProject && !inheritedDefault?.teamId)
         throw new Error("--linear-project requires --linear-team or an inherited directory Linear team.");
@@ -468,6 +471,19 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       ? { ...(options["--setup-json"] !== undefined ? (repoConfig.setup ? { setup: repoConfig.setup } : {}) : target.team.setup ? { setup: target.team.setup } : {}), checks: target.team.checks }
       : repoConfig);
     const delivery = requestedDelivery(root, options, target);
+    const permissionMode = options["--permissions"];
+    if (permissionMode !== undefined && permissionMode !== "coordinator" && permissionMode !== "off")
+      throw new Error("--permissions must be coordinator or off.");
+    if (permissionMode !== "coordinator" && (options["--permission-scope"] !== undefined || options["--permission-limit"] !== undefined))
+      throw new Error("Permission scope and limit require --permissions coordinator.");
+    if (permissionMode !== undefined && me.teams?.permissionDelegation !== 1)
+      throw new Error("This host does not support delegated permissions. Upgrade it before changing this policy.");
+    const permissions = permissionMode === "off" ? undefined : permissionMode === "coordinator" ? teamPermissionsSchema.parse({
+      mode: "coordinator",
+      scope: String(options["--permission-scope"] ?? "Approve one-time repository read, edit, build and test operations required by the accepted task within its assigned workspace. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, permission bypasses and unclear effects."),
+      maxDecisions: Number(options["--permission-limit"] ?? 10),
+    }) : target.team?.permissions;
+
     if (projectConfig.establishChecks && me.teams?.establishChecks !== 1)
       throw new Error("This host does not support establishing team checks for an empty repository. Upgrade the host before running repo init.");
     const uploadKey = `${key}:source-upload:${selected}:${sourceRevision}`;
@@ -514,7 +530,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       linearDefaultsFrom = rootDefault.origin;
     }
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}) }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}) };
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.
@@ -669,11 +685,11 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       return true;
     } finally { rmSync(temporary, { recursive: true, force: true }); }
   }
-  if (["steer", "answer", "pause", "resume", "cancel"].includes(subcommand ?? "")) {
+  if (["steer", "answer", "pause", "resume", "cancel", "revoke-permissions"].includes(subcommand ?? "")) {
     if (!id) throw new Error(`Usage: infinite team ${subcommand} ID ...`);
     const current = await api.json<any>(`/teams/${id}`);
     const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
-    let endpoint = `/teams/${id}/${subcommand}`, body: Record<string, unknown>;
+    let endpoint = subcommand === "revoke-permissions" ? `/teams/${id}/permissions/revoke` : `/teams/${id}/${subcommand}`, body: Record<string, unknown>;
     if (subcommand === "steer") {
       const text = rest.join(" "); if (!text) throw new Error("Provide steering text.");
       body = { requestId, revision: current.revision, text };
@@ -688,5 +704,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     requireSamePendingIntent(receiptsPath, `team-${subcommand}:`, endpoint, prior => subcommand === "steer" || subcommand === "answer" ? prior.text === body.text : true, options["--request-id"] === undefined ? undefined : requestId, rawArgs);
     outputTeam(await postMutation(api, receiptsPath, `team-${subcommand}:${requestId}`, endpoint, body), Boolean(options["--json"])); return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|cancel ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|cancel|revoke-permissions ...");
 }

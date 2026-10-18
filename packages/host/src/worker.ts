@@ -2,7 +2,7 @@ import { stopHandoffProcesses } from "./handoff-processes.js";
 import { handoffEnvelopeSchema, handoffObjective } from "./handoff-types.js";
 import { cleanTeamCheckpoint } from "./team-workspace.js";
 import { createServer } from "node:net";
-import { chmodSync, mkdirSync, unlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -37,7 +37,8 @@ import {
 import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
 import { startHookServer, HookPayloadError, type HookReply, type HookRoute } from "./hooks.js";
-import { teamReportEnvelopeSchema } from "./team-types.js";
+import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
+import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
 import { buildLaunch } from "./launch.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
@@ -83,9 +84,11 @@ const terminal = new headless.Terminal({
 });
 const snapshots = new TerminalSnapshots(terminal);
 type AnswerRequest = Extract<WorkerRequest, { op: "answer" }>;
+type TeamAnswerRequest = Extract<WorkerRequest, { op: "team-answer" }>;
 type DeliveryRequest = Extract<WorkerRequest, { op: "input" | "raw" | "key" | "stop" }>;
 type StoredReceipt = Receipt & { digest: string; result?: AnswerResult };
 const receipts = new Map<string, StoredReceipt>();
+const invalidatedTeamPermissionDecisions = new Set<string>();
 /** The receipt a client sees: the request digest stays inside the worker. */
 const publicReceipt = ({ digest: _digest, ...receipt }: StoredReceipt) =>
   receipt;
@@ -615,7 +618,7 @@ function refreshControl(request: InputControl) {
     controller.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
 }
 /** A retry identifies the intended input, not the client which currently holds control. */
-function requestDigest(request: (DeliveryRequest | AnswerRequest)) {
+function requestDigest(request: (DeliveryRequest | AnswerRequest | TeamAnswerRequest)) {
   const { actor: _actor, leaseId: _leaseId, ...input } = request;
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
@@ -715,16 +718,38 @@ const arrow = (key: "up" | "down") =>
   (key === "up" ? "A" : "B");
 
 async function answer(
-  request: AnswerRequest,
+  request: AnswerRequest | TeamAnswerRequest,
 ): Promise<Receipt & { result?: AnswerResult }> {
+  const teamRequest = request.op === "team-answer" ? request : undefined;
+  const answerText = request.op === "answer" ? request.text : undefined;
   const digest = requestDigest(request);
   const previous = receipts.get(request.requestId);
   if (previous) {
-    if (previous.digest !== digest || previous.result === undefined)
+    if (previous.digest !== digest || (previous.result === undefined && !teamRequest))
       throw new Error("Request ID already belongs to different input");
     return publicReceipt(previous);
   }
-  checkControl(request);
+  if (teamRequest) {
+    if (invalidatedTeamPermissionDecisions.has(teamRequest.decisionId)) throw new Refusal("unsupported");
+    const actual = session.team;
+    const assigned = teamRequest.assignment;
+    let cwd: string;
+    try { cwd = realpathSync(session.cwd); }
+    catch { throw new Refusal("unsupported"); }
+    if (!actual || teamRequest.targetSessionId !== session.id ||
+        actual.runId !== assigned.runId || actual.memberId !== assigned.memberId ||
+        actual.revision !== assigned.revision || actual.role !== assigned.role || actual.taskId !== assigned.taskId ||
+        teamRequest.targetCwd !== cwd ||
+        session.runtime?.nativeUi || session.runtime?.transport !== "pty")
+      throw new Refusal("unsupported");
+    if (teamRequest.actor.id !== `team-permission:${teamRequest.decisionId}` ||
+        teamRequest.actor.label !== "Team permission" || !/^[a-f0-9-]{36}$/i.test(teamRequest.decisionId) ||
+        !/^[a-f0-9-]{36}$/i.test(teamRequest.coordinatorMemberId) ||
+        !/^[a-f0-9]{64}$/i.test(teamRequest.policyHash) ||
+        !Number.isFinite(Date.parse(teamRequest.expiresAt)) || Date.parse(teamRequest.expiresAt) <= Date.now())
+      throw new Refusal("prompt-changed");
+    checkControl(teamRequest);
+  } else checkControl(request);
   const pty = child;
   if (state.status !== "running" || !pty)
     throw new Error("Session is not running");
@@ -739,10 +764,15 @@ async function answer(
   const current = screenPrompt();
   if (!current || hashOf(current.fingerprint) !== prompt.hash)
     throw new Refusal("prompt-changed");
+  if (teamRequest && (teamRequest.promptId !== prompt.id || teamRequest.promptHash !== prompt.hash ||
+      teamRequest.evidenceHash !== permissionEvidenceHash(prompt) ||
+      oneShotPermissionOption(prompt) !== teamRequest.option ||
+      !current.options.some(option => option.index === teamRequest.option && option.role === "accept")))
+    throw new Refusal("prompt-changed");
   if (prompt.multiSelect || current.multiSelect)
     throw new Refusal("unsupported");
   // Same hash, so the screen's options are the prompt's options.
-  if (request.option !== undefined && !current.options[request.option])
+  if (request.option !== undefined && !current.options.some(option => option.index === request.option))
     throw new Refusal("invalid-option");
   // Delivery follows the dialog on screen, not the hook's kind for it.
   const yesNo = current.kind === "yes-no";
@@ -750,13 +780,13 @@ async function answer(
     (o) => o.role === "reject-with-feedback",
   );
   if (
-    request.text !== undefined &&
+    answerText !== undefined &&
     // Free text only follows the "No, and tell … what to do differently" option.
     (!prompt.acceptsText ||
       yesNo ||
       !feedback ||
       (request.option !== undefined && request.option !== feedback.index) ||
-      (request.text.includes("\n") && !terminal.modes.bracketedPasteMode))
+      (answerText.includes("\n") && !terminal.modes.bracketedPasteMode))
   )
     throw new Refusal("text-not-accepted");
   const chosen =
@@ -778,29 +808,55 @@ async function answer(
     promptId: prompt.id,
     option: chosen.index,
     keys,
-    ...(request.text !== undefined ? { text: request.text } : {}),
+    ...(answerText !== undefined ? { text: answerText } : {}),
+    ...(teamRequest ? { delegation: {
+      decisionId: teamRequest.decisionId,
+      coordinatorMemberId: teamRequest.coordinatorMemberId,
+      targetSessionId: teamRequest.targetSessionId,
+      assignment: teamRequest.assignment,
+      targetCwd: teamRequest.targetCwd,
+      expiresAt: teamRequest.expiresAt,
+      policyHash: teamRequest.policyHash,
+      promptHash: teamRequest.promptHash,
+      evidenceHash: teamRequest.evidenceHash,
+    } } : {}),
   });
-  const receipt: StoredReceipt & { result: AnswerResult } = {
+  const receipt: StoredReceipt = {
     requestId: request.requestId,
     state: "uncertain",
     seq: intent.seq,
     digest,
-    result: "refused",
+    // Preserve the ordinary answer retry contract: an interrupted delivery has
+    // a refused result, while delegated answers remain explicitly uncertain.
+    ...(teamRequest ? {} : { result: "refused" as AnswerResult }),
   };
   receipts.set(request.requestId, receipt);
   const unchanged = () => {
     const now = screenPrompt();
     return now && hashOf(now.fingerprint) === prompt.hash ? now : null;
   };
+  const beforeWrite = () => {
+    if (teamRequest && invalidatedTeamPermissionDecisions.has(teamRequest.decisionId)) throw new Refusal("control-lost");
+    if (teamRequest && Date.parse(teamRequest.expiresAt) <= Date.now()) throw new Refusal("prompt-changed");
+    checkControl(request);
+    if (state.status !== "running" || child !== pty) throw new Refusal("prompt-changed");
+    if (teamRequest && (!session.team || session.team.runId !== teamRequest.assignment.runId ||
+        session.team.memberId !== teamRequest.assignment.memberId || session.team.revision !== teamRequest.assignment.revision ||
+        session.team.role !== teamRequest.assignment.role || session.team.taskId !== teamRequest.assignment.taskId))
+      throw new Refusal("unsupported");
+  };
   answering = prompt.id;
   try {
     let result: AnswerResult = "still-open";
     if (yesNo) {
+      beforeWrite();
       pty.write(keys[0]);
       await sleep(40);
+      beforeWrite();
       pty.write("\r");
     } else {
       for (const key of keys.slice(0, -1)) {
+        beforeWrite();
         pty.write(arrow(key as "up" | "down"));
         await sleep(40);
       }
@@ -808,6 +864,7 @@ async function answer(
       let onTarget = false;
       for (const until = Date.now() + 500; ; ) {
         await sleep(40);
+        beforeWrite();
         const now = unchanged();
         if (!now) break;
         if (now.highlighted === undefined || now.highlighted === chosen.index) {
@@ -816,7 +873,7 @@ async function answer(
         }
         if (Date.now() >= until) break;
       }
-      if (onTarget) pty.write("\r");
+      if (onTarget) { beforeWrite(); pty.write("\r"); }
       else result = "changed";
     }
     if (result !== "changed")
@@ -839,13 +896,15 @@ async function answer(
           },
           "host",
         );
-      if (request.text !== undefined) {
+      if (answerText !== undefined) {
         await sleep(150);
+        beforeWrite();
         pty.write(
           terminal.modes.bracketedPasteMode
-            ? `\x1b[200~${request.text}\x1b[201~`
-            : request.text,
+            ? `\x1b[200~${answerText}\x1b[201~`
+            : answerText,
         );
+        beforeWrite();
         pty.write("\r");
       }
     }
@@ -855,7 +914,7 @@ async function answer(
         promptId: prompt.id,
         requestId: request.requestId,
         option: { index: chosen.index, label: chosen.label },
-        text: request.text !== undefined,
+        text: answerText !== undefined,
         result,
       },
       "host",
@@ -870,6 +929,11 @@ async function answer(
     receipt.result = result;
     refreshControl(request);
     return publicReceipt(receipt);
+  } catch (error) {
+    // The intent is durable, but control loss or a worker failure may stop delivery mid-answer.
+    // Retrying this decision returns the uncertain receipt and never presses another key.
+    if (teamRequest) return publicReceipt(receipt);
+    throw error;
   } finally {
     answering = undefined;
   }
@@ -890,6 +954,26 @@ function validAnswer(request: AnswerRequest) {
         request.text.length <= 32000 &&
         !/[\x00-\x08\x0b-\x1f\x7f]/.test(request.text)))
   );
+}
+function validTeamAnswer(request: TeamAnswerRequest) {
+  const rawAssignment: unknown = request.assignment;
+  if (!rawAssignment || typeof rawAssignment !== "object" || Array.isArray(rawAssignment)) return false;
+  const assignment = rawAssignment as TeamAssignment;
+  return typeof request.requestId === "string" && request.requestId.length <= 80 &&
+    /^[a-f0-9-]{36}$/i.test(request.decisionId) &&
+    /^[a-f0-9-]{36}$/i.test(request.coordinatorMemberId) &&
+    request.targetSessionId === session.id &&
+    /^[a-f0-9-]{36}$/i.test(assignment.runId) &&
+    /^[a-f0-9-]{36}$/i.test(assignment.memberId) &&
+    Number.isInteger(assignment.revision) && assignment.revision > 0 &&
+    ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"].includes(assignment.role) &&
+    (assignment.taskId === undefined || typeof assignment.taskId === "string") &&
+    typeof request.targetCwd === "string" && request.targetCwd.length > 0 && request.targetCwd.length <= 4096 &&
+    Number.isInteger(Date.parse(request.expiresAt)) && /^[a-f0-9]{64}$/i.test(request.policyHash) &&
+    Number.isInteger(request.promptId) && request.promptId >= 1 &&
+    /^[a-f0-9]{64}$/i.test(request.promptHash) && /^[a-f0-9]{64}$/i.test(request.evidenceHash) &&
+    Number.isInteger(request.option) && request.option >= 0 && validActor(request.actor) &&
+    typeof request.leaseId === "string" && request.leaseId.length > 0 && request.leaseId.length <= 80;
 }
 
 const server = createServer((socket) => {
@@ -948,7 +1032,17 @@ const server = createServer((socket) => {
           return native.connect(request);
         });
       } else if (request.op === "control") {
-        result = await serialize(() => changeControl(request));
+        // Control changes must be able to fence an answer between its awaited terminal writes.
+        result = changeControl(request);
+      } else if (request.op === "team-answer-invalidate") {
+        if (!/^[a-f0-9-]{36}$/i.test(request.decisionId)) throw new Error("Invalid delegated decision identity");
+        invalidatedTeamPermissionDecisions.add(request.decisionId);
+        if (controller?.actorId === `team-permission:${request.decisionId}`) {
+          controller = null;
+          state = { ...state, control: null };
+          persist();
+        }
+        result = { invalidated: true };
       } else if (request.op === "resize") {
         if (
           !Number.isInteger(request.cols) ||
@@ -968,6 +1062,9 @@ const server = createServer((socket) => {
         });
       } else if (request.op === "answer") {
         if (!validAnswer(request)) throw new Error("Invalid answer request");
+        result = await serialize(() => answer(request));
+      } else if (request.op === "team-answer") {
+        if (!validTeamAnswer(request)) throw new Error("Invalid delegated answer request");
         result = await serialize(() => answer(request));
       } else {
         if (

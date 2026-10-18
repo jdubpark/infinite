@@ -232,6 +232,9 @@ infinite list [--json]                      List cloud sessions
 infinite resume [SESSION_ID]                Reattach to a live process
 infinite monitor [SESSION_ID]               Watch; Enter enables interaction
 infinite repo init [DIRECTORY]              Enroll a repository or set parent-folder Linear defaults
+infinite repo init --permissions coordinator [--permission-scope TEXT] [--permission-limit N]
+infinite repo init --permissions off        Disable delegation for future runs
+infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
 infinite team status [ID]                   Show teams or one team
 infinite team watch ID                      Poll team status; Ctrl+C detaches

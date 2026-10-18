@@ -178,3 +178,24 @@ Before putting private production repositories here, verify the isolation and st
 ## Dependency audit
 
 The current lockfile's production host dependency audit reports zero known advisories. The full workspace audit reports 29 findings (19 high, 10 moderate), propagated from four transitive packages in the Expo 57 dependency tree: `braces`, `node-forge`, `uuid`, and `decode-uri-component`. Most are in build tooling; the Router URI decoder also requires review before native release. At the time of the check, the registry's latest `braces` and `node-forge` versions remained affected. A forced audit fix proposed incompatible SDK changes, so it was not applied. These findings remain open; the mobile debug build is not a security-reviewed release.
+
+## Delegated team permission decisions
+
+Delegation is an explicit repository enrollment policy, pinned when a run starts.
+Only the run's strong Claude coordinator profile can report a permission decision. The
+report channel remains bound to its own assignment; it receives no owner key or
+sibling-session control capability. The host applies only a current one-shot
+choice after verifying the target assignment, canonical workspace, prompt
+identity and evidence, owner policy, expiry and human control lease. It records
+intent before delivery and preserves uncertain acknowledgements without replay.
+
+The permission coordinator runs noninteractively with no built-in tools and only
+the authenticated assignment report MCP server. Unexpected tool permissions are
+denied. Configurations that add conflicting launch or MCP flags are rejected.
+If the configured strong provider is unsupported, the request remains with the owner.
+
+The owner can revoke a run's delegation independently of task steering. Changing
+the repository policy does not opt existing runs in. Coordinator prompts never
+qualify for recursive approval; workspace trust, persistent allow rules and
+unsupported native requests require owner handling. This does not isolate
+processes sharing a Unix account or grant permission beyond the accepted task.

@@ -520,6 +520,44 @@ does not offer an interactive approval flow. A denied reporting tool or required
 tool can stop the member without an accepted report. Inspect the failure and the
 configured provider policy; retries do not grant permission.
 
+## Delegating permission decisions
+
+Enable delegation once in the enrolled repository:
+
+```sh
+infinite repo init --permissions coordinator
+```
+
+This pins an owner-approved scope and a limit of ten decisions to each new run.
+Use `--permission-scope TEXT` to set narrower boundaries and `--permission-limit N`
+to set a limit from one to twenty. Omitting these options on a later enrollment
+preserves the repository policy. Existing runs remain unchanged.
+
+A current one-shot tool prompt can start a separate turn on the run's strong
+Claude coordinator profile. The coordinator receives the task, owner scope and exact
+request, then reports approve-once or escalate. The host checks the assignment,
+workspace, prompt, policy, expiry and human input control before delivering the
+recorded choice. Workers cannot approve their own requests. The permission
+coordinator runs noninteractively with built-in tools disabled and only its
+assignment's report tool allowed. It escalates when the supplied evidence is
+insufficient. Worker provider modes, global trust settings and credentials
+remain unchanged. Other coordinator providers are not yet supported for this role.
+
+Workspace trust, persistent allow rules, ambiguous prompts and unsupported native
+requests still need owner handling. A coordinator that itself needs permission
+cannot approve its own prompt. Each decision is bounded; stale or uncertain
+answers are never replayed automatically. Run status and Linear retain the
+receipt separately from successful tool execution.
+
+```sh
+infinite team revoke-permissions TEAM_ID
+infinite repo init --permissions off
+```
+
+The first command revokes delegation for a current run. The second disables it
+for future runs. Both require an owner client. Pausing, cancelling or steering a
+run prevents its old pending decisions from being applied.
+
 ## Configuration
 
 Each new run gets a folder named from its UTC creation date, a slug of its

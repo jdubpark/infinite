@@ -61,6 +61,10 @@ export interface Session {
   status: Status;
   pid?: number;
   exitCode?: number;
+  /** Canonical source checkout at creation; never inferred from a Linear mapping. */
+  projectRoot?: string;
+  contextSources?: import("./project-context.js").ContextSource[];
+  contextLinksVersion?: number;
   contextVersion: number;
   context: string;
   initialPrompt: string;

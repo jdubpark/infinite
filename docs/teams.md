@@ -10,7 +10,11 @@ Use **Teams** for one feature request or pasted PRD. A team plans and implements
 that request without selecting a sequence of follow-up improvements. Both flows
 show member sessions, questions, steering, file ownership, and verification
 records. The web interface supports desktop and narrow phone browsers. The
-native phone app can open member sessions; it has no Goals or Teams dashboard.
+native phone app has **Teams** and **Goals** tabs beside its sessions. It
+starts, answers, steers, pauses, resumes, and cancels runs with the same roles
+and request rules as the web client, and records goal outcomes. It opens member
+sessions, and a member session links back to its team. The Mac app shows Teams
+only.
 
 A Team marked **ready for your review** has explicit reports for its current revision,
 passing configured checks, and an approving reviewer report. It does not
@@ -66,6 +70,33 @@ A mapping is configuration, not proof of connectivity: each run shows
 whether Linear has confirmed its issue and execution evidence. Historical runs
 remain unchanged. Run status, verification, and human acceptance retain the
 separate meanings described below.
+
+## Project context and explicit relationships
+
+Each project keeps its own context, task history, and repository evidence. Parent
+folder enrollment and Linear mappings do not share context. An alias pointing to
+the same directory also keeps a separate context record.
+
+From an enrolled repository, explicitly name a source project or enrolled directory:
+
+```sh
+infinite repo link ../backend --relationship "Uses the backend API"
+infinite repo links
+infinite repo unlink ../backend
+```
+
+Use `--project ID` to select the consuming project without changing directories.
+Only an owner can change links. A link imports the source's owner-authored project
+context into future managed sessions, with its project ID, version, and relationship.
+It does not import transcripts, follow another link, or merge Linear projects.
+Existing sessions keep their snapshots after unlinking. Native CLI launches keep
+their existing no-injection behavior; team sessions receive the scoped context.
+
+The separately installed shared-brain skill also defaults to the requested
+repository alone. Its owner-managed knowledge links require an explicit linked
+search; `global` is not included automatically. An Infinite context link does not
+create a brain link. Each surface grants only its named kind of context, and
+neither grants filesystem or network permissions.
 
 ## Let an ordinary session request a team
 

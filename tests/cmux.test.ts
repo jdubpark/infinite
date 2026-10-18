@@ -2,7 +2,7 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn as ptySpawn } from "node-pty";
@@ -297,6 +297,33 @@ test("cmux resume respects capacity before recording intent while existing recei
   assert.equal(resumed.status, "running");
   assert.equal((await f.sessions.resume(saved.id, requestId)).runtime!.id, resumed.runtime!.id);
   assert.equal(f.mutations().filter(row => row.method === "workspace.create").length, 1);
+});
+
+test("cmux preserves an explicitly selected same-root project alias and rejects a moved root before resume", { timeout: 20000 }, async (t) => {
+  const f = await fixture(t);
+  f.config.projects.unshift({ id: "alias", name: "Alias", path: f.cwd });
+  const requestId = randomUUID();
+  const created = await f.sessions.create({ requestId, provider: "claude", projectId: "project", title: "Pinned project", prompt: "Continue here" });
+  const nativeId = randomUUID();
+  f.hooks[nativeId] = {
+    ...f.hooks[f.nativeId], sessionId: nativeId, surfaceId: "created-surface-1", workspaceId: "created-workspace-1",
+    updatedAt: Date.now() / 1000 + 1,
+  };
+  f.writeHooks();
+  f.setState({ vault: [{ agent: "claude", session_id: nativeId, cwd: f.cwd, file: f.transcript }] });
+  const refreshed = await f.sessions.get(created.id);
+  assert.equal(refreshed.projectId, "project", "a same-root hook refresh cannot relabel an explicitly selected project alias");
+  assert.equal(refreshed.projectRoot, realpathSync(f.cwd));
+
+  const movedRoot = join(f.root, "moved-project");
+  mkdirSync(movedRoot);
+  f.config.projects.find(project => project.id === "project")!.path = movedRoot;
+  f.setState({ workspaces: [{ id: "workspace", panes: [{ surfaces: [{ id: "surface", type: "terminal", title: "Original" }] }] }] });
+  const intentCount = f.sessions.events(created.id).events.filter(event => event.type === "input-intent").length;
+  const mutationCount = f.mutations().length;
+  await assert.rejects(f.sessions.resume(created.id, randomUUID()), { code: "unsupported" });
+  assert.equal(f.sessions.events(created.id).events.filter(event => event.type === "input-intent").length, intentCount);
+  assert.equal(f.mutations().length, mutationCount, "a moved project root is rejected before a native resume launch");
 });
 
 test("the inbox hides only the same live cmux process, preserving separate and resumed runtimes", { timeout: 25000 }, async (t) => {

@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { startHost, waitFor, claimControl } from "./helpers.js";
 import { git, mixedLineup } from "./team-fixture.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
 
 async function fixture(optIn = true, externalCmux = false) {
   const root = realpathSync(mkdtempSync("/tmp/inf-handoff-")), source = join(root, "source"), receipts = join(root, "receipts");
@@ -131,14 +132,41 @@ test("Codex handoff blocks changed checkpoints without stopping or overwriting t
   } finally { await f.close(); }
 });
 
-test("non-opted and unsupported launches preserve exact argv and expose no handoff capability", { timeout: 60000 }, async () => {
+test("handoff admission blocks policy source or project mismatches before stopping the source", { timeout: 60000 }, async () => {
+  for (const mismatch of ["sourceSessionId", "projectId"] as const) {
+    const f = await fixture();
+    try {
+      const { id, receipt } = await f.create([]);
+      const key = readFileSync(f.host.config.keyFile);
+      const file = join(f.host.config.stateDir, "sessions", id, "meta.sealed");
+      const stored = unseal<{ session: { handoff: { policy: Record<string, unknown> } } }>(key, `${id}:meta`, readFileSync(file, "utf8"));
+      stored.session.handoff.policy[mismatch] = mismatch === "sourceSessionId" ? randomUUID() : "another-project";
+      writeSealed(file, key, `${id}:meta`, stored);
+
+      assert.equal((await tool(receipt.server, request(f.base))).isError, false);
+      const view = await waitFor(() => f.view(id), value => value.status === "blocked");
+      assert.match(view.reason, /policy does not belong to its source session and project/);
+      assert.equal((await f.host.fetchApi(`/sessions/${id}`)).body.status, "running", "invalid policy is refused before the source process stops");
+      assert.equal((await f.host.fetchApi("/teams")).body.teams.length, 0);
+    } finally { await f.close(); }
+  }
+});
+
+test("non-opted launch preserves argv and native history selection is rejected", { timeout: 60000 }, async () => {
   for (const optIn of [false, true]) {
     const f = await fixture(optIn);
     try {
-      const args = optIn ? ["--resume", "conversation-id"] : ["--model", "claude-opus-5-5", "A normal prompt"];
-      const { id, receipt } = await f.create(args);
-      assert.deepEqual(receipt.argv, args);
-      assert.equal(receipt.server, undefined); assert.equal((await f.view(id)).status, "unavailable");
+      if (optIn) {
+        const response = await f.host.fetchApi("/sessions", "owner", { requestId: randomUUID(), projectId: "rehearsal", provider: "claude", title: "Must remain fresh", nativeArgs: ["--resume", "conversation-id"] });
+        assert.equal(response.status, 400);
+        assert.match(response.body.error, /infinite resume SESSION_ID/);
+        assert.equal((await f.host.fetchApi("/sessions")).body.sessions.length, 0);
+      } else {
+        const args = ["--model", "claude-opus-5-5", "A normal prompt"];
+        const { id, receipt } = await f.create(args);
+        assert.deepEqual(receipt.argv, args);
+        assert.equal(receipt.server, undefined); assert.equal((await f.view(id)).status, "unavailable");
+      }
     } finally { await f.close(); }
   }
 });

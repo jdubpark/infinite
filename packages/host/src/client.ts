@@ -467,7 +467,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
-  const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--teamwork"]);
+  const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--relationship", "--teamwork"]);
   const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes"]);
   const option = () => {
     const name = args.shift()!;

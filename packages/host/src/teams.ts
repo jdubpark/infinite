@@ -141,8 +141,11 @@ export class TeamService {
     }
   }
   createForHandoff(request: CreateTeam, handoff: TeamHandoffContext, policy: HandoffPolicy): Promise<TeamView> {
+    const parsed = createTeamSchema.parse(request);
+    if (policy.sourceSessionId !== handoff.sourceSessionId || policy.projectId !== parsed.projectId || JSON.stringify(policy.project) !== JSON.stringify(handoff.project))
+      throw new TeamError(409, "handoff-identity-mismatch", "The handoff policy, source, and team project must match before a team can start.");
     this.assertHandoffPolicy(policy);
-    return this.createRun(createTeamSchema.parse(request), { handoff, handoffPolicy: policy, lineup: policy.lineup }, Boolean(policy.linear));
+    return this.createRun(parsed, { handoff, handoffPolicy: policy, lineup: policy.lineup }, Boolean(policy.linear));
   }
   private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup }, linearTracking = false): Promise<TeamView> {
     return this.enqueue(async () => {

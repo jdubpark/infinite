@@ -80,6 +80,8 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | Resize / terminate | `POST /api/sessions/:id/resize`, `/stop` | Owner |
 | Read project context | `GET /api/projects/:id/context` | Any |
 | Replace context with version check | `PUT /api/projects/:id/context` | Owner |
+| Read direct context relationships | `GET /api/projects/:id/context-links` | Any |
+| Replace direct relationships with version check | `PUT /api/projects/:id/context-links` | Owner |
 | Resolve a home-relative project | `POST /api/projects/resolve` | Owner CLI |
 | Project detail and sync state | `GET /api/projects/:id` | Any |
 | Receive a laptop generation | `POST /api/projects/:id/sync/{begin,has,commit}`, `PUT /api/projects/:id/sync/blob/:hash` | Owner CLI |

@@ -1,4 +1,5 @@
 import express from "express";
+import { ProjectContexts, contextLinksRequest } from "./project-context.js";
 import { createServer } from "node:http";
 import { connectTerminals, terminalPages } from "./terminal-stream.js";
 import { connectNativeFrontends } from "./native-bridge.js";
@@ -888,6 +889,13 @@ export function createApp(config: Config, key: Buffer) {
   });
   app.get("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     res.json({ base64: await projectSync.readBlob(projectSchema.parse(req.params.id), String(req.params.hash)) });
+  });
+  const projectContexts = new ProjectContexts(config, key);
+  app.get("/api/projects/:id/context-links", (req, res) => {
+    return res.json(projectContexts.listLinks(String(req.params.id)));
+  });
+  app.put("/api/projects/:id/context-links", requireRole(["owner"]), (req, res) => {
+    return res.json(projectContexts.setLinks(String(req.params.id), contextLinksRequest.parse(req.body)));
   });
   app.get("/api/projects/:id/context", (req, res) => {
     if (!config.projects.some((p) => p.id === req.params.id))

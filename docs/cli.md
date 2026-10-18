@@ -210,7 +210,7 @@ This recovery covers Infinite's Ctrl+E editor in streamed terminal mode. Native 
 
 ## Native arguments and cloud workspaces
 
-In ordinary terminal mode, everything after the provider name is passed as an argument array to that provider, unchanged. There is no shell evaluation. Put Infinite options before the provider:
+In ordinary terminal mode, accepted arguments after the provider name are passed as an array, unchanged. There is no shell evaluation. Native history selectors such as `--resume`, `--continue`, and `codex resume` are refused on fresh launches; use `infinite resume SESSION_ID` to keep a recorded conversation bound to its original project. Put `--` before literal prompt arguments that match history commands, for example `infinite opencode run -- explain import`. Put Infinite options before the provider:
 
 ```sh
 infinite projects

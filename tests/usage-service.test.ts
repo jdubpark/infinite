@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { waitFor } from "./helpers.js";
 import { fixture, mixedLineup } from "./team-fixture.js";
 import type { UsageSummary } from "../packages/host/src/usage-service.js";
@@ -19,6 +21,8 @@ test("usage ledger prices OpenCode members, survives restart idempotently, and c
     assert.equal(usage.providers.opencode.spent!.cost.toFixed(4), (0.002 + 0.5).toFixed(4));
     assert.deepEqual(usage.providers.opencode.spent!.pricing, { configured: 2, provider: 2, unknown: 0 });
     assert.equal(usage.providers.opencode.budget?.usd, 10);
+    assert.equal(usage.providers.opencode.period.start, usage.period.start, "A monthly budget shares the default month window");
+    assert.ok(usage.providers.claude.unmeasuredSessions >= 2, "Active coordinator and reviewer sessions count in the current period");
     assert.equal(usage.providers.claude.measured, false);
     assert.equal(usage.providers.claude.spent, undefined);
     assert.ok(usage.providers.claude.unmeasuredSessions >= 2); // coordinator + reviewer
@@ -39,5 +43,27 @@ test("usage ledger prices OpenCode members, survives restart idempotently, and c
     assert.equal(sessions.find((s: any) => s.id === deepseek.sessionId).usage.cost.toFixed(4), "0.0020");
     const reviewer = team.members.find(member => member.role === "reviewer")!;
     assert.equal(sessions.find((s: any) => s.id === reviewer.sessionId).usage, undefined);
+  } finally { await run.close(); }
+});
+
+test("one unreadable journal does not hide another measured session's usage", { timeout: 120000 }, async () => {
+  const lineup = structuredClone(mixedLineup);
+  lineup.implementers = [
+    lineup.implementers[0],
+    { id: "deepseek-high", label: "DeepSeek implementer", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light", dataUse: "contributor" },
+  ];
+  const run = await fixture("usage", lineup, { usage: { prices: {}, budgets: {} } });
+  try {
+    const team = await run.settled((await run.host.fetchApi("/teams", "owner", run.create())).body.id);
+    await waitFor(() => run.host.fetchApi("/usage").then(r => r.body as UsageSummary), (u: UsageSummary) => u.providers.opencode.spent?.messages === 4, 20000);
+    // Rebuild the ledger from journals after damaging one member's journal.
+    await run.host.stopApi();
+    const damaged = team.members.find(member => member.modelProfile?.id === "deepseek-high")!;
+    const events = join(run.host.config.stateDir, "sessions", damaged.sessionId!, "events");
+    for (const name of readdirSync(events)) writeFileSync(join(events, name), "not a sealed journal\n");
+    rmSync(join(run.host.config.stateDir, "usage.sealed"));
+    await run.host.start();
+    const usage = await waitFor(() => run.host.fetchApi("/usage").then(r => r.body as UsageSummary), (u: UsageSummary) => u.providers.opencode.spent?.messages === 2, 20000);
+    assert.equal(usage.providers.opencode.spent!.cost.toFixed(4), "0.5000");
   } finally { await run.close(); }
 });

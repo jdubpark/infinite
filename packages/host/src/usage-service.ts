@@ -9,14 +9,17 @@ import { periodStart, priceUsage, sumUsage, type UsageRecord, type UsageTotals }
 type Period = "day" | "week" | "month";
 export interface SessionUsage extends UsageTotals { measured: true }
 export type UsageSummary = {
+  /** The default month window; each provider carries the window of its own budget period. */
   period: { start: string; end: string };
-  providers: Record<Provider, { measured: boolean; spent?: UsageTotals; budget?: { usd: number; period: Period }; previous?: UsageTotals; unmeasuredSessions: number }>;
+  providers: Record<Provider, { period: { start: string; end: string }; measured: boolean; spent?: UsageTotals; budget?: { usd: number; period: Period }; previous?: UsageTotals; unmeasuredSessions: number }>;
 };
-type LedgerSession = { provider: Provider; projectId: string; createdAt: string; measured: boolean; team?: TeamAssignment; profileId?: string };
+type LedgerSession = { provider: Provider; projectId: string; createdAt: string; lastActiveAt?: string; measured: boolean; team?: TeamAssignment; profileId?: string };
 type Ledger = { cursors: Record<string, number>; sessions: Record<string, LedgerSession>; rows: Record<string, UsageRecord> };
 
 const PROVIDERS: Provider[] = ["claude", "codex", "grok", "opencode", "demo"];
 const PAGE = 200;
+const periodEnd = (period: Period, start: Date) => period === "month" ? new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1))
+  : new Date(start.getTime() + (period === "week" ? 7 : 1) * 86_400_000);
 const SCOPE = "usage";
 
 /**
@@ -31,6 +34,7 @@ export class UsageService {
   private running = false;
   private closed = false;
   private ticking = false;
+  private readonly failed = new Set<string>();
   private readonly file: string;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager) {
     this.file = join(config.stateDir, "usage.sealed");
@@ -51,20 +55,35 @@ export class UsageService {
       let changed = false;
       for (const session of await this.manager.list()) {
         const measured = session.provider === "opencode" && (session.teamModelProfile ? session.teamModelProfile.provider === "opencode" : !session.team && session.runtime?.nativeUi === "opencode");
+        const previous = this.ledger.sessions[session.id];
+        const active = ["starting", "running"].includes(session.status);
+        // Refreshed at most once a minute so a running session does not rewrite the ledger on every tick.
+        const stale = !previous?.lastActiveAt || Date.now() - Date.parse(previous.lastActiveAt) > 60_000;
+        const lastActiveAt = active && stale ? new Date().toISOString() : previous?.lastActiveAt;
         const entry: LedgerSession = { provider: session.provider, projectId: session.projectId, createdAt: session.createdAt, measured,
+          ...(lastActiveAt ? { lastActiveAt } : {}),
           ...(session.team ? { team: session.team } : {}), ...(session.teamModelProfile ? { profileId: session.teamModelProfile.id } : {}) };
-        if (JSON.stringify(this.ledger.sessions[session.id]) !== JSON.stringify(entry)) { this.ledger.sessions[session.id] = entry; changed = true; }
+        if (JSON.stringify(previous) !== JSON.stringify(entry)) { this.ledger.sessions[session.id] = entry; changed = true; }
         if (!measured) continue;
-        let cursor = this.ledger.cursors[session.id] ?? 0;
-        for (let more = true; more && this.running;) {
-          const page = this.manager.events(session.id, cursor, PAGE, new Set(["usage"]));
-          for (const event of page.events) {
-            if (event.type !== "usage") continue;
-            const record = event.data as unknown as UsageRecord;
-            this.ledger.rows[`${session.id}/${record.messageId}/${record.partId}`] = record; changed = true;
+        // One unreadable journal must not strand the rows other sessions produced in this tick.
+        try {
+          let cursor = this.ledger.cursors[session.id] ?? 0;
+          for (let more = true; more && this.running;) {
+            const page = this.manager.events(session.id, cursor, PAGE, new Set(["usage"]));
+            for (const event of page.events) {
+              if (event.type !== "usage") continue;
+              const record = event.data as unknown as UsageRecord;
+              this.ledger.rows[`${session.id}/${record.messageId}/${record.partId}`] = record; changed = true; this.index = undefined;
+            }
+            if (page.cursor !== cursor) { cursor = page.cursor; this.ledger.cursors[session.id] = cursor; changed = true; }
+            more = page.more;
           }
-          if (page.cursor !== cursor) { cursor = page.cursor; this.ledger.cursors[session.id] = cursor; changed = true; }
-          more = page.more;
+          this.failed.delete(session.id);
+        } catch (error) {
+          if (!this.failed.has(session.id)) {
+            this.failed.add(session.id);
+            console.warn(`[Infinite] Usage for session ${session.id} cannot be read: ${error instanceof Error ? error.message : String(error)}`);
+          }
         }
       }
       if (changed) { this.index = undefined; writeSealed(this.file, this.key, SCOPE, this.ledger); }
@@ -103,16 +122,17 @@ export class UsageService {
       const start = periodStart(period, now), previousStart = periodStart(period, new Date(start.getTime() - 1));
       const measured = provider === "opencode";
       const sessions = Object.entries(this.ledger.sessions).filter(([, s]) => s.provider === provider);
-      const unmeasuredSessions = sessions.filter(([, s]) => !s.measured && Date.parse(s.createdAt) >= start.getTime()).length;
+      const unmeasuredSessions = sessions.filter(([, s]) => !s.measured && Date.parse(s.lastActiveAt ?? s.createdAt) >= start.getTime()).length;
       const within = (from: Date, to: Date) => this.priced(sessions.filter(([, s]) => s.measured).flatMap(([id]) => this.rowsBySession().get(id) ?? [])
         .filter(record => { const at = Date.parse(record.completedAt); return at >= from.getTime() && at < to.getTime(); }));
       providers[provider] = {
+        period: { start: start.toISOString(), end: periodEnd(period, start).toISOString() },
         measured, unmeasuredSessions,
         ...(measured ? { spent: sumUsage(within(start, new Date(now.getTime() + 1))), previous: sumUsage(within(previousStart, start)) } : {}),
         ...(budget ? { budget: { usd: budget.usd, period } } : {}),
       };
     }
-    const end = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, 1));
+    const end = periodEnd("month", monthStart);
     return { period: { start: monthStart.toISOString(), end: end.toISOString() }, providers };
   }
 }

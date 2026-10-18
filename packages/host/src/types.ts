@@ -78,7 +78,7 @@ export interface Project {
   name: string;
   path: string;
   team?: import("./team-types.js").TeamProject;
-  linear?: { teamId: string };
+  linear?: { teamId: string; projectId?: string };
 }
 export interface AgentProfile {
   command: string;
@@ -116,7 +116,6 @@ export interface Config {
   maxSessions: number;
   attention?: {
     idleAfterMs: number;
-    limitConfirmMs: number;
     hooks: { claude: boolean; codex: boolean };
   };
   push?: {

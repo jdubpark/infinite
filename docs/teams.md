@@ -73,7 +73,15 @@ A project can map its Goals, feature cycles, and standalone Teams to Linear
 through private host configuration. On a mapped project, **New goal** offers an
 optional existing issue identifier or UUID. Leave it empty to create a goal issue. Each feature
 cycle gets a child issue under that goal. A standalone Team creates its own
-issue. Projects without a mapping keep the local Goal and Team workflow.
+issue. Configure `projects[].linear.teamId` and optionally `projectId` to place
+new issues in the selected Linear project. An explicitly linked issue must match
+that project. Changing the mapping blocks existing tracked work for review.
+Projects without a mapping keep the local Goal and Team workflow.
+
+Tracking intent is saved when a goal or team is created. Adding a mapping later
+does not publish historical runs, including through startup or list/get calls.
+Child teams inherit their goal's tracking intent. Already tracked identities
+continue to reconcile across restarts.
 
 The linked issue is the task record for scope and human workflow state. The host
 re-reads both the parent and child before starting another member and checks
@@ -125,6 +133,69 @@ The browser receives tracking records and a project capability flag, never the
 Linear API credential. Keep credentials, workspace mappings, and concrete issue
 bindings in private configuration or encrypted runtime state. Do not copy them
 into tracked configuration examples, screenshots, or repository reports.
+
+## Usage and provider limits
+
+The optional `usage` host setting prices captured OpenCode usage and sets a soft
+per-provider budget. Prices are USD per million tokens. The values below are
+illustrative configuration values; replace them with the rates you intend to
+use. A configured price takes precedence over OpenCode's reported cost. Without
+a configured price, a non-zero reported cost is labeled as reported by
+OpenCode. If neither is available, the cost remains unknown. Changing the price
+table reprices recorded history.
+
+```json
+{
+  "usage": {
+    "prices": {
+      "deepseek/deepseek-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.014, "cacheWrite": 0.14 },
+      "meta/muse-spark-1.3-contributor": { "input": 0, "output": 0 }
+    },
+    "budgets": {
+      "opencode": { "usd": 50, "period": "month" }
+    }
+  }
+}
+```
+
+Budgets support `day`, `week`, or `month` periods in UTC; omitted periods use
+`month`. A budget only gives you a comparison line. It never pauses, rejects,
+or reroutes work. Team and goal totals include measured OpenCode usage and show
+the number of unmeasured members. Claude Code, Codex, Grok, and OpenCode TUI
+sessions have no capture path here, so they remain unmeasured rather than
+contributing a fabricated zero.
+
+The lineup can name a `limitFallback` profile for each model that should move
+when its provider reaches a quota. The fallback must use another provider and,
+for a strong profile, another strong profile. It preserves the member's task,
+workspace, path scope, and existing work limits. Each replacement consumes a
+member attempt. Fallbacks do not change a goal's recorded lineup or approved
+scope.
+
+For example, add a fallback profile to the lineup and point the affected profile
+at it. This fragment shows only the fields involved; keep the other required
+lineup fields in place. Replace these profile and model identifiers with the
+ones configured on your host:
+
+```json
+{
+  "implementers": [
+    { "id": "haiku-medium", "label": "Primary light model", "provider": "claude", "model": "claude-haiku-model", "effort": "medium", "tier": "light", "limitFallback": "deepseek-flash-medium" }
+  ],
+  "fallbacks": [
+    { "id": "deepseek-flash-medium", "label": "DeepSeek Flash medium", "provider": "opencode", "model": "deepseek/deepseek-flash", "variant": "medium", "tier": "light" }
+  ]
+}
+```
+
+Limit signals are observations, not predictions of remaining quota. A Claude
+Code hook alone can switch the member whose turn failed; a corroborated Claude
+observation can also be remembered for new members. Codex terminal text does not trigger automatic fallback. The native Codex protocol supplies an explicit `usageLimitExceeded` error; transient `rateLimitExceeded` errors remain ordinary failures. A structural terminal detector is deferred until its footer format has been verified.
+
+Only corroborated observations enter the host's provider-limit memory and
+influence new members. Interactive sessions show notices and keep their chosen
+provider. The host never answers a limit dialog or enters credentials. Provider
+clock times are interpreted as UTC; reset times are shown only when stated.
 
 ## Roles and execution
 

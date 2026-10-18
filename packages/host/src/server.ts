@@ -21,6 +21,7 @@ import { ContentError, recordedMessages, sessionFile } from "./session-content.j
 import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
+import { UsageService } from "./usage-service.js";
 import { TeamService, TeamError } from "./teams.js";
 import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
 import { GoalService } from "./goals.js";
@@ -111,6 +112,8 @@ export function createApp(config: Config, key: Buffer) {
   };
   const linear = new LinearService(config, key);
   const teams = new TeamService(config, key, manager, startInProject, linear);
+  const usage = new UsageService(config, key, manager);
+  teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
@@ -119,8 +122,9 @@ export function createApp(config: Config, key: Buffer) {
   // Native records written before executionLocation existed carry only the hybrid workspace.
   const executionLocation = (session: { executionLocation?: "cloud" | "laptop"; workspace?: unknown }): "cloud" | "laptop" =>
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
+  const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
-    const native = (await manager.list()).map(session => ({ ...session, executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id, resumable: resumable(session) }));
+    const native = (await manager.list()).map(session => ({ ...session, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id, resumable: resumable(session) }));
     // Provider conversation IDs survive restarts and can exist in several
     // recordings. Only a currently verified worker PID identifies this runtime.
     const known = new Set(native.filter(s => s.status === "running" && s.nativeSession && s.pid)
@@ -270,8 +274,10 @@ export function createApp(config: Config, key: Buffer) {
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
+      providerLimits: teams.limits.active(),
       teams: { enabled: Boolean(config.teams), maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
+      usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
       projects: config.projects.map(({ id, name, team, linear }) => ({ id, name, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
       capabilities: {
         signals: true,
@@ -280,6 +286,7 @@ export function createApp(config: Config, key: Buffer) {
       },
     }),
   );
+  app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
@@ -763,13 +770,15 @@ export function createApp(config: Config, key: Buffer) {
   const server = createServer(app);
   server.once("listening", () => linear.start());
   server.once("listening", () => teams.start());
+  server.once("listening", () => usage.start());
   server.once("listening", () => goals.start());
   server.once("close", () => teams.close());
+  server.once("close", () => usage.close());
   server.once("close", () => goals.close());
   server.once("close", () => linear.close());
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { goals.close(); teams.close(); linear.close(); closeTerminals(); closeNative(); closeRemote(); cmux?.close(); server.closeAllConnections(); };
+  const closeConnections = () => { goals.close(); teams.close(); usage.close(); linear.close(); closeTerminals(); closeNative(); closeRemote(); cmux?.close(); server.closeAllConnections(); };
   return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

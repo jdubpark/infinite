@@ -1,9 +1,12 @@
+import type { Provider } from "./types.js";
 import type { UsageConfig } from "./config.js";
 
 export interface UsageTokens { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
-export interface UsageRecord { provider: "opencode"; providerId: string; modelId: string; messageId: string; partId: string; modelSource: "requested" | "reported"; completedAt: string; tokens: UsageTokens; reportedCost: number }
+export interface UsageRecord { provider: "opencode"; providerId: string; modelId: string; messageId: string; partId: string; modelSource: "requested" | "reported" | "unknown"; completedAt: string; tokens: UsageTokens; reportedCost: number }
 export type Pricing = "configured" | "provider" | "unknown";
-export interface UsageTotals { cost: number; tokens: UsageTokens; messages: number; pricing: Record<Pricing, number> }
+export interface UsageTotals { incomplete?: boolean; cost: number; tokens: UsageTokens; messages: number; pricing: Record<Pricing, number> }
+
+export interface TeamUsage { total: UsageTotals; byProfile: Record<string, UsageTotals>; byProvider: Partial<Record<Provider, UsageTotals>>; unmeasuredMembers: number }
 
 const MICRO_DOLLARS_PER_DOLLAR = 1_000_000;
 

@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { ProviderLimits } from "./provider-limits.js";
 import type { Config } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
-import { createTeamSchema, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
 import { teamPrompt } from "./team-prompts.js";
 import { teamModelLaunch } from "./launch.js";
+import type { UsageService } from "./usage-service.js";
 import type { LinearService } from "./linear.js";
 import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureMemberResult, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, validateTeamPlan } from "./team-workspace.js";
 export { TeamError } from "./team-workspace.js";
@@ -38,7 +40,10 @@ export class TeamService {
   private tickQueued = false;
   private readonly commands = new Map<string, AbortController>();
   private readonly directory: string;
+  private usage?: UsageService;
+  readonly limits: ProviderLimits;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService) {
+    this.limits = new ProviderLimits(join(config.stateDir, "provider-limits.sealed"), key);
     this.directory = join(config.stateDir, "teams");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     for (const file of readdirSync(this.directory).filter(name => /^[a-f0-9-]{36}\.sealed$/.test(name))) {
@@ -56,6 +61,8 @@ export class TeamService {
       }
     }
   }
+  useUsage(service: UsageService) { this.usage = service; }
+  usageForRuns(ids: string[]) { return this.usage?.aggregate([...new Set(ids)].flatMap(id => this.record(id).run.members)); }
   private enqueue<T>(task: () => T | Promise<T>): Promise<T> {
     const next = this.serial.then(task); this.serial = next.catch(() => {}); return next;
   }
@@ -68,9 +75,12 @@ export class TeamService {
     const { members, ...run } = structuredClone(stored.run);
     // Queue evidence from this exact state before a goal can use its sync gate
     // to continue from a newly reviewed or no-change result.
-    const tracking = this.linear?.updateTeam(stored.run);
+    const tracking = this.linear?.updateTeam(stored.run, stored.run.linearTracking === true);
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
-    return { ...run, members: members.map(({ prompt: _prompt, ...member }) => member) };
+    return { ...run, ...(this.usage ? { usage: this.usage.aggregate(members) } : {}), providerLimits: this.limits.active(), members: members.map(({ prompt: _prompt, feedback: _feedback, pendingLimit: _pendingLimit, ...member }) => {
+      const usage = this.usage?.session(member.sessionId);
+      return { ...member, ...(usage?.measured ? { usage } : {}) };
+    }) };
   }
   private save(stored: Stored) {
     stored.run.updatedAt = timestamp();
@@ -90,10 +100,10 @@ export class TeamService {
     return this.createRun(parsed);
   }
   /** Goal authority and model snapshots come from the host, never from a public create body. */
-  createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup): Promise<TeamView> {
-    return this.createRun(createTeamSchema.parse(request), { goal: teamGoalContextSchema.parse(goal), lineup: teamLineupSchema.parse(lineup) });
+  createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup, linearTracking = false): Promise<TeamView> {
+    return this.createRun(createTeamSchema.parse(request), { goal: teamGoalContextSchema.parse(goal), lineup: teamLineupSchema.parse(lineup) }, linearTracking);
   }
-  private createRun(parsed: CreateTeam, internal?: { goal: TeamGoalContext; lineup: TeamLineup }): Promise<TeamView> {
+  private createRun(parsed: CreateTeam, internal?: { goal: TeamGoalContext; lineup: TeamLineup }, linearTracking = false): Promise<TeamView> {
     return this.enqueue(async () => {
       // Preserve the fingerprints written before lineup selection existed.
       const { useConfiguredLineup, ...singleProviderRequest } = parsed;
@@ -110,7 +120,7 @@ export class TeamService {
       if (useConfiguredLineup && !lineup) throw new TeamError(409, "team-lineup-not-configured", "The requested team lineup is not configured on this host.");
       if (lineup && parsed.provider !== lineup.coordinator.provider)
         throw new TeamError(409, "team-provider-mismatch", "The selected provider must match the configured coordinator provider.");
-      const profiles = lineup ? [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? [])] : [];
+      const profiles = lineup ? lineupProfiles(lineup) : [];
       const providers = new Set(lineup ? profiles.map(profile => profile.provider) : [parsed.provider]);
       for (const provider of providers) {
         const profile = this.config.agents[provider];
@@ -129,7 +139,7 @@ export class TeamService {
       const source = { path: parent?.workspace ?? project.path, ...(parent ? { head: parent.headCommit! } : {}) };
       const parentRevision = parent?.revision;
       const at = timestamp();
-      const run: TeamRun = { id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(this.config.teams.workspaceDir, parsed.requestId), branch: `infinite/team-${parsed.requestId}`, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(this.config.teams.workspaceDir, parsed.requestId), branch: `infinite/team-${parsed.requestId}`, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       this.assertBudget(run);
       const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, source };
       this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
@@ -243,7 +253,7 @@ export class TeamService {
       if (this.tickQueued || !this.running) return;
       this.tickQueued = true;
       void this.enqueue(async () => {
-        try { for (const stored of this.records.values()) await this.step(stored); }
+        try { await this.observeProviderLimits(); for (const stored of this.records.values()) await this.step(stored); }
         finally { this.tickQueued = false; }
       }).catch(() => { this.tickQueued = false; });
     };
@@ -301,10 +311,62 @@ export class TeamService {
     if (state.status !== "exited") return false;
     member.status = "stopped"; return true;
   }
+  private async observeProviderLimits() {
+    for (const session of await this.manager.list()) {
+      if (session.provider !== "claude" && session.provider !== "codex") continue;
+      const limit = session.attention.limit;
+      if (limit?.confidence === "corroborated") {
+        this.limits.observe({ provider: session.provider, detectedAt: limit.since, resetsAt: limit.resetsAt,
+          sessionId: session.id, ...(session.team ? { runId: session.team.runId } : {}), confidence: "corroborated" });
+      }
+      const current = this.limits.active().find(entry => entry.provider === session.provider);
+      if (current && session.attention.lastSuccessfulTurnAt && session.attention.lastSuccessfulTurnAt > current.detectedAt)
+        this.limits.clear(session.provider, session.attention.lastSuccessfulTurnAt);
+    }
+  }
+  private async switchLimitedMember(stored: Stored, member: TeamMember) {
+    const run = stored.run, limit = member.pendingLimit!;
+    const provider = member.provider ?? run.provider;
+    if (limit.confidence === "corroborated") this.limits.observe({ provider, detectedAt: limit.detectedAt,
+      resetsAt: limit.resetsAt, sessionId: member.sessionId, runId: run.id, confidence: "corroborated" });
+    try {
+      if (!await this.stopped(member)) { member.status = "unavailable"; run.reason = runtimeUnavailableReason; this.save(stored); return; }
+    } catch {
+      member.status = "unavailable";
+      run.reason = "The limited agent could not be stopped. Release its input control or inspect its terminal before a replacement can write.";
+      this.save(stored); return;
+    }
+    const limited = this.limits.limited(); limited.add(provider);
+    const fallback = run.lineup && member.modelProfile ? resolveLimitFallback(run.lineup, member.modelProfile.id, limited) : undefined;
+    const reason = `${provider} ${limit.limit} limit reached${limit.resetsAt ? `; resets ${limit.resetsAt}` : ""}`;
+    member.stoppedReason = reason;
+    if (!fallback) {
+      this.block(stored, new TeamError(409, "provider-limit", `${reason}; no fallback profile is configured for ${member.modelProfile?.id ?? provider}.`)); return;
+    }
+    this.assertBudget(run, true);
+    const task = member.role === "scout" ? run.discovery?.tasks.find(task => task.id === member.taskId) : run.tasks.find(task => task.id === member.taskId);
+    this.operation(stored, "member", async signal => {
+      if (member.role === "implementer") await assertMemberScope(member.cwd, member.baseCommit, (task as TeamTask).paths, this.config.teams?.commandPrefix, signal);
+      else if (member.role === "integrator") await assertMemberScope(member.cwd, member.baseCommit, run.goal?.allowedPaths, this.config.teams?.commandPrefix, signal);
+      else await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+    }, () => {
+      const feedback = [this.memberFeedback(run, member), "The previous member stopped at a provider usage limit. Its partial edits, if any, are present and passed the role's path check. Inspect them and finish the same assignment."].filter(Boolean).join("\n\n");
+      const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, feedback, fallback);
+      run.members.push(next); member.pendingLimit = undefined;
+      if (task) { task.memberId = next.memberId; task.status = "running"; }
+      if (member.role === "implementer" && task) {
+        const implementation = task as TeamTask;
+        (implementation.limitSwitches ??= []).push({ fromProfileId: member.modelProfile?.id, toProfileId: fallback.id,
+          reason, resetsAt: limit.resetsAt, memberId: member.memberId, at: limit.detectedAt });
+      }
+      run.reason = undefined;
+      this.event(stored, `${member.modelProfile?.label ?? provider} hit a usage limit; ${member.taskId ?? member.role} continues on ${fallback.label} with partial work preserved.`);
+    });
+  }
   private async step(stored: Stored) {
     const run = stored.run;
     try {
-      const tracking = this.linear?.updateTeam(run) ?? run.linear;
+      const tracking = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
       if (JSON.stringify(run.linear) !== JSON.stringify(tracking)) { run.linear = tracking; this.save(stored); }
       if (tracking?.status === "blocked" && !stored.halt && !["cancelled", "blocked", "ready-for-review", "no-change"].includes(run.status)) {
         this.block(stored, new TeamError(409, "linear-issue-changed", tracking.reason ?? "The Linear issue no longer permits this work. Review its requirements before starting another team."));
@@ -338,9 +400,18 @@ export class TeamService {
         if (member.status === "queued") { await this.launch(stored, member); continue; }
         if (!member.report) {
           if (member.startedAt && Date.now() - Date.parse(member.startedAt) > 60 * 60 * 1000) { this.block(stored, new TeamError(409, "member-time-limit", "An agent exceeded its one-hour runtime limit. Its workspace was preserved.")); return; }
-          const page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report"]));
+          const page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
           member.cursor = page.cursor;
           for (const event of page.events) {
+            if (event.type === "signal") {
+              const signal = event.data;
+              if (signal.kind === "provider-limit" && ["usage", "credits"].includes(String(signal.limit)) && typeof signal.message === "string"
+                && (signal.confidence === "corroborated" || ((member.provider ?? run.provider) === "claude" && signal.source === "hook" && signal.confidence === "single-source"))) {
+                member.pendingLimit = { limit: signal.limit as "usage" | "credits", confidence: signal.confidence as "single-source" | "corroborated",
+                  message: signal.message, detectedAt: event.at, ...(typeof signal.resetsAt === "string" ? { resetsAt: signal.resetsAt } : {}) };
+              }
+              continue;
+            }
             const parsed = teamReportEnvelopeSchema.safeParse(event.data);
             if (!parsed.success) continue;
             const envelope = parsed.data;
@@ -348,6 +419,15 @@ export class TeamService {
             member.report = envelope.report; member.status = "reported"; break;
           }
           if (!member.report) {
+            if (member.pendingLimit) {
+              // Persist the observation before attempting a lease-aware stop. A denied stop
+              // retries this same member, even though the journal cursor has advanced.
+              this.save(stored);
+              // Allow the worker's next two screen checks to add a reset time and
+              // corroboration before stopping a hook-only failed turn.
+              if (member.pendingLimit.confidence === "single-source" && Date.now() - Date.parse(member.pendingLimit.detectedAt) < 2200) continue;
+              await this.switchLimitedMember(stored, member); return;
+            }
             const state = await this.manager.state(member.sessionId);
             if (state.status === "exited" && (page.more || member.cursor < state.seq)) { this.save(stored); continue; }
             if (state.status === "exited") { member.status = "stopped"; this.block(stored, new TeamError(409, "missing-agent-report", "An agent exited without a valid structured report. Its task is unresolved.")); return; }
@@ -373,8 +453,7 @@ export class TeamService {
       for (const decision of run.decisions.filter(item => item.revision === run.revision && item.answer)) {
         const prior = run.members.find(member => member.memberId === decision.memberId)!;
         if (prior.status !== "waiting") continue;
-        const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, `${prior.prompt}\n\nUser answered: ${decision.answer}`, prior.modelProfile);
-        next.provider = prior.provider ?? prior.modelProfile?.provider ?? run.provider;
+        const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, `${this.memberFeedback(run, prior)}\n\nUser answered: ${decision.answer}`, prior.modelProfile);
         prior.status = "stopped"; run.members.push(next);
         const task = prior.role === "scout" ? run.discovery?.tasks.find(item => item.id === prior.taskId) : run.tasks.find(item => item.id === prior.taskId);
         if (task) { task.memberId = next.memberId; task.status = "running"; }
@@ -436,20 +515,36 @@ export class TeamService {
     this.taskProfiles(run, [task]);
     return run.lineup.implementers.find(profile => profile.id === task.agentProfileId)!;
   }
-  private newMember(run: TeamRun, role: TeamMember["role"], cwd: string, baseCommit: string, taskId?: string, prompt?: string, pinnedProfile?: TeamModelProfile): TeamMember {
+  private memberFeedback(run: TeamRun, member: TeamMember) {
+    if (member.feedback !== undefined) return member.feedback;
+    // Legacy members did not retain structured feedback. Recover only that section,
+    // never their provider-specific runtime or reporting instructions.
+    const start = member.prompt.indexOf("\n\nFeedback and answers:\n");
+    const end = member.prompt.lastIndexOf("\n\nDo not publish, merge, deploy,");
+    const feedback = start >= 0 && end > start ? member.prompt.slice(start + "\n\nFeedback and answers:\n".length, end) : "";
+    const answers = run.decisions.filter(decision => decision.memberId === member.memberId && decision.answer).map(decision => `User answered: ${decision.answer}`).join("\n");
+    return [feedback, answers].filter(Boolean).join("\n\n");
+  }
+  private newMember(run: TeamRun, role: TeamMember["role"], cwd: string, baseCommit: string, taskId?: string, feedback?: string, pinnedProfile?: TeamModelProfile): TeamMember {
     this.assertBudget(run, true);
     const memberId = randomUUID();
     const task = role === "scout" ? run.discovery?.tasks.find(task => task.id === taskId) : run.tasks.find(task => task.id === taskId);
-    const selected = pinnedProfile ?? this.memberProfile(run, role, task);
+    let selected = pinnedProfile ?? this.memberProfile(run, role, task);
+    if (selected && run.lineup && this.limits.limited().has(selected.provider)) {
+      const fallback = resolveLimitFallback(run.lineup, selected.id, this.limits.limited());
+      if (fallback) {
+        this.event(this.record(run.id), `${selected.label} launched on ${fallback.label}: ${selected.provider} has an active usage limit.`);
+        selected = fallback;
+      }
+    }
     const modelProfile = selected ? structuredClone(selected) : undefined;
     const provider = modelProfile?.provider ?? run.provider;
-    const instructions = prompt ?? teamPrompt(run, role, task, undefined, provider, modelProfile);
+    const instructions = teamPrompt(run, role, task, feedback, provider, modelProfile);
     if (Buffer.byteLength(instructions) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
-    return { runId: run.id, memberId, revision: run.revision, role, provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, cursor: 0, stopRequestId: randomUUID() };
+    return { runId: run.id, memberId, revision: run.revision, role, provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, ...(feedback ? { feedback } : {}), cursor: 0, stopRequestId: randomUUID() };
   }
   private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string) {
-    const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id);
-    if (feedback) member.prompt = teamPrompt(run, role, task, feedback, member.provider ?? run.provider, member.modelProfile);
+    const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id, feedback);
     run.status = role === "project-manager" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" ? "reviewing" : role === "integrator" ? "integrating" : "implementing";
     this.operation(stored, "member", async signal => {
       const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal);
@@ -472,7 +567,7 @@ export class TeamService {
     // Recover an already-created assignment even while Linear is unavailable. A new
     // process requires the bridge's fresh feature and parent issue observations.
     if (!this.hasLaunch(member)) {
-      const tracking = this.linear?.updateTeam(stored.run) ?? stored.run.linear;
+      const tracking = this.linear?.updateTeam(stored.run, stored.run.linearTracking === true) ?? stored.run.linear;
       if (JSON.stringify(stored.run.linear) !== JSON.stringify(tracking)) { stored.run.linear = tracking; this.save(stored); }
       if (tracking?.status === "blocked") throw new TeamError(409, "linear-issue-changed", tracking.reason ?? "The Linear issue no longer permits this work.");
       if (tracking && tracking.status !== "synced") return;
@@ -531,8 +626,8 @@ export class TeamService {
         throw new TeamError(409, "invalid-escalation", "An implementer may escalate once to a different profile in the approved escalation pool.");
       this.operation(stored, "result", signal => assertMemberScope(member.cwd, member.baseCommit, task.paths, this.config.teams?.commandPrefix, signal), () => {
         task.escalation = { ...(member.modelProfile ? { fromProfileId: member.modelProfile.id } : {}), toProfileId: profile.id, reason: report.reason, memberId: member.memberId, at: timestamp() };
-        const next = this.newMember(run, "implementer", member.cwd, member.baseCommit, task.id, undefined, profile);
-        next.prompt = teamPrompt(run, "implementer", task, `The previous implementer requested escalation: ${report.reason}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`, next.provider ?? run.provider, next.modelProfile);
+        const next = this.newMember(run, "implementer", member.cwd, member.baseCommit, task.id,
+          `The previous implementer requested escalation: ${report.reason}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`, profile);
         run.members.push(next); task.memberId = next.memberId; task.status = "running";
         run.status = "implementing";
         this.event(stored, `${task.title} escalated to ${profile.label}; the stopped member's partial work was preserved.`);

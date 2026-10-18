@@ -1387,3 +1387,8 @@ small,
 @media (max-width: 700px) {
   .linear-tracking-heading a { min-height: 44px; }
 }
+
+.team-spend { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 24px; margin: 24px 0; }
+.team-spend article { border-left: 2px solid var(--line); padding-left: 16px; }
+.team-spend h3 { font-size: 15px; margin: 0 0 10px; }
+.team-spend p { margin: 6px 0; font-size: 13px; line-height: 1.5; }

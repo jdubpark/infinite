@@ -8,7 +8,9 @@ export interface LinearIssueView {
   updatedAt: string;
 }
 
-/** Linear's workflow state is separate from the local execution status. */
+/** Present only for a run opted into tracking at creation or with a saved link.
+ * Linear workflow state stays separate from local execution status.
+ */
 export interface LinearTrackingView {
   status: "pending" | "synced" | "blocked" | "error";
   reason?: string;

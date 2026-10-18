@@ -50,6 +50,10 @@ if (receipt.provider === "opencode") {
     receipt.variant = args[variant + 1];
   }
   receipt.prompt = args[boundary + 1];
+  if ((scenario === "limit" || scenario === "limit-no-fallback" || scenario === "limit-other-failed") && assignment.taskId === "a")
+    receipt.sawPartial = existsSync("a.txt");
+  if (scenario === "integrator-limit" && assignment.role === "integrator")
+    receipt.sawPartial = existsSync("repair.txt");
 }
 writeFileSync(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
 
@@ -123,6 +127,9 @@ async function main() {
     } else if (scenario === "mixed") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "astra-xhigh";
+    } else if (scenario === "limit" || scenario === "limit-no-fallback" || scenario === "limit-other-failed" || scenario === "integrator-limit") {
+      tasks[0].agentProfileId = "haiku";
+      tasks[1].agentProfileId = scenario === "limit-other-failed" ? "haiku-b" : "codex-light";
     } else if (scenario === "mixed-invalid") {
       // The first task is valid: rejection must inspect the whole plan before
       // dispatching any member, including work preceding the invalid choice.
@@ -145,6 +152,26 @@ async function main() {
     // Keep both processes alive after the barrier so overlap can be measured
     // independently of the member states returned by the API.
     await new Promise(resolve => setTimeout(resolve, 150));
+    if (scenario === "limit-other-failed" && receipt.provider === "claude" && assignment.taskId === "b") {
+      await new Promise(resolve => setTimeout(resolve, 2600));
+      const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}` },
+        body: JSON.stringify({ hook_event_name: "StopFailure", error: "transient_provider_error" }),
+      });
+      if (response.status !== 204) throw new Error(`Claude failed-turn hook was refused with status ${response.status}`);
+    }
+    if ((scenario === "limit" || scenario === "limit-no-fallback" || scenario === "limit-other-failed") && receipt.provider === "claude" && assignment.taskId === "a") {
+      writeFileSync("a.txt", "partial work from the limited member\n");
+      const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}` },
+        body: JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit" }),
+      });
+      if (response.status !== 204) throw new Error(`Claude limit hook was refused with status ${response.status}`);
+      console.log("You've hit your session limit · resets 3:45pm");
+      await new Promise(() => {});
+    }
     const name = scenario === "scope-escape" && assignment.taskId === "a" ? " a.txt" : `${assignment.taskId}.txt`;
     writeFileSync(name, `revision ${assignment.revision}\n`);
     if (scenario === "usage" && receipt.provider === "opencode") {
@@ -165,6 +192,18 @@ async function main() {
     writeFileSync(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
     await report({ kind: "result", summary: `Implemented ${assignment.taskId}.txt` });
   } else if (assignment.role === "integrator") {
+    if (scenario === "integrator-limit" && receipt.provider === "claude") {
+      writeFileSync("repair.txt", "partial repair from the limited integrator\n");
+      console.log("You've hit your session limit · resets 3:45pm");
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}` },
+        body: JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit" }),
+      });
+      if (response.status !== 204) throw new Error(`Claude limit hook was refused with status ${response.status}`);
+      await new Promise(() => {});
+    }
     writeFileSync("repair.txt", `${assignment.memberId}\n`);
     await report({ kind: "result", summary: "Applied a local repair for verification" });
   } else if (assignment.role === "reviewer") {

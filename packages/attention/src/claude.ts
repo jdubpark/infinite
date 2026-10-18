@@ -60,6 +60,7 @@ export function mapClaudeHook(body: unknown): Signal[] {
     case "Notification": {
       const type = str(b.notification_type, 60) ?? "unknown";
       const out: Signal[] = [{ kind: "notice", type, message: str(b.message, 500), title: str(b.title, 100) }];
+      if (type.startsWith("quota_auto_resume_")) out.push({ kind: "provider-limit", limit: "usage", confidence: "corroborated", message: str(b.message, 500) ?? "Claude Code reported a quota auto-resume notice" });
       if (type === "permission_prompt") out.push({ kind: "prompt-open", prompt: hookPrompt("permission", str(b.message, 200) ?? "Permission needed", undefined, {}) });
       if (type === "elicitation_dialog" || type === "elicitation_url_dialog") out.push({ kind: "prompt-open", prompt: hookPrompt("elicitation", str(b.message, 200) ?? "Input requested", undefined, {}) });
       return out;
@@ -68,10 +69,14 @@ export function mapClaudeHook(body: unknown): Signal[] {
       const tasks = Array.isArray(b.background_tasks) ? b.background_tasks.length : 0;
       return [turnEnd(b, tasks)];
     }
-    case "StopFailure": return [
-      { kind: "error", message: str(b.error, 1000) ?? "The provider reported a failure", where: "provider" },
-      { kind: "turn-end", backgroundTasks: 0, failed: true },
-    ];
+    case "StopFailure": {
+      const error = str(b.error, 1000) ?? "The provider reported a failure";
+      return [
+        { kind: "error", message: error, where: "provider" },
+        { kind: "turn-end", backgroundTasks: 0, failed: true },
+        ...(b.error === "rate_limit" ? [{ kind: "provider-limit" as const, limit: "usage" as const, confidence: "single-source" as const, message: error }] : []),
+      ];
+    }
     case "SessionEnd": return [{ kind: "notice", type: "session_end", message: str(b.reason, 100) }];
     default: return [];
   }

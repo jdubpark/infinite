@@ -1,5 +1,8 @@
 # Usage Ledger and Provider-Limit Fallback Implementation Plan
 
+Implementation update: the Codex screen recognizer and stability timer described below were rejected in review because ordinary transcript text could trigger them. They remain deferred until an authentic footer format is verified. Native typed quota errors, Claude hook observations, usage totals, and bounded fallback are implemented and covered by focused integration checks.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Record OpenCode token usage and USD cost durably with a soft per-provider budget, and make the team scheduler recognise a Claude Code or Codex usage limit and move the member's task to a configured fallback profile with partial work preserved.

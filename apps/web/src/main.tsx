@@ -1000,6 +1000,7 @@ function SessionView({
         ) : (
           <div className="catchup">
             {session.attention?.now && <div className="attention-summary"><strong>{sessionStatus(session)}</strong><p>{session.attention.now}</p></div>}
+            {session.attention?.limit && <div className="attention-summary" role="status"><strong>Usage limit reached</strong><p>{session.attention.limit.resetsAt ? `Provider reset stated for ${time(session.attention.limit.resetsAt)}` : "The provider did not state a reset time."} · {session.attention.limit.confidence} observation</p></div>}
             <div className="section-label">
               <h2>Current screen</h2>
               <div className="screen-actions">

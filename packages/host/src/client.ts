@@ -334,7 +334,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "sync", "pull"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "usage", "sync", "pull"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
@@ -452,6 +452,30 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
       if (options["--json"]) console.log(JSON.stringify(sessions, null, 2));
       else printSessions(sessions, (await api.json<Me>("/me")).machine?.label || new URL(config.origin).hostname);
+      return true;
+    }
+    if (command === "usage") {
+      const summary = await api.json<{ period: { start: string; end: string }; providers: Record<string, { period?: { start: string; end: string }; measured: boolean; spent?: { incomplete?: boolean; cost: number; messages: number; pricing: { configured: number; provider: number; unknown: number } }; budget?: { usd: number; period: "day" | "week" | "month" }; unmeasuredSessions: number }> }>("/usage");
+      if (options["--json"]) console.log(JSON.stringify(summary, null, 2));
+      else {
+        for (const [provider, item] of Object.entries(summary.providers)) {
+          const label = provider === "claude" ? "Claude Code" : provider === "codex" ? "Codex" : provider === "grok" ? "Grok Build" : provider === "opencode" ? "OpenCode" : provider;
+          const parts: string[] = [];
+          if (item.period) parts.push(`${item.period.start} to ${item.period.end}`);
+          if (item.spent?.incomplete) parts.push("partial usage data");
+          if (!item.measured || !item.spent) parts.push("unmeasured");
+          else if (!item.spent.messages && !item.spent.pricing.unknown) parts.push("no measured usage");
+          else {
+            parts.push(item.spent.pricing.unknown ? `known spend $${item.spent.cost.toFixed(item.spent.cost > 0 && item.spent.cost < 0.01 ? 6 : 2)}` : `spent $${item.spent.cost.toFixed(item.spent.cost > 0 && item.spent.cost < 0.01 ? 6 : 2)}`);
+            parts.push(`configured price: ${item.spent.pricing.configured}, reported by OpenCode: ${item.spent.pricing.provider}${item.spent.pricing.unknown ? `, unknown cost: ${item.spent.pricing.unknown}` : ""}`);
+            parts.push(`${item.spent.messages} usage records`);
+          }
+          if (item.budget) parts.push(`budget $${item.budget.usd.toFixed(2)} per ${item.budget.period}`);
+          else parts.push("no budget configured");
+          if (item.unmeasuredSessions) parts.push(`${item.unmeasuredSessions} unmeasured sessions`);
+          console.log(`${label}  ${parts.join(" · ")}`);
+        }
+      }
       return true;
     }
     if (command === "sync" && (options["--stop"] || options["--status"])) {

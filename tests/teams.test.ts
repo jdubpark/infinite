@@ -1,4 +1,5 @@
 import test from "node:test";
+import { ProviderLimits } from "../packages/host/src/provider-limits.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -10,84 +11,7 @@ import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 
-const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-
-const mixedLineup: TeamLineup = {
-  coordinator: { id: "opus-coordinator", label: "Opus coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" },
-  implementers: [
-    { id: "spark-high", label: "Spark implementer", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "light", dataUse: "contributor" },
-    { id: "astra-xhigh", label: "Astra implementer", provider: "codex", model: "gpt-6-astra", effort: "xhigh" },
-  ],
-  integrator: { id: "astra-integrator", label: "Astra integrator", provider: "codex", model: "gpt-6-astra", effort: "high" },
-  reviewer: { id: "opus-reviewer", label: "Opus reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" },
-};
-
-async function fixture(scenario = "success", lineup?: TeamLineup) {
-  const root = realpathSync(mkdtempSync("/tmp/inf-team-"));
-  const source = join(root, "source");
-  const receipts = join(root, "receipts");
-  mkdirSync(source); mkdirSync(receipts, { mode: 0o700 });
-  const opencode = join(root, "opencode-fixture");
-  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
-  writeFileSync(opencode, `#!/bin/sh\nexec ${[process.execPath, resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "opencode"].map(quote).join(" ")} "$@"\n`);
-  chmodSync(opencode, 0o700);
-  git(source, "init", "--initial-branch=main");
-  writeFileSync(join(source, "original.txt"), "The configured project remains unchanged.\n");
-  writeFileSync(join(source, "check.mjs"), [
-    'import assert from "node:assert/strict";',
-    'import { existsSync, readFileSync } from "node:fs";',
-    'assert.match(readFileSync("a.txt", "utf8"), /^revision [1-9][0-9]*\\n$/);',
-    'assert.equal(readFileSync("a.txt", "utf8"), readFileSync("b.txt", "utf8"));',
-    'if (process.argv.includes("--prefix")) assert.equal(process.env.INFINITE_TEST_COMMAND_IDENTITY, "team-prefix");',
-    'if (process.argv.includes("--fail")) { console.error("Configured verification failed"); process.exit(17); }',
-    ...(scenario === "mixed" ? ['if (!existsSync("repair.txt")) { console.error("Integration repair required"); process.exit(18); }'] : []),
-  ].join("\n"));
-  git(source, "add", "original.txt", "check.mjs");
-  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
-  const base = git(source, "rev-parse", "HEAD");
-  let host: Host;
-  try {
-    host = await startHost({
-      agents: {
-        demo: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), scenario, receipts] },
-        ...(lineup ? {
-          claude: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "claude"] },
-          codex: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "codex"] },
-          opencode: { command: opencode, args: [] },
-        } : {}),
-      },
-      config: {
-        teams: { workspaceDir: join(root, "teams"), ...(lineup ? { lineup } : {}), ...(scenario === "success" ? {
-          commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },
-        } : {}) },
-        remote: { enabled: true },
-        projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
-          team: { checks: [
-            { command: process.execPath, args: ["check.mjs", ...(scenario === "failed-check" ? ["--fail"] : []), ...(scenario === "success" ? ["--prefix"] : [])] },
-            ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
-          ] } }],
-      },
-    });
-  } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
-  const create = (): CreateTeam => ({ requestId: randomUUID(), projectId: "rehearsal", provider: lineup?.coordinator.provider ?? "demo",
-    ...(lineup ? { useConfiguredLineup: true } : {}), title: "Implement a small feature",
-    objective: "Create two independent files and verify their integrated contents.", parallelism: 2 });
-  const get = async (id: string): Promise<TeamView> => {
-    const response = await host.fetchApi(`/teams/${id}`);
-    assert.equal(response.status, 200, JSON.stringify(response.body));
-    return response.body;
-  };
-  const settled = (id: string) => waitFor(() => get(id), run => ["ready-for-review", "blocked"].includes(run.status), 90000);
-  const close = async () => {
-    try {
-      const listed = await host.fetchApi("/teams");
-      for (const run of listed.body.teams ?? [])
-        if (!["ready-for-review", "cancelled"].includes(run.status))
-          await host.fetchApi(`/teams/${run.id}/cancel`, "owner", { requestId: randomUUID(), revision: run.revision });
-    } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
-  };
-  return { host, source, receipts, base, create, get, settled, close };
-}
+import { git, limitLineup, mixedLineup, fixture } from "./team-fixture.js";
 
 test("a team builds concurrently in isolated copies and produces checked, reviewed work without changing its source", { timeout: 120000 }, async () => {
   const f = await fixture();
@@ -605,4 +529,112 @@ test("OpenCode team members journal each step with its tokens and cost", { timeo
       assert.ok(Math.abs(usage.reduce((sum, event) => sum + event.data.reportedCost, 0) - 0.5) < 1e-9);
     }
   } finally { await f.close(); }
+});
+
+test("a Claude usage limit preserves partial work on its fallback and informs later runs", { timeout: 120000 }, async () => {
+  const run = await fixture("limit", limitLineup);
+  try {
+    const created = await run.host.fetchApi("/teams", "owner", run.create());
+    const team = await run.settled(created.body.id);
+    assert.equal(team.status, "ready-for-review", JSON.stringify(team));
+    const task = team.tasks.find(value => value.id === "a")!;
+    assert.equal(task.limitSwitches?.length, 1);
+    assert.equal(task.limitSwitches![0].fromProfileId, "haiku");
+    assert.equal(task.limitSwitches![0].toProfileId, "deepseek-light");
+    assert.equal(task.limitSwitches![0].resetsAt?.slice(11, 16), "15:45");
+    assert.equal(team.members.filter(member => member.taskId === "a").length, 2);
+    assert.match(team.members.find(member => member.modelProfile?.id === "haiku")!.stoppedReason!, /usage limit/);
+    assert.equal(team.providerLimits[0]?.provider, "claude");
+    const receipts = readdirSync(run.receipts).filter(name => name.endsWith(".json")).map(name => JSON.parse(readFileSync(join(run.receipts, name), "utf8")));
+    assert.ok(receipts.some(receipt => receipt.runId === team.id && receipt.model === "deepseek/deepseek-flash" && receipt.sawPartial === true));
+
+    const nextCreated = await run.host.fetchApi("/teams", "owner", run.create());
+    const next = await run.settled(nextCreated.body.id);
+    assert.equal(next.status, "ready-for-review", JSON.stringify(next));
+    assert.ok(next.events.some(event => /launched on DeepSeek Flash/.test(event.text)));
+    assert.equal(next.members.filter(member => member.modelProfile?.provider === "claude").length, 0);
+  } finally { await run.close(); }
+});
+
+test("a Claude usage limit blocks the run when no fallback profile is configured", { timeout: 90000 }, async () => {
+  const lineup = structuredClone(limitLineup);
+  delete lineup.implementers[0].limitFallback;
+  delete lineup.fallbacks;
+  const run = await fixture("limit-no-fallback", lineup);
+  try {
+    const created = await run.host.fetchApi("/teams", "owner", run.create());
+    const team = await run.settled(created.body.id);
+    assert.equal(team.status, "blocked", JSON.stringify(team));
+    assert.match(team.reason!, /usage limit reached.*no fallback profile is configured for haiku/);
+    assert.match(team.members.find(member => member.modelProfile?.id === "haiku")!.stoppedReason!, /usage limit/);
+    assert.equal(team.tasks.find(task => task.id === "a")?.limitSwitches?.length ?? 0, 0);
+    assert.equal(team.tasks.find(task => task.id === "a")?.status, "running");
+  } finally { await run.close(); }
+});
+
+test("a limited Claude integrator continues the same repair with its partial changes", { timeout: 120000 }, async () => {
+  const lineup = structuredClone(limitLineup);
+  lineup.integrator = {
+    id: "haiku-integrator", label: "Claude integrator", provider: "claude", model: "claude-haiku-5-5",
+    effort: "medium", tier: "light", limitFallback: "deepseek-light",
+  };
+  const run = await fixture("integrator-limit", lineup);
+  try {
+    const created = await run.host.fetchApi("/teams", "owner", run.create());
+    const team = await run.settled(created.body.id);
+    assert.equal(team.status, "ready-for-review", JSON.stringify(team));
+    assert.ok(team.checks.some(check => check.status === "failed"), "The integrator starts only after a failed verification run");
+    assert.ok(team.checks.some(check => check.status === "passed"), "The fallback finishes the repair and verification passes");
+    const original = team.members.find(member => member.role === "integrator" && member.modelProfile?.id === "haiku-integrator")!;
+    const fallback = team.members.find(member => member.role === "integrator" && member.modelProfile?.id === "deepseek-light")!;
+    assert.match(original.stoppedReason!, /usage limit/);
+    const receipts = readdirSync(run.receipts).filter(name => name.endsWith(".json")).map(name => JSON.parse(readFileSync(join(run.receipts, name), "utf8")));
+    const fallbackReceipt = receipts.find(receipt => receipt.memberId === fallback.memberId);
+    assert.ok(fallbackReceipt?.sawPartial === true, "The fallback sees the limited integrator's partial repair");
+    assert.match(fallbackReceipt.prompt, /Configured verification failed/, "The replacement receives the check feedback");
+    assert.match(fallbackReceipt.prompt, /team-report\.(?:ts|js)/, "The replacement receives the host's structured report helper");
+    assert.doesNotMatch(fallbackReceipt.prompt, /mcp__infinite_team__report/, "OpenCode must not inherit Claude's reporting instructions");
+    assert.ok(team.members.some(member => member.role === "reviewer"));
+  } finally { await run.close(); }
+});
+
+test("a failed Claude turn in another session does not clear the corroborated provider limit", { timeout: 120000 }, async () => {
+  const lineup = structuredClone(limitLineup);
+  lineup.implementers[1] = {
+    id: "haiku-b", label: "Second Claude implementer", provider: "claude", model: "claude-haiku-5-5",
+    effort: "medium", tier: "light", limitFallback: "deepseek-light",
+  };
+  const run = await fixture("limit-other-failed", lineup);
+  try {
+    const firstCreated = await run.host.fetchApi("/teams", "owner", run.create());
+    const first = await run.settled(firstCreated.body.id);
+    assert.equal(first.status, "ready-for-review", JSON.stringify(first));
+    assert.ok(first.providerLimits.some(limit => limit.provider === "claude" && limit.confidence === "corroborated"), "The screen and hook preserve a corroborated Claude limit");
+
+    const nextCreated = await run.host.fetchApi("/teams", "owner", run.create());
+    const next = await run.settled(nextCreated.body.id);
+    assert.equal(next.status, "ready-for-review", JSON.stringify(next));
+    assert.ok(next.events.some(event => /launched on DeepSeek Flash/.test(event.text)), "A failed turn from the other Claude session does not release the limit for a later run");
+    assert.equal(next.members.filter(member => member.modelProfile?.provider === "claude").length, 0);
+  } finally { await run.close(); }
+});
+
+test("provider limit memory expires and successful clearing survives restart without stale replay", () => {
+  const root = mkdtempSync("/tmp/inf-limits-");
+  try {
+    const file = join(root, "limits.sealed"), key = Buffer.alloc(32, 7);
+    const observation = { provider: "claude" as const, detectedAt: "2026-10-18T10:00:00.000Z", sessionId: randomUUID(), confidence: "corroborated" as const };
+    let limits = new ProviderLimits(file, key);
+    limits.observe(observation);
+    assert.equal(limits.active(new Date("2026-10-18T10:14:59Z")).length, 1);
+    assert.equal(limits.active(new Date("2026-10-18T10:15:00Z")).length, 0);
+    limits.observe({ ...observation, detectedAt: "2026-10-18T11:00:00.000Z", resetsAt: "2026-10-21T10:00:00.000Z" });
+    assert.equal(limits.active(new Date("2026-10-18T12:00:00Z"))[0].expiresAt, "2026-10-19T11:00:00.000Z");
+    limits.clear("claude", "2026-10-18T12:00:00.000Z");
+    limits = new ProviderLimits(file, key);
+    limits.observe(observation);
+    assert.deepEqual(limits.active(new Date("2026-10-18T12:01:00Z")), []);
+    limits.observe({ ...observation, detectedAt: "2026-10-18T12:02:00.000Z" });
+    assert.equal(limits.active(new Date("2026-10-18T12:03:00Z")).length, 1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -67,8 +67,10 @@ export class GoalService {
   list() { return [...this.records.values()].map(({ goal }) => this.get(goal.id)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   get(id: string) {
     const goal = structuredClone(this.record(id).goal);
-    const tracking = this.linear?.updateGoal(goal);
+    const tracking = this.linear?.updateGoal(goal, goal.linearTracking === true);
     goal.linear = this.linear?.getGoal(id) ?? tracking ?? goal.linear;
+    goal.usage = this.teams.usageForRuns(goal.cycles.map(cycle => cycle.teamId));
+    for (const cycle of goal.cycles) cycle.usage = this.teams.usageForRuns([cycle.teamId])?.total;
     return goal;
   }
   answer(teamId: string, decisionId: string, body: Action & { text: string }) {
@@ -101,13 +103,13 @@ export class GoalService {
       const { requestId, ...fields } = request;
       const createdAt = now();
       const stored: Stored = { fingerprint, receipts: {}, goal: {
-        ...fields, id: requestId, revision: 1, status: "running", createdAt, updatedAt: createdAt,
+        ...fields, linearTracking: Boolean(project.linear), id: requestId, revision: 1, status: "running", createdAt, updatedAt: createdAt,
         deadlineAt: new Date(Date.now() + request.maxMinutes * 60000).toISOString(),
         lineup: structuredClone(this.config.teams!.lineup!), cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
       } };
       this.event(stored, "Goal approved. The coordinator can select and build work within its scope and limits.");
       this.records.set(requestId, stored); this.save(stored);
-      stored.goal.linear = this.linear?.updateGoal(stored.goal); this.save(stored);
+      stored.goal.linear = this.linear?.updateGoal(stored.goal, stored.goal.linearTracking === true); this.save(stored);
       return structuredClone(stored.goal);
     });
   }
@@ -233,7 +235,7 @@ export class GoalService {
   }
   private async launch(stored: Stored) {
     const pending = stored.launch!;
-    const team = await this.teams.createForGoal(pending.request, pending.context, stored.goal.lineup);
+    const team = await this.teams.createForGoal(pending.request, pending.context, stored.goal.lineup, stored.goal.linearTracking === true);
     if (this.closed) return;
     if (!stored.goal.cycles.some(cycle => cycle.teamId === team.id)) stored.goal.cycles.push({ teamId: team.id, cycle: pending.context.cycle, goalRevision: pending.context.revision, status: team.status, startedAt: team.createdAt, memberCount: team.members.length });
     stored.goal.activeTeamId = team.id; stored.launch = undefined;
@@ -243,7 +245,7 @@ export class GoalService {
   private async step(stored: Stored) {
     if (this.closed) return;
     const goal = stored.goal;
-    goal.linear = this.linear?.updateGoal(goal) ?? goal.linear;
+    goal.linear = this.linear?.updateGoal(goal, goal.linearTracking === true) ?? goal.linear;
     if (goal.linear?.status === "blocked" && !terminal.has(goal.status)) {
       goal.status = "blocked"; goal.reason = goal.linear.reason ?? "The Linear issue no longer matches this approved goal. Review it before starting another goal.";
       this.setControl(stored, "cancel"); this.event(stored, goal.reason);

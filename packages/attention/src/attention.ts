@@ -66,9 +66,23 @@ export function applySignal(att: Attention, event: SignalEvent): Attention {
       if (rejects(data.option?.label)) next.lastTool = undefined;
       break;
     case "turn-end":
-      next = { ...enter(next, "turn-finished", source, at), prompt: undefined, lastTool: undefined, sawTurnEnd: true };
+      next = { ...enter(next, "turn-finished", source, at), prompt: undefined, lastTool: undefined, sawTurnEnd: true,
+        ...(data.failed ? {} : { limit: undefined, lastSuccessfulTurnAt: at }) };
       next.lastMessage = data.message;
       break;
+    case "provider-limit": {
+      const existing = next.limit;
+      if (existing?.limit === data.limit && existing.confidence === "corroborated" && data.confidence === "single-source") break;
+      const resetsAt = data.resetsAt ?? (existing?.limit === data.limit ? existing.resetsAt : undefined);
+      next.limit = {
+        limit: data.limit,
+        confidence: data.confidence,
+        ...(resetsAt ? { resetsAt } : {}),
+        since: existing?.limit === data.limit ? existing.since : at,
+        message: data.message,
+      };
+      break;
+    }
     case "error":
       if (data.where === "hooks") next.hookErrors += 1;
       break;

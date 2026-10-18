@@ -74,7 +74,7 @@ export async function startNativeOpenCode(options: {
       const requested = options.settings.model ?? "unknown/unknown", slash = requested.indexOf("/");
       const usage = usageFromStepFinish(p.part, { completedAt: new Date().toISOString(),
         ...(reported ? { ...reported, modelSource: "reported" as const }
-          : { providerId: slash < 0 ? requested : requested.slice(0, slash), modelId: slash < 0 ? requested : requested.slice(slash + 1), modelSource: "requested" as const }) });
+          : { providerId: slash < 0 ? requested : requested.slice(0, slash), modelId: slash < 0 ? requested : requested.slice(slash + 1), modelSource: options.settings.model ? "requested" as const : "unknown" as const }) });
       if (usage) options.onUsage?.(usage);
     }
     if (type === "message.part.updated" && p.part?.type === "text" && roles.get(p.part.messageID) === "assistant") lastMessage = p.part.text?.slice(0, 4000);

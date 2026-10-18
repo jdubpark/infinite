@@ -56,7 +56,7 @@ const schema = z
           name: z.string(),
           path: z.string(),
           team: teamProjectSchema.optional(),
-          linear: z.object({ teamId: z.uuid() }).strict().optional(),
+          linear: z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict().optional(),
         }),
       )
       .min(1),
@@ -70,7 +70,6 @@ const schema = z
     attention: z
       .object({
         idleAfterMs: z.number().int().min(1000).max(600000).default(20000),
-        limitConfirmMs: z.number().int().min(1000).max(600000).default(30000),
         hooks: z
           .object({
             claude: z.boolean().default(DEFAULT_HOOKS.claude),

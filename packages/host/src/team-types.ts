@@ -1,4 +1,6 @@
 import { z } from "zod";
+import type { TeamUsage, UsageTotals } from "./usage.js";
+import type { ProviderLimit } from "./provider-limits.js";
 import type { Provider } from "./types.js";
 import type { LinearTrackingView } from "./linear-types.js";
 
@@ -156,12 +158,17 @@ export interface TeamMember extends TeamAssignment {
   cwd: string;
   baseCommit: string;
   prompt: string;
+  feedback?: string;
   startedAt?: string;
   report?: TeamReport;
   cursor: number;
   stopRequestId: string;
+  usage?: UsageTotals;
+  stoppedReason?: string;
+  pendingLimit?: { limit: "usage" | "credits"; confidence: "single-source" | "corroborated"; message: string; resetsAt?: string; detectedAt: string };
 }
 export interface TeamTask extends TeamTaskPlan {
+  limitSwitches?: { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string }[];
   status: "pending" | "running" | "waiting" | "integrated" | "blocked";
   memberId?: string;
   commit?: string;
@@ -194,6 +201,8 @@ export interface TeamCheck {
   revision: number;
 }
 export interface TeamRun {
+  linearTracking?: boolean;
+  usage?: TeamUsage;
   linear?: LinearTrackingView;
   id: string;
   projectId: string;
@@ -226,4 +235,4 @@ export interface TeamRun {
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
   round: number;
 }
-export type TeamView = Omit<TeamRun, "members"> & { members: Omit<TeamMember, "prompt">[] };
+export type TeamView = Omit<TeamRun, "members"> & { members: Omit<TeamMember, "prompt" | "feedback" | "pendingLimit">[]; providerLimits: ProviderLimit[] };

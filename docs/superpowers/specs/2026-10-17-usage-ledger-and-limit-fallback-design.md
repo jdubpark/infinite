@@ -1,5 +1,8 @@
 # Usage ledger and provider-limit fallback
 
+Implementation update: Codex terminal detection is deferred. Review demonstrated that bottom-row text alone cannot distinguish transcript content from provider status. Only the native protocol's typed `usageLimitExceeded` event is accepted for Codex; the screen proposal below is not enabled. Successful-turn evidence, rather than general activity, clears provider limits. Integrator fallback validates partial work against its permitted paths and regenerates provider-specific reporting instructions.
+
+
 Date: 2026-10-17. Status: design for review. Checkout: the agent-teams branch, where Goals, Teams, and the lineup live.
 
 ## Intent

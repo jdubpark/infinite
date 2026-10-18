@@ -37,6 +37,7 @@ export type Signal =
   | { kind: "prompt-closed"; promptId: number; reason: PromptClosedReason; label?: string }
   | { kind: "answer"; promptId: number; requestId: string; option?: { index: number; label: string }; text: boolean; result: AnswerResult }
   | { kind: "notice"; type: string; message?: string; title?: string; promptId?: number; detail?: string }
+  | { kind: "provider-limit"; limit: "usage" | "credits"; confidence: "single-source" | "corroborated"; resetsAt?: string; message: string }
   | { kind: "error"; message: string; where: "provider" | "hooks" | "host" };
 export type SignalKind = Signal["kind"];
 
@@ -66,8 +67,10 @@ export interface Attention {
   lastMessage?: string;
   lastTool?: { tool: string; summary: string; at: string };
   lastActivityAt: string;
+  lastSuccessfulTurnAt?: string;
   hooks: "active" | "none";
   hookErrors: number;
+  limit?: { limit: "usage" | "credits"; confidence: "single-source" | "corroborated"; resetsAt?: string; since: string; message: string };
   /** Internal: a turn-end has been seen in this session. */
   sawTurnEnd: boolean;
 }

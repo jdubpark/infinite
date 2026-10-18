@@ -12,6 +12,7 @@ import {
   claudeAgent,
   correlates,
   describeNow,
+  detectLimit,
   detectPrompt,
   dropsPrompt,
   initialAttention,
@@ -237,6 +238,10 @@ function record(
     data as unknown as Record<string, unknown>,
   ) as unknown as SignalEvent;
   publish(applySignal(attention, event));
+  if (signal.kind === "turn-end" && !signal.failed) {
+    limitWatch = undefined;
+    screenLimitMessage = undefined;
+  }
   return event;
 }
 
@@ -340,6 +345,13 @@ function onHook(route: HookRoute, body: unknown) {
     record({ kind: "hooks-ready", event: event.slice(0, 60) }, "hook");
   }
   for (const signal of signals) {
+    if (signal.kind === "provider-limit") {
+      if (signal.confidence === "single-source") {
+        limitWatch = { checks: 0 };
+      } else limitWatch = undefined;
+      record(signal, "hook", agent);
+      continue;
+    }
     if (signal.kind === "prompt-closed") {
       // A hook's close (PermissionDenied) names no prompt; it closes the open one, unless an
       // answer is pressing keys on it or its block is still on screen (the screen loop owns that).
@@ -363,6 +375,8 @@ let outputSinceCheck = false;
 let missCount = 0;
 /** Prompt id with an answer in flight; the answer path, not the screen loop, closes it. */
 let answering: number | undefined;
+let limitWatch: { checks: number } | undefined;
+let screenLimitMessage: string | undefined;
 
 /** Runs after every output flush and once a second. */
 function checkScreen() {
@@ -372,6 +386,20 @@ function checkScreen() {
     const detected = detectPrompt(lines, provider);
     const nowMs = Date.now();
     const at = new Date(nowMs).toISOString();
+    const detectedLimit = detectLimit(lines, provider, new Date(nowMs));
+    if (provider === "claude") {
+      if (limitWatch) {
+        limitWatch.checks += 1;
+        if (limitWatch.checks <= 2 && detectedLimit) {
+          record({ ...detectedLimit, kind: "provider-limit", confidence: "corroborated" }, "screen");
+          screenLimitMessage = detectedLimit.message;
+          limitWatch = undefined;
+        } else if (limitWatch.checks >= 2) limitWatch = undefined;
+      } else if (detectedLimit && screenLimitMessage !== detectedLimit.message) {
+        record({ ...detectedLimit, kind: "provider-limit", confidence: "single-source" }, "screen");
+        screenLimitMessage = detectedLimit.message;
+      }
+    }
     const idle =
       !outputSinceCheck &&
       nowMs - lastOutputAt >= config.attention.idleAfterMs &&

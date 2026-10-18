@@ -410,3 +410,21 @@ test("snapshot attachments and fenced device takeover preserve one live process 
     await host.stop();
   }
 });
+
+test("infinite usage prints the host summary as JSON and readable output", { timeout: 20000 }, async () => {
+  const { startHost } = await import("./helpers.js");
+  const host = await startHost({ config: { usage: { budgets: { opencode: { usd: 10, period: "month" } } } } });
+  const config = join(host.root, "client.json");
+  writeFileSync(config, JSON.stringify({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
+  const cli = resolve("packages/host/src/client-entry.ts");
+  try {
+    const json = await exec(process.execPath, ["--import", "tsx", cli, "--client-config", config, "usage", "--json"]);
+    const summary = JSON.parse(json.stdout);
+    assert.equal(summary.providers.opencode.budget.usd, 10);
+    assert.equal(summary.providers.opencode.budget.period, "month");
+    const readable = await exec(process.execPath, ["--import", "tsx", cli, "--client-config", config, "usage"]);
+    assert.match(readable.stdout, /OpenCode  no measured usage/);
+    assert.match(readable.stdout, /OpenCode.*budget \$10\.00 per month/);
+    assert.match(readable.stdout, /Codex  unmeasured/);
+  } finally { await host.stop(); }
+});

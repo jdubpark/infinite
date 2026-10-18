@@ -35,6 +35,8 @@ completion, merge, deployment, or product achievement.
 
 Application records are encrypted with AES-256-GCM. Each record has a fresh 96-bit random nonce and authenticated data containing the format version, session ID, and sequence number. This detects content modification and substitution between records or sessions. It does not detect deletion/rollback of a whole valid suffix without an independently anchored checkpoint.
 
+Usage totals and provider-limit entries record what the host observed. They do not establish task completion or predict a provider's remaining quota. Usage prices and budgets are private host configuration; the aggregated totals sent to paired clients contain no provider credential. Limit records contain the provider, observation and reset times, confidence, and related session/run identifiers, with no credential involved.
+
 The 256-bit key is a separate 0600 file outside the data directory, loaded into the API and worker memory. Encrypting a backup of the state directory is useful only if the attacker does not also obtain this key. Back up the key separately through an owner-controlled channel; losing it loses the recording. The local development layout is not a protected production key management system.
 
 Metadata and context use atomic encrypted writes. Workers fsync recording entries, serialize input, and refuse to silently continue after a detected recording error. A short output buffer of at most roughly 40 ms is not yet durable if the worker or machine dies; this is distinct from client disconnection.

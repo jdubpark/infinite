@@ -44,6 +44,13 @@ export const sessionStatus = (session: Session) => session.attention?.state === 
 
 type Filter = "active" | "attention" | "all";
 const active = (session: Session) => session.status === "running" || session.status === "starting";
+function usagePreview(usage: Session["usage"]) {
+  if (!usage) return "";
+  if ("measured" in usage && !usage.measured) return "Unmeasured";
+  if (!usage.messages && !usage.pricing.unknown) return usage.incomplete ? "Usage unavailable" : "No measured usage";
+  const unknown = usage.pricing.unknown;
+  return `${usage.incomplete ? "Partial data · " : ""}${unknown ? `Known spend $${usage.cost.toFixed(usage.cost > 0 && usage.cost < 0.01 ? 6 : 2)} · ${unknown} costs unknown` : `Spend $${usage.cost.toFixed(usage.cost > 0 && usage.cost < 0.01 ? 6 : 2)}`} · configured price: ${usage.pricing.configured}, reported by OpenCode: ${usage.pricing.provider}`;
+}
 
 export function SessionPicker({ sessions, selected, loading, onSelect }: {
   sessions: Session[]; selected: string | null; loading: boolean; onSelect: (id: string) => void;
@@ -74,6 +81,7 @@ export function SessionPicker({ sessions, selected, loading, onSelect }: {
         className={`session-row ${selected === session.id ? "selected" : ""}`} onClick={() => onSelect(session.id)}>
         <div className="row-top"><span className={`dot ${needsYou(session) ? "needs-you" : session.status}`} /><strong>{session.title}</strong><ChevronRight size={16} /></div>
         <div className="row-meta"><span>{names[session.provider]}{session.backend === "cmux" ? " · cmux" : ""}</span><span>{sessionStatus(session)}</span></div>
+        {session.usage && <p className="row-preview">{usagePreview(session.usage)}</p>}
         {session.attention?.now && <p className="row-preview">{session.attention.now}</p>}
         <div className="row-meta session-id">{session.id.slice(0, 8)}</div>
       </button>)}

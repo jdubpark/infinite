@@ -6,7 +6,7 @@ const count = (value: unknown): number => typeof value === "number" && Number.is
 const amount = (value: unknown): number => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 const text = (value: unknown): string | undefined => typeof value === "string" && value ? value : undefined;
 
-export interface UsageContext { completedAt: string; providerId: string; modelId: string; modelSource: "requested" | "reported" }
+export interface UsageContext { completedAt: string; providerId: string; modelId: string; modelSource: "requested" | "reported" | "unknown" }
 
 /**
  * Turns an OpenCode `step-finish` part into a usage record. Each step reports its own tokens and

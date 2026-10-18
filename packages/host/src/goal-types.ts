@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { TeamUsage, UsageTotals } from "./usage.js";
 import type { TeamBrief, TeamLineup } from "./team-types.js";
 import type { LinearTrackingView } from "./linear-types.js";
 
@@ -28,6 +29,7 @@ export const goalOutcomeSchema = goalActionSchema.extend({
 }).strict();
 export type GoalStatus = "running" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-opportunity" | "limit-reached" | "cancelled" | "achieved";
 export interface GoalCycle {
+  usage?: UsageTotals;
   teamId: string;
   cycle: number;
   goalRevision: number;
@@ -43,6 +45,8 @@ export interface GoalCycle {
   memberCount: number;
 }
 export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
+  linearTracking?: boolean;
+  usage?: TeamUsage;
   linear?: LinearTrackingView;
   id: string;
   revision: number;

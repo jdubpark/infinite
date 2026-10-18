@@ -15,3 +15,5 @@ ios/
 .impeccable/mocks/
 playwright-report/
 test-results/
+apps/macos/.build/
+apps/macos/Sources/InfiniteDesktop/Resources/vendor/

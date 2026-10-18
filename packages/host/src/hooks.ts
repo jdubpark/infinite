@@ -1,13 +1,24 @@
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
-export type HookRoute = "claude" | "codex" | "codex-notify";
-const ROUTES = new Set<string>(["claude", "codex", "codex-notify"]);
+export type HookRoute = "claude" | "codex" | "codex-notify" | "transcript";
+const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "transcript"]);
 const MAX_BODY = 256 * 1024;
+
+/**
+ * What the worker wants back from the relay. Only the relay reads this reply; the provider
+ * sees the relay's empty stdout, so a reply can never become a hook decision.
+ */
+export interface HookReply {
+  /** Send the transcript file at `path` from byte `after` to the `transcript` route. */
+  transcript?: { path: string; after: number };
+  /** Acknowledged transcript bytes; the relay continues from here. */
+  after?: number;
+}
 
 export function startHookServer(opts: {
   token: string;
-  onPayload: (route: HookRoute, body: unknown) => void;
+  onPayload: (route: HookRoute, body: unknown) => HookReply | void;
   onError: () => void;
 }): Promise<{ port: number; url: string; close: () => void }> {
   const expected = Buffer.from(opts.token);
@@ -27,11 +38,15 @@ export function startHookServer(opts: {
       return;
     }
     let body = "";
+    let bytes = 0;
     let tooBig = false;
-    req.on("data", (chunk) => {
+    // A multi-byte character can straddle two TCP chunks; the stream decoder joins them.
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => {
       if (tooBig) return;
       body += chunk;
-      if (body.length > MAX_BODY) {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > MAX_BODY) {
         tooBig = true;
         body = "";
         opts.onError();
@@ -50,12 +65,14 @@ export function startHookServer(opts: {
         res.writeHead(400).end();
         return;
       }
-      res.writeHead(204).end();
+      let reply: HookReply | void = undefined;
       try {
-        opts.onPayload(route as HookRoute, parsed);
+        reply = opts.onPayload(route as HookRoute, parsed);
       } catch {
         opts.onError();
       }
+      if (reply && Object.keys(reply).length) res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(reply));
+      else res.writeHead(204).end();
     });
     req.on("error", () => {});
   });

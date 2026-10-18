@@ -2,8 +2,9 @@
 """Create an age-encrypted, crash-consistent backup of the single-tenant host.
 
 Only the public age recipient is installed on the server. All writers running as
-infinite-host/infinite-agent must belong to infinite.service. Processes are frozen
-only while a private staging copy is made on the encrypted application volume.
+infinite-host/infinite-agent must belong to the explicitly supported service
+cgroups. Processes are frozen only while a private staging copy is made on the
+encrypted application volume.
 An independent systemd timer thaws them even if this process is killed.
 """
 import argparse
@@ -31,9 +32,15 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def archive_command(staging):
+    # PAX ACL records retain named-user access and inherited directory access.
+    return ["tar", "--create", "--gzip", "--format=pax", "--acls", "--numeric-owner", "--file=-", "--directory=" + str(staging), "."]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="/etc/infinite/backup.json")
+    parser.add_argument("--preflight-only", action="store_true", help="Check writer and directory coverage without freezing or copying")
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise RuntimeError("Run this host backup as root")
@@ -60,14 +67,31 @@ def main():
         raise RuntimeError("Backup directory must be root-owned with mode 0700")
     with Path("/run/infinite-backup.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if args.preflight_only:
+            services, groups, names, processes = backup_plan(source)
+            print(json.dumps({"services": services, "controlGroups": groups, "directories": names, "writerCount": len(processes), "preflightPassed": True}))
+            return
         create_backup(source, output, recipient)
 
 
-def create_backup(source, output, recipient):
-    service = "infinite.service"
-    if run("systemctl", "is-active", service) != "active":
-        raise RuntimeError("The runner must be active for this online backup")
-    group = run("systemctl", "show", service, "--property=ControlGroup", "--value")
+def service_groups(source):
+    groups = {}
+    for service in ("infinite.service", "infinite-cmux.service"):
+        loaded = run("systemctl", "show", service, "-p", "LoadState", "--value")
+        if service == "infinite-cmux.service" and loaded == "not-found":
+            continue
+        if loaded != "loaded" or run("systemctl", "is-active", service) != "active":
+            raise RuntimeError("Every installed application service must be active for this online backup")
+        group = run("systemctl", "show", service, "--property=ControlGroup", "--value")
+        if group != "/system.slice/" + service:
+            raise RuntimeError("Application service has an unexpected cgroup; backup refused")
+        groups[service] = group
+    if "infinite-cmux.service" in groups and not (source / "cmux").is_dir():
+        raise RuntimeError("The cmux service has no application-volume state directory")
+    return groups
+
+
+def application_writers(groups):
     uids = {pwd.getpwnam(user).pw_uid for user in ("infinite-host", "infinite-agent")}
     processes = {}
     for process in Path("/proc").iterdir():
@@ -75,12 +99,42 @@ def create_backup(source, output, recipient):
             continue
         try:
             if process.stat().st_uid in uids:
-                if f"0::{group}" not in (process / "cgroup").read_text().splitlines():
-                    raise RuntimeError("An application writer is outside the frozen service; stop it before backup")
+                memberships = (process / "cgroup").read_text().splitlines()
+                if not any(f"0::{group}" in memberships for group in groups.values()):
+                    raise RuntimeError("An application writer is outside the supported service cgroups; stop it before backup")
                 processes[process.name] = (process / "stat").read_text().rsplit(")", 1)[1].split()[19]
         except FileNotFoundError:
             continue
+    return processes
+
+
+def backup_plan(source):
+    groups = service_groups(source)
+    processes = application_writers(groups)
     names = ("control", "control-home", "agent-home", "workspaces")
+    if (source / "cmux").exists() or (source / "cmux").is_symlink():
+        names += ("cmux",)
+    for name in names:
+        path = source / name
+        if path.is_symlink() or not path.is_dir() or path.stat().st_dev != source.stat().st_dev:
+            raise RuntimeError("Application snapshot directories must be real directories on the encrypted volume")
+    return list(groups), groups, names, processes
+
+
+def thaw_services(services):
+    failed = False
+    for service in services:
+        try:
+            run("systemctl", "thaw", service, timeout=5)
+        except (subprocess.SubprocessError, OSError):
+            failed = True
+    if failed:
+        raise RuntimeError("An application service did not thaw; the independent watchdog remains armed")
+
+
+def create_backup(source, output, recipient):
+    service = "infinite.service"
+    services, groups, names, processes = backup_plan(source)
     required = sum(int(run("du", "--summarize", "--block-size=1", str(source / name)).split()[0]) for name in names)
     reserve = 2 * 1024 ** 3
     if shutil.disk_usage(source).free < required * 1.2 + reserve or shutil.disk_usage(output).free < required * 1.2 + reserve:
@@ -94,13 +148,16 @@ def create_backup(source, output, recipient):
     try:
         # Register the independent watchdog before freezing. A slow/failed copy
         # is never published; the pause is bounded even after SIGKILL.
-        run("systemd-run", "--quiet", "--unit=" + thaw_unit, "--on-active=45s", "/usr/bin/systemctl", "thaw", service)
+        run("systemd-run", "--quiet", "--unit=" + thaw_unit, "--on-active=45s", "/usr/bin/systemctl", "thaw", *services)
         started = time.monotonic()
         try:
             frozen = True
-            run("systemctl", "freeze", service, timeout=5)
-            if run("systemctl", "show", service, "-p", "FreezerState", "--value") != "frozen":
-                raise RuntimeError("Service did not freeze")
+            run("systemctl", "freeze", *services, timeout=5)
+            if any(run("systemctl", "show", unit, "-p", "FreezerState", "--value") != "frozen" for unit in services):
+                raise RuntimeError("An application service did not freeze")
+            if service_groups(source) != groups:
+                raise RuntimeError("Application services changed during backup")
+            processes = application_writers(groups)
             run("sync", "-f", str(source), timeout=5)
             data = staging / "data"; data.mkdir(mode=0o700)
             # The dedicated temporary directory is omitted. Native homes are
@@ -110,25 +167,29 @@ def create_backup(source, output, recipient):
                 if budget <= 0:
                     raise RuntimeError("Snapshot pause exceeded 30 seconds; use filesystem snapshots for larger workspaces")
                 run("cp", "-a", "-x", "--reflink=auto", str(source / name), str(data / name), timeout=budget)
-            if run("systemctl", "show", service, "-p", "FreezerState", "--value") != "frozen":
+            if any(run("systemctl", "show", unit, "-p", "FreezerState", "--value") != "frozen" for unit in services):
                 raise RuntimeError("Watchdog thawed during the copy; snapshot rejected")
+            if service_groups(source) != groups:
+                raise RuntimeError("Application services changed during backup")
+            application_writers(groups)
         finally:
             if frozen:
-                run("systemctl", "thaw", service, timeout=5)
+                thaw_services(services)
                 frozen = False
             run("systemctl", "stop", thaw_unit + ".timer", timeout=5)
         pause_seconds = round(time.monotonic() - started, 3)
         shutil.copytree("/etc/infinite", staging / "config", symlinks=True)
         # Vault and LUKS keys are recovered separately from the owner's device.
         manifest = {"format": 1, "createdAt": stamp, "consistency": "process-frozen-crash-consistent", "pauseSeconds": pause_seconds,
-                    "service": service, "processStartTicks": processes, "release": os.path.realpath("/opt/infinite"),
-                    "keyRecovery": "owner-held vault.key and storage.key; not included", "files": {}}
+                    "service": service, "services": services, "controlGroups": groups, "processStartTicks": processes, "release": os.path.realpath("/opt/infinite"),
+                    "keyRecovery": "owner-held vault.key and storage.key; not included",
+                    "filesystemMetadata": {"format": "gnu-tar-pax", "posixACLs": True, "numericOwners": True}, "files": {}}
         for path in staging.rglob("*"):
             if path.is_file() and not path.is_symlink():
                 manifest["files"][str(path.relative_to(staging))] = {"sha256": digest(path), "bytes": path.stat().st_size}
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         with partial.open("xb") as target:
-            tar = subprocess.Popen(["tar", "--create", "--gzip", "--numeric-owner", "--file=-", "--directory=" + str(staging), "."], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            tar = subprocess.Popen(archive_command(staging), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             try:
                 encrypted = subprocess.run(["age", "--encrypt", "--recipient", recipient], stdin=tar.stdout, stdout=target, stderr=subprocess.DEVNULL, timeout=600)
                 tar.stdout.close()
@@ -140,12 +201,17 @@ def create_backup(source, output, recipient):
                     tar.kill(); tar.wait()
         partial.rename(archive)
         receipt = {"archive": archive.name, "bytes": archive.stat().st_size, "sha256": digest(archive), "pauseSeconds": pause_seconds,
-                   "serviceState": run("systemctl", "show", service, "-p", "FreezerState", "--value")}
+                   "serviceState": run("systemctl", "show", service, "-p", "FreezerState", "--value"),
+                   "serviceStates": {unit: run("systemctl", "show", unit, "-p", "FreezerState", "--value") for unit in services}}
         (output / (stamp + ".json")).write_text(json.dumps(receipt, indent=2) + "\n")
         print(json.dumps(receipt))
     finally:
         if frozen:
-            subprocess.run(["systemctl", "thaw", service], timeout=10, capture_output=True)
+            for unit in services:
+                try:
+                    subprocess.run(["systemctl", "thaw", unit], timeout=10, capture_output=True)
+                except (subprocess.SubprocessError, OSError):
+                    pass
         partial.unlink(missing_ok=True)
         shutil.rmtree(staging)
 

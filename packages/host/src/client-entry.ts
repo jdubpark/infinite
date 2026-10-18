@@ -8,6 +8,7 @@ if (!((process.argv[2] === "--laptop-service" || process.argv[2] === "--sync-ser
   console.log(`Infinite — cloud sessions in your native terminal
 
 infinite pair https://HOST --token-file FILE
+infinite cmux [native workspace/terminal commands]
 infinite claude|codex|grok|opencode [native flags and prompt]
 infinite --project ID --title "Task" codex [native flags]
 infinite --detach codex [native flags]
@@ -15,6 +16,8 @@ infinite --laptop [--include DIR] codex ["Initial prompt"]
 infinite --local-ui codex [supported native flags] "Initial prompt"
 infinite --local-ui opencode [--model PROVIDER/MODEL] [--prompt "Task"]
 infinite list [--json]
+infinite resources [--watch] [--json]
+infinite close SESSION_ID [--yes] [--takeover] [--json]
 infinite projects
 infinite resume [session ID or unique prefix]
 infinite monitor [session ID or unique prefix]
@@ -31,6 +34,9 @@ Ctrl+] detaches; Ctrl+G monitors; Enter in monitor mode enables input.
 Ctrl+E opens a local draft; Ctrl+S inserts it; Enter in the native UI submits it.
 Drafts recover after restart. Esc keeps the draft; Ctrl+X discards it.
 A viewer key remains read-only. Reconnecting never starts another agent.
+Closing requires confirmation; --yes confirms noninteractive use. --takeover explicitly replaces another client's control.
+Resources are timestamped; unavailable measurements remain unavailable. --watch refreshes every two seconds.
+cmux opens the same separate cmux workspace catalog as the Mac app, using the installed infinite-cmux launcher.
 Local UI supports Codex and OpenCode experimentally.
 Only cloud Codex with --local-ui requires an initial prompt.
 Resume reopens the existing cloud conversation in its local native interface.

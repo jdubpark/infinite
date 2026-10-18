@@ -32,14 +32,15 @@ export function buildLaunch(
   enabled: { claude: boolean; codex: boolean },
 ): AgentProfile {
   const args = [...profile.args];
+  // Dev runs the relay from TypeScript through tsx; builds run the compiled file. The tsx
+  // loader is passed as an absolute URL because the agent's cwd is the project, not this repo.
+  const relay = relayPath.endsWith(".ts")
+    ? ["node", "--import", import.meta.resolve("tsx"), relayPath]
+    : ["node", relayPath];
   if (hooks && provider === "claude" && enabled.claude) {
-    const handler = {
-      type: "http",
-      url: `${hooks.url}/claude`,
-      headers: { Authorization: "Bearer $INFINITE_HOOK_TOKEN" },
-      allowedEnvVars: ["INFINITE_HOOK_TOKEN"],
-      timeout: 5,
-    };
+    // A command hook, not an HTTP hook: the relay runs in the agent's account and is the only
+    // process that can read the transcript the worker asks for in its reply.
+    const handler = { type: "command", command: [...relay, "claude"].join(" "), timeout: 10 };
     const settings = {
       hooks: Object.fromEntries(
         CLAUDE_EVENTS.map((e) => [e, [{ hooks: [handler] }]]),
@@ -48,11 +49,6 @@ export function buildLaunch(
     args.push("--settings", JSON.stringify(settings));
   }
   if (hooks && provider === "codex" && enabled.codex) {
-    // Dev runs the relay from TypeScript through tsx; builds run the compiled file. The tsx
-    // loader is passed as an absolute URL because the agent's cwd is the project, not this repo.
-    const relay = relayPath.endsWith(".ts")
-      ? ["node", "--import", import.meta.resolve("tsx"), relayPath]
-      : ["node", relayPath];
     const command = [...relay, "codex"].join(" ");
     for (const event of CODEX_EVENTS)
       args.push(

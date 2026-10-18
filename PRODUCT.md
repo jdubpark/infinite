@@ -3,12 +3,22 @@
 <!-- impeccable:product-schema 1 -->
 
 ## Platform
-Web desktop client and React Native mobile client, Android first, iPhone build support.
+Web client, React Native phone client (Android first, iPhone build support), and
+a personal native macOS client in `apps/macos`. The Mac implementation includes
+streamed provider terminals, a local prompt composer, resource/agent monitoring,
+file browsing, reviewed folder synchronization, and encrypted server connections.
+Its native build, provider UI parity, and physical-device commissioning remain
+separate acceptance checks. See [Infinite Desktop](docs/desktop.md).
 
-The native prototype uses a fixed light theme in both OS appearance modes. Phone layouts and enlarged Android text are in scope for this delivery; a native dark palette, tablet-specific layout, and iPhone native runtime verification remain future work.
+The phone prototype uses a fixed light theme in both OS appearance modes. Phone layouts and enlarged Android text are in scope for that client; a native dark palette, tablet-specific layout, and iPhone native runtime verification remain future work.
 
 ## Stack
-React Native selected by the user. Implementation choice: TypeScript, Node.js worker host, React web client, Expo native client. Ubuntu is the deployment target. AWS was the initial preference; the user subsequently requested a comparison with Hetzner and other providers for 10 or more agents, high bandwidth, and low egress charges.
+React Native selected by the user for the phone. Implementation: TypeScript,
+Node.js worker host, React web client, Expo phone client, and SwiftUI/CryptoKit Mac
+client with an embedded terminal renderer and optional native cmux SDK/helper.
+Ubuntu is the deployment target. AWS was the initial preference; the user
+subsequently requested a comparison with Hetzner and other providers for 10 or
+more agents, high bandwidth, and low egress charges.
 
 ## Users
 An individual running a single-tenant host, or multiple users on the managed service with independent private contexts and execution environments, including the service owner as an ordinary tenant. Each user works from a laptop and checks or steers from a phone or another computer. Flights, sleep, lost Wi-Fi, and laptop shutdown must not terminate cloud work.
@@ -35,4 +45,17 @@ The current runner is single-tenant. Owner/controller/viewer are roles within th
 ## Open Decisions
 The development server lacks confidential VM support. It is suitable for the single-tenant pilot and development/control-plane work; managed confidential execution needs a separate host. The server now runs the single-tenant pilot on Ubuntu 24.04 with private Tailscale HTTPS and LUKS2 application storage. Claude, Codex, Grok, and OpenCode have completed authenticated file edits; Codex also passed an in-flight tool/API-restart continuity check. OpenCode uses the owner's selected Muse Spark Contributor and DeepSeek providers. The confidential execution provider/region/budget, off-host backup destination, native signing identities, and cold-boot recovery remain unfinished. A paired laptop CLI and an owner-key encrypted backup with verified data restoration are now available. See `deploy/ubuntu/commissioning.md` for verified receipts.
 
-The laptop interaction target now requires locally responsive native prompt editing, not just a remote PTY in a local terminal. See [native interaction and continuity](docs/native-continuity.md) for the Herdr and Orca reviews, verified provider connection capabilities, consistent checkpoint requirements, and the distinction between a local interface and actual Mac execution. Cloud execution is the default for every provider as of 2026-10-16; Codex laptop execution with automatic checkpoint handoff is the explicit `--laptop` mode on qualified backends. Empty launches accept their first real input through the persistent terminal. OpenCode also has an experimental local UI adapter and supports empty conversations. Claude/Grok native UI adapters, automatic conflict application, platform-specific dependency provisioning and worker reboot recovery remain unfinished.
+The Mac interaction target uses a native local prompt composer: editing does not
+wait for the network; Enter submits the complete prompt and Shift-Enter inserts a
+newline. The actual provider terminal remains available, with direct keys and
+provider output subject to network latency. This is the selected local drafting
+approach; a locally running provider editor and complete provider-specific UI
+parity remain separate capabilities. See [Infinite Desktop](docs/desktop.md) and
+[native interaction and continuity](docs/native-continuity.md) for native provider
+adapters and checkpoint requirements. Cloud execution is the default for every
+provider as of 2026-10-16; Codex laptop execution with automatic checkpoint
+handoff is the explicit `--laptop` mode on qualified backends. Empty launches
+accept their first real input through the persistent terminal. OpenCode also has
+an experimental local UI adapter and supports empty conversations. Claude/Grok
+native UI adapters, automatic conflict application, platform-specific dependency
+provisioning and worker reboot recovery remain unfinished.

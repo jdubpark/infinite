@@ -1,0 +1,533 @@
+import SwiftUI
+import AppKit
+import Security
+import InfiniteCore
+
+@main struct InfiniteDesktopApp: App {
+    @StateObject private var model = AppModel()
+    @NSApplicationDelegateAdaptor(DesktopDelegate.self) private var delegate
+    init() {
+        // A locked Keychain or changed signing identity must produce a usable
+        // connection error instead of blocking the UI in a background prompt.
+        SecKeychainSetUserInteractionAllowed(false)
+    }
+    var body: some Scene {
+        Window("Infinite", id: "main") {
+            DesktopView(app: model)
+                .frame(minWidth: 880, minHeight: 560)
+                .onAppear { delegate.model = model; model.start() }
+        }
+        .defaultSize(width: 1240, height: 820)
+        .commands { WorkspaceCommands(app: model) }
+        Window("Resources", id: "resources") { ResourceView(app: model).frame(minWidth: 640, minHeight: 480) }
+            .defaultSize(width: 840, height: 640)
+        Window("Files & Sync", id: "files") { FilesView(app: model).frame(minWidth: 780, minHeight: 540) }
+            .defaultSize(width: 1040, height: 720)
+        Window("cmux Workspaces", id: "cmux") { CmuxWorkspaceView(model: model.cmux).frame(minWidth: 780, minHeight: 540) }
+            .defaultSize(width: 1120, height: 760)
+        Settings { ConnectionsView(app: model).frame(width: 600) }
+    }
+}
+
+/// Everything beyond the session list lives in the menu bar and separate windows.
+struct WorkspaceCommands: Commands {
+    @ObservedObject var app: AppModel
+    @Environment(\.openWindow) private var openWindow
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button("New Session") { app.showingCreate = true }.keyboardShortcut("n").disabled(!app.connected || !app.isOwner)
+            Button("New Team…") { app.showingCreateTeam = true }.keyboardShortcut("n", modifiers: [.command, .shift]).disabled(!app.connected || !app.isOwner || !app.teamsEnabled)
+        }
+        CommandMenu("Server") {
+            Button("Refresh") { Task { if app.connected { await app.refresh() } else { await app.connect() } } }.keyboardShortcut("r")
+            Divider()
+            Button("Resources") { openWindow(id: "resources") }.keyboardShortcut("2")
+            Button("Files & Sync") { openWindow(id: "files") }.keyboardShortcut("3")
+            Button("cmux Workspaces") { openWindow(id: "cmux") }.keyboardShortcut("4")
+            Divider()
+            Button("Connect a Server…") { app.showingPair = true }
+        }
+    }
+}
+
+@MainActor final class DesktopDelegate: NSObject, NSApplicationDelegate {
+    weak var model: AppModel?
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        showMainWindow()
+    }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { showMainWindow() }; return true
+    }
+    private func showMainWindow() {
+        DispatchQueue.main.async {
+            NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
+        }
+    }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    private var quitting = false
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !quitting else { return .terminateLater }
+        quitting = true
+        Task { @MainActor in
+            do {
+                for terminal in model?.terminals.values ?? Dictionary<String, SessionModel>().values { await terminal.detach() }
+                try await model?.cmux.disconnect()
+                await model?.client?.close()
+                sender.reply(toApplicationShouldTerminate: true)
+            } catch {
+                quitting = false
+                let alert = NSAlert(); alert.messageText = "Connection identity could not be saved"
+                alert.informativeText = error.localizedDescription; alert.addButton(withTitle: "Keep app open")
+                alert.runModal(); sender.reply(toApplicationShouldTerminate: false)
+            }
+        }
+        return .terminateLater
+    }
+}
+
+struct DesktopView: View {
+    @ObservedObject var app: AppModel
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.openWindow) private var openWindow
+    @State private var search = ""
+    @State private var endID: String?
+    private var filtered: [AgentSession] {
+        app.sessions.filter { search.isEmpty || [$0.title, $0.path, providerName($0.provider)].joined(separator: " ").localizedCaseInsensitiveContains(search) }
+    }
+    private var filteredTeams: [TeamRun] {
+        app.teams.filter { search.isEmpty || [$0.title, $0.objective].joined(separator: " ").localizedCaseInsensitiveContains(search) }
+    }
+    /// One list selects either a team or a session; a team row carries a prefix so the two never collide.
+    private var selection: Binding<String?> {
+        Binding(get: { app.selectedTeamID.map { "team:" + $0 } ?? app.selectedID }, set: { value in
+            if let value, value.hasPrefix("team:") {
+                if app.selectedTeamID == nil, let current = app.selectedID { app.terminals[current]?.markRead() }
+                app.selectedTeamID = String(value.dropFirst(5))
+            } else { app.selectedTeamID = nil; app.selectedID = value }
+        })
+    }
+    private var teamModel: TeamModel? { app.selectedTeamID.flatMap(app.teamModel(for:)) }
+    var body: some View {
+        NavigationSplitView {
+            sidebar.navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 380)
+        } detail: {
+            detail
+        }
+        .navigationTitle(app.active?.label ?? "Infinite")
+        .tint(colorScheme == .dark ? Color(red: 0.46, green: 0.73, blue: 0.59) : Color(red: 0.14, green: 0.40, blue: 0.31))
+        .toolbar {
+            if app.profiles.count > 1 {
+                ToolbarItem(placement: .navigation) {
+                    Picker("Server", selection: $app.activeID) { ForEach(app.profiles) { Text($0.label).tag($0.id) } }
+                        .labelsHidden().onChange(of: app.activeID) { _, _ in Task { await app.connect() } }
+                }
+            }
+            ToolbarItemGroup(placement: .primaryAction) {
+                if app.connecting { ProgressView().controlSize(.small) }
+                if app.teamsEnabled {
+                    Button { app.showingCreateTeam = true } label: { Label("New team", systemImage: "person.3") }
+                        .labelStyle(.titleAndIcon).disabled(!app.connected || !app.isOwner)
+                }
+                Button { app.showingCreate = true } label: { Label("New session", systemImage: "plus") }
+                    .labelStyle(.titleAndIcon).disabled(!app.connected || !app.isOwner)
+                Menu {
+                    Button("Resources") { openWindow(id: "resources") }
+                    Button("Files & Sync") { openWindow(id: "files") }
+                    Button("cmux Workspaces") { openWindow(id: "cmux") }
+                    Divider()
+                    Button("Connect a Server…") { app.showingPair = true }
+                    SettingsLink { Text("Connections…") }
+                } label: { Label("More", systemImage: "ellipsis.circle") }
+            }
+        }
+        .sheet(isPresented: $app.showingPair) { PairView(app: app) }
+        .sheet(isPresented: $app.showingCreate) { CreateView(app: app) }
+        .sheet(isPresented: $app.showingCreateTeam) { TeamCreateView(app: app) }
+        .alert("End this session?", isPresented: Binding(get: { endID != nil }, set: { if !$0 { endID = nil } })) {
+            Button("Cancel", role: .cancel) { endID = nil }
+            Button("End session", role: .destructive) { if let id = endID { Task { await app.end(id) } }; endID = nil }
+        } message: { Text("This stops the agent process on the server. Its recording stays available.") }
+    }
+
+    private var sidebar: some View {
+        let needsYou = filtered.filter(\.needsYou)
+        let running = filtered.filter { $0.running && !$0.needsYou }
+        let idle = filtered.filter { !$0.running }
+        return List(selection: selection) {
+            if !filteredTeams.isEmpty {
+                Section("Teams") { ForEach(filteredTeams) { team in TeamRowView(team: team).tag("team:" + team.id) } }
+            }
+            if !needsYou.isEmpty { Section("Needs you") { rows(needsYou) } }
+            if !running.isEmpty { Section("Running") { rows(running) } }
+            if !idle.isEmpty { Section("Not running") { rows(idle) } }
+        }
+        .listStyle(.sidebar)
+        .searchable(text: $search, placement: .sidebar, prompt: app.teamsEnabled ? "Find a session or team" : "Find a session")
+        .overlay {
+            if app.sessions.isEmpty && app.teams.isEmpty {
+                Text(app.active == nil ? "No server connected" : app.connecting ? "Connecting…" : "No sessions")
+                    .foregroundStyle(.secondary).font(.callout)
+            } else if filtered.isEmpty && filteredTeams.isEmpty {
+                Text("No matches").foregroundStyle(.secondary).font(.callout)
+            }
+        }
+    }
+    private func rows(_ sessions: [AgentSession]) -> some View {
+        ForEach(sessions) { row in
+            HStack(spacing: 9) {
+                Circle().fill(statusColor(row)).frame(width: 7, height: 7)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(row.title).lineLimit(1).foregroundStyle(row.running ? .primary : .secondary)
+                    Text(row.running && !row.now.isEmpty ? row.now : "\(providerName(row.provider)) · \(row.displayState)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                if row.value["team"] != .null {
+                    Spacer(minLength: 4)
+                    Image(systemName: "person.3").font(.caption2).foregroundStyle(.secondary)
+                        .help("\(TeamRun.roleName(row.value["team"]["role"].string)) in team \(app.teams.first { $0.id == row.value["team"]["runId"].string }?.title ?? "run")")
+                }
+            }
+            .padding(.vertical, 2)
+            .tag(row.id)
+            .contextMenu {
+                Button("Open beside current") { app.secondaryID = row.id }.disabled(app.selectedID == row.id)
+                if app.isOwner && row.running { Button("End session…", role: .destructive) { endID = row.id } }
+            }
+        }
+    }
+
+    @ViewBuilder private var detail: some View {
+        VStack(spacing: 0) {
+            if !app.message.isEmpty {
+                HStack {
+                    Image(systemName: "wifi.exclamationmark")
+                    Text(app.message).lineLimit(2); Spacer()
+                    Button("Reconnect") { Task { await app.connect() } }.disabled(app.connecting)
+                }.font(.caption).padding(10).background(Color.orange.opacity(0.12))
+            }
+            // Session panes stay mounted underneath a team dashboard, so switching back is instant.
+            ZStack {
+                Group {
+                    if app.active == nil { welcome }
+                    else if app.mounted.isEmpty {
+                        if app.connecting && app.sessions.isEmpty {
+                            ProgressView("Connecting to \(app.active?.label ?? "server")…").frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else {
+                            ContentUnavailableView {
+                                Label(app.sessions.isEmpty ? "No sessions yet" : "Choose a session", systemImage: "terminal")
+                            } description: {
+                                Text(app.sessions.isEmpty ? "Start Claude Code or Codex in one of your projects, or give a team an outcome." : "Pick a session or team from the sidebar.")
+                            } actions: {
+                                Button("New session") { app.showingCreate = true }.disabled(!app.connected || !app.isOwner)
+                                if app.teamsEnabled { Button("New team") { app.showingCreateTeam = true }.disabled(!app.connected || !app.isOwner) }
+                            }
+                        }
+                    } else { panes }
+                }.opacity(teamModel == nil ? 1 : 0).allowsHitTesting(teamModel == nil).accessibilityHidden(teamModel != nil)
+                if let teamModel { TeamDetailView(app: app, model: teamModel).id(teamModel.id) }
+            }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+    private var welcome: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "infinity").font(.system(size: 44, weight: .light)).foregroundStyle(.tint)
+            Text("Connect your server").font(.title2.weight(.semibold))
+            Text("Your agents run on the server and keep running when this app is closed.")
+                .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 380)
+            Button("Connect server…") { app.showingPair = true }.buttonStyle(.borderedProminent).controlSize(.large)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity).padding(40)
+    }
+    /// Recent terminals stay mounted off-screen, so switching back is instant and keeps their scrollback.
+    private var panes: some View {
+        GeometryReader { area in
+            let visible = app.visibleIDs
+            let width = max(1, (area.size.width - CGFloat(visible.count - 1)) / CGFloat(max(1, visible.count)))
+            ZStack(alignment: .topLeading) {
+                ForEach(app.mounted, id: \.self) { id in
+                    if let model = app.model(for: id) {
+                        let slot = visible.firstIndex(of: id)
+                        SessionPane(model: model, closeView: visible.count > 1 && id == app.secondaryID ? { app.secondaryID = nil } : nil)
+                            .frame(width: slot == nil ? area.size.width : width, height: area.size.height)
+                            .offset(x: slot.map { CGFloat($0) * (width + 1) } ?? 0)
+                            .opacity(slot == nil ? 0 : 1)
+                            .allowsHitTesting(slot != nil)
+                            .accessibilityHidden(slot == nil)
+                            .onChange(of: slot == nil) { _, hidden in if hidden { model.markRead(); Task { await model.release() } } }
+                            .onDisappear { Task { await model.detach() } }
+                    }
+                }
+                if visible.count > 1 { Rectangle().fill(.separator).frame(width: 1, height: area.size.height).offset(x: width) }
+            }
+        }
+    }
+}
+
+func providerName(_ name: String) -> String { ["claude": "Claude Code", "codex": "Codex", "grok": "Grok", "opencode": "OpenCode", "demo": "Rehearsal"][name] ?? name }
+func statusColor(_ session: AgentSession) -> Color {
+    session.needsYou ? .orange : session.running ? .green : session.recordingError ? .red : .secondary
+}
+
+struct SessionPane: View {
+    @ObservedObject var model: SessionModel
+    var closeView: (() -> Void)?
+    @State private var confirmEnd = false
+    @State private var confirmClear = false
+    private var session: AgentSession { model.session }
+    var body: some View {
+        VStack(spacing: 0) {
+            header.padding(.horizontal, 14).padding(.vertical, 10)
+            Divider()
+            ZStack {
+                // The terminal is created the first time the screen is shown and kept afterwards,
+                // so returning to it is immediate; chat needs no renderer at all.
+                if model.screenShown {
+                    GeometryReader { area in
+                        let generation = model.rendererGeneration
+                        TerminalSurface(pipe: model.pipe, acceptsInput: model.directInput && model.canUseTerminal, followsViewport: model.hasControl, onInput: model.raw, onResize: { cols, rows in Task { await model.resize(cols, rows) } }, onFailure: { message in
+                            if generation == model.rendererGeneration { model.rendererFailed(message) }
+                        }, onReady: { model.rendererRestored(generation) })
+                            .id(generation).frame(width: area.size.width, height: area.size.height)
+                    }.opacity(model.view == .screen ? 1 : 0).allowsHitTesting(model.view == .screen)
+                }
+                if model.view == .chat { ChatView(model: model) }
+            }.frame(minHeight: 100, maxHeight: .infinity).layoutPriority(-1).clipped()
+            Divider()
+            VStack(spacing: 10) {
+                if let prompt = model.prompt, model.session.needsYou { PromptCard(model: model, prompt: prompt).id(prompt["id"].int) }
+                composer
+            }.padding(12).fixedSize(horizontal: false, vertical: true).layoutPriority(1)
+        }.background(Color(nsColor: .windowBackgroundColor))
+        .task { await model.attach() }
+        .alert("End this session?", isPresented: $confirmEnd) {
+            Button("Cancel", role: .cancel) {}
+            Button("End session", role: .destructive) { Task { await model.end() } }
+        } message: { Text("This stops the agent process on the server. Its recording stays available.") }
+        .alert("Have you checked the terminal?", isPresented: $confirmClear) {
+            Button("Keep pending send", role: .cancel) {}
+            Button("Clear after review") { model.clearPending() }
+        } message: { Text("The previous prompt may already have been delivered. Clearing it does not cancel server work.") }
+    }
+    private var header: some View {
+        HStack(spacing: 10) {
+            Circle().fill(statusColor(session)).frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(session.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                HStack(spacing: 8) {
+                    Text("\(providerName(session.provider)) · \(session.displayState)").font(.caption).foregroundStyle(.secondary).lineLimit(1).fixedSize()
+                    Text(session.path.isEmpty ? session.project : session.path).font(.system(size: 11, design: .monospaced)).foregroundStyle(.tertiary)
+                        .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                }
+            }
+            Spacer(minLength: 8)
+            Picker("View", selection: Binding(get: { model.view }, set: { if $0 == .screen { model.showScreen() } else { model.view = .chat } })) {
+                Text("Chat").tag(SessionViewMode.chat); Text("Screen").tag(SessionViewMode.screen)
+            }.pickerStyle(.segmented).labelsHidden().fixedSize()
+            if !session.running && session.value["resumable"].bool == true {
+                Button("Resume") { Task { await model.resume() } }.disabled(model.role != "owner")
+            } else {
+                Menu {
+                    Button("Reconnect terminal") { Task { await model.detach(); await model.attach() } }
+                    if model.role == "owner" { Button("End session…", role: .destructive) { confirmEnd = true } }
+                } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton).fixedSize().help("Session actions")
+            }
+            if let closeView { Button(action: closeView) { Image(systemName: "xmark") }.buttonStyle(.plain).help("Close this view; the agent keeps running") }
+        }
+    }
+    /// Text would land in the open dialog; the screen view, where the dialog is visible, still allows it.
+    private var promptBlocks: Bool { model.prompt != nil && session.needsYou && model.view == .chat }
+    private var footer: (text: String, color: Color) {
+        if model.draft.pendingID != nil { return (model.notice.isEmpty ? "Delivery unconfirmed. Check the terminal before retrying." : model.notice, .orange) }
+        if !model.notice.isEmpty { return (model.notice, .secondary) }
+        if model.role == "viewer" { return ("View only", .secondary) }
+        if !session.running { return ("This session is \(session.displayState.lowercased()).", .secondary) }
+        if model.prompt != nil && session.needsYou && model.view == .chat { return ("Answer the dialog above first.", .secondary) }
+        if model.busy && !model.attached { return ("Connecting to the terminal…", .secondary) }
+        if let other = model.otherHolder { return ("\(other) has control · sending takes over", .secondary) }
+        if model.directInput { return ("Keys go straight to the terminal", .secondary) }
+        return ("Enter to send · Shift-Enter for a new line", .secondary)
+    }
+    private var composer: some View {
+        VStack(spacing: 8) {
+            PromptEditor(text: Binding(get: { model.draft.text }, set: model.setDraft), placeholder: "Message \(providerName(session.provider))…",
+                         enabled: model.canSend && model.role != "viewer" && !promptBlocks, submit: { Task { await model.send() } })
+                .frame(height: 76).clipShape(RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.14)))
+            HStack(spacing: 12) {
+                Text(footer.text).font(.system(size: 11)).foregroundStyle(footer.color).lineLimit(2).help(footer.text).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if model.role == "owner" {
+                    Toggle("Type in terminal", isOn: Binding(get: { model.directInput }, set: model.setDirectInput))
+                        .toggleStyle(.switch).controlSize(.mini).font(.caption).disabled(!model.screenReady || model.view != .screen)
+                }
+                if model.draft.pendingID != nil {
+                    Button("Retry same send") { Task { await model.send(retry: true) } }.disabled(!model.ready || model.busy)
+                    Button("Clear…") { confirmClear = true }
+                } else {
+                    Button { Task { await model.send() } } label: { Label(model.busy ? "Sending…" : "Send", systemImage: "arrow.up") }
+                        .buttonStyle(.borderedProminent).disabled(!model.canSend || model.role == "viewer" || promptBlocks)
+                }
+            }
+        }
+    }
+}
+
+struct PairView: View {
+    @ObservedObject var app: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var label = ""
+    @State private var origin = ""
+    @State private var token = ""
+    @State private var relay = ""
+    @State private var busy = false
+    @State private var error = ""
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("Connect your server", systemImage: "lock.shield").font(.title2.weight(.semibold))
+            Text("Use this Mac’s paired device key. It is saved in Keychain and never passed to the terminal renderer.").foregroundStyle(.secondary)
+            Form {
+                TextField("Name", text: $label, prompt: Text("Server"))
+                TextField("HTTPS address", text: $origin, prompt: Text("https://host.example.com"))
+                SecureField("Device key", text: $token)
+                TextField("Relay machine ID", text: $relay, prompt: Text("Leave empty for a direct connection"))
+            }.textFieldStyle(.roundedBorder)
+            Text("The host must have encrypted remote access enabled. There is no unencrypted fallback.").font(.caption).foregroundStyle(.secondary)
+            if !error.isEmpty { Text(error).foregroundStyle(.red).font(.callout).textSelection(.enabled) }
+            HStack {
+                Button("Import CLI connection…") { importConnection() }.disabled(busy)
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction).disabled(busy)
+                Button(busy ? "Connecting…" : "Connect") {
+                    busy = true; error = ""
+                    Task {
+                        do { try await app.pair(label: label, origin: origin, token: token, relay: relay); token = ""; dismiss() }
+                        catch { self.error = error.localizedDescription }; busy = false
+                    }
+                }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(busy || origin.isEmpty || token.isEmpty)
+            }
+        }.padding(26).frame(width: 510)
+    }
+    private func importConnection() {
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.message = "Choose the Infinite CLI connection file. Its key will be stored in Keychain after the server authenticates."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let value = try JSON.parse(Data(contentsOf: url))
+            guard !value["origin"].string.isEmpty, !value["token"].string.isEmpty else { throw DesktopError("This file does not contain an Infinite origin and token.") }
+            origin = value["origin"].string; token = value["token"].string
+        } catch { self.error = error.localizedDescription }
+    }
+}
+
+struct CreateView: View {
+    @ObservedObject var app: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var provider = "claude"
+    @State private var project = ""
+    @State private var title = ""
+    @State private var busy = false
+    @State private var error = ""
+    @State private var clearPending = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("New session").font(.title2.weight(.semibold))
+            Form {
+                Picker("Agent", selection: $provider) { ForEach(app.me["providers"].array.map(\.string), id: \.self) { Text(providerName($0)).tag($0) } }
+                Picker("Project", selection: $project) { ForEach(Array(app.projects.enumerated()), id: \.offset) { _, item in Text(item["name"].string).tag(item["id"].string) } }
+                TextField("Name", text: $title, prompt: Text("Optional"))
+            }.disabled(app.pendingCreation.pendingID != nil)
+            if app.pendingCreation.pendingID != nil {
+                Text("A creation request is pending. Retry uses its original agent, project, and request identity. Check the session list before starting a different request.").font(.callout).foregroundStyle(.orange)
+                Button("Clear after checking sessions…") { clearPending = true }.disabled(busy)
+            }
+            if let selected = app.projects.first(where: { $0["id"].string == project }) {
+                Text(selected["path"].string).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            if !error.isEmpty { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+            HStack { Spacer(); Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction).disabled(busy); Button(busy ? "Starting…" : app.pendingCreation.pendingID == nil ? "Start" : "Retry same creation") {
+                busy = true
+                Task { do { try await app.create(provider: provider, project: project, title: title); dismiss() } catch { self.error = error.localizedDescription }; busy = false }
+            }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(busy || project.isEmpty) }
+        }.padding(26).frame(width: 480)
+            .alert("Clear the pending creation?", isPresented: $clearPending) {
+                Button("Keep pending", role: .cancel) {}
+                Button("I checked the sessions") { app.clearCreation() }
+            } message: { Text("The server may already have created this agent. Clearing does not stop it.") }
+            .onAppear { project = app.projects.first?["id"].string ?? ""; if !app.me["providers"].array.map(\.string).contains(provider) { provider = app.me["providers"].array.first?.string ?? "" } }
+    }
+}
+
+struct ConnectionsView: View {
+    @ObservedObject var app: AppModel
+    @State private var confirmForget = false
+    @State private var showingPair = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text("Connections").font(.title.weight(.medium))
+            Text("Your Mac connects directly to each trusted server. Closing the app does not stop its agents.").foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if app.profiles.isEmpty { Text("No server connected yet.").foregroundStyle(.secondary) }
+            ForEach(app.profiles) { profile in
+                HStack {
+                    Image(systemName: "server.rack").font(.title2).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(profile.label).font(.headline)
+                        Text(profile.origin).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+                        Text(profile.relayMachineID == nil ? "Direct · end-to-end encrypted" : "Relay · end-to-end encrypted").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if profile.id == app.activeID { Text(app.connected ? "Connected" : app.connecting ? "Connecting…" : "Disconnected").font(.caption).foregroundStyle(.secondary) }
+                    else { Button("Connect") { app.activeID = profile.id; Task { await app.connect() } } }
+                }.padding(.vertical, 10)
+                Divider()
+            }
+            HStack {
+                Button("Add server…") { showingPair = true }.buttonStyle(.borderedProminent)
+                Button("Forget selected server…", role: .destructive) { confirmForget = true }.disabled(app.active == nil)
+            }
+            Text("Forgetting removes this Mac app's saved key. Revoke a lost device on the server to invalidate its access. The current Infinite transport has no forward secrecy; cmux connections use the qualified upstream Noise transport.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }.padding(26).frame(maxWidth: .infinity, alignment: .leading)
+            .sheet(isPresented: $showingPair) { PairView(app: app) }
+            .alert("Forget this connection?", isPresented: $confirmForget) { Button("Cancel", role: .cancel) {}; Button("Forget", role: .destructive) { Task { await app.forget() } } } message: { Text("Server sessions remain running. You will need a device key to connect again.") }
+    }
+}
+
+struct ResourceView: View {
+    @ObservedObject var app: AppModel
+    private var resources: JSON { app.resources }
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                HStack { Text("Server resources").font(.title.weight(.medium)); Spacer(); Text(app.connected ? "Live observations" : "Stale · reconnecting").font(.caption).foregroundStyle(app.connected ? Color.secondary : .orange) }
+                Text("Measurements belong to the execution server. Unavailable readings are never shown as zero.").foregroundStyle(.secondary)
+                if !resources["unavailable"].string.isEmpty { Text(resources["unavailable"].string).foregroundStyle(.orange) }
+                Grid(alignment: .leading, horizontalSpacing: 40, verticalSpacing: 16) {
+                    GridRow { metric("CPU", percent(resources["cpu"]["usagePercent"])); metric(resources["memory"]["availableKind"].string == "free" ? "Memory free" : "Memory available", bytes(resources["memory"]["availableBytes"])); metric("Memory total", bytes(resources["memory"]["totalBytes"])) }
+                    GridRow { metric("Swap used", bytes(resources["swap"]["usedBytes"])); metric("Network received", rate(resources["network"]["receiveBytesPerSecond"])); metric("Network sent", rate(resources["network"]["sendBytesPerSecond"])) }
+                }.padding(.vertical, 14)
+                Divider()
+                Text("Storage").font(.title3.weight(.semibold))
+                ForEach(Array(resources["disks"].array.enumerated()), id: \.offset) { _, disk in
+                    HStack { Text(disk["projectId"].string); Spacer(); Text("\(bytes(disk["availableBytes"])) available / \(bytes(disk["totalBytes"]))").monospacedDigit() }
+                    if let available = disk["availableBytes"].number, let total = disk["totalBytes"].number, total > 0 { ProgressView(value: max(0, min(1, 1 - available / total))) }
+                }
+                Divider()
+                Text("Agent processes").font(.title3.weight(.semibold))
+                ForEach(Array(resources["sessions"].array.enumerated()), id: \.offset) { _, row in
+                    HStack {
+                        VStack(alignment: .leading) { Text(app.sessions.first { $0.id == row["sessionId"].string }?.title ?? String(row["sessionId"].string.prefix(8))); Text(row["scope"].string).font(.caption).foregroundStyle(.secondary) }
+                        Spacer(); Text(percent(row["cpuPercent"])).frame(width: 80, alignment: .trailing); Text(bytes(row["rssBytes"])).frame(width: 100, alignment: .trailing)
+                    }.padding(.vertical, 5)
+                }
+                Text("Sample: \(resources["capturedAt"].string.isEmpty ? "not available" : resources["capturedAt"].string)").font(.caption).foregroundStyle(.secondary)
+                ForEach(Array(resources["unavailable"].array.enumerated()), id: \.offset) { _, value in Text("\(value["field"].string): \(value["reason"].string)").font(.caption).foregroundStyle(.secondary) }
+            }.padding(26).frame(maxWidth: 1000, alignment: .leading)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        // Samples are only requested while this window is open.
+        .onAppear { app.resourceWatchers += 1; Task { await app.refresh(includeResources: true) } }
+        .onDisappear { app.resourceWatchers -= 1 }
+    }
+    private func metric(_ label: String, _ value: String) -> some View { VStack(alignment: .leading, spacing: 7) { Text(label).font(.caption).foregroundStyle(.secondary); Text(value).font(.system(size: 25, weight: .medium, design: .rounded)).monospacedDigit() }.frame(minWidth: 170, alignment: .leading) }
+    private func percent(_ value: JSON) -> String { value.number.map { String(format: "%.1f%%", $0) } ?? "Unavailable" }
+    private func bytes(_ value: JSON) -> String { value.number.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .memory) } ?? "Unavailable" }
+    private func rate(_ value: JSON) -> String { value.number == nil ? "Unavailable" : bytes(value) + "/s" }
+}

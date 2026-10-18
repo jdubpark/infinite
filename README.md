@@ -1,6 +1,6 @@
 # Infinite
 
-A persistent agent host for Claude Code, Codex, Grok Build, and OpenCode. Agents run on the host; cmux, a browser, and the React Native phone app attach to the same sessions. Closing the laptop does not move or restart the agent.
+A persistent agent host for Claude Code, Codex, Grok Build, and OpenCode. Agents run on the host; cmux, the native Mac app, a browser, and the React Native phone app attach to the same sessions. Closing the laptop does not move or restart the agent.
 
 **Status: single-tenant cloud pilot with a paired laptop CLI.** Claude, Codex, Grok, and OpenCode have completed authenticated tool runs on the rented server. Cloud processes survive client disconnection and API restarts. Encrypted backup and data-restore checks are complete. Independent cloud backup storage, cold-boot recovery, and operator-confidential multi-tenant execution remain unfinished. See the [commissioning record](deploy/ubuntu/commissioning.md).
 
@@ -22,11 +22,16 @@ infinite codex --model MODEL
 infinite grok
 infinite opencode --model deepseek/deepseek-flash
 infinite list
+infinite resources --watch
 infinite resume
 infinite monitor
+infinite close SESSION_ID
+infinite cmux
 ```
 
 The CLI is installed and paired on the commissioning laptop. Every provider runs on the cloud host by default. `resume` attaches to the same process; `monitor` starts read-only. Press Enter to enable steering, Ctrl+G to monitor, or Ctrl+] to detach. Put wrapper options before the provider, for example `infinite --project PROJECT_ID --title "Task" codex`. See [installation, pairing, and CLI behavior](docs/cli.md).
+
+The Mac app can stay closed. `list` includes project and working directory, `resources --watch` shows server counters, and `close` asks before ending the selected provider process (`--yes` for scripts). `infinite cmux` opens the app's separate cmux workspace catalog through the independently installed and enrolled `infinite-cmux` launcher. Infinite's catalog and cmux's catalog retain their own IDs. An independent SSH tunnel can keep both connections available at login.
 
 Run `infinite sync` inside a checkout to keep the configured cloud project current with it, one way; `infinite pull` downloads the cloud tree into a new directory. See [workspace sync](docs/workspace-sync.md).
 
@@ -62,9 +67,25 @@ Search sessions by title, provider, project ID, or session ID. **Active** shows 
 
 Type a draft while monitoring or offline, then take control explicitly to send. **Cmd/Ctrl+Enter** sends; Enter adds a line. Switching sessions preserves drafts and recent views in this tab's memory. Reconnecting refreshes the view without sending the draft or reclaiming control. Reloading or closing the tab discards unsent drafts; they are not synchronized to other devices.
 
+## Mac app
+
+The personal macOS app embeds real terminal output, a native prompt editor,
+resource monitoring, session controls, and file transfer/sync preview. Enter sends
+a locally edited prompt; Shift-Enter adds a line. Direct terminal keys are an
+explicit mode. Server processes continue after the app closes.
+
+```sh
+npm run desktop:install
+```
+
+Requires macOS 14 or newer and Xcode command-line tools. Connect an Infinite host
+with `remote.enabled: true`, or enroll separately with a cmux server. The native
+connections are application-encrypted to the trusted server. See [build, pairing,
+file-safety rules, and verified limitations](docs/desktop.md).
+
 ## Phone
 
-The React Native app is in `apps/mobile`. It supports Android and has an iPhone build configuration. Pair it with an HTTPS Tailscale Serve address and a **controller** or **viewer** key. Keys go into Android Keystore/iOS Keychain through Expo SecureStore. Logs are kept in memory while the app is open and remain on the host for replay.
+The React Native app is in `apps/mobile`. It supports Android and has an iPhone build configuration. Pair it with an HTTPS Tailscale Serve address and a **controller** or **viewer** key. Enable `remote.enabled` on the host; direct and relay connections require the application-encrypted endpoint. Keys go into Android Keystore/iOS Keychain through Expo SecureStore. Logs are kept in memory while the app is open and remain on the host for replay.
 
 ```sh
 npm run android -w @infinite/mobile

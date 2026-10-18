@@ -1,3 +1,7 @@
+import { appendFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { relay } from "./hook-relay.js";
 const request = process.argv[2] ?? "";
 console.log("Infinite · local continuity rehearsal");
 console.log("This is a deterministic demo process. No model requests are made.");
@@ -7,13 +11,18 @@ if (request) console.log(`Initial request: ${request}\n`);
 const hookUrl = process.env.INFINITE_HOOK_URL;
 const hookToken = process.env.INFINITE_HOOK_TOKEN;
 const withHooks = request.includes("hook") && Boolean(hookUrl) && Boolean(hookToken);
+// The rehearsal keeps a Claude-format conversation record, like a real provider would, and its
+// hooks travel through the same relay code, so the chat path is exercised end to end.
+const transcriptPath = join(tmpdir(), `infinite-rehearsal-${process.pid}.jsonl`);
+if (withHooks) writeFileSync(transcriptPath, "", { mode: 0o600 });
+let records = 0;
+function transcribe(type: "user" | "assistant", content: unknown) {
+  if (!withHooks) return;
+  appendFileSync(transcriptPath, JSON.stringify({ type, uuid: `demo-${process.pid}-${++records}`, timestamp: new Date().toISOString(), message: { role: type, content } }) + "\n");
+}
 async function post(body: Record<string, unknown>) {
-  await fetch(`${hookUrl}/claude`, {
-    signal: AbortSignal.timeout(1500),
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${hookToken}` },
-    body: JSON.stringify({ session_id: "demo", transcript_path: "/dev/null", cwd: process.cwd(), permission_mode: "default", ...body }),
-  }).catch(() => {});
+  await relay("claude", JSON.stringify({ session_id: "demo", transcript_path: transcriptPath, cwd: process.cwd(), permission_mode: "default", ...body }),
+    { url: hookUrl!, token: hookToken! }).catch(() => {});
 }
 // Hooks go out in order on a chain that drawing and printing never await.
 let chain: Promise<void> = Promise.resolve();
@@ -43,7 +52,9 @@ function redraw() {
 }
 const RM_INPUT = { command: "rm -rf build", description: "Remove the stale build directory" };
 const turnHooks = () => {
+  transcribe("user", request);
   hook({ hook_event_name: "UserPromptSubmit", prompt: request });
+  transcribe("assistant", [{ type: "text", text: "I will remove the stale build directory." }, { type: "tool_use", name: "Bash", input: RM_INPUT }]);
   hook({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: RM_INPUT, tool_use_id: "demo-1" });
 };
 const permissionHook = () => hook({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: RM_INPUT, permission_suggestions: [] });
@@ -69,6 +80,7 @@ function selectOption(index: number) {
     console.log("Tell Claude what to do differently:");
   } else {
     hook({ hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "rm -rf build" }, tool_response: { stdout: "", exitCode: 0 }, tool_use_id: "demo-1", duration_ms: 42 });
+    transcribe("assistant", [{ type: "text", text: "Removed the build directory. Nothing else changed." }]);
     hook({ hook_event_name: "Stop", stop_hook_active: false, last_assistant_message: "Removed the build directory. Nothing else changed.", background_tasks: [] });
   }
   process.stdout.write("\n> ");
@@ -94,6 +106,10 @@ process.stdin.on("data", (chunk: string) => {
     if (awaitingYesNo && /^[nN]$/.test(line)) { awaitingYesNo = false; console.log("\nCancelled.\n"); process.stdout.write("> "); continue; }
     console.log(`\nYou: ${line}\nRehearsal: message received by process ${process.pid}.\n`);
     process.stdout.write("> ");
+    transcribe("user", line);
+    hook({ hook_event_name: "UserPromptSubmit", prompt: line });
+    transcribe("assistant", [{ type: "text", text: `Message received by process ${process.pid}.` }]);
+    hook({ hook_event_name: "Stop", stop_hook_active: false, last_assistant_message: `Message received by process ${process.pid}.`, background_tasks: [] });
   }
 });
 

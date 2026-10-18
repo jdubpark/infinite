@@ -12,7 +12,7 @@ import { connectRemoteAccess } from "../packages/host/src/remote-access.js";
 import { createRelayServer } from "../packages/host/src/relay.js";
 import { hashToken } from "../packages/host/src/config.js";
 import type { Config } from "../packages/host/src/types.js";
-import { startHost, waitFor } from "./helpers.js";
+import { inProcessHost, startHost, waitFor } from "./helpers.js";
 
 async function listen(server: Server) {
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -123,6 +123,75 @@ test("encrypted relay creates and steers real sessions while retaining roles and
     for (const client of clients) client.close();
     await host.stop(); proxy.close(); relay.close(); rmSync(privateFiles, { recursive: true, force: true });
   }
+});
+
+test("encrypted terminals carry real PTY output and receipts, enforce leases and roles, and stop on revocation", { timeout: 30000 }, async () => {
+  const host = await inProcessHost();
+  host.config.remote = { enabled: true };
+  const closeRemote = connectRemoteAccess(host.server, host.config);
+  const proxy = await wireProxy(host.origin);
+  const owner = createRemoteClient({ url: proxy.url, token: host.tokens.owner });
+  const viewer = createRemoteClient({ url: proxy.url, token: host.tokens.viewer });
+  type Page = {
+    events?: { data: { text?: string } }[];
+    state?: { status: string };
+    receipt?: { requestId: string; state: string };
+    refusal?: { requestId: string; code: string };
+    requestId?: string;
+    control?: { id: string };
+  };
+  const pages: Page[] = [], viewerPages: Page[] = [], closed: number[] = [], viewerClosed: number[] = [];
+  try {
+    const session = await owner.request<{ id: string }>("/sessions", { body: {
+      requestId: randomUUID(), provider: "demo", projectId: "rehearsal", title: "Encrypted terminal", prompt: "Terminal rehearsal",
+    } });
+    const clientId = randomUUID();
+    const terminal = await owner.openTerminal(session.id, { clientId, snapshot: false, onMessage: page => pages.push(page as Page), onClose: event => closed.push(event.code) });
+    await waitFor(async () => pages, value => value.some(page => page.events?.some(event => event.data.text?.includes("local continuity rehearsal"))));
+    const refused = randomUUID();
+    terminal.send({ op: "raw", requestId: refused, text: "must not arrive\r" });
+    await waitFor(async () => pages.find(page => page.refusal?.requestId === refused), value => value?.refusal?.code === "control-lost");
+    const claim = randomUUID();
+    terminal.send({ op: "control", requestId: claim, action: "claim" });
+    const control = await waitFor(async () => pages.find(page => page.requestId === claim), value => Boolean(value?.control?.id));
+    const leaseId = control!.control!.id;
+    const text = "encrypted terminal input sentinel", requestId = randomUUID();
+    terminal.send({ op: "raw", requestId, text: text + "\r", leaseId });
+    await waitFor(async () => pages.find(page => page.receipt?.requestId === requestId), value => value?.receipt?.state === "delivered");
+    await waitFor(async () => pages, value => value.some(page => page.events?.some(event => event.data.text?.includes(`You: ${text}`))));
+    const beforeReplay = (await owner.request<{ events: unknown[] }>(`/sessions/${session.id}/events?types=input-intent`)).events.length;
+    terminal.send({ op: "raw", requestId, text: text + "\r", leaseId });
+    await waitFor(async () => pages.filter(page => page.receipt?.requestId === requestId).length, value => value === 2);
+    assert.equal((await owner.request<{ events: unknown[] }>(`/sessions/${session.id}/events?types=input-intent`)).events.length, beforeReplay, "the gateway retains durable input deduplication through encryption");
+
+    const viewerTerminal = await viewer.openTerminal(session.id, { clientId: randomUUID(), snapshot: false, onMessage: page => viewerPages.push(page as Page), onClose: event => viewerClosed.push(event.code) });
+    await waitFor(async () => viewerPages, value => value.some(page => page.events?.some(event => event.data.text?.includes(text))));
+    viewerTerminal.send({ op: "raw", requestId: randomUUID(), text: "viewer must not type\r", leaseId });
+    await waitFor(async () => viewerClosed, value => value.includes(1008));
+    assert.equal((await owner.request<{ events: unknown[] }>(`/sessions/${session.id}/events?types=input-intent`)).events.length, beforeReplay, "viewer input never reaches the worker");
+
+    const otherId = randomUUID();
+    const takeover = await owner.request<{ control: { id: string } }>(`/sessions/${session.id}/control`, { headers: { "X-Infinite-Client": otherId }, body: { action: "claim", takeover: true } });
+    assert.notEqual(takeover.control.id, leaseId);
+    const stale = randomUUID();
+    terminal.send({ op: "raw", requestId: stale, text: "stale lease must not type\r", leaseId });
+    await waitFor(async () => pages.find(page => page.refusal?.requestId === stale), value => value?.refusal?.code === "control-lost");
+
+    const attachments = await Promise.all(Array.from({ length: 3 }, () => owner.openTerminal(session.id, {
+      clientId: randomUUID(), onMessage: () => {}, onClose: () => {},
+    })));
+    await assert.rejects(owner.openTerminal(session.id, { clientId: randomUUID(), onMessage: () => {}, onClose: () => {} }), (error: RemoteError) => error.code === "busy");
+    attachments.forEach(attachment => attachment.close());
+    assert.equal((await owner.request<{ status: string }>(`/sessions/${session.id}`)).status, "running", "closing a display does not stop the server process");
+    const visible = proxy.frames.join("\n");
+    for (const privateValue of [text, host.tokens.owner, session.id, leaseId, "terminal-open", "terminal-event"])
+      assert.equal(visible.includes(privateValue), false, "stream metadata and terminal contents remain encrypted");
+
+    host.config.tokens = host.config.tokens.filter(device => device.role !== "owner");
+    await waitFor(async () => closed, value => value.length === 1, 2500);
+    assert.throws(() => terminal.send({ op: "raw", requestId: randomUUID(), text: "revoked\r", leaseId }), (error: RemoteError) => error.code === "disconnected");
+    assert.equal((await viewer.request<{ status: string }>(`/sessions/${session.id}`)).status, "running", "device revocation closes its subscriptions without killing work");
+  } finally { owner.close(); viewer.close(); closeRemote(); proxy.close(); await host.stop(); }
 });
 
 async function httpRunner() {

@@ -14,28 +14,44 @@ export interface ChatMessage {
   text: string;
   toolName?: string;
   ts: string;
+  /** Journal position of the recording event, comparable with the page cursor. */
+  seq?: number;
 }
 
-/** Only explicit recorded messages become chat; terminal output remains terminal output. */
-export function recordedMessages(manager: Manager, session: Session, after = "0", limit = 200) {
+/**
+ * Only explicit recorded messages become chat; terminal output remains terminal output.
+ * With `transcript`, the provider's own conversation record was journaled as `message`
+ * events, which already carry the prompts and replies the fallback would synthesize.
+ */
+export function recordedMessages(manager: Manager, session: Session, after = "0", limit = 200, transcript = false) {
   if (!/^\d{1,16}$/.test(after) || !Number.isSafeInteger(Number(after)))
     throw new ContentError("Invalid message cursor", 400);
   const page = manager.events(session.id, Number(after), limit);
   const messages: ChatMessage[] = [];
-  if (after === "0" && session.initialPrompt) messages.push({
+  if (after === "0" && session.initialPrompt && !transcript) messages.push({
     id: "initial", role: "user", text: session.initialPrompt, ts: session.createdAt,
   });
   for (const event of page.events) {
     const data = event.data;
-    if (event.type === "input-result" && data.state === "delivered" && typeof data.message === "string") {
-      messages.push({ id: `input:${event.seq}`, role: "user", text: data.message, ts: event.at });
+    if (event.type === "message") {
+      if (typeof data.text !== "string" || !["user", "assistant", "tool"].includes(String(data.role))) continue;
+      messages.push({
+        id: typeof data.id === "string" ? `message:${data.id}` : `message:${event.seq}`,
+        role: data.role as ChatMessage["role"], text: data.text,
+        ...(typeof data.toolName === "string" ? { toolName: data.toolName } : {}),
+        ts: typeof data.ts === "string" ? data.ts : event.at, seq: event.seq,
+      });
+    } else if (transcript) {
+      continue;
+    } else if (event.type === "input-result" && data.state === "delivered" && typeof data.message === "string") {
+      messages.push({ id: `input:${event.seq}`, role: "user", text: data.message, ts: event.at, seq: event.seq });
     } else if (event.type === "signal" && data.kind === "turn-end" && typeof data.message === "string" && data.message.trim()) {
-      messages.push({ id: `reply:${event.seq}`, role: "assistant", text: data.message, ts: event.at });
+      messages.push({ id: `reply:${event.seq}`, role: "assistant", text: data.message, ts: event.at, seq: event.seq });
     } else if (event.type === "signal" && data.kind === "tool-start" && typeof data.tool === "string") {
-      messages.push({ id: `tool:${event.seq}`, role: "tool", toolName: data.tool, text: data.tool, ts: event.at });
+      messages.push({ id: `tool:${event.seq}`, role: "tool", toolName: data.tool, text: data.tool, ts: event.at, seq: event.seq });
     }
   }
-  return { messages, cursor: String(page.cursor), more: page.more, source: "recording", available: messages.length > 0 };
+  return { messages, cursor: String(page.cursor), more: page.more, source: transcript ? "transcript" : "recording", available: messages.length > 0 };
 }
 
 const images: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };

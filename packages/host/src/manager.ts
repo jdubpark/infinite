@@ -165,7 +165,6 @@ export class Manager {
           context: _context,
           initialPrompt: _prompt,
           nativeArgs: _nativeArgs,
-          cwd: _cwd,
           ...summary
         } = session;
         return {

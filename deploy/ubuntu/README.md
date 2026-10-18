@@ -69,6 +69,8 @@ Authenticate each provider as `infinite-agent` on the server. Do not forward a l
 
 On Ubuntu 24.04, check Bubblewrap's namespace support before a Codex tool run. Install `bubblewrap`, `apparmor-profiles`, and `apparmor-utils`. If no loaded profile already attaches to `/usr/bin/bwrap`, install the distribution's `/usr/share/apparmor/extra-profiles/bwrap-userns-restrict` as `/etc/apparmor.d/bwrap-userns-restrict` and load it with `apparmor_parser -r`. Avoid duplicate profiles for that executable. Check a harmless sandbox command as the agent account from an accessible workspace, then verify a real Codex file edit through Infinite. Keep `kernel.apparmor_restrict_unprivileged_userns=1` and Codex sandboxing enabled. [OpenAI Linux sandbox prerequisites](https://learn.chatgpt.com/docs/sandboxing?sandbox-os=ubuntu-debian).
 
+Install `deploy/ubuntu/infinite.sudoers` as `/etc/sudoers.d/infinite` after checking it with `visudo -cf`. Its `env_keep` lines pass the per-session hook listener address and token through to the agent account; without them Claude Code and Codex hooks, and the chat transcript they carry, never reach the worker, and sessions fall back to screen heuristics. Existing sessions keep their old environment; end and recreate them after installing the file.
+
 ## Configure Infinite
 
 Build a release from this checkout using `npm ci --workspace @infinite/host --workspace @infinite/web --include-workspace-root` and `npm run build`. Build as an unprivileged build user, then install the resulting tree under `/opt/infinite` with root-owned files. Keep the pinned lockfile. Mobile dependencies are unnecessary on the execution server.
@@ -112,9 +114,11 @@ Back up the vault key through a separate owner-controlled channel immediately. I
 
 Copy the `agents` block from `config.example.json` into the generated config, keeping real generated hashes and real project paths. The `sudo -H -u infinite-agent` boundary is essential: generated default profiles run as the control user and are suitable only for local rehearsal. Add a separate project directory for each concurrent writer. Do not blindly point ten sessions at one checkout.
 
-Default local Codex profiles select the prepared backend automatically. This wrapped deployment selects it explicitly through `appServerCommand` and `appServerArgs`, preserving the transition to `infinite-agent`. The sudoers allowlist names the `codex-app-server` wrapper separately. Keep the backend and stock Codex launch settings together when updating the profile.
+The `codex` wrapper adds `--no-daemon` to every interactive launch, including `resume`: the stock CLI otherwise expects a background app-server daemon that cannot start in the agent account and exits before the UI appears. The `codex-app-server` wrapper is unaffected. Default local Codex profiles select the prepared backend automatically. This wrapped deployment selects it explicitly through `appServerCommand` and `appServerArgs`, preserving the transition to `infinite-agent`. The sudoers allowlist names the `codex-app-server` wrapper separately. Keep the backend and stock Codex launch settings together when updating the profile.
 
 The Codex profile sets `workspaceDir` to the prepared hybrid directory and enables `sharedWorkspace`. Preparation remains host-private until cloud selection grants access to the selected execution tree. Checkpoint blobs and placement receipts stay in the private control directory. Keep `workspaceDir` outside control state and on encrypted storage.
+
+To let clients ask for a model-written digest of a session's chat, add a `summaries` block: `{"model": "gpt-6-luna", "apiKeyFile": "/etc/infinite/openai.key"}`, with the key in a root-owned 0640 file readable by the control user and, optionally, `baseUrl` for another OpenAI-compatible Responses endpoint. The host sends recorded chat messages to that service with `store: false`; leave the block out to send nothing.
 
 Validate and install `infinite.sudoers` using `visudo -cf`; then install `infinite.service`, reload systemd, and start it. Check that the API binds only to 127.0.0.1. `ProtectSystem` and the listed writable paths may require adjustment for legitimate project toolchains, but no adjustment should expose the control directory or runtime key to agent code.
 

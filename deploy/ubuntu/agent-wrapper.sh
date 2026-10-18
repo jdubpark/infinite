@@ -19,7 +19,12 @@ case "$provider" in
     export DISABLE_UPDATES=1
     export DISABLE_AUTOUPDATER=1
     ;;
-  codex|codex-app-server|grok|opencode) ;;
+  codex)
+    # The interactive CLI tries a background app-server daemon that cannot run in this
+    # account; the prepared app-server backend is launched separately through codex-app-server.
+    set -- --no-daemon "$@"
+    ;;
+  codex-app-server|grok|opencode) ;;
   demo)
     exec /usr/local/bin/node /opt/infinite/packages/host/dist/demo.js "$@"
     ;;

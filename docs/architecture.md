@@ -55,6 +55,7 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | List / inspect sessions | `GET /api/sessions`, `GET /api/sessions/:id` | Any |
 | Create session | `POST /api/sessions` | Owner |
 | Read chat / preview a project file | `GET /api/sessions/:id/messages`, `/file?path=` | Any |
+| Read a model-written digest of the chat | `GET /api/sessions/:id/summary?after=` | Any, when `summaries` is configured |
 | Explicitly resume an exited conversation | `POST /api/sessions/:id/resume` | Owner |
 | Replay logs | `GET /api/sessions/:id/events`, optionally filtered with `?types=` | Any |
 | Answer an on-screen dialog | `POST /api/sessions/:id/answer` | Owner, controller |
@@ -86,7 +87,13 @@ Each session reports one attention state: `working`, `needs-you`, `turn-finished
 
 A hook prompt is merged into the on-screen dialog only when it correlates line-for-line with it. Otherwise it is journaled as a `prompt-mismatch` notice and the on-screen dialog stands. The merged prompt always shows the on-screen detail.
 
-`POST /api/sessions/:id/answer` answers a dialog the terminal already shows. The client sends only the prompt id. The worker checks that it is still the open prompt and that the hash it stored for that prompt matches the dialog on the live screen. The worker sends keystrokes that navigate to the chosen option and presses Enter only after re-checking that the marker is on that option. A post-check reports `closed`, `still-open` or `changed`. Hooks never decide anything: the worker answers hooks with an empty `204`, so the laptop's dialog always appears and can still be answered there.
+`POST /api/sessions/:id/answer` answers a dialog the terminal already shows. The client sends only the prompt id. The worker checks that it is still the open prompt and that the hash it stored for that prompt matches the dialog on the live screen. The worker sends keystrokes that navigate to the chosen option and presses Enter only after re-checking that the marker is on that option. A post-check reports `closed`, `still-open` or `changed`. Hooks never decide anything: the worker's reply to a hook is read only by Infinite's relay process, which prints nothing to the provider, so the laptop's dialog always appears and can still be answered there.
+
+### Chat from the provider's own record
+
+Claude Code and Codex hooks are command hooks that run Infinite's relay inside the agent's account. The authenticated primary hook names the provider's transcript file (`transcript_path`; Codex rollouts are located by thread id under its sessions directory). The worker replies with the byte offset it has already seen, and the relay streams the file from there in bounded chunks to the `transcript` hook route. The worker never opens the file itself, which keeps the agent's home private to its account. Each complete transcript record becomes a journaled event with `type = "message"` carrying the provider's own message id, role, text and tool name; injected context, subagent records and model reasoning are dropped, text is bounded, and a repeated chunk cannot duplicate a message. Native Codex sessions journal the same events from the app-server's completed items. Once a session has transcript messages its state carries `capabilities.transcript = 1`, and `GET /api/sessions/:id/messages` returns only those (`source: "transcript"`); otherwise it returns delivered prompts and hook-reported replies from the recording (`source: "recording"`) and never fabricates an assistant message from terminal output.
+
+`GET /api/sessions/:id/summary?after=<cursor>` asks the configured model (`summaries.model`, an OpenAI-compatible Responses API) for a plain-text digest of the chat messages after that cursor. The response names the model and the cursor range it covers, and is cached per range. The instructions tell the model to attribute any claimed result to the agent; clients label the text as a summary, and nothing in the host acts on it.
 
 `POST /api/sessions/:id/input` refuses text while the open prompt's dialog is on screen, with `409 { error: "prompt-open", attention }`, because text and Enter would select the dialog's highlighted option. Nothing is typed or journaled. A request with `force: true` is delivered anyway; only terminal surfaces, where the person sees the dialog, send it.
 

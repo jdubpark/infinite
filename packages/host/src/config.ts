@@ -20,6 +20,12 @@ const schema = z
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),
     sync: z.object({ sharedGroup: z.boolean().optional() }).strict().optional(),
+    // Model-written chat digests. The key file is read once at startup and never logged.
+    summaries: z.object({
+      model: z.string().min(1).max(100),
+      apiKeyFile: z.string().refine(isAbsolute, "Summary key file must be absolute"),
+      baseUrl: z.url().default("https://api.openai.com"),
+    }).strict().optional(),
     port: z.number().int().min(0).max(65535),
     origin: z.url(),
     stateDir: z.string(),

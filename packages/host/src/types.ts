@@ -67,7 +67,7 @@ export interface Session {
 export interface Event {
   seq: number;
   at: string;
-  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal";
+  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "message";
   data: Record<string, unknown>;
 }
 export interface Project {
@@ -92,6 +92,8 @@ export interface Config {
   deployment?: import("./deployment.js").Deployment;
   /** Workspace sync. `sharedGroup` makes applied trees group-writable for a separate agent account. */
   sync?: { sharedGroup?: boolean };
+  /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
+  summaries?: { model: string; apiKeyFile: string; baseUrl: string };
   port: number;
   origin: string;
   stateDir: string;
@@ -129,7 +131,8 @@ export interface WorkerState {
   seq: number;
   screen: string;
   attention: Attention;
-  capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode" };
+  /** `transcript` means chat messages come from the provider's own conversation record. */
+  capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode"; transcript?: 1 };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
   nativeSession?: { id: string; source: "hook" | "protocol" };

@@ -11,7 +11,7 @@ const hooks = { url: "http://127.0.0.1:4321/hook", token: "tok" };
 const relay = "/opt/infinite/packages/host/dist/hook-relay.js";
 const enabled = { claude: true, codex: true };
 
-test("claude gets --settings with http hooks before the prompt", () => {
+test("claude gets --settings with relay command hooks before the prompt", () => {
   const launch = buildLaunch("claude", { command: "claude", args: ["--model", "opus"] }, "do it", hooks, relay, enabled);
   assert.equal(launch.command, "claude");
   assert.equal(launch.args[0], "--model");
@@ -21,11 +21,10 @@ test("claude gets --settings with http hooks before the prompt", () => {
   const events = Object.keys(settings.hooks).sort();
   assert.deepEqual(events, ["Elicitation", "Notification", "PermissionDenied", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PreToolUse", "SessionEnd", "Stop", "StopFailure", "UserPromptSubmit"]);
   const handler = settings.hooks.PreToolUse[0].hooks[0];
-  assert.equal(handler.type, "http");
-  assert.equal(handler.url, "http://127.0.0.1:4321/hook/claude");
-  assert.equal(handler.headers.Authorization, "Bearer $INFINITE_HOOK_TOKEN");
-  assert.deepEqual(handler.allowedEnvVars, ["INFINITE_HOOK_TOKEN"]);
-  assert.equal(handler.timeout, 5);
+  assert.equal(handler.type, "command");
+  assert.equal(handler.command, "node /opt/infinite/packages/host/dist/hook-relay.js claude");
+  assert.equal(handler.timeout, 10);
+  assert.equal("url" in handler, false);
   assert.equal(launch.args.at(-1), "do it");
 });
 

@@ -14,6 +14,13 @@ Metadata and context use atomic encrypted writes. Workers fsync recording entrie
 
 The laptop CLI also saves its Ctrl+E drafts with authenticated encryption and private file permissions. The encryption key is derived from the high-entropy paired device key with HKDF, scoped to the origin, session, project, and runtime. Draft ciphertext alone does not reveal the text; someone who obtains the paired client configuration can derive its key. This is local crash recovery, not protection from a compromised laptop. No draft is uploaded before explicit insertion, and unconfirmed insertions remain blocked on recovery.
 
+The native Mac app's local prompt composer has its own AES-GCM draft store and a
+device-only Keychain key. Draft identity is authenticated with the ciphertext;
+pending submission identities survive recovery and are not automatically
+resubmitted. Editing the composer does not send keystrokes to the host. Explicit
+terminal typing (**Type in terminal**) is a separate input mode. Neither mode supplies provider
+approval decisions automatically.
+
 The HTTP listener is loopback-only. Host and Origin checks, HttpOnly/SameSite cookies, role checks, bounded request bodies, login throttling, and a restrictive CSP cover the private control interface. Native release clients require HTTPS and keep their key in platform secure storage. Browser data is not cached to localStorage or a service worker. Decrypted log export is an explicit download to the owner's device.
 
 The experimental native Codex gateway grants owner-level provider access and requires a bearer key plus the worker's device-bound control lease. Browser cookies and controller/viewer roles cannot connect. Both provider listeners and the laptop relay bind only to loopback and require per-run capabilities; the local TUI receives a relay capability, not the owner's device key. The worker fences each native request after takeover and never supplies an approval response itself. Conversation pinning prevents accidental session switching; it is not a sandbox against an owner or an agent that can execute commands. The observer capability and provider state stay inside the same trusted tenant runtime.
@@ -36,7 +43,70 @@ The relay uses separate per-machine registration keys. It cannot decrypt applica
 
 A web portal's hosting origin is trusted to supply its JavaScript. If the relay serves that portal, a malicious relay operator could replace the client code and capture the key before encryption. Protection from that operator requires a separately trusted web origin or trusted native build. Native keys use platform secure storage; browser pairings and decrypted views remain in tab memory. Browser speech dictation may use the browser vendor's speech service and is an explicit user action.
 
-Remote forwarding permits only the compact client API. It excludes raw terminal/native provider gateways, workspace administration, and arbitrary launch arguments. Roles and input leases remain enforced by the runner. cmux input additionally verifies the target surface and foreground process, but local typing and other cmux controllers do not participate in Infinite's leases. Their concurrent actions can invalidate a prompt between observations. No lease grants permission to bypass provider approval.
+The native Mac client and both direct and relayed phone connections use this
+application-encrypted transport. There is no automatic fallback to bearer HTTPS
+when the encrypted endpoint is unavailable. Mac credentials remain in Keychain;
+the phone uses platform secure storage. The Mac pins the authenticated machine ID
+after first pairing. Initial pairing still trusts the manually provisioned device
+key and the identity it authenticates; this is not independent hardware attestation
+or an expiring enrollment protocol.
+
+The allowlist now includes terminal streams, resource observations, and bounded
+project file operations. `terminal-open`, `terminal-send`, and `terminal-close`
+travel inside ciphertext, together with device credentials and session identifiers.
+Server `terminal-event` frames carry original output, snapshots, state, receipts,
+and refusals. The host connects only to its own loopback terminal gateway; it
+cannot forward an arbitrary destination. Raw input remains owner-only, and
+worker input leases and durable request identities remain authoritative. Each
+channel permits four attached terminals, with bounded input and output buffers.
+Closing an attachment does not terminate its agent.
+
+Every encrypted request checks current device authorization. Active encrypted
+subscriptions also recheck authorization before output and periodically while
+idle, so removed keys cannot retain streaming access in a running configuration.
+Editing the configuration file still requires the documented API restart. No
+terminal is automatically reattached and no uncertain input is automatically
+replayed. Native provider gateways, general workspace administration, arbitrary
+forwarding, and native launch arguments remain outside the allowlist. See
+[desktop protocol](desktop.md#remote-api-extension).
+
+Desktop file operations use configured project roots, reject symlinks and special
+files, and keep the existing 96 KiB request limit. Transfers use at most 48 KiB raw
+chunks and 256 MiB files. Downloads pin content hashes; staged uploads verify size,
+hash, destination version, project, and paired device before commit. Host write
+fences prevent file mutation while project agents run or a sync application is
+active. The local sync UI previews conflicts and never propagates deletion.
+Private local backups and baseline metadata are plaintext with private permissions;
+they need the laptop's encrypted storage. They are not protected by transport
+encryption after download. Concurrent filesystem mutation remains a separate
+acceptance boundary; configured roots are not a sandbox against a trusted owner.
+
+## Direct native cmux transport
+
+The native app also supports a separate cmux route, terminal SDK, and bundled
+helper. It does not translate an Infinite device key into a cmux identity.
+Enrollment uses the daemon's invitation/approval flow. The upstream remote
+transport uses authenticated Noise connections; its cryptographic and enrollment
+contract must be qualified with the selected SDK/helper/server artifacts. The
+Infinite v1 pre-shared-key transport above does not inherit cmux's handshake or
+security properties.
+
+The app passes cmux invitations through standard input and keeps device identity
+and known daemon pins together in a device-only Keychain item. The helper and SDK
+share that identity in an owner-only runtime directory while connected. Normal
+disconnect saves the identity and removes the runtime directory; abrupt
+termination can leave private plaintext identity files behind. Do not describe
+that cleanup as crash-proof erasure. Non-loopback routes require `wss` or `iroh`;
+the daemon sees plaintext because it runs the terminals and file service.
+
+A cmux-enrolled device has broad daemon authority. Infinite viewer/controller
+roles and worker leases do not constrain independent cmux clients, local typing,
+or other cmux controllers. Their concurrent actions can invalidate a prompt
+between observations. SDK queue acceptance is not a durable input receipt, and
+ambiguous mutations must not be automatically resent. Neither enrollment nor any
+lease grants permission to bypass provider approval. The existing Infinite cmux
+discovery adapter continues to verify its target surface and foreground process;
+it is a different attachment path from direct native cmux.
 
 ## Required on a real host
 
@@ -64,6 +134,8 @@ Use encrypted off-host backups with restore testing. Keep the backup decryption 
 - Codex hooks are off by default. When `attention.hooks.codex` is enabled, they are injected with `--dangerously-bypass-hook-trust`. Unverified until spike S2: the flag applies only to the hooks Infinite injects for that one process, and hooks the person configured keep their own trust requirements. `doctor` prints a line naming the flag when Codex hooks are enabled.
 - Push is an optional outbound dependency of the host. Bodies are minimal by default and carry no session content; `push.detail: "full"` is opt-in. Messages go through Expo's push service and can be cached there. The Expo access token lives in a 0600 file outside the state directory. Push can be left disabled.
 - Signal payloads can contain commands and file contents. They are journaled encrypted like the rest of the recording and shown only to paired roles.
+- Transcript bytes reach the worker only through the authenticated hook relay, which runs as the agent and reads only a regular `.jsonl` file the provider's own hook named. The worker records them as `message` events in the encrypted journal, so chat carries the same plaintext the provider already stores in its home. On the Linux deployment the hook variables must be in sudo's `env_keep`, or hooks and transcripts never leave the agent account.
+- Chat summaries send recorded messages to the configured external model (`summaries`). The API key lives in a 0600 file outside the state directory; the host sends `store: false`, but the provider's own retention policy is a separate boundary. Leave `summaries` unset to send nothing.
 - Confidential VMs can narrow provider/hypervisor threats, but they do not protect against compromised software inside the trusted guest. Attestation and external key release would be a separate security project, not a box to check on this service. [Confidential VM model](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/about-cvm).
 
 Before putting private production repositories here, verify the isolation and storage controls on the selected host and repeat a real provider session through an actual laptop-network outage. Local synthetic continuity tests establish neither cloud hardening nor provider acceptance.

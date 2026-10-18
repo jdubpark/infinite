@@ -344,7 +344,7 @@ export class CmuxSessions {
 
   list() {
     const rows = () => [...this.records.values()].map((record) => {
-      const { context: _context, initialPrompt: _prompt, nativeArgs: _args, cwd: _cwd, ...session } = record.session;
+      const { context: _context, initialPrompt: _prompt, nativeArgs: _args, ...session } = record.session;
       const { screen: _screen, ...state } = this.state(record);
       return { ...session, ...state, attention: { ...state.attention, lastMessage: state.attention.lastMessage?.slice(0, 280) } };
     });

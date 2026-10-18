@@ -1,11 +1,11 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import type { Receipt, Session, Status, WorkerState } from "./types.js";
+import type { ControlLease, Receipt, Session, Status, WorkerState } from "./types.js";
 import { terminalConnection, TerminalAccessError, TerminalControlError, type TerminalPage } from "./client-transport.js";
 import { draftTerminal } from "./client-draft.js";
 import { localDraftStore } from "./client-draft-store.js";
@@ -53,10 +53,10 @@ function loadConfig(path: string): ClientConfig {
   return { ...config, origin: originOf(config.origin) };
 }
 function connection(config: ClientConfig, clientId = randomUUID()) {
-  const request = async (path: string, body?: unknown, signal?: AbortSignal) => {
+  const request = async (path: string, body?: unknown, signal?: AbortSignal, headers: Record<string, string> = {}) => {
     const response = await fetch(config.origin + "/api" + path, {
       method: body === undefined ? "GET" : "POST", redirect: "error",
-      headers: { Authorization: `Bearer ${config.token}`, "X-Infinite-Client": clientId, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+      headers: { Authorization: `Bearer ${config.token}`, "X-Infinite-Client": clientId, ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: signal ?? AbortSignal.timeout(15000),
     });
@@ -67,7 +67,10 @@ function connection(config: ClientConfig, clientId = randomUUID()) {
     }
     return response;
   };
-  return { request, json: async <T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> => (await request(path, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined)).json() as Promise<T> };
+  return { request, json: async <T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>): Promise<T> => (await request(path, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined, headers)).json() as Promise<T> };
+}
+function sessionCwd(session: Session & Partial<WorkerState>) {
+  return (session.execution?.location ?? session.executionLocation) === "laptop" ? session.workspace?.cwd : session.cwd;
 }
 /** One line per session, with where its tools run: the live executor when the session reports one, else its recorded location. */
 function printSessions(sessions: (Session & Partial<WorkerState>)[], machine: string) {
@@ -75,7 +78,83 @@ function printSessions(sessions: (Session & Partial<WorkerState>)[], machine: st
     const execution = s.execution;
     const where = (execution?.location ?? s.executionLocation) === "laptop" ? "laptop tools" : `tools on ${clean(machine)}`;
     const detail = execution ? ` · ${execution.state}${execution.checkpoint ? ` · checkpoint ${Math.max(0, Math.floor((Date.now() - Date.parse(execution.checkpoint.capturedAt)) / 1000))}s old` : ""}${execution.location === "laptop" ? execution.cloudReady ? " · cloud ready" : " · cloud preparing" : ""}` : "";
-    console.log(`${s.id}  ${s.provider.padEnd(8)}  ${s.status.padEnd(15)}  ${clean(s.title)}  · ${where}${detail}`);
+    console.log(`${s.id}  ${s.provider.padEnd(8)}  ${s.status.padEnd(15)}  ${clean(s.title)}  · project ${clean(s.projectId)} · cwd ${clean(sessionCwd(s) ?? "unavailable")} · ${where}${detail}`);
+  }
+}
+
+type ResourceSnapshot = {
+  capturedAt: string; sampleIntervalMs: number | null; uptimeSeconds: number;
+  cpu: { logicalCount: number; usagePercent: number | null; loadAverage: number[] | null };
+  memory: { totalBytes: number; availableBytes: number; availableKind: string };
+  swap: { totalBytes: number | null; usedBytes: number | null };
+  network: { receivedBytes: number | null; sentBytes: number | null; receiveBytesPerSecond: number | null; sendBytesPerSecond: number | null };
+  disks: { projectId: string; totalBytes: number | null; availableBytes: number | null }[];
+  sessions: { sessionId: string; pid: number | null; cpuPercent: number | null; rssBytes: number | null }[];
+  unavailable: { field: string; reason: string }[];
+};
+function printResources(value: ResourceSnapshot) {
+  const bytes = (n: number | null) => n === null ? "unavailable" : `${(n / 1048576).toFixed(1)} MiB`;
+  const percent = (n: number | null) => n === null ? "unavailable" : `${n.toFixed(1)}%`;
+  const rate = (n: number | null) => n === null ? "unavailable" : `${bytes(n)}/s`;
+  console.log(`Captured ${clean(value.capturedAt)} · uptime ${(value.uptimeSeconds / 3600).toFixed(1)} h · interval ${value.sampleIntervalMs === null ? "first sample" : `${value.sampleIntervalMs} ms`}`);
+  console.log(`CPU ${percent(value.cpu.usagePercent)} · ${value.cpu.logicalCount} logical CPUs · load ${value.cpu.loadAverage?.map(n => n.toFixed(2)).join(" / ") ?? "unavailable"}`);
+  console.log(`Memory ${bytes(value.memory.availableBytes)} ${clean(value.memory.availableKind)} / ${bytes(value.memory.totalBytes)} total · swap ${bytes(value.swap.usedBytes)} used / ${bytes(value.swap.totalBytes)} total`);
+  console.log(`Network received ${bytes(value.network.receivedBytes)} (${rate(value.network.receiveBytesPerSecond)}) · sent ${bytes(value.network.sentBytes)} (${rate(value.network.sendBytesPerSecond)})`);
+  for (const disk of value.disks) console.log(`Disk ${clean(disk.projectId)} · ${bytes(disk.availableBytes)} available / ${bytes(disk.totalBytes)} total`);
+  for (const session of value.sessions) console.log(`Session ${clean(session.sessionId)} · PID ${session.pid ?? "unavailable"} · CPU ${percent(session.cpuPercent)} · RSS ${bytes(session.rssBytes)} (provider process)`);
+  for (const item of value.unavailable) console.log(`Unavailable ${clean(item.field)}: ${clean(item.reason)}`);
+}
+async function resources(api: ReturnType<typeof connection>, options: Record<string, string | boolean>) {
+  const abort = new AbortController(), stop = () => abort.abort();
+  process.on("SIGINT", stop); process.on("SIGTERM", stop);
+  try {
+    do {
+      const value = await api.json<ResourceSnapshot>("/machine/resources", undefined, abort.signal);
+      if (options["--json"]) console.log(JSON.stringify(value, null, options["--watch"] ? undefined : 2));
+      else {
+        if (options["--watch"] && process.stdout.isTTY) process.stdout.write("\x1b[2J\x1b[H");
+        printResources(value);
+      }
+      if (!options["--watch"]) return;
+      await delay(2000, undefined, { signal: abort.signal });
+    } while (!abort.signal.aborted);
+  } catch (error) { if (!abort.signal.aborted) throw error; }
+  finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
+}
+
+async function closeSession(api: ReturnType<typeof connection>, me: Me, selected: Session, options: Record<string, string | boolean>) {
+  if (me.role !== "owner") throw new Error("Closing a session requires an owner device key");
+  const session = await api.json<Session & WorkerState>(`/sessions/${selected.id}`);
+  if (session.status !== "running") throw new Error(`Session is ${clean(session.status)}. Inspect it with infinite monitor ${selected.id}; no close was sent.`);
+  if (!options["--yes"]) {
+    if (!process.stdin.isTTY) throw new Error("Closing a session ends its provider process. Use --yes with an explicit session ID for noninteractive use.");
+    const input = createInterface({ input: process.stdin, output: process.stderr });
+    try {
+      const answer = await input.question(`Close ${clean(session.provider)} ${JSON.stringify(clean(session.title))} (${session.id}) in project ${clean(session.projectId)}, cwd ${clean(sessionCwd(session) ?? "unavailable")}? [y/N] `);
+      if (!/^(y|yes)$/i.test(answer.trim())) { console.error("[Infinite] Close cancelled. The session keeps running."); return; }
+    } finally { input.close(); }
+  }
+  let lease: ControlLease | undefined;
+  if (session.capabilities?.inputControl) {
+    try { lease = (await api.json<{ control: ControlLease }>(`/sessions/${session.id}/control`, { action: "claim", ...(options["--takeover"] ? { takeover: true } : {}) })).control; }
+    catch (error) {
+      if (error instanceof HttpError && error.status === 409) throw new Error("Session control is held by another client or changed. Release it there, or use close --takeover to replace its control explicitly. No close was sent.");
+      throw error;
+    }
+  }
+  const headers = lease ? { "X-Infinite-Control": lease.id } : undefined;
+  const requestId = randomUUID();
+  console.error(`[Infinite] Close ${requestId} · session ${session.id}`);
+  try {
+    const receipt = await api.json<Receipt>(`/sessions/${session.id}/stop`, { requestId }, undefined, headers);
+    if (receipt.requestId !== requestId || receipt.state !== "delivered") throw new Error("Unconfirmed close receipt");
+    if (options["--json"]) console.log(JSON.stringify({ sessionId: session.id, ...receipt }, null, 2));
+    else console.log(`Close delivered for ${session.id}. Use infinite list to check process status.`);
+  } catch (error) {
+    if (error instanceof HttpError && [401, 403, 409].includes(error.status)) throw error;
+    throw new Error(`Close delivery is unconfirmed for ${session.id} (request ${requestId}). Nothing was retried. Inspect infinite list or monitor before taking further action.`);
+  } finally {
+    if (lease) await api.json(`/sessions/${session.id}/control`, { action: "release", leaseId: lease.id }).catch(() => {});
   }
 }
 async function selectSession(sessions: Session[], requested: string | undefined, monitor: boolean) {
@@ -334,7 +413,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "sync", "pull"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "resources", "close", "sync", "pull"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
@@ -343,7 +422,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
   const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output"]);
-  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force"]);
+  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes"]);
   const option = () => {
     const name = args.shift()!;
     if (name === "--include" && args.length) includes.push(args.shift()!);
@@ -367,6 +446,10 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   if (options["--force"] && !options["--apply"]) throw new Error("--force applies to infinite sync --apply");
   if (command === "sync" && positional.length) throw new Error("infinite sync takes no arguments; run it inside the checkout and choose the project with --project ID");
   if (command === "pull" && positional.length > 1) throw new Error("infinite pull takes at most one project ID");
+  if (options["--watch"] && command !== "resources") throw new Error("--watch applies to infinite resources");
+  if (options["--yes"] && command !== "close") throw new Error("--yes applies to infinite close");
+  if (command === "resources" && positional.length) throw new Error("infinite resources takes no arguments");
+  if (command === "close" && positional.length !== 1) throw new Error("Usage: infinite close SESSION_ID [--yes] [--takeover]");
   return { command, args: providers.has(command) ? args : positional, options, includes };
 }
 
@@ -413,6 +496,16 @@ function describeSync(sync: ProjectDetail["sync"]) {
 }
 
 export async function handleClientCommand(argv: string[]): Promise<boolean> {
+  if (argv[0] === "cmux") {
+    try {
+      const child = spawn("infinite-cmux", argv.slice(1), { stdio: "inherit" });
+      process.exitCode = await new Promise<number>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", code => resolve(code ?? 1));
+      });
+    } catch { console.error("[Infinite] The standalone infinite-cmux launcher is unavailable. Install and pair it before using infinite cmux."); process.exitCode = 1; }
+    return true;
+  }
   const progress = startupProgress();
   const args = [...argv];
   // Keep server administration commands and their --config semantics intact.
@@ -454,6 +547,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       else printSessions(sessions, (await api.json<Me>("/me")).machine?.label || new URL(config.origin).hostname);
       return true;
     }
+    if (command === "resources") { await resources(api, options); return true; }
     if (command === "sync" && (options["--stop"] || options["--status"])) {
       // The service is a local process: stopping or inspecting it must not depend on reaching the host.
       const syncDir = join(dirname(path), "sync");
@@ -479,6 +573,11 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command !== "projects") progress.start(`Connecting to ${new URL(config.origin).hostname}`);
     const me = await api.json<Me>("/me");
     progress.stop();
+    if (command === "close") {
+      const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
+      await closeSession(api, me, await selectSession(sessions, positional[0], true), options);
+      return true;
+    }
     if (command === "projects") {
       for (const p of me.projects) {
         const detail = await api.json<ProjectDetail>(`/projects/${p.id}`).catch(() => undefined);

@@ -357,23 +357,26 @@ export class TeamService {
         if (member.status === "queued") { await this.launch(stored, member); continue; }
         if (!member.report) {
           if (member.startedAt && Date.now() - Date.parse(member.startedAt) > 60 * 60 * 1000) { this.block(stored, new TeamError(409, "member-time-limit", "An agent exceeded its one-hour runtime limit. Its workspace was preserved.")); return; }
-          const page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
-          member.cursor = page.cursor;
-          let limit: LimitSwitch | undefined;
-          for (const event of page.events) {
-            if (event.type === "signal") {
-              const data = event.data;
-              // Prefer a corroborated observation; a later successful turn means the member recovered.
-              if (switchesMember(data)) { if (!limit || (limit.confidence !== "corroborated" && data.confidence === "corroborated")) limit = { ...data, at: event.at, seq: event.seq }; }
-              else if ((data.kind === "turn-end" && !data.failed) || (data.kind === "notice" && data.type === "quota_auto_resume_fired")) limit = undefined;
-              continue;
+          let page: ReturnType<Manager["events"]>, limit: LimitSwitch | undefined;
+          // A limit acts only on the whole journal: a report or recovery in an unread tail wins.
+          do {
+            page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
+            member.cursor = page.cursor;
+            for (const event of page.events) {
+              if (event.type === "signal") {
+                const data = event.data;
+                // Prefer a corroborated observation; a later successful turn means the member recovered.
+                if (switchesMember(data)) { if (!limit || (limit.confidence !== "corroborated" && data.confidence === "corroborated")) limit = { ...data, at: event.at, seq: event.seq }; }
+                else if ((data.kind === "turn-end" && !data.failed) || (data.kind === "notice" && data.type === "quota_auto_resume_fired")) limit = undefined;
+                continue;
+              }
+              const parsed = teamReportEnvelopeSchema.safeParse(event.data);
+              if (!parsed.success) continue;
+              const envelope = parsed.data;
+              if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
+              member.report = envelope.report; member.status = "reported"; break;
             }
-            const parsed = teamReportEnvelopeSchema.safeParse(event.data);
-            if (!parsed.success) continue;
-            const envelope = parsed.data;
-            if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
-            member.report = envelope.report; member.status = "reported"; break;
-          }
+          } while (!member.report && limit && page.more);
           if (!member.report && limit) {
             await this.switchLimitedMember(stored, member, limit);
             if (stored.pending || run.status === "blocked") return;
@@ -476,11 +479,11 @@ export class TeamService {
     let selected = pinnedProfile ?? this.memberProfile(run, role, task);
     const limit = selected && this.limits.active().find(item => item.provider === selected!.provider);
     const fallback = limit && run.lineup ? resolveLimitFallback(run.lineup, selected!.id, this.limits.limited()) : undefined;
-    if (selected && limit && fallback) {
-      // Without a resolvable fallback the launch proceeds: the limit may have lifted.
+    const retargeted = fallback && prompt !== undefined ? retargetPrompt(prompt, { provider: fallback.provider, profile: fallback }) : undefined;
+    // Without a resolvable fallback, or with a passed prompt it cannot carry, the launch proceeds: the limit may have lifted.
+    if (selected && limit && fallback && (prompt === undefined || retargeted !== undefined)) {
       runEvent(run, `${selected.label} launched on ${fallback.label}: ${PROVIDER_NAMES[limit.provider]} is limited until ${clock(limit.expiresAt)}`);
-      if (prompt) prompt = retargetPrompt(prompt, { provider: selected.provider, profile: selected }, { provider: fallback.provider, profile: fallback });
-      selected = fallback;
+      prompt = retargeted; selected = fallback;
     }
     const modelProfile = selected ? structuredClone(selected) : undefined;
     const provider = modelProfile?.provider ?? run.provider;
@@ -509,12 +512,15 @@ export class TeamService {
     if (member.role === "implementer" && !task) throw new TeamError(409, "invalid-task", "The implementer has no current task assignment.");
     const scout = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
     const prefix = this.config.teams?.commandPrefix, editing = member.role === "implementer" || member.role === "integrator";
+    const note = editing ? `The previous ${member.role} stopped at a ${name} ${kind}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`
+      : `The previous ${member.role} stopped at a ${name} ${kind} before reporting. Its working copy was checked unchanged; complete the same assignment.`;
     // Editing roles keep in-scope partial work; read-only roles must have left their copy unchanged.
     this.operation(stored, "result", signal => editing ? assertMemberScope(member.cwd, member.baseCommit, task ? task.paths : run.goal?.allowedPaths, prefix, signal) : assertMemberReadOnly(member.cwd, member.baseCommit, prefix, signal), () => {
-      const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId,
-        task ? undefined : retargetPrompt(member.prompt, { provider, profile: from }, { provider: fallback.provider, profile: fallback }), fallback);
+      // The prompt keeps its feedback and user answers. An unrecognized prompt is rebuilt with its answers.
+      const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback),
+        ...run.decisions.filter(decision => decision.answer && run.members.some(prior => prior.memberId === decision.memberId && prior.role === member.role && prior.taskId === member.taskId && prior.revision === member.revision)).map(decision => `User answered: ${decision.answer}`)].join("\n\n");
+      const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, `${carried}\n\n${note}`, fallback);
       if (task) {
-        next.prompt = teamPrompt(run, "implementer", task, `The previous implementer stopped at a ${name} ${kind}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`, next.provider ?? run.provider, next.modelProfile);
         (task.limitSwitches ??= []).push({ fromProfileId: from.id, toProfileId: fallback.id, reason: limit.message, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}), memberId: member.memberId, at: timestamp() });
         task.memberId = next.memberId; task.status = "running";
       }

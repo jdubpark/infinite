@@ -144,11 +144,23 @@ async function main() {
       return;
     }
     if (scenario.startsWith("limit") && receipt.provider === "claude" && receipt.argv[receipt.argv.indexOf("--model") + 1] === "claude-haiku-5-5") {
+      // In `limit`, the first attempt asks a question so the limited attempt carries a user answer.
+      if (scenario === "limit" && !existsSync(asked)) {
+        writeFileSync(asked, "asked", { mode: 0o600 });
+        await report({ kind: "question", question: "Which display label should the first file use?", options: ["Detailed", "Compact"] });
+        return;
+      }
       // Partial work, then Claude Code's limit notice and its StopFailure hook. The notice comes
       // first so the hook arrives as its corroboration: a hook alone switches the member before a
       // later notice could record the host-level limit. The member idles without reporting.
+      // The stated reset is two hours ahead of this clock (read as UTC), so it is never in the past.
       writeFileSync("a.txt", "partial\n");
-      process.stdout.write("You've hit your session limit · resets 3:45pm\n");
+      const reset = new Date(Date.now() + 2 * 3600_000); reset.setUTCSeconds(0, 0);
+      const hour = reset.getUTCHours();
+      receipt.limitNotice = `You've hit your session limit · resets ${hour % 12 || 12}:${String(reset.getUTCMinutes()).padStart(2, "0")}${hour < 12 ? "am" : "pm"}`;
+      receipt.expectedResetsAt = reset.toISOString();
+      writeFileSync(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
+      process.stdout.write(`${receipt.limitNotice}\n`);
       await new Promise(resolve => setTimeout(resolve, 500));
       const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
         method: "POST",

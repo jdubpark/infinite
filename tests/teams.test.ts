@@ -8,7 +8,8 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
-import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
+import type { CreateTeam, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
+import { retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
 
 import { git, mixedLineup, fixture } from "./team-fixture.js";
 
@@ -543,37 +544,49 @@ const limitLineup: TeamLineup = {
 const readReceipts = (dir: string) => readdirSync(dir).filter(name => name.endsWith(".json")).map(name => JSON.parse(readFileSync(join(dir, name), "utf8")));
 const sessionEvents = async (host: Host, id: string, types: string) => (await host.fetchApi(`/sessions/${id}/events?types=${types}&after=0&limit=200`)).body.events as unknown[];
 
-test("a Claude member that hits a usage limit continues on its fallback with partial work, and later Claude members launch on the fallback directly", { timeout: 120000 }, async () => {
+test("a Claude member that hits a usage limit continues on its fallback with its answers and partial work, and later Claude members launch on the fallback directly", { timeout: 120000 }, async () => {
   const run = await fixture("limit", limitLineup);
   try {
-    const team = await run.settled((await run.host.fetchApi("/teams", "owner", run.create())).body.id);
+    const created = (await run.host.fetchApi("/teams", "owner", run.create())).body;
+    const waiting = await waitFor(() => run.get(created.id), t => t.status === "needs-input" && t.decisions.length === 1, 45000);
+    const answer = { requestId: randomUUID(), revision: waiting.revision, text: "Compact" };
+    assert.equal((await run.host.fetchApi(`/teams/${waiting.id}/decisions/${waiting.decisions[0].id}/answer`, "controller", answer)).status, 200);
+    const team = await run.settled(waiting.id);
     assert.equal(team.status, "ready-for-review", JSON.stringify(team));
     const task = team.tasks.find(t => t.id === "a")!;
-    const limited = team.members.find(m => m.modelProfile?.id === "haiku")!;
     assert.equal(task.limitSwitches?.length, 1);
-    assert.equal(task.limitSwitches![0].fromProfileId, "haiku");
-    assert.equal(task.limitSwitches![0].toProfileId, "deepseek-light");
-    assert.equal(task.limitSwitches![0].memberId, limited.memberId);
-    assert.equal(task.limitSwitches![0].resetsAt?.slice(11, 16), "15:45");
+    const [switched] = task.limitSwitches!;
+    const limited = team.members.find(m => m.memberId === switched.memberId)!;
+    const receipts = readReceipts(run.receipts);
+    const expected: string = receipts.find(r => r.memberId === limited.memberId).expectedResetsAt, hhmm = expected.slice(11, 16);
+    assert.equal(limited.modelProfile?.id, "haiku");
+    assert.equal(switched.fromProfileId, "haiku");
+    assert.equal(switched.toProfileId, "deepseek-light");
+    assert.equal(switched.resetsAt, expected, "The reset time comes from the provider's notice");
     assert.equal(task.escalation, undefined, "A limit switch does not use the task's escalation");
     const attempts = team.members.filter(m => m.taskId === "a");
-    assert.equal(attempts.length, 2, "The switch is a new member attempt");
-    assert.equal(attempts[0].cwd, attempts[1].cwd);
+    assert.deepEqual(attempts.map(m => m.modelProfile?.id), ["haiku", "haiku", "deepseek-light"], "The question retry and the switch are each a new member attempt");
+    assert.equal(new Set(attempts.map(m => m.cwd)).size, 1);
     assert.equal(limited.status, "stopped");
-    assert.match(limited.stoppedReason!, /^Claude Code usage limit, resets 15:45$/);
+    assert.equal(limited.stoppedReason, `Claude Code usage limit, resets ${hhmm}`);
     assert.deepEqual((await sessionEvents(run.host, limited.sessionId, "input-intent") as { data: { op: string } }[]).map(event => event.data.op), ["stop"], "Stopping is the only action the host takes on a limited member");
-    assert.ok(team.events.some(e => e.text === "Haiku implementer hit a Claude Code usage limit (resets 15:45); Build the first file continues on DeepSeek Flash with partial work preserved."), JSON.stringify(team.events));
+    assert.ok(team.events.some(e => e.text === `Haiku implementer hit a Claude Code usage limit (resets ${hhmm}); Build the first file continues on DeepSeek Flash with partial work preserved.`), JSON.stringify(team.events));
     assert.equal(team.providerLimits[0]?.provider, "claude");
     assert.equal(team.providerLimits[0]?.runId, team.id);
-    assert.equal((await run.host.fetchApi("/me")).body.providerLimits[0]?.provider, "claude");
-    const replacement = readReceipts(run.receipts).find(r => r.memberId === attempts[1].memberId);
+    assert.equal(team.providerLimits[0]?.expiresAt, expected, "The host entry lasts until the stated reset");
+    assert.equal((await run.host.fetchApi("/me")).body.providerLimits[0]?.expiresAt, expected);
+    const replacement = receipts.find(r => r.memberId === attempts[2].memberId);
     assert.equal(replacement?.model, "deepseek/deepseek-flash");
     assert.equal(replacement?.sawPartial, true, "The fallback starts in the limited member's working copy");
-    assert.match(replacement?.prompt, /partial edits are present in this working copy and have passed the host's path-scope check/);
+    const prompt: string = replacement.prompt;
+    assert.match(prompt, /\n\nUser answered: Compact\n\n/, "The fallback keeps the user's recorded answer");
+    assert.match(prompt, /partial edits are present in this working copy and have passed the host's path-scope check/);
+    assert.ok(prompt.includes("Pipe a JSON object matching the above schema to this command:") && !prompt.includes("mcp__infinite_team__report"), "The fallback reports the OpenCode way");
+    assert.ok(prompt.includes(`Requested runtime profile: ${JSON.stringify(attempts[2].modelProfile)}.`) && !prompt.includes('Requested runtime profile: {"id":"haiku"'));
     assert.equal(readFileSync(join(team.workspace, "a.txt"), "utf8"), "revision 1\n");
 
     const second = await run.settled((await run.host.fetchApi("/teams", "owner", run.create())).body.id);
-    assert.ok(second.events.some(e => /^Haiku implementer launched on DeepSeek Flash: Claude Code is limited until 15:45$/.test(e.text)), JSON.stringify(second.events));
+    assert.ok(second.events.some(e => e.text === `Haiku implementer launched on DeepSeek Flash: Claude Code is limited until ${hhmm}`), JSON.stringify(second.events));
     assert.equal(second.members.filter(m => m.modelProfile?.provider === "claude").length, 0);
     assert.equal(second.members.find(m => m.taskId === "a")?.modelProfile?.id, "deepseek-light");
   } finally { await run.close(); }
@@ -587,10 +600,23 @@ test("a usage limit with no configured fallback blocks the run with its reason a
   try {
     const team = await run.settled((await run.host.fetchApi("/teams", "owner", run.create())).body.id);
     assert.equal(team.status, "blocked", JSON.stringify(team));
-    assert.match(team.reason!, /^Claude Code usage limit reached at \d\d:\d\d, resets 15:45; no fallback profile is configured for haiku\.$/);
     const limited = team.members.find(m => m.modelProfile?.id === "haiku")!;
+    const expected: string = readReceipts(run.receipts).find(r => r.memberId === limited.memberId).expectedResetsAt;
+    assert.equal(team.reason, `Claude Code usage limit reached at ${team.providerLimits[0]?.detectedAt.slice(11, 16)}, resets ${expected.slice(11, 16)}; no fallback profile is configured for haiku.`);
     assert.equal(team.members.filter(m => m.taskId === "a").length, 1);
     assert.equal(limited.status, "stopped");
     assert.equal(readFileSync(join(limited.cwd, "a.txt"), "utf8"), "partial\n");
   } finally { await run.close(); }
+});
+
+test("retargeting a member prompt keeps its answers, swaps reporting and profile, and refuses an unrecognized prompt", () => {
+  const run = { provider: "codex", revision: 1, objective: "Create a.txt", baseCommit: "base", headCommit: "head", steering: [], tasks: [], checks: [], lineup: limitLineup } as unknown as TeamRun;
+  const [haiku, astra] = limitLineup.implementers, deepseek = limitLineup.fallbacks![0];
+  const answered = (provider: TeamModelProfile["provider"], profile: TeamModelProfile) => `${teamPrompt(run, "implementer", undefined, undefined, provider, profile)}\n\nUser answered: Compact`;
+  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "opencode", profile: deepseek }), answered("opencode", deepseek));
+  // A prompt written by another release names a different report helper path.
+  const older = answered("codex", astra).replace(/to this command: [^\n]+?\. The helper/, "to this command: 'node' 'dist/team-report.js'. The helper");
+  assert.notEqual(older, answered("codex", astra));
+  assert.equal(retargetPrompt(older, { provider: "claude", profile: haiku }), answered("claude", haiku));
+  assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek }), undefined);
 });

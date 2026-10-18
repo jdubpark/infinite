@@ -79,6 +79,8 @@ export class ProviderLimits {
         else if (event.data.kind === "turn-end" && event.data.failed !== true && at > (time(seen.turnAt) ?? -Infinity)) seen.turnAt = event.at;
       }
       seen.cursor = page.cursor; this.sessions.set(session.id, seen);
+      // A later limit may sit in the unread tail; decide once the journal has been read to its end.
+      if (page.more) continue;
       const turnAt = time(seen.turnAt);
       if (turnAt !== undefined && turnAt > Date.parse(entry.detectedAt) && (seen.limitAt === undefined || turnAt > seen.limitAt)) this.clear(session.provider, seen.turnAt);
     }

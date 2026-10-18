@@ -14,12 +14,13 @@ function store() {
 }
 type Row = Awaited<ReturnType<LimitSessions["list"]>>[number];
 /** A manager stand-in: session rows plus journals of signal events read with a cursor. */
-function sessions(rows: Row[], journals: Record<string, { at: string; data: Record<string, unknown> }[]>): LimitSessions {
+function sessions(rows: Row[], journals: Record<string, { at: string; data: Record<string, unknown> }[]>, pageSize = Infinity): LimitSessions {
   return {
     list: async () => rows,
     events: (id, after, limit) => {
       const all = (journals[id] ?? []).map((event, index) => ({ ...event, seq: index + 1 }));
-      const events = all.filter(event => event.seq > after).slice(0, limit);
+      // A manager page also ends early at its byte cap, so a page can hold fewer events than asked.
+      const events = all.filter(event => event.seq > after).slice(0, Math.min(limit, pageSize));
       return { events, cursor: events.at(-1)?.seq ?? after, more: all.length > after + events.length };
     },
   };
@@ -84,6 +85,26 @@ test("only a successful turn after the entry and after that session's own latest
     assert.deepEqual(limits.active(now), [], "A later successful turn of that provider clears the entry");
     await limits.reconcile(manager, now);
     assert.deepEqual(s.open().active(now), [], "The limited session's old observation does not restore it");
+  } finally { s.close(); }
+});
+
+test("a clear waits until the session's journal has been read to its end", async () => {
+  const s = store();
+  try {
+    const limits = s.open();
+    const now = new Date(at("11:00"));
+    limits.observe({ provider: "claude", detectedAt: at("10:00"), resetsAt: at("15:45"), sessionId: "limited", confidence: "corroborated" });
+    const journals: Record<string, { at: string; data: Record<string, unknown> }[]> = {
+      other: [{ at: at("10:12"), data: { kind: "turn-end" } }, { at: at("10:13"), data: { ...claudeLimit, confidence: "single-source", source: "hook" } }],
+    };
+    const manager = sessions([{ id: "other", provider: "claude", attention: {} }], journals, 1);
+    await limits.reconcile(manager, now);
+    assert.equal(limits.active(now).length, 1, "A successful turn followed by an unread page does not clear yet");
+    await limits.reconcile(manager, now);
+    assert.equal(limits.active(now).length, 1, "The unread page held a newer limit for that session");
+    journals.other.push({ at: at("10:14"), data: { kind: "turn-end" } });
+    await limits.reconcile(manager, now);
+    assert.deepEqual(limits.active(now), []);
   } finally { s.close(); }
 });
 

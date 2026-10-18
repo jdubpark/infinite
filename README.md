@@ -107,6 +107,8 @@ npm run ios -w @infinite/mobile
 
 On hosts whose workers enforce input control, the phone sends nothing until you tap **Take control** (or **Take over** when another device holds the session). The lease lasts 30 seconds, renews while the session is on screen, and is released when you leave the session or background the app. Viewers stay read-only.
 
+The **Teams** and **Goals** tabs appear on hosts that support teams; a host without teams configured shows setup guidance there. They list each run with what it waits on, open its decisions, plan, members, checks, and review, and let an owner or controller answer and steer. Starting, pausing, resuming, and cancelling a run are owner actions. See [Goals and agent teams](docs/teams.md).
+
 Search the inbox or pull down to refresh it. The composer allows local drafting while monitoring or reconnecting, with a control action beside the draft when the host is ready. Taking control never sends the draft. Drafts remain in this app's memory across navigation; they are not shared with another device or retained after the app exits.
 
 Push notifications need an EAS project ID. Keep it in the ignored `apps/mobile/.local/eas.json` file as `{ "projectId": "YOUR_EAS_PROJECT_ID" }`, or set `INFINITE_EAS_PROJECT_ID`. The dynamic app config adds it to `extra.eas.projectId` at build time. Set the same variable in the EAS preview and production environments for cloud builds; do not commit the real identifier to `app.json` or `eas.json`. See [Expo dynamic configuration](https://docs.expo.dev/workflow/configuration/).
@@ -147,7 +149,7 @@ Push setup, in order:
 - Detached PTY workers; client and API lifetimes are independent of agent lifetimes.
 - Same-process terminal attachment, screen snapshots, full raw terminal recordings, and paginated replay by sequence number.
 - An encrypted record of session metadata, initial context, output, input intent, and delivery receipts. Records use AES-256-GCM with session/sequence authenticated data and a key outside the state directory.
-- Owner, controller, and viewer access. Creation is owner-only; the phone UI only monitors and steers. These are credential roles, not proof of a physical laptop's identity.
+- Owner, controller, and viewer access. Creating sessions, teams, and goals is owner-only on every client; controllers answer and steer; viewers read. These are credential roles, not proof of a physical laptop's identity.
 - Device input control: one renewable 30-second lease per session, enforced in the worker, with explicit takeover. A refused input journals nothing.
 - A laptop CLI that launches native provider CLIs with exact arguments, reattaches over one WebSocket, and starts from a bounded terminal snapshot.
 - Idempotent creation and input IDs. An ambiguous terminal write is not automatically repeated. A delivered receipt means bytes reached the PTY, not that the provider accepted or completed a task.

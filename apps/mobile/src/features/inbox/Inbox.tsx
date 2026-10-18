@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
-import { useRouter } from "expo-router";
+import { useIsFocused, useRouter } from "expo-router";
 import { PROVIDER_NAMES, groupSessions } from "@infinite/attention";
 import {
   api,
@@ -14,6 +14,10 @@ import { Button } from "../../components/Button";
 import { OfflineBanner } from "../../components/OfflineBanner";
 import { StatePill } from "../../components/StatePill";
 import { theme } from "../../theme";
+import { ROLE_NAMES, type ProductGoal, type TeamView } from "../teams/model";
+import { GoalList, TeamList } from "../teams/RunLists";
+
+export type InboxView = "sessions" | "teams" | "goals";
 
 function timeAgo(iso: string): string {
   const seconds = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
@@ -29,13 +33,16 @@ export function Inbox({
   connection,
   onDisconnect,
   pushNote,
+  initialView = "sessions",
 }: {
   connection: Connection;
   onDisconnect: () => void;
   pushNote?: string;
+  initialView?: InboxView;
 }) {
   const router = useRouter();
   const [query, setQuery] = useState("");
+  const [view, setView] = useState<InboxView>(initialView);
   const { data, online, loading, refreshing, seen, refresh } = usePoll(
     async () => {
       const [list, me] = await Promise.all([
@@ -52,6 +59,25 @@ export function Inbox({
     2500,
     [connection],
   );
+  // Hosts that predate teams advertise no `teams` field and have no team routes to poll.
+  const hasTeams = Boolean(data?.me.teams), hasGoals = Boolean(data?.me.goals);
+  // Full run records are large, so only the visible tab polls quickly; the others refresh their counts slowly.
+  const focused = useIsFocused();
+  const pace = (tab: InboxView) => focused && view === tab ? 4000 : 20000;
+  const teamsPoll = usePoll(() => hasTeams ? api<{ teams: TeamView[] }>(connection, "/teams").then(value => value.teams) : Promise.resolve(null), pace("teams"), [connection, hasTeams]);
+  const goalsPoll = usePoll(() => hasGoals ? api<{ goals: ProductGoal[] }>(connection, "/goals").then(value => value.goals) : Promise.resolve(null), pace("goals"), [connection, hasGoals]);
+  const teams = teamsPoll.data ?? [];
+  const goals = goalsPoll.data ?? [];
+  const teamTitles = new Map(teams.map(team => [team.id, team.title]));
+  const shown = hasTeams ? view : "sessions";
+  const refreshAll = () => { refresh(); teamsPoll.refresh(); goalsPoll.refresh(); };
+  const runs = shown === "goals" ? goalsPoll : teamsPoll;
+  // Each tab names how many of its items wait on a person.
+  const tabs: [InboxView, string, number][] = [
+    ["sessions", "Sessions", (data?.sessions ?? []).filter(session => session.attention.state === "needs-you").length],
+    ["teams", "Teams", teams.filter(team => team.status === "needs-input").length],
+    ...(hasGoals ? [["goals", "Goals", goals.filter(goal => goal.status === "needs-input").length] as [InboxView, string, number]] : []),
+  ];
   const sessions = data?.sessions ?? [];
   const matches = sessions.filter(session => [session.title, session.id, PROVIDER_NAMES[session.provider]]
     .some(value => value.toLowerCase().includes(query.trim().toLowerCase())));
@@ -65,8 +91,8 @@ export function Inbox({
         </View>
       </View>
       <ScrollView contentContainerStyle={s.list} keyboardShouldPersistTaps="handled"
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
-        <Text style={s.title}>Your sessions</Text>
+        refreshControl={<RefreshControl refreshing={refreshing || runs.refreshing} onRefresh={refreshAll} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
+        <Text style={s.title}>{shown === "teams" ? "Teams" : shown === "goals" ? "Goals" : "Your sessions"}</Text>
         <Text style={s.body}>
           {data?.me.machine?.label || connection.label || (data?.me.environment === "local" ? "Laptop" : "Cloud machine")}
         </Text>
@@ -74,6 +100,14 @@ export function Inbox({
           online={online || loading}
           message="This view may be stale. Your agents may still be running. Check the machine and your network connection."
         />
+        {hasTeams ? <View style={s.tabs}>
+          {tabs.map(([value, label, waiting]) => <Button key={value} title={waiting ? `${label} · ${waiting}` : label} secondary={shown !== value} onPress={() => setView(value)} />)}
+        </View> : null}
+        {shown !== "sessions" ? <>
+          <OfflineBanner online={runs.online || runs.loading} message="Team and goal updates are unavailable. Showing the last received state." />
+          {shown === "teams" ? <TeamList connection={connection} me={data!.me} teams={teams} online={online && runs.online} />
+            : <GoalList connection={connection} me={data!.me} goals={goals} online={online && runs.online} />}
+        </> : <>
         <View style={s.listHeading}>
           <Text style={s.small}>
             {sessions.filter((session) => session.status === "running").length}{" "}
@@ -128,6 +162,7 @@ export function Inbox({
                 <Text style={s.meta}>
                   {PROVIDER_NAMES[row.provider]}{row.backend === "cmux" ? " · cmux" : ""} ·{" "}
                   {timeAgo(row.attention.since)}
+                  {row.team ? ` · ${ROLE_NAMES[row.team.role]} in ${teamTitles.get(row.team.runId) ?? "a team"}` : ""}
                 </Text>
               </Pressable>
             ))}
@@ -141,6 +176,7 @@ export function Inbox({
             </Text>
           </View>
         )}
+        </>}
       </ScrollView>
       <View style={s.bottom}>
         {pushNote ? <Text style={s.small}>{pushNote}</Text> : null}
@@ -180,6 +216,7 @@ const s = StyleSheet.create({
   offlineDot: { backgroundColor: theme.colors.warningInk },
   small: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk },
   list: { padding: 25 },
+  tabs: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 4 },
   search: {
     minHeight: 50, borderWidth: 1, borderColor: theme.colors.fieldRule,
     borderRadius: theme.radius.control, color: theme.colors.ink, fontSize: 15,

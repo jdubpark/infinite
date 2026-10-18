@@ -10,7 +10,11 @@ Use **Teams** for one feature request or pasted PRD. A team plans and implements
 that request without selecting a sequence of follow-up improvements. Both flows
 show member sessions, questions, steering, file ownership, and verification
 records. The web interface supports desktop and narrow phone browsers. The
-native phone app can open member sessions; it has no Goals or Teams dashboard.
+native phone app has **Teams** and **Goals** tabs beside its sessions. It
+starts, answers, steers, pauses, resumes, and cancels runs with the same roles
+and request rules as the web client, and records goal outcomes. It opens member
+sessions, and a member session links back to its team. The Mac app shows Teams
+only.
 
 A Team marked **ready for your review** has explicit reports for its current revision,
 passing configured checks, and an approving reviewer report. It does not

@@ -271,3 +271,17 @@ Pairing validates the host and device role before saving a mode-0600 `~/.config/
 For a tunnel that already forwards local port 4780 to the trusted server's API, use `infinite pair http://127.0.0.1:4780 --token-file "$OWNER_KEY_FILE"`. Keep the forward bound to loopback and verify the SSH host identity. SSH encrypts the network connection between laptop and server; the existing Infinite terminal CLI carries HTTP/WebSocket traffic inside that tunnel. It does not use the native Mac/phone application's encrypted WebSocket protocol or its public relay. Native provider gateways, `--laptop`, sync, and pull retain this direct connection path. The standalone tunnel can run at login and does not require the Mac app to be open.
 
 This client currently connects directly to a trusted single-tenant runner. TLS pairing is not confidential-VM attestation and does not implement the future operator-private multi-tenant protocol.
+
+### Delegated team permissions
+
+Run `infinite repo init --permissions coordinator` once to delegate supported
+one-shot tool prompts to the strong Claude coordinator for future runs. The default
+scope covers the accepted task and assigned workspace; delivery still needs its
+separate repository policy. Use `--permission-scope TEXT` and
+`--permission-limit N` to narrow the scope or change the ten-decision default
+(maximum twenty).
+
+`infinite team revoke-permissions TEAM_ID` revokes an active run's delegation.
+`infinite repo init --permissions off` disables it for future runs. Workspace
+trust and unsupported prompts remain visible for owner handling. See
+[delegated permission behavior](teams.md#delegating-permission-decisions).

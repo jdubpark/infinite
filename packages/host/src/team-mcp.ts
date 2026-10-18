@@ -56,7 +56,7 @@ export async function runTeamMcp() {
         protocolVersion: COMPATIBLE_VERSIONS.has(params.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "infinite-team", version: "1.0.0" },
-        instructions: handoff ? HANDOFF_INSTRUCTIONS : "Use the report tool for the assigned member only. Tool permission decisions belong to the user. Stop on a denial; never attempt a shell workaround.",
+        instructions: handoff ? HANDOFF_INSTRUCTIONS : "Use the report tool for the assigned member only. Permission decisions require owner authorization; a delegated coordinator may report only its assigned decision. Never approve your own request or bypass a denial. Stop on a denial; never attempt a shell workaround.",
       });
       return;
     }

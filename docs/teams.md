@@ -82,9 +82,9 @@ selected host project. A new remote source receives a committed Git snapshot;
 ignored files and uncommitted changes are not included. Existing cloud sources
 are not replaced by enrollment. Setup and verification commands belong to that
 repository, while the coordinator, workers, and reviewer come from the host's
-configured lineup. Ordinary tool prompts in a member's assigned workspace are
-approved by the host. Dangerous tool prompts are decided by the coordinator
-model. The owner does not type those answers.
+configured lineup. Owners can delegate current one-shot tool requests to the
+strong coordinator under an explicit repository policy; see
+[Delegating permission decisions](#delegating-permission-decisions).
 
 A new empty repository can enroll immediately after `git init`. Its cloud source
 gets an empty baseline commit; local Git history and files stay unchanged. When
@@ -554,28 +554,52 @@ Ubuntu template. Before it, supported options are `-n`, `-H`, `-u USER`, and
 `-g GROUP` (or their separate-argument long forms). Other wrapper forms are
 refused so provider flags cannot become prompt text.
 
-A Claude team member trusts only its assigned workspace. Before launch, the host
-sets that directory's `hasTrustDialogAccepted` flag in the agent account's
-Claude config. If the trust dialog still appears and names that same directory,
-the member process selects "Yes, I trust this folder". A dialog for any other
-path is left unanswered.
-
-Claude team launches use `--permission-mode auto` unless the provider profile
-already sets `--permission-mode`. That mode approves ordinary edits and commands.
-It does not add `--dangerously-skip-permissions`. When a permission dialog still
-appears, the member process accepts a non-destructive "Yes". Destructive
-commands, `sudo`, `git push`, publication, credential paths, and permission
-bypasses are sent to a separate print-mode coordinator process. The coordinator
-replies allow or deny, and the host presses that option. Two failed reviews
-stop retrying, and the run then reports that the provider still needs input.
-A person holding the input lease is not overridden. The member retries an
-ordinary accept twice. Product questions reported by a member still wait for
-`infinite team answer`.
+Team launches preserve configured provider permission modes and trust settings.
+A team assignment does not grant tool permission or accept a workspace trust
+dialog. Product questions reported by a member wait for `infinite team answer`.
 
 Headless OpenCode `run` rejects unmet permission requests; this adapter does
 not offer an interactive approval flow for that provider. A denied reporting
 tool or required tool can stop the member without an accepted report. Inspect
 the failure and the configured provider policy; retries do not grant permission.
+
+## Delegating permission decisions
+
+Enable delegation once in the enrolled repository:
+
+```sh
+infinite repo init --permissions coordinator
+```
+
+This pins an owner-approved scope and a limit of ten decisions to each new run.
+Use `--permission-scope TEXT` to set narrower boundaries and `--permission-limit N`
+to set a limit from one to twenty. Omitting these options on a later enrollment
+preserves the repository policy. Existing runs remain unchanged.
+
+A current one-shot tool prompt can start a separate turn on the run's strong
+Claude coordinator profile. The coordinator receives the task, owner scope and exact
+request, then reports approve-once or escalate. The host checks the assignment,
+workspace, prompt, policy, expiry and human input control before delivering the
+recorded choice. Workers cannot approve their own requests. The permission
+coordinator runs noninteractively with built-in tools disabled and only its
+assignment's report tool allowed. It escalates when the supplied evidence is
+insufficient. Worker provider modes, global trust settings and credentials
+remain unchanged. Other coordinator providers are not yet supported for this role.
+
+Workspace trust, persistent allow rules, ambiguous prompts and unsupported native
+requests still need owner handling. A coordinator that itself needs permission
+cannot approve its own prompt. Each decision is bounded; stale or uncertain
+answers are never replayed automatically. Run status and Linear retain the
+receipt separately from successful tool execution.
+
+```sh
+infinite team revoke-permissions TEAM_ID
+infinite repo init --permissions off
+```
+
+The first command revokes delegation for a current run. The second disables it
+for future runs. Both require an owner client. Pausing, cancelling or steering a
+run prevents its old pending decisions from being applied.
 
 ## Configuration
 
@@ -689,9 +713,10 @@ Claude Code team members receive a scoped MCP tool, `mcp__infinite_team__report`
 that accepts a typed report as data. Other providers receive a reporting command
 that accepts JSON on standard input. Reports include `plan`, `explore`,
 `findings`, `no-change`, `escalate`, `result`, `review`, `question`, and `blocked`;
-each role has a permitted subset. The host does not automatically allow the MCP
-tool; its permission follows the configured provider profile. This keeps report JSON
-out of Claude's shell-command parsing while preserving its permission checks.
+each role has a permitted subset. The report tool follows the configured provider
+profile, except for the dedicated permission coordinator: its constrained launch
+allows only its assignment's authenticated report tool. This keeps report JSON
+out of Claude's shell-command parsing while preserving worker permission checks.
 The detached worker authenticates the report, validates its run,
 member and revision binding, and writes it to the encrypted journal before
 acknowledging it. A repeated identical report returns the same acceptance;

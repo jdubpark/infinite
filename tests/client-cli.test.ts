@@ -1121,3 +1121,29 @@ test("infinite usage prints the host summary as JSON and readable output", { tim
     assert.match(readable.stdout, /^Codex  \S+ to \S+ · unmeasured · no budget configured$/m);
   } finally { await host.stop(); }
 });
+
+test("repository CLI pins, preserves and removes owner permission delegation", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success");
+  const localRoot = mkdtempSync(join(tmpdir(), "infinite-permission-cli-"));
+  const checkout = join(localRoot, "checkout");
+  const configFile = join(localRoot, "client.json");
+  writeFileSync(configFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const args = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", configFile,
+    "repo", "init", "--project", "rehearsal", "--check-json", JSON.stringify([{ command: process.execPath, args: ["check.mjs", "--prefix"] }])];
+  const enroll = (...extra: string[]) => exec(process.execPath, [...args, ...extra], { cwd: checkout });
+  try {
+    await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
+    const delegated = JSON.parse((await enroll("--permissions", "coordinator", "--permission-scope", "Read files and run the configured check only.", "--permission-limit", "3")).stdout);
+    assert.deepEqual(delegated.team.permissions, { mode: "coordinator", scope: "Read files and run the configured check only.", maxDecisions: 3 });
+    const retained = JSON.parse((await enroll()).stdout);
+    assert.deepEqual(retained.team.permissions, delegated.team.permissions);
+    await assert.rejects(enroll("--permissions", "coordinator", "--permission-limit", "21"));
+    assert.deepEqual((await run.host.fetchApi("/projects/rehearsal/team")).body.team.permissions, delegated.team.permissions);
+    const forbidden = await run.host.fetchApi("/projects/rehearsal/team", "controller", {
+      requestId: randomUUID(), revision: retained.revision, team: { ...retained.team, permissions: { ...delegated.team.permissions, scope: "Broaden scope" } },
+    }, undefined, "PUT");
+    assert.equal(forbidden.status, 403);
+    const removed = JSON.parse((await enroll("--permissions", "off")).stdout);
+    assert.equal(removed.team.permissions, undefined);
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
+});

@@ -140,3 +140,18 @@ test("truncateInput enforces the 16 KiB UTF-8 cap", () => {
   const wide = truncateInput({ a: "日".repeat(4000), b: "日".repeat(4000), c: "日".repeat(4000) });
   assert.ok(bytes(wide) <= 16384, `multibyte case was ${bytes(wide)}`);
 });
+
+
+test("permission evidence distinguishes complete input from omitted array items and command tails", () => {
+  const cases = [
+    { input: { command: "npm test" }, complete: true },
+    { input: { command: "x".repeat(5000) }, complete: false },
+    { input: { edits: Array.from({ length: 51 }, (_, n) => ({ old_string: String(n), new_string: "replacement" })) }, complete: false },
+  ];
+  for (const { input, complete } of cases) {
+    const [signal] = mapClaudeHook({ ...base, hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: input });
+    assert.equal(signal.kind, "prompt-open");
+    if (signal.kind !== "prompt-open") throw new Error("Expected a permission request");
+    assert.equal(signal.prompt.tool?.inputComplete, complete);
+  }
+});

@@ -1,4 +1,6 @@
 import { z } from "zod";
+import type { Prompt, AnswerResult } from "@infinite/attention";
+import type { Receipt } from "./types.js";
 import type { TeamUsage, UsageTotals } from "./usage.js";
 import type { ProviderLimit } from "./provider-limits.js";
 import type { Provider } from "./types.js";
@@ -23,12 +25,38 @@ export const teamDeliverySchema = z.object({
   mergeMethod: z.enum(["squash", "merge", "rebase"]).default("squash"),
 }).strict();
 export type TeamDelivery = z.infer<typeof teamDeliverySchema>;
+export const teamPermissionsSchema = z.object({
+  mode: z.literal("coordinator"),
+  scope: z.string().trim().min(1).max(4000),
+  maxDecisions: z.number().int().min(1).max(20).default(10),
+}).strict();
+export type TeamPermissions = z.infer<typeof teamPermissionsSchema>;
+export interface TeamPermissionDecision {
+  id: string;
+  revision: number;
+  policyHash: string;
+  targetMemberId: string;
+  targetSessionId: string;
+  targetCwd: string;
+  promptId: number;
+  promptHash: string;
+  evidenceHash: string;
+  prompt: Prompt;
+  option: number;
+  expiresAt: string;
+  coordinatorMemberId?: string;
+  answerRequestId: string;
+  status: "pending" | "reviewing" | "approved" | "answering" | "answered" | "escalated" | "stale" | "uncertain";
+  reason?: string;
+  receipt?: Receipt & { result?: AnswerResult };
+}
 export const teamProjectSchema = z.object({
   handoff: z.enum(["auto", "off"]).optional(),
   setup: teamCommandSchema.optional(),
   checks: z.array(teamCommandSchema).max(8),
   establishChecks: z.literal(true).optional(),
   delivery: teamDeliverySchema.optional(),
+  permissions: teamPermissionsSchema.optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -157,6 +185,7 @@ export const teamTaskPlanSchema = z.object({
 }).strict();
 export type TeamTaskPlan = z.infer<typeof teamTaskPlanSchema>;
 export const teamReportSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("permission-decision"), decisionId: z.uuid(), verdict: z.enum(["approve-once", "escalate"]), summary: z.string().trim().min(1).max(2000) }).strict(),
   z.object({ kind: z.literal("plan"), summary: z.string().min(1).max(4000), brief: teamBriefSchema.optional(), tasks: z.array(teamTaskPlanSchema).min(1).max(12), verification: teamVerificationSchema.optional() }).strict(),
   z.object({ kind: z.literal("explore"), summary: z.string().min(1).max(4000), tasks: z.array(teamScoutPlanSchema).min(1).max(3) }).strict(),
   z.object({ kind: z.literal("findings"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
@@ -172,7 +201,7 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
 export type TeamReport = z.infer<typeof teamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: teamReportSchema }).strict();
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
-export type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
+export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
 export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string };
 /** `merged` is set only from an explicit delivery report; it is not host verification. */
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
@@ -230,6 +259,10 @@ export interface TeamCheck {
   revision: number;
 }
 export interface TeamRun {
+  /** Explicit owner delegation pinned at creation. Old runs remain opted out. */
+  permissions?: TeamPermissions;
+  permissionsRevokedAt?: string;
+  permissionDecisions?: TeamPermissionDecision[];
   /** Owner opt-in is pinned at creation; accepted commands cannot change within this run. */
   establishChecks?: true;
   verification?: TeamVerification;
@@ -272,4 +305,9 @@ export interface TeamRun {
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
   round: number;
 }
-export type TeamView = Omit<TeamRun, "members"> & { members: Omit<TeamMember, "prompt" | "feedback" | "pendingLimit">[]; providerLimits: ProviderLimit[]; resumable: boolean };
+export type TeamView = Omit<TeamRun, "members" | "permissionDecisions"> & {
+  members: Omit<TeamMember, "prompt" | "feedback" | "pendingLimit">[];
+  permissionDecisions?: Omit<TeamPermissionDecision, "prompt">[];
+  providerLimits: ProviderLimit[];
+  resumable: boolean;
+};

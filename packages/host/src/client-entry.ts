@@ -29,6 +29,9 @@ infinite repo init [DIRECTORY] [--project ID] [--check-json JSON] [--delivery me
 infinite repo init PARENT_DIRECTORY --linear-team UUID [--linear-project UUID]
 infinite repo link PROJECT_OR_DIRECTORY --relationship "Uses its API"
 infinite repo unlink PROJECT_OR_DIRECTORY | repo links
+infinite repo init --permissions coordinator [--permission-scope TEXT] [--permission-limit N]
+infinite repo init --permissions off        Disable delegation for future runs
+infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]
 infinite team status [ID] [--json] [--logs] | team watch ID [--logs] | team pull TEAM_ID [--json]
   status ID prints open decisions and the Jevcode summary. Watch keeps it full screen.

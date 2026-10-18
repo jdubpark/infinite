@@ -197,6 +197,25 @@ export type WorkerRequest =
       option?: number;
       text?: string;
     } & InputControl)
+  | ({
+      /** Host-only delegated one-shot permission answer over the private worker socket. */
+      op: "team-answer";
+      requestId: string;
+      decisionId: string;
+      coordinatorMemberId: string;
+      targetSessionId: string;
+      assignment: import("./team-types.js").TeamAssignment;
+      targetCwd: string;
+      expiresAt: string;
+      policyHash: string;
+      promptId: number;
+      promptHash: string;
+      evidenceHash: string;
+      option: number;
+      actor: ControlActor;
+      leaseId: string;
+    })
+  | { op: "team-answer-invalidate"; decisionId: string }
   | ({ op: "resize"; cols: number; rows: number } & InputControl)
   | ({ op: "stop"; requestId: string } & InputControl);
 export interface Bootstrap {

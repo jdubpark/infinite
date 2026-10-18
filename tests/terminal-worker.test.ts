@@ -1,14 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import headless from "@xterm/headless";
 import { workerCall } from "../packages/host/src/ipc.js";
 import { readEvents, unseal } from "../packages/host/src/vault.js";
+import { permissionEvidenceHash, oneShotPermissionOption } from "../packages/host/src/team-permissions.js";
 import { waitFor } from "./helpers.js";
 import type { Bootstrap, ControlActor, ControlLease, Event, Receipt, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
+import type { TeamAssignment } from "../packages/host/src/team-types.js";
 
 // This process supplies actual PTY output and authenticated hooks. Assertions below use only
 // worker IPC and its encrypted journal, never internal queues, timers, or a substituted clock.
@@ -17,13 +19,30 @@ process.stdin.setRawMode(true);
 process.stdin.setEncoding("utf8");
 process.stdout.write("READY\r\n\x1b[?2004h\x1b[?25l\x1b[?1006h");
 let pending = "";
+let permissionOpen = false;
 process.stdin.on("data", data => {
+  if (permissionOpen && data.includes("\x1b[B")) {
+    setTimeout(() => process.stdout.write("\x1b[2J\x1b[Hnpm run check\r\nPermission needed\r\n  1. No\r\n❯ 2. Yes, proceed once\r\n"), 150);
+    return;
+  }
+  if (permissionOpen && data.includes("\r")) {
+    permissionOpen = false;
+    process.stdout.write("\x1b[2J\x1b[HAPPROVED\r\n");
+    return;
+  }
   pending += data;
   let end;
   while ((end = pending.indexOf("\n")) >= 0) {
     const command = pending.slice(0, end); pending = pending.slice(end + 1);
     if (command === "burst") {
       for (let i = 1; i <= 320; i++) process.stdout.write("\x1b[32mROW " + i + " café 界\x1b[0m\r\n");
+    } else if (command === "permission") {
+      permissionOpen = true;
+      process.stdout.write("\x1b[2J\x1b[Hnpm run check\r\nPermission needed\r\n❯ 1. No\r\n  2. Yes, proceed once\r\n");
+      fetch(process.env.INFINITE_HOOK_URL + "/claude", {
+        method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + process.env.INFINITE_HOOK_TOKEN },
+        body: JSON.stringify({ hook_event_name: "PermissionRequest", session_id: "fixture-native-session", tool_name: "Bash", tool_input: { command: "npm run check" } }),
+      });
     } else if (command === "split") process.stdout.write("\x1b[");
     else if (command === "finish") process.stdout.write("31mSPLIT COMPLETE\x1b[0m\r\n");
     else if (command === "alt") process.stdout.write("\x1b[?1049h\x1b[H\x1b[34mALTERNATE 界\x1b[0m\r\nNative prompt> ");
@@ -62,7 +81,7 @@ process.stdin.on("data", data => {
 });
 `;
 
-async function fixture(provider: "demo" | "claude" = "demo", initialPrompt = "") {
+async function fixture(provider: "demo" | "claude" = "demo", initialPrompt = "", team?: TeamAssignment) {
   const root = mkdtempSync("/tmp/inf-worker-");
   const id = randomUUID();
   const key = randomBytes(32);
@@ -73,7 +92,7 @@ async function fixture(provider: "demo" | "claude" = "demo", initialPrompt = "")
   writeFileSync(script, AGENT);
   const runtime = { id: randomUUID(), location: "cloud" as const, transport: "pty" as const };
   const bootstrap: Bootstrap = {
-    session: { id, provider, title: "Terminal contract", projectId: "fixture", cwd: root, createdAt: new Date().toISOString(), status: "starting", contextVersion: 0, context: "", initialPrompt, runtime },
+    session: { id, ...(team ? { team } : {}), provider, title: "Terminal contract", projectId: "fixture", cwd: root, createdAt: new Date().toISOString(), status: "starting", contextVersion: 0, context: "", initialPrompt, runtime },
     profile: { command: process.execPath, args: [script] },
     runDir, stateDir, key: key.toString("base64"), prompt: initialPrompt,
     attention: { idleAfterMs: 60_000, hooks: { claude: true, codex: true } },
@@ -113,7 +132,21 @@ async function fixture(provider: "demo" | "claude" = "demo", initialPrompt = "")
       catch (error) { if (worker.exitCode !== null) throw new Error(diagnostics || String(error)); return undefined; }
     }, state => Boolean(state?.screen.includes("READY")));
   } catch (error) { await stop(); throw error; }
-  return { id, runtime, call, events, output, command, stop, persisted: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")) };
+  return { id, cwd: realpathSync(root), runtime, call, events, output, command, stop, persisted: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")) };
+}
+
+function teamAnswerRequest(worker: Awaited<ReturnType<typeof fixture>>, team: TeamAssignment, prompt: NonNullable<WorkerState["attention"]["prompt"]>, requestId: string, actor: ControlActor, leaseId: string, decisionId: string) {
+  const option = oneShotPermissionOption(prompt);
+  assert.equal(option, 1, "the fixture exposes one explicit one-shot option");
+  return {
+    op: "team-answer" as const, requestId, decisionId,
+    coordinatorMemberId: randomUUID(), targetSessionId: worker.id,
+    assignment: team, targetCwd: worker.cwd,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    policyHash: "a".repeat(64), promptId: prompt.id,
+    promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt),
+    option, actor, leaseId,
+  };
 }
 
 function terminalImage(terminal: headless.Terminal) {
@@ -267,6 +300,116 @@ test("worker control fences input and resize, keeps retry receipts stable, and r
     await worker.command("after expiry");
     await waitFor(async () => worker.output(), output => output.includes("RECEIVED after expiry"));
     assert.doesNotMatch(worker.output(), /RECEIVED (stale|expired|unclaimed|unleased)/);
+  } finally { await worker.stop(); }
+});
+
+test("delegated answers stay bound to the assigned one-shot prompt and stop after a control takeover", { timeout: 30_000 }, async () => {
+  const team: TeamAssignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer", taskId: "task-one" };
+  const decisionId = randomUUID();
+  const actor = { id: `team-permission:${decisionId}`, label: "Team permission" };
+  const worker = await fixture("demo", "", team);
+  try {
+    await worker.command("permission");
+    const open = await waitFor(() => worker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+    const prompt = open.attention.prompt!;
+    const lease = await worker.call<ControlLease>({ op: "control", action: "claim", actor });
+    const stale = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), promptHash: "0".repeat(64) };
+    await assert.rejects(worker.call(stale), { code: "prompt-changed" });
+    const staleEvidence = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), evidenceHash: "0".repeat(64) };
+    await assert.rejects(worker.call(staleEvidence), { code: "prompt-changed" });
+    const wrongTarget = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), assignment: { ...team, memberId: randomUUID() } };
+    await assert.rejects(worker.call(wrongTarget), { code: "unsupported" });
+    const wrongSession = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), targetSessionId: randomUUID() };
+    await assert.rejects(worker.call(wrongSession), /Invalid delegated answer request/);
+    const wrongCwd = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), targetCwd: `${worker.cwd}/other` };
+    await assert.rejects(worker.call(wrongCwd), { code: "unsupported" });
+    for (const assignment of [null, [], {}]) {
+      const malformed = { ...teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId), assignment } as unknown as WorkerRequest;
+      await assert.rejects(worker.call(malformed), /Invalid delegated answer request/);
+    }
+    const answerIntents = () => worker.events().filter(event => event.type === "input-intent" && event.data.op === "answer");
+    assert.equal(answerIntents().length, 0, "stale hashes and foreign assignments never journal or type an answer");
+
+    const valid = teamAnswerRequest(worker, team, prompt, randomUUID(), actor, lease.id, decisionId);
+    const answer = await worker.call<Receipt & { result?: string }>(valid);
+    assert.equal(answer.state, "delivered");
+    assert.equal(answer.result, "closed");
+    assert.equal(answerIntents().length, 1);
+    const again = await worker.call<Receipt & { result?: string }>(valid);
+    assert.deepEqual(again, answer);
+    assert.equal(answerIntents().length, 1, "receipt replay does not type the permission twice");
+    const intent = answerIntents()[0];
+    assert.equal((intent.data.delegation as { decisionId: string }).decisionId, valid.decisionId);
+    assert.equal(worker.output().match(/APPROVED/g)?.length, 1);
+  } finally { await worker.stop(); }
+
+  const takeoverWorker = await fixture("demo", "", team);
+  try {
+    await takeoverWorker.command("permission");
+    const open = await waitFor(() => takeoverWorker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+    const human = { id: "human-control", label: "Human" };
+    const humanLease = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor: human });
+    await assert.rejects(takeoverWorker.call({ op: "control", action: "claim", actor }), { code: "control-busy" });
+    await takeoverWorker.call({ op: "control", action: "release", actor: human, leaseId: humanLease.id });
+    const hostLease = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor });
+    const request = teamAnswerRequest(takeoverWorker, team, open.attention.prompt!, randomUUID(), actor, hostLease.id, decisionId);
+    const pending = takeoverWorker.call(request);
+    await waitFor(async () => takeoverWorker.events(), events => events.some(event => event.type === "input-intent" && event.data.requestId === request.requestId));
+    const takeover = await takeoverWorker.call<ControlLease>({ op: "control", action: "claim", actor: human, takeover: true });
+    const interrupted = await pending as Receipt & { result?: string };
+    assert.equal(interrupted.state, "uncertain");
+    assert.equal(interrupted.result, undefined);
+    assert.equal((await takeoverWorker.call({ op: "state" })).control?.id, takeover.id);
+    const repeated = await takeoverWorker.call<Receipt & { result?: string }>(request);
+    assert.equal(repeated.state, "uncertain");
+    assert.equal(takeoverWorker.events().filter(event => event.type === "input-intent" && event.data.requestId === request.requestId).length, 1);
+    assert.equal(takeoverWorker.events().filter(event => event.type === "input-result" && event.data.requestId === request.requestId).length, 0);
+    assert.doesNotMatch(takeoverWorker.output(), /APPROVED/);
+  } finally { await takeoverWorker.stop(); }
+
+  const invalidationWorker = await fixture("demo", "", team);
+  try {
+    await invalidationWorker.command("permission");
+    const open = await waitFor(() => invalidationWorker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash && state.attention.prompt.tool?.name));
+    const hostLease = await invalidationWorker.call<ControlLease>({ op: "control", action: "claim", actor });
+    const request = teamAnswerRequest(invalidationWorker, team, open.attention.prompt!, randomUUID(), actor, hostLease.id, decisionId);
+    const pending = invalidationWorker.call<Receipt & { result?: string }>(request);
+    await waitFor(async () => invalidationWorker.events(), events => events.some(event => event.type === "input-intent" && event.data.requestId === request.requestId));
+    assert.deepEqual(await invalidationWorker.call({ op: "team-answer-invalidate", decisionId }), { invalidated: true });
+    const interrupted = await pending;
+    assert.equal(interrupted.state, "uncertain");
+    assert.equal(interrupted.result, undefined);
+    assert.equal(invalidationWorker.events().filter(event => event.type === "input-result" && event.data.requestId === request.requestId).length, 0);
+    assert.doesNotMatch(invalidationWorker.output(), /APPROVED/);
+    const afterInvalidation = await invalidationWorker.call({ op: "state", screen: true });
+    assert.equal(afterInvalidation.attention.prompt?.id, open.attention.prompt?.id);
+    assert.equal(afterInvalidation.attention.state, "needs-you");
+    assert.equal(afterInvalidation.control, null);
+    await assert.rejects(invalidationWorker.call({ ...request, requestId: randomUUID() }), { code: "unsupported" });
+  } finally { await invalidationWorker.stop(); }
+});
+
+test("ordinary interrupted answer retries return the refused receipt without typing again", { timeout: 20_000 }, async () => {
+  const worker = await fixture("demo");
+  try {
+    await worker.command("permission");
+    const open = await waitFor(() => worker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash));
+    const prompt = open.attention.prompt!;
+    const host = { id: "ordinary-answer-host", label: "Host" };
+    const human = { id: "ordinary-answer-human", label: "Human" };
+    const hostLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: host });
+    const request = { op: "answer" as const, requestId: randomUUID(), promptId: prompt.id, option: 1, actor: host, leaseId: hostLease.id };
+    const pending = worker.call(request);
+    await waitFor(async () => worker.events(), events => events.some(event => event.type === "input-intent" && event.data.requestId === request.requestId));
+    await worker.call({ op: "control", action: "claim", actor: human, takeover: true });
+    await assert.rejects(pending, { code: "control-lost" });
+
+    const retry = await worker.call<Receipt & { result?: string }>(request);
+    assert.equal(retry.state, "uncertain");
+    assert.equal(retry.result, "refused");
+    assert.equal(worker.events().filter(event => event.type === "input-intent" && event.data.requestId === request.requestId).length, 1);
+    assert.equal(worker.events().filter(event => event.type === "input-result" && event.data.requestId === request.requestId).length, 0);
+    assert.doesNotMatch(worker.output(), /APPROVED/);
   } finally { await worker.stop(); }
 });
 

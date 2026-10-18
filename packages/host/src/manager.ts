@@ -25,8 +25,9 @@ import { DEFAULT_HOOKS } from "./config.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
-import { teamModelProfileSchema, type TeamAssignment, type TeamModelProfile } from "./team-types.js";
-import { teamModelLaunch } from "./launch.js";
+import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
+import { teamModelProfileSchema, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
+import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type {
   Config,
   Provider,
@@ -262,12 +263,94 @@ export class Manager {
     await workerCall(this.config.runDir, sessionId, { op: "stop", requestId });
     return this.state(sessionId);
   }
-  /** Answer one of this assignment's prompts when nobody holds the input lease. */
-  async answerTeamPrompt(sessionId: string, requestId: string, promptId: number, option: number, team: TeamAssignment): Promise<void> {
-    const stored = this.meta(sessionId).session.team;
-    if (!stored || stored.runId !== team.runId || stored.memberId !== team.memberId || stored.revision !== team.revision)
-      throw new ContentError("This session does not belong to the team assignment", 403);
-    await workerCall(this.config.runDir, sessionId, { op: "answer", requestId, promptId, option });
+  /** Apply only the persisted, one-shot approval for this exact assigned member and prompt. */
+  async answerTeamPermission(
+    sessionId: string,
+    requestId: string,
+    team: TeamAssignment,
+    decision: TeamPermissionDecision,
+  ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    const session = this.meta(sessionId).session;
+    const stored = session.team;
+    const validAssignment = (value: unknown): value is TeamAssignment => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const candidate = value as Partial<TeamAssignment>;
+      return typeof candidate.runId === "string" && typeof candidate.memberId === "string" &&
+        Number.isInteger(candidate.revision) &&
+        ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"].includes(candidate.role ?? "") &&
+        (candidate.taskId === undefined || typeof candidate.taskId === "string");
+    };
+    const sameAssignment = (left: TeamAssignment | undefined, right: TeamAssignment) =>
+      Boolean(left && left.runId === right.runId && left.memberId === right.memberId &&
+        left.revision === right.revision && left.role === right.role && left.taskId === right.taskId);
+    if (!validAssignment(team) || !stored || !sameAssignment(stored, team) || decision.revision !== stored.revision ||
+        decision.targetMemberId !== stored.memberId || decision.targetSessionId !== sessionId ||
+        requestId !== decision.answerRequestId)
+      throw new ContentError("This permission decision does not match the assigned team member", 403);
+    if (decision.status !== "answering" || !/^[a-f0-9-]{36}$/i.test(decision.id) ||
+        !/^[a-f0-9-]{36}$/i.test(decision.answerRequestId) ||
+        !/^[a-f0-9]{64}$/i.test(decision.policyHash) || !decision.coordinatorMemberId ||
+        !/^[a-f0-9-]{36}$/i.test(decision.coordinatorMemberId) ||
+        !Number.isInteger(decision.promptId) || decision.promptId < 1 || decision.prompt.id !== decision.promptId ||
+        !/^[a-f0-9]{64}$/i.test(decision.promptHash) || !/^[a-f0-9]{64}$/i.test(decision.evidenceHash) ||
+        decision.prompt.hash !== decision.promptHash || permissionEvidenceHash(decision.prompt) !== decision.evidenceHash ||
+        oneShotPermissionOption(decision.prompt) !== decision.option ||
+        !Number.isFinite(Date.parse(decision.expiresAt)) || Date.parse(decision.expiresAt) <= Date.now())
+      throw new ContentError("The permission decision is incomplete, expired, or not a one-shot approval");
+    let canonicalCwd: string;
+    try { canonicalCwd = realpathSync(session.cwd); }
+    catch { throw new ContentError("The assigned team working directory is unavailable"); }
+    if (decision.targetCwd !== canonicalCwd)
+      throw new ContentError("The permission decision targets a different working directory", 403);
+    const state = await this.state(sessionId);
+    if (state.status !== "running" || session.runtime?.nativeUi || state.runtime?.nativeUi)
+      throw new ContentError("The assigned team member has no running managed terminal");
+    if (state.control) throw new ContentError("A person currently controls this session", 409);
+
+    const actor = { id: `team-permission:${decision.id}`, label: "Team permission" };
+    let lease: { id: string } | undefined;
+    try {
+      const acquired = await workerCall<{ id: string }>(this.config.runDir, sessionId, {
+        op: "control", action: "claim", actor,
+      });
+      lease = acquired;
+      const controlled = await this.state(sessionId);
+      if (controlled.status !== "running" || controlled.control?.id !== acquired.id ||
+          controlled.runtime?.nativeUi || session.runtime?.nativeUi)
+        throw new ContentError("The team member or its control lease changed before the answer");
+      if (decision.status !== "answering" || Date.parse(decision.expiresAt) <= Date.now())
+        throw new ContentError("The permission decision was invalidated before the answer");
+      try {
+        return await workerCall(this.config.runDir, sessionId, {
+          op: "team-answer", requestId, decisionId: decision.id,
+          coordinatorMemberId: decision.coordinatorMemberId,
+          targetSessionId: sessionId, assignment: stored, targetCwd: canonicalCwd,
+          expiresAt: decision.expiresAt, policyHash: decision.policyHash,
+          promptId: decision.promptId, promptHash: decision.promptHash,
+          evidenceHash: decision.evidenceHash, option: decision.option,
+          actor, leaseId: acquired.id,
+        }, 12000);
+      } catch (error) {
+        if ((error as { code?: unknown }).code) throw error;
+        // The worker may have written keys before its acknowledgement was lost. Never replay here.
+        return { requestId, state: "uncertain", seq: controlled.seq };
+      }
+    } finally {
+      if (lease) {
+        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        catch { /* a lost worker or lease is reported by the next state read */ }
+      }
+    }
+  }
+  /** Fence one persisted delegated decision before its owner revokes or pauses it. */
+  async invalidateTeamPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
+    if (!this.meta(sessionId).session.team || !/^[a-f0-9-]{36}$/i.test(decisionId)) return "uncertain";
+    try {
+      const result = await workerCall<{ invalidated: boolean }>(this.config.runDir, sessionId, {
+        op: "team-answer-invalidate", decisionId,
+      }, 4000);
+      return result.invalidated === true ? "invalidated" : "uncertain";
+    } catch { return "uncertain"; }
   }
   resume(sessionId: string, requestId: string): Promise<Session & WorkerState> {
     const operation = this.serial.then(() => this.resumeOnce(sessionId, requestId));
@@ -370,7 +453,8 @@ export class Manager {
     if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
     const configuredProfile = this.config.agents[request.provider];
     if (!configuredProfile) throw new Error("Provider is not configured on this host");
-    const profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
+    let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
+    if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
     const context = new ProjectContexts(this.config, this.key).snapshot(request.projectId);
     const session: Session = {
       id,

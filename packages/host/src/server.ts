@@ -334,7 +334,7 @@ export function createApp(config: Config, key: Buffer) {
         (p) => p !== "demo" || config.enableDemo,
       ),
       providerLimits: teams.limits.active(),
-      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, establishChecks: 1, sessionHandoff: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
       projects: config.projects.map(({ id, name, path, team, linear }) => ({ id, name, path, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
@@ -363,6 +363,7 @@ export function createApp(config: Config, key: Buffer) {
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  app.post("/api/teams/:id/permissions/revoke", requireRole(["owner"]), async (req, res) => res.json(await teams.revokePermissions(id.parse(req.params.id), teamActionSchema.parse(req.body))));
   app.get("/api/teams/:id/bundle", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;
     const stop = () => {

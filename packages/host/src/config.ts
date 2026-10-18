@@ -12,6 +12,13 @@ import { teamProjectSchema, teamCommandSchema, teamLineupSchema } from "./team-t
  * spike S2 confirms that `-c hooks.*` and `--dangerously-bypass-hook-trust` work as intended.
  */
 export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
+const nonNegative = z.number().min(0).finite();
+export const usageConfigSchema = z.object({
+  /** USD per million tokens, keyed `provider/model`. */
+  prices: z.record(z.string().min(1), z.object({ input: nonNegative, output: nonNegative, cacheRead: nonNegative.optional(), cacheWrite: nonNegative.optional() }).strict()).default({}),
+  budgets: z.partialRecord(z.enum(["claude", "codex", "grok", "opencode", "demo"]), z.object({ usd: nonNegative, period: z.enum(["day", "week", "month"]).default("month") }).strict()).default({}),
+}).strict();
+export type UsageConfig = z.infer<typeof usageConfigSchema>;
 export const machineLabelSchema = z.string().trim().min(1).max(80);
 
 const schema = z
@@ -22,6 +29,7 @@ const schema = z
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),
+    usage: usageConfigSchema.optional(),
     sync: z.object({ sharedGroup: z.boolean().optional() }).strict().optional(),
     port: z.number().int().min(0).max(65535),
     origin: z.url(),
@@ -62,6 +70,7 @@ const schema = z
     attention: z
       .object({
         idleAfterMs: z.number().int().min(1000).max(600000).default(20000),
+        limitConfirmMs: z.number().int().min(1000).max(600000).default(30000),
         hooks: z
           .object({
             claude: z.boolean().default(DEFAULT_HOOKS.claude),

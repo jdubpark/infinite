@@ -18,13 +18,14 @@ const modelProfileFields = {
   model: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/),
   tier: z.enum(["light", "strong"]).optional(),
   dataUse: z.enum(["standard", "contributor"]).optional(),
+  limitFallback: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(),
 };
 const effort = z.enum(["low", "medium", "high", "xhigh", "max"]);
 export const teamModelProfileSchema = z.discriminatedUnion("provider", [
   // Preserve legacy parsed key order: session request fingerprints include these objects.
-  z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("claude"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse }).strict(),
-  z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("codex"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse }).strict(),
-  z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("opencode"), model: z.string().max(180).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/), variant: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/).optional(), tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse }).strict(),
+  z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("claude"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
+  z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("codex"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
+  z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("opencode"), model: z.string().max(180).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/), variant: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/).optional(), tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
 ]);
 export type TeamModelProfile = z.infer<typeof teamModelProfileSchema>;
 export const teamLineupSchema = z.object({
@@ -33,8 +34,9 @@ export const teamLineupSchema = z.object({
   reviewer: teamModelProfileSchema,
   implementers: z.array(teamModelProfileSchema).min(1).max(8),
   escalations: z.array(teamModelProfileSchema).min(1).max(8).optional(),
+  fallbacks: z.array(teamModelProfileSchema).min(1).max(8).optional(),
 }).strict().superRefine((lineup, context) => {
-  for (const pool of ["implementers", "escalations"] as const) {
+  for (const pool of ["implementers", "escalations", "fallbacks"] as const) {
     const ids = new Set<string>();
     for (const [index, profile] of (lineup[pool] ?? []).entries()) {
       if (ids.has(profile.id)) context.addIssue({ code: "custom", path: [pool, index, "id"], message: "Profile IDs must be unique within a pool" });
@@ -42,14 +44,46 @@ export const teamLineupSchema = z.object({
     }
   }
   const identities = new Map<string, string>();
-  for (const profile of [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? [])]) {
-    const identity = JSON.stringify([profile.provider, profile.model, profile.provider === "opencode" ? profile.variant : profile.effort, profile.tier, profile.dataUse ?? "standard"]);
+  const profiles = lineupProfiles(lineup);
+  for (const profile of profiles) {
+    const identity = JSON.stringify([profile.provider, profile.model, profile.provider === "opencode" ? profile.variant : profile.effort, profile.tier, profile.dataUse ?? "standard", profile.limitFallback ?? null]);
     if (identities.has(profile.id) && identities.get(profile.id) !== identity)
       context.addIssue({ code: "custom", message: "A profile ID must identify the same provider, model, and effort throughout a lineup" });
     identities.set(profile.id, identity);
   }
+  const byId = new Map(profiles.map(profile => [profile.id, profile]));
+  for (const profile of profiles) {
+    if (!profile.limitFallback) continue;
+    const seen = new Set([profile.id]);
+    let current: TeamModelProfile = profile;
+    for (let hop = 1; current.limitFallback; hop++) {
+      const target = byId.get(current.limitFallback);
+      if (!target) { context.addIssue({ code: "custom", message: `Limit fallback "${current.limitFallback}" of "${current.id}" is not a profile in this lineup` }); break; }
+      if (target.provider === current.provider) { context.addIssue({ code: "custom", message: `Limit fallback "${target.id}" of "${current.id}" must use a different provider` }); break; }
+      if (current.tier === "strong" && target.tier !== "strong") { context.addIssue({ code: "custom", message: `Strong profile "${current.id}" must fall back to a strong profile` }); break; }
+      if (seen.has(target.id)) { context.addIssue({ code: "custom", message: `Limit fallback chain from "${profile.id}" revisits "${target.id}"` }); break; }
+      if (hop >= 2 && target.limitFallback) { context.addIssue({ code: "custom", message: `Limit fallback chain from "${profile.id}" is longer than two hops` }); break; }
+      seen.add(target.id);
+      current = target;
+    }
+  }
 });
 export type TeamLineup = z.infer<typeof teamLineupSchema>;
+type LineupShape = Pick<TeamLineup, "coordinator" | "integrator" | "reviewer" | "implementers" | "escalations" | "fallbacks">;
+export function lineupProfiles(lineup: LineupShape): TeamModelProfile[] {
+  return [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? []), ...(lineup.fallbacks ?? [])];
+}
+/** First profile reachable within two `limitFallback` hops whose provider is not limited. */
+export function resolveLimitFallback(lineup: LineupShape, profileId: string, limited: Set<Provider>): TeamModelProfile | undefined {
+  const profiles = lineupProfiles(lineup);
+  let current = profiles.find(profile => profile.id === profileId);
+  for (let hop = 0; hop < 2 && current?.limitFallback; hop++) {
+    const next = profiles.find(profile => profile.id === current!.limitFallback);
+    if (next && !limited.has(next.provider)) return next;
+    current = next;
+  }
+  return undefined;
+}
 export const createTeamSchema = z.object({
   requestId: z.uuid(),
   projectId: z.string().regex(/^[a-z0-9-]{1,80}$/),

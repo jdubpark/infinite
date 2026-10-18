@@ -98,6 +98,8 @@ export interface Config {
   machine?: { id: string; label: string };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
+  /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */
+  usage?: import("./config.js").UsageConfig;
   deployment?: import("./deployment.js").Deployment;
   /** Workspace sync. `sharedGroup` makes applied trees group-writable for a separate agent account. */
   sync?: { sharedGroup?: boolean };
@@ -114,6 +116,7 @@ export interface Config {
   maxSessions: number;
   attention?: {
     idleAfterMs: number;
+    limitConfirmMs: number;
     hooks: { claude: boolean; codex: boolean };
   };
   push?: {

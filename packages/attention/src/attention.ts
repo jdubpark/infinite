@@ -1,4 +1,4 @@
-import type { Attention, Prompt, Provider, Signal, SignalEvent } from "./types.js";
+import type { Attention, Prompt, Provider, Signal, SignalData, SignalEvent } from "./types.js";
 import { LOUD_TOOLS, PROVIDER_NAMES } from "./types.js";
 import type { DetectedPrompt } from "./prompts.js";
 import { normalisedLines } from "./prompts.js";
@@ -29,6 +29,17 @@ function enter(att: Attention, state: Attention["state"], source: Attention["sou
 
 export function applyLifecycle(att: Attention, status: "exited" | "unavailable" | "recording-error", at: string): Attention {
   return { ...enter(att, status, "lifecycle", at), prompt: undefined, now: "" };
+}
+
+/**
+ * Whether a signal proves the provider works again: a turn-end that did not fail, from a source
+ * able to say a turn failed. A Claude hook reports `Stop` or `StopFailure`, and a native adapter
+ * carries the turn status. A Codex terminal turn-end, from its Stop hook, notify, or OSC 9, never
+ * says the turn failed, so it is no evidence that a limit lifted.
+ */
+export function recoveryTurnEnd(data: SignalData): boolean {
+  if (data.kind !== "turn-end" || data.failed === true) return false;
+  return data.source === "protocol" || (data.provider === "claude" && data.source === "hook");
 }
 
 export function applySignal(att: Attention, event: SignalEvent): Attention {
@@ -68,8 +79,8 @@ export function applySignal(att: Attention, event: SignalEvent): Attention {
     case "turn-end":
       next = { ...enter(next, "turn-finished", source, at), prompt: undefined, lastTool: undefined, sawTurnEnd: true };
       next.lastMessage = data.message;
-      // A successful turn proves the provider works again; a failed one keeps the observation.
-      if (!data.failed) next.limit = undefined;
+      // A successful turn proves the provider works again; a failed or unknowable one keeps the observation.
+      if (recoveryTurnEnd(data)) next.limit = undefined;
       break;
     case "notice":
       // The wait ended and the limit lifted.

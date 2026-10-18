@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { Config } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
-import { PROVIDER_NAMES } from "@infinite/attention";
+import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
 import { retargetPrompt, teamPrompt } from "./team-prompts.js";
 import { teamModelLaunch } from "./launch.js";
@@ -367,7 +367,7 @@ export class TeamService {
                 const data = event.data;
                 // Prefer a corroborated observation; a later successful turn means the member recovered.
                 if (switchesMember(data)) { if (!limit || (limit.confidence !== "corroborated" && data.confidence === "corroborated")) limit = { ...data, at: event.at, seq: event.seq }; }
-                else if ((data.kind === "turn-end" && !data.failed) || (data.kind === "notice" && data.type === "quota_auto_resume_fired")) limit = undefined;
+                else if (recoveryTurnEnd(data as unknown as SignalData) || (data.kind === "notice" && data.type === "quota_auto_resume_fired")) limit = undefined;
                 continue;
               }
               const parsed = teamReportEnvelopeSchema.safeParse(event.data);

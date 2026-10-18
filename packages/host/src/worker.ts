@@ -22,6 +22,7 @@ import {
   mapCodexOsc,
   mergeHookIntoPrompt,
   mergeScreenIntoPrompt,
+  recoveryTurnEnd,
   screenDecision,
   type AnswerResult,
   type Attention,
@@ -239,7 +240,7 @@ function record(
   ) as unknown as SignalEvent;
   publish(applySignal(attention, event));
   // A successful turn, or the end of a quota wait, lifts the limit; the notice may stay on screen.
-  if ((signal.kind === "turn-end" && !signal.failed) || (signal.kind === "notice" && signal.type === "quota_auto_resume_fired")) {
+  if (recoveryTurnEnd(data) || (signal.kind === "notice" && signal.type === "quota_auto_resume_fired")) {
     limitEpisode = undefined;
     limitWatch = undefined;
     screenLimitSuppressed = true;
@@ -375,7 +376,8 @@ let answering: number | undefined;
 /**
  * Usage-limit observations are journaled per episode: at most one single-source and one
  * corroborated signal. An episode starts at the first observation, from a hook or the screen,
- * and ends after three checks with no match and no armed watch, or at a successful turn end.
+ * and ends after three checks with no match and no armed watch, or at a turn end that proves
+ * recovery (`recoveryTurnEnd`): a Codex terminal turn end cannot say the turn failed.
  * A Claude hook is corroborated by the screen notice within two later checks; a Codex status row
  * only by persisting for three checks and `limitConfirmMs` without new output.
  */

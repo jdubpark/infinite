@@ -486,6 +486,11 @@ test("a Codex status row is corroborated only after it persists, once per episod
     // (the fixture prints it at 4.5 s, after corroboration; wait past it, before the 9 s clear)
     await sleepMs(2500);
     assert.equal((await limitsOf(host, id)).length, 2);
+    // An OSC turn complete (6 s) cannot report failure: the limit stays shown and the episode open.
+    await waitFor(() => signalsOf(host, id), (r) => r.some((e) => e.data.kind === "turn-end" && e.data.source === "osc"), 5000);
+    await sleepMs(1500);
+    assert.equal((await limitsOf(host, id)).length, 2, "No new single-source follows the OSC turn end");
+    assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.limit?.confidence, "corroborated");
     // The row disappears for five seconds, ending the episode; its return starts a new one.
     const all = await waitFor(() => limitsOf(host, id), (r) => r.length >= 4, 25000);
     assert.deepEqual(all.slice(2).map((e) => e.data.confidence), ["single-source", "corroborated"]);

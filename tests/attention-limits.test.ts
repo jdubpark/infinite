@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { detectLimit, parseResetTime } from "../packages/attention/src/limits.js";
-import { applySignal } from "../packages/attention/src/attention.js";
-import type { Attention, SignalEvent } from "../packages/attention/src/types.js";
+import { applySignal, recoveryTurnEnd } from "../packages/attention/src/attention.js";
+import type { Attention, SignalData, SignalEvent } from "../packages/attention/src/types.js";
 
 const screen = (name: string) =>
   readFileSync(new URL(`./fixtures/screens/${name}.txt`, import.meta.url), "utf8").split("\n");
@@ -76,6 +76,24 @@ test("a successful turn-end clears attention.limit; a failed one keeps it", () =
   });
   assert.equal(applySignal(limited, end(true)).limit?.confidence, "corroborated");
   assert.equal(applySignal(limited, end()).limit, undefined);
+});
+
+test("only a turn-end that can report failure clears attention.limit", () => {
+  const limited = applySignal(att(), limitEvent("corroborated", "t1"));
+  const end = (source: SignalData["source"], provider: SignalData["provider"], failed?: boolean): SignalEvent => ({
+    seq: 2, at: "t2", type: "signal",
+    data: { kind: "turn-end", ...(failed ? { failed } : {}), source, provider },
+  });
+  assert.equal(applySignal(limited, end("osc", "codex")).limit?.confidence, "corroborated", "A Codex OSC turn complete cannot say the turn failed");
+  assert.equal(applySignal(limited, end("hook", "codex")).limit?.confidence, "corroborated", "Nor can a Codex Stop hook or notify");
+  assert.equal(applySignal(limited, end("hook", "claude")).limit, undefined, "A Claude Stop hook is distinct from StopFailure");
+  assert.equal(applySignal(limited, end("protocol", "codex")).limit, undefined, "A native adapter carries the turn status");
+  assert.equal(applySignal(limited, end("protocol", "codex", true)).limit?.confidence, "corroborated");
+  assert.deepEqual(
+    [end("hook", "claude"), end("hook", "claude", true), end("protocol", "opencode"), end("osc", "codex"), end("hook", "codex"), end("screen", "claude")].map((e) => recoveryTurnEnd(e.data)),
+    [true, false, true, false, false, false],
+  );
+  assert.equal(recoveryTurnEnd({ kind: "notice", type: "quota_auto_resume_fired", source: "hook", provider: "claude" }), false);
 });
 
 test("a quota_auto_resume_fired notice clears attention.limit; other notices keep it", () => {

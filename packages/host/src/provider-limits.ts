@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { recoveryTurnEnd, type SignalData } from "@infinite/attention";
 import type { Provider } from "./types.js";
 import { writeSealed, unseal } from "./vault.js";
 
@@ -25,7 +26,7 @@ export const switchesMember = (data: Record<string, unknown>): data is LimitObse
  * Host-level memory of corroborated provider limits, so new members of a limited provider launch on
  * their fallback. An entry lasts until the provider's stated reset, at most 24 hours, or 15 minutes
  * when no reset was stated. It ends early when a session of that provider completes a turn without
- * failing after the limit. A per-provider clear time keeps an exited session's old observation from
+ * failing after the limit, as told by a source able to report failure (`recoveryTurnEnd`). A per-provider clear time keeps an exited session's old observation from
  * re-creating a cleared entry.
  */
 export class ProviderLimits {
@@ -58,7 +59,7 @@ export class ProviderLimits {
   limited(now = new Date()): Set<Provider> { return new Set(this.active(now).map(limit => limit.provider)); }
   /**
    * Observes corroborated limits shown on any Claude or Codex session, then clears a provider's entry
-   * when one of its sessions journals a successful turn end after both the entry and that session's
+   * when one of its sessions journals a recovery turn end after both the entry and that session's
    * own latest limit observation. Activity timestamps are not evidence: a repeated limit bumps them.
    */
   async reconcile(sessions: LimitSessions, now = new Date()) {
@@ -76,7 +77,7 @@ export class ProviderLimits {
         const at = time(event.at);
         if (at === undefined) continue;
         if (event.data.kind === "provider-limit") seen.limitAt = Math.max(at, seen.limitAt ?? at);
-        else if (event.data.kind === "turn-end" && event.data.failed !== true && at > (time(seen.turnAt) ?? -Infinity)) seen.turnAt = event.at;
+        else if (recoveryTurnEnd(event.data as unknown as SignalData) && at > (time(seen.turnAt) ?? -Infinity)) seen.turnAt = event.at;
       }
       seen.cursor = page.cursor; this.sessions.set(session.id, seen);
       // A later limit may sit in the unread tail; decide once the journal has been read to its end.

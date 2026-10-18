@@ -399,3 +399,66 @@ test("a plain session says what it is doing; one unreadable status never hides t
     await host.stop();
   }
 });
+
+type LimitRow = { seq: number; data: { kind: string; confidence?: string; source: string; resetsAt?: string } };
+const limitsOf = async (host: Host, id: string) => (await signalsOf(host, id)).filter((e) => e.data.kind === "provider-limit") as unknown as LimitRow[];
+const limitHost = (script: string, provider: "claude" | "codex") =>
+  startHost({ agents: { [provider]: { command: process.execPath, args: [fileURLToPath(new URL(`./fixtures/${script}`, import.meta.url))] } }, config: { attention: { ...attention, limitConfirmMs: 2000 } } });
+const startLimitSession = (host: Host, provider: string, prompt: string) => {
+  const id = randomUUID();
+  return host.fetchApi("/sessions", "owner", { requestId: id, provider, projectId: "rehearsal", title: prompt, prompt }).then((r) => {
+    assert.equal(r.status, 201);
+    return id;
+  });
+};
+const sleepMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("a Claude rate-limit hook is single-source until the screen notice corroborates it", { timeout: 60000 }, async () => {
+  const host = await limitHost("hook-agent.mjs", "claude");
+  try {
+    const id = await startLimitSession(host, "claude", "rate-limit");
+    const rows = await waitFor(() => limitsOf(host, id), (r) => r.some((e) => e.data.confidence === "corroborated"), 20000);
+    assert.equal(rows[0].data.confidence, "single-source");
+    assert.equal(rows[0].data.source, "hook");
+    assert.equal(rows[1].data.confidence, "corroborated");
+    assert.equal(rows[1].data.source, "screen");
+    assert.equal(rows.length, 2);
+    const detail = await host.fetchApi(`/sessions/${id}`);
+    assert.equal(detail.body.attention.limit.confidence, "corroborated");
+  } finally {
+    await host.stop();
+  }
+});
+
+test("a Claude rate-limit hook with no screen notice stays single-source", { timeout: 60000 }, async () => {
+  const host = await limitHost("hook-agent.mjs", "claude");
+  try {
+    const id = await startLimitSession(host, "claude", "rate-limit-blip");
+    await waitFor(() => limitsOf(host, id), (r) => r.length >= 1, 15000);
+    await sleepMs(5000);
+    const rows = await limitsOf(host, id);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].data.confidence, "single-source");
+  } finally {
+    await host.stop();
+  }
+});
+
+test("a Codex status row is corroborated only after it persists", { timeout: 60000 }, async () => {
+  const host = await limitHost("codex-limit-agent.mjs", "codex");
+  try {
+    const id = await startLimitSession(host, "codex", "limit");
+    const first = await waitFor(() => limitsOf(host, id), (r) => r.length >= 1, 15000);
+    assert.equal(first[0].data.confidence, "single-source");
+    assert.equal(first[0].data.source, "screen");
+    const seenAt = Date.now();
+    const rows = await waitFor(() => limitsOf(host, id), (r) => r.length >= 2, 20000);
+    assert.equal(rows[1].data.confidence, "corroborated");
+    assert.ok(Date.now() - seenAt >= 1000, "corroboration waits for limitConfirmMs");
+    await sleepMs(3000);
+    assert.equal((await limitsOf(host, id)).length, 2);
+  } finally {
+    await host.stop();
+  }
+});
+

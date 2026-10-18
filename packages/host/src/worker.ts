@@ -29,6 +29,7 @@ import {
   type Signal,
   type SignalData,
   type SignalEvent,
+  detectLimit,
 } from "@infinite/attention";
 import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
@@ -354,7 +355,13 @@ function onHook(route: HookRoute, body: unknown) {
       hookPromptWhileOpen(attention.prompt, signal.prompt, agent);
       continue;
     }
-    record(signal, "hook", agent);
+    const recorded = record(signal, "hook", agent);
+    if (recorded.data.kind === "provider-limit") {
+      if (recorded.data.confidence === "single-source")
+        limitWatch = { source: "hook", firstAt: Date.now(), checks: 0, corroborated: false };
+      else limitWatch = undefined;
+      screenLimitRecorded = true;
+    }
   }
 }
 
@@ -363,6 +370,49 @@ let outputSinceCheck = false;
 let missCount = 0;
 /** Prompt id with an answer in flight; the answer path, not the screen loop, closes it. */
 let answering: number | undefined;
+
+/**
+ * Journals usage-limit observations with their confidence. A Claude hook is corroborated by the
+ * screen notice within two checks; a Codex status row only by persisting unchanged for three
+ * checks and `limitConfirmMs`. Each limit episode journals at most one signal per confidence.
+ */
+let limitWatch: { source: "hook" | "screen"; firstAt: number; checks: number; corroborated: boolean } | undefined;
+let screenLimitRecorded = false;
+function watchLimit(lines: string[], nowMs: number, freshOutput: boolean) {
+  const found = detectLimit(lines, provider, new Date(nowMs));
+  const watch = limitWatch;
+  if (!found) {
+    screenLimitRecorded = false;
+    // A hook watch gets two checks after the one that armed it; a screen watch ends with its match.
+    if (watch?.source === "screen" || (watch && ++watch.checks > 2)) limitWatch = undefined;
+    return;
+  }
+  const observed = { kind: "provider-limit" as const, limit: found.limit, message: found.message, ...(found.resetsAt ? { resetsAt: found.resetsAt } : {}) };
+  if (watch?.source === "hook") {
+    record({ ...observed, confidence: "corroborated" }, "screen");
+    limitWatch = undefined;
+    screenLimitRecorded = true;
+    return;
+  }
+  if (!watch) {
+    if (!screenLimitRecorded && !attention.limit) {
+      record({ ...observed, confidence: "single-source" }, "screen");
+      screenLimitRecorded = true;
+    }
+    if (provider === "codex") limitWatch = { source: "screen", firstAt: nowMs, checks: 1, corroborated: false };
+    return;
+  }
+  if (freshOutput) {
+    limitWatch = { source: "screen", firstAt: nowMs, checks: 1, corroborated: false };
+    return;
+  }
+  if (watch.corroborated) return;
+  watch.checks++;
+  if (watch.checks >= 3 && nowMs - watch.firstAt >= config.attention.limitConfirmMs) {
+    record({ ...observed, confidence: "corroborated" }, "screen");
+    watch.corroborated = true;
+  }
+}
 
 /** Runs after every output flush and once a second. */
 function checkScreen() {
@@ -380,7 +430,9 @@ function checkScreen() {
     // is not new work.
     const freshOutput =
       outputSinceCheck && lastOutputAt > Date.parse(attention.since);
+    const outputThisCheck = outputSinceCheck;
     outputSinceCheck = false;
+    watchLimit(lines, nowMs, outputThisCheck);
     let decision = screenDecision(attention, detected, idle, freshOutput, at);
     const open = attention.prompt;
     // A different block in place of the open one supersedes it without a blank screen between.

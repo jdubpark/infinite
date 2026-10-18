@@ -199,5 +199,6 @@ export interface Bootstrap {
   attention: {
     hooks: { claude: boolean; codex: boolean };
     idleAfterMs: number;
+    limitConfirmMs: number;
   };
 }

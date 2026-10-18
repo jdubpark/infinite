@@ -1,3 +1,5 @@
+import { ProjectContexts } from "../project-context.js";
+import { assertFreshNativeContext } from "../context-continuation.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
@@ -155,13 +157,37 @@ export class CmuxSessions {
     }).sort((a, b) => b.root.length - a.root.length)[0];
   }
 
+  /** Keep a discovered native conversation inside the project identity it first received. */
+  private boundProject(record: Stored, cwd: string) {
+    const configured = this.config.projects.find((project) => project.id === record.session.projectId);
+    if (!configured) return undefined;
+    let root: string;
+    try { root = realpathSync(configured.path); } catch { return undefined; }
+    if (record.session.projectRoot && record.session.projectRoot !== root) return undefined;
+    if (!record.session.projectRoot) {
+      // Without a saved root, only a historical root-level cwd proves the old
+      // binding. A nested cwd could have crossed into a newly broadened root.
+      if (record.session.cwd !== root) return undefined;
+      record.session.projectRoot = root;
+    }
+    const observed = this.project(cwd);
+    return observed?.root === root ? { ...configured, root, cwd: observed.cwd } : undefined;
+  }
+
+  private quarantine(record: Stored) {
+    record.surfaceId = undefined;
+    record.workspaceId = undefined;
+    record.pid = undefined;
+    record.controller = undefined;
+  }
+
   private newRecord(provider: CmuxProvider, cwd: string, title: string, id: string = randomUUID()): Stored | undefined {
     const project = this.project(cwd);
     if (!project) return undefined;
     const createdAt = now();
     const record: Stored = {
       session: {
-        id, provider, title: cleanTitle(title) || basename(cwd), projectId: project.id, cwd: project.cwd,
+        id, provider, title: cleanTitle(title) || basename(cwd), projectId: project.id, projectRoot: project.root, cwd: project.cwd,
         createdAt, status: "starting", contextVersion: 0, context: "", initialPrompt: "",
         backend: "cmux", machineId: this.config.machine?.id,
         runtime: { id: randomUUID(), location: this.config.environment, transport: "cmux" },
@@ -186,15 +212,12 @@ export class CmuxSessions {
     record ??= [...this.records.values()].find((candidate) => !candidate.nativeId && candidate.surfaceId === hook.surfaceId && candidate.session.provider === hook.provider && hook.updatedAt >= (candidate.launchedAt ?? 0) - 1000);
     record ??= hook.cwd ? this.newRecord(hook.provider, hook.cwd, surface?.title ?? basename(hook.cwd)) : undefined;
     if (!record) return;
-    const project = this.project(hook.cwd ?? record.session.cwd);
+    const project = this.boundProject(record, hook.cwd ?? record.session.cwd);
     if (!project) {
-      record.surfaceId = undefined;
-      record.workspaceId = undefined;
-      record.pid = undefined;
+      this.quarantine(record);
       return;
     }
     record.session.cwd = project.cwd;
-    record.session.projectId = project.id;
     record.nativeId = hook.nativeId;
     record.transcript = hook.transcript ?? record.transcript;
     record.hookAt = hook.updatedAt;
@@ -245,6 +268,12 @@ export class CmuxSessions {
       if (!["claude", "codex"].includes(row.agent) || !string(row.session_id) || !string(row.cwd)) continue;
       const record = this.nativeRecord(row.agent, row.session_id) ?? this.newRecord(row.agent, row.cwd, string(row.title) ?? basename(row.cwd));
       if (!record) continue;
+      const project = this.boundProject(record, row.cwd);
+      if (!project) {
+        this.quarantine(record);
+        continue;
+      }
+      record.session.cwd = project.cwd;
       record.nativeId = row.session_id;
       record.transcript = string(row.file) ?? record.transcript;
     }
@@ -403,15 +432,17 @@ export class CmuxSessions {
       await this.refresh();
       if (!this.available) throw new CmuxError("cmux-unavailable");
       if ([...this.records.values()].filter((row) => ["running", "starting"].includes(row.session.status)).length >= this.config.maxSessions) throw new CmuxError("session-limit");
+      if (request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
+      const context = new ProjectContexts(this.config, this.key).snapshot(project.id);
       const record = this.newRecord(request.provider as CmuxProvider, projectCwd(project.path, request.cwd), request.title, request.requestId);
       if (!record) throw new CmuxError("unknown-project");
       record.session.initialPrompt = request.prompt;
-      const contextFile = join(this.config.stateDir, "contexts", `${project.id}.sealed`);
-      if (existsSync(contextFile)) {
-        const context = unseal<{ version: number; text: string }>(this.key, `context:${project.id}`, readFileSync(contextFile, "utf8"));
-        record.session.contextVersion = context.version;
-        record.session.context = context.text;
-      }
+      record.session.projectId = project.id;
+      record.session.projectRoot = context.root;
+      record.session.contextVersion = context.version;
+      record.session.contextSources = context.sources;
+      record.session.contextLinksVersion = context.linksVersion;
+      record.session.context = context.text;
       record.session.nativeArgs = request.nativeArgs;
       record.creation = { digest: fingerprint, state: "uncertain" };
       record.launchId = randomUUID();
@@ -457,6 +488,7 @@ export class CmuxSessions {
       if (!UUID.test(requestId)) throw new CmuxError("invalid-request");
       await this.refresh(id);
       const record = this.stored(id);
+      if (!this.boundProject(record, record.session.cwd)) throw new CmuxError("unsupported", "The recorded project root changed; this native conversation cannot be resumed here");
       const fingerprint = digest({ op: "resume", requestId });
       const previous = record.receipts[requestId];
       if (previous) {
@@ -468,7 +500,7 @@ export class CmuxSessions {
       if (!this.available || record.session.status === "unavailable" || record.recordingError) throw new CmuxError("cmux-unavailable");
       if (!record.nativeId || !/^[a-zA-Z0-9-]{8,200}$/.test(record.nativeId)) throw new CmuxError("unsupported", "No resumable provider conversation was recorded");
       const profile = this.config.agents[record.session.provider];
-      if (!profile || !this.project(record.session.cwd)) throw new CmuxError("unsupported");
+      if (!profile) throw new CmuxError("unsupported");
       if ([...this.records.values()].filter((row) => ["running", "starting"].includes(row.session.status)).length >= this.config.maxSessions) throw new CmuxError("session-limit");
       const event = this.append(record, "input-intent", { op: "resume", requestId });
       record.receipts[requestId] = { requestId, digest: fingerprint, state: "uncertain", seq: event.seq };

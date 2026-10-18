@@ -295,6 +295,30 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
   const stateDir = join(dirname(configPath), "team-cli", identity);
   const mappingsPath = join(stateDir, "repo-mappings.json"), receiptsPath = join(stateDir, "receipts.json");
   if (command === "repo") {
+    if (["link", "unlink", "links"].includes(positional[0])) {
+      const action = positional[0];
+      if (positional.length !== (action === "links" ? 1 : 2))
+        throw new Error("Usage: infinite repo link PROJECT_OR_DIRECTORY --relationship TEXT | repo unlink PROJECT_OR_DIRECTORY | repo links [--project ID]");
+      const bound = (directory: string) => boundTeamProject(config, configPath, directory);
+      const selected = options["--project"] === undefined ? bound(process.cwd()) : String(options["--project"]);
+      if (!selected || !projectIdPattern.test(selected)) throw new Error("No repository project is bound to this directory. Run infinite repo init or use --project ID.");
+      const endpoint = `/projects/${selected}/context-links`;
+      const current = await api.json<{ version: number; binding?: "review-required"; links: { projectId: string; relationship: string }[] }>(endpoint);
+      if (action === "links") { console.log(JSON.stringify(current, null, 2)); return true; }
+      const target = projectIdPattern.test(positional[1]) ? positional[1] : bound(positional[1]);
+      if (!target || !projectIdPattern.test(target)) throw new Error("The linked directory must already be enrolled. Use its project ID or run repo init there first.");
+      const relationship = String(options["--relationship"] ?? "").trim();
+      if (action === "link" && (!relationship || relationship.length > 300)) throw new Error("Describe the relationship with --relationship TEXT (1–300 characters).");
+      const existing = current.links.find(link => link.projectId === target);
+      if (!current.binding && ((action === "link" && existing?.relationship === relationship) || (action === "unlink" && !existing))) {
+        console.log(JSON.stringify(current, null, 2)); return true;
+      }
+      const links = current.links.filter(link => link.projectId !== target);
+      if (action === "link") links.push({ projectId: target, relationship });
+      const result = await api.json(endpoint, { expectedVersion: current.version, links }, undefined, undefined, "PUT");
+      console.log(JSON.stringify(result, null, 2));
+      return true;
+    }
     if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--setup-json JSON] [--check-json JSON] [--linear-team UUID] [--linear-project UUID]");
     const requestedDirectory = canonicalDirectory(positional[1] ?? process.cwd());
     const gitResult = gitRootOrNonGit(requestedDirectory);

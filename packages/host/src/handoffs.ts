@@ -41,9 +41,13 @@ export class HandoffService {
     const envelope = handoffEnvelopeSchema.parse(event.data);
     if (envelope.sessionId !== sessionId) throw new Error("Invalid handoff source");
     const policy = source.handoff.policy;
+    const identityValid = policy.sourceSessionId === sessionId && policy.projectId === source.projectId;
     const record: Stored = { sessionId, projectId: source.projectId, teamId: randomUUID(), stopId: randomUUID(), acceptedAt: event.at,
-      deadlineAt: new Date(Date.parse(event.at) + policy.maxMinutes * 60000).toISOString(), request: envelope.request, policy, status: "requested" };
-    this.save(record); this.records.set(sessionId, record); this.manager.reserveHandoff(record.projectId);
+      deadlineAt: new Date(Date.parse(event.at) + policy.maxMinutes * 60000).toISOString(), request: envelope.request, policy,
+      status: identityValid ? "requested" : "blocked",
+      ...(!identityValid ? { reason: "The handoff policy does not belong to its source session and project." } : {}) };
+    this.save(record); this.records.set(sessionId, record);
+    if (identityValid) this.manager.reserveHandoff(record.projectId);
     return record;
   }
   view(sessionId: string): HandoffView {
@@ -85,13 +89,16 @@ export class HandoffService {
     // A crash after creation must find the same team before inspecting a changed source.
     try {
       const team = this.teams.get(record.teamId);
-      if (team.handoff?.sourceSessionId !== record.sessionId) throw new Error("Conflicting handoff team identity");
+      if (team.handoff?.sourceSessionId !== record.sessionId || team.projectId !== record.projectId) throw new Error("Conflicting handoff team identity");
       if (!team.baseCommit && team.status !== "blocked") return;
       record.status = team.baseCommit ? "started" : "blocked";
       record.reason = team.baseCommit ? undefined : team.reason;
       this.save(record); this.manager.releaseHandoff(record.projectId); return;
     } catch (error) { if (!(error && typeof error === "object" && "code" in error && error.code === "team-not-found")) throw error; }
     if (Date.now() >= Date.parse(record.deadlineAt)) throw new Error("Handoff expired before team creation; the source and its edits were preserved.");
+    const source = this.manager.meta(record.sessionId).session;
+    if (record.policy.sourceSessionId !== record.sessionId || record.policy.projectId !== record.projectId || source.projectId !== record.projectId)
+      throw new Error("The handoff policy no longer matches its source session and project.");
     const state = await this.manager.state(record.sessionId);
     if (state.control && state.control.expiresAt > Date.now()) {
       record.status = "waiting-for-control"; record.reason = "The source yielded. Detach its controlling client to allow transfer."; this.save(record); return;

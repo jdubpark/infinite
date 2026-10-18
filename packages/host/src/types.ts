@@ -47,6 +47,8 @@ export interface Session {
   /** Host-owned assignment; ordinary session creation cannot supply this. */
   team?: import("./team-types.js").TeamAssignment;
   teamModelProfile?: import("./team-types.js").TeamModelProfile;
+  /** Host-owned: this member folder lies under a team root the owner trusts. */
+  workspaceTrusted?: true;
   backend?: "infinite" | "cmux";
   machineId?: string;
   /** Where this session's tools run. Laptop execution is the explicit --laptop mode. */
@@ -101,7 +103,11 @@ export interface Config {
   /** Host-only credential; never copied into provider environment variables or prompts. */
   linear?: { apiKeyFile: string; endpoint?: string };
   /** Separate working copies, writable by the host and selected provider execution account. */
-  teams?: { workspaceDir: string; commandPrefix?: import("./team-types.js").TeamCommand; lineup?: import("./team-types.js").TeamLineup };
+  teams?: {
+    workspaceDir: string; commandPrefix?: import("./team-types.js").TeamCommand; lineup?: import("./team-types.js").TeamLineup;
+    /** Owner trust in every team root: Claude and Codex members start trusted in their own folders. */
+    trustWorkspaces?: boolean;
+  };
   machine?: { id: string; label: string };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };

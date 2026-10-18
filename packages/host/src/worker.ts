@@ -41,6 +41,7 @@ import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
 import { buildLaunch } from "./launch.js";
+import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
@@ -1183,6 +1184,14 @@ server.listen(socketPath(runDir, session.id), async () => {
     if (session.team) {
       if (!hookServer) throw new Error("Team report channel could not start");
       env.INFINITE_TEAM_ASSIGNMENT = JSON.stringify(session.team);
+      if (session.workspaceTrusted) {
+        // A sudo profile's wrapper records Claude trust in the agent account; a provider in
+        // this account reads this account's config, so the worker records it here.
+        env.INFINITE_TRUSTED_WORKSPACE = session.cwd;
+        if (provider === "claude" && env.HOME && !/(^|\/)sudo$/.test(profile.command))
+          try { recordClaudeTrust(claudeConfigPath(env.HOME), session.cwd); }
+          catch (error) { journal.append("lifecycle", { workspaceTrust: "unrecorded", reason: error instanceof Error ? error.message : String(error) }); }
+      }
     }
     if (hookServer) {
       env.INFINITE_HOOK_URL = hookServer.url;
@@ -1204,6 +1213,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       Boolean(session.team),
       session.teamModelProfile,
       session.handoff?.policy ? session.id : undefined,
+      session.workspaceTrusted ? session.cwd : undefined,
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {

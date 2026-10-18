@@ -15,7 +15,12 @@ export SHELL=/bin/bash
 
 provider=$(basename "$0")
 case "$provider" in
-  claude) ;;
+  claude)
+    # A team member under an owner-trusted root: record trust for this exact folder in
+    # this account's Claude config, so the folder prompt does not wait for the owner.
+    if [ -n "${INFINITE_TRUSTED_WORKSPACE:-}" ]; then
+      /usr/local/bin/node /opt/infinite/packages/host/dist/workspace-trust.js claude || true
+    fi ;;
   codex)
     # The interactive CLI tries a background app-server daemon that cannot run in this
     # account; the prepared app-server backend is launched separately through codex-app-server.

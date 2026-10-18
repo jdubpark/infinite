@@ -26,6 +26,8 @@ infinite sync [--project ID] | --stop | --status | --apply [--force]
 infinite pull [PROJECT_ID] [--output NEW_DIRECTORY]
 infinite repo init [DIRECTORY] [--project ID] [--check-json JSON]
 infinite repo init PARENT_DIRECTORY --linear-team UUID [--linear-project UUID]
+infinite repo link PROJECT_OR_DIRECTORY --relationship "Uses its API"
+infinite repo unlink PROJECT_OR_DIRECTORY | repo links
 infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]
 infinite team status [ID] [--json] | team watch ID
 infinite team steer ID TEXT | team answer ID QUESTION_ID TEXT

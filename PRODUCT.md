@@ -56,6 +56,8 @@ execution, and Infinite does not mark an issue Done automatically.
 
 Preserve native agent histories and workspaces. Show execution location, connection freshness, recording errors, and actual delivery receipts. Shared context must identify its version and source. Do not infer task completion from an idle terminal or automatically approve provider permissions.
 
+Bind context to the selected project and codebase. Do not infer sharing from a parent directory, Linear mapping, provider account, or similar repository name. Cross-project context requires an explicit owner-created relationship with a named source and purpose. Relationships are directional and do not propagate through further links. Revocation stops future retrieval; context already delivered to a conversation remains part of its history.
+
 In the managed multi-tenant service, tenant contents must be confidential from other users and the service operator. This requires a supported, hardened confidential runtime, independently verified attestation bound to the live client channel, user-controlled keys and update policy, and no operator recovery bypass. Native phone credentials belong in platform secure storage. A compromised agent, trusted client, or selected model provider remains a separate threat boundary.
 
 The current runner is single-tenant. Owner/controller/viewer are roles within that tenant, not separate users' context buckets. A development deployment gives each tenant an entire VM and separate Infinite instance, credentials, disks, homes, networking, and backups. Ordinary VM development is synthetic-only and cannot claim operator confidentiality. The managed contract and implementation limits are in `docs/multi-tenant.md`.

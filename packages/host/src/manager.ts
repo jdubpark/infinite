@@ -1,3 +1,5 @@
+import { ProjectContexts } from "./project-context.js";
+import { assertFreshNativeContext } from "./context-continuation.js";
 import { handoffNativePrompt, handoffPathsOverlap } from "./handoff-types.js";
 import { spawn } from "node:child_process";
 import {
@@ -226,34 +228,9 @@ export class Manager {
       row.status === "fulfilled" ? [row.value] : [],
     );
   }
-  context(projectId: string): {
-    version: number;
-    text: string;
-    updatedAt?: string;
-  } {
-    const file = join(this.config.stateDir, "contexts", `${projectId}.sealed`);
-    return existsSync(file)
-      ? unseal(this.key, `context:${projectId}`, readFileSync(file, "utf8"))
-      : { version: 0, text: "" };
-  }
+  context(projectId: string) { return new ProjectContexts(this.config, this.key).context(projectId); }
   setContext(projectId: string, text: string, expectedVersion: number) {
-    const current = this.context(projectId);
-    if (current.version !== expectedVersion)
-      throw new Error(
-        "Context changed on another device. Reload before saving.",
-      );
-    const next = {
-      version: current.version + 1,
-      text,
-      updatedAt: new Date().toISOString(),
-    };
-    writeSealed(
-      join(this.config.stateDir, "contexts", `${projectId}.sealed`),
-      this.key,
-      `context:${projectId}`,
-      next,
-    );
-    return next;
+    return new ProjectContexts(this.config, this.key).setContext(projectId, text, expectedVersion);
   }
   create(request: CreateSession): Promise<Session & WorkerState> {
     const operation = this.serial.then(() => this.createOnce(request));
@@ -293,17 +270,23 @@ export class Manager {
   private async resumeOnce(sessionId: string, requestId: string): Promise<Session & WorkerState> {
     if (this.handoffRequest(sessionId)) throw new ContentError("This session yielded to a team; inspect its handoff instead of resuming it");
     if (requestId === sessionId) throw new ContentError("Resumption needs a new request identity", 400);
+    const session = this.meta(sessionId).session;
+    const project = this.config.projects.find(project => project.id === session.projectId);
+    if (!project || (session.projectRoot ? realpathSync(project.path) !== session.projectRoot : session.cwd !== realpathSync(project.path)))
+      throw new ContentError("The recorded conversation belongs to a different codebase binding. Start a new session.", 409);
     const receiptFile = join(this.config.stateDir, "resumptions", `${requestId}.sealed`);
     if (existsSync(receiptFile)) {
       const receipt = unseal<{ sourceId: string; targetId: string }>(this.key, `resume:${requestId}`, readFileSync(receiptFile, "utf8"));
       if (receipt.sourceId !== sessionId) throw new ContentError("Request ID already belongs to a different resumption");
-      return { ...this.meta(receipt.targetId).session, ...(await this.state(receipt.targetId)) };
+      const target = this.meta(receipt.targetId).session;
+      if (target.projectId !== session.projectId || (target.projectRoot ?? target.cwd) !== realpathSync(project.path))
+        throw new ContentError("The saved continuation receipt belongs to another project or codebase. Open the original session instead.", 409);
+      return { ...target, ...(await this.state(receipt.targetId)) };
     }
     const remember = (result: Session & WorkerState) => {
       writeSealed(receiptFile, this.key, `resume:${requestId}`, { sourceId: sessionId, targetId: result.id });
       return result;
     };
-    const session = this.meta(sessionId).session;
     if (session.team) throw new ContentError("Resume this member from its team so its assignment stays consistent");
     const state = await this.state(sessionId);
     if (state.status === "running" || state.status === "starting") return remember({ ...session, ...state });
@@ -316,7 +299,6 @@ export class Manager {
       : session.provider === "codex" ? ["resume", native.id] : ["--session", native.id];
     const request: CreateSession = { requestId, provider: session.provider, projectId: session.projectId,
       title: session.title, prompt: "", nativeArgs: args, resumedFrom: sessionId, resumeNativeSession: native };
-    const project = this.config.projects.find(project => project.id === session.projectId);
     if (project) {
       const cwd = relative(realpathSync(project.path), session.cwd);
       if (cwd) request.cwd = cwd;
@@ -334,6 +316,8 @@ export class Manager {
       const current = await this.state(id).catch(() => unavailable());
       if (candidate.resumedFrom !== sessionId && candidate.resumeNativeSession?.id !== native.id && current.nativeSession?.id !== native.id) return undefined;
       if (current.status === "exited") return undefined;
+      if (candidate.projectId !== session.projectId || (candidate.projectRoot ?? candidate.cwd) !== realpathSync(project.path))
+        throw new ContentError("This native conversation has a continuation in another project or codebase. Open its original session instead.", 409);
       if (current.status !== "running" && current.status !== "starting")
         throw new ContentError("Another continuation has not confirmed exit. Reconnect before resuming.");
       return { ...candidate, ...current };
@@ -345,6 +329,7 @@ export class Manager {
     return remember(await this.createOnce(request));
   }
   private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile }) {
+    if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
     if (request.localUi) {
@@ -379,7 +364,7 @@ export class Manager {
     const configuredProfile = this.config.agents[request.provider];
     if (!configuredProfile) throw new Error("Provider is not configured on this host");
     const profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
-    const context = this.context(request.projectId);
+    const context = new ProjectContexts(this.config, this.key).snapshot(request.projectId);
     const session: Session = {
       id,
       ...(request.team ? { team: request.team } : {}),
@@ -394,6 +379,9 @@ export class Manager {
       cwd: request.teamCwd ?? projectCwd(project.path, request.cwd),
       createdAt: new Date().toISOString(),
       status: "starting",
+      projectRoot: context.root,
+      contextSources: context.sources,
+      contextLinksVersion: context.linksVersion,
       contextVersion: context.version,
       context: context.text,
       initialPrompt: request.prompt,

@@ -6,7 +6,7 @@ import {
   existsSync,
   realpathSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -21,6 +21,8 @@ import { DEFAULT_HOOKS } from "./config.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
+import { teamModelProfileSchema, type TeamAssignment, type TeamModelProfile } from "./team-types.js";
+import { teamModelLaunch } from "./launch.js";
 import type {
   Config,
   Provider,
@@ -213,6 +215,31 @@ export class Manager {
     this.serial = operation.catch(() => {});
     return operation;
   }
+  /** The team scheduler owns cwd selection. Public create requests never accept this override. */
+  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile): Promise<Session & WorkerState> {
+    if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
+      throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
+    const selection = modelProfile ? teamModelProfileSchema.parse(modelProfile) : undefined;
+    if (selection && selection.provider !== request.provider) throw new ContentError("The team model profile does not match its assigned provider", 400);
+    const root = realpathSync(this.config.teams.workspaceDir);
+    const canonical = realpathSync(cwd);
+    const rel = relative(root, canonical);
+    if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
+    const operation = this.serial.then(() => this.createOnce({ ...request, team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}) }));
+    this.serial = operation.catch(() => {});
+    return operation;
+  }
+  /** A scheduler may stop only its own member and never take over an active human lease. */
+  async stopTeamSession(sessionId: string, requestId: string, team: TeamAssignment): Promise<WorkerState> {
+    const stored = this.meta(sessionId).session.team;
+    if (!stored || stored.runId !== team.runId || stored.memberId !== team.memberId || stored.revision !== team.revision)
+      throw new ContentError("This session does not belong to the team assignment", 403);
+    const state = await this.state(sessionId);
+    if (state.status === "exited") return state;
+    if (state.status !== "running") throw new ContentError("The team member has not confirmed a controllable runtime");
+    await workerCall(this.config.runDir, sessionId, { op: "stop", requestId });
+    return this.state(sessionId);
+  }
   resume(sessionId: string, requestId: string): Promise<Session & WorkerState> {
     const operation = this.serial.then(() => this.resumeOnce(sessionId, requestId));
     this.serial = operation.catch(() => {});
@@ -231,6 +258,7 @@ export class Manager {
       return result;
     };
     const session = this.meta(sessionId).session;
+    if (session.team) throw new ContentError("Resume this member from its team so its assignment stays consistent");
     const state = await this.state(sessionId);
     if (state.status === "running" || state.status === "starting") return remember({ ...session, ...state });
     const native = state.nativeSession ?? session.resumeNativeSession;
@@ -265,7 +293,7 @@ export class Manager {
     // Use the same admission queue as create, without re-entering it.
     return remember(await this.createOnce(request));
   }
-  private async createOnce(request: CreateSession) {
+  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile }) {
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
     if (request.localUi) {
@@ -296,11 +324,14 @@ export class Manager {
       ).length >= this.config.maxSessions
     )
       throw new Error("The configured session limit has been reached");
-    const profile = this.config.agents[request.provider];
-    if (!profile) throw new Error("Provider is not configured on this host");
+    const configuredProfile = this.config.agents[request.provider];
+    if (!configuredProfile) throw new Error("Provider is not configured on this host");
+    const profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
     const context = this.context(request.projectId);
     const session: Session = {
       id,
+      ...(request.team ? { team: request.team } : {}),
+      ...(request.teamModelProfile ? { teamModelProfile: request.teamModelProfile } : {}),
       backend: "infinite",
       machineId: this.config.machine?.id,
       executionLocation: request.workspace ? "laptop" : "cloud",
@@ -308,7 +339,7 @@ export class Manager {
       provider: request.provider,
       title: request.title,
       projectId: request.projectId,
-      cwd: realpathSync(project.path),
+      cwd: request.teamCwd ?? realpathSync(project.path),
       createdAt: new Date().toISOString(),
       status: "starting",
       contextVersion: context.version,

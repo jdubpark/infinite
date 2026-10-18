@@ -65,6 +65,8 @@ test("CLI reports each startup wait before the host responds and leaves native o
     await wait(() => requests.has("/api/me"));
     assert.match(stderr, /Connecting to 127\.0\.0\.1/, "connecting is visible before authentication completes");
     reply("/api/me", { role: "owner", terminal: { stream: true, raw: true }, projects: [{ id: "project", name: "Project" }] });
+    await wait(() => requests.has("/api/projects/project"));
+    reply("/api/projects/project", { sync: {} });
     await wait(() => requests.has("/api/sessions"));
     assert.match(stderr, /Starting Grok/, "launch progress precedes session creation");
     reply("/api/sessions", { id: sessionId, provider: "grok", status: "running", title: "Grok", projectId: "project" });

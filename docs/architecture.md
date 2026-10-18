@@ -6,6 +6,20 @@ The native UI and checkpoint requirements are refined in [native interaction and
 
 ## Execution model
 
+[Goals and agent teams](teams.md) add durable scheduling above the same detached
+workers. A Goal retains the approved outcome, scope, deadline, attempt limits,
+and model lineup, then starts sequential Team cycles from reviewed commits. A
+Team validates role reports, optionally runs one discovery batch, schedules
+independent tasks in separate Git copies, serializes integration, and runs
+configured checks. Escalation uses a bounded, recorded replacement assignment.
+
+Goal control and Team execution have separate revisions and replayable request
+identities. Public control of a goal-owned Team goes through its Goal; current
+member questions stay on the Team. Agent reports and passing checks never mark
+a product goal achieved. That state requires an explicit user assessment.
+Existing provider permissions and session input leases remain authoritative;
+headless OpenCode workers can reject a permission request without a dialog.
+
 Every provider runs on the selected machine by default; `Session.executionLocation` records `cloud` or `laptop`. Codex accepts `--laptop`, which keeps the invoking laptop project as the executor while its conversation backend stays in the cloud, with background preparation and automatic handoff as described in [laptop execution mode](hybrid-execution.md). The configured cloud project directory is kept current by the one-way [workspace sync](workspace-sync.md) service. Reconnecting keeps the same conversation and placement.
 
 ```mermaid
@@ -94,7 +108,7 @@ The `Notifier` in the API process polls session attention and sends a push messa
 
 ## Provider boundary
 
-All four providers initially use their native interactive CLI in a PTY. This gives a common terminal transport and retains normal native behavior without inventing a cross-provider session format. Local `--help` confirmed launch/resume flags; all four providers have now completed authenticated turns and tool edits on the owner-controlled host; see the [commissioning record](../deploy/ubuntu/commissioning.md).
+Ordinary sessions use each provider's native interactive CLI in a PTY. This preserves the native interface and conversation history. Model-routed OpenCode team members use headless `run` mode, with the permission limits described in [agent teams](teams.md#model-routing). Local `--help` confirmed launch/resume flags; all four providers have now completed authenticated turns and tool edits on the owner-controlled host; see the [commissioning record](../deploy/ubuntu/commissioning.md).
 
 Future structured adapters can normalize user/assistant messages, approvals, tool calls, and model usage while preserving native IDs. Codex exposes thread/turn lifecycle methods; Grok and OpenCode expose ACP/server interfaces. Each provider must be tested independently; an adapter mock is insufficient. [Codex app server](https://learn.chatgpt.com/docs/app-server), [Grok scripting and ACP](https://docs.x.ai/build/cli/headless-scripting), [OpenCode server](https://opencode.ai/docs/server/).
 

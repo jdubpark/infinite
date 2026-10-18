@@ -1,0 +1,457 @@
+# Goals and agent teams
+
+Open **Goals** in the web client to give the agents a product outcome, evidence,
+and limits. The coordinator investigates the project, selects a useful change,
+and sends bounded tasks to parallel workers. A successful cycle produces an
+isolated branch with check results and an independent agent review. The next cycle starts
+from that reviewed commit.
+
+Use **Teams** for one feature request or pasted PRD. A team plans and implements
+that request without selecting a sequence of follow-up improvements. Both flows
+show member sessions, questions, steering, file ownership, and verification
+records. The web interface supports desktop and narrow phone browsers. The
+native phone app can open member sessions; it has no Goals or Teams dashboard.
+
+A Team marked **ready for your review** has explicit reports for its current revision,
+passing configured checks, and an approving reviewer report. It does not
+establish product impact or human acceptance. The host does not push, open pull
+requests, merge into the original checkout, or deploy.
+
+## Start and steer a goal
+
+An owner selects a configured workspace and supplies the desired outcome,
+success criteria, non-goals, allowed paths, and evidence. Evidence can be a link,
+a repository reference, or an observation. Starting the goal authorizes the
+coordinator to select and build work within those boundaries.
+
+| Setting | Default | Accepted range or meaning |
+| --- | --- | --- |
+| `allowedPaths` | `["."]` | Repository-relative files or folders; `.` permits the entire project. No globs or parent traversal. |
+| `maxRuns` | 3 | 1–10 sequential feature cycles |
+| `maxMinutes` | 60 | 5–1,440 minutes from creation |
+| `maxMembers` | 24 | 4–200 member attempts across the goal, including scouts, questions resumed as new attempts, review, repair, and escalation |
+| `parallelism` | 3 | 1–4 concurrent workers within a cycle, subject to host session capacity |
+
+Pausing does not extend the deadline or restore consumed attempts. Steering can
+change the direction, but cannot expand the approved paths, deadline, or limits.
+Start a new goal to approve a larger scope or more work. Each cycle also has a
+maximum of 60 member attempts, bounded by the goal's remaining allowance. These
+are execution limits; they do not enforce a token or currency budget. A stop
+request is not proof that arbitrary detached tool descendants have stopped.
+
+The goal page shows the active team, its questions and opportunity brief,
+previous cycles, recorded agent profiles, evidence, and remaining limits.
+Owners can pause, resume, or cancel. Owners and controllers can steer a running
+goal and answer a current member question on its linked team page. Viewers can
+read the same records. Direct steering and lifecycle actions on a goal-owned
+team are refused; use its goal so the scheduler retains control of the sequence.
+Questions remain answerable while that team is the active cycle of a running
+goal. A paused goal must resume before work or answers can continue.
+
+A reviewed cycle supplies the next cycle's source commit. The host checks that
+the earlier workspace still matches that recorded head before cloning it.
+Unreviewed or failed changes do not become the next cycle's base, and the
+original project checkout remains unchanged. A conflict, missing report, or
+unresolved operation blocks progression with its evidence and workspace intact.
+
+The coordinator can report that no further change is justified by the evidence.
+The goal then stops as `no-opportunity`, or `ready-for-review` if an earlier cycle
+produced reviewed changes. Exhausted attempts or time produce `limit-reached`;
+reaching the cycle limit leaves reviewed work ready for inspection. None of
+these states means the desired product outcome was achieved.
+
+After a goal has stopped and has no active cycle or pending operation, an owner
+or controller can record `achieved`, `not-achieved`, or `inconclusive`, with an
+assessment and supporting evidence. A paused goal remains resumable and cannot
+accept an outcome assessment; finish or cancel it first. Only an explicit user
+assessment can mark the goal `achieved`. Passing checks, agent approval, or an
+idle terminal cannot do so.
+
+## Linear tracking
+
+A project can map its Goals, feature cycles, and standalone Teams to Linear
+through private host configuration. On a mapped project, **New goal** offers an
+optional existing issue identifier or UUID. Leave it empty to create a goal issue. Each feature
+cycle gets a child issue under that goal. A standalone Team creates its own
+issue. Projects without a mapping keep the local Goal and Team workflow.
+
+The linked issue is the task record for scope and human workflow state. The host
+re-reads both the parent and child before starting another member and checks
+tracking in the background every 30 seconds. If Linear is unavailable, the issue
+has been closed or archived, or its title or description has changed from the
+approved snapshot, the host blocks further work. Moves between open workflow
+states are accepted. Read the recorded reason and obtain new approval for
+changed scope; a network recovery alone does not authorize different work. A cycle receives the
+recorded source issue as context; that context cannot expand its approved goal
+paths, non-goals, or limits.
+
+Goal and Team pages show the issue link, title, workflow state, tracking status,
+and last check time. A cached issue record is not proof that Linear is currently
+reachable. The issue's workflow state stays separate from local execution state,
+agent review, and product outcome assessments. Infinite does not automatically
+change that state or mark an issue Done when checks pass.
+
+The host keeps issue creation and evidence delivery in a durable outbox.
+Requirements populate new issue descriptions; briefs, steering, questions and
+answers, user outcomes, and terminal check/review summaries are sent as comments.
+The next cycle waits for confirmation of the prior cycle's evidence. After a
+lost write response or restart, the host reconciles saved issue and comment IDs
+before retrying. Raw logs and captured provider output are excluded; selected
+text is not guaranteed to be free of secrets.
+
+Add a host credential and project mapping to private configuration, alongside
+the project's existing path and checks. Replace the example team UUID with the
+intended Linear team's ID:
+
+```json
+{
+  "linear": { "apiKeyFile": "/run/secrets/linear-api-key" },
+  "projects": [{
+    "id": "example",
+    "name": "Example project",
+    "path": "/srv/infinite-data/projects/example",
+    "linear": { "teamId": "00000000-0000-4000-8000-000000000000" },
+    "team": { "checks": [{ "command": "npm", "args": ["run", "check"] }] }
+  }]
+}
+```
+
+The key must be a private `0600` file outside the host's state directory, run
+directory, team workspace root, and every project root. The host uses Linear's
+official HTTPS API. Custom `linear.endpoint` values are restricted to HTTP
+loopback `/graphql` endpoints when the host environment is `local`, for rehearsal. The credential is not passed into agent environments.
+
+The browser receives tracking records and a project capability flag, never the
+Linear API credential. Keep credentials, workspace mappings, and concrete issue
+bindings in private configuration or encrypted runtime state. Do not copy them
+into tracked configuration examples, screenshots, or repository reports.
+
+## Roles and execution
+
+| Role | Responsibility | Output |
+| --- | --- | --- |
+| Coordinator (project manager) | Inspect the request and evidence, choose a scoped opportunity, define owned paths and dependencies, and select allowed worker profiles | Short brief and plan, discovery request, question, or no-change report |
+| Scout | Answer a bounded research question without editing the repository | Findings with sources and observations |
+| Implementer | Build its task in a separate working copy within its owned paths | Result, question, blocker, or explicit escalation request |
+| Integrator | Repair an integrated result after failed checks or review feedback | Repair result within the approved scope |
+| Reviewer | Inspect the integrated change and its evidence without editing it | Approval or changes requested; UI evidence when applicable |
+
+The workflow keeps planning small. The coordinator may request one batch of
+1–3 read-only scouts from the worker pool, then receives their recorded findings
+once. It skips discovery when the request and repository already supply enough
+evidence. Scouts cannot commission more agents. A goal brief records the
+observed problem, evidence, data shape, acceptance criteria, expected effect,
+and whether the interface changes. Prompts call for a concise brief and useful
+tasks, without process documents or artificial subdivisions.
+
+The coordinator prefers `light` profiles for bounded research and implementation
+and selects from the configured pool. Each plan has 1–12 tasks. The host rejects
+unknown profiles, missing dependencies, cycles, duplicate task IDs, and
+overlapping ownership between independent tasks. Dependent tasks wait for their
+prerequisites to be integrated. Independent workers run in parallel; integration
+is serialized.
+
+A worker can request one escalation per task to a different profile in the
+approved escalation pool, with a reason and an account of partial work. The host
+checks the partial edits, stops the earlier member, and gives the replacement
+the same working copy. Escalation consumes another member attempt. The scheduler
+rejects model choices outside the configured pools and a second escalation for
+the same task.
+
+The host runs the project's configured checks. Prompts prefer API, process,
+integration, or end-to-end checks that exercise changed behavior. Before adding
+a test, the agent must identify its observable contract, a credible regression,
+and the gap in existing coverage. Repository instructions still apply. Repair
+attempts are bounded; unresolved failures remain visible.
+
+For a brief that changes the interface, an approving reviewer must include
+`uiEvidence` describing the runnable flow inspected, results, and limitations.
+This is an agent's recorded claim, separate from the host's command results. If
+inspection is unavailable, the reviewer must request changes or report a
+blocker. All roles are prompted to write plain English and report only evidence
+and checks they observed.
+
+## Model routing
+
+Add `lineup` to the private `teams` configuration. The Team form selects the
+configured lineup by default; a user can instead select one configured provider
+for all roles. Goals always use a recorded lineup and require both coordinator
+and reviewer profiles to have `tier: "strong"`.
+
+This starting configuration uses Opus 5.5 at `xhigh` for coordination and repair,
+Astra 6 at `xhigh` for review, and Haiku 5.5 and GPT-6 Luna at `medium` for ordinary
+worker tasks. Strong profiles are available through the explicit escalation
+pool. Model IDs live in host configuration, rather than application routing
+code.
+
+```json
+{
+  "lineup": {
+    "coordinator": {
+      "id": "opus-xhigh", "label": "Opus 5.5 xhigh",
+      "provider": "claude", "model": "claude-opus-5-5", "effort": "xhigh",
+      "tier": "strong"
+    },
+    "implementers": [
+      {
+        "id": "haiku-medium", "label": "Haiku 5.5 medium",
+        "provider": "claude", "model": "claude-haiku-5-5", "effort": "medium",
+        "tier": "light"
+      },
+      {
+        "id": "luna-medium", "label": "GPT-6 Luna medium",
+        "provider": "codex", "model": "gpt-6-luna", "effort": "medium",
+        "tier": "light"
+      }
+    ],
+    "integrator": {
+      "id": "opus-xhigh", "label": "Opus 5.5 xhigh",
+      "provider": "claude", "model": "claude-opus-5-5", "effort": "xhigh",
+      "tier": "strong"
+    },
+    "reviewer": {
+      "id": "astra-xhigh", "label": "Astra 6 xhigh",
+      "provider": "codex", "model": "gpt-6-astra", "effort": "xhigh",
+      "tier": "strong"
+    },
+    "escalations": [
+      {
+        "id": "opus-xhigh", "label": "Opus 5.5 xhigh",
+        "provider": "claude", "model": "claude-opus-5-5", "effort": "xhigh",
+        "tier": "strong"
+      },
+      {
+        "id": "astra-xhigh", "label": "Astra 6 xhigh",
+        "provider": "codex", "model": "gpt-6-astra", "effort": "xhigh",
+        "tier": "strong"
+      }
+    ]
+  }
+}
+```
+
+Optional OpenCode workers can be added to `implementers`. OpenCode uses a
+provider-qualified `model` and optional `variant`; it does not accept an
+`effort` field in these profiles. These examples request the `medium` variant
+for Meta Muse Spark Contributor and `low` for DeepSeek Flash:
+
+```json
+[
+  {
+    "id": "spark-medium", "label": "Muse Spark Contributor medium",
+    "provider": "opencode", "model": "meta/muse-spark-1.3-contributor",
+    "variant": "medium", "tier": "light", "dataUse": "contributor"
+  },
+  {
+    "id": "deepseek-low", "label": "DeepSeek Flash low",
+    "provider": "opencode", "model": "deepseek/deepseek-flash",
+    "variant": "low", "tier": "light", "dataUse": "standard"
+  }
+]
+```
+
+`tier` is an optional routing label (`light` or `strong`), not a measured price
+or capability guarantee. `dataUse` is an optional disclosure (`standard` or
+`contributor`); the web client displays contributor settings. It does not change
+a provider's terms or retention policy. Review those terms before routing
+project context to a contributor profile. A reused profile ID must identify the
+same provider, model, effort or variant, tier, and data-use setting throughout
+the lineup.
+
+Each selected provider executable must be configured and authenticated. Keep
+its sandbox and permission settings in the ordinary provider profile. Move
+model, effort, and variant selections into the lineup, and remove fallback-model
+flags. Conflicting arguments are refused. Infinite does not silently substitute a
+model when a requested selection is unavailable.
+
+Claude launches receive `--model` and `--effort`; Codex receives `--model` and
+`-c model_reasoning_effort=...`; OpenCode launches in headless `run` mode with
+`--model` and optional `--variant`. These are requested settings, not evidence
+of the backend model that served a turn. Provider account access and
+organization restrictions still apply. A provider failure leaves the assignment
+unresolved. The configuration example does not establish model availability on
+a particular account.
+
+A goal snapshots its lineup at creation, and every cycle uses that snapshot.
+Standalone teams also snapshot their lineup. Each member records its provider
+and selected profile before launch. Restart, steering, question retries, and
+later cycles preserve those selections even if host configuration changes.
+Credentials and permissions continue to come from the current provider
+configuration. Legacy single-provider teams retain their provider selection.
+
+Mixed-model sudo profiles use the explicit `-- EXECUTABLE` boundary from the
+Ubuntu template. Before it, supported options are `-n`, `-H`, `-u USER`, and
+`-g GROUP` (or their separate-argument long forms). Other wrapper forms are
+refused so provider flags cannot become prompt text.
+
+The scheduler never approves a provider permission or sends forced terminal
+input. Interactive providers can show permission or trust dialogs in the member
+session. Headless OpenCode `run` rejects unmet permission requests; this adapter
+does not offer an interactive approval flow. A denied reporting tool or required
+tool can stop the member without an accepted report. Inspect the failure and the
+configured provider policy; retries do not grant permission.
+
+## Configuration
+
+Enable teams in the private host configuration and define the project's
+verification commands. Commands use executable/argument arrays, without an
+implicit shell. This example is for a project with a suitable `npm run check`
+script; use that project's actual verification entry point.
+
+```json
+{
+  "teams": {
+    "workspaceDir": "/srv/infinite-data/team-workspaces"
+  },
+  "projects": [{
+    "id": "example",
+    "name": "Example project",
+    "path": "/srv/infinite-data/projects/example",
+    "team": {
+      "setup": { "command": "npm", "args": ["ci", "--no-audit", "--no-fund"] },
+      "checks": [{ "command": "npm", "args": ["run", "check"] }]
+    }
+  }]
+}
+```
+
+The source must be a clean Git repository root with a commit. Teams pin that
+commit and make independent clones without hardlinks or shared object storage.
+Ignored files and uncommitted changes are not copied. Setup must provision the
+dependencies each isolated copy needs. The source checkout remains unchanged.
+The run shows its branch, base, integrated commit and workspace for inspection.
+
+If the API and provider use different Unix identities, provision the workspace
+root with the intended shared group, setgid/default ACL inheritance and private
+permissions. Configure `teams.commandPrefix` so **all** Git, setup and check
+commands execute as the provider's unprivileged identity. For example, a
+root-owned, constrained launcher can run commands under that account. The prefix
+is an executable/argument array like the other commands. Do not run
+agent-controlled repository scripts or Git filters as the privileged API
+account. A sudo provider profile without a command prefix is refused.
+
+The Ubuntu launcher must preserve `INFINITE_HOOK_URL`, `INFINITE_HOOK_TOKEN` and
+`INFINITE_TEAM_ASSIGNMENT`; the supplied sudoers template includes them. These
+are a member's scoped report capability and assignment, not owner API keys.
+Verify executable access, workspace permissions, report delivery and configured
+checks under the actual deployment identities before using a production host.
+
+## Team questions and steering
+
+A member can explicitly ask a question with suggested options. The team records
+the question and stops that assignment; independent tasks can continue. An owner
+or controller answers from the team page. The answer is recorded and a new
+assignment receives the applicable context. This is a product decision, separate
+from the provider's tool permission dialogs.
+
+For a standalone team, steering records a new requirements revision. Earlier
+member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated
+workspace with the new direction. Completed earlier integration remains visible;
+unfinished member copies are preserved. Pause, resume and cancel are owner
+actions. Stopping an agent does not prove that arbitrary detached tool
+descendants have stopped, and a current human input lease can prevent the
+scheduler from stopping a member. Such conflicts remain visible.
+
+## Reports and recovery
+
+Claude Code team members receive a scoped MCP tool, `mcp__infinite_team__report`,
+that accepts a typed report as data. Other providers receive a reporting command
+that accepts JSON on standard input. Reports include `plan`, `explore`,
+`findings`, `no-change`, `escalate`, `result`, `review`, `question`, and `blocked`;
+each role has a permitted subset. The host does not automatically allow the MCP
+tool; its permission follows the configured provider profile. This keeps report JSON
+out of Claude's shell-command parsing while preserving its permission checks.
+The detached worker authenticates the report, validates its run,
+member and revision binding, and writes it to the encrypted journal before
+acknowledging it. A repeated identical report returns the same acceptance;
+conflicting reports are refused. Ordinary session hooks cannot grant team
+authority.
+
+Reports are agent claims. A clean process exit, an idle terminal, a turn-end
+hook, or an English completion message cannot substitute for a report. The host
+independently checks file ownership, Git integration and configured command
+results. Coordinator, scout, and review copies must remain unchanged. Goal task
+ownership and integrator changes must stay within the approved allowed paths.
+Integration conflicts and missing reports stop progression; they never silently
+become success.
+
+Goal and team state, requirements, answers, outcomes, and receipts use the
+existing encrypted store. Detached member sessions survive API loss. After restart, the scheduler
+reconciles durable assignment identities instead of launching replacements for
+uncertain workers. Interrupted Git/check operations require reconciliation; they
+are not blindly replayed. Host reboot recovery is a separate limitation of the
+underlying session runtime.
+
+Source copies, Git objects, dependency caches and provider histories are
+plaintext at runtime and require encrypted storage. Separate clones isolate
+edits; they are not security sandboxes. All roles remain inside the selected
+provider and tenant's existing trust boundary. Team workspace cleanup and
+artifact retention are explicit operator responsibilities.
+
+## API
+
+The web client and automation share these authenticated APIs. The encrypted
+remote transport permits them, with device roles enforced by the host. Every
+mutation returns the current Goal or Team record.
+
+### Goals
+
+| Method and endpoint | Body | Role |
+| --- | --- | --- |
+| `GET /api/goals` | None; returns `{goals}` | Any paired device |
+| `GET /api/goals/:id` | None; returns the goal, cycles, limits, and assessments | Any paired device |
+| `POST /api/goals` | Creation fields below | Owner |
+| `POST /api/goals/:id/steer` | `requestId`, `revision`, `text` | Owner/controller |
+| `POST /api/goals/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner |
+| `POST /api/goals/:id/outcome` | `requestId`, `revision`, `result`, `summary`, `evidence` | Owner/controller |
+
+Creation requires `requestId` (UUID), `projectId`, `title` (up to 100 characters),
+`objective` (12,000), and `successCriteria` (4,000). Optional arrays are
+`nonGoals` (20 entries, 1,000 characters each), `evidence` (20 entries, 2,000
+characters each), and `allowedPaths` (1–32 entries, 300 characters each).
+`maxRuns`, `maxMinutes`, `maxMembers`, and `parallelism` use the limits above.
+The host also limits the combined creation request to 40 KiB. On a mapped
+project, optional `linearIssueId` accepts an existing issue UUID or identifier
+(up to 100 characters); omitting it creates a new parent issue.
+
+Goal steering accepts up to 8,000 characters while running or awaiting input.
+It leaves scope and budgets unchanged. Outcome `result` is `achieved`,
+`not-achieved`, or `inconclusive`; `summary` permits 4,000 characters and
+`evidence` 8,000. An outcome requires a terminal goal with no active cycle or
+pending operation. Resume requires a paused goal whose original deadline has
+not expired.
+
+### Teams
+
+| Method and endpoint | Body | Role |
+| --- | --- | --- |
+| `GET /api/teams` | None; returns `{teams}` | Any paired device |
+| `GET /api/teams/:id` | None; returns reports and check evidence | Any paired device |
+| `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, `parallelism`, optional `useConfiguredLineup` | Owner |
+| `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
+| `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
+| `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
+
+Goal-owned team lifecycle and steering routes return `409` with
+`code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route
+remains available for its active cycle while the goal is running.
+
+`GET /api/me` advertises `teams: {enabled, maxParallelism, lineup?}`,
+`goals: {enabled}`, each project's configured checks, and optional
+`projects[].linear: {enabled}`. Goal and Team records include optional `linear`
+tracking with `status` (`pending`, `synced`, `blocked`, or `error`), `reason`,
+`checkedAt`, and the latest issue snapshot when available. Goals are enabled
+only when the configured coordinator and reviewer both carry `tier: "strong"`.
+With `useConfiguredLineup: true`, a Team creation's `provider` must match the
+lineup's coordinator. Goal creation selects that provider from its lineup.
+Callers cannot supply arbitrary profiles, model names, or executable arguments.
+
+Mutations use a UUID request identity and expected revision. An identical retry
+recovers the recorded result; changed content under the same identity and
+obsolete revisions are refused. After uncertain delivery, retry the original
+request. Browser pending requests survive navigation and connection loss in tab
+memory, but not a reload or closed tab.
+
+The workflow combines deterministic execution steps with agent decisions, as
+described in [Stripe's Minions, Part 2](https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2).
+Infinite's execution and trust boundaries remain those described above.

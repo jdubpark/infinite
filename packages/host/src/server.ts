@@ -9,7 +9,7 @@ import { z } from "zod";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Manager } from "./manager.js";
-import { hashToken } from "./config.js";
+import { hashToken, validateLinearConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
 import { workerCall, type WorkerError } from "./ipc.js";
 import { PushStore, isExpoToken } from "./push.js";
@@ -21,6 +21,11 @@ import { ContentError, recordedMessages, sessionFile } from "./session-content.j
 import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
+import { TeamService, TeamError } from "./teams.js";
+import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
+import { GoalService } from "./goals.js";
+import { LinearService } from "./linear.js";
+import { createGoalSchema, goalActionSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
 import type { Config, Role, Receipt } from "./types.js";
 
 const id = z.uuid();
@@ -85,6 +90,7 @@ export function createApp(config: Config, key: Buffer) {
   config.machine = machineIdentity(config, key);
   if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
     throw new Error("Machine access and cmux require a single-tenant host");
+  validateLinearConfig(config);
   const app = express();
   const manager = new Manager(config, key);
   const projectSync = new ProjectSync(config, key);
@@ -103,10 +109,13 @@ export function createApp(config: Config, key: Buffer) {
       if (left) startsInFlight.set(projectId, left); else startsInFlight.delete(projectId);
     }
   };
+  const linear = new LinearService(config, key);
+  const teams = new TeamService(config, key, manager, startInProject, linear);
+  const goals = new GoalService(config, key, teams, linear);
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
-  const resumable = (session: { status: string; provider: string; workspace?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
-    session.status === "exited" && !session.workspace && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
+  const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
+    session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
   // Native records written before executionLocation existed carry only the hybrid workspace.
   const executionLocation = (session: { executionLocation?: "cloud" | "laptop"; workspace?: unknown }): "cloud" | "laptop" =>
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
@@ -125,7 +134,7 @@ export function createApp(config: Config, key: Buffer) {
    * tools run elsewhere, and an exited session never counts. A session list that cannot be read counts as running.
    */
   const projectRunning = async (projectId: string) => {
-    if (startsInFlight.has(projectId)) return true;
+    if (startsInFlight.has(projectId) || teams.activeForProject(projectId) || goals.activeForProject(projectId)) return true;
     let sessions: Awaited<ReturnType<typeof listSessions>>;
     try { sessions = await listSessions(); } catch { return true; }
     return sessions.some(s => s.projectId === projectId && s.executionLocation !== "laptop" &&
@@ -261,7 +270,9 @@ export function createApp(config: Config, key: Buffer) {
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
-      projects: config.projects.map(({ id, name }) => ({ id, name })),
+      teams: { enabled: Boolean(config.teams), maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      goals: { enabled: goals.enabled() },
+      projects: config.projects.map(({ id, name, team, linear }) => ({ id, name, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
       capabilities: {
         signals: true,
         answer: ["owner", "controller"].includes(res.locals.role),
@@ -269,6 +280,37 @@ export function createApp(config: Config, key: Buffer) {
       },
     }),
   );
+  app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
+  app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
+  app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
+  app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
+    const body = createGoalSchema.parse(req.body);
+    return res.json(await startInProject(body.projectId, () => goals.create(body)));
+  });
+  app.post("/api/goals/:id/steer", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.steer(id.parse(req.params.id), goalSteerSchema.parse(req.body))));
+  app.post("/api/goals/:id/outcome", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.outcome(id.parse(req.params.id), goalOutcomeSchema.parse(req.body))));
+  for (const action of ["pause", "resume", "cancel"] as const)
+    app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
+  app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  app.post("/api/teams", requireRole(["owner"]), async (req, res) => {
+    const body = createTeamSchema.parse(req.body);
+    return res.json(await startInProject(body.projectId, () => teams.create(body)));
+  });
+  const standaloneTeam = (value: unknown) => {
+    const teamId = id.parse(value);
+    if (teams.get(teamId).goal) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal. Team decisions can still be answered here.");
+    return teamId;
+  };
+  app.post("/api/teams/:id/steer", requireRole(["owner", "controller"]), async (req, res) =>
+    res.json(await teams.steer(standaloneTeam(req.params.id), teamMutationSchema.parse(req.body))));
+  app.post("/api/teams/:id/decisions/:decisionId/answer", requireRole(["owner", "controller"]), async (req, res) => {
+    const teamId = id.parse(req.params.id), decisionId = id.parse(req.params.decisionId), body = teamMutationSchema.parse(req.body);
+    res.json(await (teams.get(teamId).goal ? goals.answer(teamId, decisionId, body) : teams.answer(teamId, decisionId, body)));
+  });
+  for (const action of ["pause", "resume", "cancel"] as const) {
+    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) =>
+      res.json(await teams[action](standaloneTeam(req.params.id), teamActionSchema.parse(req.body))));
+  }
   app.post("/api/devices/push", (req, res) => {
     const body = z
       .object({
@@ -675,6 +717,7 @@ export function createApp(config: Config, key: Buffer) {
       _next: express.NextFunction,
     ) => {
       // `error` carries the message every client displays; a failed sync operation also names its category.
+      if (error instanceof TeamError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof ProjectSyncError)
         return res.status(error.status).json({ code: error.code, error: error.message, ...(error.category ? { category: error.category, message: error.message } : {}) });
       if (error instanceof ContentError) return res.status(error.status).json({ error: error.message });
@@ -717,9 +760,15 @@ export function createApp(config: Config, key: Buffer) {
     },
   );
   const server = createServer(app);
+  server.once("listening", () => linear.start());
+  server.once("listening", () => teams.start());
+  server.once("listening", () => goals.start());
+  server.once("close", () => teams.close());
+  server.once("close", () => goals.close());
+  server.once("close", () => linear.close());
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { closeTerminals(); closeNative(); closeRemote(); cmux?.close(); server.closeAllConnections(); };
-  return { app, manager, projectSync, sessions: { list: listSessions }, pushStore, server, closeConnections };
+  const closeConnections = () => { goals.close(); teams.close(); linear.close(); closeTerminals(); closeNative(); closeRemote(); cmux?.close(); server.closeAllConnections(); };
+  return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

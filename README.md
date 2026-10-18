@@ -58,6 +58,19 @@ npm run host -- attach SESSION_ID --config .local/config.json
 
 ## Browser
 
+**Teams** accepts a feature request or PRD and coordinates a project manager,
+parallel implementers, integration, configured checks and an independent agent
+review. Questions and steering stay with the run. Configure isolated working
+copies and project checks before starting; see [agent teams](docs/teams.md).
+
+**Goals** lets the team select and build improvements within approved outcomes,
+file scope, deadlines, and execution limits. Strong coordinators and reviewers
+guide lighter workers. Each cycle starts from the previous reviewed commit;
+product outcomes require a separate assessment with evidence. Projects with
+Linear configured can link an existing goal issue or create one, with a child
+issue for each feature cycle. Issue state and the last tracking check are shown
+separately from execution; Infinite does not mark issues Done automatically.
+
 Search sessions by title, provider, project ID, or session ID. **Active** shows running and starting processes, **Needs you** shows reported attention requests, and **All** includes recordings. The selected session and view stay in the URL, so reload and browser Back return to them.
 
 Type a draft while monitoring or offline, then take control explicitly to send. **Cmd/Ctrl+Enter** sends; Enter adds a line. Switching sessions preserves drafts and recent views in this tab's memory. Reconnecting refreshes the view without sending the draft or reclaiming control. Reloading or closing the tab discards unsent drafts; they are not synchronized to other devices.
@@ -128,7 +141,7 @@ Push setup, in order:
 
 This is a universal terminal wrapper. It records visible terminal output and supplied requests; it does not expose hidden model reasoning or merge the internal state of four different providers. Provider-native history remains on the host. Mobile recording is a compact rendering of terminal events; it is not yet a structured message/tool-call timeline.
 
-Project context is deliberately shared at session creation. Later changes must be sent to running sessions explicitly. Each session should use its own worktree when agents edit the same repository. Infinite currently uses the configured project directory directly; it does not create isolated worktrees or reconcile simultaneous file edits automatically. Configure separate project entries for parallel writers.
+Project context is deliberately shared at session creation. Later changes must be sent to running sessions explicitly. Ordinary sessions use the configured project directory directly, so configure separate project entries for parallel writers. Teams and Goals create independent Git copies, validate file ownership, and serialize integration; they leave the original checkout unchanged.
 
 The system does not upload the laptop's home directory, synchronize arbitrary credentials, replicate local apps, provision MCP dependencies, or automatically pull cloud file changes into a dirty checkout. The cloud workspace is authoritative; use Git or SSH-based file access for source changes. Those boundaries matter for both fidelity and privacy.
 

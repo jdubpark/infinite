@@ -4,12 +4,61 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { buildLaunch } from "../packages/host/src/launch.js";
+import { buildLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
+import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
 const hooks = { url: "http://127.0.0.1:4321/hook", token: "tok" };
 const relay = "/opt/infinite/packages/host/dist/hook-relay.js";
 const enabled = { claude: true, codex: true };
+
+test("team model selection preserves configured provider permissions and refuses competing model controls", () => {
+  const selections: TeamModelProfile[] = [
+    { id: "opus", label: "Opus", provider: "claude" as const, model: "claude-opus-5-5", effort: "xhigh" as const },
+    { id: "astra", label: "Astra", provider: "codex" as const, model: "gpt-6-astra", effort: "high" as const },
+    { id: "scout", label: "OpenCode scout", provider: "opencode", model: "example/scout", variant: "high" },
+  ];
+  const permissions = [
+    ["--permission-mode", "plan", "--allowedTools", "Read,Glob"],
+    ["--sandbox", "workspace-write", "--ask-for-approval", "on-request", "-c", 'sandbox_workspace_write.network_access=false'],
+    ["--agent", "reviewer", "--pure", "--format", "json", "--auto=false"],
+  ];
+  for (const [index, selection] of selections.entries()) {
+    const profile = { command: selection.provider, args: permissions[index] };
+    const original = structuredClone(profile);
+    const launch = teamModelLaunch(profile, selection);
+    const offset = selection.provider === "opencode" ? 1 : 0;
+    assert.equal(launch.command, original.command);
+    assert.deepEqual(launch.args.slice(offset, offset + original.args.length), original.args, "Model selection must preserve the operator's permission and sandbox settings verbatim");
+    assert.ok(!launch.args.slice(offset + original.args.length).some(arg => /permission|approval|sandbox|dangerously|--auto|yolo/i.test(arg)), "Model routing cannot append an override that weakens the configured permissions");
+    assert.deepEqual(profile, original, "Routing one member must not mutate the shared provider profile");
+    const sudoPrefix = ["-n", "-H", "-u", "infinite-agent", "--", `/usr/local/libexec/infinite/${selection.provider}`];
+    const wrapped = { command: "/usr/bin/sudo", args: [...sudoPrefix, ...profile.args] };
+    assert.deepEqual(teamModelLaunch(wrapped, selection), {
+      command: wrapped.command, args: [...sudoPrefix, ...launch.args],
+    }, "The supported sudo wrapper must preserve its executable boundary and append model controls to the provider");
+    for (const args of [["--"], ["--", "--model"], [...sudoPrefix, "--"],
+      ["-n", selection.provider], ["-n", selection.provider, "--", "/repo/prompt"],
+      ["-n", "-u", "--", selection.provider]])
+      assert.throws(() => teamModelLaunch({ command: "/usr/bin/sudo", args }, selection));
+    const competing = selection.provider === "claude" ? [
+      ["--model", "opus"], ["--effort=medium"], ["--fallback-model", "sonnet"], ["--"],
+    ] : selection.provider === "codex" ? [
+      ["--model=gpt-6-sol"], ["-m", "gpt-6-sol"], ["-mgpt-6-sol"],
+      ["-c", 'model_reasoning_effort="low"'], ["--config", 'model="gpt-6-sol"'],
+      ['--config="model_reasoning_effort"="medium"'], ['-cmodel="gpt-6-sol"'],
+    ] : [
+      ["--model", "example/other"], ["-mexample/other"], ["--variant=low"],
+      ["run"], ["attach", "http://127.0.0.1:4321"], ["--command", "custom"],
+      ["--dir", "/repo/other"], ["--session", "ses_previous"], ["-c"], ["--prompt", "Another task"], ["--"],
+    ];
+    for (const args of competing) {
+      const error = selection.provider === "opencode" ? /model|variant|OpenCode/ : /model.*effort.*fallback/i;
+      assert.throws(() => teamModelLaunch({ ...profile, args: [...profile.args, ...args] }, selection), error, `${selection.provider}: ${args.join(" ")}`);
+      assert.throws(() => teamModelLaunch({ ...wrapped, args: [...wrapped.args, ...args] }, selection), error, `sudo ${selection.provider}: ${args.join(" ")}`);
+    }
+  }
+});
 
 test("claude gets --settings with http hooks before the prompt", () => {
   const launch = buildLaunch("claude", { command: "claude", args: ["--model", "opus"] }, "do it", hooks, relay, enabled);
@@ -27,6 +76,35 @@ test("claude gets --settings with http hooks before the prompt", () => {
   assert.deepEqual(handler.allowedEnvVars, ["INFINITE_HOOK_TOKEN"]);
   assert.equal(handler.timeout, 5);
   assert.equal(launch.args.at(-1), "do it");
+  assert.ok(!launch.args.includes("--mcp-config"), "Ordinary Claude sessions do not acquire a team tool");
+});
+
+test("Claude team launch exposes only its scoped report helper and preserves provider permission decisions", () => {
+  const profile = { command: "claude", args: ["--model", "opus"] };
+  for (const relayPath of [relay, "/repo/packages/host/src/hook-relay.ts"]) {
+    const launch = buildLaunch("claude", profile, "Implement this task", hooks, relayPath, enabled, true);
+    const index = launch.args.indexOf("--mcp-config");
+    assert.ok(index >= 0);
+    const config = JSON.parse(launch.args[index + 1]);
+    assert.deepEqual(Object.keys(config.mcpServers), ["infinite_team"]);
+    const helper = config.mcpServers.infinite_team;
+    assert.equal(helper.type, "stdio");
+    assert.equal(helper.command, process.execPath);
+    assert.equal(helper.args.at(-1), relayPath.replace("hook-relay", "team-mcp"));
+    if (relayPath.endsWith(".ts")) {
+      assert.equal(helper.args[0], "--import");
+      assert.match(helper.args[1], /^file:\/\/\/.+\/tsx\//);
+    }
+    assert.deepEqual(helper.env, {
+      INFINITE_HOOK_URL: "${INFINITE_HOOK_URL}",
+      INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}",
+      INFINITE_TEAM_ASSIGNMENT: "${INFINITE_TEAM_ASSIGNMENT}",
+    });
+    assert.ok(!launch.args.some(arg => /allowedtools|permission-mode|skip-permissions|dangerously|autoallow/i.test(arg)), "Attaching the report tool must not grant provider permissions");
+    assert.equal(launch.args.at(-1), "Implement this task");
+    assert.deepEqual(profile.args, ["--model", "opus"]);
+  }
+  assert.throws(() => buildLaunch("claude", profile, "task", null, relay, enabled, true), /report|hook/i);
 });
 
 test("codex gets -c hook overrides, notify, osc notifications and trust bypass", () => {

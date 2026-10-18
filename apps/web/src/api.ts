@@ -32,6 +32,17 @@ export type LogEvent = {
   type: "signal" | (string & {});
   data: Record<string, unknown>;
 };
+type TeamProfileDetails = { id: string; label: string; model: string; tier?: "light" | "strong"; dataUse?: "standard" | "contributor" };
+export type TeamModelProfile = TeamProfileDetails & ({ provider: "claude" | "codex"; effort: string } | { provider: "opencode"; variant?: string });
+export type TeamLineup = { coordinator: TeamModelProfile; implementers: TeamModelProfile[]; integrator: TeamModelProfile; reviewer: TeamModelProfile; escalations?: TeamModelProfile[] };
+export type TeamEvidence = { source: string; observation: string };
+export type TeamBrief = { title: string; problem: string; evidence: TeamEvidence[]; dataShape: string; acceptance: string[]; expectedOutcome: string; uiChanges: boolean };
+export type LinearTrackingView = {
+  status: "pending" | "synced" | "blocked" | "error";
+  reason?: string;
+  checkedAt?: string;
+  issue?: { id: string; identifier: string; url: string; title: string; description: string | null; state: { name: string; type: string }; updatedAt: string };
+};
 export type Me = {
   role: "owner" | "controller" | "viewer";
   environment: "cloud" | "local";
@@ -40,7 +51,9 @@ export type Me = {
   backendProviders?: { infinite: string[]; cmux?: string[] };
   capabilities?: { signals: boolean; answer: boolean; push: boolean };
   providers: string[];
-  projects: { id: string; name: string }[];
+  projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
+  teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
+  goals?: { enabled: boolean };
   terminal?: { stream: boolean; duplex: boolean; raw: boolean; snapshot?: boolean; control?: boolean };
 };
 // One identity per running browser tab, independent of its shared login cookie.

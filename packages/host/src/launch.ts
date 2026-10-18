@@ -1,4 +1,63 @@
 import type { AgentProfile, Provider } from "./types.js";
+import { dirname, join } from "node:path";
+import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
+
+/** Only model controls are added here; the configured provider permissions remain unchanged. */
+export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile): AgentProfile {
+  const selection = teamModelProfileSchema.parse(input);
+  let providerArgs = profile.args;
+  if (/(^|\/)sudo$/.test(profile.command)) {
+    const sudoBoundary = profile.args.indexOf("--");
+    const invalidWrapper = () => new Error("Mixed-model sudo profiles require an explicit -- executable boundary, with only -n, -H, -u USER, or -g GROUP before it.");
+    if (sudoBoundary < 0) throw invalidWrapper();
+    // Recognize the supported wrapper instead of mistaking a provider's -- for sudo's.
+    for (let index = 0; index < sudoBoundary; index++) {
+      const arg = profile.args[index];
+      if (["-n", "-H", "--non-interactive", "--set-home"].includes(arg)) continue;
+      if (["-u", "-g", "--user", "--group"].includes(arg)) {
+        const value = profile.args[++index];
+        if (index < sudoBoundary && value && !value.startsWith("-")) continue;
+      }
+      throw invalidWrapper();
+    }
+    const executable = profile.args[sudoBoundary + 1];
+    if (!executable || executable.startsWith("-")) throw new Error("The sudo provider profile must name an executable after --.");
+    providerArgs = profile.args.slice(sudoBoundary + 2);
+  }
+  const conflict = providerArgs.some((arg, index, args) => {
+    if (arg === "--" || /^--(?:model|effort|fallback-model)(?:=|$)/.test(arg)) return true;
+    if (selection.provider === "opencode") return /^--variant(?:=|$)/.test(arg) || /^-m/.test(arg);
+    if (selection.provider !== "codex") return false;
+    if (/^-m/.test(arg)) return true;
+    const override = arg === "-c" || arg === "--config" ? args[index + 1]
+      : arg.startsWith("--config=") ? arg.slice(9) : arg.startsWith("-c") ? arg.slice(2) : undefined;
+    return override !== undefined && /^\s*["']?(?:model|model_reasoning_effort)["']?\s*=/.test(override);
+  });
+  if (conflict) throw new Error("Move model and effort settings from the provider profile into the team lineup. Remove fallback-model arguments before starting a mixed-model team.");
+  if (selection.provider === "opencode") {
+    // Run mode owns the conversation, working directory, and prompt. Preserve
+    // provider policy flags, but refuse alternate commands and session routing.
+    const switches = new Set(["--pure", "--print-logs", "--thinking", "--auto", "--no-auto"]);
+    const values = new Set(["--agent", "--format", "--title", "--log-level"]);
+    for (let index = 0; index < providerArgs.length; index++) {
+      const arg = providerArgs[index], separator = arg.indexOf("=");
+      const flag = separator < 0 ? arg : arg.slice(0, separator);
+      if (switches.has(flag) && (separator < 0 || ["true", "false"].includes(arg.slice(separator + 1)))) continue;
+      if (values.has(flag)) {
+        const value = separator < 0 ? providerArgs[++index] : arg.slice(separator + 1);
+        if (value && !value.startsWith("-")) continue;
+      }
+      throw new Error("OpenCode team profiles support only --agent, --pure, --print-logs, --log-level, --format, --title, --thinking, and explicitly configured --auto; remove positional arguments, alternate commands, and session or directory overrides.");
+    }
+    const wrapper = profile.args.slice(0, profile.args.length - providerArgs.length);
+    return { ...profile, args: [...wrapper, "run", ...providerArgs, "--model", selection.model,
+      ...(selection.variant ? ["--variant", selection.variant] : []),
+    ] };
+  }
+  return { ...profile, args: [...profile.args, "--model", selection.model,
+    ...(selection.provider === "claude" ? ["--effort", selection.effort] : ["-c", `model_reasoning_effort=${JSON.stringify(selection.effort)}`]),
+  ] };
+}
 
 const CLAUDE_EVENTS = [
   "UserPromptSubmit",
@@ -30,8 +89,24 @@ export function buildLaunch(
   hooks: { url: string; token: string } | null,
   relayPath: string,
   enabled: { claude: boolean; codex: boolean },
+  team = false,
+  teamModelProfile?: TeamModelProfile,
 ): AgentProfile {
   const args = [...profile.args];
+  if (team && provider === "claude") {
+    if (!hooks) throw new Error("Claude team reporting requires its authenticated report channel");
+    const development = relayPath.endsWith(".ts");
+    args.push("--mcp-config", JSON.stringify({ mcpServers: { infinite_team: {
+      type: "stdio",
+      command: process.execPath,
+      args: [...(development ? ["--import", import.meta.resolve("tsx")] : []), join(dirname(relayPath), development ? "team-mcp.ts" : "team-mcp.js")],
+      env: {
+        INFINITE_HOOK_URL: "${INFINITE_HOOK_URL}",
+        INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}",
+        INFINITE_TEAM_ASSIGNMENT: "${INFINITE_TEAM_ASSIGNMENT}",
+      },
+    } } }));
+  }
   if (hooks && provider === "claude" && enabled.claude) {
     const handler = {
       type: "http",
@@ -72,6 +147,8 @@ export function buildLaunch(
     args.push("-c", `tui.notification_condition="always"`);
   }
   if (prompt)
-    args.push(...(provider === "opencode" ? ["--prompt", prompt] : [prompt]));
+    args.push(...(provider === "opencode"
+      ? [team && teamModelProfile?.provider === "opencode" ? "--" : "--prompt", prompt]
+      : [prompt]));
   return { command: profile.command, args };
 }

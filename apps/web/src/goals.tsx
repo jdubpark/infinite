@@ -1,0 +1,155 @@
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { ArrowUpRight, ChevronRight, Plus, RefreshCw, Send, Target } from "lucide-react";
+import { ApiError, ago, useApi, type Me, type TeamBrief, type TeamLineup, type LinearTrackingView } from "./api";
+import { useMachines } from "./machines";
+import { useLiveRefresh } from "./live-refresh";
+import { requestStore } from "./requests";
+import { LinearTracking } from "./linear";
+import { EvidenceSource, Lineup, TeamBriefView, type TeamView } from "./teams";
+
+type GoalStatus = "running" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-opportunity" | "limit-reached" | "cancelled" | "achieved";
+type GoalResult = "achieved" | "not-achieved" | "inconclusive";
+type GoalCycle = { teamId: string; cycle: number; goalRevision: number; status: string; startedAt: string; finishedAt?: string; baseCommit?: string; headCommit?: string; branch?: string; workspace?: string; brief?: TeamBrief; reason?: string; memberCount: number };
+type GoalInput = { projectId: string; linearIssueId?: string; title: string; objective: string; successCriteria: string; nonGoals: string[]; allowedPaths: string[]; evidence: string[]; maxRuns: number; maxMinutes: number; maxMembers: number; parallelism: number };
+export type ProductGoal = GoalInput & {
+  id: string; revision: number; status: GoalStatus; reason?: string; createdAt: string; updatedAt: string;
+  deadlineAt: string; lineup: TeamLineup; linear?: LinearTrackingView; activeTeamId?: string; cycles: GoalCycle[]; memberCount: number;
+  steering: { text: string; revision: number; at: string }[]; events: { at: string; text: string }[];
+  outcomes: { result: GoalResult; summary: string; evidence: string; at: string; revision: number }[];
+};
+type CreateRequest = GoalInput & { requestId: string };
+type GoalRequest = { requestId: string; revision: number; action: "pause" | "resume" | "cancel" | "steer" | "outcome"; text?: string; result?: GoalResult; summary?: string; evidence?: string };
+const creations = requestStore<CreateRequest, { id: string }>();
+const mutations = requestStore<GoalRequest, { id: string }>();
+const inFlight = new Set<string>();
+export function clearGoalRequests(machine: string) { creations.clearMachine(machine); mutations.clearMachine(machine); }
+const rejected = (error: unknown) => error instanceof ApiError && error.status >= 400 && error.status < 500;
+const labels: Record<GoalStatus, string> = { running: "Working", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-opportunity": "No opportunity found", "limit-reached": "Limit reached", cancelled: "Cancelled", achieved: "Outcome recorded: achieved" };
+const outcomeLabels: Record<GoalResult, string> = { achieved: "Achieved", "not-achieved": "Not achieved", inconclusive: "Inconclusive" };
+const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const entries = (value: string) => value.split("\n").map(line => line.trim()).filter(Boolean);
+const hasContributor = (lineup?: TeamLineup) => lineup && [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? [])].some(profile => profile.dataUse === "contributor");
+function GoalState({ status }: { status: GoalStatus }) {
+  const tone = status === "running" ? "working" : ["needs-input", "blocked", "limit-reached"].includes(status) ? "waiting" : status === "achieved" ? "recorded" : "";
+  return <span className={"goal-status " + tone}><span className="dot" />{labels[status]}</span>;
+}
+function GoalSetup({ me }: { me: Me }) {
+  if (!me.goals?.enabled || !me.teams?.lineup) return <div className="team-notice" role="status"><strong>Goals need a configured team lineup.</strong><p>Configure strong coordinator and reviewer profiles, an integrator, and workers on the host. Goals also need a workspace with required checks.</p></div>;
+  if (!me.projects.some(project => project.team?.checks.length)) return <div className="team-notice" role="status"><strong>No workspace is configured for goals.</strong><p>Add required team checks to a workspace on the host.</p></div>;
+  return null;
+}
+
+export function GoalPicker({ goals, selected, loading, onSelect }: { goals: ProductGoal[]; selected: string | null; loading: boolean; onSelect: (id: string) => void }) {
+  return <nav className="session-list goal-picker" aria-label="Product goals">{goals.map(goal => <button key={goal.id} className={"session-row " + (selected === goal.id ? "selected" : "")} aria-current={selected === goal.id ? "page" : undefined} onClick={() => onSelect(goal.id)}><div className="row-top"><Target size={15} /><strong>{goal.title}</strong><ChevronRight size={16} /></div><div className="row-meta"><span>{labels[goal.status]}</span></div><div className="row-meta">{goal.cycles.length}/{goal.maxRuns} cycles · {goal.memberCount}/{goal.maxMembers} members</div></button>)}{!goals.length && <p className="rail-empty" role="status">{loading ? "Loading goals…" : "Your product goals will appear here."}</p>}</nav>;
+}
+
+export function GoalList({ goals, me, fresh, loading, failed, seen, refresh, onCreate, onSelect }: { goals: ProductGoal[]; me: Me; fresh: boolean; loading: boolean; failed: boolean; seen: string; refresh: () => void; onCreate: () => void; onSelect: (id: string) => void }) {
+  return <div className="team-page goal-list-page"><div className="team-page-heading"><div><p className="team-eyebrow">Product goals</p><h1>Set the outcome and the limits.</h1><p className="quiet">Agents investigate the project, choose scoped improvements, and build reviewed cycles. You can steer the work and record whether the outcome was achieved.</p></div>{me.role === "owner" && <button className="primary" onClick={onCreate}>New goal <Plus size={18} /></button>}</div><GoalSetup me={me} /><div className="team-section-heading"><h2>Goals <span className="quiet">{goals.length}</span></h2><span className="quiet">{!me.goals ? "Unavailable on this host" : fresh ? "Up to date" : failed ? "Goal updates unavailable" : loading ? "Loading…" : "Checking…"}{seen && " · checked " + ago(seen)}</span></div>{failed && <p className="team-notice" role="status">Showing the last received goal state. <button className="text-button" onClick={refresh}>Try again</button></p>}{goals.map(goal => <button className="team-run-row" key={goal.id} onClick={() => onSelect(goal.id)}><div><strong>{goal.title}</strong><p>{me.projects.find(project => project.id === goal.projectId)?.name ?? goal.projectId} · {goal.cycles.length}/{goal.maxRuns} cycles · deadline {date(goal.deadlineAt)}</p></div><GoalState status={goal.status} /><ArrowUpRight size={18} /></button>)}{!goals.length && !loading && !failed && <div className="team-empty"><Target size={32} strokeWidth={1.4} /><h2>No goals yet.</h2><p>Start with a product outcome, evidence, and a clear boundary for what the team may change.</p>{me.role !== "owner" && <p>An owner can start a goal on this host.</p>}</div>}</div>;
+}
+
+export function GoalCreate({ me, connected, done }: { me: Me; connected: boolean; done: (id: string) => void }) {
+  const api = useApi();
+  const machine = useMachines().active.id;
+  const creation = creations.use(machine), pending = creation.pending;
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const [projectId, setProjectId] = useState(pending?.projectId ?? me.projects.find(project => project.team?.checks.length)?.id ?? me.projects[0]?.id ?? "");
+  const [linearIssueId, setLinearIssueId] = useState(pending?.linearIssueId ?? "");
+  const [title, setTitle] = useState(pending?.title ?? "");
+  const [objective, setObjective] = useState(pending?.objective ?? "");
+  const [successCriteria, setSuccessCriteria] = useState(pending?.successCriteria ?? "");
+  const [nonGoals, setNonGoals] = useState(pending?.nonGoals.join("\n") ?? "");
+  const [allowedPaths, setAllowedPaths] = useState(pending?.allowedPaths.join("\n") ?? ".");
+  const [evidence, setEvidence] = useState(pending?.evidence.join("\n") ?? "");
+  const [limits, setLimits] = useState({ maxRuns: pending?.maxRuns ?? 3, maxMinutes: pending?.maxMinutes ?? 60, maxMembers: pending?.maxMembers ?? 24, parallelism: pending?.parallelism ?? 3 });
+  const [busy, setBusy] = useState(false), [error, setError] = useState("");
+  const project = me.projects.find(value => value.id === projectId);
+  const configured = Boolean(me.goals?.enabled && me.teams?.lineup && project?.team?.checks.length);
+  const allowed = connected && me.role === "owner" && (Boolean(pending) || configured);
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (busy || !allowed || (!pending && (!objective.trim() || !successCriteria.trim() || !allowedPaths.trim()))) return;
+    setError("");
+    const nonGoalEntries = entries(nonGoals), pathEntries = entries(allowedPaths), evidenceEntries = entries(evidence);
+    if (!pending && (nonGoalEntries.length > 20 || evidenceEntries.length > 20 || pathEntries.length > 32 || nonGoalEntries.some(value => value.length > 1000) || pathEntries.some(value => value.length > 300) || evidenceEntries.some(value => value.length > 2000))) { setError("Use up to 20 non-goals (1,000 characters each), 20 evidence entries (2,000 each), and 32 paths (300 each)."); return; }
+    const request = pending ?? creations.begin(machine, { requestId: crypto.randomUUID(), projectId, title: title.trim() || objective.trim().split("\n")[0].slice(0, 100), ...(project?.linear?.enabled && linearIssueId.trim() ? { linearIssueId: linearIssueId.trim() } : {}), objective: objective.trim(), successCriteria: successCriteria.trim(), nonGoals: nonGoalEntries, allowedPaths: pathEntries, evidence: evidenceEntries, ...limits });
+    if (inFlight.has(request.requestId)) return;
+    inFlight.add(request.requestId); setBusy(true);
+    try { const goal = await api<ProductGoal>("/goals", request); if (creations.complete(machine, request.requestId, { id: goal.id }) && mounted.current) done(goal.id); }
+    catch (failure) { creations.fail(machine, request.requestId, (failure as Error).message, rejected(failure)); }
+    finally { inFlight.delete(request.requestId); if (mounted.current) setBusy(false); }
+  }
+  return <div className="team-page team-create goal-create"><p className="team-eyebrow">New product goal</p><h1>What should improve?</h1><p className="quiet">Give the team an outcome and the evidence it should use. Starting a goal authorizes work within the scope and limits below.</p><GoalSetup me={me} />{me.role !== "owner" && <p className="team-notice">An owner key is required to start a goal.</p>}{creation.result && <p role="status">Goal started. <button className="text-button" onClick={() => done(creation.result!.id)}>Open goal</button></p>}<form onSubmit={submit}><fieldset disabled={busy || Boolean(pending) || me.role !== "owner"}>
+    <label htmlFor="goal-objective">Desired outcome</label><textarea id="goal-objective" rows={5} maxLength={12000} required value={objective} onChange={event => setObjective(event.target.value)} placeholder="Describe what should improve for the people using this product…" />
+    <label htmlFor="goal-success">Success criteria</label><textarea id="goal-success" rows={3} maxLength={4000} required value={successCriteria} onChange={event => setSuccessCriteria(event.target.value)} placeholder="What evidence would show that the goal was achieved?" />
+    <label htmlFor="goal-title">Goal name <span className="quiet">(optional)</span></label><input id="goal-title" maxLength={100} value={title} onChange={event => setTitle(event.target.value)} placeholder="Uses the first line of the outcome" />
+    <label htmlFor="goal-project">Workspace</label><select id="goal-project" value={projectId} onChange={event => { setProjectId(event.target.value); setLinearIssueId(""); }}>{me.projects.map(value => <option value={value.id} key={value.id}>{value.name}{value.team?.checks.length ? "" : " · setup required"}</option>)}</select>
+    {project?.linear?.enabled && <><label htmlFor="goal-linear-issue">Existing Linear issue <span className="quiet">(optional)</span></label><input id="goal-linear-issue" maxLength={100} value={linearIssueId} onChange={event => setLinearIssueId(event.target.value)} aria-describedby="goal-linear-help" placeholder="Issue identifier or UUID" /><p id="goal-linear-help" className="form-note">Leave empty to create a goal issue. Each feature cycle gets a child issue. Linear workflow states remain under your control.</p></>}
+    <label htmlFor="goal-paths">Allowed files and folders</label><textarea id="goal-paths" rows={3} required value={allowedPaths} onChange={event => setAllowedPaths(event.target.value)} aria-describedby="goal-paths-help" /><p id="goal-paths-help" className="form-note">One repository-relative path per line. A single dot (.) allows changes across the entire project.</p>
+    <label htmlFor="goal-non-goals">Non-goals <span className="quiet">(optional)</span></label><textarea id="goal-non-goals" rows={3} value={nonGoals} onChange={event => setNonGoals(event.target.value)} placeholder="What should the team leave out? One item per line." />
+    <label htmlFor="goal-evidence">Evidence and context <span className="quiet">(optional)</span></label><textarea id="goal-evidence" rows={4} value={evidence} onChange={event => setEvidence(event.target.value)} placeholder="One link, repository reference, or observation per line." />
+    <h2 className="goal-form-heading">Work limits</h2><div className="goal-limits-grid">{([
+      { key: "maxRuns", label: "Maximum cycles", min: 1, max: 10 },
+      { key: "maxMinutes", label: "Time limit (minutes)", min: 5, max: 1440 },
+      { key: "maxMembers", label: "Maximum agent members", min: 4, max: 200 },
+      { key: "parallelism", label: "Parallel workers", min: 1, max: 4 },
+    ] as const).map(field => <div key={field.key}><label htmlFor={"goal-" + field.key}>{field.label}</label><input id={"goal-" + field.key} type="number" min={field.min} max={field.max} step={1} required value={limits[field.key]} onChange={event => setLimits(previous => ({ ...previous, [field.key]: Number(event.target.value) }))} /></div>)}</div><p className="form-note">Limits cover the whole goal. The deadline begins when the host accepts it; pausing does not extend it.</p>
+    </fieldset>{hasContributor(me.teams?.lineup) && <p className="team-notice">This lineup includes contributor data use. Review the configured profiles and their provider’s contributor terms below.</p>}{me.teams?.lineup && <details className="goal-lineup-preview"><summary>Configured agents and data use</summary><p className="quiet">The host records these requested settings when the goal starts. Provider policy may override model settings.</p><Lineup lineup={me.teams.lineup} /></details>}{me.goals?.enabled && !project?.team?.checks.length && <p className="team-notice">Select a workspace with required team checks.</p>}<p className="form-note">The team works in isolated copies and carries reviewed changes into later cycles. It does not publish or deploy. Provider permissions remain in force, and refused tools may stop a member.</p>{(error || creation.message) && <p className="error" role="alert">{error || creation.message}{pending && " Delivery is unconfirmed. Retry keeps the same goal request."}</p>}<button className="primary" disabled={busy || !allowed || (!pending && (!objective.trim() || !successCriteria.trim() || !allowedPaths.trim()))}>{busy ? "Starting goal…" : pending ? "Retry same request" : "Start goal"}<ArrowUpRight size={18} /></button></form></div>;
+}
+
+export function GoalDetail({ id, me, connected, teams, teamsFresh, refreshGoals, openTeam }: { id: string; me: Me; connected: boolean; teams: TeamView[]; teamsFresh: boolean; refreshGoals: () => void; openTeam: (id: string) => void }) {
+  const api = useApi(), machine = useMachines().active.id, key = machine + "/" + id;
+  const [goal, setGoal] = useState<ProductGoal | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const request = mutations.use(key), pending = request.pending;
+  const [busy, setBusy] = useState(false), [direction, setDirection] = useState("");
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  function receive(next: ProductGoal) { setGoal(previous => !previous || next.revision > previous.revision || (next.revision === previous.revision && next.updatedAt >= previous.updatedAt) ? next : previous); }
+  const view = useLiveRefresh(async current => { try { const value = await api<ProductGoal>("/goals/" + id); if (current()) { receive(value); setLoadError(""); } } catch (failure) { if (current()) setLoadError((failure as Error).message); throw failure; } }, 1800, key);
+  const fresh = connected && view.fresh;
+  const canControl = fresh && me.role !== "viewer";
+  async function mutate(action: GoalRequest["action"], values: Pick<GoalRequest, "text" | "result" | "summary" | "evidence"> = {}) {
+    if (!goal || !canControl || busy || (["pause", "resume", "cancel"].includes(action) && me.role !== "owner")) return;
+    const body = pending ?? mutations.begin(key, { requestId: crypto.randomUUID(), revision: goal.revision, action, ...values });
+    if (inFlight.has(body.requestId)) return;
+    inFlight.add(body.requestId); setBusy(true);
+    try {
+      const { action: endpoint, ...payload } = body;
+      const result = await api<ProductGoal>("/goals/" + id + "/" + endpoint, payload);
+      const accepted = mutations.complete(key, body.requestId, { id: result.id }, (endpoint === "outcome" ? "Your outcome assessment" : endpoint === "steer" ? "Direction" : endpoint[0].toUpperCase() + endpoint.slice(1)) + " recorded. Revision " + result.revision + ".");
+      if (mounted.current) { receive(result); if (accepted && endpoint === "steer") setDirection(""); view.refresh(); refreshGoals(); }
+    } catch (failure) { const refused = rejected(failure); mutations.fail(key, body.requestId, (failure as Error).message + (refused ? " Refresh the goal before sending another request." : " Delivery is unconfirmed. Retry will use the same request."), refused); if (mounted.current && refused) view.refresh(); }
+    finally { inFlight.delete(body.requestId); if (mounted.current) setBusy(false); }
+  }
+  if (!goal) return <div className="team-page"><h1>Product goal</h1><p role="status">{loadError || "Loading goal…"}</p>{loadError && <button className="text-button" onClick={view.refresh}><RefreshCw size={15} />Try again</button>}</div>;
+  const active = teams.find(team => team.id === goal.activeTeamId);
+  const openDecisions = active?.decisions.filter(decision => decision.revision === active.revision && decision.answer === undefined) ?? [];
+  const inactive = !goal.activeTeamId && ["blocked", "ready-for-review", "no-opportunity", "limit-reached", "cancelled", "achieved"].includes(goal.status);
+  const previousCycles = goal.cycles.filter(cycle => cycle.teamId !== goal.activeTeamId);
+  const canSteer = canControl && ["running", "needs-input"].includes(goal.status);
+  return <div className="team-detail goal-detail">
+    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === goal.projectId)?.name ?? goal.projectId} · Product goal</p><h1>{goal.title}</h1><div className="team-detail-meta"><GoalState status={goal.status} /><span>Revision {goal.revision}</span></div></div><button className="text-button" disabled={view.refreshing} onClick={view.refresh}><RefreshCw size={14} />{view.refreshing ? "Checking…" : "Refresh goal"}</button></header>
+    {!fresh && <div className="connection-notice" role="status">{view.failed ? "Goal updates are unavailable. Showing the last received state; controls are disabled." : "Checking the goal’s current state…"}{view.seen && " Last checked " + date(view.seen) + "."}</div>}
+    <div className="team-detail-body">
+      {goal.reason && <p className="team-notice" role="status">{goal.reason}</p>}
+      <LinearTracking tracking={goal.linear} fresh={fresh} />
+      <section className="team-section"><h2>Desired outcome</h2><p className="team-prose">{goal.objective}</p><h3 className="goal-subheading">Success criteria</h3><p className="team-prose">{goal.successCriteria}</p><p className="goal-honesty">Reviewed code and passing checks are implementation evidence. Only a recorded human assessment establishes the product outcome here.</p></section>
+      <section className="team-section"><h2>Work limits</h2><dl className="goal-budget"><div><dt>Cycles started</dt><dd>{goal.cycles.length} / {goal.maxRuns}</dd></div><div><dt>Agent members</dt><dd>{goal.memberCount} / {goal.maxMembers}</dd></div><div><dt>Parallel workers</dt><dd>Up to {goal.parallelism}</dd></div><div><dt>Deadline</dt><dd>{date(goal.deadlineAt)}<small>{goal.maxMinutes} minutes from creation</small></dd></div></dl></section>
+      {goal.activeTeamId && <section className="team-section goal-active-cycle"><div className="team-section-heading"><h2>Active cycle</h2><button className="text-button" onClick={() => openTeam(goal.activeTeamId!)}>Open team <ArrowUpRight size={16} /></button></div><p><strong>{active?.title ?? "Team cycle"}</strong></p>{active && <p className="quiet">{active.status.replaceAll("-", " ")}</p>}{!teamsFresh ? <p className="quiet">Team details may be out of date. Open the team for its current state.</p> : openDecisions.length > 0 && <div className="team-notice"><strong>{openDecisions.length} {openDecisions.length === 1 ? "decision needs" : "decisions need"} your input.</strong>{openDecisions.map(decision => <p key={decision.id}>{decision.question}</p>)}<button className="text-button" onClick={() => openTeam(goal.activeTeamId!)}>Answer in the team <ArrowUpRight size={15} /></button></div>}<LinearTracking tracking={active?.linear} fresh={teamsFresh} compact />{active?.brief && <TeamBriefView brief={active.brief} />}</section>}
+      <section className="team-section"><div className="team-section-heading"><h2>Previous cycles</h2><span className="quiet">{previousCycles.length}</span></div>{previousCycles.length ? previousCycles.map(cycle => <article className="goal-cycle" key={cycle.teamId}><div className="team-section-heading"><h3>Cycle {cycle.cycle}</h3><button className="text-button" onClick={() => openTeam(cycle.teamId)}>Review team <ArrowUpRight size={16} /></button></div><p className="goal-cycle-meta">{cycle.status.replaceAll("-", " ")} · goal revision {cycle.goalRevision} · {cycle.memberCount} members · {date(cycle.startedAt)}</p>{cycle.reason && <p className="team-prose">{cycle.reason}</p>}<LinearTracking tracking={teams.find(team => team.id === cycle.teamId)?.linear} fresh={teamsFresh} compact />{cycle.brief && <details><summary>Opportunity brief</summary><TeamBriefView brief={cycle.brief} /></details>}{cycle.branch && <p className="quiet">Branch: <code>{cycle.branch}</code></p>}{cycle.workspace && <details><summary>Workspace and commits</summary><dl className="team-output"><dt>Workspace</dt><dd><code>{cycle.workspace}</code></dd><dt>Base commit</dt><dd><code>{cycle.baseCommit || "Not recorded"}</code></dd><dt>Head commit</dt><dd><code>{cycle.headCommit || "Not recorded"}</code></dd></dl></details>}</article>) : <p className="quiet">No earlier cycles recorded.</p>}</section>
+      <section className="team-section"><h2>Scope and evidence</h2><h3>Allowed files and folders</h3><ul className="goal-scope">{goal.allowedPaths.map(path => <li key={path}><code>{path}</code>{path === "." && <span> Entire project</span>}</li>)}</ul>{goal.nonGoals.length > 0 && <><h3>Non-goals</h3><ul className="goal-notes">{goal.nonGoals.map((value, index) => <li key={index}>{value}</li>)}</ul></>}<h3>Provided evidence</h3>{goal.evidence.length ? <ul className="goal-notes">{goal.evidence.map((value, index) => <li key={index}><EvidenceSource source={value} /></li>)}</ul> : <p className="quiet">No external evidence was supplied.</p>}</section>
+      <section className="team-section">{hasContributor(goal.lineup) && <p className="team-notice">This goal’s recorded lineup includes profiles with contributor data use.</p>}<details className="goal-lineup-preview"><summary>Recorded agents and data use</summary><p className="quiet">These profiles were recorded when the goal started. They describe requested settings.</p><Lineup lineup={goal.lineup} /></details></section>
+      <section className="team-section"><h2>Product outcome</h2>{goal.outcomes.length ? goal.outcomes.map((outcome, index) => <article className="team-record" key={outcome.at + "/" + index}><strong>{outcomeLabels[outcome.result]} <span className="quiet">(human assessment)</span></strong><p className="quiet">Revision {outcome.revision} · {date(outcome.at)}</p><p className="team-prose">{outcome.summary}</p><h4>Evidence</h4><p className="team-prose">{outcome.evidence}</p></article>) : <p className="quiet">No human outcome assessment has been recorded.</p>}{me.role !== "viewer" && (inactive ? <OutcomeForm key={goal.outcomes.length} disabled={!canControl || busy || Boolean(pending)} submit={value => void mutate("outcome", value)} /> : <p className="form-note">Let the goal finish, or cancel it and wait for active work to stop, before recording an outcome.</p>)}</section>
+      {goal.steering.length > 0 && <section className="team-section"><h2>Your directions</h2>{goal.steering.map((entry, index) => <div className="team-record" key={entry.at + "/" + index}><small>Revision {entry.revision} · {date(entry.at)}</small><p className="team-prose">{entry.text}</p></div>)}</section>}
+      {goal.events.length > 0 && <section className="team-section"><details className="team-history"><summary>Goal history</summary><ol>{goal.events.map((event, index) => <li key={event.at + "/" + index}><time>{date(event.at)}</time><p>{event.text}</p></li>)}</ol></details></section>}
+      {me.role === "owner" && !["cancelled", "achieved"].includes(goal.status) && <div className="team-actions">{(["running", "needs-input", "paused"].includes(goal.status)) && <button className="text-button" disabled={!fresh || busy || Boolean(pending)} onClick={() => void mutate(goal.status === "paused" ? "resume" : "pause")}>{goal.status === "paused" ? "Resume goal" : "Pause goal"}</button>}<button className="text-button team-cancel" disabled={!fresh || busy || Boolean(pending)} onClick={() => { if (window.confirm("Cancel this goal? Active work will stop and its recorded cycles will remain available.")) void mutate("cancel"); }}>Cancel goal</button></div>}
+    </div>
+    <div className="team-composer-area">{request.message && <p className={request.result ? "quiet" : "error"} role="status">{request.message}</p>}{pending && <div className="team-pending"><span>{busy ? "Sending " : "Unconfirmed request: "}{pending.action} · revision {pending.revision}</span>{!busy && <button className="text-button" disabled={!canControl || (me.role !== "owner" && ["pause", "resume", "cancel"].includes(pending.action))} onClick={() => void mutate(pending.action)}>Retry same request</button>}</div>}{me.role === "viewer" ? <p className="quiet">This device can view the goal. An owner or controller can send direction and record outcomes.</p> : !["running", "needs-input"].includes(goal.status) ? <p className="quiet">{goal.status === "paused" ? "Resume the goal to send direction. The original scope, limits, and deadline still apply." : goal.status === "achieved" ? "The achieved outcome was recorded by a person." : goal.activeTeamId ? "This goal will start no further cycles. Its active team may still be stopping; inspect the active cycle above." : "This goal will start no further cycles. Start a new goal to approve further changes."}</p> : <form onSubmit={event => { event.preventDefault(); if (direction.trim()) void mutate("steer", { text: direction.trim() }); }}><label className="sr-only" htmlFor="goal-direction">Steer this goal</label><textarea id="goal-direction" rows={2} maxLength={8000} placeholder="Update the goal’s direction or add evidence…" value={direction} onChange={event => setDirection(event.target.value)} disabled={busy || Boolean(pending)} /><button className="primary" disabled={!canSteer || busy || Boolean(pending) || !direction.trim()}>Send direction <Send size={17} /></button></form>}</div>
+  </div>;
+}
+
+function OutcomeForm({ disabled, submit }: { disabled: boolean; submit: (value: { result: GoalResult; summary: string; evidence: string }) => void }) {
+  const [result, setResult] = useState<GoalResult>("inconclusive"), [summary, setSummary] = useState(""), [evidence, setEvidence] = useState("");
+  return <details className="goal-outcome-form"><summary>Record your assessment</summary><form onSubmit={event => { event.preventDefault(); if (!disabled && summary.trim() && evidence.trim()) submit({ result, summary: summary.trim(), evidence: evidence.trim() }); }}><fieldset disabled={disabled}><label htmlFor="goal-outcome-result">Outcome</label><select id="goal-outcome-result" value={result} onChange={event => setResult(event.target.value as GoalResult)}>{Object.entries(outcomeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><label htmlFor="goal-outcome-summary">Assessment</label><textarea id="goal-outcome-summary" rows={3} required maxLength={4000} value={summary} onChange={event => setSummary(event.target.value)} /><label htmlFor="goal-outcome-evidence">Evidence for your assessment</label><textarea id="goal-outcome-evidence" rows={3} required maxLength={8000} value={evidence} onChange={event => setEvidence(event.target.value)} placeholder="Measured results, review notes, or links supporting your conclusion…" /></fieldset><p className="form-note">This records your judgment of the product outcome. It does not publish the changes.</p><button className="primary" disabled={disabled || !summary.trim() || !evidence.trim()}>Record assessment <ArrowUpRight size={16} /></button></form></details>;
+}

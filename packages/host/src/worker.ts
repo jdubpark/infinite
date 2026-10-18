@@ -32,7 +32,8 @@ import {
 } from "@infinite/attention";
 import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
-import { startHookServer, type HookRoute } from "./hooks.js";
+import { startHookServer, HookPayloadError, type HookRoute } from "./hooks.js";
+import { teamReportEnvelopeSchema } from "./team-types.js";
 import { buildLaunch } from "./launch.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
@@ -284,7 +285,24 @@ function blockShown(open: Prompt) {
 }
 
 let hooksReady = false;
+let teamReportReceipt: { requestId: string; digest: string } | undefined;
 function onHook(route: HookRoute, body: unknown) {
+  if (route === "team-report") {
+    const parsed = teamReportEnvelopeSchema.safeParse(body);
+    if (!parsed.success || !session.team) throw new HookPayloadError(400);
+    const report = parsed.data;
+    if (report.runId !== session.team.runId || report.memberId !== session.team.memberId || report.revision !== session.team.revision)
+      throw new HookPayloadError(403);
+    const digest = createHash("sha256").update(JSON.stringify(report)).digest("hex");
+    if (teamReportReceipt) {
+      if (teamReportReceipt.requestId !== report.requestId || teamReportReceipt.digest !== digest) throw new HookPayloadError(409);
+      return;
+    }
+    if (state.status !== "running") throw new HookPayloadError(409);
+    append("team-report", report);
+    teamReportReceipt = { requestId: report.requestId, digest };
+    return;
+  }
   if (state.status !== "running") return;
   const signals =
     route === "claude"
@@ -904,7 +922,7 @@ const hookToken = randomBytes(32).toString("hex");
 const wantsHooks =
   !session.runtime?.nativeUi &&
   session.nativeArgs === undefined &&
-  (provider === "demo" ||
+  (Boolean(session.team) || provider === "demo" ||
     (provider === "claude" && config.attention.hooks.claude) ||
     (provider === "codex" && config.attention.hooks.codex));
 // Hooks only add precision; the screen heuristics still work if the listener cannot start.
@@ -957,6 +975,10 @@ server.listen(socketPath(runDir, session.id), async () => {
       if (process.env[name]) env[name] = process.env[name]!;
     }
     env.TERM = "xterm-256color";
+    if (session.team) {
+      if (!hookServer) throw new Error("Team report channel could not start");
+      env.INFINITE_TEAM_ASSIGNMENT = JSON.stringify(session.team);
+    }
     if (hookServer) {
       env.INFINITE_HOOK_URL = hookServer.url;
       env.INFINITE_HOOK_TOKEN = hookToken;
@@ -974,6 +996,8 @@ server.listen(socketPath(runDir, session.id), async () => {
       hookServer ? { url: hookServer.url, token: hookToken } : null,
       relayPath,
       config.attention.hooks,
+      Boolean(session.team),
+      session.teamModelProfile,
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {

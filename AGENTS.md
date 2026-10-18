@@ -35,6 +35,16 @@ If you find existing private information while working, remove or replace it and
 
 ## Working in this repository
 
+- Use the configured Linear team as the source of truth for product tasks,
+  bugs, scope, and resolution. Reuse the relevant issue; keep implementation
+  findings and verification evidence there instead of maintaining a second
+  backlog in repository documents. Keep workspace URLs and issue bindings in
+  private runtime configuration, outside tracked files.
+- Record actual progress in Linear. Passing checks and agent approval mean
+  ready for review; they do not prove merge, deployment, or product impact.
+  If Linear access is unavailable, report the unsynchronized work explicitly
+  and preserve its request identity rather than inventing a completed update.
+
 - Requirements: Node.js 22.14+ and npm. `npm ci` builds the shared `@infinite/attention` package during install.
 - Run `npm run check` (typecheck, tests, builds) before declaring host or shared-package work complete.
 - For the phone app, also run `npm run lint -w @infinite/mobile` and `npx tsc --noEmit` in `apps/mobile`.

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -20,6 +20,8 @@ import {
   Send,
   ShieldCheck,
   TerminalSquare,
+  Target,
+  Users,
   WifiOff,
 } from "lucide-react";
 import { useApi, ago, ApiError, isControlRefusal, names, pendingLabel, type ControlLease, type Me, type ProjectDetail, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
@@ -32,6 +34,9 @@ import "@fontsource/instrument-sans/400.css";
 import "@fontsource/instrument-sans/500.css";
 import "@fontsource/instrument-sans/600.css";
 import "@xterm/xterm/css/xterm.css";
+import { foreground, useLiveRefresh } from "./live-refresh";
+import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamView } from "./teams";
+import { GoalCreate, GoalDetail, GoalList, GoalPicker, clearGoalRequests, type ProductGoal } from "./goals";
 import "./style.css";
 
 const time = (value: string) =>
@@ -41,80 +46,6 @@ const time = (value: string) =>
   });
 // Switching sessions paints the last view immediately, but never restores authority.
 const sessionViews = new Map<string, { session: Session; events: LogEvent[]; cursor: number; seen: string }>();
-const foreground = () => document.visibilityState !== "hidden" && navigator.onLine;
-
-function useLiveRefresh(
-  task: (current: () => boolean) => Promise<number | void>,
-  interval: number,
-  identity: unknown,
-  unavailable?: () => void,
-) {
-  const taskRef = useRef(task);
-  const unavailableRef = useRef(unavailable);
-  useEffect(() => {
-    taskRef.current = task;
-    unavailableRef.current = unavailable;
-  });
-  const refreshRef = useRef<() => void>(() => {});
-  const [fresh, setFresh] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
-  const [seen, setSeen] = useState("");
-  const [failed, setFailed] = useState(false);
-  useEffect(() => {
-    let active = true, polling = false, queued = false, generation = 0;
-    let timer: ReturnType<typeof setTimeout>;
-    setFresh(false);
-    setFailed(false);
-    setSeen("");
-    const poll = async () => {
-      clearTimeout(timer);
-      if (!active || !identity || !foreground()) return;
-      if (polling) { queued = true; return; }
-      polling = true;
-      setRefreshing(true);
-      const started = generation;
-      const current = () => active && foreground() && started === generation;
-      let delay = interval;
-      try {
-        delay = await taskRef.current(current) ?? interval;
-        if (current()) { setFresh(true); setFailed(false); setSeen(new Date().toISOString()); }
-      } catch {
-        if (current()) { setFresh(false); setFailed(true); unavailableRef.current?.(); }
-      } finally {
-        polling = false;
-        if (active) {
-          setRefreshing(false);
-          if (foreground()) timer = setTimeout(poll, queued ? 0 : delay);
-          queued = false;
-        }
-      }
-    };
-    const resync = () => {
-      generation++;
-      setFresh(false);
-      if (!navigator.onLine) setFailed(true);
-      clearTimeout(timer);
-      if (foreground()) void poll();
-      else unavailableRef.current?.();
-    };
-    refreshRef.current = () => { void poll(); };
-    document.addEventListener("visibilitychange", resync);
-    window.addEventListener("online", resync);
-    window.addEventListener("offline", resync);
-    window.addEventListener("focus", resync);
-    void poll();
-    return () => {
-      active = false;
-      clearTimeout(timer);
-      refreshRef.current = () => {};
-      document.removeEventListener("visibilitychange", resync);
-      window.removeEventListener("online", resync);
-      window.removeEventListener("offline", resync);
-      window.removeEventListener("focus", resync);
-    };
-  }, [identity, interval]);
-  return { fresh, refreshing, seen, failed, refresh: useCallback(() => refreshRef.current(), []) };
-}
 
 function useSessionControl(id: string) {
   const api = useApi();
@@ -242,6 +173,8 @@ function App() {
   const [key, setKey] = useState("");
   const [error, setError] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [teams, setTeams] = useState<TeamView[]>([]);
+  const [goals, setGoals] = useState<ProductGoal[]>([]);
   const route = useSessionLocation(machines.active.id);
   const selected = route.id, creating = route.creating;
   const [bootstrapError, setBootstrapError] = useState(false);
@@ -265,6 +198,14 @@ function App() {
     const data = await api<{ sessions: Session[] }>("/sessions");
     if (current()) setSessions(data.sessions.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me);
+  const teamFeed = useLiveRefresh(async current => {
+    const data = await api<{ teams: TeamView[] }>("/teams");
+    if (current()) setTeams(data.teams.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  }, 1800, me?.teams ? me : null);
+  const goalFeed = useLiveRefresh(async current => {
+    const data = await api<{ goals: ProductGoal[] }>("/goals");
+    if (current()) setGoals(data.goals.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  }, 1800, me?.goals ? me : null);
   const connected = host.fresh;
   const lastSeen = host.seen;
   async function login(event: React.FormEvent) {
@@ -339,7 +280,7 @@ function App() {
     );
   const active = sessions.filter((s) => s.status === "running").length;
   return (
-    <div className={`app ${selected || creating ? "has-detail" : ""}`}>
+    <div className={`app ${selected || creating || route.teams || route.goals ? "has-detail" : ""}`}>
       <aside className="sidebar">
         <Mark />
         <MachinePicker />
@@ -347,21 +288,26 @@ function App() {
           <span>Personal workspace</span>
           <ShieldCheck size={15} />
         </div>
+        <nav className="workspace-navigation" aria-label="Workspace views">
+          <button aria-current={!route.teams && !route.goals ? "page" : undefined} onClick={() => route.navigate(null)}><TerminalSquare size={16} />Sessions</button>
+          <button aria-current={route.teams ? "page" : undefined} onClick={() => route.navigateTeam(null)}><Users size={16} />Teams</button>
+          <button aria-current={route.goals ? "page" : undefined} onClick={() => route.navigateGoal(null)}><Target size={16} />Goals</button>
+        </nav>
         <div className="rail-heading">
           <h2>
-            Sessions <span>{sessions.length}</span>
+            {route.goals ? "Goals" : route.teams ? "Teams" : "Sessions"} <span>{route.goals ? goals.length : route.teams ? teams.length : sessions.length}</span>
           </h2>
           {me.role === "owner" && (
             <button
               className="icon-button"
-              aria-label="New session"
-              onClick={route.create}
+              aria-label={route.goals ? "New goal" : route.teams ? "New team" : "New session"}
+              onClick={route.goals ? route.createGoal : route.teams ? route.createTeam : route.create}
             >
               <Plus size={20} />
             </button>
           )}
         </div>
-        <SessionPicker sessions={sessions} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />
+        {route.goals ? <GoalPicker goals={goals} selected={route.goalId} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} onSelect={route.navigateGoal} /> : route.teams ? <TeamPicker teams={teams} selected={route.teamId} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} onSelect={route.navigateTeam} /> : <SessionPicker sessions={sessions} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />}
         <div className="host-status">
           <div>
             {me.environment === "cloud" ? (
@@ -395,6 +341,10 @@ function App() {
             setMe(null);
             route.navigate(null);
             setSessions([]);
+            setTeams([]);
+            setGoals([]);
+            clearGoalRequests(machines.active.id);
+            clearTeamRequests(machines.active.id);
             creations.clear(machines.active.id);
             lifecycles.clearMachine(machines.active.id);
             clearDrafts(machines.active.id);
@@ -409,19 +359,19 @@ function App() {
           <div className="breadcrumb">
             <button
               className="back icon-button"
-              onClick={() => route.navigate(null)}
-              aria-label="Back to sessions"
+              onClick={() => route.goalId || route.creatingGoal ? route.navigateGoal(null) : route.teamId || route.creatingTeam ? route.navigateTeam(null) : route.navigate(null)}
+              aria-label={route.goalId || route.creatingGoal ? "Back to goals" : route.teamId || route.creatingTeam ? "Back to teams" : "Back to sessions"}
             >
               <ArrowLeft size={20} />
             </button>
             <span>Workspace</span>
             <ChevronRight size={13} />
             <strong>
-              {creating ? "New session" : selected ? "Session" : "Overview"}
+              {route.creatingGoal ? "New goal" : route.goalId ? "Goal" : route.goals ? "Goals" : route.creatingTeam ? "New team" : route.teamId ? "Team" : route.teams ? "Teams" : creating ? "New session" : selected ? "Session" : "Overview"}
             </strong>
           </div>
           <div className="refresh-status">
-          <button className="text-button" onClick={host.refresh} disabled={host.refreshing}>
+          <button className="text-button" onClick={() => { host.refresh(); if (me.teams) teamFeed.refresh(); if (me.goals) goalFeed.refresh(); }} disabled={host.refreshing}>
             <RefreshCw size={14} /> {host.refreshing ? "Refreshing…" : "Refresh"}
           </button>
           <span className={`connection ${connected ? "" : "offline"}`}>
@@ -436,7 +386,7 @@ function App() {
             running; controls are disabled until a fresh connection arrives.
           </div>
         )}
-        {creating ? (
+        {route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsFresh={teamFeed.fresh} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} refresh={goalFeed.refresh} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} /> : creating ? (
           <Create
             me={me}
             done={route.navigate}

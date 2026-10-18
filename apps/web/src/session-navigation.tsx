@@ -3,12 +3,16 @@ import { ChevronRight, Search, X } from "lucide-react";
 import { names, type Session } from "./api";
 
 export type SessionTab = "chat" | "screen" | "terminal" | "files" | "context";
-type Location = { id: string | null; tab: SessionTab; creating: boolean };
+type Location = { id: string | null; tab: SessionTab; creating: boolean; teams: boolean; teamId: string | null; creatingTeam: boolean; goals: boolean; goalId: string | null; creatingGoal: boolean };
 
 function readLocation(machine: string): Location {
   const hash = window.location.hash.replace(new RegExp(`^#/machines/${machine}(?=/|$)`), "#");
   const match = hash.match(/^#\/sessions\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})(?:\/(chat|screen|terminal|files|context))?$/i);
-  return { id: match?.[1] ?? null, tab: (match?.[2] as SessionTab) ?? "chat", creating: hash === "#/new" };
+  const team = hash.match(/^#\/teams\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
+  const goal = hash.match(/^#\/goals\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
+  return { id: match?.[1] ?? null, tab: (match?.[2] as SessionTab) ?? "chat", creating: hash === "#/new",
+    teams: hash === "#/teams" || hash === "#/teams/new" || Boolean(team), teamId: team?.[1] ?? null, creatingTeam: hash === "#/teams/new",
+    goals: hash === "#/goals" || hash === "#/goals/new" || Boolean(goal), goalId: goal?.[1] ?? null, creatingGoal: hash === "#/goals/new" };
 }
 
 // Only the route lives in the URL. Drafts, output and credentials never do.
@@ -28,7 +32,11 @@ export function useSessionLocation(machine = "direct") {
     history.replaceState(null, "", `#${prefix}/sessions/${location.id}/${tab}`);
     setLocation(readLocation(machine));
   }
-  return { ...location, navigate, selectTab, create: () => { window.location.hash = `${prefix}/new`; } };
+  return { ...location, navigate, selectTab, create: () => { window.location.hash = `${prefix}/new`; },
+    navigateTeam: (id: string | null) => { window.location.hash = `${prefix}/teams${id ? `/${id}` : ""}`; },
+    createTeam: () => { window.location.hash = `${prefix}/teams/new`; },
+    navigateGoal: (id: string | null) => { window.location.hash = `${prefix}/goals${id ? `/${id}` : ""}`; },
+    createGoal: () => { window.location.hash = `${prefix}/goals/new`; } };
 }
 
 export const sessionStatus = (session: Session) => session.attention?.state === "needs-you"

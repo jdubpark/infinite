@@ -1,9 +1,12 @@
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
-export type HookRoute = "claude" | "codex" | "codex-notify";
-const ROUTES = new Set<string>(["claude", "codex", "codex-notify"]);
+export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report";
+const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report"]);
 const MAX_BODY = 256 * 1024;
+export class HookPayloadError extends Error {
+  constructor(readonly status: number) { super("Hook payload was refused"); }
+}
 
 export function startHookServer(opts: {
   token: string;
@@ -50,11 +53,13 @@ export function startHookServer(opts: {
         res.writeHead(400).end();
         return;
       }
-      res.writeHead(204).end();
       try {
         opts.onPayload(route as HookRoute, parsed);
-      } catch {
+        // Acknowledgement follows the durable callback, including team reports.
+        res.writeHead(204).end();
+      } catch (error) {
         opts.onError();
+        res.writeHead(error instanceof HookPayloadError ? error.status : 500).end();
       }
     });
     req.on("error", () => {});

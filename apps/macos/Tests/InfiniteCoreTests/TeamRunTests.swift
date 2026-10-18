@@ -69,6 +69,13 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(run(["linear": .object(["issue": .object(["identifier": .string("INF-7")])])]).linearIssue, "INF-7")
     }
 
+    /// Routine host saves move updatedAt; the age a person sees follows the run's history instead.
+    func testLastActivityFollowsHistoryNotRoutineSaves() {
+        let events: JSON = .array([["at": "2026-10-18T01:00:00.000Z", "text": "Plan reported."], ["at": "2026-10-18T02:30:00.000Z", "text": "Checks passed."]].map { .object($0.mapValues { .string($0) }) })
+        XCTAssertEqual(run(["updatedAt": .string("2026-10-18T09:00:00.000Z"), "events": events]).lastActivityAt, "2026-10-18T02:30:00.000Z")
+        XCTAssertEqual(run(["updatedAt": .string("2026-10-18T09:00:00.000Z")]).lastActivityAt, "2026-10-18T09:00:00.000Z")
+    }
+
     func testFinishedRunsAndLineup() {
         XCTAssertTrue(run(["status": .string("cancelled")]).finished)
         XCTAssertFalse(run(["status": .string("paused")]).finished)

@@ -259,9 +259,9 @@ Extend `fixture()` in `tests/teams.test.ts` to accept a third `config` argument 
 
 **Files:**
 - Modify: `apps/web/src/api.ts:36-58` (types: `UsageTotals`, `Me.usage`, `TeamView.usage`, member `usage`, `ProductGoal.usage`)
-- Modify: `apps/web/src/teams.tsx:97-110` (Teams list: "Spend this period" block from `GET /usage`), `:232` (member cost line or "Unmeasured"), run total near "Review the changes"
+- Modify: `apps/web/src/teams.tsx:97-110` (Teams list: "Spend" block from `GET /usage`, one row per provider labelled with that provider's `period.start`–`period.end` window and `budget.period`; the top-level summary `period` is only the default month window and must not label a day or week budget), `:232` (member cost line or "Unmeasured"), run total near "Review the changes"
 - Modify: `apps/web/src/goals.tsx:138` (add "Agent spend" cell to the Work limits list)
-- Modify: `packages/host/src/client.ts:337` (`CLIENT_COMMANDS` add `usage`), new `usage` handler printing one line per provider: `PROVIDER  spent $X.XX of $Y.YY this month (N messages, M unmeasured sessions)`; `--json` prints the raw summary
+- Modify: `packages/host/src/client.ts:337` (`CLIENT_COMMANDS` add `usage`), new `usage` handler printing one line per provider: `PROVIDER  spent $X.XX of $Y.YY for <day|week|month> from <period.start date> (N steps, M unmeasured sessions)`, where the period words come from the provider entry's own `period: { start, end }` and `budget.period` (never a hard-coded "this month"); `--json` prints the raw summary
 - Modify: `docs/teams.md` (new "Usage and budgets" section after "Linear tracking"), `docs/cli.md:17-25` (add `infinite usage`)
 - Test: `tests/client-cli.test.ts` (add a `usage` case against `startHost` with a `usage` config), typecheck/build for web
 

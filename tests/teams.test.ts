@@ -30,7 +30,7 @@ test("team runs use readable names and exact root permissions under a strict uma
     assert.equal(first.status, "ready-for-review", JSON.stringify(first));
     const firstName = `${first.createdAt.slice(0, 10)}-implement-a-small-feature-${first.id.slice(0, 8)}`;
     assert.equal(realpathSync(first.workspace), realpathSync(join(f.host.config.teams!.workspaceDir, `rehearsal-${firstName}`, "integration")));
-    assert.equal(first.branch, `infinite/implement-a-small-feature-${first.id.slice(0, 8)}`);
+    assert.equal(first.branch, `infinite/team-implement-a-small-feature-${first.id.slice(0, 8)}`);
     for (const directory of [workspaceDir, dirname(workspaceDir), dirname(dirname(workspaceDir))])
       assert.equal(statSync(directory).mode & 0o777, 0o750);
 
@@ -41,7 +41,7 @@ test("team runs use readable names and exact root permissions under a strict uma
     assert.equal(second.status, "ready-for-review", JSON.stringify(second));
     const secondName = `${second.createdAt.slice(0, 10)}-implement-a-small-feature-${second.id.slice(0, 8)}`;
     assert.equal(realpathSync(second.workspace), realpathSync(join(teamworkRoot, secondName, "integration")));
-    assert.equal(second.branch, `infinite/implement-a-small-feature-${second.id.slice(0, 8)}`);
+    assert.equal(second.branch, `infinite/team-implement-a-small-feature-${second.id.slice(0, 8)}`);
     assert.equal(statSync(teamworkRoot).mode & 0o777, 0o750);
     assert.equal(statSync(dirname(teamworkRoot)).mode & 0o777, 0o750);
   } finally {

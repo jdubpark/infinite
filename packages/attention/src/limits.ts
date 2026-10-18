@@ -53,8 +53,8 @@ export function parseResetTime(text: string, now: Date): string | undefined {
 }
 
 /**
- * Reads a provider usage limit off the screen. Codex only counts when its own status row (one of
- * the last two non-empty rows) says `usage limited`: transcript text can be printed by a member
+ * Reads a provider usage limit off the screen. Codex only counts when its own status row (the last
+ * non-empty row, as a whole `·`-separated segment) says `usage limited`: transcript text can be printed by a member
  * with cat or grep and must never trigger on its own.
  */
 export function detectLimit(lines: string[], provider: Provider, now: Date): DetectedLimit | null {
@@ -65,11 +65,12 @@ export function detectLimit(lines: string[], provider: Provider, now: Date): Det
     return { limit: "usage", resetsAt: parseResetTime(line, now), message: line.slice(0, 300) };
   }
   if (provider === "codex") {
-    const tail = clean.filter((l) => l !== "").slice(-2);
-    if (!tail.some((l) => /\busage limited\b/i.test(l))) return null;
+    const last = clean.filter((l) => l !== "").at(-1);
+    if (last === undefined || /^[›$%]/.test(last)) return null;
+    if (!last.split(/[·|]/).some((segment) => segment.trim().toLowerCase() === "usage limited")) return null;
     const credits = clean.find((l) => /out of credits/i.test(l));
     const reached = clean.find((l) => /usage limit reached/i.test(l));
-    const reset = clean.map((l) => parseResetTime(l, now)).find((t) => t !== undefined);
+    const reset = clean.map((l) => parseResetTime(l, now)).filter((t) => t !== undefined).at(-1);
     return {
       limit: credits ? "credits" : "usage",
       resetsAt: reset,

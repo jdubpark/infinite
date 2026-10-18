@@ -67,3 +67,25 @@ test("provider-limit sets attention.limit without changing state; corroborated i
   assert.equal(c.limit?.confidence, "corroborated");
   assert.equal(c.limit?.since, "t2");
 });
+
+test("codex phrase outside the status row segment never triggers", () => {
+  assert.equal(detectLimit(["› why does the footer say usage limited?", "  gpt-5-codex · ~/workspace"], "codex", now), null);
+  assert.equal(detectLimit(["$ cat docs/teams.md", "Codex shows usage limited in its status row", "$"], "codex", now), null);
+  assert.equal(detectLimit(["", "Codex shows usage limited in its status row", ""], "codex", now), null);
+  assert.equal(detectLimit(["› ask", "  gpt-5-codex · ~/workspace-usage limited-notes"], "codex", now), null);
+});
+
+test("codex status row with usage limited as its own segment detects", () => {
+  assert.equal(detectLimit(["› ask", "  gpt-5-codex · ~/workspace · usage limited"], "codex", now)?.limit, "usage");
+  assert.equal(detectLimit(["› ask", "  gpt-5-codex | Usage Limited"], "codex", now)?.limit, "usage");
+});
+
+test("codex reset time comes from the newest Try again at line", () => {
+  const lines = [
+    "Usage limit reached. Try again at Oct 17, 2026 9:00 PM",
+    "Usage limit reached. Try again at Oct 18, 2026 3:45 PM",
+    "› ask",
+    "  gpt-5-codex · usage limited",
+  ];
+  assert.equal(detectLimit(lines, "codex", now)?.resetsAt, "2026-10-18T15:45:00.000Z");
+});

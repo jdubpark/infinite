@@ -32,17 +32,17 @@ To revoke a device, run `device-revoke DEVICE_ID --config /private/infinite/conf
 
 ## Access from any network
 
-Direct access works over private HTTPS, such as Tailscale Serve, while every client can reach that private network. For a phone or browser without that VPN, run a separate relay behind public HTTPS. The runner opens an outbound connection, so the laptop needs no inbound port forwarding.
+Direct access works over private HTTPS, such as Tailscale Serve, while every client can reach that private network. For a phone without that VPN, run a separate relay behind public HTTPS. The runner opens an outbound connection, so the laptop needs no inbound port forwarding. The [phone access guide](../deploy/ubuntu/public-relay.md) publishes the relay through Cloudflare Tunnel and gates it with a Cloudflare Access service token, so unauthenticated traffic stops before it reaches the server.
 
 On the relay machine:
 
 ```sh
-node packages/host/dist/cli.js relay-init --port 4790 --config /private/relay.json
+node packages/host/dist/cli.js relay-init --port 4790 --proxy-socket /private/relay-proxy.sock --client-address-header cf-connecting-ip --config /private/relay.json
 node packages/host/dist/cli.js relay-add --machine MACHINE_UUID --token-file /private/registration.key --config /private/relay.json
 node packages/host/dist/cli.js relay-serve --config /private/relay.json
 ```
 
-Replace `MACHINE_UUID` with `machine-info`'s ID. Transfer the registration file privately to that machine. The relay stores only its hash; each machine needs a distinct registration. Restart the relay after registration changes. Terminate HTTPS at a reverse proxy that forwards WebSocket upgrades to the loopback relay port. The relay serves the built web portal and `/relay/hosts/:machineId` and `/relay/clients/:machineId`; it does not expose the runner's ordinary HTTP API.
+Replace `MACHINE_UUID` with `machine-info`'s ID. Transfer the registration file privately to that machine. The relay stores only its hash; each machine needs a distinct registration. Restart the relay after registration changes. Publish the relay through a tunnel or reverse proxy on the same machine that forwards WebSocket upgrades. With `--proxy-socket`, the proxy connects to that Unix socket. The relay makes it mode 0600 under its own account, so the proxy must run as root (as cloudflared's installed service does) or as the relay account. Client channels are then accepted only there, and the relay reads `--client-address-header` (which the proxy must set on every request) only there, to limit upgrade attempts and concurrent channels per client address (four by default, per /64 for IPv6). The loopback port then serves only runner registrations. Without a proxy socket, publish the loopback port directly; every proxied client then shares one address. The relay serves only `/health`, `/relay/hosts/:machineId`, and `/relay/clients/:machineId`. It does not serve the web client or expose the runner's ordinary HTTP API.
 
 On the runner:
 
@@ -50,9 +50,9 @@ On the runner:
 node packages/host/dist/cli.js connect-relay https://relay.example.com --token-file /private/registration.key --config /private/infinite/config.json
 ```
 
-Restart the runner API. In web or phone **Add machine**, enter the relay HTTPS origin, machine ID, and that machine's paired device key. Leave machine ID empty for a direct host connection. Browser cross-origin direct pairing and both direct/relayed phone connections use the encrypted socket and require remote access enabled on that host. The phone does not fall back to bearer HTTPS if the encrypted endpoint is unavailable. Native credentials live in platform secure storage; browser profiles and keys stay in tab memory and must be entered again after reload. Same-origin browser cookie login remains supported. The dedicated [Mac client](desktop.md) uses the same Infinite endpoint and additionally supports separately enrolled direct cmux connections.
+When the relay runs on the runner's own machine, use its loopback address, such as `http://127.0.0.1:4790`, so the runner's registration does not pass through the public proxy. Restart the runner API. In phone **Add machine**, enter the relay HTTPS origin, machine ID, and that machine's paired device key, plus the Access client ID and secret when Cloudflare Access protects the relay. Leave machine ID empty for a direct host connection. Browser cross-origin direct pairing and both direct/relayed phone connections use the encrypted socket and require remote access enabled on that host. The phone does not fall back to bearer HTTPS if the encrypted endpoint is unavailable. Native credentials live in platform secure storage; browser profiles and keys stay in tab memory and must be entered again after reload. Same-origin browser cookie login remains supported. The dedicated [Mac client](desktop.md) uses the same Infinite endpoint and additionally supports separately enrolled direct cmux connections.
 
-The relay can also serve the web client, but that makes its operator a trusted supplier of executable browser code. A separately trusted browser origin or trusted native build is needed when the relay operator is outside the trust boundary. See [security](security.md#remote-machine-transport).
+The relay does not serve the web client. A relay that supplied browser code would make its operator a trusted supplier of executable code, and browsers cannot send the Access headers on a WebSocket upgrade. Use the web client against a local or private host during development. See [security](security.md#remote-machine-transport).
 
 ## Sessions and cmux
 

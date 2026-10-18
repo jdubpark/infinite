@@ -229,7 +229,8 @@ export class TeamService {
       const slug = parsed.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/g, "") || "team";
       const suffix = parsed.requestId.slice(0, 8);
       const directoryName = `${project.teamworkDir ? "" : `${project.id}-`}${at.slice(0, 10)}-${slug}-${suffix}`;
-      const branch = `infinite/${slug}-${suffix}`;
+      // The `infinite/team-` prefix keeps constrained launchers that allow only team branches working.
+      const branch = `infinite/team-${slug}-${suffix}`;
       const root = project.teamworkDir ?? this.config.teams.workspaceDir;
       const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       if (project.team.delivery) {

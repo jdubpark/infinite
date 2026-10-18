@@ -28,6 +28,8 @@ export function Pair({
   const [token, setToken] = useState("");
   const [label, setLabel] = useState("");
   const [relayMachine, setRelayMachine] = useState("");
+  const [accessId, setAccessId] = useState("");
+  const [accessSecret, setAccessSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(initialError);
   async function pair() {
@@ -48,11 +50,19 @@ export function Pair({
         endpoint.hash
       )
         throw new Error("Use a bare HTTPS address on your private network.");
-      const next: Connection = { url: endpoint.origin, token: token.trim(), ...(relayMachine.trim() ? { relay: { machineId: relayMachine.trim() } } : {}) };
+      if (Boolean(accessId.trim()) !== Boolean(accessSecret.trim()))
+        throw new Error("Enter both the access client ID and secret, or leave both empty.");
+      const next: Connection = {
+        url: endpoint.origin,
+        token: token.trim(),
+        ...(relayMachine.trim() ? { relay: { machineId: relayMachine.trim() } } : {}),
+        ...(accessId.trim() ? { access: { clientId: accessId.trim(), clientSecret: accessSecret.trim() } } : {}),
+      };
       const me = await api<Me>(next, "/me");
       if (!mounted.current) return;
       const saved = await saveConnection({ ...next, id: me.machine?.id, machineId: me.machine?.id, label: label.trim() || me.machine?.label || endpoint.hostname });
       setToken("");
+      setAccessSecret("");
       if (mounted.current) onPaired(saved);
     } catch (e) {
       setError((e as Error).message);
@@ -91,6 +101,10 @@ export function Pair({
         />
         <Text style={s.label}>Relay machine ID (relay connections only)</Text>
         <TextInput accessibilityLabel="Relay machine ID" value={relayMachine} onChangeText={setRelayMachine} placeholder="Leave empty for a direct connection" placeholderTextColor={theme.colors.placeholder} autoCapitalize="none" autoCorrect={false} style={s.input} />
+        <Text style={s.label}>Access client ID (Cloudflare relay only)</Text>
+        <TextInput accessibilityLabel="Access client ID" value={accessId} onChangeText={setAccessId} placeholder="Leave empty without Cloudflare Access" placeholderTextColor={theme.colors.placeholder} autoCapitalize="none" autoCorrect={false} style={s.input} />
+        <Text style={s.label}>Access client secret</Text>
+        <TextInput accessibilityLabel="Access client secret" value={accessSecret} onChangeText={setAccessSecret} placeholder="Leave empty without Cloudflare Access" placeholderTextColor={theme.colors.placeholder} secureTextEntry autoCapitalize="none" autoCorrect={false} style={s.input} />
         <Text style={s.label}>Device key</Text>
         <TextInput
           accessibilityLabel="Device key"
@@ -115,7 +129,7 @@ export function Pair({
           </Text>
         ) : null}
         <Text style={s.footnote}>
-          Device keys stay in this phone’s secure storage. Owner keys can create and end sessions; controller keys can steer existing sessions. Relay connections are encrypted between this phone and the machine.
+          Device keys stay in this phone’s secure storage. Owner keys can create and end sessions; controller keys can steer existing sessions. Relay connections are encrypted between this phone and the machine. The access token only lets this phone past Cloudflare; it stays in secure storage too.
         </Text>
       </ScrollView>
     </KeyboardAvoidingView>

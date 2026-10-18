@@ -334,7 +334,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "sync", "pull"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "usage", "sync", "pull"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
@@ -412,6 +412,21 @@ function describeSync(sync: ProjectDetail["sync"]) {
   return `synced ${age(sync.lastSyncedAt)} · applied ${age(sync.appliedAt)}${pending}${skipped}`;
 }
 
+/** One line per provider. Period words come from each provider's own window, never a fixed "month". */
+export function usageLines(summary: import("./usage-service.js").UsageSummary): string[] {
+  const width = Math.max(...Object.keys(summary.providers).map(name => name.length));
+  return Object.entries(summary.providers).map(([name, entry]) => {
+    const label = name.padEnd(width);
+    if (!entry.measured || !entry.spent) return `${label}  unmeasured (${entry.unmeasuredSessions} session${entry.unmeasuredSessions === 1 ? "" : "s"}, no usage is recorded for this provider)`;
+    const days = Math.round((Date.parse(entry.period.end) - Date.parse(entry.period.start)) / 86_400_000);
+    const word = entry.budget?.period ?? (days <= 1 ? "day" : days <= 7 ? "week" : "month");
+    const unpriced = entry.spent.pricing.unknown;
+    const detail = [`${entry.spent.messages} steps`, ...(unpriced ? [`${unpriced} unpriced`] : []), `${entry.unmeasuredSessions} unmeasured sessions`].join(", ");
+    const spent = `spent $${entry.spent.cost.toFixed(2)}${entry.budget ? ` of $${entry.budget.usd.toFixed(2)}` : ""}`;
+    return `${label}  ${spent} for ${word} from ${entry.period.start.slice(0, 10)} (${detail})${entry.budget && entry.spent.cost > entry.budget.usd ? " OVER BUDGET" : ""}`;
+  });
+}
+
 export async function handleClientCommand(argv: string[]): Promise<boolean> {
   const progress = startupProgress();
   const args = [...argv];
@@ -452,6 +467,12 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
       if (options["--json"]) console.log(JSON.stringify(sessions, null, 2));
       else printSessions(sessions, (await api.json<Me>("/me")).machine?.label || new URL(config.origin).hostname);
+      return true;
+    }
+    if (command === "usage") {
+      const summary = await api.json<import("./usage-service.js").UsageSummary>("/usage");
+      if (options["--json"]) console.log(JSON.stringify(summary, null, 2));
+      else for (const line of usageLines(summary)) console.log(line);
       return true;
     }
     if (command === "sync" && (options["--stop"] || options["--status"])) {

@@ -43,6 +43,13 @@ export type LinearTrackingView = {
   checkedAt?: string;
   issue?: { id: string; identifier: string; url: string; title: string; description: string | null; state: { name: string; type: string }; updatedAt: string };
 };
+export type UsageTotals = { cost: number; tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }; messages: number; pricing: { configured: number; provider: number; unknown: number } };
+export type TeamUsage = { total: UsageTotals; byProfile: Record<string, UsageTotals>; byProvider: Partial<Record<string, UsageTotals>>; unmeasuredMembers: number };
+export type UsageBudget = { usd: number; period: "day" | "week" | "month" };
+export type UsageSummary = {
+  period: { start: string; end: string };
+  providers: Record<string, { measured: boolean; period: { start: string; end: string }; spent?: UsageTotals; previous?: UsageTotals; budget?: UsageBudget; unmeasuredSessions: number }>;
+};
 export type Me = {
   role: "owner" | "controller" | "viewer";
   environment: "cloud" | "local";
@@ -54,6 +61,7 @@ export type Me = {
   projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
   teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
   goals?: { enabled: boolean };
+  usage?: { enabled: boolean; budgets: Partial<Record<string, UsageBudget>> };
   terminal?: { stream: boolean; duplex: boolean; raw: boolean; snapshot?: boolean; control?: boolean };
 };
 // One identity per running browser tab, independent of its shared login cookie.

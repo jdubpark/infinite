@@ -16,12 +16,16 @@ infinite opencode --model deepseek/deepseek-flash
 
 infinite list
 infinite list --json
+infinite usage             # spend per provider against its budget
+infinite usage --json
 infinite resume             # choose a running session
 infinite resume 5ba58d55    # a unique Infinite session ID prefix also works
 infinite monitor           # choose a session to watch
 ```
 
 `list` ends each line with where the session's tools run: `tools on MACHINE` for the host, or `laptop tools` with the executor state for `--laptop` sessions.
+
+`usage` prints one line per provider with spend, budget, the provider's own budget period and start date, and step and unmeasured-session counts. Providers that report no usage print `unmeasured`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
 
 For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
 

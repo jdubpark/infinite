@@ -126,6 +126,36 @@ Linear API credential. Keep credentials, workspace mappings, and concrete issue
 bindings in private configuration or encrypted runtime state. Do not copy them
 into tracked configuration examples, screenshots, or repository reports.
 
+## Usage and budgets
+
+The host records OpenCode token usage and prices it. Usage is off until the host config has a `usage` block. The web client and `infinite usage` read the same ledger.
+
+```json
+{
+  "usage": {
+    "prices": {
+      "PROVIDER_ID/MODEL_ID": { "input": 0.5, "output": 2, "cacheRead": 0.1, "cacheWrite": 0.6 }
+    },
+    "budgets": {
+      "opencode": { "usd": 50, "period": "month" }
+    }
+  }
+}
+```
+
+- **Prices** are USD per million tokens, keyed `provider/model`. `cacheRead` and `cacheWrite` default to the `input` price. Reasoning tokens bill at the `output` price.
+- **Budgets** are per provider, in USD, with a `day`, `week`, or `month` period. Periods are UTC, weeks start on Monday, and the period defaults to `month`.
+
+A configured price wins over the cost OpenCode reports. Every figure names its source: `configured price`, `reported by OpenCode`, or unpriced when neither exists. A total that includes unpriced steps says how many, so it is never presented as complete.
+
+Budgets are informational. The host shows spent against budget and marks `over budget`, but it never pauses, refuses, or hides a team, goal, or session because of spend.
+
+Only some work is measured. OpenCode team members and OpenCode sessions started from the local UI report usage. Claude Code, Codex, Grok, and OpenCode in a native terminal do not, so their sessions, and team members that use them, show `Unmeasured`. Unmeasured work is counted separately and is never added to a total as zero.
+
+Headless team members record the model that was requested for them. If the provider substitutes another model, the ledger still prices the requested one.
+
+Each provider row is labelled with that provider's own budget period and window. The web client shows these in the Spend block on the team list, as a cost line on each member, and as agent spend on each team run and goal. `infinite usage` prints one line per provider, and `infinite usage --json` prints the raw summary from `GET /api/usage`.
+
 ## Roles and execution
 
 | Role | Responsibility | Output |

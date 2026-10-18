@@ -30,6 +30,7 @@ export type TeamView = {
   discovery?: { revision: number; summary: string; tasks: TeamScout[]; completedAt?: string };
   noChange?: { summary: string; evidence: TeamEvidence[] };
   stopReason?: "deadline" | "member-limit";
+  resumable?: boolean;
 };
 type CreateRequest = { requestId: string; projectId: string; provider: string; title: string; objective: string; parallelism: number; useConfiguredLineup?: boolean };
 type MutationRequest = { requestId: string; revision: number; text?: string; path: string; label: string };
@@ -251,6 +252,8 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   if (!team) return <div className="team-page"><h1>Team run</h1><p role="status">{loadError || "Loading team…"}</p>{loadError && <button className="text-button" onClick={view.refresh}><RefreshCw size={15} />Try again</button>}</div>;
   const goalHref = team.goal ? "#" + (machine === "direct" ? "" : "/machines/" + machine) + "/goals/" + team.goal.id : undefined;
   const openDecisions = team.decisions.filter(decision => decision.revision === team.revision && decision.answer === undefined);
+  const resumeRun = team.status === "paused" || team.resumable === true;
+  const showRunControl = resumeRun || !["blocked", "ready-for-review", "merged", "no-change"].includes(team.status);
   const memberSessions = sessions.filter(session => team.members.some(member => member.sessionId === session.id && member.revision === team.revision && ["running", "waiting"].includes(member.status)));
   const attention = memberSessions.filter(session => session.attention?.state === "needs-you");
   return <div className="team-detail">
@@ -276,7 +279,8 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       <section className="team-section"><h2>Review the changes</h2><dl className="team-output"><dt><GitBranch size={15} />Branch</dt><dd><code>{team.branch}</code></dd><dt>Workspace</dt><dd><code>{team.workspace}</code></dd><dt>Base commit</dt><dd><code>{team.baseCommit}</code></dd>{team.headCommit && <><dt>Head commit</dt><dd><code>{team.headCommit}</code></dd></>}</dl></section>
       {(team.steering.length > 0 || team.decisions.some(decision => decision.answer !== undefined)) && <section className="team-section"><h2>Your directions and decisions</h2>{team.steering.map((entry, index) => <div className="team-record" key={entry.at + "/" + index}><small>Direction · revision {entry.revision} · {date(entry.at)}</small><p className="team-prose">{entry.text}</p></div>)}{team.decisions.filter(decision => decision.answer !== undefined).map(decision => <div className="team-record" key={decision.id}><small>Decision · revision {decision.revision}</small><p className="team-prose">{decision.question}</p><p className="team-prose"><strong>Your answer: </strong>{decision.answer}</p></div>)}</section>}
       {team.events.length > 0 && <section className="team-section"><details className="team-history"><summary>Run history</summary><ol>{team.events.map((event, index) => <li key={event.at + "/" + index}><time>{date(event.at)}</time><p>{event.text}</p></li>)}</ol></details></section>}
-      {me.role === "owner" && !team.goal && team.status !== "cancelled" && <div className="team-actions">{team.status !== "blocked" && team.status !== "ready-for-review" && team.status !== "merged" && team.status !== "no-change" && <button className="text-button" disabled={!canOwn || busy || Boolean(pending)} onClick={() => action(team.status === "paused" ? "resume" : "pause", team.status === "paused" ? "Resume" : "Pause")}>{team.status === "paused" ? "Resume team" : "Pause team"}</button>}<button className="text-button team-cancel" disabled={!canOwn || busy || Boolean(pending)} onClick={() => { if (window.confirm("Cancel this team run? This stops its agent sessions and keeps the recorded work.")) action("cancel", "Cancellation"); }}>Cancel team</button></div>}
+      {team.resumable && <p className="quiet">Resume starts a fresh plan from the preserved integration commit. The stopped member workspace stays available.</p>}
+      {me.role === "owner" && !team.goal && team.status !== "cancelled" && <div className="team-actions">{showRunControl && <button className="text-button" disabled={!canOwn || busy || Boolean(pending)} onClick={() => action(resumeRun ? "resume" : "pause", resumeRun ? "Resume" : "Pause")}>{resumeRun ? "Resume team" : "Pause team"}</button>}<button className="text-button team-cancel" disabled={!canOwn || busy || Boolean(pending)} onClick={() => { if (window.confirm("Cancel this team run? This stops its agent sessions and keeps the recorded work.")) action("cancel", "Cancellation"); }}>Cancel team</button></div>}
     </div>
     <div className="team-composer-area">
       {request.message && <p className={request.result ? "quiet" : "error"} role="status">{request.message}</p>}

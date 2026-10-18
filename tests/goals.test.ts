@@ -158,6 +158,7 @@ test("a goal reconciles lost Linear acknowledgements, gathers evidence, escalate
     assert.equal(ready.memberCount, runs.reduce((sum, run) => sum + run.members.length, 0));
     assert.equal(ready.usage.total.messages, ready.cycles.reduce((sum, cycle) => sum + (cycle.usage?.messages ?? 0), 0));
     assert.equal(ready.usage.unmeasuredMembers, ready.memberCount, "This lineup has no measured provider, so no member may appear as zero cost");
+    assert.ok(ready.cycles.length > 0 && ready.cycles.every(cycle => cycle.usage === undefined), "A cycle with no measured member carries no usage figure");
     assert.equal(ready.usage.total.cost, 0);
     assert.equal(runs[1].goal?.maxMembers, request.maxMembers - runs[0].members.length);
     assert.equal(git(f.source, "rev-parse", "HEAD"), f.base);

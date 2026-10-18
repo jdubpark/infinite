@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Config } from "./types.js";
+import type { Config, Provider } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
@@ -44,6 +44,14 @@ const runEvent = (run: TeamRun, text: string) => {
 };
 
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
+
+/**
+ * The fallback for a member stopped at a provider limit. Its own provider counts as limited even when
+ * only a single-source observation saw the limit, so a second hop never returns to that account.
+ */
+export function switchFallback(lineup: TeamLineup, profileId: string, provider: Provider, limited: Set<Provider>) {
+  return resolveLimitFallback(lineup, profileId, new Set([...limited, provider]));
+}
 
 /** A one-hour member stop can replan. Interrupted workspace operations cannot. */
 export function blockedTeamCanResume(input: {
@@ -920,7 +928,7 @@ export class TeamService {
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;
     }
-    const from = member.modelProfile, selected = from && run.lineup ? resolveLimitFallback(run.lineup, from.id, this.limits.limited()) : undefined;
+    const from = member.modelProfile, selected = from && run.lineup ? switchFallback(run.lineup, from.id, provider, this.limits.limited()) : undefined;
     // Only a Claude profile can run report-only permission review.
     const fallback = member.role === "permission-coordinator" && selected?.provider !== "claude" ? undefined : selected;
     if (!from || !fallback) {

@@ -73,9 +73,11 @@ export class GoalService {
     const rollups = goal.cycles.map(cycle => {
       try {
         const { usage } = this.teams.get(cycle.teamId);
-        cycle.usage = usage.total;
+        // A cycle whose members are all unmeasured has no figure; a zero total would read as measured and free.
+        if (usage.total.messages > 0 || usage.unmeasuredMembers === 0) cycle.usage = usage.total;
+        else delete cycle.usage;
         return usage;
-      } catch (error) { if (error instanceof TeamError && error.code === "team-not-found") { const missing = emptyRollup(cycle.memberCount); cycle.usage = missing.total; return missing; } throw error; }
+      } catch (error) { if (error instanceof TeamError && error.code === "team-not-found") { delete cycle.usage; return emptyRollup(cycle.memberCount); } throw error; }
     });
     goal.usage = addRollups(rollups);
     return goal;

@@ -4,14 +4,60 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { createInterface } from "node:readline";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 
 import { git, limitLineup, mixedLineup, fixture } from "./team-fixture.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
+
+test("team runs use readable date, title slug, and ID names under the project teamwork root", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const firstRequest = f.create();
+    const firstCreated = await f.host.fetchApi("/teams", "owner", firstRequest);
+    const first = await f.settled(firstCreated.body.id);
+    const firstName = `${first.createdAt.slice(0, 10)}-implement-a-small-feature-${first.id.slice(0, 8)}`;
+    assert.equal(first.workspace, join(f.host.config.teams!.workspaceDir, "rehearsal", firstName, "integration"));
+    assert.equal(first.branch, `infinite/implement-a-small-feature-${first.id.slice(0, 8)}`);
+
+    const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true });
+    const secondRequest = f.create();
+    const secondCreated = await f.host.fetchApi("/teams", "owner", secondRequest);
+    const second = await f.settled(secondCreated.body.id);
+    const secondName = `${second.createdAt.slice(0, 10)}-implement-a-small-feature-${second.id.slice(0, 8)}`;
+    assert.equal(second.workspace, join(teamworkRoot, secondName, "integration"));
+    assert.equal(second.branch, `infinite/implement-a-small-feature-${second.id.slice(0, 8)}`);
+    // macOS clears setgid on directories whose group the owner does not belong to.
+    if (process.platform === "linux") assert.equal(statSync(teamworkRoot).mode & 0o2000, 0o2000, "a newly created shared teamwork root has setgid");
+  } finally { await f.close(); }
+});
+
+test("legacy team records without a saved root retain their workspace and branch", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const finished = await f.settled(created.body.id);
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    const legacyDirectory = join(f.host.config.teams!.workspaceDir, finished.id);
+    renameSync(dirname(finished.workspace), legacyDirectory);
+    stored.run.workspace = join(legacyDirectory, "integration");
+    stored.run.branch = `infinite/team-${finished.id}`;
+    delete stored.root;
+    writeSealed(file, key, `team:${finished.id}`, stored);
+    await f.host.start();
+    const restored = await f.get(finished.id);
+    assert.equal(restored.workspace, join(legacyDirectory, "integration"));
+    assert.equal(restored.branch, `infinite/team-${finished.id}`);
+    assert.equal(restored.status, "ready-for-review");
+  } finally { await f.close(); }
+});
 
 test("an opted-in blank project accepts coordinator checks and reaches review only after verifying the implemented invariant", { timeout: 120000 }, async () => {
   const f = await fixture("bootstrap");

@@ -12,13 +12,14 @@ import { teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
 import type { LinearService } from "./linear.js";
 import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureMemberResult, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, validateTeamPlan } from "./team-workspace.js";
+import { assertTeamworkPath } from "./repo-enrollment.js";
 export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
 type Action = { requestId: string; revision: number };
 type StartInProject = <T>(projectId: string, start: () => Promise<T>) => Promise<T>;
 type Stored = {
-  run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean;
+  run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string;
   pending?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number };
   halt?: "pause" | "cancel" | "steer" | "block";
   checkHead?: string;
@@ -151,17 +152,22 @@ export class TeamService {
       const parent = goal?.parentRunId ? this.record(goal.parentRunId).run : undefined;
       if (parent && (parent.goal?.id !== goal!.id || parent.projectId !== parsed.projectId || parent.status !== "ready-for-review" || !parent.headCommit))
         throw new TeamError(409, "invalid-goal-parent", "Continue only from a ready, recorded run of this goal and project.");
-      if (parent) assertTeamPath(this.config.teams.workspaceDir, parent.workspace);
+      if (parent) assertTeamPath(this.records.get(parent.id)?.root ?? this.config.teams.workspaceDir, parent.workspace);
       const source = { path: parent?.workspace ?? project.path, ...(parent ? { head: parent.headCommit! } : internal?.handoff ? { head: internal.handoff.checkpointHead } : {}) };
       const parentRevision = parent?.revision;
       const at = timestamp();
-      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(this.config.teams.workspaceDir, parsed.requestId), branch: `infinite/team-${parsed.requestId}`, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      const slug = parsed.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/g, "") || "team";
+      const suffix = parsed.requestId.slice(0, 8);
+      const directoryName = `${at.slice(0, 10)}-${slug}-${suffix}`;
+      const branch = `infinite/${slug}-${suffix}`;
+      const root = project.teamworkDir ?? join(this.config.teams.workspaceDir, project.id);
+      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       if (parent?.establishChecks || project.team.establishChecks) {
         run.establishChecks = true;
         if (parent?.verification) run.verification = structuredClone(parent.verification);
       }
       this.assertBudget(run);
-      const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
+      const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, root, source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
       this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
       this.operation(stored, "prepare", async signal => this.startInProject(run.projectId, async () => {
         const assertParent = () => {
@@ -169,7 +175,8 @@ export class TeamService {
             throw new TeamError(409, "parent-workspace-changed", "The previous goal run changed while its continuation was being prepared.");
         };
         assertParent();
-        const workspace = await prepareTeamWorkspace(source.path, this.config.teams!.workspaceDir, run.id, this.config.teams?.commandPrefix, signal, source.head);
+        if (project.teamworkDir) assertTeamworkPath(this.config, root);
+        const workspace = await prepareTeamWorkspace(source.path, root, directoryName, branch, this.config.teams?.commandPrefix, signal, source.head, this.config.sync?.sharedGroup, Boolean(project.teamworkDir));
         assertParent();
         if (project.team?.setup) {
           const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
@@ -417,7 +424,7 @@ export class TeamService {
         if (run.reason !== reason) { run.reason = reason; this.save(stored); }
       }
       if (stored.pending) return;
-      assertTeamPath(this.config.teams!.workspaceDir, run.workspace);
+      assertTeamPath(stored.root ?? this.config.teams!.workspaceDir, run.workspace);
       for (const member of run.members.filter(item => item.revision === run.revision && activeMember(item))) {
         if (member.status === "queued") { await this.launch(stored, member); continue; }
         if (!member.report) {
@@ -591,7 +598,7 @@ export class TeamService {
   }
   private async launch(stored: Stored, member: TeamMember) {
     this.assertBudget(stored.run);
-    assertTeamPath(this.config.teams!.workspaceDir, member.cwd);
+    assertTeamPath(stored.root ?? this.config.teams!.workspaceDir, member.cwd);
     // Recover an already-created assignment even while Linear is unavailable. A new
     // process requires the bridge's fresh feature and parent issue observations.
     if (!this.hasLaunch(member)) {
@@ -603,7 +610,7 @@ export class TeamService {
     if (!this.hasLaunch(member) && (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; }
     // All launch fields were persisted with the queued member before this call.
     let result;
-    try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession({ requestId: member.sessionId, provider: member.provider ?? stored.run.provider, projectId: stored.run.projectId, title: member.title, prompt: member.prompt }, assignment(member), member.cwd, member.modelProfile)); }
+    try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession({ requestId: member.sessionId, provider: member.provider ?? stored.run.provider, projectId: stored.run.projectId, title: member.title, prompt: member.prompt }, assignment(member), member.cwd, member.modelProfile, stored.root)); }
     catch (error) { if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; } throw error; }
     member.status = result.status === "unavailable" ? "unavailable" : "running"; member.startedAt ??= timestamp(); this.save(stored);
   }

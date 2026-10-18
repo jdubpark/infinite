@@ -43,7 +43,7 @@ async function git(cwd: string, args: string[], prefix?: TeamCommand, timeoutMs 
   return args.includes("-z") ? result.stdout : result.stdout.trim();
 }
 function lines(value: string) { return value.split("\0").filter(Boolean); }
-export function teamWorkspacePath(root: string, runId: string) { return join(root, runId, "integration"); }
+export function teamWorkspacePath(root: string, directoryName: string) { return join(root, directoryName, "integration"); }
 /** A source handoff must preserve every tracked and untracked edit and pin the actual root. */
 export async function cleanTeamCheckpoint(source: string, expectedHead: string, prefix?: TeamCommand) {
   const canonical = realpathSync(source);
@@ -52,7 +52,7 @@ export async function cleanTeamCheckpoint(source: string, expectedHead: string, 
   await assertMemberReadOnly(canonical, expectedHead, prefix);
   return expectedHead;
 }
-export async function prepareTeamWorkspace(source: string, root: string, runId: string, prefix?: TeamCommand, signal?: AbortSignal, expectedHead?: string) {
+export async function prepareTeamWorkspace(source: string, root: string, directoryName: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, expectedHead?: string, sharedGroup = false, teamworkRoot = false) {
   let canonical: string, top: string;
   try { canonical = realpathSync(source); top = await git(canonical, ["rev-parse", "--show-toplevel"], prefix, 30000, signal); }
   catch { throw new TeamError(409, "project-not-git-root", "The configured team project must be an accessible Git repository with a committed HEAD."); }
@@ -62,14 +62,15 @@ export async function prepareTeamWorkspace(source: string, root: string, runId: 
   const baseCommit = await git(canonical, ["rev-parse", "HEAD"], prefix, 30000, signal);
   if (expectedHead !== undefined && baseCommit !== expectedHead)
     throw new TeamError(409, "parent-workspace-changed", "The previous goal run no longer matches its recorded integration commit. Its workspace must be reconciled before continuing.");
+  const rootExisted = existsSync(root);
   mkdirSync(root, { recursive: true, mode: 0o770 });
-  const directory = join(realpathSync(root), runId);
+  if (teamworkRoot && sharedGroup && !rootExisted) chmodSync(root, 0o2770);
+  const directory = join(realpathSync(root), directoryName);
   if (existsSync(directory)) throw new TeamError(409, "workspace-exists", "This team workspace already exists and needs explicit reconciliation.");
   mkdirSync(directory, { mode: 0o770 }); chmodSync(directory, 0o2770);
   const workspace = join(directory, "integration");
   await git(directory, ["clone", "--no-local", "--no-hardlinks", "--", canonical, workspace], prefix, 120000, signal);
   await git(workspace, ["remote", "remove", "origin"], prefix, 30000, signal);
-  const branch = `infinite/team-${runId}`;
   await git(workspace, ["checkout", "-b", branch, baseCommit], prefix, 30000, signal);
   if (await git(canonical, ["rev-parse", "HEAD"], prefix, 30000, signal) !== baseCommit || await git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"], prefix, 30000, signal))
     throw new TeamError(409, "project-changed", "The source project changed during capture. The team remains blocked with its isolated copy preserved.");

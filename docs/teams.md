@@ -460,6 +460,24 @@ configured provider policy; retries do not grant permission.
 
 ## Configuration
 
+Each new run gets a folder named from its UTC creation date, a slug of its
+title, and the first eight characters of its ID, such as
+`2026-01-15-add-export-3f2a9c1d/`, holding the `integration/` checkout and the
+`members/` copies. Its branch is `infinite/<slug>-<id8>`. The run ID remains its
+identity in the API, receipts, and Linear. Runs go under
+`teams.workspaceDir/<project-id>/` unless the project has a teamwork folder.
+
+A teamwork folder keeps a product's runs beside its code under the server home.
+For a mirrored `Projects/sample/codebase`, run `infinite repo init --teamwork
+../teamwork` in that checkout; runs then go to `Projects/sample/teamwork/` on the
+host, next to `Projects/sample/codebase/`. The local path is resolved from the
+current directory, must be below the local home and outside the repository, and
+is stored as its home-relative path. The host refuses a folder equal to its sync
+home, reached through a symbolic link, or overlapping any project, the team
+workspace root, or host state and credential paths, and checks again when each
+run is prepared. `--teamwork none` returns new runs to the default root.
+Existing runs keep the folder and branch they were created with.
+
 Enable teams in the private host configuration and define the project's
 verification commands. Commands use executable/argument arrays, without an
 implicit shell. This example is for a project with a suitable `npm run check`

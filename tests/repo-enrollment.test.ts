@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -83,6 +83,42 @@ test("repository enrollment validates Git, persists a path-bound overlay, and re
     assert.equal(config.projects[0].linear, undefined);
     assert.equal(existsSync(join(f.projectPath, "must-not-run")), false);
   } finally { f.close(); }
+});
+
+test("teamwork enrollment persists a home-relative folder and rejects protected, overlapping, or symlink paths", async () => {
+  const f = fixture();
+  try {
+    const homeDir = f.root;
+    const config = f.config(); config.sync = { homeDir };
+    const service = new RepoEnrollmentService(config, f.key);
+    const request = { requestId: randomUUID(), revision: 0, team: { checks: [{ command: "node", args: ["-e", "process.exit(0)"] }] }, teamwork: "Projects/teamwork" };
+    const saved = await service.put("example", request);
+    assert.equal(saved.teamwork, "Projects/teamwork");
+    assert.equal(config.projects[0].teamworkDir, join(realpathSync(homeDir), "Projects/teamwork"));
+    const restartedConfig = f.config(); restartedConfig.sync = { homeDir };
+    assert.equal(new RepoEnrollmentService(restartedConfig, f.key).get("example").teamwork, "Projects/teamwork");
+  } finally { f.close(); }
+  const rejects = async (path: string, code: string | undefined, change?: (root: string, value: Config) => void) => {
+    const g = fixture();
+    try {
+      const value = g.config(); value.sync = { homeDir: g.root }; change?.(g.root, value);
+      const enrollment = new RepoEnrollmentService(value, g.key);
+      const request = { requestId: randomUUID(), revision: 0, team: { checks: [{ command: "node", args: ["-e", "process.exit(0)"] }] }, teamwork: path };
+      await assert.rejects(enrollment.put("example", request), (error: { code?: string }) => code === undefined || error.code === code, path);
+      assert.equal(value.projects[0].teamworkDir, undefined, "a refused folder is not applied");
+    } finally { g.close(); }
+  };
+  await rejects("project/work", "teamwork-path-conflict");
+  await rejects("Projects", "teamwork-path-conflict", (root, value) => {
+    const child = join(root, "Projects/child"); mkdirSync(child, { recursive: true });
+    value.projects.push({ id: "nested", name: "Nested", path: child });
+  });
+  await rejects("linked/teamwork", "teamwork-path-symlink", root => {
+    const outside = join(root, "outside"); mkdirSync(outside); symlinkSync(outside, join(root, "linked"));
+  });
+  await rejects("team-workspaces/sample", "teamwork-path-conflict");
+  await rejects("state", "teamwork-path-conflict");
+  await rejects("../outside", undefined);
 });
 
 test("repository enrollment rejects stale revisions, dirty worktrees, and in-flight changes", async () => {

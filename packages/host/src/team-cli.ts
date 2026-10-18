@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema } from "./team-types.js";
@@ -87,6 +87,25 @@ function canonicalDirectory(directory: string) {
   if (!statSync(path).isDirectory()) throw new Error("Choose a directory.");
   if (path === realpathSync(homedir()) || path === dirname(path)) throw new Error("The home directory and filesystem root are not supported.");
   return path;
+}
+function canonicalTeamworkPath(value: string, cwd: string, repository: string) {
+  const requested = resolve(cwd, value);
+  let ancestor = requested;
+  const missing: string[] = [];
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) throw new Error("The teamwork path has no existing ancestor.");
+    missing.unshift(basename(ancestor)); ancestor = parent;
+  }
+  const canonical = join(realpathSync(ancestor), ...missing);
+  const home = realpathSync(homedir());
+  const homeRelative = relative(home, canonical);
+  if (!homeRelative || homeRelative === ".." || homeRelative.startsWith(`..${sep}`) || isAbsolute(homeRelative))
+    throw new Error("The teamwork folder must be below the local home directory.");
+  const repoRel = relative(repository, canonical), targetRel = relative(canonical, repository);
+  const within = (path: string) => path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
+  if (within(repoRel) || within(targetRel)) throw new Error("The teamwork folder must be outside and separate from the repository.");
+  return localProjectPath(canonical);
 }
 function gitRootOrNonGit(directory: string): { root: string } | { nonGit: true } {
   let stderr = "";
@@ -306,7 +325,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
   const stateDir = join(dirname(configPath), "team-cli", identity);
   const mappingsPath = join(stateDir, "repo-mappings.json"), receiptsPath = join(stateDir, "receipts.json");
   if (command === "repo") {
-    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--setup-json JSON] [--check-json JSON] [--linear-team UUID] [--linear-project UUID]");
+    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--teamwork PATH|none] [--setup-json JSON] [--check-json JSON] [--linear-team UUID] [--linear-project UUID]");
     const requestedDirectory = canonicalDirectory(positional[1] ?? process.cwd());
     const gitResult = gitRootOrNonGit(requestedDirectory);
     const defaultsPath = join(stateDir, "directory-defaults.json");
@@ -315,7 +334,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
     const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
     if ("nonGit" in gitResult) {
-      const unsupported = ["--project", "--setup-json", "--check-json", "--handoff", "--request-id"].filter(flag => options[flag] !== undefined);
+      const unsupported = ["--project", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id"].filter(flag => options[flag] !== undefined);
       if (unsupported.length) throw new Error(`This directory is not a Git repository, so ${unsupported.join(", ")} cannot be used here. Run repo init in a Git repository for enrollment, or use only --linear-team and --linear-project to save directory defaults.`);
       if (!explicitLinearTeam && explicitLinearProject && !inheritedDefault?.teamId)
         throw new Error("--linear-project requires --linear-team or an inherited directory Linear team.");
@@ -332,6 +351,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       return true;
     }
     const root = gitResult.root;
+    const teamwork = options["--teamwork"] === undefined ? undefined : String(options["--teamwork"]) === "none" ? null : canonicalTeamworkPath(String(options["--teamwork"]), process.cwd(), root);
     const status = git(root, ["status", "--porcelain", "--untracked-files=all"]);
     if (status) throw new Error("Repository must be clean before onboarding. Commit or remove tracked and untracked changes first.");
     const head = inspectSourceHead(root);
@@ -407,12 +427,13 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       linearDefaultsFrom = rootDefault.origin;
     }
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}) };
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.
     const linearIntent = (request: Record<string, any>) => request.linear === undefined ? targetLinear ?? null : request.linear;
-    requireSamePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)), options["--request-id"] === undefined ? undefined : requestId, rawArgs);
+    const teamworkIntent = (request: Record<string, any>) => request.teamwork === undefined ? target.teamwork ?? null : request.teamwork;
+    requireSamePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)), options["--request-id"] === undefined ? undefined : requestId, rawArgs);
     if (uploadSource) {
       assertSourceUnchanged();
       process.stderr.write(`[Infinite] Request ${requestId}\n`);
@@ -456,7 +477,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     if (explicitProject || uploadSource) { config.projectId = selected; privateJson(configPath, config); }
     const source = uploadSource && !head.commit ? "empty cloud baseline" : uploadSource ? `local commit ${head.commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout";
-    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, revision: output.revision, execution: output.execution, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source }, null, 2));
+    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, teamwork: output.teamwork, revision: output.revision, execution: output.execution, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source }, null, 2));
     return true;
   }
   const [subcommand, id, ...rest] = positional;

@@ -12,7 +12,7 @@ type Entry = { path: string; id: string; forgotten?: true };
 const slug = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60).replace(/-+$/g, "") || "project";
 
 /** The wire path is relative to a home directory, with portable separators and no normalization ambiguity. */
-function homeRelativePath(path: string): boolean {
+export function homeRelativePath(path: string): boolean {
   return path.length > 0 && path.length <= 4096 && !path.startsWith(".") &&
     !/[\\\x00-\x1f\x7f-\x9f]/.test(path) && path.split("/").every(part => part !== "" && part !== "." && part !== "..");
 }

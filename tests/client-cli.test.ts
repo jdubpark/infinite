@@ -116,6 +116,31 @@ test("projects forget matches the Git root and removes local repository bindings
   } finally { await host.stop(); rmSync(localRoot, { recursive: true, force: true }); rmSync(cloudHome, { recursive: true, force: true }); }
 });
 
+test("repo init sends, removes, and omits the teamwork setting as requested", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success", mixedLineup);
+  const localRoot = mkdtempSync(join(homedir(), "infinite-cli-teamwork-"));
+  const checkout = join(localRoot, "checkout"), teamwork = join(localRoot, "teamwork");
+  mkdirSync(checkout); mkdirSync(teamwork);
+  await exec("git", ["init", "--initial-branch=main"], { cwd: checkout });
+  writeFileSync(join(checkout, "source.txt"), "local checkout\n");
+  await exec("git", ["-C", checkout, "add", "source.txt"]);
+  await exec("git", ["-C", checkout, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture"]);
+  const clientFile = join(run.host.root, "teamwork-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const checks = ["--check-json", JSON.stringify([{ command: "node", args: ["-e", "process.exit(0)"] }])];
+  const invoke = (args: string[]) => exec(entry[0], [...entry.slice(1), "repo", "init", checkout, "--project", "rehearsal", ...checks, ...args], { cwd: checkout });
+  try {
+    const selected = JSON.parse((await invoke(["--teamwork", "../teamwork", "--json"])).stdout);
+    const relativeTeamwork = relative(realpathSync(homedir()), realpathSync(teamwork)).split(/[\\/]/).join("/");
+    assert.equal(selected.teamwork, relativeTeamwork);
+    const omitted = JSON.parse((await invoke(["--json"])).stdout);
+    assert.equal(omitted.teamwork, relativeTeamwork, "omission retains the saved host setting");
+    const removed = JSON.parse((await invoke(["--teamwork", "none", "--json"])).stdout);
+    assert.equal(removed.teamwork, null);
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
+});
+
 test("repo init enrolls an unborn local repository without changing it and uploads an empty cloud baseline", { timeout: 120000 }, async () => {
   const localRoot = mkdtempSync(join(homedir(), "infinite-cli-unborn-repo-"));
   const cloudHome = mkdtempSync(join(tmpdir(), "infinite-cli-unborn-cloud-"));

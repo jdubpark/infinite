@@ -75,7 +75,7 @@ export class GoalService {
         const { usage } = this.teams.get(cycle.teamId);
         cycle.usage = usage.total;
         return usage;
-      } catch (error) { if (error instanceof TeamError && error.code === "team-not-found") return emptyRollup(cycle.memberCount); throw error; }
+      } catch (error) { if (error instanceof TeamError && error.code === "team-not-found") { const missing = emptyRollup(cycle.memberCount); cycle.usage = missing.total; return missing; } throw error; }
     });
     goal.usage = addRollups(rollups);
     return goal;

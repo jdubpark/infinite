@@ -19,8 +19,11 @@ Each member report is bound to its run, member, and revision and is acknowledged
 after durable recording. Separate Git copies isolate edits without sandboxing
 providers. Git, setup, and check commands must run under the intended agent
 identity. Workspace files remain plaintext runtime data. Provider permissions
-remain unchanged; headless OpenCode rejects unmet permissions instead of
-providing an interactive approval flow. Profile `dataUse` labels disclose
+remain with the owner unless an explicit repository policy delegates bounded
+one-shot requests to the strong coordinator. Guarded delivery checks the current
+assignment, workspace, prompt, policy, expiry and human input control. Workspace
+trust and persistent allow rules remain outside delegation. Headless OpenCode
+rejects unmet permissions instead of providing an interactive approval flow. Profile `dataUse` labels disclose
 configured contributor use without changing provider terms or retention. See
 [Goals and agent teams](teams.md) for scope, routing, limits, and recovery.
 
@@ -70,13 +73,13 @@ Selected-root files, content-addressed blobs and materialized checkpoints are pl
 
 ## Remote machine transport
 
-Optional remote access is restricted to single-tenant runners. A runner can accept encrypted direct WebSockets and connect outbound to a separate relay. Keep the runner's ordinary HTTP API private. Only the separate relay endpoint is intended for public HTTPS exposure; it forwards opaque frames and routing metadata rather than exposing runner administration. [Remote machine setup](remote-machines.md) defines pairing and deployment.
+Optional remote access is restricted to single-tenant runners. A runner can accept encrypted direct WebSockets and connect outbound to a separate relay. Keep the runner's ordinary HTTP API private. Only the separate relay endpoint is intended for public HTTPS exposure; it forwards opaque frames and routing metadata rather than exposing runner administration. The supported public deployment puts Cloudflare Access in front of it: a service token is checked at Cloudflare's edge and the tunnel validates the Access JWT before forwarding, so unauthenticated traffic does not reach the server. Access is a spam and flood gate, not the application authentication; the paired device key still authenticates every channel. [Remote machine setup](remote-machines.md) defines pairing and deployment.
 
 The paired high-entropy device key authenticates the client and runner. The shared transport derives a pre-shared secret from its SHA-256 hash, authenticates fresh client/server nonces with HMAC, and uses HKDF to derive directional AES-GCM keys. Monotonic counters reject replay within each connection. The actual device key travels inside the encrypted request and is checked by the existing runner API. There is no forward secrecy: obtaining a paired key or its stored hash can expose captured transport sessions. Treat stored token hashes as transport secrets, not harmless password-verifier data.
 
-The relay uses separate per-machine registration keys. It cannot decrypt application requests without paired key material, but can observe machine/channel identifiers, traffic sizes and timing, and can delay or drop traffic. Relay and runner connections, pending requests, frame sizes and buffered output are bounded. HTTPS remains required outside literal loopback development. This protocol is not confidential-VM attestation or protection from a compromised execution host.
+The relay uses separate per-machine registration keys. It cannot decrypt application requests without paired key material, but can observe machine/channel identifiers, traffic sizes and timing, and can delay or drop traffic. A TLS-terminating proxy such as Cloudflare sits in the same position. Relay and runner connections, pending requests, frame sizes and buffered output are bounded. Upgrade attempts and concurrent client channels are also bounded per client address. Behind a local proxy, client channels enter only through a private Unix socket, and the relay reads the proxy's client-address header only there, so other local processes cannot choose an address or occupy client slots. Without Access in front, anyone who learns a machine ID can still occupy that machine's channels up to these limits. HTTPS remains required outside literal loopback development. This protocol is not confidential-VM attestation or protection from a compromised execution host.
 
-A web portal's hosting origin is trusted to supply its JavaScript. If the relay serves that portal, a malicious relay operator could replace the client code and capture the key before encryption. Protection from that operator requires a separately trusted web origin or trusted native build. Native keys use platform secure storage; browser pairings and decrypted views remain in tab memory. Browser speech dictation may use the browser vendor's speech service and is an explicit user action.
+A web portal's hosting origin is trusted to supply its JavaScript, so the relay serves no web client: a relay operator that supplied the code could capture the key before encryption. The browser client is for local development against a local or private host. Native keys use platform secure storage; browser pairings and decrypted views remain in tab memory. Browser speech dictation may use the browser vendor's speech service and is an explicit user action.
 
 The native Mac client and both direct and relayed phone connections use this
 application-encrypted transport. There is no automatic fallback to bearer HTTPS
@@ -155,6 +158,13 @@ Authenticate providers on the server in their own protected home, with only the 
 
 Repository briefings execute through a root-owned wrapper as `infinite-agent`, using that account's provider authentication (Codex, or Muse Spark and DeepSeek through OpenCode) and read-only source collection. The selected project source and explicitly supplied recorded chat messages are sent to the configured writer's provider; when the account holds a TypeSafe key, changed-line excerpts and claim excerpts are also sent to Jev. Muse Spark 1.3 Contributor is a contributor data-use model; check the provider's terms before routing a project to it. Approve that transmission for each project before enabling automatic briefings. The feature does not discover provider histories or other sessions. The agent account remains a shared single-tenant trust boundary; briefings are unavailable when the runtime cannot resolve a cloud source root, including current hybrid laptop and cmux sessions. See [repository briefings](repository-briefings.md) for deployment and evidence limits.
 
+For unattended GitHub delivery, the optional [GitHub App renewal service](../deploy/ubuntu/github-app.md)
+keeps the app private key outside agent-readable storage and issues one-repository
+installation tokens. The Git/GitHub client refuses expired or mismatched tokens
+for configured repositories. Existing credentials for other repositories remain
+separate. Agents sharing a Unix identity can read that identity's token files;
+this does not add filesystem isolation or change provider approval controls.
+
 Workspace sync runs only on single-tenant hosts. Owner CLI launches without `--project` start or reuse it for the selected home-relative checkout; an explicit `infinite sync` can also start it. Folder registration accepts only an owner bearer key, persists in sealed host state, and refuses symlink aliases, overlapping projects, and protected host paths. It uploads the entire Git root of the selected checkout, including ignored and untracked files and its `.git` directory. For a linked Git worktree it also uploads Git metadata from outside the root: the common repository's objects, refs, ref logs, packed refs, `info/`, `shallow`, `description`, and a projected config, and the worktree's own `HEAD`, `index`, ref logs, refs, in-progress merge, rebase, cherry-pick, revert, and bisect state, and a projected `config.worktree`. A Git config can carry credentials such as a token in a remote URL. Keep credentials out of synced checkouts or accept that they reach the host. A forced apply replaces the cloud tree; one previous copy is kept beside the project directory. Received chunks are plaintext files under the host's private state directory, so that directory belongs on the encrypted storage above. See [workspace sync](workspace-sync.md).
 
 The owner pilot now has an age-encrypted laptop backup with file, SQLite, and journal restore verification. Its daily server timer creates encrypted snapshots; automatic upload to independent storage is still pending. See [backup operations](../deploy/ubuntu/backups.md).
@@ -180,3 +190,24 @@ Before putting private production repositories here, verify the isolation and st
 ## Dependency audit
 
 The current lockfile's production host dependency audit reports zero known advisories. The full workspace audit reports 29 findings (19 high, 10 moderate), propagated from four transitive packages in the Expo 57 dependency tree: `braces`, `node-forge`, `uuid`, and `decode-uri-component`. Most are in build tooling; the Router URI decoder also requires review before native release. At the time of the check, the registry's latest `braces` and `node-forge` versions remained affected. A forced audit fix proposed incompatible SDK changes, so it was not applied. These findings remain open; the mobile debug build is not a security-reviewed release.
+
+## Delegated team permission decisions
+
+Delegation is an explicit repository enrollment policy, pinned when a run starts.
+Only the run's strong Claude coordinator profile can report a permission decision. The
+report channel remains bound to its own assignment; it receives no owner key or
+sibling-session control capability. The host applies only a current one-shot
+choice after verifying the target assignment, canonical workspace, prompt
+identity and evidence, owner policy, expiry and human control lease. It records
+intent before delivery and preserves uncertain acknowledgements without replay.
+
+The permission coordinator runs noninteractively with no built-in tools and only
+the authenticated assignment report MCP server. Unexpected tool permissions are
+denied. Configurations that add conflicting launch or MCP flags are rejected.
+If the configured strong provider is unsupported, the request remains with the owner.
+
+The owner can revoke a run's delegation independently of task steering. Changing
+the repository policy does not opt existing runs in. Coordinator prompts never
+qualify for recursive approval; workspace trust, persistent allow rules and
+unsupported native requests require owner handling. This does not isolate
+processes sharing a Unix account or grant permission beyond the accepted task.

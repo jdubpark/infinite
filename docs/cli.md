@@ -40,20 +40,36 @@ infinite close SESSION_ID  # confirm before ending its provider process
 Initialize a project from a clean Git checkout, then start and control teams from that directory:
 
 ```sh
-infinite repo init [DIRECTORY] [--project PROJECT_ID]
+infinite repo init [DIRECTORY] [--project PROJECT_ID] [--teamwork PATH|none]
 infinite repo init --check-json '[{"command":"make","args":["test"]}]'
 infinite repo init --linear-team TEAM_UUID --linear-project PROJECT_UUID
 infinite team start "Add a feature"
 infinite team start --prd requirements.md
 infinite team status
+infinite team status TEAM_ID
 infinite team status TEAM_ID --json
+infinite team status TEAM_ID --logs
 infinite team watch TEAM_ID
+infinite team watch TEAM_ID --logs
+infinite team pull TEAM_ID [--json]
 infinite team steer TEAM_ID "Keep the change within the API package"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing route"
 infinite team pause TEAM_ID
 infinite team resume TEAM_ID
 infinite team cancel TEAM_ID
 ```
+
+`infinite team status` without an ID lists each team. `infinite team status TEAM_ID`
+prints that team's open decisions and Jevcode summary. `infinite team watch
+TEAM_ID` keeps it full screen: `l` opens one agent's review log, `←` `→` or
+`n` `p` change agents, `s` or `b` returns to the summary, `↑` `↓`, `j` `k`,
+Space, and Page Up or Down scroll, `a` asks Jevcode when the summary is empty or
+failed, and `q` or Ctrl+C detaches. The bottom line always lists the keys for
+the current view. A non-interactive watch prints again only when the visible
+text changes. `--logs` starts in the review log, and
+`infinite team status TEAM_ID --logs` prints the current revision's logs once.
+`--json` prints the team record. See [Goals and agent teams](teams.md) for the
+full key list.
 
 Linear IDs are saved during enrollment; team commands do not need them again.
 To reuse them across repositories, initialize their parent folder once:
@@ -78,9 +94,11 @@ Paths are resolved before looking up parents, so a symlink outside the parent
 does not inherit its defaults. Defaults stay in private client storage for the
 paired host and device key; another pairing needs its own setup.
 
-For a repository, `repo init` binds the canonical Git root to its cloud project in private client state. Existing repositories must have a clean checkout. A freshly initialized, empty repository needs no first commit: the CLI creates an empty baseline only in the cloud snapshot and leaves local files, Git metadata, and history unchanged. The command infers `npm ci` when an npm lockfile exists and `npm run check` when `package.json` defines a `check` script. For a new empty repository without checks, onboarding authorizes the first team to establish them. Its coordinator must define verification commands before implementation; the host then runs them against the integrated work and requires independent review. Existing repositories without identifiable checks still need `--check-json` as a JSON array of `{ "command": "...", "args": [...] }` objects; `--setup-json` accepts one setup command in the same format. For a newly resolved local project, it uploads a one-time source snapshot from an isolated clone of the current commit. It does not start continuous sync or include ignored and untracked files. An explicit `--project` or existing directory binding configures the selected project without uploading local source. A pending cloud generation is refused; an already applied generation is retained without replacement.
+For a repository, `repo init` binds the canonical Git root to its cloud project in private client state. Existing repositories must have a clean checkout. `--teamwork PATH` selects a local folder outside the repository and below the local home; the host stores its matching home-relative path and uses it for new team runs. `--teamwork none` removes that setting, while omission preserves it. The option requires a Git repository. A freshly initialized, empty repository needs no first commit: the CLI creates an empty baseline only in the cloud snapshot and leaves local files, Git metadata, and history unchanged. The command infers `npm ci` when an npm lockfile exists and `npm run check` when `package.json` defines a `check` script. For a new empty repository without checks, onboarding authorizes the first team to establish them. Its coordinator must define verification commands before implementation; the host then runs them against the integrated work and requires independent review. Existing repositories without identifiable checks still need `--check-json` as a JSON array of `{ "command": "...", "args": [...] }` objects; `--setup-json` accepts one setup command in the same format. For a newly resolved local project, it uploads a one-time source snapshot from an isolated clone of the current commit. It does not start continuous sync or include ignored and untracked files. An explicit `--project` or existing directory binding configures the selected project without uploading local source. A pending cloud generation is refused; an already applied generation is retained without replacement.
 
 The host must have team workspace storage configured, and the project must have required checks or explicit authorization for the team to establish them, before `team start` can run. The host's configured lineup is used by default. `--provider PROVIDER` requests a single-provider team explicitly. `team start` uses the current directory's saved project binding, or an explicit `--project PROJECT_ID`. `team status` without an ID lists teams on the paired host; the other commands address a team by ID. `--linear-team` and `--linear-project` configure the optional project issue mapping during initialization. `--handoff auto|off` defaults to `auto` for this onboarding path.
+
+Run `team pull TEAM_ID` from the enrolled repository bound to that team's project to fetch its integrated branch as a local branch. It leaves your working tree and checked-out branch alone, skips a result already contained by that branch, and lets Git refuse a conflicting branch update.
 
 Ordinary provider launches from an enrolled directory also use its saved project binding. For example, `infinite claude` opens that project's existing cloud checkout without uploading local changes or starting continuous sync. Launching from a subdirectory preserves its relative working directory. Use explicit sync commands when the cloud source needs an update.
 
@@ -211,12 +229,15 @@ In ordinary terminal mode, accepted arguments after the provider name are passed
 
 ```sh
 infinite projects
+infinite projects forget [DIRECTORY] [--project PROJECT_ID]
 infinite --project PROJECT_ID --title "Investigate tests" codex --model MODEL
 infinite --detach --project PROJECT_ID claude "Review this checkout"
 infinite --client-config "$CLIENT_CONFIG_FILE" monitor SESSION_ID
 ```
 
 Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not translated. A launch without `--project` uploads the selected checkout through workspace sync. Use `--project ID` to select an existing server project without automatic upload. Sync scope includes ignored files, untracked files, and Git metadata; credentials inside that scope travel to the server.
+
+`infinite projects forget` removes the folder mapping for the current Git root, the supplied directory's Git root, or `--project PROJECT_ID`, and keeps the server directory and cloud files. See [workspace sync](workspace-sync.md#folder-mapping) for when it is refused.
 
 `--laptop` Codex launches use the laptop project and background cloud handoff described above. The earlier [SSH prototype](hybrid-execution.md#earlier-ssh-prototype) remains available for isolated protocol experiments and retains its original offline behavior.
 
@@ -250,3 +271,17 @@ Pairing validates the host and device role before saving a mode-0600 `~/.config/
 For a tunnel that already forwards local port 4780 to the trusted server's API, use `infinite pair http://127.0.0.1:4780 --token-file "$OWNER_KEY_FILE"`. Keep the forward bound to loopback and verify the SSH host identity. SSH encrypts the network connection between laptop and server; the existing Infinite terminal CLI carries HTTP/WebSocket traffic inside that tunnel. It does not use the native Mac/phone application's encrypted WebSocket protocol or its public relay. Native provider gateways, `--laptop`, sync, and pull retain this direct connection path. The standalone tunnel can run at login and does not require the Mac app to be open.
 
 This client currently connects directly to a trusted single-tenant runner. TLS pairing is not confidential-VM attestation and does not implement the future operator-private multi-tenant protocol.
+
+### Delegated team permissions
+
+Run `infinite repo init --permissions coordinator` once to delegate supported
+one-shot tool prompts to the strong Claude coordinator for future runs. The default
+scope covers the accepted task and assigned workspace; delivery still needs its
+separate repository policy. Use `--permission-scope TEXT` and
+`--permission-limit N` to narrow the scope or change the ten-decision default
+(maximum twenty).
+
+`infinite team revoke-permissions TEAM_ID` revokes an active run's delegation.
+`infinite repo init --permissions off` disables it for future runs. Workspace
+trust and unsupported prompts remain visible for owner handling. See
+[delegated permission behavior](teams.md#delegating-permission-decisions).

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ArrowUpRight, Check, ChevronRight, GitBranch, Plus, RefreshCw, Send, Users } from "lucide-react";
-import { ApiError, ago, names, useApi, type Me, type Session, type TeamLineup, type TeamModelProfile, type TeamBrief, type TeamEvidence, type LinearTrackingView, type UsageSummary, type UsageTotals, type TeamUsage, type ProviderLimit } from "./api";
+import { ApiError, ago, names, useApi, type LogEvent, type Me, type Session, type TeamLineup, type TeamModelProfile, type TeamBrief, type TeamEvidence, type LinearTrackingView, type UsageSummary, type UsageTotals, type TeamUsage, type ProviderLimit } from "./api";
+import { briefText, chooseBrief, monitorMembers, summarySessionId, type BriefingView } from "./team-monitor";
 import { useMachines } from "./machines";
 import { useLiveRefresh } from "./live-refresh";
 import { requestStore } from "./requests";
@@ -30,6 +31,7 @@ export type TeamView = {
   discovery?: { revision: number; summary: string; tasks: TeamScout[]; completedAt?: string };
   noChange?: { summary: string; evidence: TeamEvidence[] };
   stopReason?: "deadline" | "member-limit";
+  resumable?: boolean;
 };
 type CreateRequest = { requestId: string; projectId: string; provider: string; title: string; objective: string; parallelism: number; useConfiguredLineup?: boolean };
 type MutationRequest = { requestId: string; revision: number; text?: string; path: string; label: string };
@@ -211,6 +213,73 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
   </div>;
 }
 
+function eventLabel(event: LogEvent) {
+  if (event.type === "signal") return String(event.data.kind ?? "Signal");
+  if (event.type === "input-result") return event.data.state === "delivered" ? "Input delivered" : "Input";
+  if (event.type === "lifecycle") return String(event.data.status ?? "Session updated");
+  return event.type;
+}
+function eventDetail(event: LogEvent) {
+  const value = event.data.message ?? event.data.text ?? event.data.error;
+  return typeof value === "string" ? value : "";
+}
+function JevcodeSummary({ team, rows, failed, asking, error, onRequest }: {
+  team: TeamView; rows: { sessionId: string; status: BriefingView }[]; failed: boolean; asking: boolean; error: string;
+  onRequest: (sessionId: string) => void;
+}) {
+  const coordinatorId = summarySessionId(team.members, team.revision);
+  const chosen = chooseBrief(rows, coordinatorId);
+  const member = team.members.find(item => item.sessionId === chosen?.sessionId);
+  const brief = chosen?.status.summary?.repository?.brief;
+  const text = briefText(chosen?.status);
+  const when = chosen?.status.summary?.repository?.generatedAt ?? chosen?.status.summary?.at;
+  const updating = chosen?.status.state === "pending" || chosen?.status.state === "running";
+  const canAsk = !text && (chosen?.status.state === "empty" || chosen?.status.state === "failed");
+  const age = when ? ago(when) : "";
+  return <section className="team-section team-summary" aria-live="polite">
+    <div className="team-section-heading"><h2>Jevcode summary</h2><span className="quiet">{[brief || chosen?.status.summary?.engine === "jevcode" ? "Jevcode" : "Session summary", member ? roles[member.role].name : "", when ? date(when) : "", age].filter(Boolean).join(" · ")}</span></div>
+    {!text && <p className="quiet">{failed ? "The Jevcode summary could not be loaded." : !rows.length ? (team.members.length ? "Loading the Jevcode summary…" : "No agent session is available for a Jevcode summary.") : updating ? "Jevcode is writing the summary." : chosen?.status.error || "No Jevcode summary yet."}</p>}
+    {text && <>
+      {updating && <p className="quiet">Jevcode is updating this summary.</p>}
+      <p className="team-summary-lead">{brief?.summary ?? text}</p>
+      {brief?.architecture?.length ? <details className="team-summary-fold"><summary>System shape <span className="quiet">{brief.architecture.length}</span></summary><ul className="team-summary-list">{brief.architecture.map((item, index) => <li key={index}>{item.text}</li>)}</ul></details> : null}
+      {brief?.review?.length ? <><h3>Review first <span className="quiet">{brief.review.length}</span></h3><ol className="team-review-list">{brief.review.map((item, index) => <li key={index}>
+        <div className="team-review-head"><span className="team-review-rank">{index + 1}</span>{item.priority && <span className={"team-review-priority " + item.priority}>{item.priority}</span>}<strong>{item.area}</strong></div>
+        {item.why && <p>{item.why}</p>}
+        {item.question && <p className="team-review-question">Ask: {item.question}</p>}
+      </li>)}</ol></> : null}
+      {brief?.changes?.length ? <><h3>What changed <span className="quiet">{brief.changes.length}</span></h3><ul className="team-summary-list">{brief.changes.map((item, index) => <li key={index}>{item.text}</li>)}</ul></> : null}
+      {brief?.checks?.length ? <><h3>Check evidence <span className="quiet">{brief.checks.length}</span></h3><ul className="team-summary-list">{brief.checks.map((item, index) => <li key={index}>{item.text}</li>)}</ul></> : null}
+      {brief?.guidance?.length ? <details className="team-summary-fold"><summary>Guidance for agents <span className="quiet">{brief.guidance.length}</span></summary><ul className="team-summary-list">{brief.guidance.map((item, index) => <li key={index}>{[item.basis, item.text].filter(Boolean).join(": ")}</li>)}</ul></details> : null}
+      {brief?.unknowns?.length ? <><h3>Gaps and unknowns <span className="quiet">{brief.unknowns.length}</span></h3><ul className="team-summary-list">{brief.unknowns.map((item, index) => <li key={index}>{item}</li>)}</ul></> : null}
+      <p className="quiet">This is the Jevcode agent’s reading of recorded activity and the repository. It is not completion or approval.</p>
+    </>}
+    {error && <p className="error" role="alert">{error}</p>}
+    {canAsk && coordinatorId && <button className="text-button" disabled={asking} onClick={() => onRequest(chosen?.sessionId ?? coordinatorId)}>{asking ? "Asking Jevcode… this can take a few minutes" : "Ask Jevcode for a summary"}</button>}
+  </section>;
+}
+function TeamLogs({ member, session, events, failed, follow, setFollow, onOpen }: {
+  member: TeamMember; session: Session | null; events: LogEvent[]; failed: boolean; follow: boolean; setFollow: (value: boolean) => void; onOpen: () => void;
+}) {
+  const screenRef = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    const node = screenRef.current;
+    if (follow && node) node.scrollTop = node.scrollHeight;
+  }, [session?.screen, follow]);
+  return <section className="team-section team-logs">
+    <div className="team-section-heading"><h2>{roles[member.role].name}</h2><button className="text-button" onClick={onOpen}>Open session <ArrowUpRight size={16} /></button></div>
+    <p className="quiet">{member.title} · {member.status}{member.revision ? ` · revision ${member.revision}` : ""}{session?.attention?.now ? ` · ${session.attention.now}` : ""}</p>
+    {failed && <p className="team-notice" role="status">This agent’s log could not be refreshed.</p>}
+    <div className="screen-actions"><span>{session ? "Current screen" : "Loading the screen…"}</span><button className="text-button" aria-pressed={follow} onClick={() => setFollow(!follow)}>{follow ? "Following latest" : "Follow latest"}</button></div>
+    <pre className="screen" ref={screenRef} tabIndex={0} aria-label={`${roles[member.role].name} terminal screen`} onScroll={event => {
+      const node = event.currentTarget;
+      setFollow(node.scrollHeight - node.scrollTop - node.clientHeight < 48);
+    }}>{session?.screen || (member.status === "running" || member.status === "waiting" ? "Waiting for output…" : "No screen is recorded for this agent.")}</pre>
+    <div className="section-label activity-label"><h2>Recent log</h2><span>Control events</span></div>
+    {events.length ? <ol className="activity">{events.map(event => <li key={event.seq}><time>{date(event.at)}</time><span className="event-dot" /><div><strong>{eventLabel(event)}</strong>{eventDetail(event) && <p>{eventDetail(event)}</p>}</div></li>)}</ol> : <p className="quiet">No recent control events.</p>}
+  </section>;
+}
+
 export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSession }: { id: string; me: Me; connected: boolean; sessions: Session[]; refreshTeams: () => void; openSession: (id: string) => void }) {
   const api = useApi();
   const machine = useMachines().active.id;
@@ -248,13 +317,76 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
     } finally { inFlight.delete(body.requestId); if (mounted.current) setBusy(false); }
   }
   const action = (name: string, label: string) => void mutate("/teams/" + id + "/" + name, label);
+  const [mode, setMode] = useState<"summary" | "logs">("summary");
+  const [agentId, setAgentId] = useState("");
+  const [briefs, setBriefs] = useState<{ sessionId: string; status: BriefingView }[]>([]);
+  const [briefError, setBriefError] = useState("");
+  const [asking, setAsking] = useState(false);
+  const [logSession, setLogSession] = useState<Session | null>(null);
+  const [logEvents, setLogEvents] = useState<LogEvent[]>([]);
+  const [followLog, setFollowLog] = useState(true);
+  const logCursor = useRef<number | null>(null);
+  const orderedMembers = team ? monitorMembers(team.members, team.revision) : [];
+  const summaryTargets = orderedMembers.filter(member => member.revision === team?.revision).slice(0, 6);
+  const summaryKey = mode === "summary" ? (summaryTargets.length ? summaryTargets : orderedMembers.slice(0, 1)).map(member => member.sessionId).join(",") : "";
+  useEffect(() => {
+    logCursor.current = null;
+    setLogEvents([]);
+    setLogSession(null);
+    setFollowLog(true);
+  }, [agentId]);
+  useEffect(() => {
+    if (!team) return;
+    if (agentId && team.members.some(member => member.memberId === agentId)) return;
+    const next = monitorMembers(team.members, team.revision).find(member => member.revision === team.revision && (member.status === "running" || member.status === "waiting"))
+      ?? monitorMembers(team.members, team.revision)[0];
+    setAgentId(next?.memberId ?? "");
+  }, [team, agentId]);
+  const briefing = useLiveRefresh(async current => {
+    if (!summaryKey) return 8000;
+    const rows: { sessionId: string; status: BriefingView }[] = [];
+    for (const sessionId of summaryKey.split(",")) {
+      try { rows.push({ sessionId, status: await api<BriefingView>(`/sessions/${sessionId}/summary?status=1`) }); }
+      catch (error) { rows.push({ sessionId, status: { state: "unknown", error: (error as Error).message } }); }
+    }
+    if (current()) setBriefs(rows);
+    return 4000;
+  }, 4000, summaryKey);
+  const logs = useLiveRefresh(async current => {
+    const member = team?.members.find(item => item.memberId === agentId);
+    if (!member) return 1500;
+    const detail = await api<Session>(`/sessions/${member.sessionId}`);
+    const start = logCursor.current;
+    const after = start ?? Math.max(0, detail.seq - 80);
+    const page = await api<{ events: LogEvent[]; cursor: number; more: boolean }>(`/sessions/${member.sessionId}/events?after=${after}&types=lifecycle,signal,input-result&limit=80`);
+    if (!current()) return;
+    setLogSession(detail);
+    logCursor.current = page.cursor;
+    setLogEvents(previous => (start === null ? page.events : [...previous, ...page.events]).filter((event, index, all) => all.findIndex(item => item.seq === event.seq) === index).slice(-80));
+    return page.more ? 0 : 1500;
+  }, 1500, mode === "logs" ? agentId : "");
+  async function requestSummary(sessionId: string) {
+    setAsking(true);
+    setBriefError("");
+    try {
+      const summary = await api<BriefingView["summary"]>(`/sessions/${sessionId}/summary?after=0`, undefined, "GET", undefined, 180000);
+      if (!mounted.current) return;
+      const ready = Boolean(summary?.repository?.brief || summary?.text);
+      setBriefs(previous => [...previous.filter(row => row.sessionId !== sessionId), { sessionId, status: { state: ready ? "ready" : "empty", summary, error: ready ? undefined : "No recorded chat is available for a repository brief." } }]);
+    } catch (error) {
+      if (mounted.current) setBriefError((error as Error).message);
+    } finally { if (mounted.current) setAsking(false); }
+  }
   if (!team) return <div className="team-page"><h1>Team run</h1><p role="status">{loadError || "Loading team…"}</p>{loadError && <button className="text-button" onClick={view.refresh}><RefreshCw size={15} />Try again</button>}</div>;
   const goalHref = team.goal ? "#" + (machine === "direct" ? "" : "/machines/" + machine) + "/goals/" + team.goal.id : undefined;
   const openDecisions = team.decisions.filter(decision => decision.revision === team.revision && decision.answer === undefined);
+  const resumeRun = team.status === "paused" || team.resumable === true;
+  const showRunControl = resumeRun || !["blocked", "ready-for-review", "merged", "no-change"].includes(team.status);
   const memberSessions = sessions.filter(session => team.members.some(member => member.sessionId === session.id && member.revision === team.revision && ["running", "waiting"].includes(member.status)));
   const attention = memberSessions.filter(session => session.attention?.state === "needs-you");
+  const selectedMember = team.members.find(member => member.memberId === agentId);
   return <div className="team-detail">
-    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span>Up to {team.parallelism} implementers</span></div></div><button className="text-button" disabled={view.refreshing} onClick={view.refresh}><RefreshCw size={14} />{view.refreshing ? "Checking…" : "Refresh team"}</button></header>
+    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.objective.trim() || team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span>Up to {team.parallelism} implementers</span></div></div><div className="team-heading-actions"><div className="team-view-switch" role="group" aria-label="Team view"><button type="button" aria-pressed={mode === "summary"} onClick={() => setMode("summary")}>Summary</button><button type="button" aria-pressed={mode === "logs"} onClick={() => setMode("logs")}>Review logs</button></div><button className="text-button team-refresh" disabled={view.refreshing} onClick={view.refresh}><RefreshCw size={14} />{view.refreshing ? "Checking…" : "Refresh team"}</button></div></header>
     {!fresh && <div className="connection-notice" role="status">{view.failed ? "Team updates are unavailable. Showing the last received state; controls are disabled." : "Checking the team’s current state…"}{view.seen && " Last checked " + date(view.seen) + "."}</div>}
     <div className="team-detail-body">
       {team.reason && <p className="team-notice" role="status">{team.reason}</p>}
@@ -263,20 +395,33 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       {team.status === "ready-for-review" && <p className="team-notice team-ready"><Check size={18} />The team reports that this run is ready for your review. Inspect the changes and evidence below before merging or publishing.</p>}
       {team.goal && <p className="goal-team-origin"><a href={goalHref}>Open goal</a> · cycle {team.goal.cycle} · goal revision {team.goal.revision}</p>}
       {team.noChange && <section className="team-section"><h2>No change proposed</h2><p className="team-prose">{team.noChange.summary}</p><EvidenceList evidence={team.noChange.evidence} /></section>}
-      {team.brief && <section className="team-section"><h2>Opportunity brief <span className="quiet">(agent proposal)</span></h2><TeamBriefView brief={team.brief} /></section>}
-      {team.discovery && <section className="team-section"><h2>Discovery</h2><p className="team-prose">{team.discovery.summary}</p>{team.discovery.tasks.map(task => <article className="team-task" key={task.id}><div className="team-task-heading"><h3>{task.title}</h3><span className="team-task-state">{task.status}</span></div>{team.lineup?.implementers.find(profile => profile.id === task.agentProfileId) && <ModelProfile profile={team.lineup.implementers.find(profile => profile.id === task.agentProfileId)!} />}{task.summary && <p className="team-prose">{task.summary}</p>}{task.evidence && <EvidenceList evidence={task.evidence} />}<details><summary>Scout instructions</summary><p className="team-prose">{task.instructions}</p></details></article>)}</section>}
-      <section className="team-section"><h2>Your request</h2><p className="team-prose">{team.objective}</p></section>
       {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>Decisions for you <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} member={team.members.find(member => member.memberId === decision.memberId)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} />)}</section>}
-      {attention.length > 0 && <section className="team-section team-decisions"><h2>Agent sessions need you</h2><p className="quiet">Respond to provider permission prompts in the session. The team does not approve them.</p>{attention.map(session => <button className="team-session-link" key={session.id} onClick={() => openSession(session.id)}><span><strong>{session.title}</strong><small>{session.attention?.now ?? "Open the session to respond."}</small></span><ArrowUpRight size={18} /></button>)}</section>}
+      {attention.length > 0 && <section className="team-section team-decisions"><h2>Agent sessions need you</h2><p className="quiet">The host answers ordinary prompts in a member’s own workspace. These sessions still wait on a provider prompt; respond in the session.</p>{attention.map(session => <button className="team-session-link" key={session.id} onClick={() => openSession(session.id)}><span><strong>{session.title}</strong><small>{session.attention?.now ?? "Open the session to respond."}</small></span><ArrowUpRight size={18} /></button>)}</section>}
       {team.providerLimits?.map(limit => <p className="team-notice" role="status" key={limit.provider}>{providerLimitText(limit)}</p>)}
       {team.usage && <p className="team-notice">Team usage · {usageLabel(team.usage.total)} · {team.usage.unmeasuredMembers} unmeasured member{team.usage.unmeasuredMembers === 1 ? "" : "s"}</p>}
+      {mode === "logs" ? <>
+        <div className="team-agent-switch" role="tablist" aria-label="Agents">{orderedMembers.map(member => <button type="button" role="tab" key={member.memberId} aria-selected={member.memberId === agentId} onClick={() => setAgentId(member.memberId)}><strong><span className={"team-agent-dot" + (["running", "waiting"].includes(member.status) ? " live" : "")} />{roles[member.role].name}</strong><span>{member.status}{member.revision === team.revision ? "" : ` · revision ${member.revision}`}</span></button>)}</div>
+        {orderedMembers.length > 1 && (() => {
+          const index = Math.max(0, orderedMembers.findIndex(member => member.memberId === agentId));
+          const step = (by: number) => setAgentId(orderedMembers[(index + by + orderedMembers.length) % orderedMembers.length]!.memberId);
+          return <div className="team-agent-stepper"><button type="button" className="text-button" onClick={() => step(-1)}>‹ Previous</button><span className="quiet">Agent {index + 1} of {orderedMembers.length}</span><button type="button" className="text-button" onClick={() => step(1)}>Next ›</button></div>;
+        })()}
+        {selectedMember ? <TeamLogs member={selectedMember} session={logSession?.id === selectedMember.sessionId ? logSession : null} events={logEvents} failed={logs.failed} follow={followLog} setFollow={setFollowLog} onOpen={() => openSession(selectedMember.sessionId)} /> : <p className="quiet">This run has no agents yet.</p>}
+        <button type="button" className="text-button team-back-summary" onClick={() => setMode("summary")}>Back to summary</button>
+      </> : <JevcodeSummary team={team} rows={briefs} failed={briefing.failed} asking={asking} error={briefError} onRequest={sessionId => void requestSummary(sessionId)} />}
+      <details className="team-run-details"><summary>Run details</summary>
+      <section className="team-section"><h2>Your request</h2><p className="team-prose">{team.objective}</p></section>
+      {team.brief && <section className="team-section"><h2>Opportunity brief <span className="quiet">(agent proposal)</span></h2><TeamBriefView brief={team.brief} /></section>}
+      {team.discovery && <section className="team-section"><h2>Discovery</h2><p className="team-prose">{team.discovery.summary}</p>{team.discovery.tasks.map(task => <article className="team-task" key={task.id}><div className="team-task-heading"><h3>{task.title}</h3><span className="team-task-state">{task.status}</span></div>{team.lineup?.implementers.find(profile => profile.id === task.agentProfileId) && <ModelProfile profile={team.lineup.implementers.find(profile => profile.id === task.agentProfileId)!} />}{task.summary && <p className="team-prose">{task.summary}</p>}{task.evidence && <EvidenceList evidence={task.evidence} />}<details><summary>Scout instructions</summary><p className="team-prose">{task.instructions}</p></details></article>)}</section>}
       <section className="team-section"><div className="team-section-heading"><h2>Work plan</h2><span className="quiet">{team.tasks.length} tasks</span></div>{team.tasks.length ? <div className="team-tasks">{team.tasks.map(task => <article className="team-task" key={task.id}><div className="team-task-heading"><h3>{task.title}</h3><span className="team-task-state">{task.status}</span></div><p className="team-task-dependencies">{task.dependsOn.length ? "After: " + task.dependsOn.map(dependency => team.tasks.find(value => value.id === dependency)?.title ?? dependency).join(", ") : "No task dependencies"}</p><TaskModel task={task} team={team} />{task.escalation && <p className="team-escalation">Escalated to {task.escalation.toProfileId}: {task.escalation.reason}</p>}{task.limitSwitches?.map((change, index) => <p className="team-escalation" key={change.at + index}>Provider limit: {change.fromProfileId ?? "profile"} continued on {change.toProfileId} · {change.reason}{change.resetsAt && ` · resets ${date(change.resetsAt)}`}</p>)}<div className="team-owned"><span>Owns</span>{task.paths.map(path => <code key={path}>{path}</code>)}</div>{task.summary && <p className="team-prose">{task.summary}</p>}<details><summary>Task instructions</summary><p className="team-prose">{task.instructions}</p>{task.commit && <p className="quiet">Integrated commit: <code>{task.commit}</code></p>}</details></article>)}</div> : <p className="quiet">The coordinator has not reported a work plan yet.</p>}</section>
       <section className="team-section"><h2>Team members</h2>{team.lineup ? <><p className="quiet">This lineup was recorded when the run started. It shows requested model settings; provider policy may override them.</p><Lineup lineup={team.lineup} /></> : <RoleGuide />}{team.members.map(member => <div className="team-member" key={member.memberId}><div><strong>{member.title}</strong><p>{roles[member.role].name} · {member.status} · revision {member.revision}{member.taskId && " · " + member.taskId}</p>{member.modelProfile ? <ModelProfile profile={member.modelProfile} /> : <p>{names[member.provider ?? team.provider] ?? member.provider ?? team.provider}</p>}<p className="quiet">{member.usage ? usageLabel(member.usage) : "Unmeasured"}</p>{member.stoppedReason && <p className="team-notice">Stopped: {member.stoppedReason}</p>}</div><button className="text-button" disabled={!sessions.some(session => session.id === member.sessionId)} onClick={() => openSession(member.sessionId)}>Open session <ArrowUpRight size={16} /></button></div>)}</section>
       <section className="team-section"><h2>Verification evidence</h2><p className="quiet">Host check results and the reviewer’s assessment are recorded separately.</p><h3>Required checks</h3>{team.checks.length ? team.checks.map((check, index) => <details className="team-check" key={check.startedAt + "/" + index}><summary><code>{[check.command.command, ...check.command.args].join(" ")}</code><span className={"team-check-status " + check.status}>{check.status} · revision {check.revision}</span></summary><p className="quiet">Revision {check.revision} · started {date(check.startedAt)}{check.finishedAt && " · finished " + date(check.finishedAt)}{check.exitCode !== undefined && " · exit " + String(check.exitCode)}</p><pre>{check.output || "No output recorded."}</pre></details>) : <p className="quiet">No check results recorded yet.</p>}<h3 className="team-review-heading">Reviewer assessment <span className="quiet">(agent report)</span></h3>{team.review ? <div><p><strong>{team.review.verdict === "approved" ? "Approved by reviewer" : "Changes requested"}</strong> <span className="quiet">· revision {team.review.revision}</span></p><p className="team-prose">{team.review.summary}</p>{team.review.uiEvidence && <><h4>Reviewer UI evidence</h4><p className="team-prose">{team.review.uiEvidence}</p></>}</div> : <p className="quiet">No reviewer assessment recorded yet.</p>}</section>
       <section className="team-section"><h2>Review the changes</h2><dl className="team-output"><dt><GitBranch size={15} />Branch</dt><dd><code>{team.branch}</code></dd><dt>Workspace</dt><dd><code>{team.workspace}</code></dd><dt>Base commit</dt><dd><code>{team.baseCommit}</code></dd>{team.headCommit && <><dt>Head commit</dt><dd><code>{team.headCommit}</code></dd></>}</dl></section>
       {(team.steering.length > 0 || team.decisions.some(decision => decision.answer !== undefined)) && <section className="team-section"><h2>Your directions and decisions</h2>{team.steering.map((entry, index) => <div className="team-record" key={entry.at + "/" + index}><small>Direction · revision {entry.revision} · {date(entry.at)}</small><p className="team-prose">{entry.text}</p></div>)}{team.decisions.filter(decision => decision.answer !== undefined).map(decision => <div className="team-record" key={decision.id}><small>Decision · revision {decision.revision}</small><p className="team-prose">{decision.question}</p><p className="team-prose"><strong>Your answer: </strong>{decision.answer}</p></div>)}</section>}
-      {team.events.length > 0 && <section className="team-section"><details className="team-history"><summary>Run history</summary><ol>{team.events.map((event, index) => <li key={event.at + "/" + index}><time>{date(event.at)}</time><p>{event.text}</p></li>)}</ol></details></section>}
-      {me.role === "owner" && !team.goal && team.status !== "cancelled" && <div className="team-actions">{team.status !== "blocked" && team.status !== "ready-for-review" && team.status !== "merged" && team.status !== "no-change" && <button className="text-button" disabled={!canOwn || busy || Boolean(pending)} onClick={() => action(team.status === "paused" ? "resume" : "pause", team.status === "paused" ? "Resume" : "Pause")}>{team.status === "paused" ? "Resume team" : "Pause team"}</button>}<button className="text-button team-cancel" disabled={!canOwn || busy || Boolean(pending)} onClick={() => { if (window.confirm("Cancel this team run? This stops its agent sessions and keeps the recorded work.")) action("cancel", "Cancellation"); }}>Cancel team</button></div>}
+      {team.events.length > 0 && <section className="team-section"><div className="team-history"><h2>Run history</h2><ol>{team.events.map((event, index) => <li key={event.at + "/" + index}><time>{date(event.at)}</time><p>{event.text}</p></li>)}</ol></div></section>}
+      </details>
+      {team.resumable && <p className="quiet">Resume starts a fresh plan from the preserved integration commit. The stopped member workspace stays available.</p>}
+      {me.role === "owner" && !team.goal && team.status !== "cancelled" && <div className="team-actions">{showRunControl && <button className="text-button" disabled={!canOwn || busy || Boolean(pending)} onClick={() => action(resumeRun ? "resume" : "pause", resumeRun ? "Resume" : "Pause")}>{resumeRun ? "Resume team" : "Pause team"}</button>}<button className="text-button team-cancel" disabled={!canOwn || busy || Boolean(pending)} onClick={() => { if (window.confirm("Cancel this team run? This stops its agent sessions and keeps the recorded work.")) action("cancel", "Cancellation"); }}>Cancel team</button></div>}
     </div>
     <div className="team-composer-area">
       {request.message && <p className={request.result ? "quiet" : "error"} role="status">{request.message}</p>}

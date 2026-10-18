@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync, realpathSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync, realpathSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn as ptySpawn, type IPty } from "node-pty";
@@ -62,6 +62,78 @@ test("team CLI starts and reads a real host team, and reports missing host setup
   } finally { await run.close(); }
 });
 
+test("team pull imports an integrated branch without changing the checkout and refuses a divergent branch", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success");
+  const localRoot = mkdtempSync(join(tmpdir(), "infinite-team-pull-"));
+  const checkout = join(localRoot, "checkout"), otherCheckout = join(localRoot, "other-checkout");
+  const clientFile = join(run.host.root, "pull-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  try {
+    const created = await run.host.fetchApi("/teams", "owner", run.create());
+    const team = await run.settled(created.body.id);
+    assert.equal(team.status, "ready-for-review");
+    const checks = JSON.stringify([{ command: process.execPath, args: ["check.mjs", "--prefix"] }]);
+    await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
+    const enroll = await exec(entry[0], [...entry.slice(1), "repo", "init", "--project", "rehearsal", "--check-json", checks], { cwd: checkout });
+    assert.match(enroll.stdout, /"id": "rehearsal"/);
+
+    const pull = async (directory = checkout, ...args: string[]) => exec(entry[0], [...entry.slice(1), "team", "pull", team.id, ...args], { cwd: directory });
+    const first = JSON.parse((await pull(checkout, "--json")).stdout);
+    assert.deepEqual(first, { teamId: team.id, branch: team.branch, head: team.headCommit });
+    assert.equal(execFileSync("git", ["-C", checkout, "rev-parse", `refs/heads/${team.branch}`], { encoding: "utf8" }).trim(), team.headCommit);
+    assert.equal(execFileSync("git", ["-C", checkout, "symbolic-ref", "--short", "HEAD"], { encoding: "utf8" }).trim(), "main");
+    const second = JSON.parse((await pull(checkout, "--json")).stdout);
+    assert.deepEqual(second, { teamId: team.id, branch: team.branch, head: team.headCommit, upToDate: true });
+
+    await exec("git", ["-C", checkout, "switch", team.branch]);
+    writeFileSync(join(checkout, "local.txt"), "Local work on top of the team result.\n");
+    await exec("git", ["-C", checkout, "add", "local.txt"]);
+    await exec("git", ["-C", checkout, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Local work"]);
+    assert.deepEqual(JSON.parse((await pull(checkout, "--json")).stdout), { teamId: team.id, branch: team.branch, head: team.headCommit, upToDate: true });
+
+    await exec("git", ["-C", checkout, "checkout", "-B", team.branch, run.base]);
+    writeFileSync(join(checkout, "diverged.txt"), "Independent local result.\n");
+    await exec("git", ["-C", checkout, "add", "diverged.txt"]);
+    await exec("git", ["-C", checkout, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Diverged local work"]);
+    const diverged = execFileSync("git", ["-C", checkout, "rev-parse", `refs/heads/${team.branch}`], { encoding: "utf8" }).trim();
+    await exec("git", ["-C", checkout, "switch", "main"]);
+    await assert.rejects(pull(checkout, "--json"), (error: { stderr: string }) => /Git refused to update .*local branch was left unchanged/i.test(error.stderr));
+    assert.equal(execFileSync("git", ["-C", checkout, "rev-parse", `refs/heads/${team.branch}`], { encoding: "utf8" }).trim(), diverged);
+    assert.equal(execFileSync("git", ["-C", checkout, "symbolic-ref", "--short", "HEAD"], { encoding: "utf8" }).trim(), "main");
+
+    await exec("git", ["clone", "--no-hardlinks", run.source, otherCheckout]);
+    await exec(entry[0], [...entry.slice(1), "repo", "init", "--project", "rehearsal", "--check-json", checks], { cwd: otherCheckout });
+    const identity = createHash("sha256").update(`${run.host.origin}\n${run.host.tokens.owner}`).digest("hex");
+    const mappingsPath = join(dirname(clientFile), "team-cli", identity, "repo-mappings.json");
+    const mappings = JSON.parse(readFileSync(mappingsPath, "utf8"));
+    mappings[`${run.host.origin}\n${realpathSync(otherCheckout)}`].projectId = "another-project";
+    writeFileSync(mappingsPath, JSON.stringify(mappings), { mode: 0o600 });
+    await assert.rejects(pull(otherCheckout, "--json"), (error: { stderr: string }) => /another-project.*rehearsal|rehearsal.*another-project/.test(error.stderr));
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
+});
+
+test("team pull refuses a lifecycle run before review", { timeout: 60000 }, async () => {
+  const run = await teamFixture("lifecycle");
+  const localRoot = mkdtempSync(join(tmpdir(), "infinite-team-pull-not-ready-"));
+  const checkout = join(localRoot, "checkout");
+  const clientFile = join(run.host.root, "pull-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  try {
+    // Readiness is checked before the repository binding, so no enrollment is needed;
+    // enrolling would also replace the fixture's held check.
+    await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
+    const created = await run.host.fetchApi("/teams", "owner", run.create());
+    assert.ok([200, 201].includes(created.status));
+    await waitFor(() => run.host.fetchApi(`/teams/${created.body.id}`), response => response.body.status === "verifying" && response.body.checks.some((check: { status: string }) => check.status === "running"), 30000);
+    await assert.rejects(
+      exec(entry[0], [...entry.slice(1), "team", "pull", created.body.id], { cwd: checkout }),
+      (error: { stderr: string }) => /team is not ready to pull/i.test(error.stderr),
+    );
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
+});
+
 test("repo init configures an explicit project without resolving or replacing its checkout", { timeout: 120000 }, async () => {
   const run = await teamFixture("success", mixedLineup);
   const clientFile = join(run.host.root, "repo-client.json");
@@ -85,6 +157,60 @@ test("repo init configures an explicit project without resolving or replacing it
     assert.equal(launched?.projectId, "rehearsal", "normal launches use the saved directory binding without --project");
     assert.deepEqual((await run.host.fetchApi("/me")).body.projects.map((project: { id: string }) => project.id), before.body.projects.map((project: { id: string }) => project.id), "a bound launch does not resolve a second workspace");
   } finally { await run.close(); }
+});
+
+test("projects forget matches the Git root and removes local repository bindings and the paired default", { timeout: 30000 }, async () => {
+  const localRoot = mkdtempSync(join(homedir(), "infinite-cli-forget-"));
+  const cloudHome = mkdtempSync(join(tmpdir(), "infinite-cli-forget-cloud-"));
+  const host = await startHost({ config: { sync: { homeDir: cloudHome } } });
+  const configFile = join(host.root, "forget-client.json");
+  const client = { origin: host.origin, token: host.tokens.owner, projectId: "placeholder" };
+  writeFileSync(configFile, JSON.stringify(client), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", configFile];
+  try {
+    await exec("git", ["init", "--initial-branch=main"], { cwd: localRoot });
+    const mapping = await host.fetchApi("/projects/resolve", "owner", { path: relative(homedir(), localRoot) });
+    assert.equal(mapping.status, 200);
+    client.projectId = mapping.body.id;
+    writeFileSync(configFile, JSON.stringify(client), { mode: 0o600 });
+    const identity = createHash("sha256").update(`${host.origin}\n${host.tokens.owner}`).digest("hex");
+    const mappingsPath = join(dirname(configFile), "team-cli", identity, "repo-mappings.json");
+    mkdirSync(dirname(mappingsPath), { recursive: true, mode: 0o700 });
+    writeFileSync(mappingsPath, JSON.stringify({ [`${host.origin}\n${realpathSync(localRoot)}`]: { projectId: mapping.body.id, source: "test" } }), { mode: 0o600 });
+
+    const output = await exec(entry[0], [...entry.slice(1), "projects", "forget"], { cwd: localRoot });
+    assert.match(output.stdout, /cloud files were kept/);
+    assert.ok(output.stdout.includes(mapping.body.path));
+    assert.equal(JSON.parse(readFileSync(configFile, "utf8")).projectId, undefined);
+    assert.deepEqual(JSON.parse(readFileSync(mappingsPath, "utf8")), {});
+    assert.equal(existsSync(mapping.body.path), true);
+    assert.equal((await host.fetchApi("/me")).body.projects.some((project: { id: string }) => project.id === mapping.body.id), false);
+  } finally { await host.stop(); rmSync(localRoot, { recursive: true, force: true }); rmSync(cloudHome, { recursive: true, force: true }); }
+});
+
+test("repo init sends, removes, and omits the teamwork setting as requested", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success", mixedLineup);
+  const localRoot = mkdtempSync(join(homedir(), "infinite-cli-teamwork-"));
+  const checkout = join(localRoot, "checkout"), teamwork = join(localRoot, "teamwork");
+  mkdirSync(checkout); mkdirSync(teamwork);
+  await exec("git", ["init", "--initial-branch=main"], { cwd: checkout });
+  writeFileSync(join(checkout, "source.txt"), "local checkout\n");
+  await exec("git", ["-C", checkout, "add", "source.txt"]);
+  await exec("git", ["-C", checkout, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture"]);
+  const clientFile = join(run.host.root, "teamwork-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const checks = ["--check-json", JSON.stringify([{ command: "node", args: ["-e", "process.exit(0)"] }])];
+  const invoke = (args: string[]) => exec(entry[0], [...entry.slice(1), "repo", "init", checkout, "--project", "rehearsal", ...checks, ...args], { cwd: checkout });
+  try {
+    const selected = JSON.parse((await invoke(["--teamwork", "../teamwork", "--json"])).stdout);
+    const relativeTeamwork = relative(realpathSync(homedir()), realpathSync(teamwork)).split(/[\\/]/).join("/");
+    assert.equal(selected.teamwork, relativeTeamwork);
+    const omitted = JSON.parse((await invoke(["--json"])).stdout);
+    assert.equal(omitted.teamwork, relativeTeamwork, "omission retains the saved host setting");
+    const removed = JSON.parse((await invoke(["--teamwork", "none", "--json"])).stdout);
+    assert.equal(removed.teamwork, null);
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
 });
 
 test("repo init enrolls an unborn local repository without changing it and uploads an empty cloud baseline", { timeout: 120000 }, async () => {
@@ -994,4 +1120,30 @@ test("infinite usage prints the host summary as JSON and readable output", { tim
     assert.match(readable.stdout, /^OpenCode  \S+ to \S+ · no measured usage · budget \$10\.00 per month$/m);
     assert.match(readable.stdout, /^Codex  \S+ to \S+ · unmeasured · no budget configured$/m);
   } finally { await host.stop(); }
+});
+
+test("repository CLI pins, preserves and removes owner permission delegation", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success");
+  const localRoot = mkdtempSync(join(tmpdir(), "infinite-permission-cli-"));
+  const checkout = join(localRoot, "checkout");
+  const configFile = join(localRoot, "client.json");
+  writeFileSync(configFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const args = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", configFile,
+    "repo", "init", "--project", "rehearsal", "--check-json", JSON.stringify([{ command: process.execPath, args: ["check.mjs", "--prefix"] }])];
+  const enroll = (...extra: string[]) => exec(process.execPath, [...args, ...extra], { cwd: checkout });
+  try {
+    await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
+    const delegated = JSON.parse((await enroll("--permissions", "coordinator", "--permission-scope", "Read files and run the configured check only.", "--permission-limit", "3")).stdout);
+    assert.deepEqual(delegated.team.permissions, { mode: "coordinator", scope: "Read files and run the configured check only.", maxDecisions: 3 });
+    const retained = JSON.parse((await enroll()).stdout);
+    assert.deepEqual(retained.team.permissions, delegated.team.permissions);
+    await assert.rejects(enroll("--permissions", "coordinator", "--permission-limit", "21"));
+    assert.deepEqual((await run.host.fetchApi("/projects/rehearsal/team")).body.team.permissions, delegated.team.permissions);
+    const forbidden = await run.host.fetchApi("/projects/rehearsal/team", "controller", {
+      requestId: randomUUID(), revision: retained.revision, team: { ...retained.team, permissions: { ...delegated.team.permissions, scope: "Broaden scope" } },
+    }, undefined, "PUT");
+    assert.equal(forbidden.status, 403);
+    const removed = JSON.parse((await enroll("--permissions", "off")).stdout);
+    assert.equal(removed.team.permissions, undefined);
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
 });

@@ -1,0 +1,22 @@
+[Unit]
+Description=Renew repository-scoped GitHub App credentials
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/infinite-github/issuer.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+RuntimeDirectory=infinite-github
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/flock -n /run/infinite-github/refresh.lock /usr/local/bin/node /opt/infinite-github-auth/github-app-refresh.mjs --config /etc/infinite-github/issuer.json
+TimeoutStartSec=120
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/infinite-data/github-app-tokens
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

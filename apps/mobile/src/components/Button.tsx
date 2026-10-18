@@ -1,46 +1,63 @@
 import { Pressable, StyleSheet, Text } from "react-native";
 import { theme } from "../theme";
+import { Glyph, type GlyphName } from "./Icon";
 
+/** A capsule action. `compact` draws smaller but keeps a 48-unit touch target through hit slop. */
 export function Button({
   title,
   onPress,
   disabled,
   secondary = false,
+  compact = false,
+  glyph,
 }: {
   title: string;
   onPress: () => void;
   disabled?: boolean;
   secondary?: boolean;
+  compact?: boolean;
+  glyph?: GlyphName;
 }) {
+  const ink = secondary ? theme.colors.secondaryInk : theme.colors.white;
   return (
     <Pressable
       accessibilityRole="button"
       accessibilityState={{ disabled }}
       disabled={disabled}
       onPress={onPress}
+      hitSlop={compact ? { top: 7, bottom: 7 } : undefined}
       style={({ pressed }) => [
         s.button,
+        compact && s.compact,
         secondary && s.secondary,
         (disabled || pressed) && s.dim,
       ]}
     >
-      <Text style={[s.text, secondary && s.secondaryText]}>{title}</Text>
+      {glyph ? <Glyph name={glyph} size={compact ? 13 : 15} color={ink} /> : null}
+      <Text style={[s.text, compact && s.compactText, { color: ink }]} numberOfLines={1}>{title}</Text>
     </Pressable>
   );
 }
 
 const s = StyleSheet.create({
   button: {
-    minHeight: 48,
-    borderRadius: theme.radius.control,
+    minHeight: 46,
+    flexDirection: "row",
+    gap: 7,
+    borderRadius: theme.radius.capsule,
     paddingHorizontal: theme.space.controlX,
-    paddingVertical: 13,
+    paddingVertical: 11,
     backgroundColor: theme.colors.forest,
     justifyContent: "center",
     alignItems: "center",
   },
-  text: { fontSize: 14, fontWeight: "600", color: theme.colors.white },
-  secondary: { backgroundColor: theme.colors.secondarySurface },
-  secondaryText: { color: theme.colors.secondaryInk },
+  compact: { minHeight: 34, paddingHorizontal: 13, paddingVertical: 6 },
+  text: { fontSize: 14, fontWeight: "600", flexShrink: 1 },
+  compactText: { fontSize: 13 },
+  secondary: {
+    backgroundColor: theme.colors.white,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: theme.colors.fieldRule,
+  },
   dim: { opacity: 0.45 },
 });

@@ -11,6 +11,10 @@ if (process.argv[2] === "--command-prefix") {
   child.once("exit", code => process.exit(code ?? 128));
   await new Promise(() => {});
 }
+if (process.argv[2] === "--permission-setup") {
+  appendFileSync(join(process.argv[3], "permission-setup.jsonl"), JSON.stringify({ cwd: process.cwd() }) + "\n", { mode: 0o600 });
+  process.exit(0);
+}
 if (process.argv[2] === "--bootstrap-setup") {
   if (!existsSync("check.mjs")) throw new Error("The implemented check file is missing");
   const check = readFileSync("check.mjs", "utf8");
@@ -136,6 +140,9 @@ async function main() {
     } else if (scenario === "mixed") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "astra-xhigh";
+    } else if (scenario.startsWith("permissions")) {
+      tasks[0].agentProfileId = "haiku";
+      tasks[1].agentProfileId = "codex-light";
     } else if (scenario.startsWith("delivery") || scenario === "limit" || scenario === "limit-no-fallback" || scenario === "limit-other-failed" || scenario === "integrator-limit") {
       tasks[0].agentProfileId = "haiku";
       tasks[1].agentProfileId = scenario === "limit-other-failed" ? "haiku-b" : "codex-light";
@@ -151,6 +158,22 @@ async function main() {
       verification.checks[0].args.push("--different");
     await report({ kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
       ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) });
+  } else if (assignment.role === "permission-coordinator") {
+    const launchPrompt = process.argv.at(-1) ?? "";
+    const decisionId = /"decisionId":"([a-f0-9-]{36})"/.exec(launchPrompt)?.[1];
+    if (!decisionId) throw new Error("The permission review assignment omitted its decision identity");
+    if (!["permissions", "permissions-restart", "permissions-judge-exit"].includes(scenario)) {
+      writeFileSync(join(receiptDir, `${assignment.runId}.judge-ready`), "ready", { mode: 0o600 });
+      const until = Date.now() + 30000;
+      while (!existsSync(join(receiptDir, `${assignment.runId}.judge-release`))) {
+        if (Date.now() >= until) throw new Error("The test did not release the permission coordinator");
+        await new Promise(resolve => setTimeout(resolve, 40));
+      }
+    }
+    if (scenario === "permissions-judge-exit") process.exit(2);
+    await report({ kind: "permission-decision", decisionId: scenario === "permissions-foreign" ? randomUUID() : decisionId,
+      verdict: scenario === "permissions-escalate" ? "escalate" : "approve-once",
+      summary: "The request is limited to reading the assigned project file for the stated objective." });
   } else if (assignment.role === "implementer") {
     await waitForPeer();
     const asked = join(receiptDir, `${assignment.runId}.${assignment.taskId}.asked`);
@@ -162,6 +185,38 @@ async function main() {
     if (scenario === "question") {
       while (!existsSync(join(receiptDir, `${assignment.runId}.release`)))
         await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    if (scenario.startsWith("permissions") && assignment.taskId === "a") {
+      const menu = scenario === "permissions-restart"
+        ? `\nBash command\ncat original.txt\nDo you want to proceed?\n${Array.from({ length: 8 }, (_, index) => `  ${index + 1}. No, stop`).join("\n")}\n❯ 9. Yes\n`
+        : "\nBash command\ncat original.txt\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again for Bash commands\n  3. No, and tell Claude what to do differently (esc)\n";
+      process.stdout.write(`\u001b[2J\u001b[H${menu}`);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "cat original.txt" } }),
+      });
+      if (response.status !== 204) throw new Error(`Provider permission hook was refused with status ${response.status}`);
+      if (scenario === "permissions-stale") {
+        writeFileSync(join(receiptDir, `${assignment.runId}.target-ready`), "ready", { mode: 0o600 });
+        const until = Date.now() + 30000;
+        while (!existsSync(join(receiptDir, `${assignment.runId}.target-change`))) {
+          if (Date.now() >= until) throw new Error("The test did not change the permission prompt");
+          await new Promise(resolve => setTimeout(resolve, 40));
+        }
+        process.stdout.write("\u001b[2J\u001b[H");
+        await new Promise(resolve => setTimeout(resolve, 250));
+        const closed = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ hook_event_name: "PermissionDenied", reason: "The fixture changed the pending request" }),
+        });
+        if (closed.status !== 204) throw new Error(`Provider prompt change was refused with status ${closed.status}`);
+      }
+      await new Promise(resolve => process.stdin.once("data", resolve));
+      if (scenario === "permissions-restart") await new Promise(resolve => setTimeout(resolve, 5000));
+      process.stdout.write("\u001b[2J\u001b[HPermission request closed.\n");
     }
     if (scenario.startsWith("bootstrap") && assignment.taskId === "a") {
       const check = scenario === "bootstrap-fail"

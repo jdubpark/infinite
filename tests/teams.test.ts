@@ -4,14 +4,155 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { createInterface } from "node:readline";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
+import { memberTimeLimitReason } from "../packages/host/src/teams.js";
 import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 
 import { git, limitLineup, mixedLineup, fixture } from "./team-fixture.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
+
+test("team runs use readable names and exact root permissions under a strict umask", { timeout: 120000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-team-modes-"));
+  const workspaceDir = join(root, "first", "second", "teams");
+  const previousUmask = process.umask(0o077);
+  let f: Awaited<ReturnType<typeof fixture>> | undefined;
+  try {
+    // The API subprocess inherits this umask, including after enrollment restarts it.
+    f = await fixture("success", undefined, { teams: { workspaceDir,
+      commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", root] },
+    } });
+    const firstRequest = f.create();
+    const firstCreated = await f.host.fetchApi("/teams", "owner", firstRequest);
+    const first = await f.settled(firstCreated.body.id);
+    assert.equal(first.status, "ready-for-review", JSON.stringify(first));
+    const firstName = `${first.createdAt.slice(0, 10)}-implement-a-small-feature-${first.id.slice(0, 8)}`;
+    assert.equal(realpathSync(first.workspace), realpathSync(join(f.host.config.teams!.workspaceDir, `rehearsal-${firstName}`, "integration")));
+    assert.equal(first.branch, `infinite/team-implement-a-small-feature-${first.id.slice(0, 8)}`);
+    for (const directory of [workspaceDir, dirname(workspaceDir), dirname(dirname(workspaceDir))])
+      assert.equal(statSync(directory).mode & 0o777, 0o750);
+
+    const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true }, "Projects/teamwork");
+    const secondRequest = f.create();
+    const secondCreated = await f.host.fetchApi("/teams", "owner", secondRequest);
+    const second = await f.settled(secondCreated.body.id);
+    assert.equal(second.status, "ready-for-review", JSON.stringify(second));
+    const secondName = `${second.createdAt.slice(0, 10)}-implement-a-small-feature-${second.id.slice(0, 8)}`;
+    assert.equal(realpathSync(second.workspace), realpathSync(join(teamworkRoot, secondName, "integration")));
+    assert.equal(second.branch, `infinite/team-implement-a-small-feature-${second.id.slice(0, 8)}`);
+    assert.equal(statSync(teamworkRoot).mode & 0o777, 0o750);
+    assert.equal(statSync(dirname(teamworkRoot)).mode & 0o777, 0o750);
+  } finally {
+    process.umask(previousUmask);
+    try { await f?.close(); } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+for (const unsafe of ["root", "parent"] as const)
+test(`default runs refuse a group-writable ${unsafe} until its permissions are repaired`, { timeout: 120000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-team-root-"));
+  const parent = join(root, "parent"), workspaceDir = join(parent, "teams");
+  mkdirSync(parent, { mode: 0o750 });
+  mkdirSync(workspaceDir, { mode: 0o750 });
+  chmodSync(parent, 0o750);
+  chmodSync(workspaceDir, 0o750);
+  const unsafeDirectory = unsafe === "root" ? workspaceDir : parent;
+  chmodSync(unsafeDirectory, 0o770);
+  let f: Awaited<ReturnType<typeof fixture>> | undefined;
+  try {
+    f = await fixture("success", undefined, { teams: { workspaceDir,
+      commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", root] },
+    } });
+    const refused = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.deepEqual([refused.status, refused.body.code], [409, "team-root-unsafe"]);
+    assert.deepEqual(readdirSync(workspaceDir), []);
+    assert.equal(statSync(unsafeDirectory).mode & 0o777, 0o770, "the host must not repair an existing unsafe directory");
+
+    chmodSync(unsafeDirectory, 0o750);
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+  } finally { try { await f?.close(); } finally { rmSync(root, { recursive: true, force: true }); } }
+});
+
+for (const unsafe of ["parent", "anchor"] as const)
+test(`teamwork preparation refuses a group-writable ${unsafe}`, { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const parent = join(dirname(f.source), "Projects");
+    mkdirSync(parent);
+    const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true }, "Projects/teamwork");
+    assert.ok(teamworkRoot);
+    chmodSync(unsafe === "parent" ? parent : dirname(f.source), 0o770);
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.deepEqual([created.status, created.body.code], [409, "team-root-unsafe"]);
+  } finally { await f.close(); }
+});
+
+test("a lifecycle run cannot be bundled before review", { timeout: 60000 }, async () => {
+  const f = await fixture("lifecycle");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status));
+    const checking = await waitFor(() => f.get(created.body.id), run => run.status === "verifying" && run.checks.some(check => check.status === "running"), 30000);
+    const response = await f.host.fetchApi(`/teams/${checking.id}/bundle`);
+    assert.deepEqual([response.status, response.body.code], [409, "team-not-ready"]);
+  } finally { await f.close(); }
+});
+
+test("legacy team records without a saved root retain their workspace and branch", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const finished = await f.settled(created.body.id);
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    const legacyDirectory = join(f.host.config.teams!.workspaceDir, finished.id);
+    renameSync(dirname(finished.workspace), legacyDirectory);
+    stored.run.workspace = join(legacyDirectory, "integration");
+    stored.run.branch = `infinite/team-${finished.id}`;
+    delete stored.root;
+    writeSealed(file, key, `team:${finished.id}`, stored);
+    await f.host.start();
+    const restored = await f.get(finished.id);
+    assert.equal(restored.workspace, join(legacyDirectory, "integration"));
+    assert.equal(restored.branch, `infinite/team-${finished.id}`);
+    assert.equal(restored.status, "ready-for-review");
+  } finally { await f.close(); }
+});
+
+test("team bundle route requires an owner CLI and a recorded result", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const finished = await f.settled(created.body.id);
+    const endpoint = `/teams/${finished.id}/bundle`;
+    for (const role of ["viewer", "controller"] as const)
+      assert.equal((await f.host.fetchApi(endpoint, role)).status, 403);
+    const login = await f.host.fetchApi("/login", null, { token: f.host.tokens.owner }, { Origin: f.host.config.origin });
+    assert.equal(login.status, 200);
+    const browser = { Cookie: login.headers.get("set-cookie")!.split(";")[0], Origin: f.host.config.origin };
+    assert.equal((await f.host.fetchApi(endpoint, null, undefined, browser)).status, 403);
+
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    delete stored.run.headCommit;
+    writeSealed(file, key, `team:${finished.id}`, stored);
+    await f.host.start();
+    const noResult = await f.host.fetchApi(endpoint);
+    assert.equal(noResult.status, 409);
+    assert.equal(noResult.body.code, "team-no-result");
+  } finally { await f.close(); }
+});
 
 test("an opted-in blank project accepts coordinator checks and reaches review only after verifying the implemented invariant", { timeout: 120000 }, async () => {
   const f = await fixture("bootstrap");
@@ -739,4 +880,32 @@ test("provider limit memory expires and successful clearing survives restart wit
     limits.observe({ ...observation, detectedAt: "2026-10-18T12:02:00.000Z" });
     assert.equal(limits.active(new Date("2026-10-18T12:03:00Z")).length, 1);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a team blocked by the one-hour member limit resumes into a fresh plan", { timeout: 60000 }, async () => {
+  const f = await fixture("mcp");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const id = created.body.id;
+    await waitFor(() => f.get(id), run => run.members.some(member => member.status === "running" && member.startedAt), 30000);
+    await f.host.stopApi();
+    const key = readFileSync(f.host.config.keyFile);
+    const file = join(f.host.config.stateDir, "teams", `${id}.sealed`);
+    const stored = unseal<{ run: { members: { startedAt?: string }[] } }>(key, `team:${id}`, readFileSync(file, "utf8"));
+    const startedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    for (const member of stored.run.members) member.startedAt = startedAt;
+    writeSealed(file, key, `team:${id}`, stored);
+    await f.host.start();
+    const blocked = await waitFor(() => f.get(id), run => run.status === "blocked" && run.reason === memberTimeLimitReason && run.resumable === true && run.members.every(member => !["queued", "running", "reported", "unavailable"].includes(member.status)), 30000);
+    const head = blocked.headCommit;
+    const resumed = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
+    assert.equal(resumed.body.status, "planning");
+    assert.equal(resumed.body.revision, blocked.revision + 1);
+    assert.equal(resumed.body.reason, undefined);
+    assert.equal(resumed.body.resumable, false);
+    assert.equal(resumed.body.headCommit, head);
+    assert.equal(resumed.body.members.length, blocked.members.length);
+  } finally { await f.close(); }
 });

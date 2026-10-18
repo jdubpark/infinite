@@ -1,14 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
-import { createTeamSchema, teamDeliverySchema, type TeamDelivery } from "./team-types.js";
+import { createTeamSchema, teamDeliverySchema, teamPermissionsSchema, type TeamDelivery } from "./team-types.js";
 import { captureWorkspace, readWorkspaceBlob } from "./workspace-checkpoint.js";
 import { localProjectPath } from "./mirrored-projects.js";
 import { readSyncState, syncServiceRunning } from "./sync-service.js";
+import { canAskForBrief, chooseTeamBrief, orderedTeamMembers, summaryMember, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, wrapText, type TeamBriefStatus, type TeamWatchCommand } from "./team-watch.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
 type Api = {
@@ -45,6 +48,10 @@ function isolatedGitEnv(overrides: NodeJS.ProcessEnv = {}) {
 }
 function git(cwd: string, args: string[], timeout = 10000) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout, stdio: ["ignore", "pipe", "ignore"], env: gitEnv({ GIT_OPTIONAL_LOCKS: "0" }) }).trim();
+}
+function gitStatus(cwd: string, args: string[]) {
+  try { execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" }) }); return 0; }
+  catch (error) { return (error as NodeJS.ErrnoException & { status?: number }).status ?? 128; }
 }
 function inferGitHubRepository(root: string): string {
   let remote: string;
@@ -144,6 +151,25 @@ function canonicalDirectory(directory: string) {
   if (path === realpathSync(homedir()) || path === dirname(path)) throw new Error("The home directory and filesystem root are not supported.");
   return path;
 }
+function canonicalTeamworkPath(value: string, cwd: string, repository: string) {
+  const requested = resolve(cwd, value);
+  let ancestor = requested;
+  const missing: string[] = [];
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) throw new Error("The teamwork path has no existing ancestor.");
+    missing.unshift(basename(ancestor)); ancestor = parent;
+  }
+  const canonical = join(realpathSync(ancestor), ...missing);
+  const home = realpathSync(homedir());
+  const homeRelative = relative(home, canonical);
+  if (!homeRelative || homeRelative === ".." || homeRelative.startsWith(`..${sep}`) || isAbsolute(homeRelative))
+    throw new Error("The teamwork folder must be below the local home directory.");
+  const repoRel = relative(repository, canonical), targetRel = relative(canonical, repository);
+  const within = (path: string) => path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
+  if (within(repoRel) || within(targetRel)) throw new Error("The teamwork folder must be outside and separate from the repository.");
+  return localProjectPath(canonical);
+}
 function gitRootOrNonGit(directory: string): { root: string } | { nonGit: true } {
   let stderr = "";
   let reportedRoot = "";
@@ -228,6 +254,17 @@ export function boundTeamProject(config: ClientConfig, configPath: string, direc
   if (typeof projectId !== "string" || !projectIdPattern.test(projectId)) throw new Error("Saved repository binding is invalid; inspect private team CLI state before launching.");
   return projectId;
 }
+export function forgetBoundTeamProject(config: ClientConfig, configPath: string, projectId: string): void {
+  const identity = createHash("sha256").update(`${new URL(config.origin).origin}\n${config.token}`).digest("hex");
+  const file = join(dirname(configPath), "team-cli", identity, "repo-mappings.json");
+  const mappings = readPrivateJson(file, {}) as Record<string, unknown>;
+  let changed = false;
+  for (const [key, value] of Object.entries(mappings)) {
+    const bound = typeof value === "string" ? value : (value as { projectId?: unknown } | undefined)?.projectId;
+    if (bound === projectId) { delete mappings[key]; changed = true; }
+  }
+  if (changed) privateJson(file, mappings);
+}
 function commandArray(text: string, flag: string) {
   let value: unknown;
   try { value = JSON.parse(text); } catch { throw new Error(`${flag} must contain a JSON command array.`); }
@@ -247,6 +284,99 @@ function inferredProjectConfig(root: string, options: Options, allowUnconfigured
   if (setup.length > 1) throw new Error("--setup-json contains one setup command at most.");
   return projectConfigSchema.parse({ ...(setup[0] ? { setup: setup[0] } : {}), checks, ...(!checks.length ? { establishChecks: true } : {}) });
 }
+type BriefRow = { sessionId: string; status: TeamBriefStatus };
+
+function eventLine(event: { type?: string; data?: Record<string, unknown> }) {
+  const data = event.data ?? {};
+  const label = event.type === "signal" ? String(data.kind ?? "Signal")
+    : event.type === "input-result" ? (data.state === "delivered" ? "Input delivered" : "Input")
+    : event.type === "lifecycle" ? String(data.status ?? "Session updated")
+    : String(event.type ?? "Event");
+  const detail = data.message ?? data.text ?? data.error;
+  return typeof detail === "string" && detail.trim() ? `${label}: ${detail}` : label;
+}
+
+async function teamBriefRows(api: Api, team: any, signal: AbortSignal): Promise<BriefRow[]> {
+  const ordered = orderedTeamMembers(team).filter(member => member?.sessionId);
+  const current = ordered.filter(member => member?.revision === team?.revision);
+  const targets = (current.length ? current : ordered).slice(0, 6);
+  return Promise.all(targets.map(async member => {
+    const sessionId = String(member.sessionId);
+    try {
+      return { sessionId, status: await api.json<TeamBriefStatus>(`/sessions/${sessionId}/summary?status=1`, undefined, signal) };
+    } catch (error) {
+      if (signal.aborted) throw error;
+      return { sessionId, status: { state: "unknown", error: clean((error as Error).message) } };
+    }
+  }));
+}
+
+async function memberLog(api: Api, member: any, signal: AbortSignal) {
+  const sessionId = String(member.sessionId);
+  const detail = await api.json<{ screen?: string; seq?: number }>(`/sessions/${sessionId}`, undefined, signal);
+  const after = Math.max(0, Number(detail?.seq ?? 0) - 80);
+  const page = await api.json<{ events?: { at?: string; type?: string; data?: Record<string, unknown> }[] }>(
+    `/sessions/${sessionId}/events?after=${after}&types=lifecycle,signal,input-result&limit=80`,
+    undefined,
+    signal,
+  );
+  return { screen: detail?.screen, events: (page.events ?? []).map(event => ({ at: event.at, text: eventLine(event) })) };
+}
+
+function shiftMember(members: any[], memberId: string, direction: 1 | -1) {
+  const index = members.findIndex(member => member?.memberId === memberId);
+  if (index < 0) return String(members[0]?.memberId ?? "");
+  return String(members[(index + direction + members.length) % members.length]?.memberId ?? "");
+}
+
+function preferredMember(team: any, memberId: string, followRunning: boolean) {
+  const ordered = orderedTeamMembers(team).filter(member => member?.sessionId);
+  const current = ordered.filter(member => member?.revision === team?.revision);
+  const pool = current.length ? current : ordered;
+  if (!followRunning && memberId) {
+    const selected = ordered.find(member => member?.memberId === memberId);
+    if (selected) return selected;
+  }
+  return pool.find(member => member?.status === "running" || member?.status === "waiting") ?? pool[0];
+}
+
+async function printTeamLogs(api: Api, team: any, signal: AbortSignal) {
+  const current = orderedTeamMembers(team).filter(member => member?.revision === team?.revision && member?.sessionId);
+  const shown = current.slice(0, 8);
+  if (!shown.length) {
+    console.log(`${clean(team?.id)} · review logs\n\nNo agents are in this revision.\n`);
+    return;
+  }
+  const recorded = await Promise.all(shown.map(async member => {
+    try { return { member, ...(await memberLog(api, member, signal)) }; }
+    catch (error) {
+      if (signal.aborted) throw error;
+      return { member, screen: `Log unavailable: ${clean((error as Error).message)}`, events: [] as { at?: string; text?: string }[] };
+    }
+  }));
+  for (const item of recorded) console.log(`${teamLogsText(team, shown, item.member, item.screen, item.events)}\n`);
+  if (current.length > shown.length) console.log(`+ ${current.length - shown.length} more agents. Follow one with infinite team watch ${clean(team?.id)} --logs\n`);
+}
+
+async function askForBrief(api: Api, team: any, rows: BriefRow[], signal: AbortSignal, show: (text: string) => void, checkedAt: string): Promise<BriefRow[]> {
+  const chosen = chooseTeamBrief(rows, summaryMember(team)?.sessionId);
+  if (!chosen || !canAskForBrief(team, rows)) return rows;
+  const card = teamSummaryText(team, rows, checkedAt, true, Date.now()).split("\n");
+  const footer = card.pop() ?? "";
+  show([...card, "", "Asking Jevcode for a summary. This can take a few minutes.", "", footer].join("\n"));
+  try {
+    // json() caps every call at 15 seconds. A repository brief can take longer, so this uses request().
+    const response = await api.request(`/sessions/${chosen.sessionId}/summary?after=0`, undefined, AbortSignal.any([signal, AbortSignal.timeout(180000)]));
+    const summary = await response.json() as TeamBriefStatus["summary"];
+    const ready = Boolean(summary?.repository?.brief?.summary || summary?.text);
+    const next: BriefRow = { sessionId: chosen.sessionId, status: { state: ready ? "ready" : "empty", summary, ...(ready ? {} : { error: "No recorded chat is available for a repository brief." }) } };
+    return [...rows.filter(row => row.sessionId !== chosen.sessionId), next];
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return [...rows.filter(row => row.sessionId !== chosen.sessionId), { sessionId: chosen.sessionId, status: { state: "failed", error: clean((error as Error).message) } }];
+  }
+}
+
 function outputTeam(team: any, json: boolean) {
   if (json) { console.log(JSON.stringify(team, null, 2)); return; }
   console.log(`${clean(team.id)}  ${clean(team.status)}  ${clean(team.title)}`);
@@ -254,6 +384,9 @@ function outputTeam(team: any, json: boolean) {
   if (team.linear?.issue?.url) console.log(`Linear ${clean(team.linear.issue.url)}`);
   else if (team.linear?.url) console.log(`Linear ${clean(team.linear.url)}`);
   if (team.reason) console.log(`Reason: ${clean(team.reason)}`);
+  if (team.permissions) console.log(`Permissions: ${team.permissionsRevokedAt ? "revoked" : "delegated to coordinator"} · ${(team.permissionDecisions ?? []).length}/${team.permissions.maxDecisions} decisions`);
+  for (const decision of (team.permissionDecisions ?? []).slice(-5))
+    console.log(`Permission ${clean(decision.id)}: ${clean(decision.status)} · member ${clean(decision.targetMemberId)}${decision.receipt ? ` · ${clean(decision.receipt.state)}/${clean(decision.receipt.result ?? "unconfirmed")}` : ""}`);
   for (const question of team.decisions ?? []) if (!question.answer) console.log(`Question ${clean(question.id)}: ${clean(question.question)}`);
 }
 function receipt(path: string, key: string, body: unknown) {
@@ -375,7 +508,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       console.log(JSON.stringify(result, null, 2));
       return true;
     }
-    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--setup-json JSON] [--check-json JSON] [--delivery merge|review] [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase] [--linear-team UUID] [--linear-project UUID]");
+    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--teamwork PATH|none] [--setup-json JSON] [--check-json JSON] [--delivery merge|review] [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase] [--linear-team UUID] [--linear-project UUID]");
     const requestedDirectory = canonicalDirectory(positional[1] ?? process.cwd());
     const gitResult = gitRootOrNonGit(requestedDirectory);
     const defaultsPath = join(stateDir, "directory-defaults.json");
@@ -384,7 +517,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
     const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
     if ("nonGit" in gitResult) {
-      const unsupported = ["--project", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method"].filter(flag => options[flag] !== undefined);
+      const unsupported = ["--project", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit"].filter(flag => options[flag] !== undefined);
       if (unsupported.length) throw new Error(`This directory is not a Git repository, so ${unsupported.join(", ")} cannot be used here. Run repo init in a Git repository for enrollment, or use only --linear-team and --linear-project to save directory defaults.`);
       if (!explicitLinearTeam && explicitLinearProject && !inheritedDefault?.teamId)
         throw new Error("--linear-project requires --linear-team or an inherited directory Linear team.");
@@ -401,6 +534,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       return true;
     }
     const root = gitResult.root;
+    const teamwork = options["--teamwork"] === undefined ? undefined : String(options["--teamwork"]) === "none" ? null : canonicalTeamworkPath(String(options["--teamwork"]), process.cwd(), root);
     const status = git(root, ["status", "--porcelain", "--untracked-files=all"]);
     if (status) throw new Error("Repository must be clean before onboarding. Commit or remove tracked and untracked changes first.");
     const head = inspectSourceHead(root);
@@ -431,6 +565,19 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       ? { ...(options["--setup-json"] !== undefined ? (repoConfig.setup ? { setup: repoConfig.setup } : {}) : target.team.setup ? { setup: target.team.setup } : {}), checks: target.team.checks }
       : repoConfig);
     const delivery = requestedDelivery(root, options, target);
+    const permissionMode = options["--permissions"];
+    if (permissionMode !== undefined && permissionMode !== "coordinator" && permissionMode !== "off")
+      throw new Error("--permissions must be coordinator or off.");
+    if (permissionMode !== "coordinator" && (options["--permission-scope"] !== undefined || options["--permission-limit"] !== undefined))
+      throw new Error("Permission scope and limit require --permissions coordinator.");
+    if (permissionMode !== undefined && me.teams?.permissionDelegation !== 1)
+      throw new Error("This host does not support delegated permissions. Upgrade it before changing this policy.");
+    const permissions = permissionMode === "off" ? undefined : permissionMode === "coordinator" ? teamPermissionsSchema.parse({
+      mode: "coordinator",
+      scope: String(options["--permission-scope"] ?? "Approve one-time repository read, edit, build and test operations required by the accepted task within its assigned workspace. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, permission bypasses and unclear effects."),
+      maxDecisions: Number(options["--permission-limit"] ?? 10),
+    }) : target.team?.permissions;
+
     if (projectConfig.establishChecks && me.teams?.establishChecks !== 1)
       throw new Error("This host does not support establishing team checks for an empty repository. Upgrade the host before running repo init.");
     const uploadKey = `${key}:source-upload:${selected}:${sourceRevision}`;
@@ -477,12 +624,13 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       linearDefaultsFrom = rootDefault.origin;
     }
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}) }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}) };
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.
     const linearIntent = (request: Record<string, any>) => request.linear === undefined ? targetLinear ?? null : request.linear;
-    requireSamePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)), options["--request-id"] === undefined ? undefined : requestId, rawArgs);
+    const teamworkIntent = (request: Record<string, any>) => request.teamwork === undefined ? target.teamwork ?? null : request.teamwork;
+    requireSamePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)), options["--request-id"] === undefined ? undefined : requestId, rawArgs);
     if (uploadSource) {
       assertSourceUnchanged();
       process.stderr.write(`[Infinite] Request ${requestId}\n`);
@@ -526,7 +674,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     if (explicitProject || uploadSource) { config.projectId = selected; privateJson(configPath, config); }
     const source = uploadSource && !head.commit ? "empty cloud baseline" : uploadSource ? `local commit ${head.commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout";
-    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, revision: output.revision, execution: output.execution, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source }, null, 2));
+    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, teamwork: output.teamwork, revision: output.revision, execution: output.execution, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source }, null, 2));
     return true;
   }
   const [subcommand, id, ...rest] = positional;
@@ -554,27 +702,205 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     outputTeam(team, Boolean(options["--json"])); return true;
   }
   if (subcommand === "status" || subcommand === "watch") {
-    if (subcommand === "watch" && !id) throw new Error("Usage: infinite team watch ID");
-    if (id && rest.length) throw new Error(`Usage: infinite team ${subcommand} [ID]`);
+    if (subcommand === "watch" && !id) throw new Error("Usage: infinite team watch ID [--logs]");
+    if (options["--logs"] && !id) throw new Error("Usage: infinite team status ID --logs");
+    if (id && rest.length) throw new Error(`Usage: infinite team ${subcommand} ${subcommand === "watch" ? "ID" : "[ID]"} [--logs]`);
     const abort = new AbortController(), stop = () => abort.abort();
+    const json = Boolean(options["--json"]);
+    const logs = Boolean(options["--logs"]);
+    const tty = subcommand === "watch" && Boolean(process.stdout.isTTY) && !json;
+    const interactive = tty && Boolean(process.stdin.isTTY && process.stdin.setRawMode);
+    let mode: "summary" | "logs" = logs ? "logs" : "summary";
+    let memberId = "";
+    let previous: string | null = null;
+    let pending: ReturnType<typeof teamWatchCommand> = null;
+    let wake = new AbortController();
+    // A full-screen watch keeps the last card so scrolling and resizing repaint without a request.
+    let card = "";
+    let notice = "";
+    let view = "";
+    let offset = 0;
+    let page = 1;
+    const paint = () => {
+      if (!card) return;
+      const screen = teamWatchScreen(notice ? `${notice}\n\n${card}` : card, { rows: process.stdout.rows || 24, columns: process.stdout.columns || 80, offset, color: !process.env.NO_COLOR });
+      offset = screen.offset;
+      page = screen.page;
+      process.stdout.write(screen.frame);
+    };
+    const scrolls: Partial<Record<TeamWatchCommand, () => number>> = {
+      up: () => offset - 1, down: () => offset + 1, pageUp: () => offset - page, pageDown: () => offset + page,
+      top: () => 0, bottom: () => Number.MAX_SAFE_INTEGER,
+    };
+    const onData = (data: string | Buffer) => {
+      const command = teamWatchCommand(String(data));
+      if (command === "detach") { stop(); return; }
+      if (!command) return;
+      const scroll = scrolls[command];
+      if (scroll) { offset = scroll(); paint(); return; }
+      pending = command;
+      wake.abort();
+    };
+    const clock = () => tty ? new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+    const show = (text: string) => {
+      if (subcommand !== "watch") console.log(`${process.stdout.isTTY ? wrapText(text, process.stdout.columns || 80).join("\n") : text}\n`);
+      else if (!tty) {
+        const frame = teamWatchFrame(previous, text, false);
+        if (frame) process.stdout.write(frame);
+        previous = text;
+      } else {
+        // Switching view or agent starts at the top; a refresh of the same view keeps the reader's place.
+        const key = `${mode}/${mode === "logs" ? memberId : ""}`;
+        if (key !== view) { view = key; offset = 0; }
+        card = text;
+        notice = "";
+        paint();
+      }
+    };
     process.once("SIGINT", stop);
+    if (tty) {
+      process.stdout.write("\x1b[?1049h\x1b[?25l");
+      process.stdout.on("resize", paint);
+    }
+    if (interactive) {
+      process.stdin.setRawMode(true);
+      process.stdin.setEncoding("utf8");
+      process.stdin.resume();
+      process.stdin.on("data", onData);
+    }
     try {
       do {
-        const teams = id ? [await api.json<any>(`/teams/${id}`, undefined, abort.signal)] : (await api.json<{ teams: any[] }>("/teams", undefined, abort.signal)).teams;
-        if (options["--json"]) console.log(JSON.stringify(id ? teams[0] : teams, null, subcommand === "watch" ? undefined : 2));
-        else for (const team of teams) outputTeam(team, false);
+        try {
+          const teams = id ? [await api.json<any>(`/teams/${id}`, undefined, abort.signal)] : (await api.json<{ teams: any[] }>("/teams", undefined, abort.signal)).teams;
+          if (json) {
+            const text = JSON.stringify(id ? teams[0] : teams, null, subcommand === "watch" ? undefined : 2);
+            if (subcommand !== "watch" || text !== previous) console.log(text);
+            previous = text;
+          } else if (!id) {
+            for (const team of teams) console.log(`${teamMonitorText(team)}\n`);
+            if (teams.length) console.log("Open one team for the Jevcode summary: infinite team status ID\n");
+          } else {
+            const team = teams[0];
+            const action = pending;
+            pending = null;
+            if (action === "logs") mode = "logs";
+            else if (action === "summary") mode = "summary";
+            else if (action === "next" || action === "prev") {
+              mode = "logs";
+              const ordered = orderedTeamMembers(team).filter(member => member?.sessionId);
+              const known = ordered.some(member => member?.memberId === memberId);
+              memberId = known ? shiftMember(ordered, memberId, action === "next" ? 1 : -1) : String(ordered[0]?.memberId ?? "");
+            }
+            if (subcommand === "status" && logs) await printTeamLogs(api, team, abort.signal);
+            else if (mode === "logs") {
+              const member = preferredMember(team, memberId, !interactive);
+              if (member?.memberId) memberId = String(member.memberId);
+              if (!member) show(`${clean(team?.id)} · review logs\n\nNo agent session is available.\n\n${interactive ? "s summary · q quit" : "Summary: infinite team status " + clean(team?.id)}`);
+              else {
+                const recorded = await memberLog(api, member, abort.signal);
+                show(teamLogsText(team, orderedTeamMembers(team).filter(item => item?.sessionId), member, recorded.screen, recorded.events, clock(), interactive));
+              }
+            } else {
+              let rows = await teamBriefRows(api, team, abort.signal);
+              if (action === "ask" && interactive) rows = await askForBrief(api, team, rows, abort.signal, show, clock());
+              show(teamSummaryText(team, rows, clock(), interactive, interactive ? Date.now() : undefined));
+            }
+          }
+        } catch (error) {
+          if (abort.signal.aborted || subcommand !== "watch") throw error;
+          const failure = `Update failed: ${clean((error as Error).message)}`;
+          if (tty && card) { notice = `${failure}. Showing the last received card.`; paint(); }
+          else show(`${failure}\n\n${interactive ? "q quit" : "Ctrl+C detaches"}`);
+        }
         if (subcommand !== "watch") break;
-        await delay(2000, undefined, { signal: abort.signal });
+        if (wake.signal.aborted) wake = new AbortController();
+        else {
+          try { await delay(2000, undefined, { signal: AbortSignal.any([abort.signal, wake.signal]) }); }
+          catch { if (abort.signal.aborted) break; }
+          if (wake.signal.aborted) wake = new AbortController();
+        }
       } while (!abort.signal.aborted);
     } catch (error) { if (!abort.signal.aborted) throw error; }
-    finally { process.off("SIGINT", stop); }
+    finally {
+      if (interactive) {
+        process.stdin.off("data", onData);
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+      }
+      if (tty) {
+        process.stdout.off("resize", paint);
+        process.stdout.write("\x1b[?25h\x1b[?1049l");
+      }
+      process.off("SIGINT", stop);
+    }
     return true;
   }
-  if (["steer", "answer", "pause", "resume", "cancel"].includes(subcommand ?? "")) {
+  if (subcommand === "pull") {
+    if (!id || rest.length) throw new Error("Usage: infinite team pull TEAM_ID [--json]");
+    const team = await api.json<any>(`/teams/${id}`);
+    if (team.status !== "ready-for-review") throw new Error("This team is not ready to pull.");
+    const localProject = boundTeamProject(config, configPath);
+    if (localProject !== team.projectId)
+      throw new Error(`This repository is bound to project ${localProject ?? "<unbound>"}, but team ${id} belongs to project ${clean(team.projectId)}.`);
+    const root = canonicalRoot(process.cwd());
+    const branch = String(team.branch ?? ""), teamHead = String(team.headCommit ?? "");
+    if (!branch || !teamHead || !/^[a-f0-9]{40,64}$/.test(teamHead)) throw new Error("This team has no recorded result to pull.");
+    const ref = `refs/heads/${branch}`;
+    try { execFileSync("git", ["-C", root, "check-ref-format", ref], { stdio: "ignore", timeout: 10000, env: isolatedGitEnv() }); }
+    catch { throw new Error("The team reported an invalid integration branch."); }
+    if (gitStatus(root, ["show-ref", "--verify", "--quiet", ref]) === 0
+      && gitStatus(root, ["cat-file", "-e", `${teamHead}^{commit}`]) === 0
+      && gitStatus(root, ["merge-base", "--is-ancestor", teamHead, ref]) === 0) {
+      const result = { teamId: id, branch, head: teamHead, upToDate: true };
+      if (options["--json"]) console.log(JSON.stringify(result));
+      else { console.log(`${branch} already contains team result ${teamHead}`); console.log(`Switch with: git switch ${branch}`); }
+      return true;
+    }
+
+    const response = await api.request(`/teams/${id}/bundle`);
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({})) as { error?: string; code?: string };
+      throw new Error(body.error ?? `Could not download team result (${response.status}).`);
+    }
+    const headerBranch = response.headers.get("X-Infinite-Branch"), headerHead = response.headers.get("X-Infinite-Head");
+    if (headerBranch !== branch || headerHead !== teamHead) {
+      await response.body?.cancel();
+      throw new Error("The team result changed while it was being prepared. Refresh team status and retry.");
+    }
+    const tempRoot = join(stateDir, "pull-");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const temporary = mkdtempSync(tempRoot); chmodSync(temporary, 0o700);
+    const bundlePath = join(temporary, "team.bundle");
+    try {
+      if (!response.body) throw new Error("The host returned an empty team bundle.");
+      await pipeline(Readable.fromWeb(response.body as import("node:stream/web").ReadableStream), createWriteStream(bundlePath, { flags: "wx", mode: 0o600 }));
+      try { execFileSync("git", ["-C", root, "bundle", "verify", bundlePath], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C" }) }); }
+      catch (error) { throw new Error(`The downloaded team bundle failed verification: ${clean(String((error as NodeJS.ErrnoException & { stderr?: Buffer | string }).stderr ?? (error as Error).message))}.`); }
+      let heads = "";
+      try { heads = execFileSync("git", ["-C", root, "bundle", "list-heads", bundlePath, ref], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C" }) }); }
+      catch { throw new Error("The team result changed while it was being prepared. Refresh team status and retry."); }
+      // Refuse a branch that moved after the host's preflight, before fetching it locally.
+      if (heads.trim().split(/\r?\n/).length !== 1 || heads.trim() !== `${teamHead} ${ref}`)
+        throw new Error("The team result changed while it was being prepared. Refresh team status and retry.");
+      try {
+        execFileSync("git", ["-C", root, "fetch", "--no-tags", "--no-write-fetch-head", bundlePath, `${ref}:${ref}`], { encoding: "utf8", timeout: 120000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C" }) });
+      } catch (error) {
+        const detail = clean(String((error as NodeJS.ErrnoException & { stderr?: Buffer | string }).stderr ?? (error as Error).message));
+        throw new Error(`Git refused to update ${branch}; it may be checked out or have diverged. The local branch was left unchanged. ${detail}`);
+      }
+      const localHead = git(root, ["rev-parse", "--verify", `${ref}^{commit}`]);
+      if (localHead !== headerHead || localHead !== teamHead) throw new Error("The fetched branch did not resolve to the recorded team result.");
+      const result = { teamId: id, branch, head: teamHead };
+      if (options["--json"]) console.log(JSON.stringify(result));
+      else { console.log(`Pulled ${branch} at ${teamHead}`); console.log(`Switch with: git switch ${branch}`); }
+      return true;
+    } finally { rmSync(temporary, { recursive: true, force: true }); }
+  }
+  if (["steer", "answer", "pause", "resume", "cancel", "revoke-permissions"].includes(subcommand ?? "")) {
     if (!id) throw new Error(`Usage: infinite team ${subcommand} ID ...`);
     const current = await api.json<any>(`/teams/${id}`);
     const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
-    let endpoint = `/teams/${id}/${subcommand}`, body: Record<string, unknown>;
+    let endpoint = subcommand === "revoke-permissions" ? `/teams/${id}/permissions/revoke` : `/teams/${id}/${subcommand}`, body: Record<string, unknown>;
     if (subcommand === "steer") {
       const text = rest.join(" "); if (!text) throw new Error("Provide steering text.");
       body = { requestId, revision: current.revision, text };
@@ -589,5 +915,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     requireSamePendingIntent(receiptsPath, `team-${subcommand}:`, endpoint, prior => subcommand === "steer" || subcommand === "answer" ? prior.text === body.text : true, options["--request-id"] === undefined ? undefined : requestId, rawArgs);
     outputTeam(await postMutation(api, receiptsPath, `team-${subcommand}:${requestId}`, endpoint, body), Boolean(options["--json"])); return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|steer|answer|pause|resume|cancel ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|cancel|revoke-permissions ...");
 }

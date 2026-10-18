@@ -61,3 +61,12 @@ test("sync accepts one action and no arguments; pull takes at most one project",
   assert.throws(() => parseClientArgs(["pull", "a", "b"]), /infinite pull takes at most one project ID/);
   assert.deepEqual(parseClientArgs(["pull"]).args, []);
 });
+
+test("team review logs are a view flag and do not replace json", () => {
+  const parsed = parseClientArgs(["team", "watch", "team-1", "--logs"]);
+  assert.equal(parsed.command, "team");
+  assert.deepEqual(parsed.args, ["watch", "team-1"]);
+  assert.equal(parsed.options["--logs"], true);
+  assert.throws(() => parseClientArgs(["team", "status", "team-1", "--logs", "--json"]), /either --logs or --json/);
+  assert.throws(() => parseClientArgs(["list", "--logs"]), /--logs applies to infinite team/);
+});

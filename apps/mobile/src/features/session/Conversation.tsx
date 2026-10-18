@@ -16,7 +16,7 @@ export function Conversation({ connection, id }: { connection: Connection; id: s
     return { ...page, messages: messages.current };
   }, 1500, [connection, id]);
   return <View style={s.list}>
-    <Text style={s.note}>{data?.source === "recording" ? "Recorded messages and signals. Open Terminal for complete output." : "Provider conversation"}</Text>
+    <Text style={s.note}>{data?.source === "recording" ? "From the recording · full output in Terminal" : "Provider conversation"}</Text>
     {!online && !loading ? <Text style={s.note}>Conversation may be stale. Reconnecting…</Text> : null}
     {data?.messages.map(message => <View key={message.id} style={[s.message, message.role === "user" && s.user]}>
       <Text style={s.role}>{message.toolName || (message.role === "assistant" ? "Agent" : message.role === "user" ? "You" : message.role)}{message.ts ? ` · ${new Date(message.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}</Text>

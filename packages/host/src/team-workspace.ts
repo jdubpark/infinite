@@ -1,22 +1,30 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, chmodSync, lstatSync, realpathSync } from "node:fs";
-import { join, resolve, relative, isAbsolute } from "node:path";
+import { constants } from "node:fs";
+import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
+import { dirname, join, resolve, relative, isAbsolute, parse } from "node:path";
 import type { TeamCommand, TeamTaskPlan } from "./team-types.js";
 
 export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
 export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean }
+export function teamCommandEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
+    if (process.env[name]) env[name] = process.env[name];
+  env.GIT_TERMINAL_PROMPT = "0";
+  env.GIT_OPTIONAL_LOCKS = "0";
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  return env;
+}
+export function teamGitArgs(cwd: string, args: string[]) {
+  return ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args];
+}
 /** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
-    const env: NodeJS.ProcessEnv = {};
-    for (const name of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
-      if (process.env[name]) env[name] = process.env[name];
-    env.GIT_TERMINAL_PROMPT = "0";
-    env.GIT_OPTIONAL_LOCKS = "0";
-    env.GIT_CONFIG_NOSYSTEM = "1";
-    env.GIT_CONFIG_GLOBAL = "/dev/null";
+    const env = teamCommandEnvironment();
     const child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false;
     const stop = () => {
@@ -37,13 +45,83 @@ export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSig
     child.once("close", exitCode => { if (settled) return; settled = true; finish(); resolveResult({ exitCode, output, stdout, interrupted, truncated }); });
   });
 }
+/** Streams a full bundle of one branch on stdout, with the same restricted Git invocation as other team operations. */
+export function spawnTeamBundle(workspace: string, branch: string, prefix?: TeamCommand) {
+  const args = teamGitArgs(workspace, ["bundle", "create", "-", `refs/heads/${branch}`]);
+  return spawn(prefix?.command ?? "git", prefix ? [...prefix.args, "git", ...args] : args, { cwd: workspace, env: teamCommandEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+}
 async function git(cwd: string, args: string[], prefix?: TeamCommand, timeoutMs = 30000, signal?: AbortSignal) {
-  const result = await teamCommand({ command: "git", args: ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args] }, cwd, signal, timeoutMs, prefix);
+  const result = await teamCommand({ command: "git", args: teamGitArgs(cwd, args) }, cwd, signal, timeoutMs, prefix);
   if (result.exitCode !== 0 || result.interrupted || result.truncated) throw new TeamError(409, "workspace-operation-failed", "A team Git operation failed. The isolated workspace was preserved for inspection.");
   return args.includes("-z") ? result.stdout : result.stdout.trim();
 }
 function lines(value: string) { return value.split("\0").filter(Boolean); }
-export function teamWorkspacePath(root: string, runId: string) { return join(root, runId, "integration"); }
+export function teamWorkspacePath(root: string, directoryName: string) { return join(root, directoryName, "integration"); }
+const hostOwned = (stat: ReturnType<typeof lstatSync>) => {
+  if (!stat) return false;
+  return typeof process.getuid !== "function" || stat.uid === process.getuid() || stat.uid === 0;
+};
+const unsafeTeamRoot = () => new TeamError(409, "team-root-unsafe", "Team roots must contain only host-owned real directories that are not writable by group or others.");
+function assertSecureAncestors(path: string) {
+  try {
+    const canonical = realpathSync(path), root = parse(canonical).root;
+    let current = root;
+    for (const part of ["", ...relative(root, canonical).split(/[\\/]/).filter(Boolean)]) {
+      current = join(current, part);
+      const info = lstatSync(current);
+      if (!info.isDirectory() || !hostOwned(info) || ((info.mode & 0o022) !== 0 && (info.mode & 0o1000) === 0)) throw unsafeTeamRoot();
+    }
+  } catch { throw unsafeTeamRoot(); }
+}
+function ensureHostDirectoryComponent(path: string, mode: number, create: boolean) {
+  if (mode & 0o022) throw unsafeTeamRoot();
+  let info, created = false;
+  try { info = lstatSync(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) throw unsafeTeamRoot();
+    try { mkdirSync(path, { mode }); created = true; } catch (mkdirError) { if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError; }
+    try { info = lstatSync(path); } catch { throw unsafeTeamRoot(); }
+  }
+  if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info) || (info.mode & 0o022) !== 0) throw unsafeTeamRoot();
+  if (created) chmodDirectoryNoFollow(path, (mode & 0o777) | (info.mode & 0o2000));
+}
+/** The configured default root is protected just like an anchored teamwork root. */
+export function ensureDefaultTeamRoot(root: string, create = false) {
+  let anchor = dirname(resolve(root));
+  while (true) {
+    try { lstatSync(anchor); break; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create || dirname(anchor) === anchor) throw unsafeTeamRoot();
+      anchor = dirname(anchor);
+    }
+  }
+  return ensureHostDirectory(anchor, root, 0o750, create);
+}
+/** Create/check each component below a trusted anchor without traversing an unsafe parent. */
+export function ensureHostDirectory(anchor: string, target: string, mode: number, create = true) {
+  let base: string;
+  try { base = realpathSync(anchor); } catch { throw unsafeTeamRoot(); }
+  assertSecureAncestors(base);
+  // Keep the suffix relative to the supplied anchor when a system alias resolves elsewhere.
+  const rel = relative(resolve(anchor), resolve(target));
+  if (!rel || rel === ".." || rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(rel)) throw unsafeTeamRoot();
+  let current = base;
+  for (const part of rel.split(/[\\/]/)) {
+    current = join(current, part);
+    ensureHostDirectoryComponent(current, mode, create);
+  }
+  return realpathSync(current);
+}
+/** Change directory modes through an opened no-follow descriptor, never through a redirected path. */
+export function chmodDirectoryNoFollow(path: string, mode: number) {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    const info = fstatSync(fd);
+    if (!info.isDirectory() || !hostOwned(info)) throw unsafeTeamRoot();
+    fchmodSync(fd, mode);
+  } finally { if (fd !== undefined) closeSync(fd); }
+}
 /** A source handoff must preserve every tracked and untracked edit and pin the actual root. */
 export async function cleanTeamCheckpoint(source: string, expectedHead: string, prefix?: TeamCommand) {
   const canonical = realpathSync(source);
@@ -52,7 +130,7 @@ export async function cleanTeamCheckpoint(source: string, expectedHead: string, 
   await assertMemberReadOnly(canonical, expectedHead, prefix);
   return expectedHead;
 }
-export async function prepareTeamWorkspace(source: string, root: string, runId: string, prefix?: TeamCommand, signal?: AbortSignal, expectedHead?: string, startCommit?: string) {
+export async function prepareTeamWorkspace(source: string, root: string, directoryName: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, expectedHead?: string, anchor?: string, startCommit?: string) {
   let canonical: string, top: string;
   try { canonical = realpathSync(source); top = await git(canonical, ["rev-parse", "--show-toplevel"], prefix, 30000, signal); }
   catch { throw new TeamError(409, "project-not-git-root", "The configured team project must be an accessible Git repository with a committed HEAD."); }
@@ -64,15 +142,20 @@ export async function prepareTeamWorkspace(source: string, root: string, runId: 
   if (startCommit && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(startCommit)) throw new TeamError(409, "invalid-delivery-baseline", "The recorded merge baseline is invalid.");
   if (expectedHead !== undefined && sourceHead !== expectedHead)
     throw new TeamError(409, "parent-workspace-changed", "The previous goal run no longer matches its recorded integration commit. Its workspace must be reconciled before continuing.");
-  mkdirSync(root, { recursive: true, mode: 0o770 });
-  const directory = join(realpathSync(root), runId);
+  if (anchor) ensureHostDirectory(anchor, root, 0o750);
+  else ensureDefaultTeamRoot(root, true);
+  const canonicalRoot = realpathSync(root);
+  const directory = join(canonicalRoot, directoryName);
   if (existsSync(directory)) throw new TeamError(409, "workspace-exists", "This team workspace already exists and needs explicit reconciliation.");
-  mkdirSync(directory, { mode: 0o770 }); chmodSync(directory, 0o2770);
+  mkdirSync(directory, { mode: 0o700 });
+  const members = join(directory, "members");
+  mkdirSync(members, { mode: 0o700 });
+  chmodDirectoryNoFollow(members, 0o2770);
+  chmodDirectoryNoFollow(directory, 0o2770);
   const workspace = join(directory, "integration");
   await git(directory, ["clone", "--no-local", "--no-hardlinks", "--", canonical, workspace], prefix, 120000, signal);
   await git(workspace, ["remote", "remove", "origin"], prefix, 30000, signal);
   if (startCommit) await git(workspace, ["fetch", "--no-tags", "--", canonical, startCommit], prefix, 30000, signal);
-  const branch = `infinite/team-${runId}`;
   await git(workspace, ["checkout", "-b", branch, baseCommit], prefix, 30000, signal);
   if (await git(canonical, ["rev-parse", "HEAD"], prefix, 30000, signal) !== sourceHead || await git(canonical, ["status", "--porcelain=v1", "--untracked-files=all"], prefix, 30000, signal))
     throw new TeamError(409, "project-changed", "The source project changed during capture. The team remains blocked with its isolated copy preserved.");
@@ -80,7 +163,12 @@ export async function prepareTeamWorkspace(source: string, root: string, runId: 
 }
 export async function prepareMemberWorkspace(workspace: string, memberId: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {
   const parent = join(workspace, "..", "members");
-  mkdirSync(parent, { recursive: true, mode: 0o770 }); chmodSync(parent, 0o2770);
+  let info;
+  try { info = lstatSync(parent); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; mkdirSync(parent, { mode: 0o700 }); }
+  try { info = lstatSync(parent); } catch { throw unsafeTeamRoot(); }
+  if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info)) throw unsafeTeamRoot();
+  chmodDirectoryNoFollow(parent, 0o2770);
   const cwd = join(parent, memberId);
   if (existsSync(cwd)) throw new TeamError(409, "workspace-exists", "A member workspace already exists and needs explicit reconciliation.");
   await git(parent, ["clone", "--no-local", "--no-hardlinks", "--", workspace, cwd], prefix, 120000, signal);
@@ -134,7 +222,7 @@ export async function captureMemberResult(cwd: string, base: string, paths?: str
 export async function integrateMemberResult(workspace: string, memberCwd: string, commit: string, prefix?: TeamCommand, signal?: AbortSignal) {
   if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new TeamError(409, "invalid-commit", "The task commit is invalid.");
   await git(workspace, ["fetch", "--no-tags", "--", memberCwd, commit], prefix, 30000, signal);
-  const result = await teamCommand({ command: "git", args: ["-c", `safe.directory=${workspace}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", "cherry-pick", commit] }, workspace, signal, 30000, prefix);
+  const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["cherry-pick", commit]) }, workspace, signal, 30000, prefix);
   if (result.exitCode !== 0 || result.interrupted || result.truncated) {
     // A failed integration is preserved; no reset, forced cleanup, or automatic retry.
     throw new TeamError(409, "integration-conflict", "Task integration encountered a conflict. The team is blocked with the isolated conflict preserved.");

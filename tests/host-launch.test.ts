@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { buildLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
+import { buildLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
@@ -104,6 +104,50 @@ test("Claude team launch exposes only its scoped report helper and preserves pro
     assert.deepEqual(profile.args, ["--model", "opus"]);
   }
   assert.throws(() => buildLaunch("claude", profile, "task", null, relay, enabled, true), /report|hook/i);
+});
+
+test("permission coordinator gets a noninteractive report-only Claude profile", () => {
+  const configured = { command: "claude", args: ["--allowedTools", "Read", "Glob", "--disallowedTools", "Bash"] };
+  const selected = teamModelLaunch(configured, { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-sonnet-5", effort: "high" });
+  const profile = permissionCoordinatorLaunch("claude", selected);
+  assert.deepEqual(configured.args, ["--allowedTools", "Read", "Glob", "--disallowedTools", "Bash"], "The shared configured profile is not mutated");
+  assert.ok(profile.args.indexOf("--effort") < profile.args.indexOf("--print"), "Coordinator mode follows the configured model and effort args");
+  assert.deepEqual(profile.args.slice(profile.args.indexOf("--disallowedTools"), profile.args.indexOf("--disallowedTools") + 2), ["--disallowedTools", "Bash"]);
+  assert.equal(profile.args.filter(arg => arg === "--print").length, 1);
+  assert.equal(profile.args.filter(arg => arg === "--strict-mcp-config").length, 1);
+  assert.equal(profile.args.filter(arg => arg === "--permission-mode").length, 1);
+  assert.equal(profile.args[profile.args.indexOf("--permission-mode") + 1], "dontAsk");
+  assert.equal(profile.args[profile.args.indexOf("--tools") + 1], "");
+  assert.deepEqual(profile.args.slice(profile.args.indexOf("--allowedTools") + 1, profile.args.indexOf("--disallowedTools")), ["Read", "Glob", "mcp__infinite_team__report"]);
+  assert.deepEqual(profile.args.slice(profile.args.indexOf("--disallowedTools"), profile.args.indexOf("--disallowedTools") + 2), ["--disallowedTools", "Bash"]);
+
+  const launch = buildLaunch("claude", profile, "Review this permission request", hooks, relay, enabled, true);
+  const mcpIndex = launch.args.indexOf("--mcp-config");
+  assert.ok(mcpIndex >= 0);
+  assert.deepEqual(Object.keys(JSON.parse(launch.args[mcpIndex + 1]).mcpServers), ["infinite_team"]);
+  assert.ok(launch.args.includes("--strict-mcp-config"));
+  assert.equal(launch.args.at(-1), "Review this permission request");
+
+  const wrapped = permissionCoordinatorLaunch("claude", { command: "/usr/bin/sudo", args: ["-n", "-u", "agent", "--", "/usr/local/libexec/infinite/claude", "--model", "sonnet"] });
+  assert.deepEqual(wrapped.args.slice(0, 7), ["-n", "-u", "agent", "--", "/usr/local/libexec/infinite/claude", "--model", "sonnet"]);
+  assert.ok(wrapped.args.indexOf("--print") > 6, "Coordinator flags follow the configured sudo executable and provider args");
+  assert.throws(() => permissionCoordinatorLaunch("claude", { command: process.execPath, args: ["--loader", "provider-wrapper"] }), /must launch Claude Code/);
+  assert.throws(() => permissionCoordinatorLaunch("claude", { command: "/usr/bin/sudo", args: ["-n", "--", process.execPath] }), /must name Claude Code/);
+});
+
+test("permission coordinator rejects conflicting Claude permission and tool settings", () => {
+  for (const args of [
+    ["--permission-mode", "acceptEdits"],
+    ["--tools", "Read"],
+    ["--output-format", "json"],
+    ["--mcp-config", "{}"],
+    ["--plugin-dir", "./plugins"],
+    ["--settings", "settings.json"],
+    ["--plugin-url", "https://plugins.example.invalid"],
+    ["--chrome"],
+    ["--dangerously-skip-permissions"],
+  ]) assert.throws(() => permissionCoordinatorLaunch("claude", { command: "claude", args }), /Permission coordinator/);
+  assert.throws(() => permissionCoordinatorLaunch("codex", { command: "codex", args: [] }), /Claude Code/);
 });
 
 test("codex gets -c hook overrides, notify, osc notifications and trust bypass", () => {

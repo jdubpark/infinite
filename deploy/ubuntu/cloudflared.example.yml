@@ -1,0 +1,19 @@
+# /etc/cloudflared/config.yml for a locally managed tunnel. Replace the placeholders.
+# cloudflared runs as root, which can open the relay's mode-0600 socket.
+tunnel: TUNNEL_UUID
+credentials-file: /etc/cloudflared/TUNNEL_UUID.json
+
+ingress:
+  - hostname: relay.example.com
+    # The relay accepts phone channels only on this socket and trusts CF-Connecting-IP only here.
+    service: unix:/run/infinite-relay/proxy.sock
+    originRequest:
+      # cloudflared itself rejects requests without a valid Access token for this application,
+      # so a misconfigured Access policy or a direct hit on the tunnel still cannot reach the relay.
+      access:
+        required: true
+        teamName: YOUR-TEAM
+        audTag:
+          - ACCESS_APPLICATION_AUD_TAG
+  # Nothing else on this machine is published.
+  - service: http_status:404

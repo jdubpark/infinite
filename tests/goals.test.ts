@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { startHost, waitFor, type Host } from "./helpers.js";
 import type { CreateGoal, ProductGoal } from "../packages/host/src/goal-types.js";
@@ -81,6 +81,15 @@ test("a goal reconciles lost Linear acknowledgements, gathers evidence, escalate
   const linear = await startLinearServer();
   const f = await fixture("cycles", linear);
   try {
+    // Serve the fixture's parent as the sync home and enroll a sibling teamwork folder through the API.
+    const teamworkRoot = join(dirname(f.source), "teamwork");
+    f.host.config.sync = { homeDir: dirname(f.source) };
+    await f.host.stopApi();
+    writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
+    await f.host.start();
+    const enrollment = (await f.host.fetchApi(`/projects/${f.host.config.projects[0].id}/team`, "owner")).body;
+    const enrolled = await f.host.fetchApi(`/projects/${f.host.config.projects[0].id}/team`, "owner", { requestId: randomUUID(), revision: enrollment.revision, team: enrollment.team, teamwork: "teamwork" }, {}, "PUT");
+    assert.equal(enrolled.status, 200, JSON.stringify(enrolled.body));
     const request = f.create();
     const me = await f.host.fetchApi("/me");
     assert.equal(me.status, 200);
@@ -125,6 +134,7 @@ test("a goal reconciles lost Linear acknowledgements, gathers evidence, escalate
     assert.equal(ready.outcomes.length, 0, "Code and review evidence cannot establish the product outcome");
     assert.equal(ready.cycles.length, 2);
     const runs = await Promise.all(ready.cycles.map(cycle => f.team(cycle.teamId)));
+    assert.ok(runs.every(run => run.workspace.startsWith(`${teamworkRoot}/`)), "Both the original run and goal continuation stay under the enrolled teamwork root");
     assert.ok(runs.every(run => run.status === "ready-for-review" && run.review?.verdict === "approved" && run.checks.length > 0 && run.checks.every(check => check.status === "passed")));
     assert.equal(runs[0].baseCommit, f.base);
     assert.equal(runs[1].baseCommit, runs[0].headCommit);

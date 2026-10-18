@@ -147,6 +147,29 @@ test("native Codex attachment fences device control, pins its conversation, and 
   } finally { for (const client of clients) client.terminate(); await host.stop(); }
 });
 
+for (const [prompt, usageLimit] of [["usage-limit", true], ["rate-limit-transient", false]] as const) {
+  test(`native Codex ${prompt} turn ${usageLimit ? "records one corroborated usage limit" : "is only a failed turn"}`, { timeout: 30000 }, async () => {
+    const host = await startHost({ agents: { codex: { command: process.execPath, args: [resolve("tests/fixtures/native-codex.mjs")] } } });
+    const id = randomUUID();
+    try {
+      assert.equal((await host.fetchApi("/sessions", "owner", { provider: "codex", projectId: "rehearsal", title: "Native limit", localUi: true, requestId: id, nativeArgs: [prompt] })).status, 201);
+      const signals = await waitFor(async () => (await host.fetchApi(`/sessions/${id}/events?types=signal`)).body.events,
+        events => events.some((event: any) => event.data.kind === "turn-end"));
+      const limits = signals.filter((event: any) => event.data.kind === "provider-limit");
+      const ends = signals.filter((event: any) => event.data.kind === "turn-end");
+      assert.equal(ends.length, 1);
+      assert.equal(ends[0].data.failed, true);
+      if (usageLimit) {
+        assert.equal(limits.length, 1);
+        assert.equal(limits[0].data.limit, "usage");
+        assert.equal(limits[0].data.confidence, "corroborated");
+        assert.equal(limits[0].data.source, "protocol");
+        assert.ok(limits[0].seq < ends[0].seq, "the limit signal precedes the turn end");
+      } else assert.equal(limits.length, 0);
+    } finally { await host.stop(); }
+  });
+}
+
 test("CLI opens a local native frontend with a loopback credential and detaches without ending the backend", { timeout: 30000 }, async () => {
   const fixture = resolve("tests/fixtures/native-codex.mjs");
   const host = await startHost({ agents: { codex: { command: process.execPath, args: [fixture] } } });

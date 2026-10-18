@@ -222,6 +222,8 @@ export async function startNativeCodex(options: {
               if (message.method === "turn/started") { lastMessage = undefined; options.onSignal({ kind: "turn-start" }); }
               if (message.method === "item/completed" && message.params?.item?.type === "agentMessage" && typeof message.params.item.text === "string")
                 lastMessage = message.params.item.text.slice(0, 4000);
+              if (message.method === "turn/completed" && message.params?.turn?.status === "failed" && message.params.turn.error?.codexErrorInfo === "usageLimitExceeded")
+                options.onSignal({ kind: "provider-limit", limit: "usage", confidence: "corroborated", message: "Codex reported usageLimitExceeded" });
               if (message.method === "turn/completed") options.onSignal({ kind: "turn-end", message: message.params?.turn?.status === "interrupted" ? "Turn interrupted" : lastMessage, failed: message.params?.turn?.status === "failed" });
             }
             const method = message.id === undefined ? undefined : pending.get(message.id);

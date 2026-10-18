@@ -1132,7 +1132,9 @@ server.listen(socketPath(runDir, session.id), async () => {
           persist();
         },
         onExit: () => { child?.kill("SIGTERM"); },
-        onSignal: (signal) => { record(signal, "protocol"); },
+        onSignal: (signal) => {
+          if (signal.kind === "provider-limit") { limitWatch = undefined; recordLimit(signal, "protocol"); } else record(signal, "protocol");
+        },
         record: (method) => { append("input-intent", { op: "native", method }); },
       });
       hybrid?.providerReady(native.supportsExecutionSelection);

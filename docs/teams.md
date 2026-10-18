@@ -82,8 +82,9 @@ selected host project. A new remote source receives a committed Git snapshot;
 ignored files and uncommitted changes are not included. Existing cloud sources
 are not replaced by enrollment. Setup and verification commands belong to that
 repository, while the coordinator, workers, and reviewer come from the host's
-configured lineup. Owners can delegate current one-shot tool requests to the
-strong coordinator under an explicit repository policy; see
+configured lineup. First-time repository enrollment delegates current one-shot
+tool requests to the strong coordinator by default; `--permissions off` opts out.
+The repository policy bounds that authority; see
 [Delegating permission decisions](#delegating-permission-decisions).
 
 A new empty repository can enroll immediately after `git init`. Its cloud source
@@ -565,16 +566,19 @@ the failure and the configured provider policy; retries do not grant permission.
 
 ## Delegating permission decisions
 
-Enable delegation once in the enrolled repository:
+The first repository enrollment enables delegation by default:
 
 ```sh
-infinite repo init --permissions coordinator
+infinite repo init
 ```
 
-This pins an owner-approved scope and a limit of ten decisions to each new run.
-Use `--permission-scope TEXT` to set narrower boundaries and `--permission-limit N`
-to set a limit from one to twenty. Omitting these options on a later enrollment
-preserves the repository policy. Existing runs remain unchanged.
+This pins a repository scope and a limit of ten decisions to each new run. Later
+enrollments preserve the saved policy, including an explicit opt-out. To enable
+delegation on an existing enrollment, pass `--permissions coordinator`. Add
+`--permission-scope TEXT` or `--permission-limit N` to that explicit command to
+change the scope or set a limit from one to twenty. Existing runs remain unchanged.
+An older host without delegation support requires an upgrade or an explicit
+`--permissions off` choice.
 
 A current one-shot tool prompt can start a separate turn on the run's strong
 Claude coordinator profile. The coordinator receives the task, owner scope and exact

@@ -15,11 +15,15 @@ import { git, limitLineup, mixedLineup, fixture } from "./team-fixture.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 
 test("team runs use readable names and exact root permissions under a strict umask", { timeout: 120000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-team-modes-"));
+  const workspaceDir = join(root, "first", "second", "teams");
   const previousUmask = process.umask(0o077);
   let f: Awaited<ReturnType<typeof fixture>> | undefined;
   try {
     // The API subprocess inherits this umask, including after enrollment restarts it.
-    f = await fixture("success");
+    f = await fixture("success", undefined, { teams: { workspaceDir,
+      commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", root] },
+    } });
     const firstRequest = f.create();
     const firstCreated = await f.host.fetchApi("/teams", "owner", firstRequest);
     const first = await f.settled(firstCreated.body.id);
@@ -27,7 +31,8 @@ test("team runs use readable names and exact root permissions under a strict uma
     const firstName = `${first.createdAt.slice(0, 10)}-implement-a-small-feature-${first.id.slice(0, 8)}`;
     assert.equal(realpathSync(first.workspace), realpathSync(join(f.host.config.teams!.workspaceDir, `rehearsal-${firstName}`, "integration")));
     assert.equal(first.branch, `infinite/implement-a-small-feature-${first.id.slice(0, 8)}`);
-    assert.equal(statSync(f.host.config.teams!.workspaceDir).mode & 0o777, 0o750);
+    for (const directory of [workspaceDir, dirname(workspaceDir), dirname(dirname(workspaceDir))])
+      assert.equal(statSync(directory).mode & 0o777, 0o750);
 
     const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true }, "Projects/teamwork");
     const secondRequest = f.create();
@@ -39,14 +44,22 @@ test("team runs use readable names and exact root permissions under a strict uma
     assert.equal(second.branch, `infinite/implement-a-small-feature-${second.id.slice(0, 8)}`);
     assert.equal(statSync(teamworkRoot).mode & 0o777, 0o750);
     assert.equal(statSync(dirname(teamworkRoot)).mode & 0o777, 0o750);
-  } finally { process.umask(previousUmask); await f?.close(); }
+  } finally {
+    process.umask(previousUmask);
+    try { await f?.close(); } finally { rmSync(root, { recursive: true, force: true }); }
+  }
 });
 
-test("default runs refuse a group-writable root until its permissions are repaired", { timeout: 120000 }, async () => {
+for (const unsafe of ["root", "parent"] as const)
+test(`default runs refuse a group-writable ${unsafe} until its permissions are repaired`, { timeout: 120000 }, async () => {
   const root = realpathSync(mkdtempSync("/tmp/inf-team-root-"));
-  const workspaceDir = join(root, "teams");
-  mkdirSync(workspaceDir, { mode: 0o770 });
-  chmodSync(workspaceDir, 0o770);
+  const parent = join(root, "parent"), workspaceDir = join(parent, "teams");
+  mkdirSync(parent, { mode: 0o750 });
+  mkdirSync(workspaceDir, { mode: 0o750 });
+  chmodSync(parent, 0o750);
+  chmodSync(workspaceDir, 0o750);
+  const unsafeDirectory = unsafe === "root" ? workspaceDir : parent;
+  chmodSync(unsafeDirectory, 0o770);
   let f: Awaited<ReturnType<typeof fixture>> | undefined;
   try {
     f = await fixture("success", undefined, { teams: { workspaceDir,
@@ -55,9 +68,9 @@ test("default runs refuse a group-writable root until its permissions are repair
     const refused = await f.host.fetchApi("/teams", "owner", f.create());
     assert.deepEqual([refused.status, refused.body.code], [409, "team-root-unsafe"]);
     assert.deepEqual(readdirSync(workspaceDir), []);
-    assert.equal(statSync(workspaceDir).mode & 0o777, 0o770, "the host must not repair an existing unsafe root");
+    assert.equal(statSync(unsafeDirectory).mode & 0o777, 0o770, "the host must not repair an existing unsafe directory");
 
-    chmodSync(workspaceDir, 0o750);
+    chmodSync(unsafeDirectory, 0o750);
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const finished = await f.settled(created.body.id);
@@ -65,14 +78,15 @@ test("default runs refuse a group-writable root until its permissions are repair
   } finally { try { await f?.close(); } finally { rmSync(root, { recursive: true, force: true }); } }
 });
 
-test("teamwork preparation refuses a group-writable root parent", { timeout: 120000 }, async () => {
+for (const unsafe of ["parent", "anchor"] as const)
+test(`teamwork preparation refuses a group-writable ${unsafe}`, { timeout: 120000 }, async () => {
   const f = await fixture("success");
   try {
     const parent = join(dirname(f.source), "Projects");
     mkdirSync(parent);
-    chmodSync(parent, 0o770);
     const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true }, "Projects/teamwork");
     assert.ok(teamworkRoot);
+    chmodSync(unsafe === "parent" ? parent : dirname(f.source), 0o770);
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     assert.deepEqual([created.status, created.body.code], [409, "team-root-unsafe"]);
   } finally { await f.close(); }

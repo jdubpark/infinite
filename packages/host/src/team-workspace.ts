@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
-import { dirname, join, resolve, relative, isAbsolute } from "node:path";
+import { dirname, join, resolve, relative, isAbsolute, parse } from "node:path";
 import type { TeamCommand, TeamTaskPlan } from "./team-types.js";
 
 export class TeamError extends Error {
@@ -62,6 +62,17 @@ const hostOwned = (stat: ReturnType<typeof lstatSync>) => {
   return typeof process.getuid !== "function" || stat.uid === process.getuid() || stat.uid === 0;
 };
 const unsafeTeamRoot = () => new TeamError(409, "team-root-unsafe", "Team roots must contain only host-owned real directories that are not writable by group or others.");
+function assertSecureAncestors(path: string) {
+  try {
+    const canonical = realpathSync(path), root = parse(canonical).root;
+    let current = root;
+    for (const part of ["", ...relative(root, canonical).split(/[\\/]/).filter(Boolean)]) {
+      current = join(current, part);
+      const info = lstatSync(current);
+      if (!info.isDirectory() || !hostOwned(info) || ((info.mode & 0o022) !== 0 && (info.mode & 0o1000) === 0)) throw unsafeTeamRoot();
+    }
+  } catch { throw unsafeTeamRoot(); }
+}
 function ensureHostDirectoryComponent(path: string, mode: number, create: boolean) {
   if (mode & 0o022) throw unsafeTeamRoot();
   let info, created = false;
@@ -76,21 +87,30 @@ function ensureHostDirectoryComponent(path: string, mode: number, create: boolea
 }
 /** The configured default root is protected just like an anchored teamwork root. */
 export function ensureDefaultTeamRoot(root: string, create = false) {
-  // The parent belongs to the operator, as before; only the root itself must be protected.
-  if (create) mkdirSync(dirname(root), { recursive: true, mode: 0o750 });
-  ensureHostDirectoryComponent(root, 0o750, create);
-  return realpathSync(root);
+  let anchor = dirname(resolve(root));
+  while (true) {
+    try { lstatSync(anchor); break; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create || dirname(anchor) === anchor) throw unsafeTeamRoot();
+      anchor = dirname(anchor);
+    }
+  }
+  return ensureHostDirectory(anchor, root, 0o750, create);
 }
 /** Create/check each component below a trusted anchor without traversing an unsafe parent. */
 export function ensureHostDirectory(anchor: string, target: string, mode: number, create = true) {
-  const base = realpathSync(anchor), destination = resolve(target), rel = relative(base, destination);
+  let base: string;
+  try { base = realpathSync(anchor); } catch { throw unsafeTeamRoot(); }
+  assertSecureAncestors(base);
+  // Keep the suffix relative to the supplied anchor when a system alias resolves elsewhere.
+  const rel = relative(resolve(anchor), resolve(target));
   if (!rel || rel === ".." || rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(rel)) throw unsafeTeamRoot();
   let current = base;
   for (const part of rel.split(/[\\/]/)) {
     current = join(current, part);
     ensureHostDirectoryComponent(current, mode, create);
   }
-  return realpathSync(destination);
+  return realpathSync(current);
 }
 /** Change directory modes through an opened no-follow descriptor, never through a redirected path. */
 export function chmodDirectoryNoFollow(path: string, mode: number) {

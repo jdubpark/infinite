@@ -489,6 +489,7 @@ identity receives access. The default root is checked during preparation and
 whenever a run path is used, including for legacy records. Unsafe legacy roots
 leave their records preserved but prevent preparation, launch, and bundling.
 Stored roots outside `teams.workspaceDir` require a trusted teamwork anchor.
+Directories above each root must be owned by root or the API account and not writable by other accounts unless sticky.
 
 Enable teams in the private host configuration and define the project's
 verification commands. Commands use executable/argument arrays, without an

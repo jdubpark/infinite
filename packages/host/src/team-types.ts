@@ -10,6 +10,7 @@ export const teamCommandSchema = z.object({
 }).strict();
 export type TeamCommand = z.infer<typeof teamCommandSchema>;
 export const teamProjectSchema = z.object({
+  handoff: z.enum(["auto", "off"]).optional(),
   setup: teamCommandSchema.optional(),
   checks: z.array(teamCommandSchema).min(1).max(8),
 }).strict();
@@ -210,6 +211,7 @@ export interface TeamRun {
   /** Immutable model choices; current provider credentials and permissions are not copied here. */
   lineup?: TeamLineup;
   goal?: TeamGoalContext;
+  handoff?: import("./handoff-types.js").TeamHandoffContext;
   brief?: TeamBrief;
   discovery?: { revision: number; summary: string; tasks: TeamScout[]; completedAt?: string };
   noChange?: { summary: string; evidence: TeamEvidence[] };

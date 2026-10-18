@@ -17,6 +17,7 @@ import { checkLaptopExecutor, startLaptopService } from "./laptop-service.js";
 import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWorkspaceManifest } from "./workspace-checkpoint.js";
 import { readSyncState, startSyncService, stopSyncService, syncServiceRunning } from "./sync-service.js";
 import { localProjectPath } from "./mirrored-projects.js";
+import { boundTeamProject, handleTeamClientCommand } from "./team-cli.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; capabilities?: { workspaceMirror?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
@@ -39,7 +40,7 @@ function startupProgress() {
     stop,
   };
 }
-class HttpError extends Error { constructor(readonly status: number, message: string) { super(message); } }
+class HttpError extends Error { constructor(readonly status: number, message: string, readonly code?: string) { super(message); } }
 function originOf(value: string) {
   const url = new URL(value);
   if (url.username || url.password || url.search || url.hash || url.pathname !== "/") throw new Error("Use the host origin without credentials, a path, or query parameters");
@@ -54,21 +55,24 @@ function loadConfig(path: string): ClientConfig {
   return { ...config, origin: originOf(config.origin) };
 }
 function connection(config: ClientConfig, clientId = randomUUID()) {
-  const request = async (path: string, body?: unknown, signal?: AbortSignal, headers: Record<string, string> = {}) => {
+  const request = async (path: string, body?: unknown, signal?: AbortSignal, headers: Record<string, string> = {}, method?: string) => {
     const response = await fetch(config.origin + "/api" + path, {
-      method: body === undefined ? "GET" : "POST", redirect: "error",
+      method: method ?? (body === undefined ? "GET" : "POST"), redirect: "error",
       headers: { Authorization: `Bearer ${config.token}`, "X-Infinite-Client": clientId, ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...headers },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: body === undefined ? undefined : body instanceof Uint8Array ? body as unknown as BodyInit : JSON.stringify(body),
       signal: signal ?? AbortSignal.timeout(15000),
     });
     if (!response.ok) {
       // Server errors may contain request details; report only a bounded category.
-      await response.body?.cancel();
-      throw new HttpError(response.status, `Host returned HTTP ${response.status}. ${response.status === 401 ? "Pair a current device key." : response.status === 403 ? "This device is not permitted to perform that action." : "Check the session before retrying an input or launch."}`);
+      const detail = await response.json().catch(() => ({})) as { code?: unknown };
+      const code = typeof detail.code === "string" && /^[a-z0-9-]{1,80}$/.test(detail.code) ? detail.code : undefined;
+      const guidance = code === "stale-enrollment-revision" ? "The repository enrollment changed; refresh its status and submit a new request ID." :
+        response.status === 401 ? "Pair a current device key." : response.status === 403 ? "This device is not permitted to perform that action." : "Inspect the current state before retrying a mutation.";
+      throw new HttpError(response.status, `Host returned HTTP ${response.status}${code ? ` (${code})` : ""}. ${guidance}`, code);
     }
     return response;
   };
-  return { request, json: async <T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>): Promise<T> => (await request(path, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined, headers)).json() as Promise<T> };
+  return { request, json: async <T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> => (await request(path, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined, headers, method)).json() as Promise<T> };
 }
 function sessionCwd(session: Session & Partial<WorkerState>) {
   return (session.execution?.location ?? session.executionLocation) === "laptop" ? session.workspace?.cwd : session.cwd;
@@ -218,6 +222,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   let duplex: ReturnType<typeof terminalConnection> | undefined;
   let interactive = !watch && me.role === "owner", online = false, cursor = 0, queued = "", sending = false, warned = false;
   let initialControl = interactive, leasesSupported = false, controlPending = false;
+  let handoffTimer: ReturnType<typeof setInterval> | undefined, handoffBusy = false, handoffNotice = "";
   let renewal: ReturnType<typeof setInterval> | undefined;
   let lastStatus: Status = session.status;
   // A detached CLI has no background job to keep alive. Terminate this client
@@ -273,6 +278,39 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   const uncertain = (error?: unknown) => {
     if (abort.signal.aborted || !interactive) return;
     loseControl(error instanceof TerminalControlError ? error.message : "Input delivery is uncertain. Nothing was retried. Inspect the terminal, then press Enter to enable input again.");
+  };
+  const checkHandoff = async () => {
+    if (handoffBusy || abort.signal.aborted) return;
+    handoffBusy = true;
+    try {
+      const handoff = await api.json<{ status: string; reason?: string; teamId?: string }>(`/sessions/${session.id}/handoff`, undefined, AbortSignal.timeout(5000));
+      if (handoff.status === "blocked") {
+        const message = `Agent handoff is blocked${handoff.reason ? `: ${clean(handoff.reason)}` : ". Inspect the session before continuing."}`;
+        if (handoffNotice !== message) notice(handoffNotice = message);
+        return;
+      }
+      if (!["requested", "waiting-for-control", "stopping", "creating", "started"].includes(handoff.status)) return;
+      if (handoff.status === "started" || handoff.status === "creating") {
+        const message = `Agent handoff ${handoff.status}${handoff.teamId ? ` · team ${clean(handoff.teamId)}` : ""}.`;
+        if (handoffNotice !== message) notice(handoffNotice = message);
+        stop();
+      } else if (screen.active || screen.hasUnsentDraft) {
+        const message = `Agent handoff is waiting${handoff.teamId ? ` for team ${clean(handoff.teamId)}` : ""} because this terminal has an unsent local draft. Insert or discard it explicitly, then detach with Ctrl+]; the host will not send or discard it.`;
+        if (handoffNotice !== message) notice(handoffNotice = message);
+        return;
+      } else {
+        if (["requested", "waiting-for-control"].includes(handoff.status) && duplex?.lease && leasesSupported && !controlPending) {
+          controlPending = true;
+          try { await duplex.control("release"); }
+          catch { notice("Agent handoff is waiting for this terminal's control lease. Detach with Ctrl+] after checking the terminal."); return; }
+          finally { controlPending = false; }
+        }
+        const message = `Agent handoff accepted${handoff.teamId ? ` · team ${clean(handoff.teamId)}` : ""}. Releasing this terminal and detaching; any other device lease remains untouched.`;
+        notice(message);
+        stop();
+      }
+    } catch { /* Older hosts return no handoff route; normal attachment continues. */ }
+    finally { handoffBusy = false; }
   };
   const send = async () => {
     if (sending) return;
@@ -336,6 +374,8 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   process.stdin.on("data", input); process.stdin.resume();
   process.stdout.on("resize", resize);
   process.on("SIGTERM", stop); process.on("SIGINT", stop); process.on("SIGHUP", stop);
+  handoffTimer = setInterval(() => { void checkHandoff(); }, 1000);
+  handoffTimer.unref();
   try {
     while (!abort.signal.aborted) {
       const stalled = new AbortController();
@@ -405,7 +445,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
     }
   } finally { restoreTerminal(); }
   function restoreTerminal() {
-    progress.stop(); clearInterval(renewal); abort.abort(); queued = ""; screen.dispose();
+    progress.stop(); clearInterval(renewal); clearInterval(handoffTimer); abort.abort(); queued = ""; screen.dispose();
     process.stdin.off("data", input); process.stdin.pause();
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.stdout.off("resize", resize);
@@ -414,7 +454,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "usage", "resources", "close", "sync", "pull"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "usage", "resources", "close", "sync", "pull", "team", "repo"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
@@ -422,7 +462,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
-  const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output"]);
+  const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id"]);
   const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes"]);
   const option = () => {
     const name = args.shift()!;
@@ -555,6 +595,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     // Existing local-host list remains available before a laptop is paired.
     if (command === "list" && !existsSync(path) && !options["--client-config"] && !process.env.INFINITE_CLIENT_CONFIG) return false;
     const config = loadConfig(path), api = connection(config);
+    if (command === "team" || command === "repo") {
+      return await handleTeamClientCommand(command, positional, options, config, api, path, argv);
+    }
     if (command === "list") {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
       if (options["--json"]) console.log(JSON.stringify(sessions, null, 2));
@@ -737,8 +780,10 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         } else validateNativeOpenCodeArgs(nativeArgs);
         if (!options["--detach"]) await (command === "codex" ? checkNativeCodex : checkNativeOpenCode)();
       }
-      const mapped = !workspace && !options["--project"] ? await mappedProject() : undefined;
-      const projectId = String(mapped?.id ?? options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
+      const bound = !workspace && !options["--project"] ? boundTeamProject(config, path) : undefined;
+      const boundCwd = bound ? relative(gitRoot(realpathSync(process.cwd())), realpathSync(process.cwd())).split(sep).join("/") : undefined;
+      const mapped = !workspace && !options["--project"] && !bound ? await mappedProject() : undefined;
+      const projectId = String(bound ?? mapped?.id ?? options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!mapped && !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
       if (mapped) {
         progress.start(`Syncing ${clean(mapped.root)} to ${clean(mapped.path)}`);
@@ -755,7 +800,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const requestId = randomUUID();
       console.error(`[Infinite] Launch ${requestId} on ${config.origin} · project ${projectId}`);
       progress.start(`Starting ${providerNames[command]} on ${new URL(config.origin).hostname}`);
-      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs, ...(mapped?.cwd ? { cwd: mapped.cwd } : {}), ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
+      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs, ...((boundCwd ?? mapped?.cwd) ? { cwd: boundCwd ?? mapped!.cwd } : {}), ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
       if (workspace) {
         progress.start("Connecting the laptop executor");
         await startLaptopService({ ...config, sessionId: session.id, workspaceToken: workspace.token, cwd: workspace.cwd, roots: workspace.roots, configFile: path });

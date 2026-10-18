@@ -35,6 +35,57 @@ infinite close SESSION_ID  # confirm before ending its provider process
 
 `usage` shows per-provider spend for the current UTC budget period. It labels configured prices and costs reported by OpenCode separately, and reports sessions without a usage capture path as unmeasured. `--json` prints the host's raw `/api/usage` summary. Budgets are informational and do not block or reroute work.
 
+## Team CLI
+
+Initialize a project from a clean Git checkout, then start and control teams from that directory:
+
+```sh
+infinite repo init [DIRECTORY] [--project PROJECT_ID]
+infinite repo init --check-json '[{"command":"make","args":["test"]}]'
+infinite repo init --linear-team TEAM_UUID --linear-project PROJECT_UUID
+infinite team start "Add a feature"
+infinite team start --prd requirements.md
+infinite team status
+infinite team status TEAM_ID --json
+infinite team watch TEAM_ID
+infinite team steer TEAM_ID "Keep the change within the API package"
+infinite team answer TEAM_ID QUESTION_ID "Use the existing route"
+infinite team pause TEAM_ID
+infinite team resume TEAM_ID
+infinite team cancel TEAM_ID
+```
+
+Linear IDs are saved during enrollment; team commands do not need them again.
+To reuse them across repositories, initialize their parent folder once:
+
+```sh
+infinite repo init /path/to/work --linear-team TEAM_UUID --linear-project PROJECT_UUID
+cd /path/to/work/my-repo
+infinite repo init
+infinite team start "Add a feature"
+```
+
+A parent folder outside Git stores only local Linear defaults. It does not upload
+the folder or create a host project. Each child repository still needs its own
+enrollment and verification commands. An enrolled Git repository also supplies
+its saved Linear mapping to repositories nested beneath it.
+
+Enrollment uses explicit Linear flags first, an existing host project mapping
+second, and the nearest parent default third. Parent changes affect future
+enrollments; they do not rewrite enrolled repositories or historical runs. A
+different explicit team never retains a project from the previous team.
+Paths are resolved before looking up parents, so a symlink outside the parent
+does not inherit its defaults. Defaults stay in private client storage for the
+paired host and device key; another pairing needs its own setup.
+
+For a repository, `repo init` binds the canonical Git root to its cloud project in private client state and requires a committed, clean checkout. The command infers `npm ci` when an npm lockfile exists and `npm run check` when `package.json` defines a `check` script. If it cannot identify checks, provide `--check-json` as a JSON array of `{ "command": "...", "args": [...] }` objects; `--setup-json` accepts one setup command in the same format. For a newly resolved local project, it uploads a one-time source snapshot from an isolated clone of the current commit. It does not start continuous sync or include ignored and untracked files. An explicit `--project` or existing directory binding configures the selected project without uploading local source. A pending cloud generation is refused; an already applied generation is retained without replacement.
+
+The host must have team workspace storage configured, and the project must have required checks, before `team start` can run. The host's configured lineup is used by default. `--provider PROVIDER` requests a single-provider team explicitly. `team start` uses the current directory's saved project binding, or an explicit `--project PROJECT_ID`. `team status` without an ID lists teams on the paired host; the other commands address a team by ID. `--linear-team` and `--linear-project` configure the optional project issue mapping during initialization. `--handoff auto|off` defaults to `auto` for this onboarding path.
+
+Ordinary provider launches from an enrolled directory also use its saved project binding. For example, `infinite claude` opens that project's existing cloud checkout without uploading local changes or starting continuous sync. Launching from a subdirectory preserves its relative working directory. Use explicit sync commands when the cloud source needs an update.
+
+Team mutations save a private request receipt before sending and do not retry an uncertain request. Supply `--request-id UUID` only when deliberately resuming the same request. `status` and `watch` show the host's workspace, branch, Linear URL, and pending questions. Ctrl+C detaches from `watch`; it does not stop the team.
+
 For terminal sessions, `resume` attaches to the existing OS process. It does not invoke the provider's resume command, fork a conversation, or submit the initial request again. An exited process remains available as a recording through `monitor`; restarting it requires explicit native-provider recovery. For example, `infinite codex resume NATIVE_ID` passes that native command through and creates a new Infinite recording. Use `infinite resume INFINITE_ID` while the existing process is alive.
 
 ## The app's cmux workspaces from a terminal

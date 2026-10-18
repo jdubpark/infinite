@@ -1,3 +1,4 @@
+import { handoffNativePrompt, handoffPathsOverlap } from "./handoff-types.js";
 import { spawn } from "node:child_process";
 import {
   readFileSync,
@@ -103,6 +104,37 @@ const unavailable = (now = new Date().toISOString()): WorkerState => ({
 });
 export class Manager {
   private serial: Promise<unknown> = Promise.resolve();
+  private readonly handoffProjects = new Map<string, string>();
+  reserveHandoff(projectId: string) {
+    const project = this.config.projects.find(project => project.id === projectId);
+    if (!project) throw new ContentError("Handoff project is unavailable");
+    this.handoffProjects.set(projectId, realpathSync(project.path));
+  }
+  releaseHandoff(projectId: string) { this.handoffProjects.delete(projectId); }
+  async assertHandoffAlone(sessionId: string) {
+    const source = this.meta(sessionId).session;
+    for (const id of readdirSync(join(this.config.stateDir, "sessions")).filter(id => /^[a-f0-9-]{36}$/.test(id))) {
+      if (id === sessionId) continue;
+      const other = this.meta(id).session;
+      if ((await this.state(id)).status === "exited") continue;
+      const otherPath = realpathSync(other.cwd);
+      const overlappingPath = handoffPathsOverlap(realpathSync(source.cwd), otherPath);
+      if (other.projectId === source.projectId || overlappingPath)
+        throw new ContentError("Another session in this project has not confirmed exit");
+    }
+  }
+  async stopHandoffSession(sessionId: string, requestId: string) {
+    if (!this.meta(sessionId).session.handoff?.policy || !this.handoffRequest(sessionId))
+      throw new ContentError("This session has not requested handoff", 403);
+    const state = await this.state(sessionId);
+    if (state.status === "exited") {
+      if (state.handoffQuiescence?.requestId !== requestId) throw new ContentError("The source exited without verified handoff process quiescence");
+      return state;
+    }
+    if (state.status !== "running") throw new ContentError("The source runtime has not confirmed a controllable state");
+    await workerCall(this.config.runDir, sessionId, { op: "handoff-stop", requestId }, 10000);
+    return this.state(sessionId);
+  }
   constructor(
     readonly config: Config,
     readonly key: Buffer,
@@ -180,6 +212,7 @@ export class Manager {
           context: _context,
           initialPrompt: _prompt,
           nativeArgs: _nativeArgs,
+          handoff: _handoff,
           ...summary
         } = session;
         return {
@@ -258,6 +291,7 @@ export class Manager {
     return operation;
   }
   private async resumeOnce(sessionId: string, requestId: string): Promise<Session & WorkerState> {
+    if (this.handoffRequest(sessionId)) throw new ContentError("This session yielded to a team; inspect its handoff instead of resuming it");
     if (requestId === sessionId) throw new ContentError("Resumption needs a new request identity", 400);
     const receiptFile = join(this.config.stateDir, "resumptions", `${requestId}.sealed`);
     if (existsSync(receiptFile)) {
@@ -341,6 +375,7 @@ export class Manager {
       ).length >= this.config.maxSessions
     )
       throw new Error("The configured session limit has been reached");
+    if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
     const configuredProfile = this.config.agents[request.provider];
     if (!configuredProfile) throw new Error("Provider is not configured on this host");
     const profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
@@ -366,8 +401,25 @@ export class Manager {
       ...(request.nativeArgs !== undefined ? { nativeArgs: request.nativeArgs } : {}),
       ...(request.workspace ? { workspace: { cwd: request.workspace.cwd, roots: request.workspace.roots } } : {}),
     };
-    // Native CLI arguments are exact: do not append a second positional prompt or
-    // provider settings. The context snapshot remains available in the record.
+    if (!request.team) {
+      const userRequest = request.nativeArgs === undefined ? request.prompt : handoffNativePrompt(request.provider, request.nativeArgs);
+      let reason = "This project has not enabled automatic team handoff.";
+      if (project.team?.handoff === "auto") {
+        reason = "Handoff requires a new Claude or Codex PTY session at the project root, a supported prompt up to 12000 characters, and only supported model flags.";
+        if (!request.localUi && !request.workspace && !request.resumedFrom && ["claude", "codex"].includes(request.provider) && userRequest !== undefined && userRequest.length <= 12000 && session.cwd === realpathSync(project.path)) {
+          reason = "Handoff requires configured checks and a reviewed model lineup.";
+          if (this.config.teams?.lineup && project.team.checks.length) session.handoff = { policy: structuredClone({
+            sourceSessionId: id, projectId: project.id, path: session.cwd, userRequest,
+            lineup: this.config.teams.lineup, project: project.team, linear: project.linear,
+            commandPrefix: this.config.teams.commandPrefix, workspaceDir: this.config.teams.workspaceDir,
+            maxMinutes: 60, maxMembers: 16, parallelism: 2,
+          }) };
+        }
+      }
+      session.handoff ??= { reason };
+    }
+    // Keep the native prompt exact. Only opted-in, qualified sessions receive the
+    // separate handoff MCP capability; the context snapshot stays in the record.
     const prompt = request.nativeArgs !== undefined ? "" : [
       context.text
         ? `Shared project context (version ${context.version}, provided by the owner):\n${context.text}`
@@ -425,6 +477,15 @@ export class Manager {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     return { ...session, ...(await this.state(id)) };
+  }
+  handoffRequest(id: string) {
+    let cursor = 0;
+    for (;;) {
+      const page = this.events(id, cursor, 1, new Set(["team-handoff"]));
+      if (page.events[0]) return page.events[0];
+      if (!page.more) return undefined;
+      cursor = page.cursor;
+    }
   }
   events(id: string, after: number, limit: number, types?: Set<string>) {
     this.meta(id);

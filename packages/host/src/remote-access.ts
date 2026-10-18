@@ -48,7 +48,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (upload && UUID.test(upload[1]) && (upload[2] ? method === "POST" : ["PUT", "DELETE"].includes(method))) return true;
   const match = /^\/api\/sessions\/([^/]+)(?:\/([^/]+))?$/.exec(url.pathname);
   if (!match || !UUID.test(match[1])) return false;
-  return method === "GET" ? [undefined, "events", "messages", "summary", "file"].includes(match[2])
+  return method === "GET" ? [undefined, "events", "messages", "summary", "file", "handoff"].includes(match[2])
     : method === "POST" && ["control", "input", "answer", "key", "stop", "resize", "resume"].includes(match[2]);
 }
 

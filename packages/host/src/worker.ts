@@ -1,3 +1,6 @@
+import { stopHandoffProcesses } from "./handoff-processes.js";
+import { handoffEnvelopeSchema, handoffObjective } from "./handoff-types.js";
+import { cleanTeamCheckpoint } from "./team-workspace.js";
 import { createServer } from "node:net";
 import { chmodSync, mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -313,7 +316,28 @@ function onTranscript(body: unknown): HookReply | void {
   if (b.offset === transcript.tail.offset) for (const message of transcript.tail.ingest(b.text)) recordMessage(message);
   return { after: transcript.tail.offset };
 }
-function onHook(route: HookRoute, body: unknown): HookReply | void {
+let handoffReceipt: string | undefined;
+let handoffStopping = false;
+let handoffInFlight = false;
+async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void> {
+  if (route === "team-handoff") {
+    const parsed = handoffEnvelopeSchema.safeParse(body);
+    if (!parsed.success || !session.handoff?.policy) throw new HookPayloadError(400);
+    if (parsed.data.sessionId !== session.id) throw new HookPayloadError(403);
+    const digest = createHash("sha256").update(JSON.stringify(parsed.data)).digest("hex");
+    if (handoffReceipt) { if (handoffReceipt !== digest) throw new HookPayloadError(409); return; }
+    if (state.status !== "running" || handoffInFlight) throw new HookPayloadError(409);
+    handoffInFlight = true;
+    try {
+      handoffObjective(session.handoff.policy, parsed.data.request);
+      await cleanTeamCheckpoint(session.handoff.policy.path, parsed.data.request.checkpointHead, session.handoff.policy.commandPrefix);
+      if (state.status !== "running") throw new HookPayloadError(409);
+      append("team-handoff", parsed.data);
+      handoffReceipt = digest;
+    } catch { throw new HookPayloadError(409); }
+    finally { handoffInFlight = false; }
+    return;
+  }
   if (route === "team-report") {
     const parsed = teamReportEnvelopeSchema.safeParse(body);
     if (!parsed.success || !session.team) throw new HookPayloadError(400);
@@ -607,6 +631,7 @@ function deliver(
     return publicReceipt(previous);
   }
   checkControl(request);
+  if (handoffReceipt && request.op !== "stop") throw new Error("This session yielded to a team; further input is disabled");
   if (state.status !== "running" || !child)
     throw new Error("Session is not running");
   // Text and Enter typed over an open dialog would pick its highlighted option. Only a
@@ -890,6 +915,20 @@ const server = createServer((socket) => {
           seq: journal.seq,
           screen: request.screen ? screen() : "",
         };
+      } else if (request.op === "handoff-stop") {
+        result = await serialize(async () => {
+          if (!handoffReceipt || !session.handoff?.policy || !child || !/^[a-f0-9-]{36}$/.test(request.requestId)) throw new Refusal("unsupported");
+          checkControl({});
+          if (state.handoffQuiescence?.requestId === request.requestId) return state;
+          if (state.status !== "running") throw new Error("The source exited without a verified handoff process receipt");
+          handoffStopping = true;
+          try {
+            await stopHandoffProcesses(child.pid, processes => append("lifecycle", { handoffStopIntent: { requestId: request.requestId, processes } }));
+            state = { ...state, handoffQuiescence: { requestId: request.requestId, verifiedAt: new Date().toISOString(), scope: "process-group-and-observed-descendants" } };
+            append("lifecycle", { handoffQuiescence: state.handoffQuiescence }); persist();
+            return state;
+          } finally { handoffStopping = false; }
+        });
       } else if (request.op === "snapshot") {
         result = await serialize(snapshot);
       } else if (request.op === "native-info") {
@@ -980,11 +1019,11 @@ const server = createServer((socket) => {
 // ---- Launch ---------------------------------------------------------------------------------
 
 const hookToken = randomBytes(32).toString("hex");
-// A native CLI launch runs its exact argv: no hook listener, settings or relay environment.
+// Ordinary native arguments stay exact unless a scoped handoff policy was captured.
 const wantsHooks =
   !session.runtime?.nativeUi &&
-  session.nativeArgs === undefined &&
-  (Boolean(session.team) || provider === "demo" ||
+  (Boolean(session.handoff?.policy) || session.nativeArgs === undefined) &&
+  (Boolean(session.handoff?.policy) || Boolean(session.team) || provider === "demo" ||
     (provider === "claude" && config.attention.hooks.claude) ||
     (provider === "codex" && config.attention.hooks.codex));
 // Hooks only add precision; the screen heuristics still work if the listener cannot start.
@@ -1060,6 +1099,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       config.attention.hooks,
       Boolean(session.team),
       session.teamModelProfile,
+      session.handoff?.policy ? session.id : undefined,
     );
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {
@@ -1191,7 +1231,8 @@ server.listen(socketPath(runDir, session.id), async () => {
       } catch {
         recordingFailure();
       }
-      setTimeout(() => exitWorker(0), 1500);
+      const finish = () => { if (handoffStopping) setTimeout(finish, 100); else exitWorker(0); };
+      setTimeout(finish, 1500);
     };
     child.onExit(({ exitCode }) => {
       if (snapshotQueue) snapshotQueue.push(() => exited(exitCode));

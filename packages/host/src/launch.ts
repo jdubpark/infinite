@@ -1,3 +1,4 @@
+import { HANDOFF_INSTRUCTIONS } from "./handoff-types.js";
 import type { AgentProfile, Provider } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
@@ -94,8 +95,22 @@ export function buildLaunch(
   enabled: { claude: boolean; codex: boolean },
   team = false,
   teamModelProfile?: TeamModelProfile,
+  handoffSessionId?: string,
 ): AgentProfile {
   const args = [...profile.args];
+  if (handoffSessionId) {
+    if (!hooks || !["claude", "codex"].includes(provider)) throw new Error("Handoff requires an authenticated provider channel");
+    const development = relayPath.endsWith(".ts");
+    const serverArgs = [...(development ? ["--import", import.meta.resolve("tsx")] : []), join(dirname(relayPath), development ? "team-mcp.ts" : "team-mcp.js")];
+    if (provider === "claude") args.push("--append-system-prompt", HANDOFF_INSTRUCTIONS, "--mcp-config", JSON.stringify({ mcpServers: { infinite_handoff: {
+      type: "stdio", command: process.execPath, args: serverArgs,
+      env: { INFINITE_HOOK_URL: "${INFINITE_HOOK_URL}", INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}", INFINITE_HANDOFF_SESSION: handoffSessionId },
+    } } }));
+    else {
+      for (const [key, value] of Object.entries({ command: process.execPath, args: serverArgs, env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN"], "env.INFINITE_HANDOFF_SESSION": handoffSessionId }))
+        args.push("-c", `mcp_servers.infinite_handoff.${key}=${JSON.stringify(value)}`);
+    }
+  }
   if (team && provider === "claude") {
     if (!hooks) throw new Error("Claude team reporting requires its authenticated report channel");
     const development = relayPath.endsWith(".ts");

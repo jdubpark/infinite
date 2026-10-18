@@ -231,6 +231,12 @@ infinite --project ID --title "Task" codex [FLAGS]
 infinite list [--json]                      List cloud sessions
 infinite resume [SESSION_ID]                Reattach to a live process
 infinite monitor [SESSION_ID]               Watch; Enter enables interaction
+infinite repo init [DIRECTORY]              Enroll a repository or set parent-folder Linear defaults
+infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
+infinite team status [ID]                   Show teams or one team
+infinite team watch ID                      Poll team status; Ctrl+C detaches
+infinite team steer ID TEXT                 Steer an active team
+infinite team answer ID QUESTION_ID TEXT    Answer a pending question
 
 Ctrl+] detaches. Ctrl+G returns to monitor mode. Flags after a provider
 name belong to that provider and use cloud paths.

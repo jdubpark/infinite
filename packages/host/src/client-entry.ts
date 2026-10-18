@@ -24,6 +24,12 @@ infinite monitor [session ID or unique prefix]
 infinite recover SESSION_ID [--output NEW_DIRECTORY]
 infinite sync [--project ID] | --stop | --status | --apply [--force]
 infinite pull [PROJECT_ID] [--output NEW_DIRECTORY]
+infinite repo init [DIRECTORY] [--project ID] [--check-json JSON]
+infinite repo init PARENT_DIRECTORY --linear-team UUID [--linear-project UUID]
+infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]
+infinite team status [ID] [--json] | team watch ID
+infinite team steer ID TEXT | team answer ID QUESTION_ID TEXT
+infinite team pause|resume|cancel ID
 
 Put Infinite options before the provider. Everything after it is passed unchanged.
 Sessions run on the cloud machine. --laptop runs Codex tools in this directory with background cloud handoff.

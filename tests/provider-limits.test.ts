@@ -1,0 +1,97 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ProviderLimits, switchesMember, type LimitSessions } from "../packages/host/src/provider-limits.js";
+
+const at = (hhmm: string, day = 18) => `2026-10-${day}T${hhmm}:00.000Z`;
+function store() {
+  const dir = mkdtempSync(join(tmpdir(), "inf-limits-"));
+  const file = join(dir, "provider-limits.sealed"), key = randomBytes(32);
+  return { file, key, open: () => new ProviderLimits(file, key), close: () => rmSync(dir, { recursive: true, force: true }) };
+}
+type Row = Awaited<ReturnType<LimitSessions["list"]>>[number];
+/** A manager stand-in: session rows plus journals of signal events read with a cursor. */
+function sessions(rows: Row[], journals: Record<string, { at: string; data: Record<string, unknown> }[]>): LimitSessions {
+  return {
+    list: async () => rows,
+    events: (id, after, limit) => {
+      const all = (journals[id] ?? []).map((event, index) => ({ ...event, seq: index + 1 }));
+      const events = all.filter(event => event.seq > after).slice(0, limit);
+      return { events, cursor: events.at(-1)?.seq ?? after, more: all.length > after + events.length };
+    },
+  };
+}
+const claudeLimit = { kind: "provider-limit", limit: "usage", confidence: "corroborated", message: "You've hit your session limit", source: "screen", provider: "claude" };
+
+test("a corroborated limit lasts until its stated reset, at most a day, or 15 minutes without one, across restarts", () => {
+  const s = store();
+  try {
+    const limits = s.open();
+    limits.observe({ provider: "claude", detectedAt: at("10:00"), resetsAt: at("15:45"), sessionId: "s1", runId: "r1", confidence: "corroborated" });
+    limits.observe({ provider: "codex", detectedAt: at("10:00"), resetsAt: at("10:00", 21), sessionId: "s2", confidence: "corroborated" });
+    limits.observe({ provider: "opencode", detectedAt: at("10:00"), sessionId: "s3", confidence: "corroborated" });
+    const reopened = s.open();
+    assert.deepEqual(reopened.active(new Date(at("10:05"))).map(limit => [limit.provider, limit.expiresAt]),
+      [["claude", at("15:45")], ["codex", at("10:00", 19)], ["opencode", at("10:15")]]);
+    assert.equal(reopened.active(new Date(at("10:05")))[0].runId, "r1");
+    assert.deepEqual([...reopened.limited(new Date(at("10:20")))], ["claude", "codex"]);
+    assert.deepEqual([...reopened.limited(new Date(at("15:45")))], ["codex"]);
+    reopened.observe({ provider: "claude", detectedAt: at("09:00"), sessionId: "old", confidence: "corroborated" });
+    assert.equal(s.open().active(new Date(at("10:05")))[0].sessionId, "s1", "An older observation does not replace a newer entry");
+  } finally { s.close(); }
+});
+
+test("a cleared limit stays cleared until a newer observation", () => {
+  const s = store();
+  try {
+    const limits = s.open();
+    limits.observe({ provider: "claude", detectedAt: at("10:00"), resetsAt: at("15:45"), sessionId: "s1", confidence: "corroborated" });
+    limits.clear("claude", at("10:30"));
+    limits.observe({ provider: "claude", detectedAt: at("10:00"), resetsAt: at("15:45"), sessionId: "s1", confidence: "corroborated" });
+    assert.deepEqual(s.open().active(new Date(at("10:31"))), [], "The cleared observation cannot re-create its entry, even after restart");
+    s.open().observe({ provider: "claude", detectedAt: at("10:40"), sessionId: "s2", confidence: "corroborated" });
+    assert.equal(s.open().active(new Date(at("10:41")))[0].sessionId, "s2");
+  } finally { s.close(); }
+});
+
+test("only a successful turn after the entry and after that session's own latest limit clears it", async () => {
+  const s = store();
+  try {
+    const limits = s.open();
+    const now = new Date(at("11:00"));
+    const limited: Row = { id: "limited", provider: "claude", attention: { limit: { confidence: "corroborated", since: at("10:00"), resetsAt: at("15:45") } } };
+    const other: Row = { id: "other", provider: "claude", attention: {} };
+    const codex: Row = { id: "codex", provider: "codex", attention: {} };
+    const journals: Record<string, { at: string; data: Record<string, unknown> }[]> = {
+      limited: [{ at: at("10:00"), data: claudeLimit }],
+      other: [
+        { at: at("09:50"), data: { kind: "turn-end" } },
+        { at: at("10:05"), data: { kind: "turn-end" } },
+        { at: at("10:10"), data: { ...claudeLimit, confidence: "single-source", source: "hook" } },
+        { at: at("10:11"), data: { kind: "turn-end", failed: true } },
+      ],
+      codex: [{ at: at("10:20"), data: { kind: "turn-end" } }],
+    };
+    const manager = sessions([limited, other, codex], journals);
+    await limits.reconcile(manager, now);
+    assert.deepEqual(limits.active(now).map(limit => [limit.provider, limit.sessionId, limit.runId, limit.expiresAt]), [["claude", "limited", undefined, at("15:45")]],
+      "A non-team session's corroborated limit is recorded; older, failed, superseded, and other-provider turns do not clear it");
+    journals.other.push({ at: at("10:12"), data: { kind: "turn-end" } });
+    await limits.reconcile(manager, now);
+    assert.deepEqual(limits.active(now), [], "A later successful turn of that provider clears the entry");
+    await limits.reconcile(manager, now);
+    assert.deepEqual(s.open().active(now), [], "The limited session's old observation does not restore it");
+  } finally { s.close(); }
+});
+
+test("a corroborated observation or a Claude hook switches a member; a single-source screen match does not", () => {
+  assert.equal(switchesMember(claudeLimit), true);
+  assert.equal(switchesMember({ ...claudeLimit, confidence: "single-source", source: "hook" }), true);
+  assert.equal(switchesMember({ ...claudeLimit, confidence: "single-source", source: "screen" }), false);
+  assert.equal(switchesMember({ ...claudeLimit, provider: "codex", confidence: "single-source", source: "screen" }), false);
+  assert.equal(switchesMember({ ...claudeLimit, provider: "codex", source: "protocol" }), true);
+  assert.equal(switchesMember({ kind: "turn-end", confidence: "corroborated" }), false);
+});

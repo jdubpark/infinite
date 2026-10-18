@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
@@ -19,6 +19,7 @@ function writePrivate(file: string, value: unknown) {
 const relaySchema = z.object({
   port: z.number().int().min(1).max(65535),
   registrations: z.array(z.object({ machineId: z.uuid(), tokenHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).max(256),
+  proxy: z.object({ socket: z.string().refine(isAbsolute), addressHeader: z.string().regex(/^[a-z0-9-]{1,64}$/) }).strict().optional(),
 }).strict();
 const xml = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 const systemd = (value: string) => '"' + value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%").replaceAll("\n", "\\n") + '"';
@@ -28,12 +29,15 @@ export async function handleMachineCommand(argv: string[]) {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
     config: { type: "string" }, name: { type: "string" }, role: { type: "string" },
     "token-file": { type: "string" }, machine: { type: "string" }, port: { type: "string" },
+    "proxy-socket": { type: "string" }, "client-address-header": { type: "string" },
   } });
   const command = positionals[0];
   const file = resolve(values.config ?? process.env.INFINITE_CONFIG ?? join(homedir(), ".config/infinite", command.startsWith("relay-") ? "relay.json" : "config.json"));
   if (command === "relay-init") {
     if (existsSync(file)) throw new Error("Relay configuration already exists");
-    writePrivate(file, relaySchema.parse({ port: Number(values.port ?? 4790), registrations: [] }));
+    if (values["client-address-header"] && !values["proxy-socket"]) throw new Error("--client-address-header requires --proxy-socket");
+    const proxy = values["proxy-socket"] ? { socket: resolve(values["proxy-socket"]), addressHeader: (values["client-address-header"] ?? "cf-connecting-ip").toLowerCase() } : undefined;
+    writePrivate(file, relaySchema.parse({ port: Number(values.port ?? 4790), registrations: [], ...(proxy ? { proxy } : {}) }));
     console.log("Created private relay configuration. Register machines before exposing its HTTPS endpoint.");
     return true;
   }
@@ -53,8 +57,14 @@ export async function handleMachineCommand(argv: string[]) {
       writePrivate(file, next);
       console.log("Registered machine. Transfer the private key to that machine, then restart the relay.");
     } else {
-      const relay = createRelayServer({ registrations: config.registrations });
-      relay.server.listen(config.port, "127.0.0.1", () => console.log(`Infinite relay listening on loopback port ${config.port}. Terminate HTTPS at your reverse proxy.`));
+      const relay = createRelayServer({ registrations: config.registrations, ...(config.proxy ? { proxy: { addressHeader: config.proxy.addressHeader } } : {}) });
+      relay.server.listen(config.port, "127.0.0.1", () => console.log(`Infinite relay listening on loopback port ${config.port}.${config.proxy ? "" : " Publish it through an HTTPS tunnel or reverse proxy."}`));
+      if (relay.proxy && config.proxy) {
+        const socket = config.proxy.socket;
+        // Replace only a stale socket left by a previous run, never another file.
+        if (existsSync(socket)) { if (!lstatSync(socket).isSocket()) throw new Error("Relay proxy socket path is not a socket"); unlinkSync(socket); }
+        relay.proxy.listen(socket, () => { chmodSync(socket, 0o600); console.log(`Clients connect only through the proxy socket ${socket}.`); });
+      }
       for (const signal of ["SIGTERM", "SIGINT"] as const) process.once(signal, () => {
         relay.close(); relay.server.close(() => process.exit(0));
       });

@@ -1,12 +1,12 @@
 import type { Attention, Provider } from "@infinite/attention";
-import { createRemoteClient, RemoteError } from "@infinite/remote";
+import { createRemoteClient, RemoteError, type RemoteAccessToken } from "@infinite/remote";
 import * as Crypto from "expo-crypto";
 import { loadClientId } from "../store/connection";
 import type { TeamLineup, TeamProject, TeamRole } from "../features/teams/model";
 
-export type Connection = { id?: string; machineId?: string; label?: string; url: string; token: string; relay?: { machineId: string } };
+export type Connection = { id?: string; machineId?: string; label?: string; url: string; token: string; relay?: { machineId: string }; access?: RemoteAccessToken };
 export const connectionKey = (connection: Connection) => connection.id ?? `${connection.url}/${connection.relay?.machineId ?? "direct"}`;
-const remotes = new Map<string, { token: string; client: ReturnType<typeof createRemoteClient> }>();
+const remotes = new Map<string, { secrets: string; client: ReturnType<typeof createRemoteClient> }>();
 const remoteKey = (connection: Connection) => `${connectionKey(connection)}/${connection.url}/${connection.relay?.machineId ?? "direct"}`;
 export function closeConnection(connection: Connection) {
   remotes.get(remoteKey(connection))?.client.close();
@@ -15,9 +15,10 @@ export function closeConnection(connection: Connection) {
 function remote(connection: Connection) {
   const key = remoteKey(connection);
   let saved = remotes.get(key);
-  if (!saved || saved.token !== connection.token) {
+  const secrets = JSON.stringify([connection.token, connection.access?.clientId, connection.access?.clientSecret]);
+  if (!saved || saved.secrets !== secrets) {
     saved?.client.close();
-    saved = { token: connection.token, client: createRemoteClient(connection, { randomBytes: Crypto.getRandomBytes }) };
+    saved = { secrets, client: createRemoteClient(connection, { randomBytes: Crypto.getRandomBytes }) };
     remotes.set(key, saved);
   }
   return saved.client;

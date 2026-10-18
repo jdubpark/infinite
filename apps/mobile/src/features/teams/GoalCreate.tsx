@@ -5,6 +5,7 @@ import * as Crypto from "expo-crypto";
 import { api, ApiError, connectionKey, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
+import { TopBar } from "../../components/Glass";
 import { goalCreations } from "../../store/requests";
 import { theme } from "../../theme";
 import { lines, teamReady, type ProductGoal } from "./model";
@@ -86,7 +87,7 @@ export function GoalCreate({ connection }: { connection: Connection }) {
     {options.note ? <Text style={t.note}>{options.note}</Text> : null}
   </>;
   return <KeyboardAvoidingView style={s.fill} behavior="padding">
-    <View style={s.header}><Button title="Goals" secondary onPress={() => router.canGoBack() ? router.back() : router.replace({ pathname: "/", params: { machine, view: "goals" } })} /><Text style={t.note}>{connection.label || "Selected machine"}</Text></View>
+    <TopBar backLabel="Goals" onBack={() => router.canGoBack() ? router.back() : router.replace({ pathname: "/", params: { machine, view: "goals" } })} right={<Text style={t.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
     <ScrollView contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>New goal</Text>
       <Text style={t.note}>Give the team an outcome and the evidence it should use. Agents choose scoped improvements and build reviewed cycles within these limits.</Text>
@@ -126,9 +127,8 @@ export function GoalCreate({ connection }: { connection: Connection }) {
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
-  header: { padding: 18, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   body: { padding: 24, gap: 10, paddingBottom: 48 },
-  title: { fontSize: 32, color: theme.colors.ink, fontWeight: "500" },
+  title: { fontSize: 28, lineHeight: 34, color: theme.colors.ink, fontWeight: "700", letterSpacing: -0.6 },
   section: { marginVertical: 16, gap: 12 },
   limitsHeading: { fontSize: 16, marginTop: 24 },
   limit: { flexDirection: "row", alignItems: "center", gap: 12 },

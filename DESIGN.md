@@ -23,6 +23,9 @@ colors:
   error: '#9d382a'
   terminal-surface: '#202923'
   terminal-ink: '#e4e9de'
+  glass: 'rgba(252,252,249,0.86)'
+  glass-rim: 'rgba(34,42,39,0.10)'
+  scrim: 'rgba(24,30,27,0.28)'
 typography:
   display:
     fontFamily: Instrument Sans, sans-serif
@@ -70,6 +73,9 @@ rounded:
   native-message: 10px
   panel: 12px
   pairing-sheet: 16px
+  native-card: 16px
+  native-sheet: 28px
+  capsule: 999px
 spacing:
   compact: 8px
   label: 12px
@@ -137,6 +143,20 @@ components:
     textColor: '{colors.ink}'
     rounded: '{rounded.panel}'
     padding: 8px
+  native-glass-control:
+    backgroundColor: '{colors.glass}'
+    textColor: '{colors.ink}'
+    rounded: '{rounded.capsule}'
+    size: 42px
+  native-status-chip:
+    backgroundColor: '{colors.white}'
+    textColor: '{colors.ink}'
+    rounded: '{rounded.capsule}'
+    padding: 0 9px
+  native-sheet:
+    backgroundColor: '{colors.paper}'
+    rounded: '{rounded.native-sheet}'
+    padding: 8px 12px
 ---
 
 # Design System: Infinite
@@ -168,6 +188,8 @@ Desktop opens with a session rail beside the overview; a selected session replac
 ### FORM
 
 Use a continuous sheet, horizontal rules, compact metadata, and softly rounded controls. The reusable signature is the stable session frame around interchangeable record views. Web view entry uses a brief blur-to-clear transition only when reduced motion is not requested. Native interaction uses immediate pressed feedback and standard phone navigation.
+
+Native follows a content-first arrangement adapted from Apple's Liquid Glass guidance: content stays flat on the paper sheet, and controls that act on the whole screen float above it as translucent capsules (back, status, actions, view switcher, composer). The clients load no native material module, so glass is a translucent fill, a light rim, and one shared lift rather than a blur. Secondary choices open in slide-up sheets with a grabber. Every native screen uses the same top bar, status chips, segmented views, and sheet.
 
 **Key Characteristics:**
 
@@ -215,10 +237,11 @@ The web face uses moderate weights and tight title spacing. Native keeps the sam
 ### Hierarchy
 
 - **Display:** the desktop overview uses `display`; web pairing uses a slightly smaller title (42px, line-height 1.1). Native pairing uses a title (39, line-height 44, weight 500).
-- **Headline:** `headline` supplies the web form heading; `session-title` supplies desktop session detail. Narrow detail uses a smaller title (27px). Native list and detail titles use the same role (30, weight 500).
+- **Headline:** `headline` supplies the web form heading; `session-title` supplies desktop session detail. Narrow detail uses a smaller title (27px). Native titles use the compact roles below.
 - **Title:** `title` anchors web subsections. Native subsections use an 18-size, weight-500 title; native list rows use a 17-size, weight-500 title.
 - **Body:** `body` sets the web base. Native prose uses size 15 with line-height 24. Dense web activity and context text use smaller body text (13px).
-- **Label:** `label` describes view and section labels. Supporting metadata uses `metadata`, with denser event and receipt text (11px). Native metadata uses size 11 with line-height 17.
+- **Label:** `label` describes view and section labels. Supporting metadata uses `metadata`, with denser event and receipt text (11px). Native metadata uses size 12 with line-height 17.
+- **Native compact roles:** home list screens use a 28-size, weight-700 title; detail titles use 22, weight 600; list rows use a 15-size, weight-600 title over one line of 13-size activity.
 - **Screen:** `screen` preserves terminal formatting. Narrow web snapshots use smaller text (11px); native snapshots use size 11 with line-height 19.
 
 **The Title First Rule.** Put the session title before provider and status metadata. Keep process qualifiers subordinate without hiding them.
@@ -231,7 +254,7 @@ Desktop uses a two-column grid: a session rail (264px) and a flexible main sheet
 
 The main sheet contains a top bar, session heading, view tabs, a scrolling record body, and a composer that does not shrink. The overview has a bounded width (1020px); creation and context content are narrower (760px). There is no separate contextual side panel in the current build: context occupies a tab within session detail.
 
-Native uses safe-area-aware list and detail screens with standard route navigation. Pairing scrolls when space is constrained; a saved connection bypasses pairing on return. Detail has a scrolling record area above the composer. Command keys wrap onto further rows as needed. Native tabs and buttons have a minimum target of 48 logical units; web icon, tab, and command controls have a minimum 44px target. Primary web buttons and fields are taller (46px minimum), and native pairing fields are at least 50 logical units tall.
+Native uses safe-area-aware list and detail screens with standard route navigation. Pairing scrolls when space is constrained; a saved connection bypasses pairing on return. Detail has a scrolling record area above the composer. Command keys wrap onto further rows as needed. Native tabs and buttons have a minimum target of 48 logical units, reached through hit slop where a compact control draws smaller; web icon, tab, and command controls have a minimum 44px target. Primary web buttons and fields are taller (46px minimum), and native pairing fields are at least 50 logical units tall.
 
 Native is explicitly fixed light in `apps/mobile/app.json`, including when the OS requests dark appearance. A native dark palette, tablet-specific composition, and native iPhone runtime verification remain future scope, as recorded in `PRODUCT.md`. The dark terminal replay panel is a content surface, not an alternate app theme. The local Android review verified legibility at 1.3 font scale and under OS dark appearance, with the app remaining light and command controls wrapping.
 
@@ -239,7 +262,7 @@ Native is explicitly fixed light in `apps/mobile/app.json`, including when the O
 
 ## Elevation & Depth
 
-The current clients use no decorative shadows. Canvas, paper, selected-row fills, pale output panels, and single-pixel rules separate regions. The terminal replay is the deepest tonal surface. Keyboard focus adds an outline to the active control; it does not lift the control or alter the page geometry.
+The web client uses no decorative shadows. Canvas, paper, selected-row fills, pale output panels, and single-pixel rules separate regions. The terminal replay is the deepest tonal surface. Keyboard focus adds an outline to the active control; it does not lift the control or alter the page geometry. On native, only floating controls, the selected segment, and sheets carry the one shared lift; records, rows, and cards stay flat.
 
 **The Tonal Depth Rule.** Use the existing sheet, inset panel, selection fill, and divider roles to separate content. Preserve their hierarchy before adding a new surface treatment.
 
@@ -247,7 +270,7 @@ The current clients use no decorative shadows. Canvas, paper, selected-row fills
 
 Controls and web session rows share the `control` radius. Captured output, context blocks, provider initials, the terminal shell, and the web composer share the `panel` radius. The pairing sheet has a broader `pairing-sheet` radius. The native message field uses `native-message` rounding. Status dots remain small circles with adjacent labels.
 
-Dividers follow the content width. Session records remain rows rather than elevated cards. Fields have a visible one-pixel boundary; selected tabs use a two-pixel underline. Web UI icons are line SVGs. Native controls use visible words such as Sessions, Send, and Interrupt.
+Dividers follow the content width. Session records remain rows rather than elevated cards. Fields have a visible one-pixel boundary; selected web tabs use a two-pixel underline. Web UI icons are line SVGs. Native icons are line glyphs drawn from views, plus Linear-style status circles: dashed for backlog, empty for to do, filled by quarters for progress, a check ring for review, a filled check for done, and filled marks for attention, blocked, and cancelled. Native buttons, chips, and segmented views are capsules. An icon-only control carries an accessibility label, and a status icon stays beside its state words.
 
 ## Components
 
@@ -269,9 +292,15 @@ The web composer is a white inset within the paper sheet. It receives a shared f
 
 ### Navigation
 
-The desktop session rail identifies each record with title, provider, text state, and an eight-character stable ID. The selected row gains a quiet fill. Native list rows preserve the same information, allow titles to wrap, and use a visible Open label. The overview and list remain useful before a session is selected.
+The desktop session rail identifies each record with title, provider, text state, and an eight-character stable ID. The selected row gains a quiet fill. The overview and list remain useful before a session is selected.
 
-Web detail exposes Catch up, Full terminal, and Context. Native detail exposes Catch up, Recording, and Context. Selected tabs use the primary color and underline; their labels stay in sentence case. The native Recording view is a bounded event list, not an embedded terminal emulator. Back or Sessions returns to the list.
+Native home has no machine bar. The active machine's name, with a small toggle, opens a sheet to switch, add, or remove machines; removal asks for confirmation. Sessions, Teams, and Goals sit in a floating capsule with counts of items waiting on a person, beside a round control for creating one. Lists are grouped by state with counts, and stopped groups start folded. A session row shows its status icon, title, age, provider avatar, and one line of activity. A team row reads like a Linear project: status, integrated tasks out of the plan, the assigned agents as model avatars with live or waiting dots, and the Linear issue.
+
+A person runs a team through its coordinator, not its agents. Team agents leave the Sessions list (search still finds them). An agent's session view replaces the composer and stop controls with a link to its team. An agent prompt that needs a person appears on the team as an approval, beside the coordinator's escalation reason. Prompts the coordinator is deciding under the run's delegation show only as a count. Team Overview opens on a coordinator card: a plan-to-review phase track, task, agent, and check counts, the latest activity, and pause, resume, and cancel.
+
+Native copy stays terse. Icons, counts, and chips carry state; sentences remain only where a decision or an honesty qualifier needs them, shortened to markers such as "agent claim", "not approval", and "Offline · last received".
+
+Web detail exposes Catch up, Full terminal, and Context. Native session detail exposes Chat, Activity, and Files; native team detail exposes Overview, Tasks, Agents, and Activity, with tasks as issue rows carrying an assignee avatar. Selected web tabs use the primary color and underline; the selected native segment is a raised lens. Labels stay in sentence case. The back control returns to the list.
 
 ### Session Record and Composer
 

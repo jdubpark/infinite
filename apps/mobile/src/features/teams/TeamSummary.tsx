@@ -6,27 +6,15 @@ import { api, type Connection, type LogEvent, type SessionDetail } from "../../a
 import { usePoll } from "../../api/usePoll";
 import { loadClientId } from "../../store/connection";
 import { Button } from "../../components/Button";
+import { Card } from "../../components/Glass";
 import { theme } from "../../theme";
-import { ROLE_NAMES, shortDate, type TeamMember, type TeamView } from "./model";
+import { ROLE_NAMES, type TeamMember, type TeamView } from "./model";
 import { Clamp, Disclosure, t } from "./parts";
 import { briefText, briefTime, chooseBrief, controlEventText, plainScreen, relativeAge, summarySessionId, type TeamBriefView } from "./summary";
 
 type BriefRow = { sessionId: string; status: TeamBriefView };
-export type TeamViewMode = "summary" | "logs";
 
 const roleName = (role: string) => ROLE_NAMES[role as TeamMember["role"]] ?? role;
-const live = (member: TeamMember) => member.status === "running" || member.status === "waiting";
-
-/** The two team views as one segmented control, so the current view is always visible. */
-export function ViewSwitch({ mode, onChange }: { mode: TeamViewMode; onChange: (mode: TeamViewMode) => void }) {
-  const options: [TeamViewMode, string][] = [["summary", "Summary"], ["logs", "Review logs"]];
-  return <View accessibilityRole="tablist" style={s.switch}>
-    {options.map(([value, label]) => <Pressable key={value} accessibilityRole="tab" accessibilityState={{ selected: mode === value }} onPress={() => onChange(value)}
-      style={[s.switchOption, mode === value && s.switchActive]}>
-      <Text style={[s.switchText, mode === value && s.switchTextActive]}>{label}</Text>
-    </Pressable>)}
-  </View>;
-}
 
 /** Up to `limit` entries, then the rest on request. */
 function Bullets({ title, items, limit = 3 }: { title: string; items: string[]; limit?: number }) {
@@ -36,17 +24,18 @@ function Bullets({ title, items, limit = 3 }: { title: string; items: string[]; 
   return <View style={s.group}>
     <Text style={s.heading}>{title}<Text style={s.count}>{`  ${shown.length}`}</Text></Text>
     {(open ? shown : shown.slice(0, limit)).map((item, index) => <View key={index} style={s.bullet}>
-      <Text style={s.dot}>•</Text><Text selectable style={[t.body, s.fill]}>{item}</Text>
+      <View style={s.dot} /><Text selectable style={[t.body, s.fill]}>{item}</Text>
     </View>)}
-    {shown.length > limit ? <Pressable accessibilityRole="button" onPress={() => setOpen(value => !value)} style={s.more}>
-      <Text style={s.moreText}>{open ? "Show fewer" : `Show ${shown.length - limit} more`}</Text>
+    {shown.length > limit ? <Pressable accessibilityRole="button" onPress={() => setOpen(value => !value)} hitSlop={8} style={s.more}>
+      <Text style={s.moreText}>{open ? "Fewer" : `${shown.length - limit} more`}</Text>
     </Pressable> : null}
   </View>;
 }
 
 /**
- * The Jevcode reading of the team, in the briefing contract's order: outcome, system shape, ranked
- * review questions, changes, check evidence, guidance, and gaps. It is not completion or approval.
+ * The Jevcode reading of the team, in the briefing contract's order: outcome, review questions,
+ * changes, check evidence, and gaps, with system shape and guidance folded. It is not completion or
+ * approval.
  */
 export function JevcodeSummary({ connection, team }: { connection: Connection; team: TeamView }) {
   const [asking, setAsking] = useState(false);
@@ -76,7 +65,8 @@ export function JevcodeSummary({ connection, team }: { connection: Connection; t
   const canAsk = !text && (state === "empty" || state === "failed") && Boolean(chosen?.sessionId);
   const written = briefTime(chosen?.status);
   const age = poll.data ? relativeAge(written, poll.data.at) : "";
-  const source = [brief || chosen?.status.summary?.engine === "jevcode" ? "Jevcode" : "Session summary", member ? roleName(member.role) : "", written ? shortDate(written) : "", age].filter(Boolean).join(" · ");
+  const engine = brief || chosen?.status.summary?.engine === "jevcode" ? "Jevcode" : "Session summary";
+  const source = [member ? roleName(member.role) : "", updating ? "updating" : age].filter(Boolean).join(" · ");
 
   async function ask(sessionId: string) {
     if (askingRef.current) return;
@@ -98,146 +88,92 @@ export function JevcodeSummary({ connection, team }: { connection: Connection; t
     }
   }
 
-  return <View style={[t.card, s.summary]} accessibilityLiveRegion="polite">
-    <Text style={s.kicker}>JEVCODE SUMMARY</Text>
-    {source ? <Text style={t.note}>{source}</Text> : null}
-    {!text ? <Text style={t.body}>{
-      !poll.online && !poll.loading && !rows.length ? "The Jevcode summary could not be loaded."
-        : !rows.length ? (targets ? "Loading the Jevcode summary…" : "No agent session is available for a summary.")
-          : updating ? "Jevcode is writing the summary." : chosen?.status.error || "No Jevcode summary yet."
+  return <Card style={s.summary}>
+    <View accessibilityLiveRegion="polite" style={s.head}>
+      {engine === "Jevcode" ? <View style={s.mark}><Text style={s.markText}>J</Text></View> : null}
+      <Text style={s.engine}>{engine}</Text>
+      <Text style={[t.note, s.fill]} numberOfLines={1}>{source}</Text>
+    </View>
+    {!text ? <Text style={t.note}>{
+      !poll.online && !poll.loading && !rows.length ? "Could not load."
+        : !rows.length ? (targets ? "Loading…" : "No agent to summarize.")
+          : updating ? "Writing…" : chosen?.status.error || "No summary yet."
     }</Text> : <>
-      {updating ? <Text style={t.note}>Jevcode is updating this summary.</Text> : null}
-      <Clamp text={brief?.summary || text} lines={8} />
-      {brief?.architecture?.length ? <Disclosure title={`System shape (${brief.architecture.length})`}>
-        {brief.architecture.map((item, index) => <Text key={index} selectable style={t.body}>• {item.text}</Text>)}
-      </Disclosure> : null}
+      <Clamp text={brief?.summary || text} lines={5} />
       {brief?.review?.length ? <View style={s.group}>
         <Text style={s.heading}>Review first<Text style={s.count}>{`  ${brief.review.length}`}</Text></Text>
         {brief.review.map((item, index) => <View key={index} style={s.review}>
           <View style={s.reviewHead}>
             <Text style={s.rank}>{index + 1}</Text>
+            <Text selectable style={[t.strong, s.fill]} numberOfLines={2}>{item.area}</Text>
             {item.priority ? <Text style={[s.priority, item.priority === "high" && s.priorityHigh]}>{item.priority}</Text> : null}
-            <Text selectable style={[t.strong, s.fill]}>{item.area}</Text>
           </View>
-          {item.why ? <Text selectable style={t.body}>{item.why}</Text> : null}
-          {item.question ? <Text selectable style={s.question}>Ask: {item.question}</Text> : null}
+          {item.why ? <Text selectable style={t.note} numberOfLines={3}>{item.why}</Text> : null}
+          {item.question ? <Text selectable style={s.question}>{item.question}</Text> : null}
         </View>)}
       </View> : null}
       <Bullets title="What changed" items={(brief?.changes ?? []).map(item => item.text ?? "")} />
       <Bullets title="Check evidence" items={(brief?.checks ?? []).map(item => item.text ?? "")} />
-      {brief?.guidance?.length ? <Disclosure title={`Guidance for agents (${brief.guidance.length})`}>
+      <Bullets title="Gaps" items={brief?.unknowns ?? []} />
+      {brief?.architecture?.length ? <Disclosure title={`System shape · ${brief.architecture.length}`}>
+        {brief.architecture.map((item, index) => <Text key={index} selectable style={t.body}>• {item.text}</Text>)}
+      </Disclosure> : null}
+      {brief?.guidance?.length ? <Disclosure title={`Guidance for agents · ${brief.guidance.length}`}>
         {brief.guidance.map((item, index) => <Text key={index} selectable style={t.body}>• {[item.basis, item.text].filter(Boolean).join(": ")}</Text>)}
       </Disclosure> : null}
-      <Bullets title="Gaps and unknowns" items={brief?.unknowns ?? []} />
-      <Text style={t.note}>This is the Jevcode agent’s reading of recorded activity and the repository. It is not completion or approval.</Text>
+      <Text style={t.note}>Not completion or approval.</Text>
     </>}
     {askError ? <Text accessibilityRole="alert" style={t.error}>{askError}</Text> : null}
-    {canAsk && chosen ? <Button title={asking ? "Asking Jevcode… this can take a few minutes" : "Ask Jevcode for a summary"} disabled={asking} onPress={() => void ask(chosen.sessionId)} /> : null}
-  </View>;
+    {canAsk && chosen ? <Button compact secondary title={asking ? "Writing… a few minutes" : "Summarize"} disabled={asking} onPress={() => void ask(chosen.sessionId)} /> : null}
+  </Card>;
 }
 
-/** One agent's terminal screen and recent control events, with every agent one tap away. */
-export function ReviewLogs({ connection, team, agentId, onSelect, onOpen, onBack }: {
-  connection: Connection; team: TeamView; agentId: string; onSelect: (memberId: string) => void; onOpen: (sessionId: string) => void; onBack: () => void;
-}) {
-  // Current revision first; within it, live agents first, then the team's role order.
-  const order = ["project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"];
-  const agents = [...team.members].sort((a, b) => Number(b.revision === team.revision) - Number(a.revision === team.revision)
-    || Number(live(b)) - Number(live(a)) || order.indexOf(a.role) - order.indexOf(b.role));
-  const selected = agents.find(member => member.memberId === agentId)
-    ?? agents.find(member => member.revision === team.revision && live(member)) ?? agents[0];
-  const index = selected ? agents.indexOf(selected) : -1;
+/** One agent's current screen and recent control events. */
+export function AgentLog({ connection, member, live, onOpen }: { connection: Connection; member: TeamMember; live: boolean; onOpen: () => void }) {
   const poll = usePoll(async () => {
-    if (!selected) return null;
-    const detail = await api<SessionDetail>(connection, `/sessions/${selected.sessionId}`);
-    const page = await api<{ events: LogEvent[] }>(connection, `/sessions/${selected.sessionId}/events?after=${Math.max(0, detail.seq - 80)}&types=lifecycle,signal,input-result&limit=80`);
-    return { sessionId: selected.sessionId, screen: detail.screen ?? "", events: page.events ?? [] };
-  }, 2500, [connection, selected?.sessionId]);
-  const log = poll.data?.sessionId === selected?.sessionId ? poll.data : null;
-  const screen = log ? plainScreen(log.screen, 40) : "";
-  const step = (by: number) => { if (agents.length) onSelect(agents[(index + by + agents.length) % agents.length]!.memberId); };
-
-  if (!selected) return <View style={s.group}>
-    <Text style={t.body}>This run has no agents yet.</Text>
-    <Button title="Back to summary" secondary onPress={onBack} />
-  </View>;
-  return <View style={s.group}>
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.chips}>
-      {agents.map(member => {
-        const active = member.memberId === selected.memberId;
-        return <Pressable key={member.memberId} accessibilityRole="tab" accessibilityState={{ selected: active }} accessibilityLabel={`${roleName(member.role)}, ${member.status}`}
-          onPress={() => onSelect(member.memberId)} style={[s.chip, active && s.chipActive]}>
-          <View style={s.chipHead}>
-            <View style={[s.statusDot, live(member) && s.statusLive]} />
-            <Text style={[s.chipTitle, active && s.chipTitleActive]}>{roleName(member.role)}</Text>
-          </View>
-          <Text style={[s.chipMeta, active && s.chipTitleActive]}>{member.status}{member.revision === team.revision ? "" : ` · rev ${member.revision}`}</Text>
-        </Pressable>;
-      })}
-    </ScrollView>
-    {agents.length > 1 ? <View style={s.stepper}>
-      <Button title="‹ Previous" secondary onPress={() => step(-1)} />
-      <Text style={t.note}>Agent {index + 1} of {agents.length}</Text>
-      <Button title="Next ›" secondary onPress={() => step(1)} />
-    </View> : null}
-    <View style={s.agentHead}>
-      <Text style={t.strong}>{roleName(selected.role)} · {selected.status}</Text>
-      <Text style={t.note} numberOfLines={2}>{selected.title}{selected.taskId ? ` · ${selected.taskId}` : ""}{selected.revision === team.revision ? "" : ` · revision ${selected.revision}`}</Text>
-      {selected.stoppedReason ? <Text style={t.warning}>Stopped: {selected.stoppedReason}</Text> : null}
-    </View>
-    {!poll.online && !poll.loading ? <Text style={t.warning}>This agent’s log could not be refreshed. Showing the last received screen.</Text> : null}
+    const detail = await api<SessionDetail>(connection, `/sessions/${member.sessionId}`);
+    const page = await api<{ events: LogEvent[] }>(connection, `/sessions/${member.sessionId}/events?after=${Math.max(0, detail.seq - 80)}&types=lifecycle,signal,input-result&limit=80`);
+    return { sessionId: member.sessionId, screen: detail.screen ?? "", events: page.events ?? [] };
+  }, 2500, [connection, member.sessionId]);
+  const log = poll.data?.sessionId === member.sessionId ? poll.data : null;
+  const screen = log ? plainScreen(log.screen, 30) : "";
+  return <View style={s.log}>
+    {!poll.online && !poll.loading ? <Text style={t.warning}>Offline · last received screen.</Text> : null}
     <ScrollView horizontal style={s.screen} contentContainerStyle={s.screenContent}>
-      <Text selectable style={s.screenText}>{log ? screen || (live(selected) ? "Waiting for output…" : "No screen is recorded for this agent.") : "Loading the screen…"}</Text>
+      <Text selectable style={s.screenText}>{log ? screen || (live ? "Waiting for output…" : "No screen recorded.") : "Loading…"}</Text>
     </ScrollView>
-    <Text style={s.heading}>Recent events</Text>
-    {log ? log.events.length ? [...log.events].slice(-8).reverse().map(event => <View key={event.seq} style={s.event}>
-      <Text style={s.eventTime}>{new Date(event.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</Text>
-      <Text selectable style={[t.body, s.fill]}>{controlEventText(event)}</Text>
-    </View>) : <Text style={t.note}>No recent control events.</Text> : null}
-    <View style={s.row}>
-      <Button title="Open session" secondary onPress={() => onOpen(selected.sessionId)} />
-      <Button title="Back to summary" secondary onPress={onBack} />
-    </View>
+    {log?.events.length ? [...log.events].slice(-5).reverse().map(event => <View key={event.seq} style={s.event}>
+      <Text style={s.eventTime} numberOfLines={1}>{new Date(event.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</Text>
+      <Text selectable style={[t.note, s.fill]} numberOfLines={2}>{controlEventText(event)}</Text>
+    </View>) : log ? <Text style={t.note}>No recent events.</Text> : null}
+    <Button compact secondary glyph="terminal" title="Open session" onPress={onOpen} />
   </View>;
 }
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
-  switch: { flexDirection: "row", padding: 3, gap: 3, borderRadius: theme.radius.control + 2, backgroundColor: theme.colors.secondarySurface, marginHorizontal: theme.space.section, marginBottom: theme.space.label },
-  switchOption: { flex: 1, minHeight: 40, borderRadius: theme.radius.control, alignItems: "center", justifyContent: "center" },
-  switchActive: { backgroundColor: theme.colors.white, borderWidth: 1, borderColor: theme.colors.rule },
-  switchText: { fontSize: 14, fontWeight: "600", color: theme.colors.mutedInk },
-  switchTextActive: { color: theme.colors.forest },
-  summary: { gap: 10, marginTop: theme.space.compact },
-  kicker: { fontSize: 11, letterSpacing: 1, fontWeight: "700", color: theme.colors.forest },
-  group: { gap: 8, marginTop: theme.space.compact },
-  heading: { fontSize: 14, fontWeight: "600", color: theme.colors.ink },
+  summary: { gap: 10 },
+  head: { flexDirection: "row", alignItems: "center", gap: 8 },
+  mark: { width: 20, height: 20, borderRadius: 6, backgroundColor: theme.colors.forest, alignItems: "center", justifyContent: "center" },
+  markText: { fontSize: 12, fontWeight: "800", color: theme.colors.white, includeFontPadding: false },
+  engine: { fontSize: 13, fontWeight: "700", color: theme.colors.ink },
+  group: { gap: 6 },
+  heading: { fontSize: 13, fontWeight: "700", color: theme.colors.ink },
   count: { fontWeight: "400", color: theme.colors.mutedInk },
-  bullet: { flexDirection: "row", gap: 8 },
-  dot: { fontSize: 15, lineHeight: 23, color: theme.colors.mutedInk },
-  more: { paddingVertical: 6 },
-  moreText: { fontSize: 13, fontWeight: "600", color: theme.colors.secondaryInk },
-  review: { gap: 4, paddingVertical: 8, borderTopWidth: 1, borderTopColor: theme.colors.rule },
+  bullet: { flexDirection: "row", gap: 9, alignItems: "flex-start" },
+  dot: { width: 5, height: 5, borderRadius: 3, marginTop: 8, backgroundColor: theme.colors.fieldRule },
+  more: { paddingVertical: 2, alignSelf: "flex-start" },
+  moreText: { fontSize: 13, fontWeight: "600", color: theme.colors.forest },
+  review: { gap: 3, paddingTop: 8, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.colors.rule },
   reviewHead: { flexDirection: "row", alignItems: "center", gap: 8 },
-  rank: { width: 22, height: 22, borderRadius: 11, textAlign: "center", lineHeight: 22, fontSize: 12, fontWeight: "700", color: theme.colors.white, backgroundColor: theme.colors.forest, overflow: "hidden" },
-  priority: { fontSize: 11, fontWeight: "700", textTransform: "uppercase", color: theme.colors.mutedInk, backgroundColor: theme.colors.screenSurface, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, overflow: "hidden" },
+  rank: { width: 20, height: 20, borderRadius: 10, textAlign: "center", lineHeight: 20, fontSize: 11, fontWeight: "700", color: theme.colors.white, backgroundColor: theme.colors.forest, overflow: "hidden" },
+  priority: { fontSize: 10, fontWeight: "700", textTransform: "uppercase", color: theme.colors.mutedInk, backgroundColor: theme.colors.screenSurface, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6, overflow: "hidden" },
   priorityHigh: { color: theme.colors.warningInk, backgroundColor: theme.colors.warningSurface },
-  question: { fontSize: 14, lineHeight: 21, color: theme.colors.secondaryInk, fontStyle: "italic" },
-  chips: { gap: 8, paddingVertical: 2 },
-  chip: { minWidth: 112, paddingHorizontal: 12, paddingVertical: 8, borderRadius: theme.radius.control, borderWidth: 1, borderColor: theme.colors.rule, backgroundColor: theme.colors.white },
-  chipActive: { backgroundColor: theme.colors.forest, borderColor: theme.colors.forest },
-  chipHead: { flexDirection: "row", alignItems: "center", gap: 6 },
-  chipTitle: { fontSize: 14, fontWeight: "700", color: theme.colors.secondaryInk },
-  chipTitleActive: { color: theme.colors.white },
-  chipMeta: { fontSize: 12, color: theme.colors.mutedInk, marginTop: 2 },
-  statusDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: theme.colors.fieldRule },
-  statusLive: { backgroundColor: theme.colors.running },
-  stepper: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
-  agentHead: { gap: 2 },
-  screen: { borderRadius: theme.radius.panel, backgroundColor: theme.colors.terminalSurface },
+  question: { fontSize: 13, lineHeight: 19, color: theme.colors.secondaryInk, fontStyle: "italic" },
+  log: { gap: 8, paddingBottom: 10 },
+  screen: { borderRadius: theme.radius.panel, backgroundColor: theme.colors.terminalSurface, maxHeight: 260 },
   screenContent: { padding: 12 },
-  screenText: { fontFamily: theme.mono, fontSize: 12, lineHeight: 18, color: theme.colors.terminalInk },
-  event: { flexDirection: "row", gap: 10, paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: theme.colors.rule },
-  eventTime: { width: 52, fontFamily: theme.mono, fontSize: 12, lineHeight: 23, color: theme.colors.mutedInk },
-  row: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: theme.space.compact },
+  screenText: { fontFamily: theme.mono, fontSize: 11, lineHeight: 16, color: theme.colors.terminalInk },
+  event: { flexDirection: "row", gap: 10 },
+  eventTime: { width: 64, fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk, fontVariant: ["tabular-nums"] },
 });

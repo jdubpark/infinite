@@ -71,7 +71,7 @@ export function DecisionCard({
             {status.message}
           </Text>
           {status.retry ? (
-            <Button title="Retry" disabled={!canAnswer} onPress={onRetry} />
+            <Button compact title="Retry" disabled={!canAnswer} onPress={onRetry} />
           ) : null}
         </>
       ) : null}
@@ -95,7 +95,7 @@ export function DecisionCard({
       ) : null}
       {prompt.destructive ? (
         <Text style={s.destructive}>
-          {`⚠ Destructive command (${prompt.destructive.pattern.replace(/-/g, " ")})`}
+          {`Destructive command · ${prompt.destructive.pattern.replace(/-/g, " ")}`}
         </Text>
       ) : null}
       {needsTerminal ? (
@@ -106,7 +106,7 @@ export function DecisionCard({
               : "The dialog has not been read from the screen yet."}
             {backend !== "cmux" ? " Open the terminal to answer." : ""}
           </Text>
-          {backend !== "cmux" ? <Button title="Open terminal" secondary onPress={onOpenTerminal} /> : null}
+          {backend !== "cmux" ? <Button compact glyph="terminal" title="Open terminal" secondary onPress={onOpenTerminal} /> : null}
           {statusLine}
         </>
       ) : (
@@ -154,12 +154,13 @@ export function DecisionCard({
                 value={reply}
                 onChangeText={setReply}
                 editable={enabled}
-                placeholder="Reply instead: tell it what to do differently…"
+                placeholder="Reply instead…"
                 placeholderTextColor={theme.colors.placeholder}
                 style={s.replyInput}
                 maxLength={32000}
               />
               <Button
+                compact
                 title="Send reply"
                 disabled={!enabled || !reply.trim()}
                 onPress={() => onAnswer(undefined, reply.trim())}
@@ -176,12 +177,12 @@ export function DecisionCard({
 const s = StyleSheet.create({
   card: {
     backgroundColor: theme.colors.warningSurface,
-    borderRadius: theme.radius.panel,
-    padding: 18,
-    gap: 10,
+    borderRadius: theme.radius.card,
+    padding: 14,
+    gap: 8,
   },
-  kicker: { fontSize: 12, color: theme.colors.warningInk, fontWeight: "600" },
-  title: { fontSize: 18, fontWeight: "600", color: theme.colors.ink },
+  kicker: { fontSize: 12, color: theme.colors.warningInk, fontWeight: "700" },
+  title: { fontSize: 15, lineHeight: 21, fontWeight: "600", color: theme.colors.ink },
   detail: {
     fontFamily: theme.mono,
     fontSize: 12,
@@ -193,16 +194,16 @@ const s = StyleSheet.create({
   },
   destructive: { color: theme.colors.error, fontSize: 13, fontWeight: "600" },
   hint: { fontSize: 13, color: theme.colors.mutedInk, lineHeight: 20 },
-  options: { gap: 8, marginTop: 4 },
+  options: { gap: 6, marginTop: 2 },
   option: {
-    minHeight: 48,
+    minHeight: 46,
     justifyContent: "center",
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: theme.radius.control,
-    backgroundColor: theme.colors.paper,
-    borderWidth: 1,
-    borderColor: theme.colors.rule,
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+    borderRadius: 23,
+    backgroundColor: theme.colors.white,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: theme.colors.fieldRule,
   },
   optionAccept: {
     backgroundColor: theme.colors.secondarySurface,
@@ -218,7 +219,7 @@ const s = StyleSheet.create({
     maxHeight: 140,
     borderWidth: 1,
     borderColor: theme.colors.fieldRule,
-    borderRadius: theme.radius.message,
+    borderRadius: theme.radius.card,
     padding: 12,
     fontSize: 14,
     color: theme.colors.ink,

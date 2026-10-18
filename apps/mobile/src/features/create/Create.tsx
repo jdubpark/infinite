@@ -7,6 +7,7 @@ import { ago, api, ApiError, connectionKey, pendingLabel, type Connection, type 
 import { creations } from "../../store/requests";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
+import { TopBar } from "../../components/Glass";
 import { theme } from "../../theme";
 
 export function Create({ connection }: { connection: Connection }) {
@@ -66,7 +67,7 @@ export function Create({ connection }: { connection: Connection }) {
     } finally { sending.current = false; if (mounted.current) setBusy(false); }
   }
   return <KeyboardAvoidingView style={s.fill} behavior="padding">
-    <View style={s.header}><Button title="Sessions" secondary onPress={() => router.replace({ pathname: "/", params: { machine } })} /><Text style={s.note}>{connection.label || "Selected machine"}</Text></View>
+    <TopBar backLabel="Sessions" onBack={() => router.replace({ pathname: "/", params: { machine } })} right={<Text style={s.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
     <ScrollView contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>New session</Text>
       <Text style={s.note}>Runs on {me?.machine?.label || connection.label || "this machine"}. The machine must stay online.</Text>
@@ -95,8 +96,8 @@ export function Create({ connection }: { connection: Connection }) {
   </KeyboardAvoidingView>;
 }
 const s = StyleSheet.create({
-  fill: { flex: 1 }, header: { padding: 18, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  body: { padding: 24, gap: 10 }, title: { fontSize: 32, color: theme.colors.ink, fontWeight: "500" },
+  fill: { flex: 1 },
+  body: { padding: 24, gap: 10 }, title: { fontSize: 28, lineHeight: 34, color: theme.colors.ink, fontWeight: "700", letterSpacing: -0.6 },
   label: { fontSize: 14, fontWeight: "600", color: theme.colors.ink, marginTop: 16 },
   note: { fontSize: 12, lineHeight: 19, color: theme.colors.mutedInk }, warning: { fontSize: 13, lineHeight: 20, color: theme.colors.warningInk },
   choices: { flexDirection: "row", flexWrap: "wrap", gap: 8 }, section: { marginVertical: 16, gap: 12 },

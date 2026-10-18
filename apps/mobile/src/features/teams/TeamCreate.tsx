@@ -5,6 +5,7 @@ import * as Crypto from "expo-crypto";
 import { api, ApiError, connectionKey, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
+import { TopBar } from "../../components/Glass";
 import { teamCreations } from "../../store/requests";
 import { theme } from "../../theme";
 import { teamReady, type TeamView } from "./model";
@@ -63,7 +64,7 @@ export function TeamCreate({ connection }: { connection: Connection }) {
     } finally { inFlight.delete(request.requestId); if (mounted.current) setSending(false); }
   }
   return <KeyboardAvoidingView style={s.fill} behavior="padding">
-    <View style={s.header}><Button title="Teams" secondary onPress={() => router.canGoBack() ? router.back() : router.replace({ pathname: "/", params: { machine, view: "teams" } })} /><Text style={t.note}>{connection.label || "Selected machine"}</Text></View>
+    <TopBar backLabel="Teams" onBack={() => router.canGoBack() ? router.back() : router.replace({ pathname: "/", params: { machine, view: "teams" } })} right={<Text style={t.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
     <ScrollView contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>New team</Text>
       <Text style={t.note}>A coordinator plans the work, implementers build it in isolated copies, and a reviewer checks the result. The team asks when it needs a decision.</Text>
@@ -107,9 +108,8 @@ export function TeamCreate({ connection }: { connection: Connection }) {
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
-  header: { padding: 18, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   body: { padding: 24, gap: 10, paddingBottom: 48 },
-  title: { fontSize: 32, color: theme.colors.ink, fontWeight: "500" },
+  title: { fontSize: 28, lineHeight: 34, color: theme.colors.ink, fontWeight: "700", letterSpacing: -0.6 },
   section: { marginVertical: 16, gap: 12 },
   objective: { minHeight: 160, textAlignVertical: "top" },
 });

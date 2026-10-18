@@ -382,11 +382,14 @@ let answering: number | undefined;
 let limitWatch: { source: "hook" | "screen"; firstAt: number; checks: number; corroborated: boolean } | undefined;
 /** Set when a limit lifted; screen matches are ignored until the screen stops showing one. */
 let screenLimitSuppressed = false;
-let limitEpisode: { single?: "hook" | "screen"; corroborated: boolean; misses: number } | undefined;
+let limitEpisode: { single?: "hook" | "screen"; corroborated: boolean; misses: number; resetsAt?: string } | undefined;
 type LimitSignal = Extract<Signal, { kind: "provider-limit" }>;
 function recordLimit(signal: LimitSignal, source: SignalData["source"], agent?: { id: string; type: string }) {
   const episode = (limitEpisode ??= { corroborated: false, misses: 0 });
   episode.misses = 0;
+  // A reset time stated by any source belongs to the episode, so a corroborating hook keeps the notice's time.
+  episode.resetsAt = signal.resetsAt ?? episode.resetsAt;
+  if (episode.resetsAt) signal = { ...signal, resetsAt: episode.resetsAt };
   if (signal.confidence === "corroborated") {
     if (episode.corroborated) return;
     episode.corroborated = true;

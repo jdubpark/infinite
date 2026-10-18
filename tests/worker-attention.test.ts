@@ -453,6 +453,8 @@ test("a screen notice that came first is corroborated by the hook, and a repeate
     const after = await limitsOf(host, id);
     assert.deepEqual(after.map((e) => [e.data.confidence, e.data.source]), [["single-source", "screen"], ["corroborated", "hook"]]);
     assert.equal(rows.length, 2);
+    assert.equal(after[1].data.resetsAt?.slice(11, 16), "15:45", "The corroborating hook keeps the reset time the notice stated");
+    assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.limit.resetsAt?.slice(11, 16), "15:45");
   } finally {
     await host.stop();
   }

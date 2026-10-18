@@ -307,7 +307,7 @@ function App() {
             </button>
           )}
         </div>
-        {route.goals ? <GoalPicker goals={goals} selected={route.goalId} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} onSelect={route.navigateGoal} /> : route.teams ? <TeamPicker teams={teams} selected={route.teamId} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} onSelect={route.navigateTeam} /> : <SessionPicker sessions={sessions} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />}
+        {route.goals ? <GoalPicker goals={goals} selected={route.goalId} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} onSelect={route.navigateGoal} /> : route.teams ? <TeamPicker teams={teams} selected={route.teamId} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} onSelect={route.navigateTeam} /> : <SessionPicker sessions={sessions} showUsage={me.usage?.enabled === true} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />}
         <div className="host-status">
           <div>
             {me.environment === "cloud" ? (

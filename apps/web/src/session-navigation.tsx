@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { ChevronRight, Search, X } from "lucide-react";
-import { names, type Session } from "./api";
+import { clock, names, type Session } from "./api";
+import { cost } from "./usage";
 
 export type SessionTab = "chat" | "screen" | "terminal" | "files" | "context";
 type Location = { id: string | null; tab: SessionTab; creating: boolean; teams: boolean; teamId: string | null; creatingTeam: boolean; goals: boolean; goalId: string | null; creatingGoal: boolean };
@@ -45,8 +46,8 @@ export const sessionStatus = (session: Session) => session.attention?.state === 
 type Filter = "active" | "attention" | "all";
 const active = (session: Session) => session.status === "running" || session.status === "starting";
 
-export function SessionPicker({ sessions, selected, loading, onSelect }: {
-  sessions: Session[]; selected: string | null; loading: boolean; onSelect: (id: string) => void;
+export function SessionPicker({ sessions, selected, loading, onSelect, showUsage }: {
+  sessions: Session[]; selected: string | null; loading: boolean; onSelect: (id: string) => void; showUsage?: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("active");
@@ -74,6 +75,8 @@ export function SessionPicker({ sessions, selected, loading, onSelect }: {
         className={`session-row ${selected === session.id ? "selected" : ""}`} onClick={() => onSelect(session.id)}>
         <div className="row-top"><span className={`dot ${needsYou(session) ? "needs-you" : session.status}`} /><strong>{session.title}</strong><ChevronRight size={16} /></div>
         <div className="row-meta"><span>{names[session.provider]}{session.backend === "cmux" ? " · cmux" : ""}</span><span>{sessionStatus(session)}</span></div>
+        {session.attention?.limit && <p className="row-meta">Usage limit reached{session.attention.limit.resetsAt && ` · resets ${clock(session.attention.limit.resetsAt)}`} <span className="quiet">· {session.attention.limit.confidence === "corroborated" ? "corroborated" : "single observation"}</span></p>}
+        {showUsage && session.usage && <p className="row-meta quiet">{cost(session.usage)}</p>}
         {session.attention?.now && <p className="row-preview">{session.attention.now}</p>}
         <div className="row-meta session-id">{session.id.slice(0, 8)}</div>
       </button>)}

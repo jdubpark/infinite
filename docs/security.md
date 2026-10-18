@@ -53,6 +53,14 @@ The selected cwd and roots describe Codex's workspace, not a filesystem isolatio
 
 Selected-root files, content-addressed blobs and materialized checkpoints are plaintext runtime data with private permissions; keep them on encrypted storage. The selected roots include ignored files and repository metadata, including any credentials stored inside that scope. Source transfer does not copy the entire home. The owner-only workspace export endpoint returns verified checkpoint data; controller/viewer keys and browser-origin requests cannot use it. A separate execution identity needs the dedicated shared data directory in the Ubuntu template, while receipts, blobs, keys and control sockets stay private.
 
+A provider-limit observation and a usage total are records of what the host
+saw. Neither carries a credential, and neither is an inference about completion
+or product impact. They never substitute for a member's report. The host acts on
+a limit only by stopping the affected member, and it never answers a provider
+dialog or sends input to clear one. Price tables and budgets stay in private
+host configuration, and only aggregated numbers and limit observations reach
+clients.
+
 ## Remote machine transport
 
 Optional remote access is restricted to single-tenant runners. A runner can accept encrypted direct WebSockets and connect outbound to a separate relay. Keep the runner's ordinary HTTP API private. Only the separate relay endpoint is intended for public HTTPS exposure; it forwards opaque frames and routing metadata rather than exposing runner administration. [Remote machine setup](remote-machines.md) defines pairing and deployment.

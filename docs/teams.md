@@ -156,6 +156,79 @@ Headless team members record the model that was requested for them. If the provi
 
 Each provider row is labelled with that provider's own budget period and window. The web client shows these in the Spend block on the team list, as a cost line on each member, and as agent spend on each team run and goal. `infinite usage` prints one line per provider, and `infinite usage --json` prints the raw summary from `GET /api/usage`.
 
+## Provider usage limits and fallbacks
+
+A provider can refuse work because the account reached a usage limit. The host records that observation, stops the affected team member, and can relaunch the work on a fallback profile from another provider. A limit does not mean the task failed, and a switch does not mean progress. Only a member's report establishes either.
+
+### Configuration
+
+A profile may name another profile in the same lineup as its `limitFallback`. The lineup may also carry a `fallbacks` pool of profiles that exist only to be fallbacks, beside `implementers` and `escalations`. A `limitFallback` may name an implementer, an escalation, or a pool entry. Model ids below are placeholders for the operator's own.
+
+```json
+{
+  "coordinator": { "id": "opus-xhigh", "...": "...", "limitFallback": "deepseek-pro-xhigh" },
+  "implementers": [
+    { "id": "haiku-medium", "...": "...", "limitFallback": "deepseek-flash-medium" }
+  ],
+  "fallbacks": [
+    { "id": "deepseek-pro-xhigh", "label": "DeepSeek V4 Pro high", "provider": "opencode", "model": "deepseek/deepseek-v4-pro", "variant": "high", "tier": "strong" },
+    { "id": "deepseek-flash-medium", "label": "DeepSeek Flash medium", "provider": "opencode", "model": "deepseek/deepseek-flash", "variant": "medium", "tier": "light" }
+  ]
+}
+```
+
+The host validates this when it loads configuration and when a goal or team snapshots its lineup:
+
+- The named id exists and belongs to a different provider than the profile it backs.
+- A `strong` profile falls back only to a `strong` profile.
+- One id means one provider, model, effort or variant, tier, and data-use setting throughout the lineup.
+- Fallback chains are followed at most two hops, and a cycle is a configuration error.
+
+### What counts as a limit
+
+- Claude Code: a `StopFailure` hook with `error` of `rate_limit`, a `Notification` of `quota_auto_resume_stale` or `quota_auto_resume_disabled`, or the documented limit notice on screen. Other `StopFailure` errors stay provider errors. `quota_auto_resume_fired` is not a limit. It means the wait ended and the limit lifted, so it ends the episode and clears the displayed limit.
+- Codex terminal sessions: the `usage limited` indicator in the terminal's own status row. Limit messages in the transcript body never trigger on their own. They may only supply a reset time.
+- Codex app-server sessions: `turn/completed` with `usageLimitExceeded`. `rateLimitExceeded` stays a provider error.
+- OpenCode is not a source. It retries its own 429 responses.
+
+Clock times in a notice, such as `resets 3:45pm`, are read as UTC because the host runs in UTC. A time that cannot be parsed is left unset.
+
+### Confidence
+
+Each observation is single-source or corroborated.
+
+- Claude Code: the hook alone is single-source. It is corroborated when the screen shows the notice in the same check or the next two, or when a `quota_auto_resume_*` notification follows.
+- Codex terminal: the status row is single-source when first seen. It is corroborated when it persists across at least three consecutive screen checks spanning at least 30 seconds with no other output change.
+- Codex app-server `usageLimitExceeded` and Claude `quota_auto_resume_*` notifications are corroborated on arrival.
+
+Observations are grouped into an episode held in the worker. An episode starts at the first observation. It ends after three consecutive screen checks with no match and no armed corroboration, after a notification that the limit lifted, or when the agent completes a turn that did not fail. An episode journals at most one single-source and one corroborated signal, in either order. A reset time stated by any observation carries onto the later ones. A successful turn also clears the session's displayed limit, and screen matching stays suppressed until a check sees no match.
+
+### What the host does
+
+- A corroborated observation, or a single-source Claude hook observation, stops the member and relaunches its work on the fallback profile. The replacement keeps the same working copy and base commit. Its prompt is the original prompt, with feedback and recorded answers, retargeted to the fallback provider. It notes that the previous member's partial edits are present and passed the path-scope check. A single-source Codex status-row observation only annotates and waits for corroboration.
+- The task records `limitSwitches` entries: the profile it left, the profile it moved to, the reason, the stated reset time if any, the member, and when. This does not use the task's one escalation. Each replacement counts against the run's and goal's member limits.
+- With no resolvable fallback, the run blocks with a reason naming the profile and the limit times. The workspace is preserved.
+- Only a corroborated observation writes the host-level entry in `providerLimits`. It lasts until the provider's stated reset time, capped at 24 hours, or 15 minutes when the provider stated none. Only a later successful turn by a session of that provider clears it early, and an older observation cannot restore a cleared entry. New members of that provider launch on their fallback while the entry exists. With no fallback, they launch on the original profile.
+- A limit seen in any session, team member or not, updates the host-level entry. Nothing else happens to a non-team session.
+- Clients show the entry on the Teams list and the observation on session rows. Reset times are the provider's own statement, and a missing time means the provider gave none.
+
+### What the host never does
+
+- It never sends input to a limited member, answers a provider dialog, or enters credentials. Stopping the member is the only action.
+- It never extends a run, goal, or member limit because a provider was unavailable.
+- It never changes owned paths, allowed paths, deadlines, or the goal's lineup snapshot. A fallback pins a different profile for one member.
+- It never reads a limit or a switch as completion, failure, or product impact.
+
+A fallback onto a contributor-data profile shows the same data-use disclosure as any other profile. The operator decides whether to configure one.
+
+### Live confirmations still owed
+
+Before the detectors are relied on for unattended goals, the operator confirms on a live host and records privately:
+
+1. A subscription quota hit delivers `error: "rate_limit"` in `StopFailure`.
+2. The Codex terminal's `usage limited` indicator sits in its bottom status row at the configured terminal size.
+3. OpenCode's reported cost is non-zero for the providers actually configured.
+
 ## Roles and execution
 
 | Role | Responsibility | Output |

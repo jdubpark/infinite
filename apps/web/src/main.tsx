@@ -307,7 +307,7 @@ function App() {
             </button>
           )}
         </div>
-        {route.goals ? <GoalPicker goals={goals} selected={route.goalId} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} onSelect={route.navigateGoal} /> : route.teams ? <TeamPicker teams={teams} selected={route.teamId} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} onSelect={route.navigateTeam} /> : <SessionPicker sessions={sessions} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />}
+        {route.goals ? <GoalPicker goals={goals} selected={route.goalId} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} onSelect={route.navigateGoal} /> : route.teams ? <TeamPicker teams={teams} selected={route.teamId} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} onSelect={route.navigateTeam} /> : <SessionPicker sessions={sessions} showUsage={me.usage?.enabled === true} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />}
         <div className="host-status">
           <div>
             {me.environment === "cloud" ? (
@@ -1000,7 +1000,6 @@ function SessionView({
         ) : (
           <div className="catchup">
             {session.attention?.now && <div className="attention-summary"><strong>{sessionStatus(session)}</strong><p>{session.attention.now}</p></div>}
-            {session.attention?.limit && <div className="attention-summary" role="status"><strong>Usage limit reached</strong><p>{session.attention.limit.resetsAt ? `Provider reset stated for ${time(session.attention.limit.resetsAt)}` : "The provider did not state a reset time."} · {session.attention.limit.confidence} observation</p></div>}
             <div className="section-label">
               <h2>Current screen</h2>
               <div className="screen-actions">

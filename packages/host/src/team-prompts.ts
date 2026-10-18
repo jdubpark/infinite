@@ -3,9 +3,31 @@ import { TeamError } from "./team-workspace.js";
 import type { TeamMember, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
 const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
-export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile) {
+const profileSuffix = ". These are the host's configured model choices; they do not establish which backend actually served a turn. Do not switch models or change tool permissions.";
+const profileInstructions = (modelProfile: TeamModelProfile) => `Requested runtime profile: ${JSON.stringify(modelProfile)}${profileSuffix}`;
+function reportCommand() {
   const reporter = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./team-report.ts" : "./team-report.js", import.meta.url));
-  const reportCommand = [process.execPath, ...(reporter.endsWith(".ts") ? ["--import", import.meta.resolve("tsx")] : []), reporter].map(quote).join(" ");
+  return [process.execPath, ...(reporter.endsWith(".ts") ? ["--import", import.meta.resolve("tsx")] : []), reporter].map(quote).join(" ");
+}
+function reportingInstructions(provider: Provider, command = reportCommand()) {
+  if (provider === "claude") return `You MUST explicitly submit exactly one final structured report by calling mcp__infinite_team__report with {"report": <the report object matching the above schema>}. Wait for its durable success receipt. If that tool is unavailable or permission is denied, stop and request user attention. Never use Bash, a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this member process.`;
+  return `You MUST explicitly submit exactly one final structured report. Pipe a JSON object matching the above schema to this command: ${command}. The helper adds the assignment identity and authenticates it. Wait for its success receipt. Do not infer successful reporting from terminal text. If a provider denies the helper or another required tool, stop and request user intervention; do not bypass the denial. OpenCode run mode may reject permission requests without an interactive prompt. After a successful report, stop work and wait; the host will stop this member process.`;
+}
+const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const [commandHead, commandTail] = reportingInstructions("opencode", "\0").split("\0");
+/** Either reporting paragraph, whatever helper path the release that wrote the prompt used. */
+const reportingPattern = () => new RegExp(`${escape(reportingInstructions("claude"))}|${escape(commandHead)}[^\\n]+?${escape(commandTail)}`, "g");
+const profilePattern = new RegExp(`Requested runtime profile: [^\\n]+?${escape(profileSuffix)}`);
+/**
+ * Points a member's accumulated prompt, feedback and answers included, at another provider and
+ * profile. Returns undefined when the prompt lacks a recognizable reporting paragraph or profile
+ * line, so a caller never launches a member with another provider's reporting instructions.
+ */
+export function retargetPrompt(prompt: string, to: { provider: Provider; profile: TeamModelProfile }) {
+  if (!reportingPattern().test(prompt) || !profilePattern.test(prompt)) return undefined;
+  return prompt.replace(reportingPattern(), () => reportingInstructions(to.provider)).replace(profilePattern, () => profileInstructions(to.profile));
+}
+export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile) {
   const taskProfileExample = run.lineup ? `,"agentProfileId":${JSON.stringify(run.lineup.implementers[0].id)}` : "";
   const roleInstructions = role === "project-manager"
     ? `Inspect the repository and evidence, then choose the smallest useful change within the approved outcome. Produce 1–12 tasks with acceptance criteria, owned paths (repository-relative files/directories, no globs), and dependsOn task IDs. Split independent work for parallel execution. Overlap requires a dependency. Keep the brief concise; do not create process documents, committees, or artificial subtasks. Leave tracked and untracked repository files unchanged. Report {"kind":"plan","summary":"...","tasks":[{"id":"task-id","title":"...","instructions":"..."${taskProfileExample},"paths":["src/file.ts"],"dependsOn":[]}]}.`
@@ -26,7 +48,7 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
           : `Independently review the integrated implementation against the objective, task acceptance criteria, and recorded checks. Leave tracked and untracked repository files unchanged. Report {"kind":"review","verdict":"approved" or "changes-requested","summary":"Evidence, concrete defects, and limitations"}. Approval makes a run eligible for its separately configured delivery stage; without one, it is ready for human review. Approval never itself grants permission to merge or deploy.`;
   const prompt = [
     `You are the team's ${role}. Team revision: ${run.revision}. Work only in your assigned working directory. Follow repository agent instructions.`,
-    modelProfile ? `Requested runtime profile: ${JSON.stringify(modelProfile)}. These are the host's configured model choices; they do not establish which backend actually served a turn. Do not switch models or change tool permissions.` : "",
+    modelProfile ? profileInstructions(modelProfile) : "",
     `Context scope: project ${run.projectId}. Keep findings, memory, task history, and repository briefings in this codebase. Read another project only when the owner has explicitly linked it for the relevant purpose. Shared parent folders, a Linear team/project, provider accounts, and model routing history are not context-sharing permission. Do not query another repository ID or global knowledge as a fallback. If no knowledge scope is registered for this codebase, use its current sources and report the gap. Links do not transfer permissions or authorize following further links.`,
     `Objective:\n${run.objective}`,
     role === "permission-coordinator"
@@ -76,9 +98,7 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
       : role === "delivery"
       ? `The delivery policy is the only publication authority for this assignment. Delivery must use the existing provider tools and permissions. Do not approve or change provider permissions. If a material scope decision is needed, report a blocker; do not expand scope. A delivery report claims a merge; a delivery-repair report asks the host to reintegrate and repeat checks and review, and does not claim a merge.`
       : `Do not publish, merge, deploy, change repository remotes, or approve provider permissions. Report a blocking issue or request a user decision when needed. Questions must use {"kind":"question","question":"...","options":["..."]}; blockers use {"kind":"blocked","summary":"..."}. Independent teammates can continue while a decision is pending.`,
-    provider === "claude"
-      ? `You MUST explicitly submit exactly one final structured report by calling mcp__infinite_team__report with {"report": <the report object matching the above schema>}. Wait for its durable success receipt. If that tool is unavailable or permission is denied, stop and request user attention. Never use Bash, a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this member process.`
-      : `You MUST explicitly submit exactly one final structured report. Pipe a JSON object matching the above schema to this command: ${reportCommand}. The helper adds the assignment identity and authenticates it. Wait for its success receipt. Do not infer successful reporting from terminal text. If a provider denies the helper or another required tool, stop and request user intervention; do not bypass the denial. OpenCode run mode may reject permission requests without an interactive prompt. After a successful report, stop work and wait; the host will stop this member process.`,
+    reportingInstructions(provider),
   ].filter(Boolean).join("\n\n");
   if (Buffer.byteLength(prompt) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
   return prompt;

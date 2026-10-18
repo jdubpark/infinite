@@ -41,8 +41,6 @@ completion, merge, deployment, or product achievement.
 
 Application records are encrypted with AES-256-GCM. Each record has a fresh 96-bit random nonce and authenticated data containing the format version, session ID, and sequence number. This detects content modification and substitution between records or sessions. It does not detect deletion/rollback of a whole valid suffix without an independently anchored checkpoint.
 
-Usage totals and provider-limit entries record what the host observed. They do not establish task completion or predict a provider's remaining quota. Usage prices and budgets are private host configuration; the aggregated totals sent to paired clients contain no provider credential. Limit records contain the provider, observation and reset times, confidence, and related session/run identifiers, with no credential involved.
-
 The 256-bit key is a separate 0600 file outside the data directory, loaded into the API and worker memory. Encrypting a backup of the state directory is useful only if the attacker does not also obtain this key. Back up the key separately through an owner-controlled channel; losing it loses the recording. The local development layout is not a protected production key management system.
 
 Metadata and context use atomic encrypted writes. Workers fsync recording entries, serialize input, and refuse to silently continue after a detected recording error. A short output buffer of at most roughly 40 ms is not yet durable if the worker or machine dies; this is distinct from client disconnection.
@@ -73,6 +71,14 @@ Codex `--laptop` execution additionally requires a single-tenant host, a paired 
 The selected cwd and roots describe Codex's workspace, not a filesystem isolation boundary. Laptop shell tools retain the selected provider sandbox and the local account's authority. Closing the tunnel or cleaning up the supervisor does not establish containment of arbitrary tool descendants. Automatic handoff requires a verified prepared tree, a settled recorded executor boundary and qualified provider selection. An unresolved operation pauses. Publication epochs reject late local updates; they do not revoke arbitrary detached descendants or external effects. A failed connection never authorizes replay or a provider approval. Captures record stable reads over an observation span, not an atomic database or filesystem snapshot. Returning files go into a new recovery directory without overwriting the laptop copy.
 
 Selected-root files, content-addressed blobs and materialized checkpoints are plaintext runtime data with private permissions; keep them on encrypted storage. The selected roots include ignored files and repository metadata, including any credentials stored inside that scope. Source transfer does not copy the entire home. The owner-only workspace export endpoint returns verified checkpoint data; controller/viewer keys and browser-origin requests cannot use it. A separate execution identity needs the dedicated shared data directory in the Ubuntu template, while receipts, blobs, keys and control sockets stay private.
+
+A provider-limit observation and a usage total are records of what the host
+saw. Neither carries a credential, and neither is an inference about completion
+or product impact. They never substitute for a member's report. The host's only
+action toward a limited member is stopping it. It never sends that member input
+or answers a provider dialog, and the relaunch on a fallback is a new member.
+Price tables stay in private host configuration. Budget amounts, aggregated
+totals, and limit observations reach clients.
 
 ## Remote machine transport
 

@@ -3,14 +3,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { ProviderLimits } from "./provider-limits.js";
-import type { Config } from "./types.js";
+import type { Config, Provider } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
+import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamPermissionDecision, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
-import { teamPrompt } from "./team-prompts.js";
+import { retargetPrompt, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
+import { teamUsage } from "./team-usage.js";
+import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
 import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
@@ -19,6 +21,7 @@ export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
 type Action = { requestId: string; revision: number };
+type LimitSwitch = LimitObservation & { at: string; seq: number };
 type StartInProject = <T>(projectId: string, start: () => Promise<T>) => Promise<T>;
 type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
@@ -34,7 +37,21 @@ const timestamp = () => new Date().toISOString();
 const activeMember = (member: TeamMember) => ["queued", "running", "reported", "unavailable"].includes(member.status);
 const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
 const runtimeUnavailableReason = "An agent runtime is unavailable; the team is waiting for confirmed state.";
+const clock = (iso: string) => `${iso.slice(11, 16)} UTC`;
+const runEvent = (run: TeamRun, text: string) => {
+  run.events.push({ at: timestamp(), text });
+  if (run.events.length > 300) run.events.splice(0, run.events.length - 300);
+};
+
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
+
+/**
+ * The fallback for a member stopped at a provider limit. Its own provider counts as limited even when
+ * only a single-source observation saw the limit, so a second hop never returns to that account.
+ */
+export function switchFallback(lineup: TeamLineup, profileId: string, provider: Provider, limited: Set<Provider>) {
+  return resolveLimitFallback(lineup, profileId, new Set([...limited, provider]));
+}
 
 /** A one-hour member stop can replan. Interrupted workspace operations cannot. */
 export function blockedTeamCanResume(input: {
@@ -69,10 +86,11 @@ export class TeamService {
   private readonly commands = new Map<string, AbortController>();
   private readonly directory: string;
   private usage?: UsageService;
-  readonly limits: ProviderLimits;
+  private readonly limits: ProviderLimits;
+  private reconciledAt = 0;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService) {
-    this.limits = new ProviderLimits(join(config.stateDir, "provider-limits.sealed"), key);
     this.directory = join(config.stateDir, "teams");
+    this.limits = new ProviderLimits(join(config.stateDir, "provider-limits.sealed"), key);
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     for (const file of readdirSync(this.directory).filter(name => /^[a-f0-9-]{36}\.sealed$/.test(name))) {
       const id = file.slice(0, -7);
@@ -105,8 +123,10 @@ export class TeamService {
       }
     }
   }
+  /** The usage ledger this service prices member usage from; its tick also drives the ledger's reads. */
   useUsage(service: UsageService) { this.usage = service; }
-  usageForRuns(ids: string[]) { return this.usage?.aggregate([...new Set(ids)].flatMap(id => this.record(id).run.members)); }
+  /** Active host-level provider limits; new members of a limited provider launch on their fallback. */
+  providerLimits() { return this.limits.active(); }
   private enqueue<T>(task: () => T | Promise<T>): Promise<T> {
     const next = this.serial.then(task); this.serial = next.catch(() => {}); return next;
   }
@@ -147,19 +167,14 @@ export class TeamService {
       resumable: this.canResume(stored, run.linear?.status),
       ...(run.permissionDecisions ? { permissionDecisions: run.permissionDecisions.map(({ prompt: _prompt, ...decision }) => decision) } : {}),
     };
-    return { ...safeRun, ...(this.usage ? { usage: this.usage.aggregate(members) } : {}), providerLimits: this.limits.active(), members: members.map(({ prompt: _prompt, feedback: _feedback, pendingLimit: _pendingLimit, ...member }) => {
-      const usage = this.usage?.session(member.sessionId);
-      return { ...member, ...(usage?.measured ? { usage } : {}) };
-    }) };
+    const withUsage = teamUsage(members.map(({ prompt: _prompt, ...member }) => member), run.provider, this.usage);
+    return { ...safeRun, members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active() };
   }
   private save(stored: Stored) {
     stored.run.updatedAt = timestamp();
     writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored);
   }
-  private event(stored: Stored, text: string) {
-    stored.run.events.push({ at: timestamp(), text });
-    if (stored.run.events.length > 300) stored.run.events.splice(0, stored.run.events.length - 300);
-  }
+  private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   get(id: string): TeamView { return this.view(this.record(id)); }
   async bundle(id: string) {
@@ -416,7 +431,19 @@ export class TeamService {
       if (this.tickQueued || !this.running) return;
       this.tickQueued = true;
       void this.enqueue(async () => {
-        try { await this.observeProviderLimits(); for (const stored of this.records.values()) await this.step(stored); }
+        try {
+          // One session listing every 2 s feeds the usage ledger and the limit memory, which follows
+          // every session on the host, not only team members.
+          if (Date.now() - this.reconciledAt >= 2000) {
+            this.reconciledAt = Date.now();
+            const rows = await this.manager.list().catch(() => undefined);
+            if (rows) {
+              await this.usage?.tick(rows).catch(() => {});
+              await this.limits.reconcile(this.manager, rows).catch(() => {});
+            }
+          }
+          for (const stored of this.records.values()) await this.step(stored);
+        }
         finally { this.tickQueued = false; }
       }).catch(() => { this.tickQueued = false; });
     };
@@ -477,19 +504,6 @@ export class TeamService {
     if (state.status !== "exited") return false;
     member.status = "stopped"; return true;
   }
-  private async observeProviderLimits() {
-    for (const session of await this.manager.list()) {
-      if (session.provider !== "claude" && session.provider !== "codex") continue;
-      const limit = session.attention.limit;
-      if (limit?.confidence === "corroborated") {
-        this.limits.observe({ provider: session.provider, detectedAt: limit.since, resetsAt: limit.resetsAt,
-          sessionId: session.id, ...(session.team ? { runId: session.team.runId } : {}), confidence: "corroborated" });
-      }
-      const current = this.limits.active().find(entry => entry.provider === session.provider);
-      if (current && session.attention.lastSuccessfulTurnAt && session.attention.lastSuccessfulTurnAt > current.detectedAt)
-        this.limits.clear(session.provider, session.attention.lastSuccessfulTurnAt);
-    }
-  }
   private async stopObsoletePermissionCoordinators(stored: Stored) {
     const run = stored.run;
     for (const member of run.members.filter(item => item.revision === run.revision && item.role === "permission-coordinator" && activeMember(item))) {
@@ -525,60 +539,6 @@ export class TeamService {
       }
       this.event(stored, "The obsolete permission coordinator was confirmed stopped; it cannot authorize a later request."); this.save(stored);
     }
-  }
-  private async switchLimitedMember(stored: Stored, member: TeamMember) {
-    const run = stored.run, limit = member.pendingLimit!;
-    const provider = member.provider ?? run.provider;
-    if (limit.confidence === "corroborated") this.limits.observe({ provider, detectedAt: limit.detectedAt,
-      resetsAt: limit.resetsAt, sessionId: member.sessionId, runId: run.id, confidence: "corroborated" });
-    try {
-      if (!await this.stopped(member)) { member.status = "unavailable"; run.reason = runtimeUnavailableReason; this.save(stored); return; }
-    } catch {
-      member.status = "unavailable";
-      run.reason = "The limited agent could not be stopped. Release its input control or inspect its terminal before a replacement can write.";
-      this.save(stored); return;
-    }
-    const limited = this.limits.limited(); limited.add(provider);
-    if (member.role === "delivery" && stored.deliveryAttempt) {
-      this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;
-    }
-    const selectedFallback = run.lineup && member.modelProfile ? resolveLimitFallback(run.lineup, member.modelProfile.id, limited) : undefined;
-    const fallback = member.role === "permission-coordinator" && selectedFallback?.provider !== "claude" ? undefined : selectedFallback;
-    const reason = `${provider} ${limit.limit} limit reached${limit.resetsAt ? `; resets ${limit.resetsAt}` : ""}`;
-    member.stoppedReason = reason;
-    if (!fallback) {
-      if (member.role === "permission-coordinator") {
-        const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
-        if (decision) { decision.status = "escalated"; decision.reason = "The coordinator provider reached a limit and no eligible strong fallback is available."; }
-        member.status = "stopped"; this.save(stored);
-        this.event(stored, "The permission review could not continue on an eligible coordinator profile; the request remains with the user.");
-        return;
-      }
-      this.block(stored, new TeamError(409, "provider-limit", `${reason}; no fallback profile is configured for ${member.modelProfile?.id ?? provider}.`)); return;
-    }
-    this.assertBudget(run, true);
-    const task = member.role === "scout" ? run.discovery?.tasks.find(task => task.id === member.taskId) : run.tasks.find(task => task.id === member.taskId);
-    this.operation(stored, "member", async signal => {
-      if (member.role === "implementer") await assertMemberScope(member.cwd, member.baseCommit, (task as TeamTask).paths, this.config.teams?.commandPrefix, signal);
-      else if (member.role === "integrator") await assertMemberScope(member.cwd, member.baseCommit, run.goal?.allowedPaths, this.config.teams?.commandPrefix, signal);
-      else await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
-    }, () => {
-      const feedback = [this.memberFeedback(run, member), "The previous member stopped at a provider usage limit. Its partial edits, if any, are present and passed the role's path check. Inspect them and finish the same assignment."].filter(Boolean).join("\n\n");
-      const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, feedback, fallback);
-      run.members.push(next); member.pendingLimit = undefined;
-      if (member.role === "permission-coordinator") {
-        const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
-        if (decision && decision.status === "reviewing") decision.coordinatorMemberId = next.memberId;
-      }
-      if (task) { task.memberId = next.memberId; task.status = "running"; }
-      if (member.role === "implementer" && task) {
-        const implementation = task as TeamTask;
-        (implementation.limitSwitches ??= []).push({ fromProfileId: member.modelProfile?.id, toProfileId: fallback.id,
-          reason, resetsAt: limit.resetsAt, memberId: member.memberId, at: limit.detectedAt });
-      }
-      run.reason = undefined;
-      this.event(stored, `${member.modelProfile?.label ?? provider} hit a usage limit; ${member.taskId ?? member.role} continues on ${fallback.label} with partial work preserved.`);
-    });
   }
   private async step(stored: Stored) {
     const run = stored.run;
@@ -627,34 +587,32 @@ export class TeamService {
             this.event(stored, "The permission coordinator exceeded its review window; the request remains with the user."); this.save(stored); continue;
           }
           if (member.startedAt && Date.now() - Date.parse(member.startedAt) > 60 * 60 * 1000) { this.block(stored, new TeamError(409, "member-time-limit", memberTimeLimitReason)); return; }
-          const page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
-          member.cursor = page.cursor;
-          for (const event of page.events) {
-            if (event.type === "signal") {
-              const signal = event.data;
-              if (signal.kind === "provider-limit" && ["usage", "credits"].includes(String(signal.limit)) && typeof signal.message === "string"
-                && (signal.confidence === "corroborated" || ((member.provider ?? run.provider) === "claude" && signal.source === "hook" && signal.confidence === "single-source"))) {
-                member.pendingLimit = { limit: signal.limit as "usage" | "credits", confidence: signal.confidence as "single-source" | "corroborated",
-                  message: signal.message, detectedAt: event.at, ...(typeof signal.resetsAt === "string" ? { resetsAt: signal.resetsAt } : {}) };
+          let page: ReturnType<Manager["events"]>, limit: LimitSwitch | undefined;
+          // A limit acts only on the whole journal: a report or recovery in an unread tail wins.
+          do {
+            page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
+            member.cursor = page.cursor;
+            for (const event of page.events) {
+              if (event.type === "signal") {
+                const data = event.data;
+                // Prefer a corroborated observation; a later successful turn means the member recovered.
+                if (switchesMember(data)) { if (!limit || (limit.confidence !== "corroborated" && data.confidence === "corroborated")) limit = { ...data, at: event.at, seq: event.seq }; }
+                else if (recoveryTurnEnd(data as unknown as SignalData) || (data.kind === "notice" && data.type === "quota_auto_resume_fired")) limit = undefined;
+                continue;
               }
-              continue;
+              const parsed = teamReportEnvelopeSchema.safeParse(event.data);
+              if (!parsed.success) continue;
+              const envelope = parsed.data;
+              if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
+              member.report = envelope.report; member.status = "reported"; break;
             }
-            const parsed = teamReportEnvelopeSchema.safeParse(event.data);
-            if (!parsed.success) continue;
-            const envelope = parsed.data;
-            if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
-            member.report = envelope.report; member.status = "reported"; break;
+          } while (!member.report && limit && page.more);
+          if (!member.report && limit) {
+            await this.switchLimitedMember(stored, member, limit);
+            if (stored.pending || run.status === "blocked") return;
+            continue;
           }
           if (!member.report) {
-            if (member.pendingLimit) {
-              // Persist the observation before attempting a lease-aware stop. A denied stop
-              // retries this same member, even though the journal cursor has advanced.
-              this.save(stored);
-              // Allow the worker's next two screen checks to add a reset time and
-              // corroboration before stopping a hook-only failed turn.
-              if (member.pendingLimit.confidence === "single-source" && Date.now() - Date.parse(member.pendingLimit.detectedAt) < 2200) continue;
-              await this.switchLimitedMember(stored, member); return;
-            }
             const state = await this.manager.state(member.sessionId);
             if (state.status === "exited" && (page.more || member.cursor < state.seq)) { this.save(stored); continue; }
             if (state.status === "exited") {
@@ -692,7 +650,9 @@ export class TeamService {
       for (const decision of run.decisions.filter(item => item.revision === run.revision && item.answer)) {
         const prior = run.members.find(member => member.memberId === decision.memberId)!;
         if (prior.status !== "waiting") continue;
-        const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, `${this.memberFeedback(run, prior)}\n\nUser answered: ${decision.answer}`, prior.modelProfile);
+        const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, `${prior.prompt}\n\nUser answered: ${decision.answer}`, prior.modelProfile);
+        // A limit substitution may have pinned a fallback profile on another provider.
+        next.provider = next.modelProfile?.provider ?? prior.provider ?? run.provider;
         prior.status = "stopped"; run.members.push(next);
         if (prior.role === "delivery" && stored.deliveryAttempt?.memberId === prior.memberId)
           stored.deliveryAttempt.memberId = next.memberId;
@@ -801,7 +761,8 @@ export class TeamService {
       this.save(stored);
       return false;
     }
-    const member = this.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, feedback, run.lineup.coordinator);
+    const member = this.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, undefined, run.lineup.coordinator);
+    member.prompt = teamPrompt(run, "permission-coordinator", undefined, feedback, member.provider ?? run.provider, member.modelProfile);
     decision.coordinatorMemberId = member.memberId;
     const selectedProfile = this.config.agents[member.provider ?? run.provider];
     if (member.provider !== "claude" || !selectedProfile) {
@@ -932,36 +893,83 @@ export class TeamService {
     this.taskProfiles(run, [task]);
     return run.lineup.implementers.find(profile => profile.id === task.agentProfileId)!;
   }
-  private memberFeedback(run: TeamRun, member: TeamMember) {
-    if (member.feedback !== undefined) return member.feedback;
-    // Legacy members did not retain structured feedback. Recover only that section,
-    // never their provider-specific runtime or reporting instructions.
-    const start = member.prompt.indexOf("\n\nFeedback and answers:\n");
-    const end = member.prompt.lastIndexOf("\n\nDo not publish, merge, deploy,");
-    const feedback = start >= 0 && end > start ? member.prompt.slice(start + "\n\nFeedback and answers:\n".length, end) : "";
-    const answers = run.decisions.filter(decision => decision.memberId === member.memberId && decision.answer).map(decision => `User answered: ${decision.answer}`).join("\n");
-    return [feedback, answers].filter(Boolean).join("\n\n");
-  }
-  private newMember(run: TeamRun, role: TeamMember["role"], cwd: string, baseCommit: string, taskId?: string, feedback?: string, pinnedProfile?: TeamModelProfile): TeamMember {
+  private newMember(run: TeamRun, role: TeamMember["role"], cwd: string, baseCommit: string, taskId?: string, prompt?: string, pinnedProfile?: TeamModelProfile): TeamMember {
     this.assertBudget(run, true);
     const memberId = randomUUID();
     const task = role === "scout" ? run.discovery?.tasks.find(task => task.id === taskId) : run.tasks.find(task => task.id === taskId);
     let selected = pinnedProfile ?? this.memberProfile(run, role, task);
-    if (selected && run.lineup && this.limits.limited().has(selected.provider)) {
-      const fallback = resolveLimitFallback(run.lineup, selected.id, this.limits.limited());
-      if (fallback) {
-        this.event(this.record(run.id), `${selected.label} launched on ${fallback.label}: ${selected.provider} has an active usage limit.`);
-        selected = fallback;
-      }
+    const limit = selected && this.limits.active().find(item => item.provider === selected!.provider);
+    const fallback = limit && run.lineup ? resolveLimitFallback(run.lineup, selected!.id, this.limits.limited()) : undefined;
+    const retargeted = fallback && prompt !== undefined ? retargetPrompt(prompt, { provider: fallback.provider, profile: fallback }) : undefined;
+    // Without a resolvable fallback, or with a passed prompt it cannot carry, the launch proceeds: the limit may have lifted.
+    if (selected && limit && fallback && (prompt === undefined || retargeted !== undefined)) {
+      runEvent(run, `${selected.label} launched on ${fallback.label}: ${PROVIDER_NAMES[limit.provider]} is limited until ${clock(limit.expiresAt)}`);
+      prompt = retargeted; selected = fallback;
     }
     const modelProfile = selected ? structuredClone(selected) : undefined;
     const provider = modelProfile?.provider ?? run.provider;
-    const instructions = teamPrompt(run, role, task, feedback, provider, modelProfile);
+    const instructions = prompt ?? teamPrompt(run, role, task, undefined, provider, modelProfile);
     if (Buffer.byteLength(instructions) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
-    return { runId: run.id, memberId, revision: run.revision, role, provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, ...(feedback ? { feedback } : {}), cursor: 0, stopRequestId: randomUUID() };
+    return { runId: run.id, memberId, revision: run.revision, role, provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, cursor: 0, stopRequestId: randomUUID() };
+  }
+  /**
+   * Stops a member whose provider hit a limit and continues its assignment on the profile's limit
+   * fallback in the same working copy. The host only stops the member; it never sends it input.
+   */
+  private async switchLimitedMember(stored: Stored, member: TeamMember, limit: LimitSwitch) {
+    const run = stored.run, provider = member.provider ?? run.provider, name = PROVIDER_NAMES[provider];
+    const kind = limit.limit === "credits" ? "credit limit" : "usage limit", resets = limit.resetsAt ? clock(limit.resetsAt) : undefined;
+    if (limit.confidence === "corroborated") this.limits.observe({ provider, detectedAt: limit.at, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}), sessionId: member.sessionId, runId: run.id, confidence: "corroborated" });
+    // Until the member's exit is confirmed, the next tick reads this observation again.
+    try { if (!await this.stopped(member)) { member.cursor = limit.seq - 1; this.save(stored); return; } }
+    catch { member.cursor = limit.seq - 1; member.status = "unavailable"; run.reason = "An agent could not be stopped. Release its input control or inspect its terminal before integration."; this.save(stored); return; }
+    member.stoppedReason = `${name} ${kind}${resets ? `, resets ${resets}` : ""}`;
+    // A delivery member may already have published; a replacement must not repeat it unseen.
+    if (member.role === "delivery" && stored.deliveryAttempt) {
+      this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;
+    }
+    const from = member.modelProfile, selected = from && run.lineup ? switchFallback(run.lineup, from.id, provider, this.limits.limited()) : undefined;
+    // Only a Claude profile can run report-only permission review.
+    const fallback = member.role === "permission-coordinator" && selected?.provider !== "claude" ? undefined : selected;
+    if (!from || !fallback) {
+      if (member.role === "permission-coordinator") {
+        const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
+        if (decision) { decision.status = "escalated"; decision.reason = "The coordinator provider reached a limit and no eligible strong fallback is available."; }
+        member.status = "stopped"; this.save(stored);
+        this.event(stored, "The permission review could not continue on an eligible coordinator profile; the request remains with the user.");
+        return;
+      }
+      this.block(stored, new TeamError(409, "provider-limit", `${name} ${kind} reached at ${clock(limit.at)}${resets ? `, resets ${resets}` : ""}; no fallback profile is configured for ${from?.id ?? provider}.`));
+      return;
+    }
+    const task = member.role === "implementer" ? run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
+    if (member.role === "implementer" && !task) throw new TeamError(409, "invalid-task", "The implementer has no current task assignment.");
+    const scout = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
+    const prefix = this.config.teams?.commandPrefix, editing = member.role === "implementer" || member.role === "integrator";
+    const note = editing ? `The previous ${member.role} stopped at a ${name} ${kind}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`
+      : `The previous ${member.role} stopped at a ${name} ${kind} before reporting. Its working copy was checked unchanged; complete the same assignment.`;
+    // Editing roles keep in-scope partial work; read-only roles must have left their copy unchanged.
+    this.operation(stored, "result", signal => editing ? assertMemberScope(member.cwd, member.baseCommit, task ? task.paths : run.goal?.allowedPaths, prefix, signal) : assertMemberReadOnly(member.cwd, member.baseCommit, prefix, signal), () => {
+      // The prompt keeps its feedback and user answers. An unrecognized prompt is rebuilt with its answers.
+      const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback),
+        ...run.decisions.filter(decision => decision.answer && run.members.some(prior => prior.memberId === decision.memberId && prior.role === member.role && prior.taskId === member.taskId && prior.revision === member.revision)).map(decision => `User answered: ${decision.answer}`)].join("\n\n");
+      const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, `${carried}\n\n${note}`, fallback);
+      if (task) {
+        (task.limitSwitches ??= []).push({ fromProfileId: from.id, toProfileId: fallback.id, reason: limit.message, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}), memberId: member.memberId, at: timestamp() });
+        task.memberId = next.memberId; task.status = "running";
+      }
+      if (scout) scout.memberId = next.memberId;
+      if (member.role === "permission-coordinator") {
+        const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
+        if (decision && decision.status === "reviewing") decision.coordinatorMemberId = next.memberId;
+      }
+      run.members.push(next);
+      this.event(stored, `${from.label} hit a ${name} ${kind}${resets ? ` (resets ${resets})` : ""}; ${task?.title ?? member.title} continues on ${fallback.label}${editing ? " with partial work preserved" : ""}.`);
+    });
   }
   private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string) {
-    const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id, feedback);
+    const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id);
+    if (feedback) member.prompt = teamPrompt(run, role, task, feedback, member.provider ?? run.provider, member.modelProfile);
     if (role !== "permission-coordinator") run.status = role === "project-manager" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
     this.operation(stored, "member", async signal => {
       this.assertRunPath(stored, run.workspace);
@@ -1058,8 +1066,8 @@ export class TeamService {
         throw new TeamError(409, "invalid-escalation", "An implementer may escalate once to a different profile in the approved escalation pool.");
       this.operation(stored, "result", signal => assertMemberScope(member.cwd, member.baseCommit, task.paths, this.config.teams?.commandPrefix, signal), () => {
         task.escalation = { ...(member.modelProfile ? { fromProfileId: member.modelProfile.id } : {}), toProfileId: profile.id, reason: report.reason, memberId: member.memberId, at: timestamp() };
-        const next = this.newMember(run, "implementer", member.cwd, member.baseCommit, task.id,
-          `The previous implementer requested escalation: ${report.reason}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`, profile);
+        const next = this.newMember(run, "implementer", member.cwd, member.baseCommit, task.id, undefined, profile);
+        next.prompt = teamPrompt(run, "implementer", task, `The previous implementer requested escalation: ${report.reason}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`, next.provider ?? run.provider, next.modelProfile);
         run.members.push(next); task.memberId = next.memberId; task.status = "running";
         run.status = "implementing";
         this.event(stored, `${task.title} escalated to ${profile.label}; the stopped member's partial work was preserved.`);

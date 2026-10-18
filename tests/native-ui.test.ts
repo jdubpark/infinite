@@ -147,37 +147,28 @@ test("native Codex attachment fences device control, pins its conversation, and 
   } finally { for (const client of clients) client.terminate(); await host.stop(); }
 });
 
-test("native Codex corroborates quota errors but leaves transient rate limits as provider errors", { timeout: 30000 }, async () => {
-  const host = await startHost({ agents: { codex: { command: process.execPath, args: [resolve("tests/fixtures/native-codex.mjs")] } } });
-  const clients: WebSocket[] = [];
-  const id = randomUUID();
-  try {
-    assert.equal((await host.fetchApi("/sessions", "owner", {
-      requestId: id, provider: "codex", projectId: "rehearsal", title: "Limit signals", localUi: true, nativeArgs: ["initial prompt"],
-    })).status, 201);
-    const info = await waitFor(async () => (await host.fetchApi(`/sessions/${id}/native`)).body, body => Boolean(body?.sessionId));
-    const control = await claimControl(host, id, "owner");
-    const native = await connect(nativeUrl(host, id, control), { Authorization: `Bearer ${host.tokens.owner}` });
-    clients.push(native.ws);
-    await native.rpc("thread/resume", { threadId: info.sessionId });
-
-    await native.rpc("turn/start", { threadId: info.sessionId, input: [{ type: "text", text: "usage-limit" }] });
-    let events = await waitFor(async () => (await host.fetchApi(`/sessions/${id}/events?types=signal`)).body.events,
-      rows => rows.some((row: any) => row.data.kind === "provider-limit"));
-    const quota = events.find((row: any) => row.data.kind === "provider-limit");
-    assert.deepEqual({ limit: quota.data.limit, confidence: quota.data.confidence, source: quota.data.source },
-      { limit: "usage", confidence: "corroborated", source: "protocol" });
-    assert.ok(events.some((row: any) => row.data.kind === "turn-end" && row.data.failed === true));
-
-    await native.rpc("turn/start", { threadId: info.sessionId, input: [{ type: "text", text: "rate-limit-transient" }] });
-    events = await waitFor(async () => (await host.fetchApi(`/sessions/${id}/events?types=signal`)).body.events,
-      rows => rows.filter((row: any) => row.data.kind === "turn-end" && row.data.failed).length >= 2);
-    assert.equal(events.filter((row: any) => row.data.kind === "provider-limit").length, 1);
-  } finally {
-    for (const client of clients) client.terminate();
-    await host.stop();
-  }
-});
+for (const [prompt, usageLimit] of [["usage-limit", true], ["rate-limit-transient", false]] as const) {
+  test(`native Codex ${prompt} turn ${usageLimit ? "records one corroborated usage limit" : "is only a failed turn"}`, { timeout: 30000 }, async () => {
+    const host = await startHost({ agents: { codex: { command: process.execPath, args: [resolve("tests/fixtures/native-codex.mjs")] } } });
+    const id = randomUUID();
+    try {
+      assert.equal((await host.fetchApi("/sessions", "owner", { provider: "codex", projectId: "rehearsal", title: "Native limit", localUi: true, requestId: id, nativeArgs: [prompt] })).status, 201);
+      const signals = await waitFor(async () => (await host.fetchApi(`/sessions/${id}/events?types=signal`)).body.events,
+        events => events.some((event: any) => event.data.kind === "turn-end"));
+      const limits = signals.filter((event: any) => event.data.kind === "provider-limit");
+      const ends = signals.filter((event: any) => event.data.kind === "turn-end");
+      assert.equal(ends.length, 1);
+      assert.equal(ends[0].data.failed, true);
+      if (usageLimit) {
+        assert.equal(limits.length, 1);
+        assert.equal(limits[0].data.limit, "usage");
+        assert.equal(limits[0].data.confidence, "corroborated");
+        assert.equal(limits[0].data.source, "protocol");
+        assert.ok(limits[0].seq < ends[0].seq, "the limit signal precedes the turn end");
+      } else assert.equal(limits.length, 0);
+    } finally { await host.stop(); }
+  });
+}
 
 test("CLI opens a local native frontend with a loopback credential and detaches without ending the backend", { timeout: 30000 }, async () => {
   const fixture = resolve("tests/fixtures/native-codex.mjs");

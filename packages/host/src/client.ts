@@ -1,3 +1,4 @@
+import { formatUsd } from "./usage.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -556,6 +557,23 @@ function describeSync(sync: ProjectDetail["sync"]) {
   return `synced ${age(sync.lastSyncedAt)} · applied ${age(sync.appliedAt)}${pending}${skipped}`;
 }
 
+/** One line per provider. Period words come from each provider's own window, never a fixed "month". */
+export function usageLines(summary: import("./usage-service.js").UsageSummary): string[] {
+  const width = Math.max(...Object.keys(summary.providers).map(name => name.length));
+  return Object.entries(summary.providers).map(([name, entry]) => {
+    const label = name.padEnd(width);
+    if (!entry.measured || !entry.spent) return `${label}  unmeasured (${entry.unmeasuredSessions} session${entry.unmeasuredSessions === 1 ? "" : "s"}, no usage is recorded for this provider)`;
+    const days = Math.round((Date.parse(entry.period.end) - Date.parse(entry.period.start)) / 86_400_000);
+    const word = entry.budget?.period ?? (days <= 1 ? "day" : days <= 7 ? "week" : "month");
+    const unpriced = entry.spent.pricing.unknown;
+    const detail = [`${entry.spent.messages} steps`, ...(unpriced ? [`${unpriced} unpriced`] : []), `${entry.unmeasuredSessions} unmeasured sessions`].join(", ");
+    const { messages, pricing } = entry.spent, noPrice = messages > 0 && pricing.unknown === messages;
+    const figure = noPrice ? "— (no price available)" : `${pricing.unknown > 0 ? "at least " : ""}$${formatUsd(entry.spent.cost)}`;
+    const spent = `spent ${figure}${entry.budget ? ` of $${formatUsd(entry.budget.usd)}` : ""}`;
+    return `${label}  ${spent} for ${word} from ${entry.period.start.slice(0, 10)} (${detail})${entry.budget && entry.spent.cost > entry.budget.usd ? " OVER BUDGET" : ""}`;
+  });
+}
+
 export async function handleClientCommand(argv: string[]): Promise<boolean> {
   if (argv[0] === "cmux") {
     try {
@@ -610,27 +628,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       return true;
     }
     if (command === "usage") {
-      const summary = await api.json<{ period: { start: string; end: string }; providers: Record<string, { period?: { start: string; end: string }; measured: boolean; spent?: { incomplete?: boolean; cost: number; messages: number; pricing: { configured: number; provider: number; unknown: number } }; budget?: { usd: number; period: "day" | "week" | "month" }; unmeasuredSessions: number }> }>("/usage");
+      const summary = await api.json<import("./usage-service.js").UsageSummary>("/usage");
       if (options["--json"]) console.log(JSON.stringify(summary, null, 2));
-      else {
-        for (const [provider, item] of Object.entries(summary.providers)) {
-          const label = provider === "claude" ? "Claude Code" : provider === "codex" ? "Codex" : provider === "grok" ? "Grok Build" : provider === "opencode" ? "OpenCode" : provider;
-          const parts: string[] = [];
-          if (item.period) parts.push(`${item.period.start} to ${item.period.end}`);
-          if (item.spent?.incomplete) parts.push("partial usage data");
-          if (!item.measured || !item.spent) parts.push("unmeasured");
-          else if (!item.spent.messages && !item.spent.pricing.unknown) parts.push("no measured usage");
-          else {
-            parts.push(item.spent.pricing.unknown ? `known spend $${item.spent.cost.toFixed(item.spent.cost > 0 && item.spent.cost < 0.01 ? 6 : 2)}` : `spent $${item.spent.cost.toFixed(item.spent.cost > 0 && item.spent.cost < 0.01 ? 6 : 2)}`);
-            parts.push(`configured price: ${item.spent.pricing.configured}, reported by OpenCode: ${item.spent.pricing.provider}${item.spent.pricing.unknown ? `, unknown cost: ${item.spent.pricing.unknown}` : ""}`);
-            parts.push(`${item.spent.messages} usage records`);
-          }
-          if (item.budget) parts.push(`budget $${item.budget.usd.toFixed(2)} per ${item.budget.period}`);
-          else parts.push("no budget configured");
-          if (item.unmeasuredSessions) parts.push(`${item.unmeasuredSessions} unmeasured sessions`);
-          console.log(`${label}  ${parts.join(" · ")}`);
-        }
-      }
+      else for (const line of usageLines(summary)) console.log(line);
       return true;
     }
     if (command === "resources") { await resources(api, options); return true; }

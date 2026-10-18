@@ -132,6 +132,7 @@ export function createApp(config: Config, key: Buffer) {
   const linear = new LinearService(config, key);
   const teams = new TeamService(config, key, manager, startInProject, linear);
   const usage = new UsageService(config, key, manager);
+  // TeamService ticks on every host and drives the ledger from its own session listing.
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
@@ -337,10 +338,10 @@ export function createApp(config: Config, key: Buffer) {
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
-      providerLimits: teams.limits.active(),
       teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
+      providerLimits: teams.providerLimits(),
       projects: config.projects.map(({ id, name, path, team, linear }) => ({ id, name, path, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
       capabilities: {
         ...(mirroredProjects ? { workspaceMirror: 1, mirrorForget: 1 } : {}),
@@ -1008,7 +1009,6 @@ export function createApp(config: Config, key: Buffer) {
   const server = createServer(app);
   server.once("listening", () => linear.start());
   server.once("listening", () => teams.start());
-  server.once("listening", () => usage.start());
   server.once("listening", () => goals.start());
   server.once("listening", () => handoffs.start());
   if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });

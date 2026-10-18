@@ -1,8 +1,5 @@
 # Usage ledger and provider-limit fallback
 
-Implementation update: Codex terminal detection is deferred. Review demonstrated that bottom-row text alone cannot distinguish transcript content from provider status. Only the native protocol's typed `usageLimitExceeded` event is accepted for Codex; the screen proposal below is not enabled. Successful-turn evidence, rather than general activity, clears provider limits. Integrator fallback validates partial work against its permitted paths and regenerates provider-specific reporting instructions.
-
-
 Date: 2026-10-17. Status: design for review. Checkout: the agent-teams branch, where Goals, Teams, and the lineup live.
 
 ## Intent
@@ -47,7 +44,7 @@ Confirmed from the installed binaries and the vendors' own documentation on 2026
 
 **Codex.** Team members run the interactive TUI in a PTY with hooks configured. On a limit the TUI stays open, prints "Usage limit reached. You've reached your usage limit." or "You're out of credits.", optionally followed by " Try again at <date>", and shows "usage limited" in its status line. No hook or exit code reports it. The app-server protocol, which the host uses only for local-UI sessions, reports `turn/completed` with `turn.error.codexErrorInfo` of `usageLimitExceeded` or `rateLimitExceeded`, and notifies `account/rateLimits/updated`.
 
-Still unobserved on the live host, and to be confirmed during implementation before the detectors are trusted: that a subscription quota hit delivers `error: "rate_limit"` in StopFailure; that the Codex TUI's "usage limited" indicator sits in its bottom status row at the configured terminal size, and what that row looks like; whether OpenCode's `cost` is non-zero for the providers actually configured there. A builder confirmed locally that `opencode run --format json` writes raw JSON lines when stdout is a PTY.
+Still unobserved on the live host, and to be confirmed during implementation before the detectors are trusted: that a subscription quota hit delivers `error: "rate_limit"` in StopFailure; that the Codex TUI's "usage limited" indicator sits in its bottom status row at the configured terminal size, and what that row looks like; whether OpenCode's `cost` is non-zero for the providers actually configured there; whether Codex emits a `Stop` hook, notify, or OSC 9 turn end when a turn ends on a limit; and whether the Claude Code notice uses a straight or a curly apostrophe (the detector accepts both). A builder confirmed locally that `opencode run --format json` writes raw JSON lines when stdout is a PTY.
 
 ## Part 1: usage ledger
 
@@ -56,7 +53,7 @@ Still unobserved on the live host, and to be confirmed during implementation bef
 OpenCode team members launch with `--format json` added by the host (the launch builder already owns the `run` argument list). The worker parses each stdout line that is a JSON object with `type: "step_finish"` and records a journal event of kind `usage` from its `part`:
 
 ```
-{ provider: "opencode", providerId, modelId, modelSource: "requested" | "reported",
+{ provider: "opencode", providerId, modelId, modelSource: "requested" | "reported" | "unknown",
   messageId, partId, completedAt,
   tokens: { input, output, reasoning, cacheRead, cacheWrite },
   reportedCost }
@@ -64,7 +61,7 @@ OpenCode team members launch with `--format json` added by the host (the launch 
 
 One record per step. Lines that are not JSON or not `step_finish` are ignored. Headless lines carry no model id, so a team member's `providerId` and `modelId` come from its requested lineup profile and are labelled `modelSource: "requested"`. The worker appends every record immediately; the journal is append-only and the ledger, not the worker, enforces one row per `(sessionId, messageId, partId)`. The member's terminal shows the JSON event stream; these members accept no interactive input anyway, and the web chat view continues to come from the provider's own record.
 
-OpenCode sessions driven through the local-UI adapter already subscribe to `/event`; the same handler records a `usage` event from each `message.part.updated` whose part is a `step-finish`, taking the provider and model from the `message.updated` it saw for that message (`modelSource: "reported"`). Terminal-mode `infinite opencode` sessions run the TUI and have no structured output; the ledger records nothing for them and the API says so rather than showing zero.
+OpenCode sessions driven through the local-UI adapter already subscribe to `/event`; the same handler records a `usage` event from each `message.part.updated` whose part is a `step-finish`, taking the provider and model from the `message.updated` it saw for that message (`modelSource: "reported"`). Without one, it uses the session's requested `--model` (`modelSource: "requested"`). With neither, the record keeps its tokens with `providerId` and `modelId` of `"unknown"` and `modelSource: "unknown"`. (Added 2026-10-18 after final review.) Terminal-mode `infinite opencode` sessions run the TUI and have no structured output; the ledger records nothing for them and the API says so rather than showing zero.
 
 Claude Code and Codex sessions record no `usage` events in this change.
 
@@ -88,11 +85,11 @@ Host configuration gains an optional `usage` block:
 
 Prices are USD per million tokens; `cacheRead` and `cacheWrite` are optional and default to the input price. `budgets` is keyed by provider (`claude`, `codex`, `grok`, `opencode`); `period` is `day`, `week`, or `month`, in UTC, defaulting to `month`. A budget is informational.
 
-Each `usage` record is priced at read time, not at capture: `cost` is computed from the configured price for `providerId/modelId` when one exists, otherwise it is `reportedCost`. The record exposes `pricing: "configured" | "provider" | "unknown"`, where `unknown` means no configured price and a reported cost of 0. Changing the price table re-prices history, which is the intended behaviour for a tally.
+Each `usage` record is priced at read time, not at capture: `cost` is computed from the configured price for `providerId/modelId` when one exists, otherwise it is `reportedCost`. The record exposes `pricing: "configured" | "provider" | "unknown"`, where `unknown` means no configured price and a reported cost of 0, or a record with `modelSource: "unknown"`, which is never priced because its model was not observed. Changing the price table re-prices history, which is the intended behaviour for a tally.
 
 ### Aggregation and durability
 
-A `UsageService` in the API owns a sealed ledger in the state directory. It follows the journals of sessions that can produce `usage` events (OpenCode sessions, by provider) with a cursor per session, the same way the team scheduler follows `team-report` events, and writes each record keyed by `(sessionId, messageId, partId)`, last write wins. Re-reading a journal after a restart produces the same ledger. The ledger also stores, per session, the provider, model profile when the session is a team member, and project.
+A `UsageService` in the API owns a sealed ledger in the state directory. It follows the journals of sessions that can produce `usage` events (OpenCode sessions, by provider) with a cursor per session, the same way the team scheduler follows `team-report` events, and writes each record keyed by `(sessionId, messageId, partId)`, last write wins. Re-reading a journal after a restart produces the same ledger. The ledger also stores, per session, the provider, model profile when the session is a team member, and project. An unreadable or misshapen ledger file is discarded with one warning and rebuilt from the journals; it never blocks host startup. (Added 2026-10-18 after final review.)
 
 The service answers:
 
@@ -124,7 +121,7 @@ A new attention signal kind, `provider-limit`:
 
 Sources:
 
-- Claude Code, hook: `StopFailure` with `error === "rate_limit"` produces `limit: "usage"`. No other `StopFailure` error is a limit: `billing_error`, `account_on_hold`, `overloaded`, and the rest stay provider errors as today, because switching models does not address them. `Notification` with `notification_type` beginning `quota_auto_resume_` also produces the signal, so a session that has started waiting is recognised even if the StopFailure was missed.
+- Claude Code, hook: `StopFailure` with `error === "rate_limit"` produces `limit: "usage"`. No other `StopFailure` error is a limit: `billing_error`, `account_on_hold`, `overloaded`, and the rest stay provider errors as today, because switching models does not address them. `Notification` with `notification_type` `quota_auto_resume_stale` or `quota_auto_resume_disabled` also produces the signal, so a session that has started waiting is recognised even if the StopFailure was missed. `quota_auto_resume_fired` means the wait ended and the limit lifted: it is not a limit observation, and it ends the current episode and clears the displayed limit exactly as a successful turn does. (Corrected 2026-10-18 after review.)
 - Claude Code, screen: a line matching the documented limit text ("You've hit your … limit · resets …"). `resetsAt` is parsed from the reset clause when present; parse failures leave it unset.
 - Codex, screen: the "usage limited" indicator in the TUI's own status row at the bottom of the screen produces `limit: "usage"`. The transcript-body messages "Usage limit reached. You've reached your usage limit." and "You're out of credits." (the latter `limit: "credits"`) never trigger on their own; they may supply `resetsAt` from a following "Try again at …" clause and are recorded as annotation when the status row has triggered.
 - Codex, app server (local-UI sessions): `turn/completed` whose `turn.error.codexErrorInfo` is `usageLimitExceeded` (quota) or `rateLimitExceeded` (transient). Only `usageLimitExceeded` is a limit for this design; `rateLimitExceeded` stays a provider error.
@@ -141,7 +138,7 @@ Two failure modes shape the rules below. A transient API 429 that exhausts Claud
 Each observation is **single-source** or **corroborated**:
 
 - Claude Code: the hook signal alone is single-source. It is corroborated when the screen shows the limit notice in the same check or within the next two, or when a `quota_auto_resume_*` notification follows.
-- Codex: the status-row indicator is single-source when first seen. It is corroborated when it persists across at least three consecutive screen checks spanning at least 30 seconds with no other output change. The screen loop only acts on the status row, so transcript text, including this repository's own test fixtures scrolled through the body, cannot trigger a switch.
+- Codex: the status-row indicator is single-source when first seen. It is corroborated when it persists across at least three consecutive screen checks spanning `attention.limitConfirmMs` (30 seconds by default) with no other output change. The screen loop only acts on the status row, so transcript text, including this repository's own test fixtures scrolled through the body, cannot trigger a switch.
 - Codex app server `usageLimitExceeded` and Claude `quota_auto_resume_*` notifications are corroborated on arrival; they are the provider's typed statement.
 
 What an observation may do:
@@ -150,9 +147,11 @@ What an observation may do:
 - **Write the host-level limit entry.** Only a corroborated observation writes `providerLimits`. The entry lasts until the provider's stated `resetsAt`, capped at 24 hours; when the provider stated no reset time the entry lasts 15 minutes. There is no one-hour default.
 - **Annotate.** Every observation, whatever its confidence, is recorded in the session's journal and attention record for people to see.
 
+Observations are grouped into a **limit episode** held in the worker's own state, never keyed on the displayed attention record. An episode begins at the first observation from any source and ends after three consecutive screen checks with no match and no armed corroboration, or when the agent completes a turn that did not fail. Within one episode the worker journals at most one single-source and one corroborated signal, whatever order the hook and the screen arrive in. A reset time stated by any observation of the episode is carried on its later signals, so a hook that corroborates an earlier notice keeps the notice's reset time. A successful turn also clears the attention record's `limit` so a stale observation is not shown after the agent has recovered, and it suppresses screen matching until a later check sees no match, because the limit text may still be in the viewport after the agent has moved on. (Added 2026-10-18 after review.) A turn counts as successful only when its source can report failure: a Claude Code `Stop` hook as distinct from `StopFailure`, or a native adapter's turn status. Codex terminal turn ends from the `Stop` hook, notify, or OSC 9 cannot say a turn failed, so they neither end an episode, clear the displayed limit, cancel a pending member switch, nor clear a host-level entry. (Corrected 2026-10-18 after final review.)
+
 ### Host-level limit memory
 
-`TeamService` keeps `providerLimits`, a map from provider to `{ detectedAt, resetsAt?, expiresAt, sessionId, runId?, confidence }`, persisted in a sealed file. A corroborated limit is recorded here regardless of which run observed it, with the expiry rules above, and is cleared early when a member of that provider later completes a turn successfully. `GET /api/me` and the team views expose the current entries so the dashboards can say why members are launching on fallbacks.
+`TeamService` keeps `providerLimits`, a map from provider to `{ detectedAt, resetsAt?, expiresAt, sessionId, runId?, confidence }`, persisted in a sealed file. A corroborated limit is recorded here regardless of which run observed it, with the expiry rules above, and is cleared early when a session of that provider journals a successful turn after the entry was detected and after that session's own latest limit observation. Activity timestamps are not evidence for this, because a repeated limit hit also updates them. An observation no newer than the clear cannot restore a cleared entry, so an exited session's old limit does not bring it back. `GET /api/me` and the team views expose the current entries so the dashboards can say why members are launching on fallbacks. An unreadable or misshapen file is discarded with one warning and the map starts empty, since every entry expires anyway. (Added 2026-10-18 after final review.)
 
 ### Lineup configuration
 
@@ -189,8 +188,8 @@ In the scheduler's per-member step, after reading new journal events and before 
 
 1. If the member has no report and its journal shows a `provider-limit` observation since the member started that is allowed to switch under the confidence rules, record the limit in `providerLimits` when corroborated, then stop the member through the existing stop path. Stopping uses the existing lease-aware stop; an unstoppable member stays `unavailable` with the existing reason.
 2. Resolve the fallback: the member's profile's `limitFallback`, following at most two hops past any profile whose provider is currently in `providerLimits`. With no resolvable fallback, the run blocks with reason "Claude Code usage limit reached at 14:02, resets 15:00; no fallback profile is configured for opus-xhigh." (times from the observation; omitted when unknown). Blocking is the existing `blocked` status, and the member's workspace is preserved.
-3. For an implementer: run the existing partial-work path-scope check on its working copy, then create the replacement member with the same `cwd`, `baseCommit`, and task, pinned to the fallback profile. Its prompt is the task prompt plus the note used for escalation: the previous member's partial edits are present and passed the path check. Record `task.limitSwitch = { fromProfileId, toProfileId, reason, resetsAt?, memberId, at }` (a list, since a replacement can itself be switched). This does not consume the task's one escalation.
-4. For a scout, coordinator, reviewer, or integrator: assert the copy is unchanged where the role requires it, then relaunch with the original prompt on the fallback profile. The replacement is a new member with its own attempt.
+3. For an implementer: run the existing partial-work path-scope check on its working copy, then create the replacement member with the same `cwd`, `baseCommit`, and task, pinned to the fallback profile. Its prompt is the limited member's own prompt, with its feedback and recorded user answers, retargeted to the fallback provider's reporting instructions and profile, plus the note used for escalation: the previous member's partial edits are present and passed the path check. Record `task.limitSwitch = { fromProfileId, toProfileId, reason, resetsAt?, memberId, at }` (a list, since a replacement can itself be switched). This does not consume the task's one escalation.
+4. For a scout, coordinator, reviewer, or integrator: assert the copy is unchanged where the role requires it, then relaunch with the original prompt, retargeted the same way, on the fallback profile. The integrator edits files, so it gets the path check against the goal's allowed paths and keeps its partial work. The replacement is a new member with its own attempt.
 5. Write a run event: "haiku-medium hit a Claude Code usage limit (resets 15:00); task X continues on deepseek-flash-medium with partial work preserved."
 
 Each replacement is a member attempt and counts against the run's and goal's member limits exactly as escalation does. The host does not extend any limit because a provider was unavailable.

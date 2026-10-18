@@ -71,10 +71,12 @@ export async function startNativeOpenCode(options: {
     }
     if (type === "message.part.updated" && p.part?.type === "step-finish" && p.part.sessionID === sessionId) {
       const reported = models.get(p.part.messageID);
-      const requested = options.settings.model ?? "unknown/unknown", slash = requested.indexOf("/");
+      const requested = options.settings.model, slash = requested?.indexOf("/") ?? -1;
       const usage = usageFromStepFinish(p.part, { completedAt: new Date().toISOString(),
         ...(reported ? { ...reported, modelSource: "reported" as const }
-          : { providerId: slash < 0 ? requested : requested.slice(0, slash), modelId: slash < 0 ? requested : requested.slice(slash + 1), modelSource: options.settings.model ? "requested" as const : "unknown" as const }) });
+          : requested ? { providerId: slash < 0 ? requested : requested.slice(0, slash), modelId: slash < 0 ? requested : requested.slice(slash + 1), modelSource: "requested" as const }
+            // Neither OpenCode nor the launch named a model: keep the tokens, never attribute or price them.
+            : { providerId: "unknown", modelId: "unknown", modelSource: "unknown" as const }) });
       if (usage) options.onUsage?.(usage);
     }
     if (type === "message.part.updated" && p.part?.type === "text" && roles.get(p.part.messageID) === "assistant") lastMessage = p.part.text?.slice(0, 4000);

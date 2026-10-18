@@ -1,21 +1,21 @@
-import type { Provider } from "./types.js";
 import type { UsageConfig } from "./config.js";
 
 export interface UsageTokens { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
+/** `modelSource: "unknown"` means neither OpenCode nor the launch named a model; its ids are then "unknown". */
 export interface UsageRecord { provider: "opencode"; providerId: string; modelId: string; messageId: string; partId: string; modelSource: "requested" | "reported" | "unknown"; completedAt: string; tokens: UsageTokens; reportedCost: number }
 export type Pricing = "configured" | "provider" | "unknown";
-export interface UsageTotals { incomplete?: boolean; cost: number; tokens: UsageTokens; messages: number; pricing: Record<Pricing, number> }
-
-export interface TeamUsage { total: UsageTotals; byProfile: Record<string, UsageTotals>; byProvider: Partial<Record<Provider, UsageTotals>>; unmeasuredMembers: number }
+export interface UsageTotals { cost: number; tokens: UsageTokens; messages: number; pricing: Record<Pricing, number> }
 
 const MICRO_DOLLARS_PER_DOLLAR = 1_000_000;
 
 /**
  * Prices one record. A configured price table wins over the reported cost. Prices are USD per
  * million tokens, so tokens times price gives micro-dollars directly. Reasoning tokens bill at
- * the output rate.
+ * the output rate. A record whose model was never observed cannot be priced or attributed, so it
+ * is unknown whatever its reported cost; its tokens still count.
  */
 export function priceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined): { cost: number; pricing: Pricing } {
+  if (record.modelSource === "unknown") return { cost: 0, pricing: "unknown" };
   const price = prices?.[`${record.providerId}/${record.modelId}`];
   if (price) {
     const { tokens } = record;
@@ -54,4 +54,11 @@ export function sumUsage(rows: { cost: number; pricing: Pricing; tokens: UsageTo
     tokens.cacheWrite += row.tokens.cacheWrite;
   }
   return { cost: Math.round(dollars * MICRO_DOLLARS_PER_DOLLAR) / MICRO_DOLLARS_PER_DOLLAR, tokens, messages: rows.length, pricing };
+}
+
+/** USD for display: two decimals from one cent, four below it, and "0.00" only for a true zero. */
+export function formatUsd(usd: number): string {
+  if (usd === 0) return "0.00";
+  if (usd >= 0.01) return usd.toFixed(2);
+  return usd < 0.0001 ? "<0.0001" : usd.toFixed(4);
 }

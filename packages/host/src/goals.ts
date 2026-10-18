@@ -6,6 +6,7 @@ import { TeamService, TeamError } from "./teams.js";
 import { createGoalSchema, goalActionSchema, goalOutcomeSchema, goalSteerSchema, type CreateGoal, type ProductGoal } from "./goal-types.js";
 import type { Config } from "./types.js";
 import type { CreateTeam, TeamGoalContext, TeamView } from "./team-types.js";
+import { addRollups, emptyRollup } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
 
 type Action = { requestId: string; revision: number };
@@ -69,8 +70,16 @@ export class GoalService {
     const goal = structuredClone(this.record(id).goal);
     const tracking = this.linear?.updateGoal(goal, goal.linearTracking === true);
     goal.linear = this.linear?.getGoal(id) ?? tracking ?? goal.linear;
-    goal.usage = this.teams.usageForRuns(goal.cycles.map(cycle => cycle.teamId));
-    for (const cycle of goal.cycles) cycle.usage = this.teams.usageForRuns([cycle.teamId])?.total;
+    const rollups = goal.cycles.map(cycle => {
+      try {
+        const { usage } = this.teams.get(cycle.teamId);
+        // A cycle whose members are all unmeasured has no figure; a zero total would read as measured and free.
+        if (usage.total.messages > 0 || usage.unmeasuredMembers === 0) cycle.usage = usage.total;
+        else delete cycle.usage;
+        return usage;
+      } catch (error) { if (error instanceof TeamError && error.code === "team-not-found") { delete cycle.usage; return emptyRollup(cycle.memberCount); } throw error; }
+    });
+    goal.usage = addRollups(rollups);
     return goal;
   }
   answer(teamId: string, decisionId: string, body: Action & { text: string }) {

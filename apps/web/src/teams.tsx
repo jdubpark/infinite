@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ArrowUpRight, Check, ChevronRight, GitBranch, Plus, RefreshCw, Send, Users } from "lucide-react";
-import { ApiError, ago, names, useApi, type LogEvent, type Me, type Session, type TeamLineup, type TeamModelProfile, type TeamBrief, type TeamEvidence, type LinearTrackingView, type UsageSummary, type UsageTotals, type TeamUsage, type ProviderLimit } from "./api";
+import { ApiError, ago, clock, names, useApi, type LimitSwitch, type LogEvent, type ProviderLimit, type Me, type Session, type TeamLineup, type TeamModelProfile, type TeamBrief, type TeamEvidence, type LinearTrackingView, type TeamUsage, type UsageTotals } from "./api";
+import { SpendBlock, UsageFigure, UsageRollup, usageEnabled } from "./usage";
 import { briefText, chooseBrief, monitorMembers, summarySessionId, type BriefingView } from "./team-monitor";
 import { useMachines } from "./machines";
 import { useLiveRefresh } from "./live-refresh";
@@ -10,7 +11,7 @@ import { LinearTracking } from "./linear";
 type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
 type TeamCommand = { command: string; args: string[] };
-type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string }[] };
+type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: LimitSwitch[] };
 type TeamScout = { id: string; title: string; instructions: string; agentProfileId: string; status: "pending" | "running" | "waiting" | "complete"; memberId?: string; summary?: string; evidence?: TeamEvidence[] };
 type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string };
 type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string };
@@ -23,8 +24,8 @@ export type TeamView = {
   reason?: string; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string }; round: number;
   deliveryReceipt?: { pullRequestUrl: string; headCommit: string; mergeCommit: string; summary: string };
   lineup?: TeamLineup;
-  usage?: TeamUsage;
   providerLimits?: ProviderLimit[];
+  usage?: TeamUsage;
   linear?: LinearTrackingView;
   goal?: { id: string; revision: number; cycle: number; successCriteria: string; nonGoals: string[]; allowedPaths: string[]; evidence: string[]; previousWork: string[]; deadlineAt: string; maxMembers: number; parentRunId?: string };
   brief?: TeamBrief;
@@ -54,33 +55,18 @@ const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"]
 function Status({ status }: { status: TeamStatus }) { return <span className={"team-status " + statusClass(status)}><span className="dot" />{labels[status]}</span>; }
 function RoleGuide() { return <div className="team-roles" aria-label="Team responsibilities">{Object.entries(roles).map(([id, role]) => <div key={id}><strong>{role.name}</strong><p>{role.description}</p></div>)}</div>; }
 const leadLabel = (team: TeamView) => team.lineup ? "Coordinator: " + team.lineup.coordinator.label : names[team.provider] ?? team.provider;
-const money = (value: number) => new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: value > 0 && value < 0.01 ? 6 : 2 }).format(value);
-export function usageLabel(usage?: UsageTotals) {
-  if (!usage || (usage.messages === 0 && usage.pricing.unknown === 0)) return usage?.incomplete ? "Usage unavailable" : "No measured usage";
-  const amount = usage.pricing.unknown ? `Known spend ${money(usage.cost)} · ${usage.pricing.unknown} costs unknown` : `Spend ${money(usage.cost)}`;
-  const sources = [usage.pricing.configured ? `${usage.pricing.configured} priced records` : "", usage.pricing.provider ? `${usage.pricing.provider} reported by OpenCode` : ""].filter(Boolean).join(" · ");
-  return `${usage.incomplete ? "Partial data · " : ""}${amount}${sources ? ` · ${sources}` : ""}`;
-}
-function PeriodSpend({ summary }: { summary: UsageSummary }) {
-  const entries = Object.entries(summary.providers).filter(([, item]) => item && (item.budget || item.measured || item.unmeasuredSessions));
-  if (!entries.length) return <p className="quiet">No provider usage is measured for this period.</p>;
-  return <div className="team-spend">{entries.map(([provider, item]) => item && <article key={provider}>
-    <h3>{names[provider] ?? provider}</h3>
-    <p>{item.spent ? usageLabel(item.spent) : "Unmeasured"}</p>
-    {item.budget && <p className="quiet">Budget {money(item.budget.usd)} per {item.budget.period}</p>}
-    {item.period && <p className="quiet">{date(item.period.start)} – {date(item.period.end)}</p>}
-    {item.unmeasuredSessions > 0 && <p className="quiet">{item.unmeasuredSessions} unmeasured session{item.unmeasuredSessions === 1 ? "" : "s"}</p>}
-  </article>)}</div>;
-}
-function providerLimitText(limit: ProviderLimit) {
-  const providerId = limit.provider;
-  const provider = names[providerId] ?? providerId;
-  const reset = limit.resetsAt ? ` · resets ${date(limit.resetsAt)}` : "";
-  return `${provider} limited since ${date(limit.detectedAt)}${reset} · configured fallbacks apply to new members`;
-}
 export function profileSetting(profile: TeamModelProfile) { return profile.provider === "opencode" ? profile.variant ? "variant: " + profile.variant : "provider default variant" : "effort: " + profile.effort; }
 export function ModelProfile({ profile }: { profile: TeamModelProfile }) {
-  return <span className="team-model-profile"><strong>{profile.label}{profile.tier && <span className="team-profile-tier">{profile.tier}</span>}</strong><span>Requested: {names[profile.provider] ?? profile.provider} · <code>{profile.model}</code> · {profileSetting(profile)}</span>{profile.dataUse === "contributor" && <span className="team-data-use">Contributor data use is enabled for this profile. Its provider’s contributor terms apply.</span>}</span>;
+  return <span className="team-model-profile"><strong>{profile.label}{profile.tier && <span className="team-profile-tier">{profile.tier}</span>}</strong><span>Requested: {names[profile.provider] ?? profile.provider} · <code>{profile.model}</code> · {profileSetting(profile)}</span>{profile.limitFallback && <span>On a usage limit: <code>{profile.limitFallback}</code></span>}{profile.dataUse === "contributor" && <span className="team-data-use">Contributor data use is enabled for this profile. Its provider’s contributor terms apply.</span>}</span>;
+}
+/** Shown while the host remembers a provider at its limit. Reset times are the provider's own statement. */
+export function ProviderLimitNotice({ limits }: { limits?: ProviderLimit[] }) {
+  const now = Date.now(), active = (limits ?? []).filter(limit => Date.parse(limit.expiresAt) > now);
+  if (!active.length) return null;
+  return <div className="team-notice" role="status">{active.map(limit => {
+    const provider = names[limit.provider] ?? limit.provider;
+    return <p key={limit.provider}>{provider} limited since {clock(limit.detectedAt)} · {limit.resetsAt ? <>resets {clock(limit.resetsAt)} <span className="quiet">(provider’s stated time)</span></> : <>until {clock(limit.expiresAt)}</>} · new {provider} members launch on their fallback</p>;
+  })}</div>;
 }
 export function Lineup({ lineup }: { lineup: TeamLineup }) {
   return <dl className="team-lineup">
@@ -89,7 +75,7 @@ export function Lineup({ lineup }: { lineup: TeamLineup }) {
     <div><dt>Integrator</dt><dd><ModelProfile profile={lineup.integrator} /></dd></div>
     <div><dt>Reviewer</dt><dd><ModelProfile profile={lineup.reviewer} /></dd></div>
     {lineup.escalations?.length ? <div><dt>Escalation pool</dt><dd>{lineup.escalations.map(profile => <ModelProfile key={profile.id} profile={profile} />)}</dd></div> : null}
-    {lineup.fallbacks?.length ? <div><dt>Limit fallback pool</dt><dd>{lineup.fallbacks.map(profile => <ModelProfile key={profile.id} profile={profile} />)}</dd></div> : null}
+    {lineup.fallbacks?.length ? <div><dt>Limit fallbacks</dt><dd>{lineup.fallbacks.map(profile => <ModelProfile key={profile.id} profile={profile} />)}</dd></div> : null}
   </dl>;
 }
 export function EvidenceSource({ source }: { source: string }) {
@@ -129,20 +115,12 @@ export function TeamList({ teams, me, fresh, loading, failed, seen, onCreate, on
   teams: TeamView[]; me: Me; fresh: boolean; loading: boolean; failed: boolean; seen: string;
   onCreate: () => void; onSelect: (id: string) => void; refresh: () => void;
 }) {
-  const api = useApi();
-  const [usage, setUsage] = useState<UsageSummary | null>(null);
-  const usageView = useLiveRefresh(async current => {
-    if (!me.usage?.enabled) return 30000;
-    const next = await api<UsageSummary>("/usage");
-    if (current()) setUsage(next);
-    return 30000;
-  }, 30000, me.usage?.enabled ? "usage" : "");
   return <div className="team-page team-list-page">
     <div className="team-page-heading"><div><p className="team-eyebrow">Agent teams</p><h1>Give your team an outcome.</h1><p className="quiet">Describe a feature or paste a PRD. Follow the work, answer decisions, and steer as it develops.</p></div>{me.role === "owner" && <button className="primary" onClick={onCreate}>New team <Plus size={18} /></button>}</div>
     <RoleGuide />
     <SetupNotice me={me} />
-    {me.usage?.enabled && <section className="team-section"><div className="team-section-heading"><h2>Spend this period</h2><span className="quiet">{usageView.fresh ? "Current" : usageView.failed ? "Unavailable" : "Loading…"}</span></div>{usage ? <PeriodSpend summary={usage} /> : <p className="quiet" role="status">{usageView.failed ? "Provider spend could not be loaded." : "Loading provider spend…"}</p>}<p className="form-note">Configured prices and costs reported by OpenCode are shown separately. Budgets are informational.</p></section>}
-    {me.providerLimits?.map(limit => <p className="team-notice" role="status" key={limit.provider}>{providerLimitText(limit)}</p>)}
+    <ProviderLimitNotice limits={me.providerLimits} />
+    <SpendBlock me={me} />
     <div className="team-section-heading"><h2>Team runs <span className="quiet">{teams.length}</span></h2><span className="quiet">{!me.teams ? "Unavailable on this host" : fresh ? "Up to date" : failed ? "Team updates unavailable" : loading ? "Loading…" : "Checking…"}{seen && " · checked " + ago(seen)}</span></div>
     {failed && <p className="team-notice" role="status">The host could not refresh team runs. Showing the last received state. <button className="text-button" onClick={refresh}>Try again</button></p>}
     {teams.map(team => <button className="team-run-row" key={team.id} onClick={() => onSelect(team.id)}><div><strong>{team.title}</strong><p>{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)} · {date(team.createdAt)}</p>{team.lineup && <p className="team-run-model">Requested coordinator: <code>{team.lineup.coordinator.model}</code> · {profileSetting(team.lineup.coordinator)}</p>}</div><Status status={team.status} /><ArrowUpRight size={18} /></button>)}
@@ -397,8 +375,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       {team.noChange && <section className="team-section"><h2>No change proposed</h2><p className="team-prose">{team.noChange.summary}</p><EvidenceList evidence={team.noChange.evidence} /></section>}
       {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>Decisions for you <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} member={team.members.find(member => member.memberId === decision.memberId)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} />)}</section>}
       {attention.length > 0 && <section className="team-section team-decisions"><h2>Agent sessions need you</h2><p className="quiet">The host answers ordinary prompts in a member’s own workspace. These sessions still wait on a provider prompt; respond in the session.</p>{attention.map(session => <button className="team-session-link" key={session.id} onClick={() => openSession(session.id)}><span><strong>{session.title}</strong><small>{session.attention?.now ?? "Open the session to respond."}</small></span><ArrowUpRight size={18} /></button>)}</section>}
-      {team.providerLimits?.map(limit => <p className="team-notice" role="status" key={limit.provider}>{providerLimitText(limit)}</p>)}
-      {team.usage && <p className="team-notice">Team usage · {usageLabel(team.usage.total)} · {team.usage.unmeasuredMembers} unmeasured member{team.usage.unmeasuredMembers === 1 ? "" : "s"}</p>}
+      <ProviderLimitNotice limits={team.providerLimits} />
       {mode === "logs" ? <>
         <div className="team-agent-switch" role="tablist" aria-label="Agents">{orderedMembers.map(member => <button type="button" role="tab" key={member.memberId} aria-selected={member.memberId === agentId} onClick={() => setAgentId(member.memberId)}><strong><span className={"team-agent-dot" + (["running", "waiting"].includes(member.status) ? " live" : "")} />{roles[member.role].name}</strong><span>{member.status}{member.revision === team.revision ? "" : ` · revision ${member.revision}`}</span></button>)}</div>
         {orderedMembers.length > 1 && (() => {
@@ -413,9 +390,10 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       <section className="team-section"><h2>Your request</h2><p className="team-prose">{team.objective}</p></section>
       {team.brief && <section className="team-section"><h2>Opportunity brief <span className="quiet">(agent proposal)</span></h2><TeamBriefView brief={team.brief} /></section>}
       {team.discovery && <section className="team-section"><h2>Discovery</h2><p className="team-prose">{team.discovery.summary}</p>{team.discovery.tasks.map(task => <article className="team-task" key={task.id}><div className="team-task-heading"><h3>{task.title}</h3><span className="team-task-state">{task.status}</span></div>{team.lineup?.implementers.find(profile => profile.id === task.agentProfileId) && <ModelProfile profile={team.lineup.implementers.find(profile => profile.id === task.agentProfileId)!} />}{task.summary && <p className="team-prose">{task.summary}</p>}{task.evidence && <EvidenceList evidence={task.evidence} />}<details><summary>Scout instructions</summary><p className="team-prose">{task.instructions}</p></details></article>)}</section>}
-      <section className="team-section"><div className="team-section-heading"><h2>Work plan</h2><span className="quiet">{team.tasks.length} tasks</span></div>{team.tasks.length ? <div className="team-tasks">{team.tasks.map(task => <article className="team-task" key={task.id}><div className="team-task-heading"><h3>{task.title}</h3><span className="team-task-state">{task.status}</span></div><p className="team-task-dependencies">{task.dependsOn.length ? "After: " + task.dependsOn.map(dependency => team.tasks.find(value => value.id === dependency)?.title ?? dependency).join(", ") : "No task dependencies"}</p><TaskModel task={task} team={team} />{task.escalation && <p className="team-escalation">Escalated to {task.escalation.toProfileId}: {task.escalation.reason}</p>}{task.limitSwitches?.map((change, index) => <p className="team-escalation" key={change.at + index}>Provider limit: {change.fromProfileId ?? "profile"} continued on {change.toProfileId} · {change.reason}{change.resetsAt && ` · resets ${date(change.resetsAt)}`}</p>)}<div className="team-owned"><span>Owns</span>{task.paths.map(path => <code key={path}>{path}</code>)}</div>{task.summary && <p className="team-prose">{task.summary}</p>}<details><summary>Task instructions</summary><p className="team-prose">{task.instructions}</p>{task.commit && <p className="quiet">Integrated commit: <code>{task.commit}</code></p>}</details></article>)}</div> : <p className="quiet">The coordinator has not reported a work plan yet.</p>}</section>
-      <section className="team-section"><h2>Team members</h2>{team.lineup ? <><p className="quiet">This lineup was recorded when the run started. It shows requested model settings; provider policy may override them.</p><Lineup lineup={team.lineup} /></> : <RoleGuide />}{team.members.map(member => <div className="team-member" key={member.memberId}><div><strong>{member.title}</strong><p>{roles[member.role].name} · {member.status} · revision {member.revision}{member.taskId && " · " + member.taskId}</p>{member.modelProfile ? <ModelProfile profile={member.modelProfile} /> : <p>{names[member.provider ?? team.provider] ?? member.provider ?? team.provider}</p>}<p className="quiet">{member.usage ? usageLabel(member.usage) : "Unmeasured"}</p>{member.stoppedReason && <p className="team-notice">Stopped: {member.stoppedReason}</p>}</div><button className="text-button" disabled={!sessions.some(session => session.id === member.sessionId)} onClick={() => openSession(member.sessionId)}>Open session <ArrowUpRight size={16} /></button></div>)}</section>
+      <section className="team-section"><div className="team-section-heading"><h2>Work plan</h2><span className="quiet">{team.tasks.length} tasks</span></div>{team.tasks.length ? <div className="team-tasks">{team.tasks.map(task => <article className="team-task" key={task.id}><div className="team-task-heading"><h3>{task.title}</h3><span className="team-task-state">{task.status}</span></div><p className="team-task-dependencies">{task.dependsOn.length ? "After: " + task.dependsOn.map(dependency => team.tasks.find(value => value.id === dependency)?.title ?? dependency).join(", ") : "No task dependencies"}</p><TaskModel task={task} team={team} />{task.escalation && <p className="team-escalation">Escalated to {task.escalation.toProfileId}: {task.escalation.reason}</p>}{task.limitSwitches?.map((entry, index) => <p className="team-escalation" key={entry.at + "/" + index}>Usage limit: {entry.fromProfileId ?? "unknown profile"} → {entry.toProfileId} · {entry.reason}{entry.resetsAt && <> · resets {clock(entry.resetsAt)} <span className="quiet">(provider’s stated time)</span></>}</p>)}<div className="team-owned"><span>Owns</span>{task.paths.map(path => <code key={path}>{path}</code>)}</div>{task.summary && <p className="team-prose">{task.summary}</p>}<details><summary>Task instructions</summary><p className="team-prose">{task.instructions}</p>{task.commit && <p className="quiet">Integrated commit: <code>{task.commit}</code></p>}</details></article>)}</div> : <p className="quiet">The coordinator has not reported a work plan yet.</p>}</section>
+      <section className="team-section"><h2>Team members</h2>{team.lineup ? <><p className="quiet">This lineup was recorded when the run started. It shows requested model settings; provider policy may override them.</p><Lineup lineup={team.lineup} /></> : <RoleGuide />}{team.members.map(member => <div className="team-member" key={member.memberId}><div><strong>{member.title}</strong><p>{roles[member.role].name} · {member.status} · revision {member.revision}{member.taskId && " · " + member.taskId}</p>{member.modelProfile ? <ModelProfile profile={member.modelProfile} /> : <p>{names[member.provider ?? team.provider] ?? member.provider ?? team.provider}</p>}{member.stoppedReason && <p className="quiet">Stopped: {member.stoppedReason}</p>}{usageEnabled(me) && <p className="quiet">Cost: <UsageFigure usage={member.usage} /></p>}</div><button className="text-button" disabled={!sessions.some(session => session.id === member.sessionId)} onClick={() => openSession(member.sessionId)}>Open session <ArrowUpRight size={16} /></button></div>)}</section>
       <section className="team-section"><h2>Verification evidence</h2><p className="quiet">Host check results and the reviewer’s assessment are recorded separately.</p><h3>Required checks</h3>{team.checks.length ? team.checks.map((check, index) => <details className="team-check" key={check.startedAt + "/" + index}><summary><code>{[check.command.command, ...check.command.args].join(" ")}</code><span className={"team-check-status " + check.status}>{check.status} · revision {check.revision}</span></summary><p className="quiet">Revision {check.revision} · started {date(check.startedAt)}{check.finishedAt && " · finished " + date(check.finishedAt)}{check.exitCode !== undefined && " · exit " + String(check.exitCode)}</p><pre>{check.output || "No output recorded."}</pre></details>) : <p className="quiet">No check results recorded yet.</p>}<h3 className="team-review-heading">Reviewer assessment <span className="quiet">(agent report)</span></h3>{team.review ? <div><p><strong>{team.review.verdict === "approved" ? "Approved by reviewer" : "Changes requested"}</strong> <span className="quiet">· revision {team.review.revision}</span></p><p className="team-prose">{team.review.summary}</p>{team.review.uiEvidence && <><h4>Reviewer UI evidence</h4><p className="team-prose">{team.review.uiEvidence}</p></>}</div> : <p className="quiet">No reviewer assessment recorded yet.</p>}</section>
+      <UsageRollup me={me} usage={team.usage} heading="Agent spend" />
       <section className="team-section"><h2>Review the changes</h2><dl className="team-output"><dt><GitBranch size={15} />Branch</dt><dd><code>{team.branch}</code></dd><dt>Workspace</dt><dd><code>{team.workspace}</code></dd><dt>Base commit</dt><dd><code>{team.baseCommit}</code></dd>{team.headCommit && <><dt>Head commit</dt><dd><code>{team.headCommit}</code></dd></>}</dl></section>
       {(team.steering.length > 0 || team.decisions.some(decision => decision.answer !== undefined)) && <section className="team-section"><h2>Your directions and decisions</h2>{team.steering.map((entry, index) => <div className="team-record" key={entry.at + "/" + index}><small>Direction · revision {entry.revision} · {date(entry.at)}</small><p className="team-prose">{entry.text}</p></div>)}{team.decisions.filter(decision => decision.answer !== undefined).map(decision => <div className="team-record" key={decision.id}><small>Decision · revision {decision.revision}</small><p className="team-prose">{decision.question}</p><p className="team-prose"><strong>Your answer: </strong>{decision.answer}</p></div>)}</section>}
       {team.events.length > 0 && <section className="team-section"><div className="team-history"><h2>Run history</h2><ol>{team.events.map((event, index) => <li key={event.at + "/" + index}><time>{date(event.at)}</time><p>{event.text}</p></li>)}</ol></div></section>}

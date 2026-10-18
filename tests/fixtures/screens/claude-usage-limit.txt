@@ -1,1 +1,8 @@
-You've hit your session limit · resets 3:45pm
+> Continue with the migration
+
+  You've hit your session limit · resets 3:45pm
+
+╭──────────────────────────────────────────╮
+│ >                                        │
+╰──────────────────────────────────────────╯
+  ? for shortcuts

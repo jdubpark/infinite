@@ -133,6 +133,7 @@ export interface Config {
   maxSessions: number;
   attention?: {
     idleAfterMs: number;
+    limitConfirmMs: number;
     hooks: { claude: boolean; codex: boolean };
   };
   push?: {
@@ -237,5 +238,6 @@ export interface Bootstrap {
   attention: {
     hooks: { claude: boolean; codex: boolean };
     idleAfterMs: number;
+    limitConfirmMs: number;
   };
 }

@@ -3,10 +3,6 @@ import { createRemoteClient, RemoteError } from "@infinite/remote";
 import type { Attention } from "@infinite/attention";
 export type Connection = { id: string; label: string; url: string; token: string; relay?: { machineId: string } };
 export type ControlLease = { id: string; label: string; expiresAt: number };
-export type UsageTokens = { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number };
-export type UsageTotals = { incomplete?: boolean; cost: number; tokens: UsageTokens; messages: number; pricing: { configured: number; provider: number; unknown: number } };
-export type UsageSummary = { period: { start: string; end: string }; providers: Partial<Record<string, { period?: { start: string; end: string }; measured: boolean; spent?: UsageTotals; budget?: { usd: number; period: "day" | "week" | "month" }; previous?: UsageTotals; unmeasuredSessions: number }>> };
-export type ProviderLimit = { provider: string; detectedAt: string; resetsAt?: string; expiresAt: string; sessionId: string; runId?: string; confidence: "corroborated" };
 export type Session = {
   id: string;
   machineId?: string;
@@ -29,7 +25,7 @@ export type Session = {
   runtime?: { id: string; location: string; transport: "pty" | "cmux" };
   execution?: { location: "laptop" | "cloud"; state: "connecting" | "online" | "offline" | "preparing" | "paused"; cloudReady: boolean; checkpoint?: { id: string; capturedAt: string }; reason?: string; reconciliation?: "available" };
   attention?: Attention;
-  usage?: (UsageTotals & { measured: true }) | { measured: false };
+  usage?: UsageTotals;
 };
 export type LogEvent = {
   seq: number;
@@ -37,10 +33,9 @@ export type LogEvent = {
   type: "signal" | (string & {});
   data: Record<string, unknown>;
 };
-type TeamProfileDetails = { id: string; label: string; model: string; tier?: "light" | "strong"; dataUse?: "standard" | "contributor" };
+type TeamProfileDetails = { id: string; label: string; model: string; tier?: "light" | "strong"; dataUse?: "standard" | "contributor"; limitFallback?: string };
 export type TeamModelProfile = TeamProfileDetails & ({ provider: "claude" | "codex"; effort: string } | { provider: "opencode"; variant?: string });
 export type TeamLineup = { coordinator: TeamModelProfile; implementers: TeamModelProfile[]; integrator: TeamModelProfile; reviewer: TeamModelProfile; escalations?: TeamModelProfile[]; fallbacks?: TeamModelProfile[] };
-export type TeamUsage = { total: UsageTotals; byProfile: Record<string, UsageTotals>; byProvider: Partial<Record<string, UsageTotals>>; unmeasuredMembers: number };
 export type TeamEvidence = { source: string; observation: string };
 export type TeamBrief = { title: string; problem: string; evidence: TeamEvidence[]; dataShape: string; acceptance: string[]; expectedOutcome: string; uiChanges: boolean };
 export type LinearTrackingView = {
@@ -49,6 +44,18 @@ export type LinearTrackingView = {
   checkedAt?: string;
   issue?: { id: string; identifier: string; url: string; title: string; description: string | null; state: { name: string; type: string }; updatedAt: string };
 };
+export type UsageTotals = { cost: number; tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }; messages: number; pricing: { configured: number; provider: number; unknown: number } };
+export type TeamUsage = { total: UsageTotals; byProfile: Record<string, UsageTotals>; byProvider: Partial<Record<string, UsageTotals>>; unmeasuredMembers: number };
+export type UsageBudget = { usd: number; period: "day" | "week" | "month" };
+export type UsageSummary = {
+  period: { start: string; end: string };
+  providers: Record<string, { measured: boolean; period: { start: string; end: string }; spent?: UsageTotals; previous?: UsageTotals; budget?: UsageBudget; unmeasuredSessions: number }>;
+};
+/** A host-level record that a provider's account was seen at its limit. The reset time is the provider's own statement. */
+export type ProviderLimit = { provider: string; detectedAt: string; resetsAt?: string; expiresAt: string; sessionId: string; runId?: string; confidence: "corroborated" };
+export type LimitSwitch = { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string };
+/** Clock time as HH:MM with a zone abbreviation, in the viewer's time zone. */
+export const clock = (iso: string) => new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit", hour12: false, timeZoneName: "short" }).format(new Date(iso));
 export type Me = {
   role: "owner" | "controller" | "viewer";
   environment: "cloud" | "local";
@@ -60,8 +67,8 @@ export type Me = {
   projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { establishChecks?: true; checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
   teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
   goals?: { enabled: boolean };
-  usage?: { enabled: boolean; budgets: Partial<Record<string, { usd: number; period: "day" | "week" | "month" }>> };
   providerLimits?: ProviderLimit[];
+  usage?: { enabled: boolean; budgets: Partial<Record<string, UsageBudget>> };
   terminal?: { stream: boolean; duplex: boolean; raw: boolean; snapshot?: boolean; control?: boolean };
 };
 // One identity per running browser tab, independent of its shared login cookie.

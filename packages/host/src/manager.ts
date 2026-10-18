@@ -68,10 +68,12 @@ export function projectCwd(projectPath: string, cwd?: string): string {
 /** List rows stay small: the last message is cut and tool input stays on the detail endpoint. */
 export function publicAttention(att: Attention): Attention {
   const lastMessage = att.lastMessage?.slice(0, 280);
-  if (!att.prompt) return { ...att, lastMessage };
+  const limit = att.limit ? { ...att.limit, message: att.limit.message.slice(0, 300) } : undefined;
+  if (!att.prompt) return { ...att, lastMessage, ...(limit ? { limit } : {}) };
   const { tool, ...prompt } = att.prompt;
   return {
     ...att,
+    ...(limit ? { limit } : {}),
     prompt: {
       ...prompt,
       ...(tool ? { tool: { name: tool.name, input: {} } } : {}),
@@ -547,6 +549,7 @@ export class Manager {
             ? { claude: false, codex: false }
             : this.config.attention?.hooks ?? DEFAULT_HOOKS,
           idleAfterMs: this.config.attention?.idleAfterMs ?? 20000,
+          limitConfirmMs: this.config.attention?.limitConfirmMs ?? 30000,
         },
       } satisfies Bootstrap),
     );

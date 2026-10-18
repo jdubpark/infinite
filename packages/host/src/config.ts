@@ -86,6 +86,7 @@ const schema = z
     attention: z
       .object({
         idleAfterMs: z.number().int().min(1000).max(600000).default(20000),
+        limitConfirmMs: z.number().int().min(1000).max(600000).default(30000),
         hooks: z
           .object({
             claude: z.boolean().default(DEFAULT_HOOKS.claude),

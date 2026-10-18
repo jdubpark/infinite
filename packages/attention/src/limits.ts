@@ -1,69 +1,82 @@
 import type { Provider } from "./types.js";
+import { cleanLine } from "./prompts.js";
 
-export type DetectedLimit = { limit: "usage" | "credits"; resetsAt?: string; message: string };
-
-const MONTHS: Record<string, number> = {
-  jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
-  may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7, sep: 8,
-  sept: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11,
-};
-const WEEKDAYS: Record<string, number> = { sun: 0, sunday: 0, mon: 1, monday: 1, tue: 2, tuesday: 2, wed: 3, wednesday: 3, thu: 4, thursday: 4, fri: 5, friday: 5, sat: 6, saturday: 6 };
-
-function clock(text: string): { hour: number; minute: number } | undefined {
-  const match = text.match(/\b(\d{1,2}):(\d{2})\s*(am|pm)?\b/i);
-  if (!match) return undefined;
-  let hour = Number(match[1]);
-  const minute = Number(match[2]);
-  const meridiem = match[3]?.toLowerCase();
-  if (minute > 59 || (meridiem ? hour < 1 || hour > 12 : hour > 23)) return undefined;
-  if (meridiem) hour = hour % 12 + (meridiem === "pm" ? 12 : 0);
-  return { hour, minute };
+export interface DetectedLimit {
+  limit: "usage" | "credits";
+  resetsAt?: string;
+  message: string;
 }
 
-function isoUtc(year: number, month: number, day: number, time: { hour: number; minute: number }): string | undefined {
-  const date = new Date(Date.UTC(year, month, day, time.hour, time.minute));
-  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month || date.getUTCDate() !== day) return undefined;
-  return date.toISOString();
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+function hour24(h: string, meridiem: string): number | undefined {
+  const n = Number(h);
+  if (n < 1 || n > 12) return undefined;
+  return (n % 12) + (meridiem.toLowerCase() === "pm" ? 12 : 0);
 }
 
-function nextClockOccurrence(now: Date, time: { hour: number; minute: number }, days = 0, weekly = false): string {
-  const candidate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + days, time.hour, time.minute));
-  if (candidate.getTime() <= now.getTime()) candidate.setUTCDate(candidate.getUTCDate() + (weekly ? 7 : 1));
-  return candidate.toISOString();
-}
-
-/** Parses the provider's reset text as UTC and returns its next occurrence after `now`. */
+/**
+ * Parses a provider reset hint into an ISO time: `resets 3:45pm`, `resets Mon 12:00am`, or
+ * `Try again at Oct 18, 2026 3:45 PM`. Clock times are read as UTC (the host runs in UTC) and
+ * resolve to the next occurrence after `now`. Returns undefined when the text has no known shape.
+ */
 export function parseResetTime(text: string, now: Date): string | undefined {
-  const normalized = text.replace(/\s+/g, " ").trim();
-  const time = clock(normalized);
-  if (!time) return undefined;
-
-  const dated = normalized.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2}),?\s+(\d{4})\b/i);
-  if (dated) return isoUtc(Number(dated[3]), MONTHS[dated[1].toLowerCase()], Number(dated[2]), time);
-
-  const weekday = normalized.match(/\b(sun(?:day)?|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?)\b/i);
-  const base = new Date(now);
-  if (weekday) {
-    const target = WEEKDAYS[weekday[1].toLowerCase()];
-    const days = (target - base.getUTCDay() + 7) % 7;
-    return nextClockOccurrence(now, time, days, true);
+  const dated = /Try again at\s+([A-Za-z]{3})[a-z]*\s+(\d{1,2}),\s+(\d{4})\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])/.exec(text);
+  if (dated) {
+    const month = MONTHS.indexOf(dated[1].toLowerCase());
+    const hour = hour24(dated[4], dated[6]);
+    if (month < 0 || hour === undefined) return undefined;
+    return new Date(Date.UTC(Number(dated[3]), month, Number(dated[2]), hour, Number(dated[5]))).toISOString();
   }
-  return nextClockOccurrence(now, time);
+  const clock = /resets\s+(?:([A-Za-z]{3})[a-z]*\s+)?(\d{1,2}):(\d{2})\s*([AaPp][Mm])/.exec(text);
+  if (!clock) return undefined;
+  const hour = hour24(clock[2], clock[4]);
+  const minute = Number(clock[3]);
+  if (hour === undefined || minute > 59) return undefined;
+  const at = (dayOffset: number) =>
+    new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + dayOffset, hour, minute));
+  if (clock[1]) {
+    const day = DAYS.indexOf(clock[1].toLowerCase());
+    if (day < 0) return undefined;
+    for (let offset = 0; offset <= 7; offset += 1) {
+      const candidate = at(offset);
+      if (candidate.getUTCDay() === day && candidate.getTime() > now.getTime()) return candidate.toISOString();
+    }
+    return undefined;
+  }
+  for (let offset = 0; offset <= 1; offset += 1) {
+    const candidate = at(offset);
+    if (candidate.getTime() > now.getTime()) return candidate.toISOString();
+  }
+  return undefined;
 }
 
-/** Detects only visible provider limit indicators; Codex transcript prose is never sufficient. */
+/**
+ * Reads a provider usage limit off the screen. Codex only counts when its own status row (the last
+ * non-empty row, as a whole `·`-separated segment) says `usage limited`: transcript text can be printed by a member
+ * with cat or grep and must never trigger on its own.
+ */
 export function detectLimit(lines: string[], provider: Provider, now: Date): DetectedLimit | null {
-  const nonempty = lines.map((line) => line.trim()).filter(Boolean);
+  const clean = lines.map(cleanLine);
   if (provider === "claude") {
-    const notice = nonempty.find((line) => /you've hit your .*? limit\b/i.test(line));
-    if (!notice) return null;
-    const resetClause = notice.match(/\bresets?\b.*$/i)?.[0];
-    return { limit: "usage", ...(resetClause ? { resetsAt: parseResetTime(resetClause, now) } : {}), message: notice.slice(0, 500) };
+    // The notice may be typeset with a straight or a curly apostrophe.
+    const line = clean.find((l) => /You['’]ve hit your .* limit/.test(l));
+    if (!line) return null;
+    return { limit: "usage", resetsAt: parseResetTime(line, now), message: line.slice(0, 300) };
   }
-  if (provider !== "codex") return null;
-  // The installed protocol schema does not describe the TUI footer, and no authentic
-  // screen sample establishes a footer grammar. Treating a near-bottom phrase as status
-  // text can reroute other work, so screen-only Codex observations stay disabled until
-  // the provider's actual footer structure is verified.
+  if (provider === "codex") {
+    const last = clean.filter((l) => l !== "").at(-1);
+    if (last === undefined || /^[›$%]/.test(last)) return null;
+    if (!last.split(/[·|]/).some((segment) => segment.trim().toLowerCase() === "usage limited")) return null;
+    const credits = clean.find((l) => /out of credits/i.test(l));
+    const reached = clean.find((l) => /usage limit reached/i.test(l));
+    const reset = clean.map((l) => parseResetTime(l, now)).filter((t) => t !== undefined).at(-1);
+    return {
+      limit: credits ? "credits" : "usage",
+      resetsAt: reset,
+      message: (credits ?? reached ?? "Codex reported a usage limit").slice(0, 300),
+    };
+  }
   return null;
 }

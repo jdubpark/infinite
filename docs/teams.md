@@ -334,22 +334,15 @@ Linear API credential. Keep credentials, workspace mappings, and concrete issue
 bindings in private configuration or encrypted runtime state. Do not copy them
 into tracked configuration examples, screenshots, or repository reports.
 
-## Usage and provider limits
+## Usage and budgets
 
-The optional `usage` host setting prices captured OpenCode usage and sets a soft
-per-provider budget. Prices are USD per million tokens. The values below are
-illustrative configuration values; replace them with the rates you intend to
-use. A configured price takes precedence over OpenCode's reported cost. Without
-a configured price, a non-zero reported cost is labeled as reported by
-OpenCode. If neither is available, the cost remains unknown. Changing the price
-table reprices recorded history.
+The host records OpenCode token usage and prices it. Usage is off until the host config has a `usage` block. The web client and `infinite usage` read the same ledger.
 
 ```json
 {
   "usage": {
     "prices": {
-      "deepseek/deepseek-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.014, "cacheWrite": 0.14 },
-      "meta/muse-spark-1.3-contributor": { "input": 0, "output": 0 }
+      "PROVIDER_ID/MODEL_ID": { "input": 0.5, "output": 2, "cacheRead": 0.1, "cacheWrite": 0.6 }
     },
     "budgets": {
       "opencode": { "usd": 50, "period": "month" }
@@ -358,44 +351,93 @@ table reprices recorded history.
 }
 ```
 
-Budgets support `day`, `week`, or `month` periods in UTC; omitted periods use
-`month`. A budget only gives you a comparison line. It never pauses, rejects,
-or reroutes work. Team and goal totals include measured OpenCode usage and show
-the number of unmeasured members. Claude Code, Codex, Grok, and OpenCode TUI
-sessions have no capture path here, so they remain unmeasured rather than
-contributing a fabricated zero.
+- **Prices** are USD per million tokens, keyed `provider/model`. `cacheRead` and `cacheWrite` default to the `input` price. Reasoning tokens bill at the `output` price.
+- **Budgets** are per provider, in USD, with a `day`, `week`, or `month` period. Periods are UTC, weeks start on Monday, and the period defaults to `month`.
 
-The lineup can name a `limitFallback` profile for each model that should move
-when its provider reaches a quota. The fallback must use another provider and,
-for a strong profile, another strong profile. It preserves the member's task,
-workspace, path scope, and existing work limits. Each replacement consumes a
-member attempt. Fallbacks do not change a goal's recorded lineup or approved
-scope.
+A configured price wins over the cost OpenCode reports. Every figure names its source: `configured price`, `reported by OpenCode`, or unpriced when neither exists. A total that includes unpriced steps says how many, so it is never presented as complete.
 
-For example, add a fallback profile to the lineup and point the affected profile
-at it. This fragment shows only the fields involved; keep the other required
-lineup fields in place. Replace these profile and model identifiers with the
-ones configured on your host:
+Budgets are informational. The host shows spent against budget and marks `over budget`, but it never pauses, refuses, or hides a team, goal, or session because of spend.
+
+Only some work is measured. OpenCode team members and OpenCode sessions started from the local UI report usage. Claude Code, Codex, Grok, and OpenCode in a native terminal do not, so their sessions, and team members that use them, show `Unmeasured`. Unmeasured work is counted separately and is never added to a total as zero.
+
+Headless team members record the model that was requested for them. If the provider substitutes another model, the ledger still prices the requested one.
+
+Each provider row is labelled with that provider's own budget period and window. The web client shows these in the Spend block on the team list, as a cost line on each member, and as agent spend on each team run and goal. `infinite usage` prints one line per provider, and `infinite usage --json` prints the raw summary from `GET /api/usage`.
+
+## Provider usage limits and fallbacks
+
+A provider can refuse work because the account reached a usage limit. The host records that observation, stops the affected team member, and can relaunch the work on a fallback profile from another provider. A limit does not mean the task failed, and a switch does not mean progress. Only a member's report establishes either.
+
+### Configuration
+
+A profile may name another profile in the same lineup as its `limitFallback`. The lineup may also carry a `fallbacks` pool of profiles that exist only to be fallbacks, beside `implementers` and `escalations`. A `limitFallback` may name an implementer, an escalation, or a pool entry. Model ids below are placeholders for the operator's own.
 
 ```json
 {
+  "coordinator": { "id": "opus-xhigh", "...": "...", "limitFallback": "deepseek-pro-xhigh" },
   "implementers": [
-    { "id": "haiku-high", "label": "Haiku 5.5 high", "provider": "claude", "model": "claude-haiku-5-5", "effort": "high", "tier": "light", "limitFallback": "deepseek-flash-high" }
+    { "id": "haiku-medium", "...": "...", "limitFallback": "deepseek-flash-medium" }
   ],
   "fallbacks": [
-    { "id": "deepseek-flash-high", "label": "DeepSeek V4.1 Flash high", "provider": "opencode", "model": "deepseek/deepseek-flash", "variant": "high", "tier": "light", "dataUse": "standard" }
+    { "id": "deepseek-pro-xhigh", "label": "DeepSeek V4 Pro high", "provider": "opencode", "model": "deepseek/deepseek-v4-pro", "variant": "high", "tier": "strong" },
+    { "id": "deepseek-flash-medium", "label": "DeepSeek Flash medium", "provider": "opencode", "model": "deepseek/deepseek-flash", "variant": "medium", "tier": "light" }
   ]
 }
 ```
 
-Limit signals are observations, not predictions of remaining quota. A Claude
-Code hook alone can switch the member whose turn failed; a corroborated Claude
-observation can also be remembered for new members. Codex terminal text does not trigger automatic fallback. The native Codex protocol supplies an explicit `usageLimitExceeded` error; transient `rateLimitExceeded` errors remain ordinary failures. A structural terminal detector is deferred until its footer format has been verified.
+The host validates this when it loads configuration and when a goal or team snapshots its lineup:
 
-Only corroborated observations enter the host's provider-limit memory and
-influence new members. Interactive sessions show notices and keep their chosen
-provider. The host never answers a limit dialog or enters credentials. Provider
-clock times are interpreted as UTC; reset times are shown only when stated.
+- The named id exists and belongs to a different provider than the profile it backs.
+- A `strong` profile falls back only to a `strong` profile.
+- One id means one provider, model, effort or variant, tier, and data-use setting throughout the lineup.
+- Fallback chains are followed at most two hops, and a cycle is a configuration error.
+
+### What counts as a limit
+
+- Claude Code: a `StopFailure` hook with `error` of `rate_limit`, a `Notification` of `quota_auto_resume_stale` or `quota_auto_resume_disabled`, or the documented limit notice on screen. Other `StopFailure` errors stay provider errors. `quota_auto_resume_fired` is not a limit. It means the wait ended and the limit lifted, so it ends the episode and clears the displayed limit.
+- Codex terminal sessions: the `usage limited` indicator in the terminal's own status row. Limit messages in the transcript body never trigger on their own. They may only supply a reset time.
+- Codex app-server sessions: `turn/completed` with `usageLimitExceeded`. `rateLimitExceeded` stays a provider error.
+- OpenCode is not a source. It retries its own 429 responses.
+
+Clock times in a notice, such as `resets 3:45pm`, are read as UTC because the host runs in UTC. A time that cannot be parsed is left unset.
+
+### Confidence
+
+Each observation is single-source or corroborated.
+
+- Claude Code: the hook alone is single-source. It is corroborated when the screen shows the notice in the same check or the next two, or when a `quota_auto_resume_*` notification follows.
+- Codex terminal: the status row is single-source when first seen. It is corroborated when it persists across at least three consecutive screen checks spanning `attention.limitConfirmMs`, 30 seconds by default, with no other output change.
+- Codex app-server `usageLimitExceeded` and Claude `quota_auto_resume_*` notifications are corroborated on arrival.
+
+Observations are grouped into an episode held in the worker. An episode starts at the first observation. It ends after three consecutive screen checks with no match and no armed corroboration, after a notification that the limit lifted, or when the agent completes a turn that did not fail. Only a source that can report a failed turn counts: a Claude Code `Stop` hook, as distinct from `StopFailure`, or a native adapter's turn status. A Codex terminal turn end, from its `Stop` hook, notify, or OSC notification, cannot say the turn failed, so it ends nothing. An episode journals at most one single-source and one corroborated signal, in either order. A reset time stated by any observation carries onto the later ones. A successful turn also clears the session's displayed limit, and screen matching stays suppressed until a check sees no match.
+
+### What the host does
+
+- A corroborated observation, or a single-source Claude hook observation, stops the member and relaunches its work on the fallback profile. The replacement keeps the same working copy and base commit. Its prompt is the original prompt, with feedback and recorded answers, retargeted to the fallback provider. It notes that the previous member's partial edits are present and passed the path-scope check. A single-source Codex status-row observation only annotates and waits for corroboration.
+- The task records `limitSwitches` entries: the profile it left, the profile it moved to, the reason, the stated reset time if any, the member, and when. This does not use the task's one escalation. Each replacement counts against the run's and goal's member limits.
+- With no resolvable fallback, the run blocks with a reason naming the profile and the limit times. The workspace is preserved.
+- Only a corroborated observation writes the host-level entry in `providerLimits`. It lasts until the provider's stated reset time, capped at 24 hours, or 15 minutes when the provider stated none. Only a later successful turn, by the same measure, of a session of that provider clears it early, and an older observation cannot restore a cleared entry. New members of that provider launch on their fallback while the entry exists. With no fallback, they launch on the original profile.
+- A limit seen in any session, team member or not, updates the host-level entry. Nothing else happens to a non-team session.
+- Clients show the entry on the Teams list and the observation on session rows. Reset times are the provider's own statement, and a missing time means the provider gave none.
+
+### What the host never does
+
+- It never sends input to a limited member, answers a provider dialog, or enters credentials. Stopping the member is the only action.
+- It never extends a run, goal, or member limit because a provider was unavailable.
+- It never changes owned paths, allowed paths, deadlines, or the goal's lineup snapshot. A fallback pins a different profile for one member.
+- It never reads a limit or a switch as completion, failure, or product impact.
+
+A fallback onto a contributor-data profile shows the same data-use disclosure as any other profile. The operator decides whether to configure one.
+
+### Operator preconditions
+
+Before relying on the detectors unattended, confirm on the target host:
+
+1. A subscription quota hit delivers `error: "rate_limit"` in `StopFailure`.
+2. The Codex terminal's `usage limited` indicator sits in its bottom status row at the configured terminal size.
+3. OpenCode's reported cost is non-zero for the providers actually configured.
+4. Whether Codex emits a `Stop` hook, a notify `agent-turn-complete`, or an OSC 9 turn-complete notification when a turn ends on a limit. None of them ends a limit episode, but each one moves the session to a finished turn.
+5. Whether the Claude Code limit notice uses a straight or a curly apostrophe in "You've hit your … limit". The detector accepts both.
 
 ## Roles and execution
 

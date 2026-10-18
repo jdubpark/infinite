@@ -1,3 +1,8 @@
-Usage limit reached. You've reached your usage limit.
-You're out of credits.
-normal status row
+> grep -n "Usage limit" docs/notes.md
+
+• Ran grep -n "Usage limit" docs/notes.md
+  └ 12:Usage limit reached. You've reached your usage limit. Increase your limits to continue using codex.
+    13:You're out of credits. Your workspace is out of credits. Add credits to continue using Codex. Try again at Oct 18, 2026 3:45 PM
+
+› Ask Codex to do anything
+  gpt-5-codex · ~/workspace

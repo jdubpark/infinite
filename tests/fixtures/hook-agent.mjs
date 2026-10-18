@@ -1,7 +1,8 @@
 // Scripted agent for tests/worker-attention.test.ts. It draws one Claude-style permission dialog
 // for `rm -rf build` and posts PermissionRequest hooks in a fixed order, so each mode drives one
 // of the worker's rules for merging hook prompts with the dialog on screen.
-const mode = process.argv[2] ?? "";
+// The prompt is the last argument; Claude launches put their hook settings before it.
+const mode = process.argv.at(-1) ?? "";
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const post = (body) =>
   fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
@@ -58,13 +59,28 @@ else if (mode === "merge") {
   await permission("rm -rf build");
   await sleep(400);
   draw();
+} else if (mode === "rate-limit-notice-first") {
+  console.log("You've hit your session limit · resets 3:45pm");
+  await sleep(500);
+  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+  await sleep(1500);
+  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+} else if (mode === "rate-limit-then-stop") {
+  console.log("You've hit your session limit · resets 3:45pm");
+  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+  await sleep(1500);
+  await post({ hook_event_name: "Stop" });
+} else if (mode === "rate-limit" || mode === "rate-limit-blip") {
+  // The hook reports the limit; only `rate-limit` also prints the notice that corroborates it.
+  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+  if (mode === "rate-limit") {
+    await sleep(300);
+    console.log("You've hit your session limit · resets 3:45pm");
+  }
 } else if (mode === "denied") {
   // No dialog is drawn: the permission is refused without asking.
   await permission("rm -rf build");
   await sleep(300);
   await post({ hook_event_name: "PermissionDenied", tool_name: "Bash", tool_input: { command: "rm -rf build" }, reason: "Denied by policy" });
-} else if (mode === "rate-limit" || mode === "rate-limit-blip") {
-  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
-  if (mode === "rate-limit") console.log("You've hit your session limit · resets 3:45pm");
 }
 setInterval(() => {}, 1000);

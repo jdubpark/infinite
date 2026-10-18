@@ -1107,21 +1107,23 @@ test("snapshot attachments and fenced device takeover preserve one live process 
   }
 });
 
-test("infinite usage prints the host summary as JSON and readable output", { timeout: 20000 }, async () => {
+test("usage prints the raw summary with --json and one labelled line per provider otherwise", { timeout: 30000 }, async () => {
   const { startHost } = await import("./helpers.js");
-  const host = await startHost({ config: { usage: { budgets: { opencode: { usd: 10, period: "month" } } } } });
-  const config = join(host.root, "client.json");
-  writeFileSync(config, JSON.stringify({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
-  const cli = resolve("packages/host/src/client-entry.ts");
+  const host = await startHost({ config: { usage: { budgets: { opencode: { usd: 10 } } } } });
+  const root = mkdtempSync("/tmp/inf-usage-");
+  const clientFile = join(root, "client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
+  const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/cli.ts"), "--client-config", clientFile];
   try {
-    const json = await exec(process.execPath, ["--import", "tsx", cli, "--client-config", config, "usage", "--json"]);
-    const summary = JSON.parse(json.stdout);
+    const summary = JSON.parse((await exec(process.execPath, [...cli, "usage", "--json"])).stdout);
     assert.equal(summary.providers.opencode.budget.usd, 10);
     assert.equal(summary.providers.opencode.budget.period, "month");
-    const readable = await exec(process.execPath, ["--import", "tsx", cli, "--client-config", config, "usage"]);
-    assert.match(readable.stdout, /^OpenCode  \S+ to \S+ · no measured usage · budget \$10\.00 per month$/m);
-    assert.match(readable.stdout, /^Codex  \S+ to \S+ · unmeasured · no budget configured$/m);
-  } finally { await host.stop(); }
+    assert.equal(new Date(summary.providers.opencode.period.start).toISOString(), summary.providers.opencode.period.start);
+    const text = (await exec(process.execPath, [...cli, "usage"])).stdout;
+    const line = text.split("\n").find(l => l.startsWith("opencode"))!;
+    assert.match(line, /of \$10\.00 for month from \d{4}-\d{2}-\d{2} \(0 steps, 0 unmeasured sessions\)/);
+    assert.match(text, /claude\s+unmeasured/i, "providers without measurement never print a spend figure");
+  } finally { rmSync(root, { recursive: true, force: true }); await host.stop(); }
 });
 
 test("repository CLI pins, preserves and removes owner permission delegation", { timeout: 120000 }, async () => {

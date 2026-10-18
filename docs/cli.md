@@ -16,7 +16,7 @@ infinite opencode --model deepseek/deepseek-flash
 
 infinite list
 infinite list --json
-infinite usage
+infinite usage             # spend per provider against its budget
 infinite usage --json
 infinite resources
 infinite resources --watch
@@ -33,7 +33,7 @@ infinite close SESSION_ID  # confirm before ending its provider process
 
 `close` requires an explicit session ID or unique prefix and an owner key. It shows the selected process and asks for confirmation; `--yes` confirms noninteractive use. Another client's active input lease blocks closing unless `--takeover` is explicitly supplied. A delivered receipt confirms the stop request reached the worker; check `list` for the resulting process status. An uncertain response is reported and never retried automatically. Closing ends the provider process; Ctrl+] only detaches the terminal client.
 
-`usage` shows per-provider spend for the current UTC budget period. It labels configured prices and costs reported by OpenCode separately, and reports sessions without a usage capture path as unmeasured. `--json` prints the host's raw `/api/usage` summary. Budgets are informational and do not block or reroute work.
+`usage` prints one line per provider with spend, budget, the provider's own budget period and start date, and step and unmeasured-session counts. Providers that report no usage print `unmeasured`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
 
 ## Team CLI
 

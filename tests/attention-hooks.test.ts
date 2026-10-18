@@ -58,22 +58,6 @@ test("claude PermissionRequest, PostToolUse, Stop, Notification", () => {
   assert.equal(mapClaudeHook({ nonsense: true }).length, 0);
 });
 
-test("Claude hook distinguishes a rate-limit observation from other provider failures", () => {
-  const rateLimit = mapClaudeHook({ ...base, hook_event_name: "StopFailure", error: "rate_limit" });
-  assert.equal(rateLimit.length, 3);
-  assert.equal(rateLimit[2].kind, "provider-limit");
-  if (rateLimit[2].kind !== "provider-limit") throw new Error();
-  assert.equal(rateLimit[2].confidence, "single-source");
-  assert.equal(rateLimit[2].limit, "usage");
-  const overloaded = mapClaudeHook({ ...base, hook_event_name: "StopFailure", error: "overloaded" });
-  assert.deepEqual(overloaded.map(signal => signal.kind), ["error", "turn-end"]);
-  const quota = mapClaudeHook({ ...base, hook_event_name: "Notification", notification_type: "quota_auto_resume_fired" });
-  const signal = quota.find(item => item.kind === "provider-limit");
-  assert.equal(signal?.kind, "provider-limit");
-  if (signal?.kind !== "provider-limit") throw new Error();
-  assert.equal(signal.confidence, "corroborated");
-});
-
 test("codex hooks and notify", () => {
   const [perm] = mapCodexHook({ session_id: "s", cwd: "/w", hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "rm -rf dist" }, tool_use_id: "c1" });
   assert.equal(perm.kind, "prompt-open");
@@ -141,6 +125,26 @@ test("truncateInput enforces the 16 KiB UTF-8 cap", () => {
   assert.ok(bytes(wide) <= 16384, `multibyte case was ${bytes(wide)}`);
 });
 
+test("claude StopFailure rate_limit adds a single-source provider-limit; other errors do not", () => {
+  const limited = mapClaudeHook({ ...base, hook_event_name: "StopFailure", error: "rate_limit", error_details: "5-hour limit" });
+  assert.equal(limited.length, 3);
+  assert.deepEqual(limited[2], { kind: "provider-limit", limit: "usage", confidence: "single-source", message: "5-hour limit" });
+  const plain = mapClaudeHook({ ...base, hook_event_name: "StopFailure", error: "rate_limit" });
+  assert.equal(plain[2].kind === "provider-limit" && plain[2].message, "Claude Code reported a usage limit");
+  const overloaded = mapClaudeHook({ ...base, hook_event_name: "StopFailure", error: "overloaded" });
+  assert.deepEqual(overloaded.map((s) => s.kind), ["error", "turn-end"]);
+});
+
+test("claude quota_auto_resume_stale and _disabled add a corroborated provider-limit; _fired is a notice only", () => {
+  for (const type of ["quota_auto_resume_stale", "quota_auto_resume_disabled"]) {
+    const out = mapClaudeHook({ ...base, hook_event_name: "Notification", notification_type: type, message: "waiting" });
+    const last = out[out.length - 1];
+    assert.equal(last.kind, "provider-limit");
+    assert.equal(last.kind === "provider-limit" && last.confidence, "corroborated");
+  }
+  const fired = mapClaudeHook({ ...base, hook_event_name: "Notification", notification_type: "quota_auto_resume_fired", message: "resumed" });
+  assert.deepEqual(fired.map((s) => s.kind), ["notice"]);
+});
 
 test("permission evidence distinguishes complete input from omitted array items and command tails", () => {
   const cases = [

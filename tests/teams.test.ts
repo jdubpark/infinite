@@ -1,5 +1,4 @@
 import test from "node:test";
-import { ProviderLimits } from "../packages/host/src/provider-limits.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -11,10 +10,11 @@ import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { memberTimeLimitReason } from "../packages/host/src/teams.js";
-import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
+import type { CreateTeam, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
+import { retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
 
-import { git, limitLineup, mixedLineup, fixture } from "./team-fixture.js";
-import { unseal, writeSealed } from "../packages/host/src/vault.js";
+// The shared fallback lineup used by delivery and permission tests; the limit tests below define their own.
+import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
 
 test("team runs use readable names and exact root permissions under a strict umask", { timeout: 120000 }, async () => {
   const root = realpathSync(mkdtempSync("/tmp/inf-team-modes-"));
@@ -785,51 +785,71 @@ test("OpenCode team members journal each step with its tokens and cost", { timeo
   } finally { await f.close(); }
 });
 
-test("a Claude usage limit preserves partial work on its fallback and informs later runs", { timeout: 120000 }, async () => {
+const limitLineup: TeamLineup = {
+  coordinator: { id: "astra-coordinator", label: "Astra coordinator", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" },
+  integrator: { id: "astra-integrator", label: "Astra integrator", provider: "codex", model: "gpt-6-astra", effort: "high", tier: "strong" },
+  reviewer: { id: "astra-reviewer", label: "Astra reviewer", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" },
+  implementers: [
+    { id: "haiku", label: "Haiku implementer", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light", limitFallback: "deepseek-light" },
+    { id: "astra-light", label: "Astra light implementer", provider: "codex", model: "gpt-6-astra", effort: "low", tier: "light" },
+  ],
+  fallbacks: [{ id: "deepseek-light", label: "DeepSeek Flash", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light" }],
+};
+const readReceipts = (dir: string) => readdirSync(dir).filter(name => name.endsWith(".json")).map(name => JSON.parse(readFileSync(join(dir, name), "utf8")));
+const sessionEvents = async (host: Host, id: string, types: string) => (await host.fetchApi(`/sessions/${id}/events?types=${types}&after=0&limit=200`)).body.events as unknown[];
+
+test("a Claude member that hits a usage limit continues on its fallback with its answers and partial work, and later Claude members launch on the fallback directly", { timeout: 120000 }, async () => {
   const run = await fixture("limit", limitLineup);
   try {
-    const created = await run.host.fetchApi("/teams", "owner", run.create());
-    const team = await run.settled(created.body.id);
+    const created = (await run.host.fetchApi("/teams", "owner", run.create())).body;
+    const waiting = await waitFor(() => run.get(created.id), t => t.status === "needs-input" && t.decisions.length === 1, 45000);
+    const answer = { requestId: randomUUID(), revision: waiting.revision, text: "Compact" };
+    assert.equal((await run.host.fetchApi(`/teams/${waiting.id}/decisions/${waiting.decisions[0].id}/answer`, "controller", answer)).status, 200);
+    const team = await run.settled(waiting.id);
     assert.equal(team.status, "ready-for-review", JSON.stringify(team));
-    const task = team.tasks.find(value => value.id === "a")!;
+    const task = team.tasks.find(t => t.id === "a")!;
     assert.equal(task.limitSwitches?.length, 1);
-    assert.equal(task.limitSwitches![0].fromProfileId, "haiku");
-    assert.equal(task.limitSwitches![0].toProfileId, "deepseek-light");
-    assert.equal(task.limitSwitches![0].resetsAt?.slice(11, 16), "15:45");
-    assert.equal(team.members.filter(member => member.taskId === "a").length, 2);
-    assert.match(team.members.find(member => member.modelProfile?.id === "haiku")!.stoppedReason!, /usage limit/);
+    const [switched] = task.limitSwitches!;
+    const limited = team.members.find(m => m.memberId === switched.memberId)!;
+    const receipts = readReceipts(run.receipts);
+    const expected: string = receipts.find(r => r.memberId === limited.memberId).expectedResetsAt, hhmm = expected.slice(11, 16) + " UTC";
+    assert.equal(limited.modelProfile?.id, "haiku");
+    assert.equal(switched.fromProfileId, "haiku");
+    assert.equal(switched.toProfileId, "deepseek-light");
+    assert.equal(switched.resetsAt, expected, "The reset time comes from the provider's notice");
+    assert.equal(task.escalation, undefined, "A limit switch does not use the task's escalation");
+    const attempts = team.members.filter(m => m.taskId === "a");
+    assert.deepEqual(attempts.map(m => m.modelProfile?.id), ["haiku", "haiku", "deepseek-light"], "The question retry and the switch are each a new member attempt");
+    assert.equal(new Set(attempts.map(m => m.cwd)).size, 1);
+    assert.equal(limited.status, "stopped");
+    assert.equal(limited.stoppedReason, `Claude Code usage limit, resets ${hhmm}`);
+    assert.deepEqual((await sessionEvents(run.host, limited.sessionId, "input-intent") as { data: { op: string } }[]).map(event => event.data.op), ["stop"], "Stopping is the only action the host takes on a limited member");
+    assert.ok(team.events.some(e => e.text === `Haiku implementer hit a Claude Code usage limit (resets ${hhmm}); Build the first file continues on DeepSeek Flash with partial work preserved.`), JSON.stringify(team.events));
     assert.equal(team.providerLimits[0]?.provider, "claude");
-    const receipts = readdirSync(run.receipts).filter(name => name.endsWith(".json")).map(name => JSON.parse(readFileSync(join(run.receipts, name), "utf8")));
-    assert.ok(receipts.some(receipt => receipt.runId === team.id && receipt.model === "deepseek/deepseek-flash" && receipt.sawPartial === true));
+    assert.equal(team.providerLimits[0]?.runId, team.id);
+    assert.equal(team.providerLimits[0]?.expiresAt, expected, "The host entry lasts until the stated reset");
+    assert.equal((await run.host.fetchApi("/me")).body.providerLimits[0]?.expiresAt, expected);
+    const replacement = receipts.find(r => r.memberId === attempts[2].memberId);
+    assert.equal(replacement?.model, "deepseek/deepseek-flash");
+    assert.equal(replacement?.sawPartial, true, "The fallback starts in the limited member's working copy");
+    const prompt: string = replacement.prompt;
+    assert.match(prompt, /\n\nUser answered: Compact\n\n/, "The fallback keeps the user's recorded answer");
+    assert.match(prompt, /partial edits are present in this working copy and have passed the host's path-scope check/);
+    assert.ok(prompt.includes("Pipe a JSON object matching the above schema to this command:") && !prompt.includes("mcp__infinite_team__report"), "The fallback reports the OpenCode way");
+    assert.ok(prompt.includes(`Requested runtime profile: ${JSON.stringify(attempts[2].modelProfile)}.`) && !prompt.includes('Requested runtime profile: {"id":"haiku"'));
+    assert.equal(readFileSync(join(team.workspace, "a.txt"), "utf8"), "revision 1\n");
     assert.ok(receipts.every(receipt => receipt.trustedWorkspace === undefined && !(receipt.argv ?? []).some((arg: string) => arg.startsWith("projects="))),
       "Without owner trust in the team roots, members must keep their providers' folder prompts");
 
-    const nextCreated = await run.host.fetchApi("/teams", "owner", run.create());
-    const next = await run.settled(nextCreated.body.id);
-    assert.equal(next.status, "ready-for-review", JSON.stringify(next));
-    assert.ok(next.events.some(event => /launched on DeepSeek Flash/.test(event.text)));
-    assert.equal(next.members.filter(member => member.modelProfile?.provider === "claude").length, 0);
-  } finally { await run.close(); }
-});
-
-test("a Claude usage limit blocks the run when no fallback profile is configured", { timeout: 90000 }, async () => {
-  const lineup = structuredClone(limitLineup);
-  delete lineup.implementers[0].limitFallback;
-  delete lineup.fallbacks;
-  const run = await fixture("limit-no-fallback", lineup);
-  try {
-    const created = await run.host.fetchApi("/teams", "owner", run.create());
-    const team = await run.settled(created.body.id);
-    assert.equal(team.status, "blocked", JSON.stringify(team));
-    assert.match(team.reason!, /usage limit reached.*no fallback profile is configured for haiku/);
-    assert.match(team.members.find(member => member.modelProfile?.id === "haiku")!.stoppedReason!, /usage limit/);
-    assert.equal(team.tasks.find(task => task.id === "a")?.limitSwitches?.length ?? 0, 0);
-    assert.equal(team.tasks.find(task => task.id === "a")?.status, "running");
+    const second = await run.settled((await run.host.fetchApi("/teams", "owner", run.create())).body.id);
+    assert.ok(second.events.some(e => e.text === `Haiku implementer launched on DeepSeek Flash: Claude Code is limited until ${hhmm}`), JSON.stringify(second.events));
+    assert.equal(second.members.filter(m => m.modelProfile?.provider === "claude").length, 0);
+    assert.equal(second.members.find(m => m.taskId === "a")?.modelProfile?.id, "deepseek-light");
   } finally { await run.close(); }
 });
 
 test("a limited Claude integrator continues the same repair with its partial changes", { timeout: 120000 }, async () => {
-  const lineup = structuredClone(limitLineup);
+  const lineup = structuredClone(fallbackLineup);
   lineup.integrator = {
     id: "haiku-integrator", label: "Claude integrator", provider: "claude", model: "claude-haiku-5-5",
     effort: "medium", tier: "light", limitFallback: "deepseek-light",
@@ -854,45 +874,33 @@ test("a limited Claude integrator continues the same repair with its partial cha
   } finally { await run.close(); }
 });
 
-test("a failed Claude turn in another session does not clear the corroborated provider limit", { timeout: 120000 }, async () => {
+test("a usage limit with no configured fallback blocks the run with its reason and keeps the partial work", { timeout: 90000 }, async () => {
   const lineup = structuredClone(limitLineup);
-  lineup.implementers[1] = {
-    id: "haiku-b", label: "Second Claude implementer", provider: "claude", model: "claude-haiku-5-5",
-    effort: "medium", tier: "light", limitFallback: "deepseek-light",
-  };
-  const run = await fixture("limit-other-failed", lineup);
+  delete lineup.implementers[0].limitFallback;
+  delete lineup.fallbacks;
+  const run = await fixture("limit-no-fallback", lineup);
   try {
-    const firstCreated = await run.host.fetchApi("/teams", "owner", run.create());
-    const first = await run.settled(firstCreated.body.id);
-    assert.equal(first.status, "ready-for-review", JSON.stringify(first));
-    assert.ok(first.providerLimits.some(limit => limit.provider === "claude" && limit.confidence === "corroborated"), "The screen and hook preserve a corroborated Claude limit");
-
-    const nextCreated = await run.host.fetchApi("/teams", "owner", run.create());
-    const next = await run.settled(nextCreated.body.id);
-    assert.equal(next.status, "ready-for-review", JSON.stringify(next));
-    assert.ok(next.events.some(event => /launched on DeepSeek Flash/.test(event.text)), "A failed turn from the other Claude session does not release the limit for a later run");
-    assert.equal(next.members.filter(member => member.modelProfile?.provider === "claude").length, 0);
+    const team = await run.settled((await run.host.fetchApi("/teams", "owner", run.create())).body.id);
+    assert.equal(team.status, "blocked", JSON.stringify(team));
+    const limited = team.members.find(m => m.modelProfile?.id === "haiku")!;
+    const expected: string = readReceipts(run.receipts).find(r => r.memberId === limited.memberId).expectedResetsAt;
+    assert.equal(team.reason, `Claude Code usage limit reached at ${team.providerLimits[0]?.detectedAt.slice(11, 16)} UTC, resets ${expected.slice(11, 16)} UTC; no fallback profile is configured for haiku.`);
+    assert.equal(team.members.filter(m => m.taskId === "a").length, 1);
+    assert.equal(limited.status, "stopped");
+    assert.equal(readFileSync(join(limited.cwd, "a.txt"), "utf8"), "partial\n");
   } finally { await run.close(); }
 });
 
-test("provider limit memory expires and successful clearing survives restart without stale replay", () => {
-  const root = mkdtempSync("/tmp/inf-limits-");
-  try {
-    const file = join(root, "limits.sealed"), key = Buffer.alloc(32, 7);
-    const observation = { provider: "claude" as const, detectedAt: "2026-10-18T10:00:00.000Z", sessionId: randomUUID(), confidence: "corroborated" as const };
-    let limits = new ProviderLimits(file, key);
-    limits.observe(observation);
-    assert.equal(limits.active(new Date("2026-10-18T10:14:59Z")).length, 1);
-    assert.equal(limits.active(new Date("2026-10-18T10:15:00Z")).length, 0);
-    limits.observe({ ...observation, detectedAt: "2026-10-18T11:00:00.000Z", resetsAt: "2026-10-21T10:00:00.000Z" });
-    assert.equal(limits.active(new Date("2026-10-18T12:00:00Z"))[0].expiresAt, "2026-10-19T11:00:00.000Z");
-    limits.clear("claude", "2026-10-18T12:00:00.000Z");
-    limits = new ProviderLimits(file, key);
-    limits.observe(observation);
-    assert.deepEqual(limits.active(new Date("2026-10-18T12:01:00Z")), []);
-    limits.observe({ ...observation, detectedAt: "2026-10-18T12:02:00.000Z" });
-    assert.equal(limits.active(new Date("2026-10-18T12:03:00Z")).length, 1);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+test("retargeting a member prompt keeps its answers, swaps reporting and profile, and refuses an unrecognized prompt", () => {
+  const run = { provider: "codex", revision: 1, objective: "Create a.txt", baseCommit: "base", headCommit: "head", steering: [], tasks: [], checks: [], lineup: limitLineup } as unknown as TeamRun;
+  const [haiku, astra] = limitLineup.implementers, deepseek = limitLineup.fallbacks![0];
+  const answered = (provider: TeamModelProfile["provider"], profile: TeamModelProfile) => `${teamPrompt(run, "implementer", undefined, undefined, provider, profile)}\n\nUser answered: Compact`;
+  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "opencode", profile: deepseek }), answered("opencode", deepseek));
+  // A prompt written by another release names a different report helper path.
+  const older = answered("codex", astra).replace(/to this command: [^\n]+?\. The helper/, "to this command: 'node' 'dist/team-report.js'. The helper");
+  assert.notEqual(older, answered("codex", astra));
+  assert.equal(retargetPrompt(older, { provider: "claude", profile: haiku }), answered("claude", haiku));
+  assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek }), undefined);
 });
 
 test("a team blocked by the one-hour member limit resumes into a fresh plan", { timeout: 60000 }, async () => {

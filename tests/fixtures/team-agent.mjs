@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
@@ -42,6 +42,11 @@ const assignment = JSON.parse(process.env.INFINITE_TEAM_ASSIGNMENT ?? "null");
 if (!assignment || !process.env.INFINITE_HOOK_URL || !process.env.INFINITE_HOOK_TOKEN)
   throw new Error("The team worker did not provide its reporting capability");
 const receiptFile = join(receiptDir, `${assignment.memberId}.json`);
+// Peers poll this directory while members run. Replace a receipt whole, never truncate it in place.
+function saveReceipt() {
+  writeFileSync(`${receiptFile}.tmp`, JSON.stringify(receipt), { mode: 0o600 });
+  renameSync(`${receiptFile}.tmp`, receiptFile);
+}
 const providerIndex = process.argv.indexOf("--fixture-provider");
 const receipt = { ...assignment, cwd: process.cwd(), pid: process.pid, startedAt: Date.now(),
   ...(process.env.INFINITE_TRUSTED_WORKSPACE ? { trustedWorkspace: process.env.INFINITE_TRUSTED_WORKSPACE } : {}),
@@ -63,12 +68,12 @@ if (receipt.provider === "opencode") {
     receipt.variant = args[variant + 1];
   }
   receipt.prompt = args[boundary + 1];
-  if ((scenario === "limit" || scenario === "limit-no-fallback" || scenario === "limit-other-failed") && assignment.taskId === "a")
-    receipt.sawPartial = existsSync("a.txt");
   if (scenario === "integrator-limit" && assignment.role === "integrator")
     receipt.sawPartial = existsSync("repair.txt");
 }
-writeFileSync(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
+// A limit fallback must start in the limited member's working copy, partial file included.
+if (scenario.startsWith("limit")) receipt.sawPartial = existsSync("a.txt");
+saveReceipt();
 
 async function report(value, overrides = {}) {
   const response = await fetch(`${process.env.INFINITE_HOOK_URL}/team-report`, {
@@ -141,12 +146,12 @@ async function main() {
     } else if (scenario === "mixed") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "astra-xhigh";
-    } else if (scenario.startsWith("permissions")) {
+    } else if (scenario.startsWith("permissions") || scenario.startsWith("delivery") || scenario === "integrator-limit") {
       tasks[0].agentProfileId = "haiku";
       tasks[1].agentProfileId = "codex-light";
-    } else if (scenario.startsWith("delivery") || scenario === "limit" || scenario === "limit-no-fallback" || scenario === "limit-other-failed" || scenario === "integrator-limit") {
+    } else if (scenario.startsWith("limit")) {
       tasks[0].agentProfileId = "haiku";
-      tasks[1].agentProfileId = scenario === "limit-other-failed" ? "haiku-b" : "codex-light";
+      tasks[1].agentProfileId = "astra-light";
     } else if (scenario === "mixed-invalid") {
       // The first task is valid: rejection must inspect the whole plan before
       // dispatching any member, including work preceding the invalid choice.
@@ -181,6 +186,33 @@ async function main() {
     if ((scenario === "mixed" || (scenario === "bootstrap-replan" || scenario === "bootstrap-change") && assignment.revision === 1) && assignment.taskId === "b" && !existsSync(asked)) {
       writeFileSync(asked, "asked", { mode: 0o600 });
       await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"] });
+      return;
+    }
+    if (scenario.startsWith("limit") && receipt.provider === "claude" && receipt.argv[receipt.argv.indexOf("--model") + 1] === "claude-haiku-5-5") {
+      // In `limit`, the first attempt asks a question so the limited attempt carries a user answer.
+      if (scenario === "limit" && !existsSync(asked)) {
+        writeFileSync(asked, "asked", { mode: 0o600 });
+        await report({ kind: "question", question: "Which display label should the first file use?", options: ["Detailed", "Compact"] });
+        return;
+      }
+      // Partial work, then Claude Code's limit notice and its StopFailure hook. The notice comes
+      // first so the hook arrives as its corroboration: a hook alone switches the member before a
+      // later notice could record the host-level limit. The member idles without reporting.
+      // The stated reset is two hours ahead of this clock (read as UTC), so it is never in the past.
+      writeFileSync("a.txt", "partial\n");
+      const reset = new Date(Date.now() + 2 * 3600_000); reset.setUTCSeconds(0, 0);
+      const hour = reset.getUTCHours();
+      receipt.limitNotice = `You've hit your session limit · resets ${hour % 12 || 12}:${String(reset.getUTCMinutes()).padStart(2, "0")}${hour < 12 ? "am" : "pm"}`;
+      receipt.expectedResetsAt = reset.toISOString();
+      saveReceipt();
+      process.stdout.write(`${receipt.limitNotice}\n`);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit" }),
+      });
+      if (response.status !== 204) throw new Error(`StopFailure hook was refused with status ${response.status}`);
       return;
     }
     if (scenario === "question") {
@@ -232,26 +264,6 @@ async function main() {
     // Keep both processes alive after the barrier so overlap can be measured
     // independently of the member states returned by the API.
     await new Promise(resolve => setTimeout(resolve, 150));
-    if (scenario === "limit-other-failed" && receipt.provider === "claude" && assignment.taskId === "b") {
-      await new Promise(resolve => setTimeout(resolve, 2600));
-      const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}` },
-        body: JSON.stringify({ hook_event_name: "StopFailure", error: "transient_provider_error" }),
-      });
-      if (response.status !== 204) throw new Error(`Claude failed-turn hook was refused with status ${response.status}`);
-    }
-    if ((scenario === "limit" || scenario === "limit-no-fallback" || scenario === "limit-other-failed") && receipt.provider === "claude" && assignment.taskId === "a") {
-      writeFileSync("a.txt", "partial work from the limited member\n");
-      const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}` },
-        body: JSON.stringify({ hook_event_name: "StopFailure", error: "rate_limit" }),
-      });
-      if (response.status !== 204) throw new Error(`Claude limit hook was refused with status ${response.status}`);
-      console.log("You've hit your session limit · resets 3:45pm");
-      await new Promise(() => {});
-    }
     const name = scenario === "scope-escape" && assignment.taskId === "a" ? " a.txt" : `${assignment.taskId}.txt`;
     writeFileSync(name, `revision ${assignment.revision}\n`);
     if (scenario === "usage" && receipt.provider === "opencode") {
@@ -269,7 +281,7 @@ async function main() {
       ].join("\n") + "\n");
     }
     receipt.finishedAt = Date.now();
-    writeFileSync(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
+    saveReceipt();
     await report({ kind: "result", summary: `Implemented ${assignment.taskId}.txt` });
   } else if (assignment.role === "integrator") {
     if (scenario === "integrator-limit" && receipt.provider === "claude") {

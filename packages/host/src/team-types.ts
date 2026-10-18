@@ -1,10 +1,11 @@
 import { z } from "zod";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt } from "./types.js";
-import type { TeamUsage, UsageTotals } from "./usage.js";
-import type { ProviderLimit } from "./provider-limits.js";
 import type { Provider } from "./types.js";
 import type { LinearTrackingView } from "./linear-types.js";
+import type { UsageTotals } from "./usage.js";
+import type { UsageRollup } from "./team-usage.js";
+import type { ProviderLimit } from "./provider-limits.js";
 
 export const teamCommandSchema = z.object({
   command: z.string().min(1).max(4096).refine(value => !value.includes("\0")),
@@ -215,22 +216,23 @@ export interface TeamMember extends TeamAssignment {
   cwd: string;
   baseCommit: string;
   prompt: string;
-  feedback?: string;
   startedAt?: string;
   report?: TeamReport;
   cursor: number;
   stopRequestId: string;
-  usage?: UsageTotals;
+  /** Why the host stopped this member without a report, such as a provider usage limit. */
   stoppedReason?: string;
-  pendingLimit?: { limit: "usage" | "credits"; confidence: "single-source" | "corroborated"; message: string; resetsAt?: string; detectedAt: string };
+  /** Computed on read for members whose provider reports usage; never stored. */
+  usage?: UsageTotals;
 }
 export interface TeamTask extends TeamTaskPlan {
-  limitSwitches?: { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string }[];
   status: "pending" | "running" | "waiting" | "integrated" | "blocked";
   memberId?: string;
   commit?: string;
   summary?: string;
   escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string };
+  /** Each provider-limit switch of this task's member; a replacement can itself be switched. */
+  limitSwitches?: { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string }[];
 }
 export interface TeamScout extends TeamScoutPlan {
   status: "pending" | "running" | "waiting" | "complete";
@@ -271,7 +273,6 @@ export interface TeamRun {
   /** Agent-reported delivery evidence; this is not independently verified by the host. */
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
   linearTracking?: boolean;
-  usage?: TeamUsage;
   linear?: LinearTrackingView;
   id: string;
   projectId: string;
@@ -305,9 +306,11 @@ export interface TeamRun {
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
   round: number;
 }
+/** `providerLimits` is the host's active limit memory at read time, shared by every run. */
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions"> & {
-  members: Omit<TeamMember, "prompt" | "feedback" | "pendingLimit">[];
+  members: Omit<TeamMember, "prompt">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt">[];
+  usage: UsageRollup;
   providerLimits: ProviderLimit[];
   resumable: boolean;
 };

@@ -15,7 +15,6 @@ import {
   claudeAgent,
   correlates,
   describeNow,
-  detectLimit,
   detectPrompt,
   dropsPrompt,
   initialAttention,
@@ -26,6 +25,7 @@ import {
   mapCodexOsc,
   mergeHookIntoPrompt,
   mergeScreenIntoPrompt,
+  recoveryTurnEnd,
   screenDecision,
   type AnswerResult,
   type Attention,
@@ -33,6 +33,7 @@ import {
   type Signal,
   type SignalData,
   type SignalEvent,
+  detectLimit,
 } from "@infinite/attention";
 import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
@@ -246,9 +247,11 @@ function record(
     data as unknown as Record<string, unknown>,
   ) as unknown as SignalEvent;
   publish(applySignal(attention, event));
-  if (signal.kind === "turn-end" && !signal.failed) {
+  // A successful turn, or the end of a quota wait, lifts the limit; the notice may stay on screen.
+  if (recoveryTurnEnd(data) || (signal.kind === "notice" && signal.type === "quota_auto_resume_fired")) {
+    limitEpisode = undefined;
     limitWatch = undefined;
-    screenLimitMessage = undefined;
+    screenLimitSuppressed = true;
   }
   return event;
 }
@@ -404,13 +407,6 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void
     record({ kind: "hooks-ready", event: event.slice(0, 60) }, "hook");
   }
   for (const signal of signals) {
-    if (signal.kind === "provider-limit") {
-      if (signal.confidence === "single-source") {
-        limitWatch = { checks: 0 };
-      } else limitWatch = undefined;
-      record(signal, "hook", agent);
-      continue;
-    }
     if (signal.kind === "prompt-closed") {
       // A hook's close (PermissionDenied) names no prompt; it closes the open one, unless an
       // answer is pressing keys on it or its block is still on screen (the screen loop owns that).
@@ -425,7 +421,8 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void
       hookPromptWhileOpen(attention.prompt, signal.prompt, agent);
       continue;
     }
-    record(signal, "hook", agent);
+    if (signal.kind === "provider-limit") recordLimitFromHook(signal, agent);
+    else record(signal, "hook", agent);
   }
   return reply;
 }
@@ -435,8 +432,86 @@ let outputSinceCheck = false;
 let missCount = 0;
 /** Prompt id with an answer in flight; the answer path, not the screen loop, closes it. */
 let answering: number | undefined;
-let limitWatch: { checks: number } | undefined;
-let screenLimitMessage: string | undefined;
+
+/**
+ * Usage-limit observations are journaled per episode: at most one single-source and one
+ * corroborated signal. An episode starts at the first observation, from a hook or the screen,
+ * and ends after three checks with no match and no armed watch, or at a turn end that proves
+ * recovery (`recoveryTurnEnd`): a Codex terminal turn end cannot say the turn failed.
+ * A Claude hook is corroborated by the screen notice within two later checks; a Codex status row
+ * only by persisting for three checks and `limitConfirmMs` without new output.
+ */
+let limitWatch: { source: "hook" | "screen"; firstAt: number; checks: number; corroborated: boolean } | undefined;
+/** Set when a limit lifted; screen matches are ignored until the screen stops showing one. */
+let screenLimitSuppressed = false;
+let limitEpisode: { single?: "hook" | "screen"; corroborated: boolean; misses: number; resetsAt?: string } | undefined;
+type LimitSignal = Extract<Signal, { kind: "provider-limit" }>;
+function recordLimit(signal: LimitSignal, source: SignalData["source"], agent?: { id: string; type: string }) {
+  const episode = (limitEpisode ??= { corroborated: false, misses: 0 });
+  episode.misses = 0;
+  // A reset time stated by any source belongs to the episode, so a corroborating hook keeps the notice's time.
+  episode.resetsAt = signal.resetsAt ?? episode.resetsAt;
+  if (episode.resetsAt) signal = { ...signal, resetsAt: episode.resetsAt };
+  if (signal.confidence === "corroborated") {
+    if (episode.corroborated) return;
+    episode.corroborated = true;
+  } else {
+    if (episode.single || episode.corroborated) return;
+    episode.single = source === "hook" ? "hook" : "screen";
+  }
+  record(signal, source, agent);
+}
+function recordLimitFromHook(signal: LimitSignal, agent?: { id: string; type: string }) {
+  if (signal.confidence === "corroborated") {
+    limitWatch = undefined;
+    recordLimit(signal, "hook", agent);
+    return;
+  }
+  // A notice already on screen is the second source for this hook.
+  if (limitEpisode?.single === "screen" && !limitEpisode.corroborated) {
+    limitWatch = undefined;
+    recordLimit({ ...signal, confidence: "corroborated" }, "hook", agent);
+    return;
+  }
+  const fresh = !limitEpisode?.single && !limitEpisode?.corroborated;
+  recordLimit(signal, "hook", agent);
+  if (fresh) limitWatch = { source: "hook", firstAt: Date.now(), checks: 0, corroborated: false };
+}
+function watchLimit(lines: string[], nowMs: number, freshOutput: boolean) {
+  const found = detectLimit(lines, provider, new Date(nowMs));
+  const watch = limitWatch;
+  if (!found) {
+    screenLimitSuppressed = false;
+    // A hook watch gets two checks after the one that armed it; a screen watch ends with its match.
+    if (watch?.source === "screen" || (watch && ++watch.checks > 2)) limitWatch = undefined;
+    if (!limitWatch && limitEpisode && ++limitEpisode.misses >= 3) limitEpisode = undefined;
+    return;
+  }
+  if (screenLimitSuppressed) return;
+  if (limitEpisode) limitEpisode.misses = 0;
+  const observed = { kind: "provider-limit" as const, limit: found.limit, message: found.message, ...(found.resetsAt ? { resetsAt: found.resetsAt } : {}) };
+  if (watch?.source === "hook") {
+    limitWatch = undefined;
+    recordLimit({ ...observed, confidence: "corroborated" }, "screen");
+    return;
+  }
+  if (!watch) {
+    recordLimit({ ...observed, confidence: "single-source" }, "screen");
+    if (provider === "codex") limitWatch = { source: "screen", firstAt: nowMs, checks: 1, corroborated: false };
+    return;
+  }
+  if (freshOutput) {
+    // New output restarts the persistence count but never re-earns an episode's corroboration.
+    limitWatch = { source: "screen", firstAt: nowMs, checks: 1, corroborated: watch.corroborated };
+    return;
+  }
+  if (watch.corroborated) return;
+  watch.checks++;
+  if (watch.checks >= 3 && nowMs - watch.firstAt >= config.attention.limitConfirmMs) {
+    recordLimit({ ...observed, confidence: "corroborated" }, "screen");
+    watch.corroborated = true;
+  }
+}
 
 /** Runs after every output flush and once a second. */
 function checkScreen() {
@@ -446,20 +521,6 @@ function checkScreen() {
     const detected = detectPrompt(lines, provider);
     const nowMs = Date.now();
     const at = new Date(nowMs).toISOString();
-    const detectedLimit = detectLimit(lines, provider, new Date(nowMs));
-    if (provider === "claude") {
-      if (limitWatch) {
-        limitWatch.checks += 1;
-        if (limitWatch.checks <= 2 && detectedLimit) {
-          record({ ...detectedLimit, kind: "provider-limit", confidence: "corroborated" }, "screen");
-          screenLimitMessage = detectedLimit.message;
-          limitWatch = undefined;
-        } else if (limitWatch.checks >= 2) limitWatch = undefined;
-      } else if (detectedLimit && screenLimitMessage !== detectedLimit.message) {
-        record({ ...detectedLimit, kind: "provider-limit", confidence: "single-source" }, "screen");
-        screenLimitMessage = detectedLimit.message;
-      }
-    }
     const idle =
       !outputSinceCheck &&
       nowMs - lastOutputAt >= config.attention.idleAfterMs &&
@@ -468,7 +529,9 @@ function checkScreen() {
     // is not new work.
     const freshOutput =
       outputSinceCheck && lastOutputAt > Date.parse(attention.since);
+    const outputThisCheck = outputSinceCheck;
     outputSinceCheck = false;
+    watchLimit(lines, nowMs, outputThisCheck);
     let decision = screenDecision(attention, detected, idle, freshOutput, at);
     const open = attention.prompt;
     // A different block in place of the open one supersedes it without a blank screen between.
@@ -1260,7 +1323,9 @@ server.listen(socketPath(runDir, session.id), async () => {
           persist();
         },
         onExit: () => { child?.kill("SIGTERM"); },
-        onSignal: (signal) => { record(signal, "protocol"); },
+        onSignal: (signal) => {
+          if (signal.kind === "provider-limit") { limitWatch = undefined; recordLimit(signal, "protocol"); } else record(signal, "protocol");
+        },
         onMessage: (message) => { recordMessage(message); },
         record: (method) => { append("input-intent", { op: "native", method }); },
       });

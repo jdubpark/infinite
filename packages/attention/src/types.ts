@@ -68,7 +68,6 @@ export interface Attention {
   lastMessage?: string;
   lastTool?: { tool: string; summary: string; at: string };
   lastActivityAt: string;
-  lastSuccessfulTurnAt?: string;
   hooks: "active" | "none";
   hookErrors: number;
   limit?: { limit: "usage" | "credits"; confidence: "single-source" | "corroborated"; resetsAt?: string; since: string; message: string };

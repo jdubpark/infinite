@@ -28,6 +28,8 @@ export type TeamView = {
   lineup?: TeamLineup; linear?: LinearTracking; brief?: TeamBrief;
   goal?: { id: string; revision: number; cycle: number };
   noChange?: { summary: string; evidence: TeamEvidence[] };
+  /** The host can start a fresh plan from the preserved integration commit, as after a member's runtime limit. */
+  resumable?: boolean;
 };
 
 export type GoalStatus = "running" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-opportunity" | "limit-reached" | "cancelled" | "achieved";
@@ -128,7 +130,7 @@ export function teamControls(team: TeamView, role: DeviceRole | undefined, fresh
     answer: acts && !["paused", "cancelled"].includes(team.status),
     steer: acts && !team.goal && team.status !== "cancelled" && !deliveryStarted,
     pause: owns && !deliveryReported && !["paused", "blocked", "ready-for-review", "no-change", "merged"].includes(team.status),
-    resume: owns && team.status === "paused" && !deliveryReported,
+    resume: owns && (team.status === "paused" || team.resumable === true) && !deliveryReported,
     cancel: owns,
   };
 }

@@ -233,8 +233,8 @@ infinite resume [SESSION_ID]                Reattach to a live process
 infinite monitor [SESSION_ID]               Watch; Enter enables interaction
 infinite repo init [DIRECTORY]              Enroll a repository or set parent-folder Linear defaults
 infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
-infinite team status [ID]                   Show teams or one team
-infinite team watch ID                      Poll team status; Ctrl+C detaches
+infinite team status [ID] [--logs]          Show teams, or one team's Jevcode summary
+infinite team watch ID [--logs]             Follow the summary; l logs, n/p agents, b summary
 infinite team steer ID TEXT                 Steer an active team
 infinite team answer ID QUESTION_ID TEXT    Answer a pending question
 

@@ -18,8 +18,10 @@ possible provider tool effect.
 Each member report is bound to its run, member, and revision and is acknowledged
 after durable recording. Separate Git copies isolate edits without sandboxing
 providers. Git, setup, and check commands must run under the intended agent
-identity. Workspace files remain plaintext runtime data. Provider permissions
-remain unchanged; headless OpenCode rejects unmet permissions instead of
+identity. Workspace files remain plaintext runtime data. A team member trusts
+only its assigned workspace. The host accepts ordinary tool prompts there, and
+the coordinator model decides dangerous ones. Other sessions do not receive
+that approval. Headless OpenCode rejects unmet permissions instead of
 providing an interactive approval flow. Profile `dataUse` labels disclose
 configured contributor use without changing provider terms or retention. See
 [Goals and agent teams](teams.md) for scope, routing, limits, and recovery.

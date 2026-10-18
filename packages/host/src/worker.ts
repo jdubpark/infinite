@@ -40,6 +40,7 @@ import { startHookServer, HookPayloadError, type HookReply, type HookRoute } fro
 import { teamReportEnvelopeSchema } from "./team-types.js";
 import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
 import { buildLaunch } from "./launch.js";
+import { acceptClaudeWorkspaceTrust, teamApprovalChoice } from "./team-approval.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
@@ -541,11 +542,34 @@ function checkScreen() {
       publish({ ...attention, state: "working", since: at, source: "screen" });
     // Keep the one-line summary current even when nothing above changed the state.
     if (describeNow(attention, provider) !== attention.now) publish(attention);
+    considerTeamApproval();
   } catch {
     /* journal failures already went through recordingFailure() */
   }
 }
 setInterval(checkScreen, 1000).unref();
+
+const teamAnswerAttempts = new Map<number, number>();
+let lastTeamAnswerAt = 0;
+/** Team members accept their own workspace and ordinary tool prompts. A person at the keyboard keeps the lease. */
+function considerTeamApproval() {
+  if (!session.team || state.status !== "running" || answering !== undefined) return;
+  if (Date.now() - lastTeamAnswerAt < 1000 || currentControl()) return;
+  const open = attention.prompt;
+  const attempts = open ? teamAnswerAttempts.get(open.id) ?? 0 : 0;
+  if (!open?.hash || attempts >= 2) return;
+  const detected = screenPrompt();
+  if (!detected || hashOf(detected.fingerprint) !== open.hash) return;
+  const choice = teamApprovalChoice(detected, session.cwd);
+  if (choice.action !== "accept") return;
+  teamAnswerAttempts.set(open.id, attempts + 1);
+  lastTeamAnswerAt = Date.now();
+  const requestId = randomUUID();
+  void serialize(() => answer({ op: "answer", requestId, promptId: open.id, option: choice.option })).catch((error: unknown) => {
+    // The lease won a race. Do not spend the attempt, and do not press keys over the person.
+    if (error instanceof Refusal && error.code === "control-busy") teamAnswerAttempts.set(open.id, attempts);
+  });
+}
 
 // ---- Input: text, keys, stop and prompt answers, one at a time ------------------------------
 
@@ -1079,6 +1103,8 @@ server.listen(socketPath(runDir, session.id), async () => {
     if (session.team) {
       if (!hookServer) throw new Error("Team report channel could not start");
       env.INFINITE_TEAM_ASSIGNMENT = JSON.stringify(session.team);
+      if (provider === "claude" && env.HOME)
+        try { acceptClaudeWorkspaceTrust(join(env.HOME, ".claude.json"), session.cwd); } catch { /* the screen backstop still accepts this workspace */ }
     }
     if (hookServer) {
       env.INFINITE_HOOK_URL = hookServer.url;

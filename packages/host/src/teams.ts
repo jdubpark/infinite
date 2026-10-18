@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ProviderLimits } from "./provider-limits.js";
-import type { Config } from "./types.js";
+import type { Config, WorkerState } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
@@ -14,6 +14,10 @@ import type { UsageService } from "./usage-service.js";
 import type { LinearService } from "./linear.js";
 import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { coordinatorJudgeLaunch, coordinatorJudgePrompt, parseCoordinatorVerdict, teamApprovalChoice } from "./team-approval.js";
+import type { Prompt } from "@infinite/attention";
 export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
@@ -32,7 +36,31 @@ const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(va
 const timestamp = () => new Date().toISOString();
 const activeMember = (member: TeamMember) => ["queued", "running", "reported", "unavailable"].includes(member.status);
 const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
+const coordinatorReviewReason = "The coordinator is reviewing a dangerous tool approval.";
 const runtimeUnavailableReason = "An agent runtime is unavailable; the team is waiting for confirmed state.";
+export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
+
+/** A one-hour member stop can replan. Interrupted workspace operations cannot. */
+export function blockedTeamCanResume(input: {
+  status: string;
+  reason?: string;
+  pending: boolean;
+  deliveryAttempt: boolean;
+  deliveryReceipt: boolean;
+  prepared: boolean;
+  stopReason?: string;
+  linearStatus?: string;
+}): boolean {
+  return input.status === "blocked"
+    && input.reason === memberTimeLimitReason
+    && input.prepared
+    && !input.pending
+    && !input.deliveryAttempt
+    && !input.deliveryReceipt
+    && !input.stopReason
+    && input.linearStatus !== "blocked";
+}
+const execFileAsync = promisify(execFile);
 const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runId, memberId: member.memberId, revision: member.revision, role: member.role, ...(member.taskId ? { taskId: member.taskId } : {}) });
 
 /** Durable orchestration; reports describe agent claims, configured checks describe host evidence. */
@@ -44,6 +72,7 @@ export class TeamService {
   private closed = false;
   private tickQueued = false;
   private readonly commands = new Map<string, AbortController>();
+  private readonly permissionReviews = new Map<string, { attempts: number; pending: boolean }>();
   private readonly directory: string;
   private usage?: UsageService;
   readonly limits: ProviderLimits;
@@ -84,13 +113,26 @@ export class TeamService {
     const canonical = stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, create) : ensureDefaultTeamRoot(root, create);
     assertTeamPath(canonical, path);
   }
+  private canResume(stored: Stored, linearStatus = stored.run.linear?.status) {
+    const run = stored.run;
+    return blockedTeamCanResume({
+      status: run.status,
+      reason: run.reason,
+      pending: Boolean(stored.pending),
+      deliveryAttempt: Boolean(stored.deliveryAttempt),
+      deliveryReceipt: Boolean(run.deliveryReceipt),
+      prepared: stored.prepared,
+      stopReason: run.stopReason,
+      linearStatus,
+    });
+  }
   private view(stored: Stored): TeamView {
     const { members, ...run } = structuredClone(stored.run);
     // Queue evidence from this exact state before a goal can use its sync gate
     // to continue from a newly reviewed or no-change result.
     const tracking = this.linear?.updateTeam(stored.run, stored.run.linearTracking === true);
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
-    return { ...run, ...(this.usage ? { usage: this.usage.aggregate(members) } : {}), providerLimits: this.limits.active(), members: members.map(({ prompt: _prompt, feedback: _feedback, pendingLimit: _pendingLimit, ...member }) => {
+    return { ...run, resumable: this.canResume(stored, run.linear?.status), ...(this.usage ? { usage: this.usage.aggregate(members) } : {}), providerLimits: this.limits.active(), members: members.map(({ prompt: _prompt, feedback: _feedback, pendingLimit: _pendingLimit, ...member }) => {
       const usage = this.usage?.session(member.sessionId);
       return { ...member, ...(usage?.measured ? { usage } : {}) };
     }) };
@@ -294,12 +336,12 @@ export class TeamService {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, action, body)) return this.view(stored);
       if (action === "pause" && ["blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
-      if (action === "resume" && (stored.pending || stored.deliveryAttempt || run.deliveryReceipt || !stored.prepared || run.status === "blocked"))
+      if (action === "resume" && (stored.pending || stored.deliveryAttempt || run.deliveryReceipt || !stored.prepared || (run.status === "blocked" && !this.canResume(stored))))
         throw new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
       if (action === "resume" && stored.halt) throw new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
       if (!this.mutation(stored, action, body)) return this.view(stored);
       if (action === "resume") {
-        if (run.status !== "paused") { this.save(stored); return this.view(stored); }
+        if (run.status !== "paused" && !this.canResume(stored)) { this.save(stored); return this.view(stored); }
         // Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection.
         run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
         run.brief = undefined; run.noChange = undefined;
@@ -371,6 +413,69 @@ export class TeamService {
       : stored.run.stopReason === "member-limit" ? "The goal reached this run's agent attempt limit. Active work is being stopped and retained for inspection."
         : error instanceof TeamError ? error.message : "A team operation failed. Its workspaces and recorded evidence were preserved for inspection.";
     this.event(stored, stored.run.reason); this.save(stored);
+  }
+  private attentionReason(state: WorkerState, cwd: string): string | undefined {
+    if (["unavailable", "recording-error"].includes(state.status)) return runtimeUnavailableReason;
+    if (state.status === "exited" || state.attention.state !== "needs-you" || !state.attention.prompt) return undefined;
+    const choice = teamApprovalChoice(state.attention.prompt, cwd);
+    if (choice.action === "ask-coordinator") return coordinatorReviewReason;
+    // The member process can press Yes only when the dialog is on screen.
+    if (choice.action === "accept" && state.attention.prompt.hash) return undefined;
+    return providerInputReason;
+  }
+  /** A dangerous prompt with no pressable decision, or two finished reviews, still needs a person. */
+  private approvalReason(state: WorkerState, member: TeamMember): string | undefined {
+    const reason = this.attentionReason(state, member.cwd);
+    if (reason !== coordinatorReviewReason || !state.attention.prompt) return reason;
+    const prompt = state.attention.prompt;
+    const accept = prompt.options.some(option => option.role === "accept");
+    const reject = prompt.options.some(option => option.role === "reject" || option.role === "reject-with-feedback");
+    const row = this.permissionReviews.get(`${member.sessionId}:${prompt.id}`);
+    if (!accept || !reject || (row && !row.pending && row.attempts >= 2)) return providerInputReason;
+    return reason;
+  }
+  private coordinatorLaunch(run: TeamRun, prompt: string) {
+    const selection = run.lineup?.coordinator;
+    const provider = selection?.provider ?? run.provider;
+    if (provider !== "claude") return undefined;
+    const profile = this.config.agents.claude;
+    if (!profile) return undefined;
+    return coordinatorJudgeLaunch(selection ? teamModelLaunch(profile, selection) : profile, prompt);
+  }
+  private reviewDangerousApproval(stored: Stored, member: TeamMember, prompt: Prompt) {
+    const key = `${member.sessionId}:${prompt.id}`;
+    const current = this.permissionReviews.get(key);
+    if (current?.pending || (current?.attempts ?? 0) >= 2 || this.closed) return;
+    const accept = prompt.options.find(option => option.role === "accept");
+    const reject = prompt.options.find(option => option.role === "reject") ?? prompt.options.find(option => option.role === "reject-with-feedback");
+    if (!accept || !reject) return;
+    const attempts = (current?.attempts ?? 0) + 1;
+    this.permissionReviews.set(key, { attempts, pending: true });
+    const judged = coordinatorJudgePrompt({ workspace: member.cwd, role: member.role, title: prompt.title, detail: prompt.detail, options: prompt.options.map(option => option.label) });
+    const launch = this.coordinatorLaunch(stored.run, judged);
+    this.event(stored, `Coordinator is reviewing a dangerous approval: ${prompt.title.slice(0, 160)}`);
+    this.save(stored);
+    const decide = launch
+      ? execFileAsync(launch.command, launch.args, { timeout: 90_000, maxBuffer: 200_000, killSignal: "SIGTERM", encoding: "utf8" })
+        .then(({ stdout }) => parseCoordinatorVerdict(String(stdout)) ?? { allow: false, reason: "The coordinator did not return a decision." })
+        .catch(() => ({ allow: false, reason: "The coordinator did not return a decision." }))
+      : Promise.resolve({ allow: false, reason: "This coordinator provider has no print-mode approval check." });
+    void decide.then(verdict => this.enqueue(async () => {
+      const row = this.permissionReviews.get(key);
+      if (row) row.pending = false;
+      try {
+        if (this.closed || stored.run.status === "cancelled") return;
+        const state = await this.manager.state(member.sessionId);
+        if (state.attention.prompt?.id !== prompt.id || state.attention.state !== "needs-you") return;
+        await this.manager.answerTeamPrompt(member.sessionId, randomUUID(), prompt.id, verdict.allow ? accept.index : reject.index, assignment(member));
+        this.event(stored, `${verdict.allow ? "Coordinator allowed" : "Coordinator denied"} a dangerous approval${verdict.reason ? `: ${verdict.reason}` : ""}.`);
+        this.save(stored);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "The approval could not be answered.";
+        this.event(stored, `Dangerous approval was not answered: ${message.slice(0, 240)}`);
+        this.save(stored);
+      }
+    }));
   }
   private hasLaunch(member: TeamMember) {
     try { this.manager.meta(member.sessionId); return true; }
@@ -459,12 +564,17 @@ export class TeamService {
         this.save(stored); return;
       }
       if (!stored.prepared || ["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) return;
-      if (run.reason === providerInputReason || run.reason === runtimeUnavailableReason) {
-        const states = await Promise.all(run.members.filter(member => member.revision === run.revision && activeMember(member) && member.status !== "queued" && !member.report)
-          .map(member => this.manager.state(member.sessionId)));
+      if (run.reason === providerInputReason || run.reason === coordinatorReviewReason || run.reason === runtimeUnavailableReason) {
+        const members = run.members.filter(member => member.revision === run.revision && activeMember(member) && member.status !== "queued" && !member.report);
+        const states = await Promise.all(members.map(member => this.manager.state(member.sessionId)));
         if (this.closed) return;
-        const reason = states.some(state => ["unavailable", "recording-error"].includes(state.status)) ? runtimeUnavailableReason
-          : states.some(state => state.status !== "exited" && state.attention.state === "needs-you") ? providerInputReason : undefined;
+        let reason: string | undefined;
+        for (let index = 0; index < members.length; index++) {
+          const next = this.approvalReason(states[index], members[index]);
+          if (next === runtimeUnavailableReason) { reason = next; break; }
+          if (next === providerInputReason) reason = next;
+          else if (next && reason !== providerInputReason) reason = next;
+        }
         if (run.reason !== reason) { run.reason = reason; this.save(stored); }
       }
       if (stored.pending) return;
@@ -472,7 +582,7 @@ export class TeamService {
       for (const member of run.members.filter(item => item.revision === run.revision && activeMember(item))) {
         if (member.status === "queued") { await this.launch(stored, member); continue; }
         if (!member.report) {
-          if (member.startedAt && Date.now() - Date.parse(member.startedAt) > 60 * 60 * 1000) { this.block(stored, new TeamError(409, "member-time-limit", "An agent exceeded its one-hour runtime limit. Its workspace was preserved.")); return; }
+          if (member.startedAt && Date.now() - Date.parse(member.startedAt) > 60 * 60 * 1000) { this.block(stored, new TeamError(409, "member-time-limit", memberTimeLimitReason)); return; }
           const page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
           member.cursor = page.cursor;
           for (const event of page.events) {
@@ -505,7 +615,11 @@ export class TeamService {
             if (state.status === "exited" && (page.more || member.cursor < state.seq)) { this.save(stored); continue; }
             if (state.status === "exited") { member.status = "stopped"; this.block(stored, new TeamError(409, "missing-agent-report", "An agent exited without a valid structured report. Its task is unresolved.")); return; }
             if (["unavailable", "recording-error"].includes(state.status)) { member.status = "unavailable"; run.reason = runtimeUnavailableReason; }
-            else if (state.attention.state === "needs-you") run.reason = providerInputReason;
+            else if (state.attention.state === "needs-you" && state.attention.prompt) {
+              const reason = this.approvalReason(state, member);
+              if (reason === coordinatorReviewReason) this.reviewDangerousApproval(stored, member, state.attention.prompt);
+              if (reason) run.reason = reason;
+            }
             else member.status = "running";
             this.save(stored); continue;
           }

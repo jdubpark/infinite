@@ -9,6 +9,8 @@ import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
+import { memberTimeLimitReason } from "../packages/host/src/teams.js";
 import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 
 import { git, limitLineup, mixedLineup, fixture } from "./team-fixture.js";
@@ -878,4 +880,32 @@ test("provider limit memory expires and successful clearing survives restart wit
     limits.observe({ ...observation, detectedAt: "2026-10-18T12:02:00.000Z" });
     assert.equal(limits.active(new Date("2026-10-18T12:03:00Z")).length, 1);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a team blocked by the one-hour member limit resumes into a fresh plan", { timeout: 60000 }, async () => {
+  const f = await fixture("mcp");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const id = created.body.id;
+    await waitFor(() => f.get(id), run => run.members.some(member => member.status === "running" && member.startedAt), 30000);
+    await f.host.stopApi();
+    const key = readFileSync(f.host.config.keyFile);
+    const file = join(f.host.config.stateDir, "teams", `${id}.sealed`);
+    const stored = unseal<{ run: { members: { startedAt?: string }[] } }>(key, `team:${id}`, readFileSync(file, "utf8"));
+    const startedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    for (const member of stored.run.members) member.startedAt = startedAt;
+    writeSealed(file, key, `team:${id}`, stored);
+    await f.host.start();
+    const blocked = await waitFor(() => f.get(id), run => run.status === "blocked" && run.reason === memberTimeLimitReason && run.resumable === true && run.members.every(member => !["queued", "running", "reported", "unavailable"].includes(member.status)), 30000);
+    const head = blocked.headCommit;
+    const resumed = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
+    assert.equal(resumed.body.status, "planning");
+    assert.equal(resumed.body.revision, blocked.revision + 1);
+    assert.equal(resumed.body.reason, undefined);
+    assert.equal(resumed.body.resumable, false);
+    assert.equal(resumed.body.headCommit, head);
+    assert.equal(resumed.body.members.length, blocked.members.length);
+  } finally { await f.close(); }
 });

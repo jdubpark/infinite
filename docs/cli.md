@@ -46,8 +46,11 @@ infinite repo init --linear-team TEAM_UUID --linear-project PROJECT_UUID
 infinite team start "Add a feature"
 infinite team start --prd requirements.md
 infinite team status
+infinite team status TEAM_ID
 infinite team status TEAM_ID --json
+infinite team status TEAM_ID --logs
 infinite team watch TEAM_ID
+infinite team watch TEAM_ID --logs
 infinite team pull TEAM_ID [--json]
 infinite team steer TEAM_ID "Keep the change within the API package"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing route"
@@ -55,6 +58,18 @@ infinite team pause TEAM_ID
 infinite team resume TEAM_ID
 infinite team cancel TEAM_ID
 ```
+
+`infinite team status` without an ID lists each team. `infinite team status TEAM_ID`
+prints that team's open decisions and Jevcode summary. `infinite team watch
+TEAM_ID` keeps it full screen: `l` opens one agent's review log, `←` `→` or
+`n` `p` change agents, `s` or `b` returns to the summary, `↑` `↓`, `j` `k`,
+Space, and Page Up or Down scroll, `a` asks Jevcode when the summary is empty or
+failed, and `q` or Ctrl+C detaches. The bottom line always lists the keys for
+the current view. A non-interactive watch prints again only when the visible
+text changes. `--logs` starts in the review log, and
+`infinite team status TEAM_ID --logs` prints the current revision's logs once.
+`--json` prints the team record. See [Goals and agent teams](teams.md) for the
+full key list.
 
 Linear IDs are saved during enrollment; team commands do not need them again.
 To reuse them across repositories, initialize their parent folder once:

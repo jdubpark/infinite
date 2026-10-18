@@ -12,8 +12,12 @@ import {
 } from "./model";
 import { Clamp, Disclosure, LineupView, LinearLine, ProfileLine, providerName, RequestStatus, RunPill, Section, SteerBox, t } from "./parts";
 import { useRunRequest } from "./useRunRequest";
+import { JevcodeSummary, ReviewLogs, ViewSwitch, type TeamViewMode } from "./TeamSummary";
 
-/** One team run: what it needs from you, who is working, the evidence, and its controls. */
+/**
+ * One team run. It opens on what needs you and the Jevcode summary; Review logs shows one agent at
+ * a time. The plan, members, and evidence stay one tap away under Run details.
+ */
 export function TeamDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
   const machine = connectionKey(connection);
@@ -24,6 +28,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const [recorded, setRecorded] = useState<TeamView | null>(null);
   const team = poll.data ? newer(recorded, poll.data) : recorded;
   const [direction, setDirection] = useState("");
+  const [mode, setMode] = useState<TeamViewMode>("summary");
+  const [agentId, setAgentId] = useState("");
   const request = useRunRequest<TeamView>(connection, `${machine}/team/${id}`, {
     accepted: (result, sent) => { setRecorded(result); if (sent.path.endsWith("/steer")) setDirection(""); poll.refresh(); },
     refused: poll.refresh,
@@ -68,6 +74,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       <Text style={t.note}>{fresh ? `Updated ${poll.seen}` : poll.seen ? `Last received ${poll.seen}` : "Waiting for a fresh response…"}</Text>
     </View>
     {!fresh ? <Text style={t.banner}>Last received team state. Controls are paused until the host reconnects. The team may still be working.</Text> : null}
+    <ViewSwitch mode={mode} onChange={setMode} />
     <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
       {team.reason ? <Text style={t.warning}>{team.reason}</Text> : null}
       <LinearLine tracking={team.linear} fresh={fresh} />
@@ -92,7 +99,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </Section> : null}
 
       {needsYou.length ? <Section title="Agent sessions need you" count={needsYou.length}>
-        <Text style={t.note}>Respond to provider permission prompts in the session. The team never approves them.</Text>
+        <Text style={t.note}>The host answers ordinary prompts in a member’s own workspace. These sessions still wait on a provider prompt; respond in the session.</Text>
         {needsYou.map(session => <View key={session.id} style={[t.card, t.attention]}>
           <Text style={t.strong}>{session.title}</Text>
           <Text style={t.note} numberOfLines={2}>{session.attention.now || "Open the session to respond."}</Text>
@@ -105,83 +112,88 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
         {team.noChange.evidence.map((item, index) => <Text key={index} style={t.note}>{item.source}: {item.observation}</Text>)}
       </Section> : null}
 
-      <Section title="Your request"><Clamp text={team.objective} /></Section>
+      {mode === "summary" ? <>
+        <JevcodeSummary connection={connection} team={team} />
+        <Disclosure title="Run details: request, plan, members, and evidence">
+          <Section title="Your request"><Clamp text={team.objective} /></Section>
 
-      {team.brief ? <Section title="Opportunity brief">
-        <Text style={t.note}>An agent proposal, not a confirmed outcome.</Text>
-        <Text style={t.strong}>{team.brief.title}</Text>
-        <Clamp text={team.brief.problem} lines={4} />
-        <Disclosure title="Acceptance criteria and evidence">
-          {team.brief.acceptance.map((item, index) => <Text key={index} style={t.body}>• {item}</Text>)}
-          <Text style={t.label}>Expected outcome</Text>
-          <Text style={t.body}>{team.brief.expectedOutcome}</Text>
-          {team.brief.evidence.map((item, index) => <Text key={index} style={t.note}>{item.source}: {item.observation}</Text>)}
-        </Disclosure>
-      </Section> : null}
-
-      <Section title="Work plan" count={team.tasks.length}>
-        {team.tasks.length ? team.tasks.map(task => {
-          const member = team.members.find(value => value.memberId === task.memberId);
-          const profile = member?.modelProfile ?? [...(team.lineup?.implementers ?? []), ...(team.lineup?.escalations ?? [])].find(value => value.id === task.agentProfileId);
-          return <View key={task.id} style={t.card}>
-            <View style={s.spread}><Text style={[t.strong, s.fill]}>{task.title}</Text><Text style={t.note}>{task.status}</Text></View>
-            <Text style={t.note}>{task.dependsOn.length ? `After ${task.dependsOn.map(dependency => team.tasks.find(value => value.id === dependency)?.title ?? dependency).join(", ")}` : "No task dependencies"}</Text>
-            {profile ? <ProfileLine profile={profile} /> : null}
-            {task.escalation ? <Text style={t.warning}>Escalated to {task.escalation.toProfileId}: {task.escalation.reason}</Text> : null}
-            {task.summary ? <Clamp text={task.summary} lines={3} /> : null}
-            <Disclosure title="Instructions and owned paths">
-              <Text style={t.body}>{task.instructions}</Text>
-              {task.paths.map(path => <Text key={path} style={t.mono}>{path}</Text>)}
+          {team.brief ? <Section title="Opportunity brief">
+            <Text style={t.note}>An agent proposal, not a confirmed outcome.</Text>
+            <Text style={t.strong}>{team.brief.title}</Text>
+            <Clamp text={team.brief.problem} lines={4} />
+            <Disclosure title="Acceptance criteria and evidence">
+              {team.brief.acceptance.map((item, index) => <Text key={index} style={t.body}>• {item}</Text>)}
+              <Text style={t.label}>Expected outcome</Text>
+              <Text style={t.body}>{team.brief.expectedOutcome}</Text>
+              {team.brief.evidence.map((item, index) => <Text key={index} style={t.note}>{item.source}: {item.observation}</Text>)}
             </Disclosure>
-          </View>;
-        }) : <Text style={t.note}>The coordinator has not reported a plan for this revision yet.</Text>}
-      </Section>
+          </Section> : null}
 
-      <Section title="Members" count={currentMembers.length}>
-        {currentMembers.length ? currentMembers.map(member => <MemberRow key={member.memberId} member={member} session={listed.get(member.sessionId)} listed={sessions !== null} provider={team.provider} onOpen={openSession} />)
-          : <Text style={t.note}>No members have started for this revision.</Text>}
-        {earlierMembers.length ? <Disclosure title={`Earlier revisions (${earlierMembers.length})`}>
-          {earlierMembers.map(member => <MemberRow key={member.memberId} member={member} session={listed.get(member.sessionId)} listed={sessions !== null} provider={team.provider} onOpen={openSession} />)}
-        </Disclosure> : null}
-        {team.lineup ? <Disclosure title="Recorded lineup">
-          <Text style={t.note}>Requested model settings recorded when the run started; provider policy may override them.</Text>
-          <LineupView lineup={team.lineup} />
-        </Disclosure> : null}
-      </Section>
+          <Section title="Work plan" count={team.tasks.length}>
+            {team.tasks.length ? team.tasks.map(task => {
+              const member = team.members.find(value => value.memberId === task.memberId);
+              const profile = member?.modelProfile ?? [...(team.lineup?.implementers ?? []), ...(team.lineup?.escalations ?? [])].find(value => value.id === task.agentProfileId);
+              return <View key={task.id} style={t.card}>
+                <View style={s.spread}><Text style={[t.strong, s.fill]}>{task.title}</Text><Text style={t.note}>{task.status}</Text></View>
+                <Text style={t.note}>{task.dependsOn.length ? `After ${task.dependsOn.map(dependency => team.tasks.find(value => value.id === dependency)?.title ?? dependency).join(", ")}` : "No task dependencies"}</Text>
+                {profile ? <ProfileLine profile={profile} /> : null}
+                {task.escalation ? <Text style={t.warning}>Escalated to {task.escalation.toProfileId}: {task.escalation.reason}</Text> : null}
+                {task.summary ? <Clamp text={task.summary} lines={3} /> : null}
+                <Disclosure title="Instructions and owned paths">
+                  <Text style={t.body}>{task.instructions}</Text>
+                  {task.paths.map(path => <Text key={path} style={t.mono}>{path}</Text>)}
+                </Disclosure>
+              </View>;
+            }) : <Text style={t.note}>The coordinator has not reported a plan for this revision yet.</Text>}
+          </Section>
 
-      <Section title="Verification">
-        <Text style={t.note}>Host check results and the reviewer’s assessment are recorded separately.</Text>
-        {team.checks.length ? team.checks.map((check, index) => <View key={`${check.startedAt}/${index}`} style={t.card}>
-          <Text style={t.mono}>{[check.command.command, ...check.command.args].join(" ")}</Text>
-          <Text style={check.status === "failed" ? t.error : t.note}>{check.phase === "setup" ? "Setup · " : ""}{check.status} · revision {check.revision} · {shortDate(check.startedAt)}{check.exitCode !== undefined ? ` · exit ${String(check.exitCode)}` : ""}</Text>
-          <Disclosure title="Output"><Text selectable style={t.mono}>{check.output ? check.output.slice(-6000) : "No output recorded."}</Text></Disclosure>
-        </View>) : <Text style={t.note}>No check results recorded yet.</Text>}
-        <Text style={t.label}>Reviewer assessment</Text>
-        {team.review ? <>
-          <Text style={team.review.verdict === "approved" ? t.strong : t.warning}>{team.review.verdict === "approved" ? "Approved" : "Changes requested"} · revision {team.review.revision} (agent claim)</Text>
-          <Clamp text={team.review.summary} lines={4} />
-          {team.review.uiEvidence ? <Disclosure title="Interface evidence"><Text style={t.body}>{team.review.uiEvidence}</Text></Disclosure> : null}
-        </> : <Text style={t.note}>No review recorded for this revision.</Text>}
-      </Section>
+          <Section title="Members" count={currentMembers.length}>
+            {currentMembers.length ? currentMembers.map(member => <MemberRow key={member.memberId} member={member} session={listed.get(member.sessionId)} listed={sessions !== null} provider={team.provider} onOpen={openSession} />)
+              : <Text style={t.note}>No members have started for this revision.</Text>}
+            {earlierMembers.length ? <Disclosure title={`Earlier revisions (${earlierMembers.length})`}>
+              {earlierMembers.map(member => <MemberRow key={member.memberId} member={member} session={listed.get(member.sessionId)} listed={sessions !== null} provider={team.provider} onOpen={openSession} />)}
+            </Disclosure> : null}
+            {team.lineup ? <Disclosure title="Recorded lineup">
+              <Text style={t.note}>Requested model settings recorded when the run started; provider policy may override them.</Text>
+              <LineupView lineup={team.lineup} />
+            </Disclosure> : null}
+          </Section>
 
-      <Section title="Changes">
-        <Text style={t.note}>Branch</Text><Text selectable style={t.mono}>{team.branch}</Text>
-        <Text style={t.note}>Workspace</Text><Text selectable style={t.mono}>{team.workspace}</Text>
-        <Text style={t.note}>Base commit</Text><Text selectable style={t.mono}>{team.baseCommit}</Text>
-        {team.headCommit ? <><Text style={t.note}>Head commit</Text><Text selectable style={t.mono}>{team.headCommit}</Text></> : null}
-      </Section>
+          <Section title="Verification">
+            <Text style={t.note}>Host check results and the reviewer’s assessment are recorded separately.</Text>
+            {team.checks.length ? team.checks.map((check, index) => <View key={`${check.startedAt}/${index}`} style={t.card}>
+              <Text style={t.mono}>{[check.command.command, ...check.command.args].join(" ")}</Text>
+              <Text style={check.status === "failed" ? t.error : t.note}>{check.phase === "setup" ? "Setup · " : ""}{check.status} · revision {check.revision} · {shortDate(check.startedAt)}{check.exitCode !== undefined ? ` · exit ${String(check.exitCode)}` : ""}</Text>
+              <Disclosure title="Output"><Text selectable style={t.mono}>{check.output ? check.output.slice(-6000) : "No output recorded."}</Text></Disclosure>
+            </View>) : <Text style={t.note}>No check results recorded yet.</Text>}
+            <Text style={t.label}>Reviewer assessment</Text>
+            {team.review ? <>
+              <Text style={team.review.verdict === "approved" ? t.strong : t.warning}>{team.review.verdict === "approved" ? "Approved" : "Changes requested"} · revision {team.review.revision} (agent claim)</Text>
+              <Clamp text={team.review.summary} lines={4} />
+              {team.review.uiEvidence ? <Disclosure title="Interface evidence"><Text style={t.body}>{team.review.uiEvidence}</Text></Disclosure> : null}
+            </> : <Text style={t.note}>No review recorded for this revision.</Text>}
+          </Section>
 
-      {team.steering.length || answered.length ? <Section title="Your directions and decisions">
-        {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>Direction · revision {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
-        {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · revision {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>Your answer: {decision.answer}</Text></View>)}
-      </Section> : null}
+          <Section title="Changes">
+            <Text style={t.note}>Branch</Text><Text selectable style={t.mono}>{team.branch}</Text>
+            <Text style={t.note}>Workspace</Text><Text selectable style={t.mono}>{team.workspace}</Text>
+            <Text style={t.note}>Base commit</Text><Text selectable style={t.mono}>{team.baseCommit}</Text>
+            {team.headCommit ? <><Text style={t.note}>Head commit</Text><Text selectable style={t.mono}>{team.headCommit}</Text></> : null}
+          </Section>
 
-      {team.events.length ? <Disclosure title={`Run history (${team.events.length})`}>
-        {[...team.events].reverse().map((event, index) => <Text key={`${event.at}/${index}`} style={t.note}>{shortDate(event.at)} · {event.text}</Text>)}
-      </Disclosure> : null}
+          {team.steering.length || answered.length ? <Section title="Your directions and decisions">
+            {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>Direction · revision {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
+            {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · revision {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>Your answer: {decision.answer}</Text></View>)}
+          </Section> : null}
+
+          {team.events.length ? <Disclosure title={`Run history (${team.events.length})`}>
+            {[...team.events].reverse().map((event, index) => <Text key={`${event.at}/${index}`} style={t.note}>{shortDate(event.at)} · {event.text}</Text>)}
+          </Disclosure> : null}
+        </Disclosure>
+      </> : <ReviewLogs connection={connection} team={team} agentId={agentId} onSelect={setAgentId} onOpen={openSession} onBack={() => setMode("summary")} />}
 
       {me?.role === "owner" && !team.goal && team.status !== "cancelled" ? <View style={s.actions}>
-        {team.status === "paused" ? team.deliveryReceipt ? null : <Button title="Resume team" secondary disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
+        {team.status === "paused" || team.resumable ? team.deliveryReceipt ? null : <Button title="Resume team" secondary disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
           : controls.pause ? <Button title="Pause team" secondary disabled={locked} onPress={() => send("/pause", "Pause")} /> : null}
         <Button title="Cancel team…" secondary disabled={!controls.cancel || locked} onPress={() => Alert.alert("Cancel this team?", "This stops its agent sessions and keeps the recorded work and evidence.", [
           { text: "Keep running", style: "cancel" },

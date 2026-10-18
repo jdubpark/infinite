@@ -27,6 +27,7 @@ import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { TeamService, TeamError } from "./teams.js";
+import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
 import { GoalService } from "./goals.js";
 import { LinearService } from "./linear.js";
@@ -361,6 +362,33 @@ export function createApp(config: Config, key: Buffer) {
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  app.get("/api/teams/:id/bundle", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    const bundle = await teams.bundle(id.parse(req.params.id));
+    const limit = 512 * 1024 * 1024;
+    const child = spawnTeamBundle(bundle.workspace, bundle.branch, config.teams?.commandPrefix);
+    res.status(200).set({ "Content-Type": "application/octet-stream", "X-Infinite-Branch": bundle.branch, "X-Infinite-Head": bundle.head });
+    let size = 0, finished = false;
+    const stop = () => {
+      if (finished) return;
+      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* Already exited. */ }
+    };
+    const disconnect = () => { if (!res.writableEnded) stop(); };
+    req.once("aborted", disconnect);
+    res.once("close", disconnect);
+    child.stdout.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) { stop(); finished = true; res.destroy(); return; }
+      if (!res.write(chunk)) child.stdout.pause();
+    });
+    res.on("drain", () => child.stdout.resume());
+    child.stderr.resume();
+    child.once("error", () => { finished = true; res.destroy(); });
+    child.once("close", code => {
+      if (finished) return;
+      finished = true;
+      if (code !== 0) res.destroy(); else res.end();
+    });
+  });
   app.post("/api/teams", requireRole(["owner"]), async (req, res) => {
     const body = createTeamSchema.parse(req.body);
     assertNoHandoff(body.projectId);

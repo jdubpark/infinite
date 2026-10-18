@@ -59,6 +59,32 @@ test("legacy team records without a saved root retain their workspace and branch
   } finally { await f.close(); }
 });
 
+test("team bundle route requires an owner CLI and a recorded result", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const finished = await f.settled(created.body.id);
+    const endpoint = `/teams/${finished.id}/bundle`;
+    for (const role of ["viewer", "controller"] as const)
+      assert.equal((await f.host.fetchApi(endpoint, role)).status, 403);
+    const login = await f.host.fetchApi("/login", null, { token: f.host.tokens.owner }, { Origin: f.host.config.origin });
+    assert.equal(login.status, 200);
+    const browser = { Cookie: login.headers.get("set-cookie")!.split(";")[0], Origin: f.host.config.origin };
+    assert.equal((await f.host.fetchApi(endpoint, null, undefined, browser)).status, 403);
+
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    delete stored.run.headCommit;
+    writeSealed(file, key, `team:${finished.id}`, stored);
+    await f.host.start();
+    const noResult = await f.host.fetchApi(endpoint);
+    assert.equal(noResult.status, 409);
+    assert.equal(noResult.body.code, "team-no-result");
+  } finally { await f.close(); }
+});
+
 test("an opted-in blank project accepts coordinator checks and reaches review only after verifying the implemented invariant", { timeout: 120000 }, async () => {
   const f = await fixture("bootstrap");
   try {

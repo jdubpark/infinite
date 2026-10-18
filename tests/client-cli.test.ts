@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync, realpathSync } from "node:fs";
@@ -60,6 +60,57 @@ test("team CLI starts and reads a real host team, and reports missing host setup
       assert.deepEqual((await unavailable.fetchApi("/teams")).body.teams, [], "missing host setup does not create a team");
     } finally { await unavailable.stop(); }
   } finally { await run.close(); }
+});
+
+test("team pull imports an integrated branch without changing the checkout and refuses a divergent branch", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success");
+  const localRoot = mkdtempSync(join(tmpdir(), "infinite-team-pull-"));
+  const checkout = join(localRoot, "checkout"), otherCheckout = join(localRoot, "other-checkout");
+  const clientFile = join(run.host.root, "pull-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  try {
+    const created = await run.host.fetchApi("/teams", "owner", run.create());
+    const team = await run.settled(created.body.id);
+    assert.equal(team.status, "ready-for-review");
+    const checks = JSON.stringify([{ command: process.execPath, args: ["check.mjs", "--prefix"] }]);
+    await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
+    const enroll = await exec(entry[0], [...entry.slice(1), "repo", "init", "--project", "rehearsal", "--check-json", checks], { cwd: checkout });
+    assert.match(enroll.stdout, /"id": "rehearsal"/);
+
+    const pull = async (directory = checkout, ...args: string[]) => exec(entry[0], [...entry.slice(1), "team", "pull", team.id, ...args], { cwd: directory });
+    const first = JSON.parse((await pull(checkout, "--json")).stdout);
+    assert.deepEqual(first, { teamId: team.id, branch: team.branch, head: team.headCommit });
+    assert.equal(execFileSync("git", ["-C", checkout, "rev-parse", `refs/heads/${team.branch}`], { encoding: "utf8" }).trim(), team.headCommit);
+    assert.equal(execFileSync("git", ["-C", checkout, "symbolic-ref", "--short", "HEAD"], { encoding: "utf8" }).trim(), "main");
+    const second = JSON.parse((await pull(checkout, "--json")).stdout);
+    assert.deepEqual(second, { teamId: team.id, branch: team.branch, head: team.headCommit, upToDate: true });
+
+    await exec("git", ["-C", checkout, "switch", team.branch]);
+    writeFileSync(join(checkout, "local.txt"), "Local work on top of the team result.\n");
+    await exec("git", ["-C", checkout, "add", "local.txt"]);
+    await exec("git", ["-C", checkout, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Local work"]);
+    assert.deepEqual(JSON.parse((await pull(checkout, "--json")).stdout), { teamId: team.id, branch: team.branch, head: team.headCommit, upToDate: true });
+
+    await exec("git", ["-C", checkout, "checkout", "-B", team.branch, run.base]);
+    writeFileSync(join(checkout, "diverged.txt"), "Independent local result.\n");
+    await exec("git", ["-C", checkout, "add", "diverged.txt"]);
+    await exec("git", ["-C", checkout, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Diverged local work"]);
+    const diverged = execFileSync("git", ["-C", checkout, "rev-parse", `refs/heads/${team.branch}`], { encoding: "utf8" }).trim();
+    await exec("git", ["-C", checkout, "switch", "main"]);
+    await assert.rejects(pull(checkout, "--json"), (error: { stderr: string }) => /Git refused to update .*local branch was left unchanged/i.test(error.stderr));
+    assert.equal(execFileSync("git", ["-C", checkout, "rev-parse", `refs/heads/${team.branch}`], { encoding: "utf8" }).trim(), diverged);
+    assert.equal(execFileSync("git", ["-C", checkout, "symbolic-ref", "--short", "HEAD"], { encoding: "utf8" }).trim(), "main");
+
+    await exec("git", ["clone", "--no-hardlinks", run.source, otherCheckout]);
+    await exec(entry[0], [...entry.slice(1), "repo", "init", "--project", "rehearsal", "--check-json", checks], { cwd: otherCheckout });
+    const identity = createHash("sha256").update(`${run.host.origin}\n${run.host.tokens.owner}`).digest("hex");
+    const mappingsPath = join(dirname(clientFile), "team-cli", identity, "repo-mappings.json");
+    const mappings = JSON.parse(readFileSync(mappingsPath, "utf8"));
+    mappings[`${run.host.origin}\n${realpathSync(otherCheckout)}`].projectId = "another-project";
+    writeFileSync(mappingsPath, JSON.stringify(mappings), { mode: 0o600 });
+    await assert.rejects(pull(otherCheckout, "--json"), (error: { stderr: string }) => /another-project.*rehearsal|rehearsal.*another-project/.test(error.stderr));
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
 });
 
 test("repo init configures an explicit project without resolving or replacing its checkout", { timeout: 120000 }, async () => {

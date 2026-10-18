@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema } from "./team-types.js";
@@ -45,6 +47,10 @@ function isolatedGitEnv(overrides: NodeJS.ProcessEnv = {}) {
 }
 function git(cwd: string, args: string[], timeout = 10000) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout, stdio: ["ignore", "pipe", "ignore"], env: gitEnv({ GIT_OPTIONAL_LOCKS: "0" }) }).trim();
+}
+function gitStatus(cwd: string, args: string[]) {
+  try { execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" }) }); return 0; }
+  catch (error) { return (error as NodeJS.ErrnoException & { status?: number }).status ?? 128; }
 }
 function inspectSourceHead(root: string): { commit: string; branch?: string } {
   try {
@@ -521,6 +527,60 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     finally { process.off("SIGINT", stop); }
     return true;
   }
+  if (subcommand === "pull") {
+    if (!id || rest.length) throw new Error("Usage: infinite team pull TEAM_ID [--json]");
+    const team = await api.json<any>(`/teams/${id}`);
+    const localProject = boundTeamProject(config, configPath);
+    if (localProject !== team.projectId)
+      throw new Error(`This repository is bound to project ${localProject ?? "<unbound>"}, but team ${id} belongs to project ${clean(team.projectId)}.`);
+    const root = canonicalRoot(process.cwd());
+    const branch = String(team.branch ?? ""), teamHead = String(team.headCommit ?? "");
+    if (!branch || !teamHead || !/^[a-f0-9]{40,64}$/.test(teamHead)) throw new Error("This team has no recorded result to pull.");
+    const ref = `refs/heads/${branch}`;
+    try { execFileSync("git", ["-C", root, "check-ref-format", ref], { stdio: "ignore", timeout: 10000, env: isolatedGitEnv() }); }
+    catch { throw new Error("The team reported an invalid integration branch."); }
+    if (gitStatus(root, ["show-ref", "--verify", "--quiet", ref]) === 0
+      && gitStatus(root, ["cat-file", "-e", `${teamHead}^{commit}`]) === 0
+      && gitStatus(root, ["merge-base", "--is-ancestor", teamHead, ref]) === 0) {
+      const result = { teamId: id, branch, head: teamHead, upToDate: true };
+      if (options["--json"]) console.log(JSON.stringify(result));
+      else { console.log(`${branch} already contains team result ${teamHead}`); console.log(`Switch with: git switch ${branch}`); }
+      return true;
+    }
+
+    const response = await api.request(`/teams/${id}/bundle`);
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({})) as { error?: string; code?: string };
+      throw new Error(body.error ?? `Could not download team result (${response.status}).`);
+    }
+    const headerBranch = response.headers.get("X-Infinite-Branch"), headerHead = response.headers.get("X-Infinite-Head");
+    if (headerBranch !== branch || headerHead !== teamHead) {
+      await response.body?.cancel();
+      throw new Error("The team result changed while it was being prepared. Refresh team status and retry.");
+    }
+    const tempRoot = join(stateDir, "pull-");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const temporary = mkdtempSync(tempRoot); chmodSync(temporary, 0o700);
+    const bundlePath = join(temporary, "team.bundle");
+    try {
+      if (!response.body) throw new Error("The host returned an empty team bundle.");
+      await pipeline(Readable.fromWeb(response.body as import("node:stream/web").ReadableStream), createWriteStream(bundlePath, { flags: "wx", mode: 0o600 }));
+      try { execFileSync("git", ["-C", root, "bundle", "verify", bundlePath], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C" }) }); }
+      catch (error) { throw new Error(`The downloaded team bundle failed verification: ${clean(String((error as NodeJS.ErrnoException & { stderr?: Buffer | string }).stderr ?? (error as Error).message))}.`); }
+      try {
+        execFileSync("git", ["-C", root, "fetch", "--no-tags", "--no-write-fetch-head", bundlePath, `${ref}:${ref}`], { encoding: "utf8", timeout: 120000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C" }) });
+      } catch (error) {
+        const detail = clean(String((error as NodeJS.ErrnoException & { stderr?: Buffer | string }).stderr ?? (error as Error).message));
+        throw new Error(`Git refused to update ${branch}; it may be checked out or have diverged. The local branch was left unchanged. ${detail}`);
+      }
+      const localHead = git(root, ["rev-parse", "--verify", `${ref}^{commit}`]);
+      if (localHead !== headerHead || localHead !== teamHead) throw new Error("The fetched branch did not resolve to the recorded team result.");
+      const result = { teamId: id, branch, head: teamHead };
+      if (options["--json"]) console.log(JSON.stringify(result));
+      else { console.log(`Pulled ${branch} at ${teamHead}`); console.log(`Switch with: git switch ${branch}`); }
+      return true;
+    } finally { rmSync(temporary, { recursive: true, force: true }); }
+  }
   if (["steer", "answer", "pause", "resume", "cancel"].includes(subcommand ?? "")) {
     if (!id) throw new Error(`Usage: infinite team ${subcommand} ID ...`);
     const current = await api.json<any>(`/teams/${id}`);
@@ -540,5 +600,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     requireSamePendingIntent(receiptsPath, `team-${subcommand}:`, endpoint, prior => subcommand === "steer" || subcommand === "answer" ? prior.text === body.text : true, options["--request-id"] === undefined ? undefined : requestId, rawArgs);
     outputTeam(await postMutation(api, receiptsPath, `team-${subcommand}:${requestId}`, endpoint, body), Boolean(options["--json"])); return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|steer|answer|pause|resume|cancel ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|cancel ...");
 }

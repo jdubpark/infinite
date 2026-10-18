@@ -16,6 +16,7 @@ A Team marked **ready for your review** has explicit reports for its current rev
 passing configured checks, and an approving reviewer report. It does not
 establish product impact or human acceptance. The host does not push, open pull
 requests, merge into the original checkout, or deploy.
+The paired CLI can bring a team's integrated branch into an ordinary local branch with `infinite team pull TEAM_ID`.
 
 ## Start from a terminal
 

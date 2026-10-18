@@ -7,16 +7,23 @@ export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
 export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean }
+export function teamCommandEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
+    if (process.env[name]) env[name] = process.env[name];
+  env.GIT_TERMINAL_PROMPT = "0";
+  env.GIT_OPTIONAL_LOCKS = "0";
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  return env;
+}
+export function teamGitArgs(cwd: string, args: string[]) {
+  return ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args];
+}
 /** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
-    const env: NodeJS.ProcessEnv = {};
-    for (const name of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
-      if (process.env[name]) env[name] = process.env[name];
-    env.GIT_TERMINAL_PROMPT = "0";
-    env.GIT_OPTIONAL_LOCKS = "0";
-    env.GIT_CONFIG_NOSYSTEM = "1";
-    env.GIT_CONFIG_GLOBAL = "/dev/null";
+    const env = teamCommandEnvironment();
     const child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false;
     const stop = () => {
@@ -37,8 +44,13 @@ export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSig
     child.once("close", exitCode => { if (settled) return; settled = true; finish(); resolveResult({ exitCode, output, stdout, interrupted, truncated }); });
   });
 }
+/** Streams a full bundle of one branch on stdout, with the same restricted Git invocation as other team operations. */
+export function spawnTeamBundle(workspace: string, branch: string, prefix?: TeamCommand) {
+  const args = teamGitArgs(workspace, ["bundle", "create", "-", `refs/heads/${branch}`]);
+  return spawn(prefix?.command ?? "git", prefix ? [...prefix.args, "git", ...args] : args, { cwd: workspace, env: teamCommandEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+}
 async function git(cwd: string, args: string[], prefix?: TeamCommand, timeoutMs = 30000, signal?: AbortSignal) {
-  const result = await teamCommand({ command: "git", args: ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args] }, cwd, signal, timeoutMs, prefix);
+  const result = await teamCommand({ command: "git", args: teamGitArgs(cwd, args) }, cwd, signal, timeoutMs, prefix);
   if (result.exitCode !== 0 || result.interrupted || result.truncated) throw new TeamError(409, "workspace-operation-failed", "A team Git operation failed. The isolated workspace was preserved for inspection.");
   return args.includes("-z") ? result.stdout : result.stdout.trim();
 }
@@ -121,7 +133,7 @@ export async function captureMemberResult(cwd: string, base: string, paths?: str
 export async function integrateMemberResult(workspace: string, memberCwd: string, commit: string, prefix?: TeamCommand, signal?: AbortSignal) {
   if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new TeamError(409, "invalid-commit", "The task commit is invalid.");
   await git(workspace, ["fetch", "--no-tags", "--", memberCwd, commit], prefix, 30000, signal);
-  const result = await teamCommand({ command: "git", args: ["-c", `safe.directory=${workspace}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", "cherry-pick", commit] }, workspace, signal, 30000, prefix);
+  const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["cherry-pick", commit]) }, workspace, signal, 30000, prefix);
   if (result.exitCode !== 0 || result.interrupted || result.truncated) {
     // A failed integration is preserved; no reset, forced cleanup, or automatic retry.
     throw new TeamError(409, "integration-conflict", "Task integration encountered a conflict. The team is blocked with the isolated conflict preserved.");

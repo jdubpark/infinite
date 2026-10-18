@@ -2,7 +2,7 @@
 
 For web/phone creation across cloud and laptop machines, cmux discovery, and the outbound relay, see [remote machines](remote-machines.md). The commands below describe the separately installed terminal client. Host setup commands use `node packages/host/dist/cli.js`.
 
-The laptop CLI works independently of the Mac app and keeps provider conversations and tools on the cloud host. `infinite sync` keeps the configured cloud project current with this checkout, one way. Codex can instead run tools in the current laptop project with `--laptop`, which prepares automatic cloud handoff in the background. Detaching or losing the interface leaves the cloud conversation running.
+The laptop CLI works independently of the Mac app and keeps provider conversations and tools on the cloud host. A launch without `--project` mirrors the current checkout below the server home and keeps it synced one way, including ignored and untracked files. The first launch waits for that copy to be applied. The folder structure and the launch subdirectory stay the same beneath each home directory; see [folder mapping](workspace-sync.md#folder-mapping). Codex can instead run tools in the current laptop project with `--laptop`, which prepares automatic cloud handoff in the background. Detaching or losing the interface leaves the cloud conversation running.
 
 Launch and attach report their current stage immediately, with elapsed time during longer waits. These messages go to stderr; JSON listings and detached session IDs remain machine-readable on stdout. Progress stops when native output takes over.
 
@@ -73,7 +73,8 @@ After cloud handoff, `infinite recover SESSION_ID --output NEW_DIRECTORY` downlo
 ## Workspace sync and pull
 
 ```sh
-infinite sync --project PROJECT_ID     # from inside the checkout; the Git root is synced
+infinite sync                          # mirror this checkout beneath the server home
+infinite sync --project PROJECT_ID     # sync into an explicitly configured project
 infinite sync --status
 infinite sync --apply [--force] --project PROJECT_ID
 infinite sync --stop --project PROJECT_ID
@@ -101,7 +102,7 @@ This opt-in mode runs the installed Codex interface on the laptop and keeps its 
 
 Both machines need a Codex version with authenticated `--remote` support. A paired **owner** key is required for the local native interface. The initial launch requires a nonempty prompt: the tested app server cannot attach a second client to an empty conversation. Infinite uses legacy provider history because the tested WebSocket server cannot hydrate the native TUI's paginated default. Existing terminal sessions stay attached to their original process.
 
-Supported launch options are `--model`, `--config`, `--ask-for-approval`, `--sandbox` (including their short forms), `--search`, and `--no-alt-screen`, plus one prompt. Other native arguments require ordinary terminal mode. Options retain their values; Infinite separates the prompt with `--` so prompt text cannot become a provider subcommand. The cloud owns model settings, credentials, working directory, tools, and history. Laptop files are not uploaded.
+Supported launch options are `--model`, `--config`, `--ask-for-approval`, `--sandbox` (including their short forms), `--search`, and `--no-alt-screen`, plus one prompt. Other native arguments require ordinary terminal mode. Options retain their values; Infinite separates the prompt with `--` so prompt text cannot become a provider subcommand. The cloud owns model settings, credentials, tools, and history. The launch uses the mirrored checkout unless `--project ID` selects an existing server project.
 
 `resume` opens a new local interface attached by the recorded provider conversation ID; it does not create another thread or resubmit the initial prompt. Native Codex shortcuts apply. Infinite's Ctrl+E, Ctrl+G, and Ctrl+] shortcuts apply only to streamed terminals. `monitor` uses the cloud terminal and remains read-only until control is requested. A phone can take over using the existing controls; the worker rejects stale native requests, including approval replies. Losing control detaches the local interface. Reopen with `resume`; use `--takeover` only when intentionally replacing another device's control.
 
@@ -159,7 +160,7 @@ infinite --detach --project PROJECT_ID claude "Review this checkout"
 infinite --client-config /private/client.json monitor SESSION_ID
 ```
 
-Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not uploaded or translated. The CLI does not silently copy the current laptop checkout or its secrets. Only `infinite sync` and `--laptop` background preparation upload a checkout, and only after the owner starts them.
+Paths, configuration files, native session IDs, installed tools, and credentials belong to the cloud host. A laptop path passed to `--cd`, `--add-dir`, or a provider configuration flag is not translated. A launch without `--project` uploads the selected checkout through workspace sync. Use `--project ID` to select an existing server project without automatic upload. Sync scope includes ignored files, untracked files, and Git metadata; credentials inside that scope travel to the server.
 
 `--laptop` Codex launches use the laptop project and background cloud handoff described above. The earlier [SSH prototype](hybrid-execution.md#earlier-ssh-prototype) remains available for isolated protocol experiments and retains its original offline behavior.
 

@@ -148,7 +148,8 @@ setInterval(() => {}, 1000);
 `);
   const host = await startHost({ agents: { claude: { command: process.execPath, args: [fixture] } } });
   try {
-    const initial = { requestId: randomUUID(), provider: "claude", projectId: "rehearsal", title: "Resumable", prompt: "NEVER REPLAY THIS PROMPT" };
+    const directory = join(host.config.projects[0].path, "nested"); mkdirSync(directory);
+    const initial = { requestId: randomUUID(), provider: "claude", projectId: "rehearsal", cwd: "nested", title: "Resumable", prompt: "NEVER REPLAY THIS PROMPT" };
     const first = await host.fetchApi("/sessions", "owner", initial);
     assert.equal(first.status, 201);
     await waitFor(() => host.fetchApi(`/sessions/${initial.requestId}`), r => r.body.nativeSession?.id === nativeId);
@@ -170,6 +171,7 @@ setInterval(() => {}, 1000);
     assert.ok([resumeRequest.requestId, competingRequest.requestId].includes(resumed.body.id));
     assert.equal(competing.body.id, resumed.body.id, "different device requests converge on one runtime");
     assert.equal(resumed.body.resumedFrom, initial.requestId);
+    assert.equal(resumed.body.cwd, realpathSync(directory), "native resumption preserves the launch subdirectory");
     assert.notEqual(resumed.body.runtime.id, first.body.runtime.id);
     assert.equal(resumed.body.initialPrompt, "");
     assert.deepEqual(resumed.body.nativeArgs, ["--resume", nativeId]);

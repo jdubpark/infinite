@@ -20,6 +20,7 @@ import { CmuxError } from "./cmux/client.js";
 import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
 import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
+import { MirroredProjects } from "./mirrored-projects.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt } from "./types.js";
@@ -42,6 +43,7 @@ const createSchema = z
     nativeArgs: z.array(z.string().max(8192).refine((s) => !s.includes("\0")))
       .max(256).refine((args) => args.join("").length <= 32000).optional(),
     localUi: z.boolean().optional(),
+    cwd: z.string().max(4096).optional(),
     workspace: z.object({
       cwd: z.string().min(1).max(4096).refine(value => value.startsWith("/") && !value.includes("\0")),
       roots: z.array(z.string().min(1).max(4096).refine(value => value.startsWith("/") && !value.includes("\0"))).min(1).max(16),
@@ -88,6 +90,7 @@ export function createApp(config: Config, key: Buffer) {
   if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
     throw new Error("Machine access and cmux require a single-tenant host");
   const app = express();
+  const mirroredProjects = runtimeSecurity(config.deployment).tenancy === "single-tenant" ? new MirroredProjects(config, key) : undefined;
   const manager = new Manager(config, key);
   const projectSync = new ProjectSync(config, key);
   const desktopFiles = new DesktopFiles(config);
@@ -285,6 +288,7 @@ export function createApp(config: Config, key: Buffer) {
       ),
       projects: config.projects.map(({ id, name, path }) => ({ id, name, path })),
       capabilities: {
+        ...(mirroredProjects ? { workspaceMirror: 1 } : {}),
         signals: true,
         answer: ["owner", "controller"].includes(res.locals.role),
         push: Boolean(config.push?.enabled),
@@ -295,6 +299,11 @@ export function createApp(config: Config, key: Buffer) {
     }),
   );
   app.get("/api/machine/resources", async (_req, res) => res.json(await desktopResources.sample()));
+  app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {
+    if (!mirroredProjects) return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
+    const { path } = z.object({ path: z.string().max(4096) }).strict().parse(req.body);
+    res.json(mirroredProjects.resolve(path));
+  });
   app.get("/api/projects/:id/files", async (req, res) => {
     res.json(await desktopFiles.list(projectSchema.parse(req.params.id), z.string().max(4096).default("").parse(req.query.path),
       z.coerce.number().int().min(1).max(200).default(100).parse(req.query.limit), z.string().max(512).optional().parse(req.query.cursor)));

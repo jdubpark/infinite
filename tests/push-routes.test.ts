@@ -33,7 +33,7 @@ test("/api/me reports capabilities by role", { timeout: 30000 }, async () => {
   const host = await startHost();
   try {
     assert.deepEqual((await host.fetchApi("/me", "controller")).body.capabilities, {
-      signals: true, answer: true, push: false,
+      signals: true, answer: true, push: false, workspaceMirror: 1,
       desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: 49152, maxFileBytes: 268435456 },
     });
     assert.equal((await host.fetchApi("/me", "viewer")).body.capabilities.answer, false);

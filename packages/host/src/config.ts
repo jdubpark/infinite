@@ -19,7 +19,7 @@ const schema = z
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),
-    sync: z.object({ sharedGroup: z.boolean().optional() }).strict().optional(),
+    sync: z.object({ sharedGroup: z.boolean().optional(), homeDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     // Model-written chat digests. The key file is read once at startup and never logged.
     summaries: z.object({
       model: z.string().min(1).max(100),

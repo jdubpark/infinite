@@ -1,13 +1,41 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, symlinkSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
 import { inProcessHost, startHost, waitFor, type Host } from "./helpers.js";
 
 type Api = Pick<Host, "origin" | "tokens" | "fetchApi">;
+
+test("owner CLI resolves distinct home-relative projects without falling back to the paired project", async () => {
+  const host = await inProcessHost();
+  try {
+    const home = join(host.root, "home");
+    host.config.sync = { homeDir: home, sharedGroup: true };
+    const resolved = await host.fetchApi("/projects/resolve", "owner", { path: "Projects/sample" });
+    assert.equal(resolved.status, 200);
+    assert.equal(resolved.body.path, join(home, "Projects", "sample"));
+    assert.equal(statSync(join(home, "Projects")).mode & 0o030, 0o010, "agents can traverse intermediate folders but cannot rename project roots");
+    const again = await host.fetchApi("/projects/resolve", "owner", { path: "Projects/sample" });
+    assert.equal(again.body.id, resolved.body.id);
+    const other = await host.fetchApi("/projects/resolve", "owner", { path: "Work/sample" });
+    assert.equal(other.status, 200);
+    assert.notEqual(other.body.id, resolved.body.id);
+    assert.notEqual(resolved.body.id, "rehearsal");
+    assert.equal((await host.fetchApi("/projects/resolve", "viewer", { path: "Projects/denied" })).status, 403);
+    assert.equal((await host.fetchApi("/projects/resolve", "controller", { path: "Projects/denied" })).status, 403);
+    for (const path of ["", "../escape", "Projects/../escape", "/absolute", ".ssh", "Projects//sample", "Projects/sample/"])
+      assert.equal((await host.fetchApi("/projects/resolve", "owner", { path })).status, 400, path);
+    symlinkSync(host.root, join(home, "alias"));
+    assert.equal((await host.fetchApi("/projects/resolve", "owner", { path: "alias/escape" })).status, 400);
+    assert.equal((await host.fetchApi("/projects/resolve", "owner", { path: "Projects/sample/nested" })).status, 409, "overlapping sync roots cannot bypass each other's running-session fence");
+    const login = await host.fetchApi("/login", null, { token: host.tokens.owner }, { Origin: host.config.origin });
+    assert.equal(login.status, 200);
+    assert.equal((await host.fetchApi("/projects/resolve", null, { path: "Projects/browser" }, { Cookie: login.headers.get("set-cookie")!.split(";")[0], Origin: host.config.origin })).status, 403);
+  } finally { await host.stop(); }
+});
 
 const putChunk = (host: Api, hash: string, body: Buffer) => fetch(`${host.origin}/api/projects/rehearsal/sync/blob/${hash}`, {
   method: "PUT", headers: { Authorization: `Bearer ${host.tokens.owner}`, "Content-Type": "application/octet-stream" }, body,

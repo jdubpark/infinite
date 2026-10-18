@@ -3,13 +3,74 @@ import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer } from "node:net";
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
 import { demoProfile, startHost, waitFor } from "./helpers.js";
 import { readSyncState, stopSyncService } from "../packages/host/src/sync-service.js";
 
 const exec = promisify(execFile);
+
+test("cloud launches mirror the local home layout, checkout contents, and nested cwd across API restarts", { timeout: 120000 }, async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-folders-")));
+  const home = join(root, "local-home"), remoteHome = join(root, "server-home");
+  mkdirSync(home);
+  const host = await startHost({ agents: { claude: demoProfile() }, config: { sync: { homeDir: remoteHome } } });
+  const clientFile = join(root, "client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
+  const entry = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const cli = [...entry, "--detach", "claude"];
+  const states = new Set<string>();
+  try {
+    const projects: string[] = [];
+    for (const parent of ["Projects", "Work"]) {
+      const checkout = join(home, parent, "sample project"), cwd = join(checkout, "apps", "web");
+      mkdirSync(cwd, { recursive: true });
+      await exec("git", ["init", "--quiet", checkout]);
+      writeFileSync(join(checkout, "content.txt"), parent);
+      const launched = await exec(process.execPath, cli, { cwd, env: { ...process.env, HOME: home }, timeout: 60000 });
+      const session = await host.fetchApi(`/sessions/${launched.stdout.trim()}`);
+      assert.equal(session.status, 200);
+      assert.notEqual(session.body.projectId, "rehearsal", "pairing's default must not replace the local folder");
+      states.add(join(root, "sync", `${session.body.projectId}.json`));
+      projects.push(session.body.projectId);
+      assert.equal(session.body.cwd, join(remoteHome, parent, "sample project", "apps", "web"));
+      assert.equal(readFileSync(join(remoteHome, parent, "sample project", "content.txt"), "utf8"), parent);
+      assert.equal(existsSync(join(remoteHome, parent, "sample project", ".git", "HEAD")), true);
+    }
+    assert.notEqual(projects[0], projects[1], "equal folder names have distinct full-path identities");
+    await host.stopApi();
+    await host.start();
+    const catalog = (await host.fetchApi("/me")).body.projects;
+    for (const id of projects) assert.ok(catalog.some((project: { id: string }) => project.id === id));
+    const repeated = await exec(process.execPath, cli, { cwd: join(home, "Projects", "sample project", "apps", "web"), env: { ...process.env, HOME: home }, timeout: 60000 });
+    const session = (await host.fetchApi(`/sessions/${repeated.stdout.trim()}`)).body;
+    assert.equal(session.projectId, projects[0]);
+    assert.equal(session.cwd, join(remoteHome, "Projects", "sample project", "apps", "web"));
+    symlinkSync(root, join(remoteHome, "Projects", "sample project", "escape"));
+    for (const cwd of ["../", root, "content.txt", "escape"])
+      assert.equal((await host.fetchApi("/sessions", "owner", { requestId: randomUUID(), provider: "claude", projectId: projects[0], title: "Invalid directory", cwd })).status, 400, cwd);
+    const outside = join(root, "outside-home"); mkdirSync(outside);
+    await assert.rejects(exec(process.execPath, cli, { cwd: outside, env: { ...process.env, HOME: home } }), (error: { stderr: string }) => /below the home directory/.test(error.stderr));
+    const conflict = join(home, "Projects", "conflict"), cloud = join(remoteHome, "Projects", "conflict");
+    mkdirSync(conflict); mkdirSync(cloud);
+    writeFileSync(join(conflict, "local.txt"), "laptop"); writeFileSync(join(cloud, "cloud.txt"), "preserve");
+    const project = (await host.fetchApi("/projects/resolve", "owner", { path: "Projects/conflict" })).body.id;
+    states.add(join(root, "sync", `${project}.json`));
+    await assert.rejects(exec(process.execPath, cli, { cwd: conflict, env: { ...process.env, HOME: home } }), (error: { stderr: string }) => /mirrored workspace has not been applied/.test(error.stderr));
+    assert.equal(readFileSync(join(cloud, "cloud.txt"), "utf8"), "preserve");
+    assert.equal(existsSync(join(cloud, "local.txt")), false);
+    assert.equal((await host.fetchApi("/sessions")).body.sessions.length, 3, "a refused first apply cannot launch on unrelated cloud contents");
+    await host.stopApi();
+    const stopped = await exec(process.execPath, [...entry, "sync", "--stop"], { cwd: join(home, "Work", "sample project", "apps", "web"), env: { ...process.env, HOME: home } });
+    assert.match(stopped.stdout, /stopped/);
+    assert.equal(existsSync(join(root, "sync", `${projects[1]}.json`)), false, "offline stop selects this folder instead of the paired default");
+  } finally {
+    for (const state of states) stopSyncService(state);
+    await host.stop(); rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("infinite sync, projects, and pull round-trip a checkout through the host", { timeout: 120000 }, async () => {
   const host = await startHost();
@@ -109,7 +170,7 @@ test("a cloud launch reports laptop changes that wait for an apply, then starts 
     await exec(process.execPath, [...cli, "sync", "--project", "rehearsal"], { cwd: checkout });
     await waitFor(() => host.fetchApi("/projects/rehearsal"), r => r.body.sync.pendingGeneration?.reason === "session-running", 30000);
     // Infinite options come before the provider; everything after it belongs to the provider.
-    const launched = await exec(process.execPath, [...cli, "--detach", "--title", "Next", "claude"], { timeout: 60000 });
+    const launched = await exec(process.execPath, [...cli, "--project", "rehearsal", "--detach", "--title", "Next", "claude"], { timeout: 60000 });
     assert.match(launched.stderr, /\[Infinite\] Laptop changes from \d+s ago are pending; run infinite sync --apply\n/);
     assert.match(launched.stdout, /^[0-9a-f-]{36}\n$/, "the launch continues");
     assert.equal(existsSync(join(host.config.projects[0].path, "file.txt")), false, "the session starts on the tree in place");

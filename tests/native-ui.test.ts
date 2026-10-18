@@ -192,7 +192,7 @@ test("CLI opens a local native frontend with a loopback credential and detaches 
     const config = host.root + "/client.json";
     writeFileSync(config, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
     client = ptySpawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", config,
-      "--cloud", "--local-ui", "codex", "--model", "fixture-model", "--no-alt-screen", "login"], {
+      "--project", "rehearsal", "--cloud", "--local-ui", "codex", "--model", "fixture-model", "--no-alt-screen", "login"], {
       cols: 120, rows: 30, cwd: host.root, env: { ...process.env, PATH: bin + ":" + process.env.PATH },
     });
     let output = "", exited = false; client.onData(data => { output += data; terminal.write(data); }); client.onExit(() => exited = true);

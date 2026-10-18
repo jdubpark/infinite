@@ -90,8 +90,8 @@ export interface Config {
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
   deployment?: import("./deployment.js").Deployment;
-  /** Workspace sync. `sharedGroup` makes applied trees group-writable for a separate agent account. */
-  sync?: { sharedGroup?: boolean };
+  /** Workspace sync. `homeDir` overrides the server home used for folder mapping; `sharedGroup` permits a separate agent account. */
+  sync?: { sharedGroup?: boolean; homeDir?: string };
   /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
   summaries?: { model: string; apiKeyFile: string; baseUrl: string };
   port: number;

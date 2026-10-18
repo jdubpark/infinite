@@ -5,8 +5,9 @@ import {
   readdirSync,
   existsSync,
   realpathSync,
+  statSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -38,6 +39,8 @@ export interface CreateSession {
   prompt: string;
   nativeArgs?: string[];
   localUi?: boolean;
+  /** Working directory relative to the configured project root. */
+  cwd?: string;
   workspace?: LaptopWorkspace & { token: string };
   resumedFrom?: string;
   resumeNativeSession?: { id: string; source: "hook" | "protocol" };
@@ -45,6 +48,16 @@ export interface CreateSession {
 interface StoredSession {
   session: Session;
   fingerprint: string;
+}
+export function projectCwd(projectPath: string, cwd?: string): string {
+  const root = realpathSync(projectPath);
+  if (cwd === undefined || cwd === "") return root;
+  if (isAbsolute(cwd) || cwd.includes("\\") || cwd.split("/").some(part => !part || part === "." || part === "..") || /[\x00-\x1f\x7f]/.test(cwd))
+    throw new ContentError("The session directory must be inside its project", 400);
+  const directory = realpathSync(resolve(root, cwd));
+  const child = relative(root, directory);
+  if (isAbsolute(child) || child === ".." || child.startsWith("../") || !statSync(directory).isDirectory()) throw new ContentError("The session directory must be inside its project", 400);
+  return directory;
 }
 /** List rows stay small: the last message is cut and tool input stays on the detail endpoint. */
 export function publicAttention(att: Attention): Attention {
@@ -241,6 +254,11 @@ export class Manager {
       : session.provider === "codex" ? ["resume", native.id] : ["--session", native.id];
     const request: CreateSession = { requestId, provider: session.provider, projectId: session.projectId,
       title: session.title, prompt: "", nativeArgs: args, resumedFrom: sessionId, resumeNativeSession: native };
+    const project = this.config.projects.find(project => project.id === session.projectId);
+    if (project) {
+      const cwd = relative(realpathSync(project.path), session.cwd);
+      if (cwd) request.cwd = cwd;
+    }
     // Creation metadata is durable before spawn. Recover its exact receipt even
     // if the API stopped before it could record the resumption result.
     if (existsSync(join(this.config.stateDir, "sessions", requestId, "meta.sealed")))
@@ -307,7 +325,7 @@ export class Manager {
       provider: request.provider,
       title: request.title,
       projectId: request.projectId,
-      cwd: realpathSync(project.path),
+      cwd: projectCwd(project.path, request.cwd),
       createdAt: new Date().toISOString(),
       status: "starting",
       contextVersion: context.version,

@@ -71,7 +71,7 @@ test("CLI reports each startup wait before the host responds and leaves native o
   const server = createServer((req, res) => { req.resume(); requests.set(req.url!, res); });
   await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
   writeFileSync(config, JSON.stringify({ origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: randomBytes(32).toString("base64url"), projectId: "project" }), { mode: 0o600 });
-  const child = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", config, "grok"], { stdio: "pipe" });
+  const child = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", config, "--project", "project", "grok"], { stdio: "pipe" });
   let stdout = "", stderr = "", exited = false;
   child.stdout.on("data", s => stdout += s); child.stderr.on("data", s => stderr += s); child.on("exit", () => exited = true);
   const reply = (path: string, body: unknown) => requests.get(path)!.end(JSON.stringify(body));
@@ -242,7 +242,7 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     await exec(process.execPath, [...cli, "pair", clientOrigin, "--token-file", tokenFile]);
     app.manager.setContext("project", "Do not append me to native argv", 0);
     const nativeArgs = ["--model", "example/model", "--config", "literal=value", "--", "spaces, $HOME and `printf literal`", "line\nbreak"];
-    const launched = await exec(process.execPath, [...cli, "--cloud", "--detach", "codex", ...nativeArgs]);
+    const launched = await exec(process.execPath, [...cli, "--project", "project", "--cloud", "--detach", "codex", ...nativeArgs]);
     const sid = launched.stdout.trim(); assert.match(sid, /^[a-f0-9-]{36}$/);
     await wait(() => { try { return JSON.parse(readFileSync(join(workspace, "argv.json"), "utf8")).length === nativeArgs.length; } catch { return false; } });
     assert.deepEqual(JSON.parse(readFileSync(join(workspace, "argv.json"), "utf8")), nativeArgs, "all provider args are exact, including --config and --");
@@ -346,7 +346,7 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     uncertainDraft.process.write("\x18"); await wait(() => saved().length === 0);
     uncertainDraft.process.write("\x1d"); await wait(uncertainDraft.exited);
     assert.equal((await app.manager.list()).length, 1);
-    const oneShot = await exec(process.execPath, [...cli, "--cloud", "codex", "--version"]);
+    const oneShot = await exec(process.execPath, [...cli, "--project", "project", "--cloud", "codex", "--version"]);
     assert.match(oneShot.stdout, /native-version-1/);
     await workerCall(config.runDir, sid, { op: "stop", requestId: randomUUID() });
     await wait(async () => (await app.manager.state(sid)).status === "exited");

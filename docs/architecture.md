@@ -6,7 +6,7 @@ The native UI and checkpoint requirements are refined in [native interaction and
 
 ## Execution model
 
-Every provider runs on the selected machine by default; `Session.executionLocation` records `cloud` or `laptop`. Codex accepts `--laptop`, which keeps the invoking laptop project as the executor while its conversation backend stays in the cloud, with background preparation and automatic handoff as described in [laptop execution mode](hybrid-execution.md). The configured cloud project directory is kept current by the one-way [workspace sync](workspace-sync.md) service. Reconnecting keeps the same conversation and placement.
+Every provider runs on the selected machine by default; `Session.executionLocation` records `cloud` or `laptop`. Codex accepts `--laptop`, which keeps the invoking laptop project as the executor while its conversation backend stays in the cloud, with background preparation and automatic handoff as described in [laptop execution mode](hybrid-execution.md). Native CLI launches without `--project` resolve the local home-relative checkout path into a persistent cloud project and retain the relative launch directory. That cloud project is kept current by the one-way [workspace sync](workspace-sync.md) service. Reconnecting keeps the same conversation and placement.
 
 ```mermaid
 flowchart LR
@@ -66,14 +66,15 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | Resize / terminate | `POST /api/sessions/:id/resize`, `/stop` | Owner |
 | Read project context | `GET /api/projects/:id/context` | Any |
 | Replace context with version check | `PUT /api/projects/:id/context` | Owner |
+| Resolve a home-relative project | `POST /api/projects/resolve` | Owner CLI |
 | Project detail and sync state | `GET /api/projects/:id` | Any |
 | Receive a laptop generation | `POST /api/projects/:id/sync/{begin,has,commit}`, `PUT /api/projects/:id/sync/blob/:hash` | Owner CLI |
 | Apply a pending generation | `POST /api/projects/:id/sync/apply` | Owner |
 | Export the cloud tree | `POST /api/projects/:id/sync/export`, `GET /api/projects/:id/sync/blob/:hash` | Owner CLI |
 
-**Owner CLI** routes accept only a paired owner bearer key; a browser session is refused. While a sync commit or apply holds a project, Infinite-managed session creation and resume in that project answer `409` with code `sync-applying`; cmux sessions are not refused. [Workspace sync](workspace-sync.md) defines the transfer limits, apply rules, and pending reasons.
+**Owner CLI** routes accept only a paired owner bearer key; a browser session is refused. While a sync commit or apply holds a project, Infinite-managed session creation and resume in that project answer `409` with code `sync-applying`; this includes cmux sessions. [Workspace sync](workspace-sync.md) defines the transfer limits, apply rules, and pending reasons.
 
-Session IDs and project IDs are validated. Executables and project working directories come from private host configuration. The owner-only native CLI launch accepts an argument array, including provider flags that may access other files available to the agent account; this is not a sandbox boundary within a tenant. Web and phone creation use configured provider arguments. Infinite workers pass prompts and native arguments directly to the executable. The cmux adapter quotes each configured argument before launching in the chosen workspace shell. Active-host process inspection can see launch arguments.
+Session IDs and project IDs are validated. Executables come from private host configuration. Project roots come from that configuration or owner-created folder mappings in sealed host state. A session can select an existing relative directory within its project; traversal and symlink escapes are refused, and native resumption retains that directory. The owner-only native CLI launch accepts an argument array, including provider flags that may access other files available to the agent account; this is not a sandbox boundary within a tenant. Web and phone creation use configured provider arguments. Infinite workers pass prompts and native arguments directly to the executable. The cmux adapter quotes each configured argument before launching in the chosen workspace shell. Active-host process inspection can see launch arguments.
 
 The maximum concurrency defaults to 24; it is a count limit, not CPU, memory, spend, or per-provider quota enforcement. Resource limits and isolated worktrees belong to commissioning. Do not run multiple editors against one configured checkout until those directories are separated.
 

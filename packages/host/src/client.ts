@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ControlLease, Receipt, Session, Status, WorkerState } from "./types.js";
@@ -16,9 +16,10 @@ import { validateNativeCodexArgs } from "./native-codex.js";
 import { checkLaptopExecutor, startLaptopService } from "./laptop-service.js";
 import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWorkspaceManifest } from "./workspace-checkpoint.js";
 import { readSyncState, startSyncService, stopSyncService, syncServiceRunning } from "./sync-service.js";
+import { localProjectPath } from "./mirrored-projects.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
-type Me = { role: string; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
+type Me = { role: string; capabilities?: { workspaceMirror?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
 const providerNames: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
 /** Project IDs name local sync files, so an ID from the host or the command line is checked before it becomes a path. */
@@ -475,6 +476,19 @@ function gitRoot(cwd: string) {
   try { return realpathSync(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()); }
   catch { return cwd; }
 }
+/** A local sync record keeps offline stop and explicit apply/pull pointed at this checkout. */
+function localSyncProject(syncDir: string, origin: string): string | undefined {
+  if (!existsSync(syncDir)) return undefined;
+  const root = gitRoot(realpathSync(process.cwd()));
+  const matches = readdirSync(syncDir).flatMap(name => {
+    if (!/^[a-z0-9-]{1,80}\.json$/.test(name)) return [];
+    try {
+      const state = readSyncState(join(syncDir, name));
+      return state?.root === root && state.origin === origin ? [name.slice(0, -5)] : [];
+    } catch { return []; }
+  });
+  return matches.length === 1 ? matches[0] : undefined;
+}
 function age(iso?: string) {
   if (!iso) return "never";
   const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
@@ -553,7 +567,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const syncDir = join(dirname(path), "sync");
       const recorded = existsSync(syncDir) ? readdirSync(syncDir).flatMap(name => /^([a-z0-9-]{1,80})\.json$/.exec(name)?.[1] ?? []) : [];
       if (options["--stop"]) {
-        const projectId = String(options["--project"] ?? config.projectId ?? (recorded.length === 1 ? recorded[0] : ""));
+        const projectId = String(options["--project"] ?? localSyncProject(syncDir, config.origin) ?? config.projectId ?? (recorded.length === 1 ? recorded[0] : ""));
         if (!PROJECT_ID.test(projectId)) throw new Error(`Choose a project with --project ID${recorded.length ? ` (recorded: ${recorded.join(", ")})` : ""}`);
         console.log(stopSyncService(join(syncDir, `${projectId}.json`)) ? "Sync service stopped. The cloud copy keeps its last applied generation." : "No sync service was running for this project.");
         return true;
@@ -573,6 +587,23 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command !== "projects") progress.start(`Connecting to ${new URL(config.origin).hostname}`);
     const me = await api.json<Me>("/me");
     progress.stop();
+    const mappedProject = async () => {
+      if (me.capabilities?.workspaceMirror !== 1) throw new Error("Upgrade the host for local folder mapping, or select a configured cloud project with --project ID.");
+      const cwd = realpathSync(process.cwd()), root = gitRoot(cwd);
+      const project = await api.json<{ id: string; name: string; path: string }>("/projects/resolve", { path: localProjectPath(root) });
+      if (!PROJECT_ID.test(project.id)) throw new Error("Invalid mirrored project response");
+      return { ...project, root, cwd: relative(root, cwd).split(sep).join("/") };
+    };
+    const syncProject = async (projectId: string, root: string, reuse: boolean) => {
+      const syncDir = join(dirname(path), "sync"), stateFile = join(syncDir, `${projectId}.json`);
+      const existing = readSyncState(stateFile);
+      if (reuse && existing && syncServiceRunning(existing)) {
+        if (existing.root !== root || existing.origin !== config.origin) throw new Error("A different checkout already syncs this cloud project. Stop its sync service before changing folders.");
+        if (!existing.lastCommitAt) throw new Error("Workspace sync is still preparing its first upload. Wait for it before launching a session.");
+        return { skipped: { count: existing.skipped ?? 0, paths: [] as string[] } };
+      }
+      return startSyncService({ origin: config.origin, token: config.token, projectId, root, stateFile, storeDir: join(syncDir, `${projectId}-store`) });
+    };
     if (command === "close") {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
       await closeSession(api, me, await selectSession(sessions, positional[0], true), options);
@@ -611,10 +642,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     }
     if (command === "sync") {
       if (me.role !== "owner") throw new Error("Workspace sync requires an owner device key");
-      const syncDir = join(dirname(path), "sync");
-      const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
-      if (!PROJECT_ID.test(projectId) || !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
-      const stateFile = join(syncDir, `${projectId}.json`);
+      const mapped = !options["--project"] && !options["--apply"] ? await mappedProject() : undefined;
+      const projectId = String(mapped?.id ?? options["--project"] ?? localSyncProject(join(dirname(path), "sync"), config.origin) ?? config.projectId ?? me.projects[0]?.id ?? "");
+      if (!PROJECT_ID.test(projectId) || (!mapped && !me.projects.some(p => p.id === projectId))) throw new Error("Unknown project. Use infinite projects");
       if (options["--apply"]) {
         // A large tree can take minutes to publish; a refusal (409) leaves its reason in the pending marker.
         const applied = await api.request(`/projects/${projectId}/sync/apply`, options["--force"] ? { force: true } : {}, AbortSignal.timeout(300000)).catch(async (error: unknown) => {
@@ -623,19 +653,19 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         });
         console.log(describeSync(await applied.json() as ProjectDetail["sync"])); return true;
       }
-      const root = gitRoot(realpathSync(process.cwd()));
+      const root = mapped?.root ?? gitRoot(realpathSync(process.cwd()));
       if (root === realpathSync(homedir()) || root === dirname(root)) throw new Error("Run inside a project directory; selecting the entire home or filesystem is not supported");
       progress.start(`Uploading ${clean(root)} to project ${projectId}`);
-      const { skipped } = await startSyncService({ origin: config.origin, token: config.token, projectId, root, stateFile, storeDir: join(syncDir, `${projectId}-store`) });
+      const { skipped } = await syncProject(projectId, root, Boolean(mapped));
       progress.stop();
       if (skipped.count) console.error(`[Infinite] Left out ${skipped.count} socket, FIFO, or device file${skipped.count === 1 ? "" : "s"}, which sync cannot copy: ${skipped.paths.map(clean).join(", ")}${skipped.count > skipped.paths.length ? ", …" : ""}`);
       const detail = await api.json<ProjectDetail>(`/projects/${projectId}`);
-      console.error(`[Infinite] Sync service running for ${clean(root)} → ${projectId}. ${describeSync(detail.sync)}. It keeps running after this command exits; stop it with infinite sync --stop.`);
+      console.error(`[Infinite] Sync service running for ${clean(root)} → ${projectId}. ${describeSync(detail.sync)}. It keeps running after this command exits; stop it with infinite sync --stop --project ${projectId}.`);
       return true;
     }
     if (command === "pull") {
       if (me.role !== "owner") throw new Error("Workspace pull requires an owner device key");
-      const projectId = positional[0] ?? String(config.projectId ?? me.projects[0]?.id ?? "");
+      const projectId = positional[0] ?? String(localSyncProject(join(dirname(path), "sync"), config.origin) ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!PROJECT_ID.test(projectId) || !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
       const directory = join(dirname(path), "pulls", projectId), storeDir = join(directory, "objects");
       const output = options["--output"] === undefined ? undefined : resolve(String(options["--output"]));
@@ -683,8 +713,16 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         } else validateNativeOpenCodeArgs(nativeArgs);
         if (!options["--detach"]) await (command === "codex" ? checkNativeCodex : checkNativeOpenCode)();
       }
-      const projectId = String(options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
-      if (!me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      const mapped = !workspace && !options["--project"] ? await mappedProject() : undefined;
+      const projectId = String(mapped?.id ?? options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
+      if (!mapped && !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      if (mapped) {
+        progress.start(`Syncing ${clean(mapped.root)} to ${clean(mapped.path)}`);
+        await syncProject(projectId, mapped.root, true);
+        const detail = await api.json<ProjectDetail>(`/projects/${projectId}`);
+        if (!detail.sync.appliedManifest) throw new Error(`The mirrored workspace has not been applied. Inspect infinite sync --status; apply it with infinite sync --apply --project ${projectId} before launching.`);
+        progress.stop();
+      }
       if (!workspace) {
         // A cloud session starts on the tree in place; laptop changes that wait for an apply are not in it.
         const pending = (await api.json<ProjectDetail>(`/projects/${projectId}`).catch(() => undefined))?.sync?.pendingGeneration;
@@ -693,7 +731,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const requestId = randomUUID();
       console.error(`[Infinite] Launch ${requestId} on ${config.origin} · project ${projectId}`);
       progress.start(`Starting ${providerNames[command]} on ${new URL(config.origin).hostname}`);
-      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs, ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
+      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs, ...(mapped?.cwd ? { cwd: mapped.cwd } : {}), ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
       if (workspace) {
         progress.start("Connecting the laptop executor");
         await startLaptopService({ ...config, sessionId: session.id, workspaceToken: workspace.token, cwd: workspace.cwd, roots: workspace.roots, configFile: path });

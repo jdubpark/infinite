@@ -17,6 +17,13 @@ test("usage ledger prices OpenCode members, survives restart idempotently, and c
     const created = await run.host.fetchApi("/teams", "owner", run.create());
     const team = await run.settled(created.body.id);
     const usage = await waitFor(() => run.host.fetchApi("/usage").then(r => r.body as UsageSummary), (u: UsageSummary) => u.providers.opencode.spent?.messages === 4 && u.providers.claude.unmeasuredSessions >= 2, 20000);
+    const view = (await run.host.fetchApi(`/teams/${created.body.id}`)).body;
+    assert.equal(view.usage.byProfile["deepseek-high"].cost.toFixed(4), "0.0020");
+    assert.equal(view.usage.byProvider.opencode.messages, 4);
+    assert.equal(view.usage.total.cost.toFixed(4), "0.5020");
+    assert.ok(view.usage.unmeasuredMembers >= 2, "Coordinator and reviewer are not measured");
+    assert.equal(view.members.find((member: any) => member.role === "reviewer").usage, undefined);
+    assert.equal(view.members.find((member: any) => member.modelProfile?.id === "deepseek-high").usage.messages, 2);
     // deepseek member: configured 1000*1 + 500*2 per million = 0.002; spark member: no table entry, reported 0.5
     assert.equal(usage.providers.opencode.spent!.cost.toFixed(4), (0.002 + 0.5).toFixed(4));
     assert.deepEqual(usage.providers.opencode.spent!.pricing, { configured: 2, provider: 2, unknown: 0 });

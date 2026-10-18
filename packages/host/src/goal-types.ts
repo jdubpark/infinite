@@ -1,5 +1,7 @@
 import { z } from "zod";
 import type { TeamBrief, TeamLineup } from "./team-types.js";
+import type { UsageTotals } from "./usage.js";
+import type { UsageRollup } from "./team-usage.js";
 import type { LinearTrackingView } from "./linear-types.js";
 
 const scopedPath = z.string().trim().min(1).max(300).refine(value => value === "." || (!value.startsWith("/") && !value.includes("\\") && !/[\0*?\[\]:]/.test(value) && !value.split("/").some(part => ["", ".", "..", ".git"].includes(part))), "Use a repository-relative file or folder, or . for the whole project");
@@ -41,6 +43,8 @@ export interface GoalCycle {
   brief?: TeamBrief;
   reason?: string;
   memberCount: number;
+  /** Computed on read from the cycle's team; never stored. */
+  usage?: UsageTotals;
 }
 export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
   linear?: LinearTrackingView;
@@ -55,6 +59,8 @@ export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
   activeTeamId?: string;
   cycles: GoalCycle[];
   memberCount: number;
+  /** Computed on read, summed over cycles; never stored. */
+  usage?: UsageRollup;
   steering: { text: string; revision: number; at: string }[];
   events: { at: string; text: string }[];
   outcomes: { result: "achieved" | "not-achieved" | "inconclusive"; summary: string; evidence: string; at: string; revision: number }[];

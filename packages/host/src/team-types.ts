@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { Provider } from "./types.js";
 import type { LinearTrackingView } from "./linear-types.js";
+import type { UsageTotals } from "./usage.js";
+import type { UsageRollup } from "./team-usage.js";
 
 export const teamCommandSchema = z.object({
   command: z.string().min(1).max(4096).refine(value => !value.includes("\0")),
@@ -160,6 +162,8 @@ export interface TeamMember extends TeamAssignment {
   report?: TeamReport;
   cursor: number;
   stopRequestId: string;
+  /** Computed on read for members whose provider reports usage; never stored. */
+  usage?: UsageTotals;
 }
 export interface TeamTask extends TeamTaskPlan {
   status: "pending" | "running" | "waiting" | "integrated" | "blocked";
@@ -226,4 +230,4 @@ export interface TeamRun {
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
   round: number;
 }
-export type TeamView = Omit<TeamRun, "members"> & { members: Omit<TeamMember, "prompt">[] };
+export type TeamView = Omit<TeamRun, "members"> & { members: Omit<TeamMember, "prompt">[]; usage: UsageRollup };

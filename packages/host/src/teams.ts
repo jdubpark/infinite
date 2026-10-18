@@ -8,6 +8,7 @@ import { createTeamSchema, teamActionSchema, teamGoalContextSchema, teamLineupSc
 import { teamPrompt } from "./team-prompts.js";
 import { teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
+import { teamUsage } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
 import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureMemberResult, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, validateTeamPlan } from "./team-workspace.js";
 export { TeamError } from "./team-workspace.js";
@@ -73,7 +74,8 @@ export class TeamService {
     // to continue from a newly reviewed or no-change result.
     const tracking = this.linear?.updateTeam(stored.run);
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
-    return { ...run, members: members.map(({ prompt: _prompt, ...member }) => member) };
+    const withUsage = teamUsage(members.map(({ prompt: _prompt, ...member }) => member), run.provider, this.usage);
+    return { ...run, members: withUsage.members, usage: withUsage.rollup };
   }
   private save(stored: Stored) {
     stored.run.updatedAt = timestamp();

@@ -6,6 +6,7 @@ import { TeamService, TeamError } from "./teams.js";
 import { createGoalSchema, goalActionSchema, goalOutcomeSchema, goalSteerSchema, type CreateGoal, type ProductGoal } from "./goal-types.js";
 import type { Config } from "./types.js";
 import type { CreateTeam, TeamGoalContext, TeamView } from "./team-types.js";
+import { addRollups, emptyRollup } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
 
 type Action = { requestId: string; revision: number };
@@ -69,6 +70,14 @@ export class GoalService {
     const goal = structuredClone(this.record(id).goal);
     const tracking = this.linear?.updateGoal(goal);
     goal.linear = this.linear?.getGoal(id) ?? tracking ?? goal.linear;
+    const rollups = goal.cycles.map(cycle => {
+      try {
+        const { usage } = this.teams.get(cycle.teamId);
+        cycle.usage = usage.total;
+        return usage;
+      } catch (error) { if (error instanceof TeamError && error.code === "team-not-found") return emptyRollup(cycle.memberCount); throw error; }
+    });
+    goal.usage = addRollups(rollups);
     return goal;
   }
   answer(teamId: string, decisionId: string, body: Action & { text: string }) {

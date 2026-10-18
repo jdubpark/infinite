@@ -4,8 +4,8 @@
  * revisions; these helpers only decide which controls to offer.
  */
 
-export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
-export type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer";
+export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
+export type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
 export type TeamCommand = { command: string; args: string[] };
 export type ModelProfile = { id: string; label: string; provider: string; model: string; effort?: string; variant?: string; tier?: "light" | "strong"; dataUse?: "standard" | "contributor" };
 export type TeamLineup = { coordinator: ModelProfile; integrator: ModelProfile; reviewer: ModelProfile; implementers: ModelProfile[]; escalations?: ModelProfile[]; fallbacks?: ModelProfile[] };
@@ -23,6 +23,8 @@ export type TeamView = {
   decisions: TeamDecision[]; checks: TeamCheck[]; steering: { text: string; revision: number; at: string }[];
   events: { at: string; text: string }[]; reason?: string; round: number;
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
+  /** Agent-reported merge evidence; it is not independently verified by the host. */
+  deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
   lineup?: TeamLineup; linear?: LinearTracking; brief?: TeamBrief;
   goal?: { id: string; revision: number; cycle: number };
   noChange?: { summary: string; evidence: TeamEvidence[] };
@@ -47,7 +49,7 @@ export type TeamProject = { id: string; name: string; linear?: { enabled: boolea
 export const TEAM_LABELS: Record<TeamStatus, string> = {
   planning: "Planning", discovering: "Investigating", implementing: "Implementing", integrating: "Integrating",
   verifying: "Running checks", reviewing: "Reviewing", "needs-input": "Needs your input", paused: "Paused",
-  blocked: "Blocked", "ready-for-review": "Ready for your review", "no-change": "No change proposed", cancelled: "Cancelled",
+  delivering: "Delivering", merged: "Merge reported", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-change": "No change proposed", cancelled: "Cancelled",
 };
 export const GOAL_LABELS: Record<GoalStatus, string> = {
   running: "Working", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked",
@@ -55,7 +57,7 @@ export const GOAL_LABELS: Record<GoalStatus, string> = {
   cancelled: "Cancelled", achieved: "Outcome recorded: achieved",
 };
 export const OUTCOME_LABELS: Record<GoalResult, string> = { achieved: "Achieved", "not-achieved": "Not achieved", inconclusive: "Inconclusive" };
-export const ROLE_NAMES: Record<TeamRole, string> = { "project-manager": "Coordinator", scout: "Scout", implementer: "Implementer", integrator: "Integrator", reviewer: "Reviewer" };
+export const ROLE_NAMES: Record<TeamRole, string> = { "project-manager": "Coordinator", scout: "Scout", implementer: "Implementer", integrator: "Integrator", reviewer: "Reviewer", delivery: "Delivery" };
 
 /** The StatePill tones: amber waits on a person, forest is working or ready, error is stuck. */
 export type Tone = "amber" | "forest" | "muted" | "error";
@@ -120,11 +122,13 @@ export function profileSetting(profile: ModelProfile) {
 export function teamControls(team: TeamView, role: DeviceRole | undefined, fresh: boolean) {
   const acts = fresh && role !== undefined && role !== "viewer";
   const owns = fresh && role === "owner" && !team.goal && team.status !== "cancelled";
+  const deliveryStarted = team.status === "delivering" || team.status === "merged" || Boolean(team.deliveryReceipt);
+  const deliveryReported = team.status === "merged" || Boolean(team.deliveryReceipt);
   return {
     answer: acts && !["paused", "cancelled"].includes(team.status),
-    steer: acts && !team.goal && team.status !== "cancelled",
-    pause: owns && !["paused", "blocked", "ready-for-review", "no-change"].includes(team.status),
-    resume: owns && team.status === "paused",
+    steer: acts && !team.goal && team.status !== "cancelled" && !deliveryStarted,
+    pause: owns && !deliveryReported && !["paused", "blocked", "ready-for-review", "no-change", "merged"].includes(team.status),
+    resume: owns && team.status === "paused" && !deliveryReported,
     cancel: owns,
   };
 }

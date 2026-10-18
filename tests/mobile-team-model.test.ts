@@ -25,6 +25,13 @@ test("phone team controls follow the documented roles and goal ownership", () =>
   // A stale view offers nothing until a poll succeeds.
   assert.deepEqual(teamControls(team(), "owner", false), { answer: false, steer: false, pause: false, resume: false, cancel: false });
   assert.deepEqual(teamControls(team({ status: "paused" }), "owner", true), { answer: false, steer: true, pause: false, resume: true, cancel: true });
+  // Delivery is a separate phase: decisions remain answerable, steering stops, and an owner can still pause an in-flight publisher.
+  assert.deepEqual(teamControls(team({ status: "delivering" }), "owner", true), { answer: true, steer: false, pause: true, resume: false, cancel: true });
+  // A merge receipt is an agent claim; steering and pausing stop, while decisions stay answerable.
+  assert.deepEqual(teamControls(team({ status: "merged" }), "owner", true), { answer: true, steer: false, pause: false, resume: false, cancel: true });
+  const receipt = { revision: 2, headCommit: "a".repeat(40), pullRequestUrl: "https://github.com/owner/repo/pull/12", mergeCommit: "b".repeat(40), summary: "Merged", reportedAt: "2026-01-01T00:00:00.000Z" };
+  assert.deepEqual(teamControls(team({ status: "paused", deliveryReceipt: receipt }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: true });
+  assert.deepEqual(teamControls(team({ status: "blocked", deliveryReceipt: receipt }), "owner", true), { answer: true, steer: false, pause: false, resume: false, cancel: true });
   for (const status of ["blocked", "ready-for-review", "no-change"] as const) assert.equal(teamControls(team({ status }), "owner", true).pause, false, status);
   assert.deepEqual(teamControls(team({ status: "cancelled" }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: false });
 });

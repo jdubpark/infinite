@@ -4,7 +4,8 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { waitFor } from "./helpers.js";
+import { startHost, waitFor } from "./helpers.js";
+import { writeSealed } from "../packages/host/src/vault.js";
 import { fixture, mixedLineup } from "./team-fixture.js";
 import { UsageService, type UsageSessionRow, type UsageSummary } from "../packages/host/src/usage-service.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -35,6 +36,36 @@ test("a tick reads the listing it is given, and skips an exited session whose jo
     assert.deepEqual(reads, [0, 1], "An exited session read to its end is not read again");
     assert.equal((usage.session("native") as { messages: number }).messages, 2);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("an unreadable or misshapen ledger is discarded with a warning and the service starts empty", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-usage-")), key = randomBytes(32), file = join(dir, "usage.sealed");
+  const warn = console.warn, warnings: string[] = [];
+  console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+  try {
+    const manager = {} as Manager;
+    for (const write of [() => writeFileSync(file, "not a sealed ledger"), () => writeSealed(file, key, "usage", { rows: [], cursors: {}, sessions: {} }), () => writeSealed(file, key, "usage", { rows: {}, cursors: {} })]) {
+      write();
+      const usage = new UsageService({ stateDir: dir } as Config, key, manager);
+      assert.equal(usage.summary().providers.opencode.spent?.messages, 0);
+      assert.deepEqual(usage.session("any"), { measured: false });
+    }
+    assert.equal(warnings.length, 3, "One warning for each discarded ledger");
+  } finally { console.warn = warn; rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the API starts and serves with unreadable usage and limit files", { timeout: 60000 }, async () => {
+  const host = await startHost();
+  try {
+    await host.stopApi();
+    writeFileSync(join(host.config.stateDir, "usage.sealed"), "not a sealed ledger");
+    writeFileSync(join(host.config.stateDir, "provider-limits.sealed"), "not a sealed limits file");
+    await host.start();
+    const usage = await host.fetchApi("/usage");
+    assert.equal(usage.status, 200);
+    assert.equal((usage.body as UsageSummary).providers.opencode.spent?.messages, 0);
+    assert.deepEqual((await host.fetchApi("/me")).body.providerLimits, []);
+  } finally { await host.stop(); }
 });
 
 test("usage ledger prices OpenCode members, survives restart idempotently, and counts unmeasured sessions", { timeout: 120000 }, async () => {

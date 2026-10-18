@@ -24,6 +24,7 @@ const PAGE = 200;
 const periodEnd = (period: Period, start: Date) => period === "month" ? new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1))
   : new Date(start.getTime() + (period === "week" ? 7 : 1) * 86_400_000);
 const SCOPE = "usage";
+const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 
 /**
  * Sealed ledger of per-step OpenCode usage. Only OpenCode sessions started with JSON output
@@ -41,7 +42,14 @@ export class UsageService {
   private readonly file: string;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager) {
     this.file = join(config.stateDir, "usage.sealed");
-    if (existsSync(this.file)) this.ledger = unseal<Ledger>(key, SCOPE, readFileSync(this.file, "utf8"));
+    // The ledger is derived from session journals, so an unreadable one is rebuilt rather than fatal.
+    if (existsSync(this.file)) try {
+      const stored = unseal<Ledger>(key, SCOPE, readFileSync(this.file, "utf8"));
+      if (!isRecord(stored) || !isRecord(stored.rows) || !isRecord(stored.cursors) || !isRecord(stored.sessions)) throw new Error("unexpected ledger shape");
+      this.ledger = stored;
+    } catch (error) {
+      console.warn(`[Infinite] The usage ledger cannot be read and is rebuilt from session journals: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   /**
    * Runs the ledger on its own 2 s timer. The host's TeamService drives `tick(rows)` from the session

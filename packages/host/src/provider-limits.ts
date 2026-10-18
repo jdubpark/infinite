@@ -17,6 +17,7 @@ type State = { limits: Partial<Record<Provider, ProviderLimit>>; cleared: Partia
 const SCOPE = "provider-limits";
 const DAY_MS = 86_400_000;
 const UNSTATED_MS = 15 * 60_000;
+const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const time = (value?: string) => { const ms = value === undefined ? NaN : Date.parse(value); return Number.isNaN(ms) ? undefined : ms; };
 
 /** A corroborated observation switches its member; so does a Claude hook alone, because that turn already failed. */
@@ -35,7 +36,14 @@ export class ProviderLimits {
   /** Per-session journal position, latest limit observation, and latest successful turn end. */
   private readonly sessions = new Map<string, { cursor: number; limitAt?: number; turnAt?: string }>();
   constructor(private readonly file: string, private readonly key: Buffer) {
-    if (existsSync(file)) this.state = unseal<State>(key, SCOPE, readFileSync(file, "utf8"));
+    // The memory is advisory and every entry expires, so an unreadable file starts it empty rather than blocking startup.
+    if (existsSync(file)) try {
+      const stored = unseal<State>(key, SCOPE, readFileSync(file, "utf8"));
+      if (!isRecord(stored) || !isRecord(stored.limits) || !isRecord(stored.cleared)) throw new Error("unexpected provider limit shape");
+      this.state = stored;
+    } catch (error) {
+      console.warn(`[Infinite] Provider limits cannot be read and start empty: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   /** Records a corroborated observation unless a newer one, or a later clear, is already known. */
   observe(limit: Omit<ProviderLimit, "expiresAt">) {

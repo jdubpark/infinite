@@ -89,7 +89,7 @@ Each `usage` record is priced at read time, not at capture: `cost` is computed f
 
 ### Aggregation and durability
 
-A `UsageService` in the API owns a sealed ledger in the state directory. It follows the journals of sessions that can produce `usage` events (OpenCode sessions, by provider) with a cursor per session, the same way the team scheduler follows `team-report` events, and writes each record keyed by `(sessionId, messageId, partId)`, last write wins. Re-reading a journal after a restart produces the same ledger. The ledger also stores, per session, the provider, model profile when the session is a team member, and project.
+A `UsageService` in the API owns a sealed ledger in the state directory. It follows the journals of sessions that can produce `usage` events (OpenCode sessions, by provider) with a cursor per session, the same way the team scheduler follows `team-report` events, and writes each record keyed by `(sessionId, messageId, partId)`, last write wins. Re-reading a journal after a restart produces the same ledger. The ledger also stores, per session, the provider, model profile when the session is a team member, and project. An unreadable or misshapen ledger file is discarded with one warning and rebuilt from the journals; it never blocks host startup. (Added 2026-10-18 after final review.)
 
 The service answers:
 
@@ -151,7 +151,7 @@ Observations are grouped into a **limit episode** held in the worker's own state
 
 ### Host-level limit memory
 
-`TeamService` keeps `providerLimits`, a map from provider to `{ detectedAt, resetsAt?, expiresAt, sessionId, runId?, confidence }`, persisted in a sealed file. A corroborated limit is recorded here regardless of which run observed it, with the expiry rules above, and is cleared early when a session of that provider journals a successful turn after the entry was detected and after that session's own latest limit observation. Activity timestamps are not evidence for this, because a repeated limit hit also updates them. An observation no newer than the clear cannot restore a cleared entry, so an exited session's old limit does not bring it back. `GET /api/me` and the team views expose the current entries so the dashboards can say why members are launching on fallbacks.
+`TeamService` keeps `providerLimits`, a map from provider to `{ detectedAt, resetsAt?, expiresAt, sessionId, runId?, confidence }`, persisted in a sealed file. A corroborated limit is recorded here regardless of which run observed it, with the expiry rules above, and is cleared early when a session of that provider journals a successful turn after the entry was detected and after that session's own latest limit observation. Activity timestamps are not evidence for this, because a repeated limit hit also updates them. An observation no newer than the clear cannot restore a cleared entry, so an exited session's old limit does not bring it back. `GET /api/me` and the team views expose the current entries so the dashboards can say why members are launching on fallbacks. An unreadable or misshapen file is discarded with one warning and the map starts empty, since every entry expires anyway. (Added 2026-10-18 after final review.)
 
 ### Lineup configuration
 

@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProviderLimits, switchesMember, type LimitRow, type LimitSessions } from "../packages/host/src/provider-limits.js";
+import { writeSealed } from "../packages/host/src/vault.js";
 
 const at = (hhmm: string, day = 18) => `2026-10-${day}T${hhmm}:00.000Z`;
 function store() {
@@ -43,6 +44,24 @@ test("a corroborated limit lasts until its stated reset, at most a day, or 15 mi
     reopened.observe({ provider: "claude", detectedAt: at("09:00"), sessionId: "old", confidence: "corroborated" });
     assert.equal(s.open().active(new Date(at("10:05")))[0].sessionId, "s1", "An older observation does not replace a newer entry");
   } finally { s.close(); }
+});
+
+test("an unreadable or misshapen limits file is discarded with a warning and the service starts empty", () => {
+  const s = store();
+  const warn = console.warn, warnings: string[] = [];
+  console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+  try {
+    writeFileSync(s.file, "not a sealed file");
+    const limits = s.open();
+    assert.deepEqual(limits.active(new Date(at("10:05"))), []);
+    limits.observe({ provider: "claude", detectedAt: at("10:00"), sessionId: "s1", confidence: "corroborated" });
+    assert.equal(s.open().active(new Date(at("10:05"))).length, 1, "The next observation replaces the discarded file");
+    for (const state of [{ limits: {}, cleared: null }, { limits: [], cleared: {} }, []]) {
+      writeSealed(s.file, s.key, "provider-limits", state);
+      assert.deepEqual(s.open().active(new Date(at("10:05"))), []);
+    }
+    assert.equal(warnings.length, 4, "One warning for each discarded file");
+  } finally { console.warn = warn; s.close(); }
 });
 
 test("a cleared limit stays cleared until a newer observation", () => {

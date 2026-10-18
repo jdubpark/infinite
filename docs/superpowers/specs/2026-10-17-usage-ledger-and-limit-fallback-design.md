@@ -38,7 +38,7 @@ This design adds a durable usage ledger for OpenCode sessions with a soft per-pr
 
 Confirmed from the installed binaries and the vendors' own documentation on 2026-10-17. Versions: OpenCode 1.18.34, Codex 0.162.0 on the live host (0.163.0 locally), Claude Code 2.1.302.
 
-**OpenCode.** The server emits `message.updated` with `properties.info`. For an assistant message, `info` has `cost` (USD), `tokens.input`, `tokens.output`, `tokens.reasoning`, `tokens.cache.read`, `tokens.cache.write`, plus `providerID`, `modelID`, and `time.completed` once the message is final. The event repeats while the message streams; the final value is the one with `time.completed`. `GET /session/{id}/message` returns the same objects after the fact. `cost` comes from models.dev pricing and is 0 when the catalog has no price for the model. `opencode run --format json` writes one JSON object per bus event to stdout, so the same `message.updated` events are available from a headless run. `session.error` carries `error.name` and, for `APIError`, `data.statusCode`; a 429 is retried by OpenCode itself.
+**OpenCode.** The server emits `message.updated` with `properties.info`. For an assistant message, `info` has `cost` (USD), `tokens.input`, `tokens.output`, `tokens.reasoning`, `tokens.cache.read`, `tokens.cache.write`, plus `providerID`, `modelID`, and `time.completed` once the message is final. The event repeats while the message streams; the final value is the one with `time.completed`. `GET /session/{id}/message` returns the same objects after the fact. `cost` comes from models.dev pricing and is 0 when the catalog has no price for the model. Each assistant message is built from one or more steps; every step ends with a `step-finish` part `{ type: "step-finish", id, messageID, sessionID, reason, cost, tokens: { input, output, reasoning, cache: { read, write } } }`, and the message's `cost` is the sum of its steps' costs. The part arrives on the server stream as `message.part.updated`. `opencode run --format json` does not write `message.updated`; it writes one JSON line per part event, `{ type: "step_finish" | "text" | "tool_use" | …, timestamp, sessionID, part }`, so a headless run exposes usage through its `step_finish` lines and nothing else. Those lines carry no provider or model id. `session.error` carries `error.name` and, for `APIError`, `data.statusCode`; a 429 is retried by OpenCode itself. (Corrected 2026-10-18 from the installed binary; an earlier draft assumed `message.updated` lines.)
 
 **Claude Code.** The `StopFailure` hook fires instead of `Stop` when a turn ends on an API error. Its payload has `error`, one of `rate_limit`, `overloaded`, `authentication_failed`, `billing_error`, `max_output_tokens`, and others, plus `error_details` and `last_assistant_message`. The host already registers this hook and maps it to a failed turn, but drops the `error` field. The interactive process does not exit on a limit; it shows "You've hit your session limit · resets 3:45pm" (or weekly, Opus, spend variants) and may wait for the reset. `Notification` hooks `quota_auto_resume_fired`, `quota_auto_resume_stale`, and `quota_auto_resume_disabled` describe that wait.
 
@@ -50,17 +50,18 @@ Still unobserved on the live host, and to be confirmed during implementation bef
 
 ### Capture
 
-OpenCode team members launch with `--format json` added by the host (the launch builder already owns the `run` argument list). The worker parses each stdout line that is a JSON object with `type: "message.updated"`, and for an assistant message with `time.completed` set, records a journal event of kind `usage`:
+OpenCode team members launch with `--format json` added by the host (the launch builder already owns the `run` argument list). The worker parses each stdout line that is a JSON object with `type: "step_finish"` and records a journal event of kind `usage` from its `part`:
 
 ```
-{ provider: "opencode", providerId, modelId, messageId, completedAt,
+{ provider: "opencode", providerId, modelId, modelSource: "requested" | "reported",
+  messageId, partId, completedAt,
   tokens: { input, output, reasoning, cacheRead, cacheWrite },
   reportedCost }
 ```
 
-Lines that are not JSON, not `message.updated`, or not completed are ignored. A repeated `messageId` replaces the earlier record for that message rather than adding to it. The member's terminal shows the JSON event stream; these members accept no interactive input anyway, and the web chat view continues to come from the provider's own record.
+One record per step. Lines that are not JSON or not `step_finish` are ignored. Headless lines carry no model id, so a team member's `providerId` and `modelId` come from its requested lineup profile and are labelled `modelSource: "requested"`. The worker appends every record immediately; the journal is append-only and the ledger, not the worker, enforces one row per `(sessionId, messageId, partId)`. The member's terminal shows the JSON event stream; these members accept no interactive input anyway, and the web chat view continues to come from the provider's own record.
 
-OpenCode sessions driven through the local-UI adapter already subscribe to `/event` and record the message role from `message.updated`; the same handler records the `usage` event. Terminal-mode `infinite opencode` sessions run the TUI and have no structured output; the ledger records nothing for them and the API says so rather than showing zero.
+OpenCode sessions driven through the local-UI adapter already subscribe to `/event`; the same handler records a `usage` event from each `message.part.updated` whose part is a `step-finish`, taking the provider and model from the `message.updated` it saw for that message (`modelSource: "reported"`). Terminal-mode `infinite opencode` sessions run the TUI and have no structured output; the ledger records nothing for them and the API says so rather than showing zero.
 
 Claude Code and Codex sessions record no `usage` events in this change.
 
@@ -88,7 +89,7 @@ Each `usage` record is priced at read time, not at capture: `cost` is computed f
 
 ### Aggregation and durability
 
-A `UsageService` in the API owns a sealed ledger in the state directory. It follows the journals of sessions that can produce `usage` events (OpenCode sessions, by provider) with a cursor per session, the same way the team scheduler follows `team-report` events, and writes each record keyed by `(sessionId, messageId)`. Re-reading a journal after a restart produces the same ledger. The ledger also stores, per session, the provider, model profile when the session is a team member, and project.
+A `UsageService` in the API owns a sealed ledger in the state directory. It follows the journals of sessions that can produce `usage` events (OpenCode sessions, by provider) with a cursor per session, the same way the team scheduler follows `team-report` events, and writes each record keyed by `(sessionId, messageId, partId)`, last write wins. Re-reading a journal after a restart produces the same ledger. The ledger also stores, per session, the provider, model profile when the session is a team member, and project.
 
 The service answers:
 

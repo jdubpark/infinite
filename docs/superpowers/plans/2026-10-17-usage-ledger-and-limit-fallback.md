@@ -29,7 +29,7 @@
 
 1. OpenCode reports `cost: 0` for a model with no configured price. Expected: the record's `pricing` is `unknown` and totals show the gap, not "$0.00". Pinned in Task 2.
 2. A `message.updated` JSON line arrives split across two PTY chunks. Expected: the assembler reassembles it and records one usage event. Pinned in Task 3.
-3. The same `messageId` arrives several times with growing token counts, then with `time.completed`. Expected: exactly one ledger row holding the final values. Pinned in Task 4.
+3. The same `step_finish` line is journaled twice (a duplicate announcement). Expected: exactly one ledger row for that `(sessionId, messageId, partId)`. Pinned in Task 4.
 4. A Codex screen whose transcript body contains "Usage limit reached" while the status row is normal. Expected: no `provider-limit` signal. Pinned in Task 7.
 5. A member's fallback profile's provider is itself in `providerLimits`. Expected: the resolver skips to the next hop; with no hop left the run blocks with a reason naming the profile. Pinned in Task 1 (resolver) and Task 10 (block).
 
@@ -151,48 +151,35 @@ test("period starts are UTC day, Monday week, and month", () => {
 
 ### Task 3: Capture OpenCode usage into the session journal
 
+(Rewritten 2026-10-18 after review: `opencode run --format json` writes part events, not `message.updated`; usage comes from `step-finish` parts in both paths.)
+
 **Files:**
 - Create: `packages/host/src/opencode-usage.ts`
+- Modify: `packages/host/src/usage.ts` (`UsageRecord` gains `partId: string` and `modelSource: "requested" | "reported"`)
 - Modify: `packages/host/src/types.ts:70-75` (add `"usage"` to `Event.type`)
-- Modify: `packages/host/src/launch.ts:37-54` (append `--format json` to the `run` arguments when the provider profile does not already set `--format`)
-- Modify: `packages/host/src/worker.ts:1085-1105` (`output()` feeds the line assembler for OpenCode team members) and `:1060-1070` (OpenCode native adapter `onUsage`)
-- Modify: `packages/host/src/native-opencode.ts:62-64` (record completed assistant messages via `options.onUsage`)
-- Modify: `tests/fixtures/team-agent.mjs:36-48` (accept `--format json` in the run argument check; scenario `usage` prints `message.updated` lines)
+- Modify: `packages/host/src/launch.ts:37-54` (append `--format json` to the `run` arguments unless the provider profile already sets `--format`)
+- Modify: `packages/host/src/worker.ts` (`output()` feeds the line assembler for OpenCode team members; native adapter `onUsage`)
+- Modify: `packages/host/src/native-opencode.ts` (map `message.updated` id → providerID/modelID; emit usage from `message.part.updated` step-finish parts)
+- Modify: `packages/host/src/server.ts` (`/api/sessions/:id/events` `types` filter accepts `usage`)
+- Modify: `tests/fixtures/team-agent.mjs` (accept `--format json`; scenario `usage` prints `step_finish` lines)
 - Test: `tests/opencode-usage.test.ts` (create), `tests/teams.test.ts` (extend)
 
 **Interfaces:**
 - Produces:
   ```ts
-  export function usageFromMessageUpdated(event: unknown): UsageRecord | undefined   // undefined unless type === "message.updated", info.role === "assistant", info.time.completed set
-  export class JsonLineAssembler { push(chunk: string): unknown[] }   // returns parsed objects for each complete line that parses as a JSON object; non-JSON lines are dropped; holds a partial trailing line (cap 1 MiB, then drop)
+  export function usageFromStepFinish(part: unknown, context: { completedAt: string; providerId: string; modelId: string; modelSource: "requested" | "reported" }): UsageRecord | undefined
+  // undefined unless part.type === "step-finish" with string id and messageID; tokens coerced to finite non-negative integers (missing → 0); cost to a finite non-negative number (otherwise 0)
+  export class JsonLineAssembler { push(chunk: string): unknown[] }   // parsed objects per complete JSON-object line; non-JSON dropped; partial trailing line held (cap 1 MiB, then dropped)
   ```
-- Worker: for `provider === "opencode" && session.team` the raw `output()` chunks (before `terminal.write`) go through one assembler; each `usageFromMessageUpdated` result is written with `append("usage", record)`. The native adapter gets `onUsage: (record: UsageRecord) => void` in its options, called from the `message.updated` branch when `usageFromMessageUpdated` returns a record.
+- Headless worker path (`provider === "opencode" && session.team`): each assembled object with `type === "step_finish"` becomes a record with `completedAt` from the line's `timestamp`, provider/model from `session.teamModelProfile.model` split at its first `/`, `modelSource: "requested"`; appended immediately with `append("usage", record)`. No worker-side coalescing.
+- Native adapter: `onUsage(record)` option; on `message.part.updated` with `part.type === "step-finish"`, record with `completedAt` = now, provider/model from the remembered `message.updated` for that message (`modelSource: "reported"`), else the session's requested model (`modelSource: "requested"`).
 
-- [ ] **Step 1: Write the failing unit tests**
-
-```ts
-// tests/opencode-usage.test.ts
-const completed = { type: "message.updated", properties: { info: { id: "msg_1", sessionID: "ses_1", role: "assistant", providerID: "deepseek", modelID: "deepseek-flash", cost: 0.0123,
-  tokens: { input: 1200, output: 300, reasoning: 50, cache: { read: 100, write: 0 } }, time: { created: 1, completed: 2 } } } };
-test("completed assistant messages become usage records; streaming and user messages do not", () => {
-  assert.deepEqual(usageFromMessageUpdated(completed), { provider: "opencode", providerId: "deepseek", modelId: "deepseek-flash", messageId: "msg_1", completedAt: new Date(2).toISOString(),
-    tokens: { input: 1200, output: 300, reasoning: 50, cacheRead: 100, cacheWrite: 0 }, reportedCost: 0.0123 });
-  assert.equal(usageFromMessageUpdated({ ...completed, properties: { info: { ...completed.properties.info, time: { created: 1 } } } }), undefined);
-  assert.equal(usageFromMessageUpdated({ type: "message.updated", properties: { info: { id: "u", role: "user", time: { created: 1, completed: 2 } } } }), undefined);
-});
-test("the assembler reassembles a JSON line split across chunks and drops other output", () => {
-  const line = JSON.stringify(completed); const assembler = new JsonLineAssembler();
-  assert.deepEqual(assembler.push("spinner text\r\n" + line.slice(0, 40)), []);
-  assert.deepEqual(assembler.push(line.slice(40) + "\n{not json}\n"), [completed]);
-});
-```
-
-- [ ] **Step 2: Run to verify failure** — `npx tsx --test tests/opencode-usage.test.ts`; expected: module not found.
-- [ ] **Step 3: Implement `opencode-usage.ts`**, the `Event.type` addition, and the launch change.** In `teamModelLaunch`, after `"run"`, add `"--format", "json"` unless `providerArgs` already contains `--format`. Update `tests/fixtures/team-agent.mjs` so the OpenCode argument check tolerates `--format json` before `--model`.
-- [ ] **Step 4: Wire the worker and native adapter** as described in Interfaces. In the worker, the assembler is created once next to `pending`; `output()` calls it before `terminal.write` and appends each record. Keep the journal write inside the existing try so a failed write still suspends the session.
-- [ ] **Step 5: Extend the team fixture and the team test.** In `team-agent.mjs`, when `receipt.provider === "opencode"` and `scenario === "usage"`, before reporting its result the implementer writes four lines to stdout: a streaming `message.updated` for `msg_<taskId>` without `time.completed`, the same id completed with `tokens.input: 400, output: 100` and `cost: 0.1`, the same id completed again with `tokens.input: 1000, output: 500, reasoning: 0, cache: {read: 0, write: 0}` and `cost: 0.5` (the final values), and a plain-text line. The ledger must hold one row per member with the final values. Add a test in `tests/teams.test.ts` using `mixedLineup` with both implementers switched to OpenCode profiles (`spark-high` and a second `deepseek-high` on `deepseek/deepseek-flash`), scenario `usage`, that after `settled` reads each implementer session's events (`GET /sessions/:id/events`, see `server.ts:461` for the query shape) and asserts exactly one `usage` event per implementer with `reportedCost === 0.5` and `tokens.input === 1000`.
-- [ ] **Step 6: Run** — `npx tsx --test tests/opencode-usage.test.ts tests/teams.test.ts tests/native-opencode.test.ts`; expected PASS.
-- [ ] **Step 7: Commit** — `git add packages/host/src/opencode-usage.ts packages/host/src/types.ts packages/host/src/launch.ts packages/host/src/worker.ts packages/host/src/native-opencode.ts tests/fixtures/team-agent.mjs tests/opencode-usage.test.ts tests/teams.test.ts && git commit -m "Record OpenCode token usage and cost from headless run output and the native adapter"`
+- [ ] **Step 1: Unit tests** in `tests/opencode-usage.test.ts`: a step-finish part with `cost: 0.0123`, `tokens: { input: 1200, output: 300, reasoning: 50, cache: { read: 100, write: 0 } }` yields the record; a part with `tokens.cache` missing and `cost: null` yields zeros; a `text` part yields undefined; the assembler reassembles a JSON line split across two chunks and drops `{not json}` and plain text.
+- [ ] **Step 2: Run to verify failure.**
+- [ ] **Step 3: Implement** the module, type changes, launch flag, worker and adapter wiring, and the events-route filter.
+- [ ] **Step 4: Fixture and team test.** Scenario `usage`: each OpenCode implementer writes a `text` line, a `step_finish` line (`id: "prt_<taskId>_1"`, `messageID: "msg_<taskId>"`, `cost: 0.1`, `tokens: { input: 400, output: 100, reasoning: 0, cache: { read: 0, write: 0 } }`), a second `step_finish` line (`id: "prt_<taskId>_2"`, same message, `cost: 0.4`, `tokens: { input: 600, output: 400, reasoning: 0, cache: { read: 0, write: 0 } }`), then a plain-text line; each JSON line is `{ type, timestamp: Date.now(), sessionID: "ses_fixture", part }`. Team test (lineup with two OpenCode implementers, `spark-high` and `deepseek-high` on `deepseek/deepseek-flash`): per implementer exactly two `usage` events (read with `types=usage`), distinct `partId`s, same `messageId`, summed `tokens.input === 1000`, `tokens.output === 500`, summed `reportedCost === 0.5` (1e-9 tolerance), `modelSource === "requested"`, provider/model equal to the profile model split at `/`.
+- [ ] **Step 5: Run** — `npx tsx --test tests/opencode-usage.test.ts tests/usage-pricing.test.ts tests/teams.test.ts tests/native-opencode.test.ts`; expected PASS.
+- [ ] **Step 6: Commit.**
 
 ---
 
@@ -216,7 +203,7 @@ test("the assembler reassembles a JSON line split across chunks and drops other 
     summary(now?: Date): UsageSummary;
   }
   ```
-- Ledger: `<stateDir>/usage.sealed` holding `{ cursors: Record<sessionId, number>, sessions: Record<sessionId, { provider, projectId, team?: TeamAssignment, profileId?: string }>, rows: Record<`${sessionId}/${messageId}`, UsageRecord> }`. Each tick: list sessions from `manager.list()`, for OpenCode sessions read `manager.events(id, cursor, 200, new Set(["usage"]))` until `!more`, upsert rows by key, persist. Pricing is applied in `session()`/`summary()` via `priceUsage` with `config.usage?.prices`. A session is `measured` when it is OpenCode and either a team member or a local-UI session (`runtime.nativeUi === "opencode"`); every other session counts toward its provider's `unmeasuredSessions`.
+- Ledger: `<stateDir>/usage.sealed` holding `{ cursors: Record<sessionId, number>, sessions: Record<sessionId, { provider, projectId, team?: TeamAssignment, profileId?: string }>, rows: Record<`${sessionId}/${messageId}/${partId}`, UsageRecord> }`. Each tick: list sessions from `manager.list()`, for OpenCode sessions read `manager.events(id, cursor, 200, new Set(["usage"]))` until `!more`, upsert rows by key (last write wins), persist. Rows are per OpenCode step, so `messages` in `UsageTotals` counts step rows. Pricing is applied in `session()`/`summary()` via `priceUsage` with `config.usage?.prices`. A session is `measured` when it is OpenCode and either a team member or a local-UI session (`runtime.nativeUi === "opencode"`); every other session counts toward its provider's `unmeasuredSessions`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -225,15 +212,15 @@ test("usage ledger prices OpenCode members, survives restart idempotently, and c
   const run = await fixture("usage", opencodeLineup, { usage: { prices: { "deepseek/deepseek-flash": { input: 1, output: 2 } }, budgets: { opencode: { usd: 10 } } } });
   try {
     const team = await run.settled((await run.host.fetchApi("/teams", "owner", run.create())).body.id);
-    const usage = await waitFor(() => run.host.fetchApi("/usage").then(r => r.body), (u: UsageSummary) => u.providers.opencode.spent?.messages === 2, 20000);
+    const usage = await waitFor(() => run.host.fetchApi("/usage").then(r => r.body), (u: UsageSummary) => u.providers.opencode.spent?.messages === 4, 20000); // two step rows per OpenCode member
     // deepseek member: configured 1000*1 + 500*2 per million = 0.002; spark member: no table entry -> reported 0.5
     assert.equal(usage.providers.opencode.spent!.cost.toFixed(4), (0.002 + 0.5).toFixed(4));
-    assert.deepEqual(usage.providers.opencode.spent!.pricing, { configured: 1, provider: 1, unknown: 0 });
+    assert.deepEqual(usage.providers.opencode.spent!.pricing, { configured: 2, provider: 2, unknown: 0 });
     assert.equal(usage.providers.opencode.budget?.usd, 10);
     assert.ok(usage.providers.claude.unmeasuredSessions >= 2); // coordinator + reviewer
     await run.host.restart();
     const again = (await run.host.fetchApi("/usage")).body as UsageSummary;
-    assert.equal(again.providers.opencode.spent!.messages, 2);
+    assert.equal(again.providers.opencode.spent!.messages, 4);
     const sessions = (await run.host.fetchApi("/sessions")).body.sessions;
     assert.equal(sessions.find((s: any) => s.id === team.members.find(m => m.modelProfile?.id === "deepseek-high")!.sessionId).usage.cost.toFixed(4), "0.0020");
   } finally { await run.close(); }

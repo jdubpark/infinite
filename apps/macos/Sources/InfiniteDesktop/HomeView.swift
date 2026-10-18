@@ -160,7 +160,7 @@ struct ProjectList: View {
     }
 }
 
-/// One run on one line: its status, name, state in words, and how long ago the host last changed it.
+/// One run on one line: its status, name, state in words, and how long ago it last did something.
 /// Decisions, the stop reason, plan progress, and the Linear issue are in the tooltip and the team page.
 struct ProjectRow: View {
     @ObservedObject var app: AppModel
@@ -191,7 +191,7 @@ struct ProjectRow: View {
                 Text(team.title).lineLimit(1).foregroundStyle(team.projectState.closed ? .secondary : .primary)
                 Spacer(minLength: 12)
                 Text(state).font(.callout).foregroundStyle(stateColor).lineLimit(1)
-                Text(shortAge(team.updatedAt)).font(.callout).foregroundStyle(.tertiary).monospacedDigit().frame(minWidth: 30, alignment: .trailing)
+                Text(shortAge(team.lastActivityAt)).font(.callout).foregroundStyle(.tertiary).monospacedDigit().frame(minWidth: 30, alignment: .trailing)
             }
             .padding(.horizontal, 10).padding(.vertical, 8)
             .background(hovering ? Color.primary.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))

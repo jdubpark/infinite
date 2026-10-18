@@ -203,10 +203,12 @@ struct DesktopView: View {
                 if !app.profiles.isEmpty { Divider() }
                 Button("Connect a Server…") { app.showingPair = true }
                 Button(app.connected ? "Refresh" : "Reconnect") { Task { if app.connected { await app.refresh() } else { await app.connect() } } }.disabled(app.active == nil)
-            } label: { Text(app.active?.label ?? "No server").font(.callout.weight(.medium)).lineLimit(1) }
-            .menuStyle(.borderlessButton).tint(.primary).fixedSize()
+            } label: { Text(app.active?.label ?? "No server").font(.callout.weight(.medium)).lineLimit(1).truncationMode(.tail) }
+            .menuStyle(.borderlessButton).tint(.primary)
+            // The connection state always shows in full; a long server name truncates instead.
             Text(app.connected ? "Connected" : app.connecting ? "Connecting…" : app.active == nil ? "Not paired" : "Offline")
                 .font(.caption).foregroundStyle(app.connected || app.connecting ? Color.secondary : .orange).lineLimit(1)
+                .fixedSize().layoutPriority(1)
             Spacer(minLength: 4)
             SettingsLink { Image(systemName: "gearshape") }.buttonStyle(.borderless).help("Connections")
         }

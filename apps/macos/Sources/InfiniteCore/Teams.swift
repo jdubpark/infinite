@@ -67,6 +67,9 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         let (done, total) = progress
         return max(floor, total > 0 ? Double(done) / Double(total) : 0)
     }
+    /// When the run last did something a person would notice: its latest history entry. The host
+    /// rewrites `updatedAt` on routine scheduler passes, so that is only the fallback.
+    public var lastActivityAt: String { events.map { $0["at"].string }.max() ?? updatedAt }
     /// The Linear issue the host syncs this run to, when it tracks one.
     public var linearIssue: String { value["linear"]["issue"]["identifier"].string }
     public static func roleName(_ role: String) -> String {

@@ -64,8 +64,9 @@ enabled (see [teams](teams.md)), it opens on one text box that starts a team:
 Return starts it in the workspace chosen beside the box, with the host's
 configured lineup (or its first provider) and two implementers. The slider
 opens the full form for a name, agents, and parallelism. Below the box, every
-run is one line (status glyph, name, state in words, age) in groups by what it
-needs next:
+run is one line (status glyph, name, state in words, and the age of its latest
+history entry, since the host also rewrites a run's update time on routine
+passes) in groups by what it needs next:
 
 | Group | Host states |
 | --- | --- |

@@ -558,7 +558,7 @@ test("a Claude member that hits a usage limit continues on its fallback with its
     const [switched] = task.limitSwitches!;
     const limited = team.members.find(m => m.memberId === switched.memberId)!;
     const receipts = readReceipts(run.receipts);
-    const expected: string = receipts.find(r => r.memberId === limited.memberId).expectedResetsAt, hhmm = expected.slice(11, 16);
+    const expected: string = receipts.find(r => r.memberId === limited.memberId).expectedResetsAt, hhmm = expected.slice(11, 16) + " UTC";
     assert.equal(limited.modelProfile?.id, "haiku");
     assert.equal(switched.fromProfileId, "haiku");
     assert.equal(switched.toProfileId, "deepseek-light");
@@ -602,7 +602,7 @@ test("a usage limit with no configured fallback blocks the run with its reason a
     assert.equal(team.status, "blocked", JSON.stringify(team));
     const limited = team.members.find(m => m.modelProfile?.id === "haiku")!;
     const expected: string = readReceipts(run.receipts).find(r => r.memberId === limited.memberId).expectedResetsAt;
-    assert.equal(team.reason, `Claude Code usage limit reached at ${team.providerLimits[0]?.detectedAt.slice(11, 16)}, resets ${expected.slice(11, 16)}; no fallback profile is configured for haiku.`);
+    assert.equal(team.reason, `Claude Code usage limit reached at ${team.providerLimits[0]?.detectedAt.slice(11, 16)} UTC, resets ${expected.slice(11, 16)} UTC; no fallback profile is configured for haiku.`);
     assert.equal(team.members.filter(m => m.taskId === "a").length, 1);
     assert.equal(limited.status, "stopped");
     assert.equal(readFileSync(join(limited.cwd, "a.txt"), "utf8"), "partial\n");

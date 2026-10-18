@@ -31,7 +31,7 @@ const timestamp = () => new Date().toISOString();
 const activeMember = (member: TeamMember) => ["queued", "running", "reported", "unavailable"].includes(member.status);
 const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
 const runtimeUnavailableReason = "An agent runtime is unavailable; the team is waiting for confirmed state.";
-const clock = (iso: string) => iso.slice(11, 16);
+const clock = (iso: string) => `${iso.slice(11, 16)} UTC`;
 const runEvent = (run: TeamRun, text: string) => {
   run.events.push({ at: timestamp(), text });
   if (run.events.length > 300) run.events.splice(0, run.events.length - 300);

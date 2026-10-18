@@ -68,6 +68,8 @@ export function applySignal(att: Attention, event: SignalEvent): Attention {
     case "turn-end":
       next = { ...enter(next, "turn-finished", source, at), prompt: undefined, lastTool: undefined, sawTurnEnd: true };
       next.lastMessage = data.message;
+      // A successful turn proves the provider works again; a failed one keeps the observation.
+      if (!data.failed) next.limit = undefined;
       break;
     case "provider-limit":
       if (!(next.limit?.limit === data.limit && next.limit.confidence === "corroborated" && data.confidence === "single-source")) {

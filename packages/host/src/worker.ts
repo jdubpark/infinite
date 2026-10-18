@@ -238,6 +238,10 @@ function record(
     data as unknown as Record<string, unknown>,
   ) as unknown as SignalEvent;
   publish(applySignal(attention, event));
+  if (signal.kind === "turn-end" && !signal.failed) {
+    limitEpisode = undefined;
+    limitWatch = undefined;
+  }
   return event;
 }
 
@@ -355,13 +359,8 @@ function onHook(route: HookRoute, body: unknown) {
       hookPromptWhileOpen(attention.prompt, signal.prompt, agent);
       continue;
     }
-    const recorded = record(signal, "hook", agent);
-    if (recorded.data.kind === "provider-limit") {
-      if (recorded.data.confidence === "single-source")
-        limitWatch = { source: "hook", firstAt: Date.now(), checks: 0, corroborated: false };
-      else limitWatch = undefined;
-      screenLimitRecorded = true;
-    }
+    if (signal.kind === "provider-limit") recordLimitFromHook(signal, agent);
+    else record(signal, "hook", agent);
   }
 }
 
@@ -372,44 +371,73 @@ let missCount = 0;
 let answering: number | undefined;
 
 /**
- * Journals usage-limit observations with their confidence. A Claude hook is corroborated by the
- * screen notice within two checks; a Codex status row only by persisting unchanged for three
- * checks and `limitConfirmMs`. Each limit episode journals at most one signal per confidence.
+ * Usage-limit observations are journaled per episode: at most one single-source and one
+ * corroborated signal. An episode starts at the first observation, from a hook or the screen,
+ * and ends after three checks with no match and no armed watch, or at a successful turn end.
+ * A Claude hook is corroborated by the screen notice within two later checks; a Codex status row
+ * only by persisting for three checks and `limitConfirmMs` without new output.
  */
 let limitWatch: { source: "hook" | "screen"; firstAt: number; checks: number; corroborated: boolean } | undefined;
-let screenLimitRecorded = false;
+let limitEpisode: { single?: "hook" | "screen"; corroborated: boolean; misses: number } | undefined;
+type LimitSignal = Extract<Signal, { kind: "provider-limit" }>;
+function recordLimit(signal: LimitSignal, source: SignalData["source"], agent?: { id: string; type: string }) {
+  const episode = (limitEpisode ??= { corroborated: false, misses: 0 });
+  episode.misses = 0;
+  if (signal.confidence === "corroborated") {
+    if (episode.corroborated) return;
+    episode.corroborated = true;
+  } else {
+    if (episode.single || episode.corroborated) return;
+    episode.single = source === "hook" ? "hook" : "screen";
+  }
+  record(signal, source, agent);
+}
+function recordLimitFromHook(signal: LimitSignal, agent?: { id: string; type: string }) {
+  if (signal.confidence === "corroborated") {
+    limitWatch = undefined;
+    recordLimit(signal, "hook", agent);
+    return;
+  }
+  // A notice already on screen is the second source for this hook.
+  if (limitEpisode?.single === "screen" && !limitEpisode.corroborated) {
+    limitWatch = undefined;
+    recordLimit({ ...signal, confidence: "corroborated" }, "hook", agent);
+    return;
+  }
+  const fresh = !limitEpisode?.single && !limitEpisode?.corroborated;
+  recordLimit(signal, "hook", agent);
+  if (fresh) limitWatch = { source: "hook", firstAt: Date.now(), checks: 0, corroborated: false };
+}
 function watchLimit(lines: string[], nowMs: number, freshOutput: boolean) {
   const found = detectLimit(lines, provider, new Date(nowMs));
   const watch = limitWatch;
   if (!found) {
-    screenLimitRecorded = false;
     // A hook watch gets two checks after the one that armed it; a screen watch ends with its match.
     if (watch?.source === "screen" || (watch && ++watch.checks > 2)) limitWatch = undefined;
+    if (!limitWatch && limitEpisode && ++limitEpisode.misses >= 3) limitEpisode = undefined;
     return;
   }
+  if (limitEpisode) limitEpisode.misses = 0;
   const observed = { kind: "provider-limit" as const, limit: found.limit, message: found.message, ...(found.resetsAt ? { resetsAt: found.resetsAt } : {}) };
   if (watch?.source === "hook") {
-    record({ ...observed, confidence: "corroborated" }, "screen");
     limitWatch = undefined;
-    screenLimitRecorded = true;
+    recordLimit({ ...observed, confidence: "corroborated" }, "screen");
     return;
   }
   if (!watch) {
-    if (!screenLimitRecorded && !attention.limit) {
-      record({ ...observed, confidence: "single-source" }, "screen");
-      screenLimitRecorded = true;
-    }
+    recordLimit({ ...observed, confidence: "single-source" }, "screen");
     if (provider === "codex") limitWatch = { source: "screen", firstAt: nowMs, checks: 1, corroborated: false };
     return;
   }
   if (freshOutput) {
-    limitWatch = { source: "screen", firstAt: nowMs, checks: 1, corroborated: false };
+    // New output restarts the persistence count but never re-earns an episode's corroboration.
+    limitWatch = { source: "screen", firstAt: nowMs, checks: 1, corroborated: watch.corroborated };
     return;
   }
   if (watch.corroborated) return;
   watch.checks++;
   if (watch.checks >= 3 && nowMs - watch.firstAt >= config.attention.limitConfirmMs) {
-    record({ ...observed, confidence: "corroborated" }, "screen");
+    recordLimit({ ...observed, confidence: "corroborated" }, "screen");
     watch.corroborated = true;
   }
 }

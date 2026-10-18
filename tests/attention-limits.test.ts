@@ -68,6 +68,16 @@ test("provider-limit sets attention.limit without changing state; corroborated i
   assert.equal(c.limit?.since, "t2");
 });
 
+test("a successful turn-end clears attention.limit; a failed one keeps it", () => {
+  const limited = applySignal(att(), limitEvent("corroborated", "t1"));
+  const end = (failed?: boolean): SignalEvent => ({
+    seq: 2, at: "t2", type: "signal",
+    data: { kind: "turn-end", ...(failed ? { failed } : {}), source: "hook", provider: "claude" },
+  });
+  assert.equal(applySignal(limited, end(true)).limit?.confidence, "corroborated");
+  assert.equal(applySignal(limited, end()).limit, undefined);
+});
+
 test("codex phrase outside the status row segment never triggers", () => {
   assert.equal(detectLimit(["› why does the footer say usage limited?", "  gpt-5-codex · ~/workspace"], "codex", now), null);
   assert.equal(detectLimit(["$ cat docs/teams.md", "Codex shows usage limited in its status row", "$"], "codex", now), null);

@@ -70,6 +70,7 @@ export class TeamService {
       }
     }
   }
+  /** The usage ledger this service prices member usage from; its tick also drives the ledger's reads. */
   useUsage(service: UsageService) { this.usage = service; }
   /** Active host-level provider limits; new members of a limited provider launch on their fallback. */
   providerLimits() { return this.limits.active(); }
@@ -259,8 +260,16 @@ export class TeamService {
       this.tickQueued = true;
       void this.enqueue(async () => {
         try {
-          // Limit memory follows every session on the host, not only team members.
-          if (Date.now() - this.reconciledAt >= 2000) { this.reconciledAt = Date.now(); await this.limits.reconcile(this.manager).catch(() => {}); }
+          // One session listing every 2 s feeds the usage ledger and the limit memory, which follows
+          // every session on the host, not only team members.
+          if (Date.now() - this.reconciledAt >= 2000) {
+            this.reconciledAt = Date.now();
+            const rows = await this.manager.list().catch(() => undefined);
+            if (rows) {
+              await this.usage?.tick(rows).catch(() => {});
+              await this.limits.reconcile(this.manager, rows).catch(() => {});
+            }
+          }
           for (const stored of this.records.values()) await this.step(stored);
         }
         finally { this.tickQueued = false; }

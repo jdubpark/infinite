@@ -113,6 +113,7 @@ export function createApp(config: Config, key: Buffer) {
   const linear = new LinearService(config, key);
   const teams = new TeamService(config, key, manager, startInProject, linear);
   const usage = new UsageService(config, key, manager);
+  // TeamService ticks on every host and drives the ledger from its own session listing.
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
@@ -770,7 +771,6 @@ export function createApp(config: Config, key: Buffer) {
   const server = createServer(app);
   server.once("listening", () => linear.start());
   server.once("listening", () => teams.start());
-  server.once("listening", () => usage.start());
   server.once("listening", () => goals.start());
   server.once("close", () => teams.close());
   server.once("close", () => usage.close());

@@ -6,9 +6,10 @@ import { writeSealed, unseal } from "./vault.js";
 export interface ProviderLimit { provider: Provider; detectedAt: string; resetsAt?: string; expiresAt: string; sessionId: string; runId?: string; confidence: "corroborated" }
 /** Journal data of a `provider-limit` signal, as the worker records it. */
 export type LimitObservation = { kind: "provider-limit"; limit: "usage" | "credits"; confidence: "single-source" | "corroborated"; resetsAt?: string; message: string; source: "hook" | "screen" | "protocol"; provider: Provider };
-/** The session rows and journal reads `reconcile` needs from the manager. */
+/** A session row, as `manager.list()` returns it, reduced to what `reconcile` reads. */
+export interface LimitRow { id: string; provider: Provider; team?: { runId: string }; attention: { limit?: { confidence: string; since: string; resetsAt?: string } } }
+/** The journal reads `reconcile` needs from the manager. */
 export interface LimitSessions {
-  list(): Promise<{ id: string; provider: Provider; team?: { runId: string }; attention: { limit?: { confidence: string; since: string; resetsAt?: string } } }[]>;
   events(id: string, after: number, limit: number, types?: Set<string>): { events: { at: string; data: Record<string, unknown> }[]; cursor: number; more: boolean };
 }
 type State = { limits: Partial<Record<Provider, ProviderLimit>>; cleared: Partial<Record<Provider, string>> };
@@ -61,9 +62,10 @@ export class ProviderLimits {
    * Observes corroborated limits shown on any Claude or Codex session, then clears a provider's entry
    * when one of its sessions journals a recovery turn end after both the entry and that session's
    * own latest limit observation. Activity timestamps are not evidence: a repeated limit bumps them.
+   * `rows` is the session listing the caller already took for this tick.
    */
-  async reconcile(sessions: LimitSessions, now = new Date()) {
-    for (const session of await sessions.list()) {
+  async reconcile(sessions: LimitSessions, rows: LimitRow[], now = new Date()) {
+    for (const session of rows) {
       const shown = session.attention.limit;
       if ((session.provider === "claude" || session.provider === "codex") && shown?.confidence === "corroborated")
         this.observe({ provider: session.provider, detectedAt: shown.since, ...(shown.resetsAt ? { resetsAt: shown.resetsAt } : {}), sessionId: session.id, ...(session.team ? { runId: session.team.runId } : {}), confidence: "corroborated" });

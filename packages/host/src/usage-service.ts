@@ -13,7 +13,10 @@ export type UsageSummary = {
   period: { start: string; end: string };
   providers: Record<Provider, { period: { start: string; end: string }; measured: boolean; spent?: UsageTotals; budget?: { usd: number; period: Period }; previous?: UsageTotals; unmeasuredSessions: number }>;
 };
-type LedgerSession = { provider: Provider; projectId: string; createdAt: string; lastActiveAt?: string; measured: boolean; team?: TeamAssignment; profileId?: string };
+/** `exited` records that the session had exited and its journal was read to its end: nothing in it can change. */
+type LedgerSession = { provider: Provider; projectId: string; createdAt: string; lastActiveAt?: string; measured: boolean; team?: TeamAssignment; profileId?: string; exited?: true };
+/** A session row as `manager.list()` returns it. */
+export type UsageSessionRow = Awaited<ReturnType<Manager["list"]>>[number];
 type Ledger = { cursors: Record<string, number>; sessions: Record<string, LedgerSession>; rows: Record<string, UsageRecord> };
 
 const PROVIDERS: Provider[] = ["claude", "codex", "grok", "opencode", "demo"];
@@ -40,6 +43,10 @@ export class UsageService {
     this.file = join(config.stateDir, "usage.sealed");
     if (existsSync(this.file)) this.ledger = unseal<Ledger>(key, SCOPE, readFileSync(this.file, "utf8"));
   }
+  /**
+   * Runs the ledger on its own 2 s timer. The host's TeamService drives `tick(rows)` from the session
+   * listing it already takes, so this is only for a host composed without one.
+   */
   start() {
     if (this.running || this.closed) return;
     this.running = true;
@@ -48,27 +55,25 @@ export class UsageService {
   }
   close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); }
 
-  private async tick() {
-    if (this.ticking || !this.running) return;
+  /** Folds new journal usage into the ledger. `rows` is a listing the caller already took; without one, the manager is asked. */
+  async tick(rows?: UsageSessionRow[]) {
+    if (this.ticking || this.closed) return;
     this.ticking = true;
     try {
       let changed = false;
-      for (const session of await this.manager.list()) {
-        const measured = session.provider === "opencode" && (session.teamModelProfile ? session.teamModelProfile.provider === "opencode" : !session.team && session.runtime?.nativeUi === "opencode");
+      for (const session of rows ?? await this.manager.list()) {
         const previous = this.ledger.sessions[session.id];
+        if (previous?.exited) continue;
+        const measured = session.provider === "opencode" && (session.teamModelProfile ? session.teamModelProfile.provider === "opencode" : !session.team && session.runtime?.nativeUi === "opencode");
         const active = ["starting", "running"].includes(session.status);
         // Refreshed at most once a minute so a running session does not rewrite the ledger on every tick.
         const stale = !previous?.lastActiveAt || Date.now() - Date.parse(previous.lastActiveAt) > 60_000;
         const lastActiveAt = active && stale ? new Date().toISOString() : previous?.lastActiveAt;
-        const entry: LedgerSession = { provider: session.provider, projectId: session.projectId, createdAt: session.createdAt, measured,
-          ...(lastActiveAt ? { lastActiveAt } : {}),
-          ...(session.team ? { team: session.team } : {}), ...(session.teamModelProfile ? { profileId: session.teamModelProfile.id } : {}) };
-        if (JSON.stringify(previous) !== JSON.stringify(entry)) { this.ledger.sessions[session.id] = entry; changed = true; }
-        if (!measured) continue;
+        let readToEnd = !measured;
         // One unreadable journal must not strand the rows other sessions produced in this tick.
-        try {
-          let cursor = this.ledger.cursors[session.id] ?? 0;
-          for (let more = true; more && this.running;) {
+        if (measured) try {
+          let cursor = this.ledger.cursors[session.id] ?? 0, more = true;
+          while (more && !this.closed) {
             const page = this.manager.events(session.id, cursor, PAGE, new Set(["usage"]));
             for (const event of page.events) {
               if (event.type !== "usage") continue;
@@ -78,6 +83,7 @@ export class UsageService {
             if (page.cursor !== cursor) { cursor = page.cursor; this.ledger.cursors[session.id] = cursor; changed = true; }
             more = page.more;
           }
+          readToEnd = !more;
           this.failed.delete(session.id);
         } catch (error) {
           if (!this.failed.has(session.id)) {
@@ -85,6 +91,12 @@ export class UsageService {
             console.warn(`[Infinite] Usage for session ${session.id} cannot be read: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
+        const entry: LedgerSession = { provider: session.provider, projectId: session.projectId, createdAt: session.createdAt, measured,
+          ...(lastActiveAt ? { lastActiveAt } : {}),
+          ...(session.team ? { team: session.team } : {}), ...(session.teamModelProfile ? { profileId: session.teamModelProfile.id } : {}),
+          // A session id never runs again once exited, so later ticks can skip it.
+          ...(session.status === "exited" && readToEnd ? { exited: true as const } : {}) };
+        if (JSON.stringify(previous) !== JSON.stringify(entry)) { this.ledger.sessions[session.id] = entry; changed = true; }
       }
       if (changed) { this.index = undefined; writeSealed(this.file, this.key, SCOPE, this.ledger); }
     } finally { this.ticking = false; }

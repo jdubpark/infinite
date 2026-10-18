@@ -1,10 +1,41 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readdirSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { waitFor } from "./helpers.js";
 import { fixture, mixedLineup } from "./team-fixture.js";
-import type { UsageSummary } from "../packages/host/src/usage-service.js";
+import { UsageService, type UsageSessionRow, type UsageSummary } from "../packages/host/src/usage-service.js";
+import type { Config } from "../packages/host/src/types.js";
+import type { Manager } from "../packages/host/src/manager.js";
+import type { UsageRecord } from "../packages/host/src/usage.js";
+
+const step = (partId: string): UsageRecord => ({ provider: "opencode", providerId: "deepseek", modelId: "deepseek-flash", messageId: "m1", partId, modelSource: "reported",
+  completedAt: new Date().toISOString(), tokens: { input: 10, output: 5, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0.01 });
+
+test("a tick reads the listing it is given, and skips an exited session whose journal it has read to the end", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-usage-"));
+  try {
+    const reads: number[] = [];
+    const manager = {
+      list: () => { throw new Error("The tick must use the listing it was given"); },
+      events: (_id: string, after: number) => {
+        reads.push(after);
+        const events = [step("p1"), step("p2")].map((data, index) => ({ seq: index + 1, at: data.completedAt, type: "usage", data })).filter(event => event.seq > after);
+        return { events: events.slice(0, 1), cursor: events[0]?.seq ?? after, more: events.length > 1 };
+      },
+    } as unknown as Manager;
+    const usage = new UsageService({ stateDir: dir } as Config, randomBytes(32), manager);
+    const row = { id: "native", provider: "opencode", projectId: "rehearsal", createdAt: new Date().toISOString(), status: "exited", runtime: { nativeUi: "opencode" } } as unknown as UsageSessionRow;
+    await usage.tick([row]);
+    assert.deepEqual(reads, [0, 1], "Two pages read the journal to its end");
+    assert.equal((usage.session("native") as { messages: number }).messages, 2);
+    await usage.tick([row]);
+    assert.deepEqual(reads, [0, 1], "An exited session read to its end is not read again");
+    assert.equal((usage.session("native") as { messages: number }).messages, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("usage ledger prices OpenCode members, survives restart idempotently, and counts unmeasured sessions", { timeout: 120000 }, async () => {
   const lineup = structuredClone(mixedLineup);

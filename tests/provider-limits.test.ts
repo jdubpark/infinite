@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ProviderLimits, switchesMember, type LimitSessions } from "../packages/host/src/provider-limits.js";
+import { ProviderLimits, switchesMember, type LimitRow, type LimitSessions } from "../packages/host/src/provider-limits.js";
 
 const at = (hhmm: string, day = 18) => `2026-10-${day}T${hhmm}:00.000Z`;
 function store() {
@@ -12,11 +12,9 @@ function store() {
   const file = join(dir, "provider-limits.sealed"), key = randomBytes(32);
   return { file, key, open: () => new ProviderLimits(file, key), close: () => rmSync(dir, { recursive: true, force: true }) };
 }
-type Row = Awaited<ReturnType<LimitSessions["list"]>>[number];
-/** A manager stand-in: session rows plus journals of signal events read with a cursor. */
-function sessions(rows: Row[], journals: Record<string, { at: string; data: Record<string, unknown> }[]>, pageSize = Infinity): LimitSessions {
+/** A manager stand-in: journals of signal events read with a cursor. */
+function sessions(journals: Record<string, { at: string; data: Record<string, unknown> }[]>, pageSize = Infinity): LimitSessions {
   return {
-    list: async () => rows,
     events: (id, after, limit) => {
       const all = (journals[id] ?? []).map((event, index) => ({ ...event, seq: index + 1 }));
       // A manager page also ends early at its byte cap, so a page can hold fewer events than asked.
@@ -65,9 +63,9 @@ test("only a successful turn after the entry and after that session's own latest
   try {
     const limits = s.open();
     const now = new Date(at("11:00"));
-    const limited: Row = { id: "limited", provider: "claude", attention: { limit: { confidence: "corroborated", since: at("10:00"), resetsAt: at("15:45") } } };
-    const other: Row = { id: "other", provider: "claude", attention: {} };
-    const codex: Row = { id: "codex", provider: "codex", attention: {} };
+    const limited: LimitRow = { id: "limited", provider: "claude", attention: { limit: { confidence: "corroborated", since: at("10:00"), resetsAt: at("15:45") } } };
+    const other: LimitRow = { id: "other", provider: "claude", attention: {} };
+    const codex: LimitRow = { id: "codex", provider: "codex", attention: {} };
     const journals: Record<string, { at: string; data: Record<string, unknown> }[]> = {
       limited: [{ at: at("10:00"), data: claudeLimit }],
       other: [
@@ -78,14 +76,14 @@ test("only a successful turn after the entry and after that session's own latest
       ],
       codex: [{ at: at("10:20"), data: { kind: "turn-end", source: "protocol", provider: "codex" } }],
     };
-    const manager = sessions([limited, other, codex], journals);
-    await limits.reconcile(manager, now);
+    const rows = [limited, other, codex], manager = sessions(journals);
+    await limits.reconcile(manager, rows, now);
     assert.deepEqual(limits.active(now).map(limit => [limit.provider, limit.sessionId, limit.runId, limit.expiresAt]), [["claude", "limited", undefined, at("15:45")]],
       "A non-team session's corroborated limit is recorded; older, failed, superseded, and other-provider turns do not clear it");
     journals.other.push({ at: at("10:12"), data: claudeStop });
-    await limits.reconcile(manager, now);
+    await limits.reconcile(manager, rows, now);
     assert.deepEqual(limits.active(now), [], "A later successful turn of that provider clears the entry");
-    await limits.reconcile(manager, now);
+    await limits.reconcile(manager, rows, now);
     assert.deepEqual(s.open().active(now), [], "The limited session's old observation does not restore it");
   } finally { s.close(); }
 });
@@ -99,13 +97,13 @@ test("a clear waits until the session's journal has been read to its end", async
     const journals: Record<string, { at: string; data: Record<string, unknown> }[]> = {
       other: [{ at: at("10:12"), data: claudeStop }, { at: at("10:13"), data: { ...claudeLimit, confidence: "single-source", source: "hook" } }],
     };
-    const manager = sessions([{ id: "other", provider: "claude", attention: {} }], journals, 1);
-    await limits.reconcile(manager, now);
+    const rows: LimitRow[] = [{ id: "other", provider: "claude", attention: {} }], manager = sessions(journals, 1);
+    await limits.reconcile(manager, rows, now);
     assert.equal(limits.active(now).length, 1, "A successful turn followed by an unread page does not clear yet");
-    await limits.reconcile(manager, now);
+    await limits.reconcile(manager, rows, now);
     assert.equal(limits.active(now).length, 1, "The unread page held a newer limit for that session");
     journals.other.push({ at: at("10:14"), data: claudeStop });
-    await limits.reconcile(manager, now);
+    await limits.reconcile(manager, rows, now);
     assert.deepEqual(limits.active(now), []);
   } finally { s.close(); }
 });
@@ -122,11 +120,11 @@ test("a Codex terminal turn end does not clear an entry; a native turn end does"
         { at: at("10:06"), data: { kind: "turn-end", source: "hook", provider: "codex" } },
       ],
     };
-    const manager = sessions([{ id: "codex", provider: "codex", attention: {} }], journals);
-    await limits.reconcile(manager, now);
+    const rows: LimitRow[] = [{ id: "codex", provider: "codex", attention: {} }], manager = sessions(journals);
+    await limits.reconcile(manager, rows, now);
     assert.equal(limits.active(now).length, 1, "OSC, Stop hook, and notify turn ends cannot say the turn failed");
     journals.codex.push({ at: at("10:07"), data: { kind: "turn-end", source: "protocol", provider: "codex" } });
-    await limits.reconcile(manager, now);
+    await limits.reconcile(manager, rows, now);
     assert.deepEqual(limits.active(now), [], "A native adapter's turn end carries the turn status");
   } finally { s.close(); }
 });

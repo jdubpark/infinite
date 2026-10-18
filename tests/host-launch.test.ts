@@ -99,7 +99,9 @@ test("Claude team launch exposes only its scoped report helper and preserves pro
       INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}",
       INFINITE_TEAM_ASSIGNMENT: "${INFINITE_TEAM_ASSIGNMENT}",
     });
-    assert.ok(!launch.args.some(arg => /allowedtools|permission-mode|skip-permissions|dangerously|autoallow/i.test(arg)), "Attaching the report tool must not grant provider permissions");
+    assert.ok(!launch.args.some(arg => /allowedtools|skip-permissions|dangerously|autoallow/i.test(arg)), "Attaching the report tool must not bypass provider permissions");
+    assert.equal(launch.args.filter(arg => arg === "--permission-mode").length, 1);
+    assert.equal(launch.args[launch.args.indexOf("--permission-mode") + 1], "auto");
     assert.equal(launch.args.at(-1), "Implement this task");
     assert.deepEqual(profile.args, ["--model", "opus"]);
   }

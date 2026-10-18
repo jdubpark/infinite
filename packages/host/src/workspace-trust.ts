@@ -38,13 +38,14 @@ const LOCK_STALE_MS = 10_000;
 const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 function withClaudeConfigLock<T>(configPath: string, waitMs: number, update: () => T): T {
   const lock = `${configPath}.lock`, deadline = Date.now() + waitMs;
+  const gone = (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT";
   for (let attempt = 1; ; attempt++) {
     try { mkdirSync(lock); break; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    let held;
-    try { held = statSync(lock); } catch { continue; }
-    if (Date.now() - held.mtimeMs > LOCK_STALE_MS) { try { rmdirSync(lock); } catch { /* another writer took it */ } continue; }
     if (Date.now() >= deadline) throw new Error("Claude config is locked by another process");
+    // A stale lock that cannot be removed is an error, not a reason to keep retrying.
+    try { if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) { rmdirSync(lock); continue; } }
+    catch (error) { if (!gone(error)) throw error; continue; }
     pause(Math.min(200, 20 * attempt));
   }
   try { return update(); } finally { rmdirSync(lock); }

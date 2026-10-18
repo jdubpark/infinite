@@ -244,6 +244,15 @@ test("Claude trust takes Claude's own config lock and keeps a concurrent Claude 
     utimesSync(lock, old, old);
     assert.equal(recordClaudeTrust(config, "/srv/stale-lock-member", 100), true);
     assert.ok(!existsSync(lock));
+    // A stale lock that cannot be removed fails promptly instead of spinning past the deadline.
+    mkdirSync(lock);
+    writeFileSync(join(lock, "unexpected"), "");
+    utimesSync(lock, old, old);
+    const started = Date.now();
+    assert.throws(() => recordClaudeTrust(config, "/srv/stuck-lock-member", 100), { code: /^(ENOTEMPTY|EEXIST)$/ });
+    assert.ok(Date.now() - started < 2000);
+    assert.ok(existsSync(join(lock, "unexpected")));
+    assert.equal(JSON.parse(readFileSync(config, "utf8")).projects["/srv/stuck-lock-member"], undefined);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

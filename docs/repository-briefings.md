@@ -13,6 +13,17 @@ existing transcript-summary behavior. When configured, the endpoint returns the
 latest repository brief for an eligible session. Add `?status=1` to inspect
 briefing state without starting a collection or model request.
 
+Each run is a Jevcode automatic refresh (`jevcode auto --trigger host`), not a
+fresh brief. It returns at no model cost when neither the checkout nor the
+session's recorded chat moved since its last check, asks Jev (TypeSafe) whether
+the change is worth a refresh when the agent account holds a key, revises only
+the stale sections of the previous brief, checks each claim against its cited
+excerpts, and tunes its own timing from recorded outcomes. Jevcode keeps that
+state per checkout in the agent account's home, so a brief survives API
+restarts. A brief that was not regenerated for a turn says so in its text, and
+`repository.decision` carries the run's decision. A checkpoint built over a
+different comparison base is rebuilt rather than returned.
+
 The runtime first observes sessions already active when it starts. It does not
 backfill their old turns. After that baseline, a new explicit turn-end or process
 exit can queue a briefing. Once configured, automatic collection is enabled by
@@ -23,8 +34,9 @@ infer task completion, answer approvals, or change the session's execution state
 Collection waits for the transcript to settle after the checkpoint and refreshes
 activity when a queued job starts. The comparison base is the checkout's HEAD
 when the runtime first observes the session, which may be later than the task
-started. Reports and caches live in memory and are lost when the API restarts;
-restart does not backfill historical sessions.
+started. The host's own report cache lives in memory and is lost when the API
+restarts; Jevcode's checkpoint is not, and restart does not backfill historical
+sessions.
 
 The report describes the source snapshot collected at `generatedAt`; it does not
 claim that the checkout still has that content when a person reads it. The
@@ -35,8 +47,11 @@ still needed to assess whether each statement follows from its citations.
 
 Enable the feature in the host configuration with an absolute executable and a
 fixed argument vector. The Ubuntu template uses the root-owned wrapper shown
-below; keep the model name aligned with the Codex account authenticated for the
-`infinite-agent` execution identity.
+below. `runner` selects Jevcode's writer: absent, Jevcode writes with Muse Spark
+1.3 Contributor through OpenCode and falls back to DeepSeek V4.1 Flash, which
+requires OpenCode authenticated for those providers in `infinite-agent`'s home;
+`codex` uses the Codex account already authenticated there. `model` overrides
+the writer's model and is optional.
 
 ```json
 {
@@ -46,7 +61,7 @@ below; keep the model name aligned with the Codex account authenticated for the
       "-n", "-H", "-u", "infinite-agent", "--",
       "/usr/local/libexec/infinite/jevcode"
     ],
-    "model": "MODEL",
+    "runner": "codex",
     "automatic": true,
     "intervalMs": 5000,
     "cooldownMs": 60000,
@@ -55,8 +70,9 @@ below; keep the model name aligned with the Codex account authenticated for the
 }
 ```
 
-`command` must be absolute. The runtime appends the briefing arguments, selected
-repository, model, timeout, and scoped activity input to that command. Do not
+`command` must be absolute. The runtime appends the automatic-run arguments,
+session id, selected repository, comparison base, writer, timeout, and scoped
+activity input to that command. Do not
 put provider credentials or prompt text in the configuration. `automatic`
 defaults to `true`; the timing fields above show their defaults in milliseconds.
 
@@ -100,8 +116,28 @@ sudo install -o root -g root -m 0440 \
 sudo visudo -cf /etc/sudoers.d/infinite
 ```
 
-The installed artifact and wrapper must not be writable by either runtime
-identity. Use the configured `TMPDIR` under encrypted storage. Keep Codex login
+Jevcode briefs only repositories the owner opted in, and the host trigger is
+no exception: a session in any other repository reports the briefing as
+unavailable. Opt a repository in as the agent account; the rule covers every
+clone and worktree of that repository, including team worktrees:
+
+```sh
+sudo -n -H -u infinite-agent -- /usr/local/libexec/infinite/jevcode \
+  optin --repo /srv/infinite-data/workspaces/PROJECT
+```
+
+To let Jev gate refreshes and check claims, store a TypeSafe key readable only
+by the agent account; the wrapper exports it when present:
+
+```sh
+sudo install -d -o infinite-agent -g infinite-agent -m 0700 ~infinite-agent/.config/jevcode
+# Write the key on stdin so it never appears in a command line or shell history.
+sudo -u infinite-agent sh -c 'umask 077; cat > ~/.config/jevcode/jev-api-key'
+```
+
+Without it, Jevcode uses its disclosed heuristic gate and leaves claims
+unchecked; the brief's coverage says so. The installed artifact and wrapper must
+not be writable by either runtime identity. Use the configured `TMPDIR` under encrypted storage. Keep Codex login
 and native history in `infinite-agent`'s protected home; do not forward laptop
 credentials. The wrapper forwards CLI arguments without adding provider flags
 or changing the provider's approval mode. Install the feature disabled until the
@@ -119,7 +155,7 @@ sudo -n -H -u infinite-agent -- /usr/local/libexec/infinite/jevcode \
   context --repo /srv/infinite-data/workspaces/briefing-sample
 sudo -n -H -u infinite-agent -- /usr/local/libexec/infinite/jevcode \
   brief --repo /srv/infinite-data/workspaces/briefing-sample \
-  --format json --model MODEL --timeout 300 --no-state
+  --format json --runner codex --timeout 300 --no-state
 ```
 
 After the context command, confirm the selected checkout and disclosed

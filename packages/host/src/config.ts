@@ -40,7 +40,8 @@ const schema = z
     repositoryBriefings: z.object({
       command: z.string().refine(isAbsolute, "Repository briefing command must be absolute"),
       args: z.array(z.string().max(4096)).default([]),
-      model: z.string().min(1).max(100),
+      runner: z.enum(["muse", "deepseek", "codex"]).optional(),
+      model: z.string().min(1).max(100).optional(),
       automatic: z.boolean().default(true),
       intervalMs: z.number().int().min(100).default(5000),
       cooldownMs: z.number().int().min(0).default(60000),

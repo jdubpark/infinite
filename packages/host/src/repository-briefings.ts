@@ -10,7 +10,9 @@ import type { Project, Session } from "./types.js";
 export interface RepositoryBriefingConfig {
   command: string;
   args: string[];
-  model: string;
+  /** Jevcode writer; Jevcode's default (Muse Spark through OpenCode) when absent. */
+  runner?: "muse" | "deepseek" | "codex";
+  model?: string;
   automatic: boolean;
   intervalMs: number;
   cooldownMs: number;
@@ -31,8 +33,16 @@ const briefSchema = z.object({
   checks: z.array(claim).max(4),
   guidance: z.array(z.object({ text: z.string().min(1).max(900), basis: z.enum(["documented", "proposed"]), citations: z.array(citation).max(6) }).strict()).max(4),
   unknowns: z.array(z.string().min(1).max(900)).max(8),
+  diagrams: z.array(z.object({ title: z.string().min(1).max(120), kind: z.enum(["system", "change"]), mermaid: z.string().min(1).max(3000), citations: z.array(citation).max(6) }).strict()).max(2).default([]),
 }).strict();
+// Jevcode's automatic run decides whether this turn warranted a refresh; the brief may predate it.
+const decisionSchema = z.object({
+  action: z.enum(["skip", "run", "coalesced", "disabled", "failed"]), reason: z.string().max(1000),
+  judge: z.enum(["jev", "heuristic"]).nullable(), worthwhile: z.number().min(0).max(1).nullable(), scope: z.enum(["skip", "update", "full"]).nullable(),
+}).strict();
+const emptySchema = z.object({ decision: decisionSchema, repo: z.string().max(4096).nullable(), brief: z.null() }).strict();
 const envelopeSchema = z.object({
+  decision: decisionSchema,
   repo: z.string().min(1).max(4096),
   head: z.string().regex(/^[a-f0-9]{40,64}$/).nullable(),
   base: z.string().regex(/^[a-f0-9]{40,64}$/).nullable(),
@@ -44,6 +54,7 @@ const envelopeSchema = z.object({
 }).strict();
 
 export interface RepositoryBrief {
+  decision: z.infer<typeof decisionSchema>;
   head: string | null;
   base: string | null;
   fingerprint: string;
@@ -82,6 +93,11 @@ const MAX_STDOUT_BYTES = 1024 * 1024;
 const DEBOUNCE_MS = 350;
 const MAX_GIT_MS = 2000;
 const FAILED_MESSAGE = "Repository brief could not be generated. Check the configured briefing wrapper.";
+const NOT_READY_MESSAGE = "No repository brief exists yet; one is generated after the next change.";
+const NOT_OPTED_IN_MESSAGE = "This repository is not opted in to repository briefings.";
+const WRITER_LABEL = { muse: "meta/muse-spark-1.3-contributor", deepseek: "deepseek/deepseek-flash", codex: "codex" } as const;
+class NotReady extends Error {}
+class NotOptedIn extends Error {}
 const EMPTY_MESSAGE = "No recorded chat is available for a repository brief.";
 
 type ListedSession = Awaited<ReturnType<Manager["list"]>>[number];
@@ -211,7 +227,7 @@ export class RepositoryBriefings {
     private readonly teamWorkspace?: string,
   ) {}
 
-  get model() { return this.config.model; }
+  get model() { return this.config.model ?? WRITER_LABEL[this.config.runner ?? "muse"]; }
 
   async start(): Promise<void> {
     if (this.closed || this.timer) return;
@@ -441,10 +457,13 @@ export class RepositoryBriefings {
           if (this.reports.size > MAX_CACHE) this.reports.delete(this.reports.keys().next().value!);
           this.setStatus(ready.session.id, { state: "ready", summary });
           for (const waiter of ready.waiters) waiter.resolve(summary);
-        } catch {
+        } catch (error) {
           this.inFlight.delete(ready.key);
-          this.setStatus(ready.session.id, { state: "failed", ...(this.latest.get(ready.session.id)?.summary ? { summary: this.latest.get(ready.session.id)!.summary } : {}), error: FAILED_MESSAGE });
-          for (const waiter of ready.waiters) waiter.reject(new Error(FAILED_MESSAGE));
+          const notReady = error instanceof NotReady;
+          const notOptedIn = error instanceof NotOptedIn;
+          const message = notOptedIn ? NOT_OPTED_IN_MESSAGE : notReady ? NOT_READY_MESSAGE : FAILED_MESSAGE;
+          this.setStatus(ready.session.id, { state: notOptedIn ? "unavailable" : notReady ? "empty" : "failed", ...(this.latest.get(ready.session.id)?.summary ? { summary: this.latest.get(ready.session.id)!.summary } : {}), error: message });
+          for (const waiter of ready.waiters) waiter.reject(new Error(message));
         }
       }
     } finally {
@@ -458,9 +477,13 @@ export class RepositoryBriefings {
     if (this.closed) throw new Error("Repository brief service closed");
     const current = await this.location(job.session);
     if (this.closed || current.cwd !== job.location.cwd || current.root !== job.location.root) throw new Error("Repository source changed");
-    const args = [...this.config.args, "brief", "--repo", job.location.cwd, "--format", "json", "--model", this.config.model,
-      "--timeout", String(Math.ceil(this.config.timeoutMs / 1000)), "--no-state", "--activity-stdin"];
+    // auto keeps per-checkout state: it skips unchanged turns, revises only stale sections, checks
+    // claims with Jev when the agent account has a key, and learns its timing from outcomes.
+    const args = [...this.config.args, "auto", "--trigger", "host", "--format", "json", "--activity-stdin", "--session", job.session.id,
+      "--repo", job.location.cwd, "--timeout", String(Math.ceil(this.config.timeoutMs / 1000))];
     if (job.location.baseline) args.push("--base", job.location.baseline);
+    if (this.config.runner) args.push("--runner", this.config.runner);
+    if (this.config.model) args.push("--model", this.config.model);
     const controller = new AbortController();
     this.controllers.add(controller);
     try {
@@ -469,16 +492,21 @@ export class RepositoryBriefings {
         cwd: job.location.cwd, input: activity.input, timeoutMs: this.config.timeoutMs,
         maxBytes: MAX_STDOUT_BYTES, signal: controller.signal,
       });
-      const parsed = envelopeSchema.parse(JSON.parse(raw));
+      const value: unknown = JSON.parse(raw);
+      const empty = emptySchema.safeParse(value);
+      // Jevcode honors the owner's per-repository opt-in; a repository outside it is unavailable, not failed.
+      if (empty.success) throw empty.data.decision.action === "disabled" ? new NotOptedIn() : new NotReady();
+      const parsed = envelopeSchema.parse(value);
       if (resolve(parsed.repo) !== job.location.root || (job.location.baseline !== null && parsed.base !== job.location.baseline))
         throw new Error("provenance");
-      const repository: RepositoryBrief = { head: parsed.head, base: parsed.base, fingerprint: parsed.fingerprint,
+      const repository: RepositoryBrief = { decision: parsed.decision, head: parsed.head, base: parsed.base, fingerprint: parsed.fingerprint,
         generatedAt: parsed.generatedAt,
         coverage: [...parsed.coverage, `Session activity: ${activity.included} of ${job.observedMessages} recorded messages included${activity.truncated || job.truncated ? "; activity outside the bounded message or page limits omitted" : "."}`],
         activity: { included: activity.included, observed: job.observedMessages, truncated: activity.truncated || job.truncated }, evidence: parsed.evidence, brief: parsed.brief };
       const evidence = parsed.evidence.map(item => `${item.source}:${item.line}${item.path ? ` (${item.path})` : ""}: ${item.text}`).join("\n");
-      const text = `${renderBrief(parsed.brief)}\n\nGenerated source snapshot: ${parsed.generatedAt}. Comparison base: ${parsed.base ?? "unborn"}. This is generated evidence, not approval.\nCoverage:\n${repository.coverage.join("\n")}${evidence ? `\nCited evidence:\n${evidence}` : ""}`;
-      return { engine: "jevcode", model: this.config.model, text, from: job.from, to: job.to,
+      const freshness = parsed.decision.action === "run" ? "Refreshed for this turn." : `Not refreshed this turn: ${parsed.decision.reason}.`;
+      const text = `${renderBrief(parsed.brief)}\n\n${freshness} Generated source snapshot: ${parsed.generatedAt}. Comparison base: ${parsed.base ?? "unborn"}. This is generated evidence, not approval.\nCoverage:\n${repository.coverage.join("\n")}${evidence ? `\nCited evidence:\n${evidence}` : ""}`;
+      return { engine: "jevcode", model: this.model, text, from: job.from, to: job.to,
         messages: activity.included, at: parsed.generatedAt, repository };
     } finally { this.controllers.delete(controller); }
   }

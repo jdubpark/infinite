@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -141,7 +141,10 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
     assert.equal(firstReceipt.length, 1, "the turn-end event must trigger generation without a manual summary request");
     assert.deepEqual(firstReceipt[0].input.split("\n").filter(Boolean).map((line: string) => JSON.parse(line).role), ["user", "assistant", "tool", "assistant"]);
     assert.ok(firstReceipt[0].args.includes("--activity-stdin"));
-    assert.ok(firstReceipt[0].args.includes("--no-state"));
+    // Jevcode's automatic run, with state, so unchanged turns are skipped and stale sections revised.
+    assert.deepEqual(firstReceipt[0].args.slice(0, 5), ["auto", "--trigger", "host", "--format", "json"]);
+    assert.ok(!firstReceipt[0].args.includes("--no-state"));
+    assert.ok(firstReceipt[0].args.includes("--session"));
 
     const cached = await host.fetchApi(`/sessions/${id}/summary`, "viewer");
     assert.equal(cached.body.engine, "jevcode");
@@ -167,6 +170,47 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
     await host.stop();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("repository briefings label an unrefreshed turn, read a missing or not-opted-in brief honestly, and pass the configured runner", { timeout: 120000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-jevcode-modes-"));
+  const fixture = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
+  for (const mode of ["skip", "empty", "disabled"] as const) {
+    const receipt = join(root, `${mode}.jsonl`);
+    const host = await startHost({ config: { attention, repositoryBriefings: {
+      command: process.execPath, args: [fixture, receipt, mode], runner: "codex", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 10000,
+    } } });
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: host.config.projects[0].path });
+      execFileSync("git", ["-C", host.config.projects[0].path, "config", "user.email", "test@example.invalid"]);
+      execFileSync("git", ["-C", host.config.projects[0].path, "config", "user.name", "Test"]);
+      writeFileSync(join(host.config.projects[0].path, "README.md"), "fixture repository\n");
+      execFileSync("git", ["-C", host.config.projects[0].path, "add", "README.md"]);
+      execFileSync("git", ["-C", host.config.projects[0].path, "commit", "-qm", "fixture"]);
+      assert.deepEqual((await host.fetchApi("/me")).body.capabilities.repositoryBriefings, { model: "codex", automatic: true });
+      const id = randomUUID();
+      await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: `Brief ${mode}`, prompt: "hook dialog" });
+      const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+      const control = await claimControl(host, id, "owner");
+      await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
+      const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`, "viewer"), r => ["ready", "failed", "empty", "unavailable"].includes(r.body.state) && existsSync(receipt), 20000);
+      const call = JSON.parse(readFileSync(receipt, "utf8").trim().split("\n")[0]);
+      assert.deepEqual(call.args.slice(call.args.indexOf("--runner"), call.args.indexOf("--runner") + 2), ["--runner", "codex"]);
+      assert.ok(!call.args.includes("--model"), "no model is passed unless configured");
+      if (mode === "skip") {
+        assert.equal(status.body.state, "ready");
+        assert.match(status.body.summary.text, /Not refreshed this turn: jev judged a refresh not worthwhile/);
+        assert.equal(status.body.summary.repository.decision.action, "skip");
+      } else if (mode === "empty") {
+        assert.equal(status.body.state, "empty");
+        assert.equal(status.body.error, "No repository brief exists yet; one is generated after the next change.");
+      } else {
+        assert.equal(status.body.state, "unavailable");
+        assert.equal(status.body.error, "This repository is not opted in to repository briefings.");
+      }
+    } finally { await host.stop(); }
+  }
+  rmSync(root, { recursive: true, force: true });
 });
 
 test("a failed automatic repository brief is safe and does not retry the same checkpoint", { timeout: 60000 }, async () => {

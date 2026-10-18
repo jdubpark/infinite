@@ -56,11 +56,13 @@ ss -ltnp | grep 4790                      # 127.0.0.1:4790 only
 sudo ls -l /run/infinite-relay/proxy.sock  # srw------- infinite-relay
 ```
 
-Point the runner at the relay over loopback, not through Cloudflare, then restart the API (workers survive):
+Point the runner at the relay over loopback, not through Cloudflare, then restart the API (workers survive). `/etc/infinite` is root-owned, so `connect-relay` runs as root and replaces the config; give it back to the control account before restarting:
 
 ```sh
-sudo -u infinite-host node /opt/infinite/packages/host/dist/cli.js connect-relay http://127.0.0.1:4790 \
+sudo node /opt/infinite/packages/host/dist/cli.js connect-relay http://127.0.0.1:4790 \
   --token-file /etc/infinite/relay-registration.key --config /etc/infinite/config.json
+sudo chown infinite-host:infinite-host /etc/infinite/config.json
+sudo chmod 600 /etc/infinite/config.json
 sudo systemctl restart infinite.service
 ```
 

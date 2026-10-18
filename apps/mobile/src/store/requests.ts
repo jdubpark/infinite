@@ -2,6 +2,13 @@ import { useCallback, useSyncExternalStore } from "react";
 
 export type CreationRequest = { requestId: string; backend: "infinite" | "cmux"; provider: string; projectId: string; title: string; prompt: string };
 export type LifecycleRequest = { requestId: string; action: "stop" | "resume" };
+export type TeamCreationRequest = { requestId: string; projectId: string; provider: string; useConfiguredLineup?: boolean; title: string; objective: string; parallelism: number };
+export type GoalCreationRequest = {
+  requestId: string; projectId: string; linearIssueId?: string; title: string; objective: string; successCriteria: string;
+  nonGoals: string[]; allowedPaths: string[]; evidence: string[]; maxRuns: number; maxMinutes: number; maxMembers: number; parallelism: number;
+};
+/** A steer, answer, lifecycle action or outcome for one team or goal, sent with the revision it was decided against. */
+export type RunRequest = { requestId: string; revision: number; path: string; label: string; fields: Record<string, string> };
 type RequestState<Request, Result> = { pending?: Request; result?: Result; message: string };
 
 /** In-memory receipts survive screen changes; only their own request may settle them. */
@@ -51,3 +58,7 @@ function requestStore<Request extends { requestId: string }, Result>() {
 
 export const creations = requestStore<CreationRequest, { id: string }>();
 export const lifecycles = requestStore<LifecycleRequest, { id: string }>();
+export const teamCreations = requestStore<TeamCreationRequest, { id: string }>();
+export const goalCreations = requestStore<GoalCreationRequest, { id: string }>();
+/** Keyed by machine and run, so a pending request follows its team or goal across screens. */
+export const runRequests = requestStore<RunRequest, { id: string }>();

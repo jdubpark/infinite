@@ -2,6 +2,7 @@ import type { Attention, Provider } from "@infinite/attention";
 import { createRemoteClient, RemoteError } from "@infinite/remote";
 import * as Crypto from "expo-crypto";
 import { loadClientId } from "../store/connection";
+import type { TeamLineup, TeamProject, TeamRole } from "../features/teams/model";
 
 export type Connection = { id?: string; machineId?: string; label?: string; url: string; token: string; relay?: { machineId: string } };
 export const connectionKey = (connection: Connection) => connection.id ?? `${connection.url}/${connection.relay?.machineId ?? "direct"}`;
@@ -97,6 +98,8 @@ export type SessionRow = {
   executionLocation?: "cloud" | "laptop";
   backend?: "infinite" | "cmux";
   projectId?: string;
+  /** Present on a team member; the team scheduler owns its lifecycle. */
+  team?: { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string };
   resumable?: boolean;
   title: string;
   provider: Provider;
@@ -131,8 +134,10 @@ export type Me = {
   backends?: ("infinite" | "cmux")[];
   providers?: Provider[];
   backendProviders?: { infinite: Provider[]; cmux?: Provider[] };
-  projects?: { id: string; name: string }[];
+  projects?: TeamProject[];
   capabilities?: { signals: boolean; answer: boolean; push: boolean };
+  teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
+  goals?: { enabled: boolean };
 };
 export type LogEvent = {
   seq: number;

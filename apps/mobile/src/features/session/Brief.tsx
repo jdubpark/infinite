@@ -27,6 +27,7 @@ import { OfflineBanner } from "../../components/OfflineBanner";
 import { SourceTag } from "../../components/SourceTag";
 import { StatePill } from "../../components/StatePill";
 import { theme } from "../../theme";
+import { ROLE_NAMES } from "../teams/model";
 import { Conversation } from "./Conversation";
 import { Files } from "./Files";
 import { Lifecycle } from "./Lifecycle";
@@ -165,6 +166,12 @@ export function Brief({
                   ? `Cached view from ${seen}`
                   : "Waiting for a fresh response…"}
             </Text>
+            {session.team ? (
+              <View style={s.metaRow}>
+                <Text style={s.small}>{ROLE_NAMES[session.team.role]} in a team · revision {session.team.revision}</Text>
+                <Button title="Open team" secondary onPress={() => router.push({ pathname: "/team/[id]", params: { id: session.team!.runId, machine: connectionKey(connection) } })} />
+              </View>
+            ) : null}
             <Text style={s.small}>Tools run on {(session.execution?.location ?? session.executionLocation) === "laptop" ? "your laptop" : me?.machine?.label || connection.label || "this machine"}</Text>
             {session.execution ? (
               <Text style={s.small}>

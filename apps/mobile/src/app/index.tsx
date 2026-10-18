@@ -6,14 +6,14 @@ import { api, closeConnection, connectionKey, type Connection, type Me } from ".
 import { registerForPush, unregisterPush, type PushState } from "../push/register";
 import { clearConnection, identifyConnection, loadConnections, selectConnection } from "../store/connection";
 import { clearDrafts } from "../store/drafts";
-import { creations, lifecycles } from "../store/requests";
+import { creations, goalCreations, lifecycles, runRequests, teamCreations } from "../store/requests";
 import { Pair } from "../features/pair/Pair";
-import { Inbox } from "../features/inbox/Inbox";
+import { Inbox, type InboxView } from "../features/inbox/Inbox";
 import { Button } from "../components/Button";
 import { theme } from "../theme";
 
 export default function Home() {
-  const { machine } = useLocalSearchParams<{ machine?: string }>();
+  const { machine, view } = useLocalSearchParams<{ machine?: string; view?: string }>();
   const [profiles, setProfiles] = useState<Connection[]>([]);
   const [active, setActive] = useState("");
   const [loaded, setLoaded] = useState(false);
@@ -60,6 +60,9 @@ export default function Home() {
     clearDrafts(connectionKey(connection));
     creations.clear(connectionKey(connection));
     lifecycles.clearMachine(connectionKey(connection));
+    teamCreations.clear(connectionKey(connection));
+    goalCreations.clear(connectionKey(connection));
+    runRequests.clearMachine(connectionKey(connection));
     await clearConnection(connectionKey(connection));
     await reload();
   }
@@ -78,6 +81,7 @@ export default function Home() {
         </ScrollView>
       </View>
       <Inbox key={active} connection={connection} onDisconnect={() => void disconnect()}
+        initialView={view === "teams" || view === "goals" ? view as InboxView : undefined}
         pushNote={push[active] ? PUSH_NOTES[push[active]] : undefined} />
     </>}
   </SafeAreaView>;

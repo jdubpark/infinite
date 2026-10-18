@@ -170,6 +170,6 @@ Do not enable automatic destructive tool approval to make the acceptance test pa
 
 ## Laptop client and backups
 
-Use the [laptop CLI](../../docs/cli.md) to launch native providers, list sessions, reattach, and monitor through private HTTPS. The server keeps the existing owner/controller/viewer roles; raw native input requires an owner bearer credential.
+Use the [laptop CLI](../../docs/cli.md) to launch native providers, list sessions, reattach, and monitor through private HTTPS. For the phone without Tailscale, follow [phone access without a VPN](public-relay.md): a loopback relay published through Cloudflare Tunnel behind a Cloudflare Access service token. The server keeps the existing owner/controller/viewer roles; raw native input requires an owner bearer credential.
 
 The [backup procedure](backups.md) uses an owner-held age identity, a bounded process freeze, a staging copy on encrypted storage, and authenticated restore verification. The daily timer creates local encrypted snapshots; independent cloud upload requires a separately configured storage destination.

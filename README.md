@@ -98,7 +98,7 @@ file-safety rules, and verified limitations](docs/desktop.md).
 
 ## Phone
 
-The React Native app is in `apps/mobile`. It supports Android and has an iPhone build configuration. Pair it with an HTTPS Tailscale Serve address and a **controller** or **viewer** key. Enable `remote.enabled` on the host; direct and relay connections require the application-encrypted endpoint. Keys go into Android Keystore/iOS Keychain through Expo SecureStore. Logs are kept in memory while the app is open and remain on the host for replay.
+The React Native app is in `apps/mobile`. It supports Android and has an iPhone build configuration. Pair it with an HTTPS Tailscale Serve address and a **controller** or **viewer** key, or, without a VPN on the phone, with a relay behind Cloudflare Access ([phone access guide](deploy/ubuntu/public-relay.md)). Enable `remote.enabled` on the host; direct and relay connections require the application-encrypted endpoint. Keys go into Android Keystore/iOS Keychain through Expo SecureStore. Logs are kept in memory while the app is open and remain on the host for replay.
 
 ```sh
 npm run android -w @infinite/mobile

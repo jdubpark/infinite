@@ -5,7 +5,9 @@ import {
   type CipherChannel, type RandomBytes, type RemoteMethod, type RemoteRequest, type RemoteTerminalCommand, type TerminalInput,
 } from "./protocol.js";
 
-export interface RemoteConnection { url: string; token: string; relay?: { machineId: string } }
+/** A Cloudflare Access service token; Cloudflare checks it before the connection reaches the relay. */
+export interface RemoteAccessToken { clientId: string; clientSecret: string }
+export interface RemoteConnection { url: string; token: string; relay?: { machineId: string }; access?: RemoteAccessToken }
 export interface RemoteRequestOptions {
   method?: RemoteMethod; body?: unknown; headers?: Record<string, string>; signal?: AbortSignal;
 }
@@ -45,6 +47,9 @@ export function createRemoteClient(connection: RemoteConnection, options: Remote
   const machineId = connection.relay?.machineId ?? "";
   if (machineId && !UUID.test(machineId)) throw new Error("Invalid machine identifier");
   const endpoint = remoteSocketUrl(connection.url, connection.relay ? `/relay/clients/${machineId}` : "/api/remote");
+  const access = connection.access;
+  if (access && ![access.clientId, access.clientSecret].every(value => /^[\x21-\x7e]{8,200}$/.test(value))) throw new Error("Invalid access token");
+  const headers = access ? { "CF-Access-Client-Id": access.clientId, "CF-Access-Client-Secret": access.clientSecret } : undefined;
   const timeout = options.requestTimeoutMs ?? 30000;
   if (!Number.isFinite(timeout) || timeout < 100 || timeout > 300000) throw new Error("Invalid remote request timeout");
   let socket: WebSocket | undefined, channel: CipherChannel | undefined, opening: Promise<void> | undefined, stopped = false;
@@ -79,7 +84,9 @@ export function createRemoteClient(connection: RemoteConnection, options: Remote
     let current: WebSocket;
     const ready = new Promise<void>((resolve, reject) => {
       failOpening = reject;
-      try { current = new WebSocket(endpoint); socket = current; }
+      // React Native reads headers from the third argument and Node from the second;
+      // each ignores the other. Browsers cannot send upgrade headers.
+      try { current = headers ? new (WebSocket as unknown as new (url: string, init: object, options: object) => WebSocket)(endpoint, { headers }, { headers }) : new WebSocket(endpoint); socket = current; }
       catch { reject(new RemoteError("Could not open the machine connection")); return; }
       handshakeTimer = setTimeout(() => { if (socket === current) disconnect(new RemoteError("Machine did not authenticate in time. Check that encrypted remote access is enabled on the host.", 0, undefined, "handshake-timeout")); }, HANDSHAKE_TIMEOUT_MS);
       current.onopen = () => { if (socket === current) current.send(JSON.stringify(hello)); };

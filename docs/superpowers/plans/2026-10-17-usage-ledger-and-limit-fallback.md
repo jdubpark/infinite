@@ -406,7 +406,7 @@ test("a usage limit with no configured fallback blocks the run with its reason",
 ### Task 11: Web limit displays and documentation
 
 **Files:**
-- Modify: `apps/web/src/api.ts` (types `ProviderLimit`, `limitSwitches`, `stoppedReason`, `Me.providerLimits`), `apps/web/src/teams.tsx:97-110` (Teams list banner "Claude Code limited since HH:MM · resets HH:MM · new Claude members launch on their fallback"), `:231` (task `limitSwitches` rendered like `escalation`), `:232` (member `stoppedReason`), `apps/web/src/main.tsx` (session row shows `attention.limit` as "Usage limit reached · resets HH:MM")
+- Modify: `apps/web/src/api.ts` (types `ProviderLimit`, `limitSwitches`, `stoppedReason`, `Me.providerLimits`), `apps/web/src/teams.tsx:97-110` (Teams list banner "Claude Code limited since HH:MM · resets HH:MM · new Claude members launch on their fallback"), `:231` (task `limitSwitches` rendered like `escalation`), `:232` (member `stoppedReason`), `apps/web/src/main.tsx` (session row shows `attention.limit` as "Usage limit reached · resets HH:MM"; measured sessions also show their `usage` cost with the shared formatter from `apps/web/src/usage.tsx`, and unmeasured sessions show nothing, never 0.00 — carried from Task 6)
 - Modify: `docs/teams.md` ("Provider usage limits and fallbacks" section: config example from the spec, confidence rules, what the host does and never does, UTC note), `docs/security.md` (one paragraph: limit observations and usage totals are records of what the host saw; no credential involved)
 - Test: `npm run typecheck && npm run build -w @infinite/web`
 

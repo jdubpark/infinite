@@ -1,8 +1,8 @@
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
-export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "transcript";
-const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "transcript"]);
+export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "team-handoff" | "transcript";
+const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "team-handoff", "transcript"]);
 const MAX_BODY = 256 * 1024;
 export class HookPayloadError extends Error {
   constructor(readonly status: number) { super("Hook payload was refused"); }
@@ -21,7 +21,7 @@ export interface HookReply {
 
 export function startHookServer(opts: {
   token: string;
-  onPayload: (route: HookRoute, body: unknown) => HookReply | void;
+  onPayload: (route: HookRoute, body: unknown) => HookReply | void | Promise<HookReply | void>;
   onError: () => void;
 }): Promise<{ port: number; url: string; close: () => void }> {
   const expected = Buffer.from(opts.token);
@@ -56,7 +56,7 @@ export function startHookServer(opts: {
         res.writeHead(413, { Connection: "close" }).end();
       }
     });
-    req.on("end", () => {
+    req.on("end", async () => {
       if (tooBig) return;
       let parsed: unknown;
       try {
@@ -70,7 +70,7 @@ export function startHookServer(opts: {
       }
       let reply: HookReply | void = undefined;
       try {
-        reply = opts.onPayload(route as HookRoute, parsed);
+        reply = await opts.onPayload(route as HookRoute, parsed);
       } catch (error) {
         opts.onError();
         res.writeHead(error instanceof HookPayloadError ? error.status : 500).end();

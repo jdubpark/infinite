@@ -1,5 +1,6 @@
+import type { HandoffPolicy, TeamHandoffContext } from "./handoff-types.js";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { ProviderLimits } from "./provider-limits.js";
 import type { Config } from "./types.js";
@@ -22,6 +23,7 @@ type Stored = {
   halt?: "pause" | "cancel" | "steer" | "block";
   checkHead?: string;
   source?: { path: string; head?: string };
+  handoffPolicy?: HandoffPolicy;
 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const timestamp = () => new Date().toISOString();
@@ -103,7 +105,21 @@ export class TeamService {
   createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup, linearTracking = false): Promise<TeamView> {
     return this.createRun(createTeamSchema.parse(request), { goal: teamGoalContextSchema.parse(goal), lineup: teamLineupSchema.parse(lineup) }, linearTracking);
   }
-  private createRun(parsed: CreateTeam, internal?: { goal: TeamGoalContext; lineup: TeamLineup }, linearTracking = false): Promise<TeamView> {
+  assertHandoffPolicy(policy: HandoffPolicy) {
+    const project = this.config.projects.find(item => item.id === policy.projectId);
+    if (!project || JSON.stringify(project.team) !== JSON.stringify(policy.project) || JSON.stringify(project.linear) !== JSON.stringify(policy.linear) || realpathSync(project.path) !== policy.path || this.config.teams?.workspaceDir !== policy.workspaceDir || JSON.stringify(this.config.teams?.commandPrefix) !== JSON.stringify(policy.commandPrefix))
+      throw new TeamError(409, "handoff-policy-changed", "Project authority changed after the source session started; inspect the checkpoint before creating a new team.");
+    for (const selection of lineupProfiles(policy.lineup)) {
+      const profile = this.config.agents[selection.provider];
+      if (!profile || (/(^|\/)sudo$/.test(profile.command) && !policy.commandPrefix)) throw new TeamError(409, "handoff-provider-unavailable", "A snapshotted provider execution profile is unavailable.");
+      teamModelLaunch(profile, selection);
+    }
+  }
+  createForHandoff(request: CreateTeam, handoff: TeamHandoffContext, policy: HandoffPolicy): Promise<TeamView> {
+    this.assertHandoffPolicy(policy);
+    return this.createRun(createTeamSchema.parse(request), { handoff, handoffPolicy: policy, lineup: policy.lineup }, Boolean(policy.linear));
+  }
+  private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup }, linearTracking = false): Promise<TeamView> {
     return this.enqueue(async () => {
       // Preserve the fingerprints written before lineup selection existed.
       const { useConfiguredLineup, ...singleProviderRequest } = parsed;
@@ -136,12 +152,12 @@ export class TeamService {
       if (parent && (parent.goal?.id !== goal!.id || parent.projectId !== parsed.projectId || parent.status !== "ready-for-review" || !parent.headCommit))
         throw new TeamError(409, "invalid-goal-parent", "Continue only from a ready, recorded run of this goal and project.");
       if (parent) assertTeamPath(this.config.teams.workspaceDir, parent.workspace);
-      const source = { path: parent?.workspace ?? project.path, ...(parent ? { head: parent.headCommit! } : {}) };
+      const source = { path: parent?.workspace ?? project.path, ...(parent ? { head: parent.headCommit! } : internal?.handoff ? { head: internal.handoff.checkpointHead } : {}) };
       const parentRevision = parent?.revision;
       const at = timestamp();
-      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(this.config.teams.workspaceDir, parsed.requestId), branch: `infinite/team-${parsed.requestId}`, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(this.config.teams.workspaceDir, parsed.requestId), branch: `infinite/team-${parsed.requestId}`, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       this.assertBudget(run);
-      const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, source };
+      const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
       this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
       this.operation(stored, "prepare", async signal => this.startInProject(run.projectId, async () => {
         const assertParent = () => {
@@ -261,13 +277,15 @@ export class TeamService {
   }
   close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const controller of this.commands.values()) controller.abort(); }
   private assertBudget(run: TeamRun, addingMember = false) {
-    if (run.goal && Date.now() >= Date.parse(run.goal.deadlineAt)) {
+    const policy = this.records.get(run.id)?.handoffPolicy;
+    if (policy) this.assertHandoffPolicy(policy);
+    if ((run.goal || run.handoff) && Date.now() >= Date.parse((run.goal ?? run.handoff)!.deadlineAt)) {
       run.stopReason = "deadline";
       throw new TeamError(409, "goal-deadline", "The goal reached its deadline. Active work is being stopped and retained for inspection.");
     }
-    const limit = run.goal?.maxMembers ?? 60;
+    const limit = (run.goal ?? run.handoff)?.maxMembers ?? 60;
     if (run.members.length + (addingMember ? 1 : 0) > limit) {
-      if (run.goal) run.stopReason = "member-limit";
+      if (run.goal || run.handoff) run.stopReason = "member-limit";
       throw new TeamError(409, "team-attempt-limit", `The team reached its limit of ${limit} agent attempts. Review its evidence before continuing.`);
     }
   }
@@ -592,7 +610,7 @@ export class TeamService {
     const expected = member.role === "project-manager" ? ["plan", "explore", "no-change"] : member.role === "scout" ? ["findings"] : member.role === "reviewer" ? ["review"] : member.role === "implementer" ? ["result", "escalate"] : ["result"];
     if (!expected.includes(report.kind)) { this.block(stored, new TeamError(409, "wrong-agent-report", "An agent's report does not match its assigned role.")); return; }
     if (report.kind === "no-change") {
-      if (!run.goal || run.tasks.length) throw new TeamError(409, "invalid-no-change", "Only a goal coordinator can conclude that discovery found no justified change.");
+      if ((!run.goal && !run.handoff) || run.tasks.length) throw new TeamError(409, "invalid-no-change", "Only a goal coordinator can conclude that discovery found no justified change.");
       this.operation(stored, "result", async signal => {
         await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
         await assertMemberReadOnly(run.workspace, run.headCommit!, this.config.teams?.commandPrefix, signal);
@@ -684,7 +702,7 @@ export class TeamService {
   }
   private check(stored: Stored) {
     const run = stored.run, revision = run.revision, head = run.headCommit!;
-    const commands = this.config.projects.find(project => project.id === run.projectId)!.team!.checks;
+    const commands = run.handoff?.project.checks ?? this.config.projects.find(project => project.id === run.projectId)!.team!.checks;
     run.status = "verifying";
     this.operation(stored, "check", async signal => {
       const results: typeof run.checks = [];

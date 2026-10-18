@@ -17,6 +17,82 @@ passing configured checks, and an approving reviewer report. It does not
 establish product impact or human acceptance. The host does not push, open pull
 requests, merge into the original checkout, or deploy.
 
+## Start from a terminal
+
+The paired laptop CLI can enroll a repository and control the same Teams shown
+in the web client. See [CLI repository setup](cli.md) for command options.
+
+```sh
+cd /path/to/project
+infinite repo init
+infinite team start "Implement the checkout retry behavior described in the issue"
+infinite team start --prd docs/checkout-prd.md
+infinite team status
+infinite team watch TEAM_ID
+infinite team steer TEAM_ID "Keep the existing checkout layout"
+infinite team answer TEAM_ID QUESTION_ID "Use the existing retry policy"
+```
+
+Repository setup records a private binding between the local Git root and the
+selected host project. A new remote source receives a committed Git snapshot;
+ignored files and uncommitted changes are not included. Existing cloud sources
+are not replaced by enrollment. Setup and verification commands belong to that
+repository, while the coordinator, workers, and reviewer come from the host's
+configured lineup. Provider permissions remain under the owner's control.
+
+Add the repository's Linear team and project mapping during enrollment to track
+new runs. A mapping is configuration, not proof of connectivity: each run shows
+whether Linear has confirmed its issue and execution evidence. Historical runs
+remain unchanged. Run status, verification, and human acceptance retain the
+separate meanings described below.
+
+## Let an ordinary session request a team
+
+`infinite repo init` enables automatic handoff for new sessions in that project.
+Use `--handoff off` during enrollment to keep them as individual sessions.
+Existing projects and already running sessions retain their settings.
+
+After enrollment, start normally with `infinite claude "Your task"` or
+`infinite codex "Your task"`. Both use the enrolled cloud project. Later local
+edits need an explicit sync; starting a session does not upload them.
+
+A supported Claude or Codex terminal session receives a scoped `handoff` tool.
+It can request a team when the current task benefits from parallel work and
+independent review. The request contains the remaining objective, the reason
+for delegation, and a summary of completed work. The coordinator can use one
+implementer if parallel work is unnecessary. It reports no change only when the
+task requires no further code changes, with evidence. No terminal-text heuristic
+makes this choice.
+
+Before yielding, the agent must stop its tool jobs, commit only its own changes,
+and supply the clean Git commit. Unrelated edits must remain untouched; a dirty
+checkout refuses the transfer. The host records the request, releases the source
+writer, checks its observable process group and descendants, and verifies the
+same commit before preparing an isolated team copy. A retry or host restart uses
+the recorded team identity. The yielded session cannot be resumed as another
+writer for the same task.
+
+The team inherits the source session's configured lineup, project checks and
+Linear mapping. It has at most two parallel implementers, sixteen member
+attempts, and sixty minutes from the accepted handoff. These are execution limits,
+not a token or currency cap. A recorded initial user request stays in its context.
+For an interactive session with no initial request, the agent's summary supplies
+the current task context and is labeled accordingly. It does not grant authority
+to expand the task, publish, deploy, or change provider permissions.
+
+The CLI releases its own terminal lease after an accepted handoff when it has no
+unsent local draft. A draft or another controlling device keeps the transfer
+waiting until that client detaches. Status and the resulting team ID are exposed
+at `GET /api/sessions/:id/handoff` and on the session record.
+
+Handoff currently covers new Claude and Codex PTY sessions at the configured
+repository root, with ordinary prompts and supported model flags. Native UI,
+laptop execution, resumed sessions, other providers, and unsupported native
+arguments retain their existing behavior and report handoff as unavailable.
+The process check is not a sandbox for arbitrary background services: the agent
+must stop jobs that detached or escaped its observed process tree before yielding.
+An uncertain stop or changed checkpoint blocks the transfer and preserves the work.
+
 ## Start and steer a goal
 
 An owner selects a configured workspace and supplies the desired outcome,

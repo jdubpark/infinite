@@ -42,6 +42,7 @@ export interface ExecutionState {
   reconciliation?: "available";
 }
 export interface Session {
+  handoff?: { policy?: import("./handoff-types.js").HandoffPolicy; reason?: string };
   id: string;
   /** Host-owned assignment; ordinary session creation cannot supply this. */
   team?: import("./team-types.js").TeamAssignment;
@@ -70,7 +71,7 @@ export interface Session {
 export interface Event {
   seq: number;
   at: string;
-  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "usage" | "message";
+  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "team-handoff" | "usage" | "message";
   data: Record<string, unknown>;
 }
 export interface Project {
@@ -134,6 +135,7 @@ export interface Receipt {
   seq: number;
 }
 export interface WorkerState {
+  handoffQuiescence?: { requestId: string; verifiedAt: string; scope: "process-group-and-observed-descendants" };
   status: Status;
   pid?: number;
   /** Written to the sealed status only; a row carries it when the worker did not answer. */
@@ -160,6 +162,7 @@ export type WorkerRequest =
   | { op: "workspace-export"; method: "sync/export" | "sync/blob"; hash?: string }
   | ({ op: "native-connect" } & InputControl)
   | { op: "snapshot" }
+  | { op: "handoff-stop"; requestId: string }
   | {
       op: "control";
       action: "claim" | "renew" | "release";

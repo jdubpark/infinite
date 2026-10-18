@@ -4,7 +4,7 @@ import { execFile, spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync, realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn as ptySpawn, type IPty } from "node-pty";
@@ -12,8 +12,9 @@ import { createApp } from "../packages/host/src/server.js";
 import { hashToken } from "../packages/host/src/config.js";
 import { workerCall } from "../packages/host/src/ipc.js";
 import type { Config } from "../packages/host/src/types.js";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { claimControl, startHost, waitFor } from "./helpers.js";
+import { fixture as teamFixture, mixedLineup } from "./team-fixture.js";
 
 const exec = promisify(execFile);
 const wait = async (predicate: () => boolean | Promise<boolean>, timeout = 10000) => {
@@ -35,8 +36,176 @@ test("CLI cmux delegates exact arguments without pairing Infinite and preserves 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("team CLI starts and reads a real host team, and reports missing host setup before launch", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success");
+  const clientFile = join(run.host.root, "team-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts")];
+  const cli = [...entry, "--client-config", clientFile];
+  try {
+    const started = JSON.parse((await exec(cli[0], [...cli.slice(1), "team", "start", "Check the project", "--project", "rehearsal", "--provider", "demo", "--json"])).stdout);
+    assert.equal(started.projectId, "rehearsal");
+    assert.ok(started.id);
+    const status = JSON.parse((await exec(cli[0], [...cli.slice(1), "team", "status", started.id, "--json"])).stdout);
+    assert.equal(status.id, started.id);
+    assert.equal(typeof status.workspace, "string");
+    assert.equal(typeof status.branch, "string");
+
+    const unavailable = await startHost();
+    const unavailableConfig = join(unavailable.root, "client.json");
+    writeFileSync(unavailableConfig, JSON.stringify({ origin: unavailable.origin, token: unavailable.tokens.owner }), { mode: 0o600 });
+    try {
+      await assert.rejects(exec(entry[0], [...entry.slice(1), "--client-config", unavailableConfig, "team", "start", "Should not launch", "--project", "rehearsal", "--provider", "demo"]),
+        (error: { stderr: string }) => /Host team configuration is incomplete: teams.workspaceDir/.test(error.stderr));
+      assert.deepEqual((await unavailable.fetchApi("/teams")).body.teams, [], "missing host setup does not create a team");
+    } finally { await unavailable.stop(); }
+  } finally { await run.close(); }
+});
+
+test("repo init configures an explicit project without resolving or replacing its checkout", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success", mixedLineup);
+  const clientFile = join(run.host.root, "repo-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts")];
+  const cli = [...entry, "--client-config", clientFile];
+  const head = (await exec("git", ["-C", run.source, "rev-parse", "HEAD"])).stdout.trim();
+  const checks = JSON.stringify([{ command: "git", args: ["status", "--short"] }]);
+  try {
+    for (let index = 0; index < 2; index++) {
+      const output = JSON.parse((await exec(cli[0], [...cli.slice(1), "repo", "init", run.source, "--project", "rehearsal", "--check-json", checks, "--json"])).stdout);
+      assert.equal(output.id, "rehearsal");
+      assert.equal(output.source, "configured project checkout");
+      assert.equal(output.team.handoff, "auto");
+    }
+    assert.equal((await exec("git", ["-C", run.source, "rev-parse", "HEAD"])).stdout.trim(), head);
+    const before = await run.host.fetchApi("/me");
+    await exec(cli[0], [...cli.slice(1), "--detach", "--title", "Bound team project", "claude"], { cwd: run.source });
+    const sessions = (await run.host.fetchApi("/sessions")).body.sessions;
+    const launched = sessions.find((session: { title: string }) => session.title === "Bound team project");
+    assert.equal(launched?.projectId, "rehearsal", "normal launches use the saved directory binding without --project");
+    assert.deepEqual((await run.host.fetchApi("/me")).body.projects.map((project: { id: string }) => project.id), before.body.projects.map((project: { id: string }) => project.id), "a bound launch does not resolve a second workspace");
+  } finally { await run.close(); }
+});
+
+test("repo init refuses to enroll a source snapshot while its sync generation is pending", { timeout: 120000 }, async () => {
+  const localRoot = mkdtempSync(join(homedir(), "infinite-cli-pending-repo-"));
+  const cloudHome = mkdtempSync(join(tmpdir(), "infinite-cli-cloud-home-"));
+  const run = await teamFixture("success", undefined, {
+    sync: { homeDir: cloudHome },
+    agents: { demo: { command: process.execPath, args: ["-e", "setTimeout(() => {}, 120000)"] } },
+  });
+  const clientFile = join(run.host.root, "pending-repo-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  let sessionId: string | undefined;
+  let enrollmentRequestId: string | undefined;
+  try {
+    await exec("git", ["init", "--initial-branch=main"], { cwd: localRoot });
+    writeFileSync(join(localRoot, "README.md"), "source snapshot\n");
+    await exec("git", ["-C", localRoot, "add", "README.md"]);
+    await exec("git", ["-C", localRoot, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial source"]);
+    const resolved = await run.host.fetchApi("/projects/resolve", "owner", { path: relative(homedir(), localRoot) });
+    assert.equal(resolved.status, 200, JSON.stringify(resolved.body));
+    const projectId = resolved.body.id;
+    const started = await run.host.fetchApi("/sessions", "owner", { requestId: randomUUID(), provider: "demo", projectId, title: "Hold source apply", prompt: "" });
+    assert.equal(started.status, 201, JSON.stringify(started.body));
+    sessionId = started.body.id;
+    await waitFor(() => run.host.fetchApi(`/sessions/${sessionId}`), response => ["starting", "running"].includes(response.body.status), 15000);
+
+    await assert.rejects(exec(entry[0], [...entry.slice(1), "repo", "init", localRoot, "--check-json", JSON.stringify([{ command: "git", args: ["status", "--short"] }])]), (error: { stderr: string }) => {
+      assert.match(error.stderr, /source snapshot is pending \(session-running\)/);
+      assert.match(error.stderr, /sync --apply --project/);
+      assert.match(error.stderr, /--request-id/);
+      enrollmentRequestId = /\[Infinite\] Request ([a-f0-9-]{36})/.exec(error.stderr)?.[1];
+      assert.ok(enrollmentRequestId, "source capture request ID is printed before upload");
+      return true;
+    });
+    const pending = await run.host.fetchApi(`/projects/${projectId}`);
+    assert.equal(pending.body.sync.pendingGeneration.reason, "session-running");
+    assert.equal(pending.body.sync.appliedManifest, undefined);
+    assert.equal((await run.host.fetchApi(`/projects/${projectId}/team`)).body.team, undefined, "pending source never receives team configuration");
+
+    await workerCall(run.host.config.runDir, sessionId, { op: "stop", requestId: randomUUID() });
+    await waitFor(() => run.host.fetchApi(`/sessions/${sessionId}`), response => response.body.status === "exited", 15000);
+    await exec(entry[0], [...entry.slice(1), "sync", "--apply", "--project", projectId]);
+    const applied = await run.host.fetchApi(`/projects/${projectId}`);
+    assert.equal(applied.body.sync.pendingGeneration, undefined);
+    assert.ok(applied.body.sync.appliedManifest);
+    assert.equal(readFileSync(join(applied.body.path, "README.md"), "utf8"), "source snapshot\n");
+    const enrolled = JSON.parse((await exec(entry[0], [...entry.slice(1), "repo", "init", localRoot, "--check-json", JSON.stringify([{ command: "git", args: ["status", "--short"] }]), "--request-id", enrollmentRequestId!])).stdout);
+    assert.equal(enrolled.id, projectId);
+    assert.equal(enrolled.team.checks[0].command, "git");
+  } finally {
+    if (sessionId) try { await workerCall(run.host.config.runDir, sessionId, { op: "stop", requestId: randomUUID() }); } catch {}
+    await run.close(); rmSync(localRoot, { recursive: true, force: true }); rmSync(cloudHome, { recursive: true, force: true });
+  }
+});
+
+test("team request receipts stay bound to the paired host", { timeout: 120000 }, async () => {
+  const first = await teamFixture("success"), second = await teamFixture("success");
+  const clientFile = join(first.host.root, "shared-client.json"), requestId = randomUUID();
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts")];
+  try {
+    for (const [host, objective] of [[first.host, "First host objective"], [second.host, "Second host objective"]] as const) {
+      writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner }), { mode: 0o600 });
+      const result = JSON.parse((await exec(entry[0], [...entry.slice(1), "--client-config", clientFile, "team", "start", objective, "--project", "rehearsal", "--provider", "demo", "--request-id", requestId, "--json"])).stdout);
+      assert.equal(result.id, requestId);
+      assert.equal(result.objective, objective);
+    }
+    assert.equal((await first.host.fetchApi(`/teams/${requestId}`)).body.objective, "First host objective");
+    assert.equal((await second.host.fetchApi(`/teams/${requestId}`)).body.objective, "Second host objective");
+  } finally { await Promise.all([first.close(), second.close()]); }
+});
+
+test("an uncertain team start blocks a duplicate and shows the saved request ID", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success"), clientFile = join(run.host.root, "lost-start.json");
+  let dropped = false;
+  const proxy = createServer((req, res) => {
+    const drop = !dropped && req.url === "/api/teams" && req.method === "POST";
+    const upstream = httpRequest(run.host.origin + req.url, { method: req.method, headers: { ...req.headers, host: new URL(run.host.origin).host } }, response => {
+      response.on("error", () => res.destroy());
+      if (drop) { response.resume(); response.on("end", () => { dropped = true; res.destroy(); }); }
+      else { res.writeHead(response.statusCode!, response.headers); response.pipe(res); }
+    });
+    upstream.on("error", () => res.destroy()); req.pipe(upstream);
+  });
+  await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+  writeFileSync(clientFile, JSON.stringify({ origin: `http://127.0.0.1:${(proxy.address() as { port: number }).port}`, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile, "team", "start", "Unique retry objective", "--project", "rehearsal", "--provider", "demo"];
+  try {
+    await assert.rejects(exec(entry[0], entry.slice(1)), () => dropped);
+    await assert.rejects(exec(entry[0], entry.slice(1)), (error: { stderr: string }) => {
+      assert.match(error.stderr, /earlier request has an uncertain result/i);
+      assert.match(error.stderr, /'--request-id' '[a-f0-9-]{36}'/);
+      return true;
+    });
+    const teams = (await run.host.fetchApi("/teams")).body.teams;
+    assert.equal(teams.length, 1);
+    assert.equal(teams[0].objective, "Unique retry objective");
+  } finally { proxy.closeAllConnections(); await new Promise<void>(resolve => proxy.close(() => resolve())); await run.close(); }
+});
+
+test("team CLI answers a decision and steers through the host API", { timeout: 120000 }, async () => {
+  const run = await teamFixture("question"), clientFile = join(run.host.root, "question-client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const created = run.create();
+  try {
+    const response = await run.host.fetchApi("/teams", "owner", created);
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    const id = response.body.id;
+    const waiting = await waitFor(() => run.get(id), team => team.decisions.some(decision => !decision.answer), 90000);
+    const question = waiting.decisions.find(decision => !decision.answer)!;
+    const answered = JSON.parse((await exec(entry[0], [...entry.slice(1), "team", "answer", id, question.id, "Compact", "--json"])).stdout);
+    assert.equal(answered.decisions.find((decision: { id: string }) => decision.id === question.id).answer, "Compact");
+    const steered = JSON.parse((await exec(entry[0], [...entry.slice(1), "team", "steer", id, "Keep the existing route", "--json"])).stdout);
+    assert.ok(steered.steering.some((item: { text: string }) => item.text === "Keep the existing route"));
+  } finally { await run.close(); }
+});
+
 test("local draft recovery isolates pairings and runtimes, preserves concurrent drafts, and refuses tampered ciphertext", async () => {
   const { localDraftStore } = await import("../packages/host/src/client-draft-store.js");
+  const { draftTerminal } = await import("../packages/host/src/client-draft.js");
   const root = mkdtempSync(join(tmpdir(), "infinite-drafts-")), path = join(root, "client.json");
   const identity = { origin: "https://host.example", token: randomBytes(32).toString("hex"), sessionId: randomUUID(), projectId: "project", runtimeId: randomUUID() };
   const notices: string[] = [], report = (s: string) => notices.push(s);
@@ -51,6 +220,9 @@ test("local draft recovery isolates pairings and runtimes, preserves concurrent 
     }
     const restored = localDraftStore(path, identity, report), remaining = new Set(["first private draft", "second private draft"]);
     const draft = restored.restore()!; assert.ok(remaining.delete(draft.text));
+    const screen = draftTerminal(restored);
+    assert.equal(screen.hasUnsentDraft, true, "handoff preflight can detect a recovered draft even while its editor is closed");
+    screen.dispose();
     restored.clear();
     assert.ok(remaining.has(restored.restore()!.text), "discarding one recovered draft preserves the other client's work");
     const files = readdirSync(join(root, "drafts"), { recursive: true }).map(String).filter(p => p.endsWith(".sealed"));

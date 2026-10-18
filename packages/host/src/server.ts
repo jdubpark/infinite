@@ -6,7 +6,7 @@ import { proxyNativeHttp } from "./native-http.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { Manager } from "./manager.js";
 import { hashToken, validateLinearConfig } from "./config.js";
@@ -21,6 +21,9 @@ import { ContentError, recordedMessages, sessionFile } from "./session-content.j
 import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { MirroredProjects } from "./mirrored-projects.js";
+import { RepoEnrollmentService, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
+import { HandoffService } from "./handoffs.js";
+import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { TeamService, TeamError } from "./teams.js";
@@ -98,17 +101,22 @@ export function createApp(config: Config, key: Buffer) {
   validateLinearConfig(config);
   const app = express();
   const mirroredProjects = runtimeSecurity(config.deployment).tenancy === "single-tenant" ? new MirroredProjects(config, key) : undefined;
+  const enrollment = new RepoEnrollmentService(config, key, { isBusy: async projectId =>
+    projectSync.applying(projectId) || await projectRunning(projectId, true) });
+  validateLinearConfig(config);
   const manager = new Manager(config, key);
   const projectSync = new ProjectSync(config, key);
   const desktopFiles = new DesktopFiles(config);
   // Session starts admitted past the sync check that the session list may not show yet.
   const startsInFlight = new Map<string, number>();
   const projectFileChanges = new Set<string>();
+  const projectConfigChanges = new Set<string>();
   /**
    * A sync commit or apply evaluates projectRunning only after `applying()` turns true.
    * A start either sees that flag and is refused, or is counted before the check runs.
    */
   const startInProject = async <T>(projectId: string, start: () => Promise<T>): Promise<T> => {
+    if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
     if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
     if (projectSync.applying(projectId))
       throw new ProjectSyncError("A workspace sync is being applied to this project. Start the session after it finishes.", "sync-applying");
@@ -125,6 +133,25 @@ export function createApp(config: Config, key: Buffer) {
   const goals = new GoalService(config, key, teams, linear);
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
+  const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
+    const sourcePath = realpathSync(manager.meta(sessionId).session.cwd);
+    // This callback owns one start reservation. Earlier admitted creates may not
+    // have a session row yet, especially while cmux returns a cached listing.
+    for (const project of config.projects) {
+      if (!handoffPathsOverlap(sourcePath, realpathSync(project.path))) continue;
+      if ((startsInFlight.get(project.id) ?? 0) > (project.id === projectId ? 1 : 0) ||
+          goals.activeForProject(project.id) || teams.activeForProject(project.id) ||
+          projectSync.applying(project.id) || projectFileChanges.has(project.id) || projectConfigChanges.has(project.id))
+        throw new TeamError(409, "project-busy", "Another operation may still be using this repository. Finish it before handing off work.");
+    }
+    const external = (await listSessions()).filter(session => session.backend === "cmux");
+    if (external.some(session => session.id !== sessionId && session.status !== "exited" &&
+        (session.projectId === projectId || handoffPathsOverlap(sourcePath, realpathSync(session.cwd)))))
+      throw new TeamError(409, "project-busy", "Another native session may still be using this project. Release it before handing off work.");
+  });
+  const assertNoHandoff = (projectId: string) => {
+    if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
+  };
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
   // Native records written before executionLocation existed carry only the hybrid workspace.
@@ -132,7 +159,11 @@ export function createApp(config: Config, key: Buffer) {
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
-    const native = (await manager.list()).map(session => ({ ...session, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id, resumable: resumable(session) }));
+    const native = (await manager.list()).map(session => {
+      const handoff = handoffs.view(session.id);
+      return { ...session, handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
+        resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
+    });
     // Provider conversation IDs survive restarts and can exist in several
     // recordings. Only a currently verified worker PID identifies this runtime.
     const known = new Set(native.filter(s => s.status === "running" && s.nativeSession && s.pid)
@@ -145,8 +176,9 @@ export function createApp(config: Config, key: Buffer) {
    * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
    * tools run elsewhere, and an exited session never counts. A session list that cannot be read counts as running.
    */
-  const projectRunning = async (projectId: string) => {
-    if (startsInFlight.has(projectId) || teams.activeForProject(projectId) || goals.activeForProject(projectId)) return true;
+  const projectRunning = async (projectId: string, ignoreConfigChange = false) => {
+    if (!ignoreConfigChange && projectConfigChanges.has(projectId)) return true;
+    if (startsInFlight.has(projectId) || handoffs.activeForProject(projectId) || teams.activeForProject(projectId) || goals.activeForProject(projectId)) return true;
     let sessions: Awaited<ReturnType<typeof listSessions>>;
     try { sessions = await listSessions(); } catch { return true; }
     return sessions.some(s => s.projectId === projectId && s.executionLocation !== "laptop" &&
@@ -300,7 +332,7 @@ export function createApp(config: Config, key: Buffer) {
         (p) => p !== "demo" || config.enableDemo,
       ),
       providerLimits: teams.limits.active(),
-      teams: { enabled: Boolean(config.teams), maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, sessionHandoff: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
       projects: config.projects.map(({ id, name, path, team, linear }) => ({ id, name, path, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
@@ -321,6 +353,7 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
     const body = createGoalSchema.parse(req.body);
+    assertNoHandoff(body.projectId);
     return res.json(await startInProject(body.projectId, () => goals.create(body)));
   });
   app.post("/api/goals/:id/steer", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.steer(id.parse(req.params.id), goalSteerSchema.parse(req.body))));
@@ -330,6 +363,7 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
   app.post("/api/teams", requireRole(["owner"]), async (req, res) => {
     const body = createTeamSchema.parse(req.body);
+    assertNoHandoff(body.projectId);
     return res.json(await startInProject(body.projectId, () => teams.create(body)));
   });
   const standaloneTeam = (value: unknown) => {
@@ -352,6 +386,20 @@ export function createApp(config: Config, key: Buffer) {
     if (!mirroredProjects) return void res.status(403).json({ error: "Folder mirroring requires a single-tenant host" });
     const { path } = z.object({ path: z.string().max(4096) }).strict().parse(req.body);
     res.json(mirroredProjects.resolve(path));
+  });
+  app.get("/api/projects/:id/team", requireRole(["owner"]), requireOwnerCli, (req, res) => {
+    res.json(enrollment.get(projectSchema.parse(req.params.id)));
+  });
+  app.put("/api/projects/:id/team", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    const body = repoEnrollmentRequestSchema.parse(req.body);
+    if (runtimeSecurity(config.deployment).tenancy !== "single-tenant")
+      throw new TeamError(403, "single-tenant-required", "Repository enrollment requires a single-tenant host.");
+    if (projectConfigChanges.has(projectId) || projectFileChanges.has(projectId))
+      throw new TeamError(409, "project-busy", "Repository setup or files are being updated. Retry after the operation finishes.");
+    projectConfigChanges.add(projectId);
+    try { res.json(await enrollment.put(projectId, body)); }
+    finally { projectConfigChanges.delete(projectId); }
   });
   app.get("/api/projects/:id/files", async (req, res) => {
     res.json(await desktopFiles.list(projectSchema.parse(req.params.id), z.string().max(4096).default("").parse(req.query.path),
@@ -424,6 +472,7 @@ export function createApp(config: Config, key: Buffer) {
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) return void res.status(400).json({ code: "invalid-create", error: "Invalid session details", details: parsed.error.issues.map(issue => ({ path: issue.path.join("."), message: issue.message })) });
     const request = parsed.data;
+    assertNoHandoff(request.projectId);
     if (request.workspace && (!res.locals.bearer || runtimeSecurity(config.deployment).tenancy !== "single-tenant"))
       return void res.status(403).json({ error: "Laptop execution requires an owner device key and a single-tenant host" });
     if (request.backend === "cmux") {
@@ -493,8 +542,11 @@ export function createApp(config: Config, key: Buffer) {
       ...manager.meta(sessionId).session,
       ...(await manager.state(sessionId, true)),
     };
-    res.json({ ...session, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id, resumable: resumable(session) });
+    const handoff = handoffs.view(sessionId);
+    res.json({ ...session, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
+      resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) });
   });
+  app.get("/api/sessions/:id/handoff", (req, res) => res.json(handoffs.view(id.parse(req.params.id))));
   app.get("/api/sessions/:id/messages", async (req, res) => {
     const sessionId = id.parse(req.params.id);
     const session = manager.meta(sessionId).session;
@@ -873,13 +925,15 @@ export function createApp(config: Config, key: Buffer) {
   server.once("listening", () => teams.start());
   server.once("listening", () => usage.start());
   server.once("listening", () => goals.start());
+  server.once("listening", () => handoffs.start());
   server.once("close", () => teams.close());
   server.once("close", () => usage.close());
   server.once("close", () => goals.close());
   server.once("close", () => linear.close());
+  server.once("close", () => handoffs.close());
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { goals.close(); teams.close(); usage.close(); linear.close(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); };
+  const closeConnections = () => { handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); };
   return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

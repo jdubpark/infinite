@@ -44,6 +44,14 @@ async function git(cwd: string, args: string[], prefix?: TeamCommand, timeoutMs 
 }
 function lines(value: string) { return value.split("\0").filter(Boolean); }
 export function teamWorkspacePath(root: string, runId: string) { return join(root, runId, "integration"); }
+/** A source handoff must preserve every tracked and untracked edit and pin the actual root. */
+export async function cleanTeamCheckpoint(source: string, expectedHead: string, prefix?: TeamCommand) {
+  const canonical = realpathSync(source);
+  const top = await git(canonical, ["rev-parse", "--show-toplevel"], prefix);
+  if (realpathSync(top) !== canonical) throw new TeamError(409, "project-not-git-root", "Handoff requires the configured Git repository root.");
+  await assertMemberReadOnly(canonical, expectedHead, prefix);
+  return expectedHead;
+}
 export async function prepareTeamWorkspace(source: string, root: string, runId: string, prefix?: TeamCommand, signal?: AbortSignal, expectedHead?: string) {
   let canonical: string, top: string;
   try { canonical = realpathSync(source); top = await git(canonical, ["rev-parse", "--show-toplevel"], prefix, 30000, signal); }

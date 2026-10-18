@@ -20,6 +20,7 @@ export function draftTerminal(store: ReturnType<typeof localDraftStore>) {
   const redraw = () => process.stdout.write("\x1b[?1049l\x1b[0m\x1b[2J\x1b[H" + serializer.serialize({ scrollback: 0 }));
   return {
     get active() { return Boolean(draft); },
+    get hasUnsentDraft() { return Boolean(text()); },
     async output(text: string) {
       await new Promise<void>(resolve => terminal.write(text, resolve));
       if (!draft && !process.stdout.write(text)) await new Promise<void>(resolve => process.stdout.once("drain", resolve));

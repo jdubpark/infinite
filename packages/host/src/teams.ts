@@ -12,7 +12,7 @@ import { teamPrompt } from "./team-prompts.js";
 import { teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
 import type { LinearService } from "./linear.js";
-import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureMemberResult, ensureHostDirectory, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
+import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 export { TeamError } from "./team-workspace.js";
 
@@ -78,7 +78,9 @@ export class TeamService {
   private assertRunPath(stored: Stored, path: string, create = false) {
     const root = stored.root ?? this.config.teams?.workspaceDir;
     if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
-    const canonical = stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, create) : root;
+    if (!stored.anchor && root !== this.config.teams?.workspaceDir)
+      throw new TeamError(409, "team-root-unsafe", "A team root outside the configured workspace directory requires a trusted anchor.");
+    const canonical = stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, create) : ensureDefaultTeamRoot(root, create);
     assertTeamPath(canonical, path);
   }
   private view(stored: Stored): TeamView {
@@ -105,16 +107,17 @@ export class TeamService {
   async bundle(id: string) {
     const stored = this.record(id), run = stored.run;
     if (run.status !== "ready-for-review") throw new TeamError(409, "team-not-ready", "This team is not ready to pull.");
-    if (!run.headCommit) throw new TeamError(409, "team-no-result", "This team has no recorded result to pull.");
-    this.assertRunPath(stored, run.workspace);
-    try {
-      const head = await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["rev-parse", "--verify", `refs/heads/${run.branch}`]) }, run.workspace, undefined, 30000, this.config.teams?.commandPrefix);
-      if (head.exitCode !== 0 || head.interrupted || head.truncated || head.stdout.trim() !== run.headCommit)
-        throw new Error("branch moved");
-    } catch {
+    const { revision, headCommit, branch, workspace } = run;
+    if (!headCommit) throw new TeamError(409, "team-no-result", "This team has no recorded result to pull.");
+    this.assertRunPath(stored, workspace);
+    const head = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["rev-parse", "--verify", `refs/heads/${branch}`]) }, workspace, undefined, 30000, this.config.teams?.commandPrefix).catch(() => {
       throw new TeamError(409, "team-branch-changed", "The team's integration branch no longer matches its recorded result.");
-    }
-    return { workspace: run.workspace, branch: run.branch, head: run.headCommit };
+    });
+    if (run.status !== "ready-for-review" || run.revision !== revision || run.headCommit !== headCommit)
+      throw new TeamError(409, "team-not-ready", "This team changed while its result was being prepared. Refresh team status and retry.");
+    if (head.exitCode !== 0 || head.interrupted || head.truncated || head.stdout.trim() !== headCommit)
+      throw new TeamError(409, "team-branch-changed", "The team's integration branch no longer matches its recorded result.");
+    return { workspace, branch, head: headCommit };
   }
   activeForProject(projectId: string) {
     return [...this.records.values()].some(({ run }) => run.projectId === projectId && !["cancelled", "ready-for-review", "no-change"].includes(run.status));
@@ -192,7 +195,7 @@ export class TeamService {
       if (anchor) {
         assertTeamworkPath(this.config, root);
         ensureHostDirectory(anchor, root, 0o750);
-      }
+      } else ensureDefaultTeamRoot(root, true);
       const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, root, ...(anchor ? { anchor } : {}), source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
       this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
       this.operation(stored, "prepare", async signal => this.startInProject(run.projectId, async () => {
@@ -201,10 +204,8 @@ export class TeamService {
             throw new TeamError(409, "parent-workspace-changed", "The previous goal run changed while its continuation was being prepared.");
         };
         assertParent();
-        if (project.teamworkDir) {
-          assertTeamworkPath(this.config, root);
-          this.assertRunPath(stored, teamWorkspacePath(root, directoryName), true);
-        }
+        if (project.teamworkDir) assertTeamworkPath(this.config, root);
+        this.assertRunPath(stored, teamWorkspacePath(root, directoryName), true);
         const workspace = await prepareTeamWorkspace(source.path, root, directoryName, branch, this.config.teams?.commandPrefix, signal, source.head, anchor);
         assertParent();
         if (project.team?.setup) {

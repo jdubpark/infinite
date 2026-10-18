@@ -121,9 +121,9 @@ test("team pull refuses a lifecycle run before review", { timeout: 60000 }, asyn
   writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
   const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
   try {
+    // Readiness is checked before the repository binding, so no enrollment is needed;
+    // enrolling would also replace the fixture's held check.
     await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
-    const checks = JSON.stringify([{ command: process.execPath, args: ["check.mjs"] }]);
-    await exec(entry[0], [...entry.slice(1), "repo", "init", "--project", "rehearsal", "--check-json", checks], { cwd: checkout });
     const created = await run.host.fetchApi("/teams", "owner", run.create());
     assert.ok([200, 201].includes(created.status));
     await waitFor(() => run.host.fetchApi(`/teams/${created.body.id}`), response => response.body.status === "verifying" && response.body.checks.some((check: { status: string }) => check.status === "running"), 30000);

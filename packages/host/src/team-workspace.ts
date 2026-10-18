@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
-import { join, resolve, relative, isAbsolute } from "node:path";
+import { dirname, join, resolve, relative, isAbsolute } from "node:path";
 import type { TeamCommand, TeamTaskPlan } from "./team-types.js";
 
 export class TeamError extends Error {
@@ -62,6 +62,25 @@ const hostOwned = (stat: ReturnType<typeof lstatSync>) => {
   return typeof process.getuid !== "function" || stat.uid === process.getuid() || stat.uid === 0;
 };
 const unsafeTeamRoot = () => new TeamError(409, "team-root-unsafe", "Team roots must contain only host-owned real directories that are not writable by group or others.");
+function ensureHostDirectoryComponent(path: string, mode: number, create: boolean) {
+  if (mode & 0o022) throw unsafeTeamRoot();
+  let info, created = false;
+  try { info = lstatSync(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) throw unsafeTeamRoot();
+    try { mkdirSync(path, { mode }); created = true; } catch (mkdirError) { if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError; }
+    try { info = lstatSync(path); } catch { throw unsafeTeamRoot(); }
+  }
+  if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info) || (info.mode & 0o022) !== 0) throw unsafeTeamRoot();
+  if (created) chmodDirectoryNoFollow(path, (mode & 0o777) | (info.mode & 0o2000));
+}
+/** The configured default root is protected just like an anchored teamwork root. */
+export function ensureDefaultTeamRoot(root: string, create = false) {
+  // The parent belongs to the operator, as before; only the root itself must be protected.
+  if (create) mkdirSync(dirname(root), { recursive: true, mode: 0o750 });
+  ensureHostDirectoryComponent(root, 0o750, create);
+  return realpathSync(root);
+}
 /** Create/check each component below a trusted anchor without traversing an unsafe parent. */
 export function ensureHostDirectory(anchor: string, target: string, mode: number, create = true) {
   const base = realpathSync(anchor), destination = resolve(target), rel = relative(base, destination);
@@ -69,14 +88,7 @@ export function ensureHostDirectory(anchor: string, target: string, mode: number
   let current = base;
   for (const part of rel.split(/[\\/]/)) {
     current = join(current, part);
-    let info;
-    try { info = lstatSync(current); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) throw unsafeTeamRoot();
-      try { mkdirSync(current, { mode }); } catch (mkdirError) { if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError; }
-      try { info = lstatSync(current); } catch { throw unsafeTeamRoot(); }
-    }
-    if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info) || (info.mode & 0o022) !== 0) throw unsafeTeamRoot();
+    ensureHostDirectoryComponent(current, mode, create);
   }
   return realpathSync(destination);
 }
@@ -109,7 +121,7 @@ export async function prepareTeamWorkspace(source: string, root: string, directo
   if (expectedHead !== undefined && baseCommit !== expectedHead)
     throw new TeamError(409, "parent-workspace-changed", "The previous goal run no longer matches its recorded integration commit. Its workspace must be reconciled before continuing.");
   if (anchor) ensureHostDirectory(anchor, root, 0o750);
-  else mkdirSync(root, { recursive: true, mode: 0o770 });
+  else ensureDefaultTeamRoot(root, true);
   const canonicalRoot = realpathSync(root);
   const directory = join(canonicalRoot, directoryName);
   if (existsSync(directory)) throw new TeamError(409, "workspace-exists", "This team workspace already exists and needs explicit reconciliation.");

@@ -481,9 +481,14 @@ Existing runs keep the folder and branch they were created with.
 
 The host owns every directory component from the sync home through the teamwork
 root. Each component below the sync home must be a real directory, owned by the
-host account or root, and not writable by group or others. Teamwork roots use
-mode `0750`; run and member directories are changed through no-follow directory
-descriptors before the agent identity receives access.
+host account or root, and not writable by group or others. Host-created teamwork
+and default workspace roots use mode `0750`, preserving inherited setgid. Run
+directories sit directly in these protected roots; run and member directories
+use mode `2770`, set through no-follow directory descriptors before the agent
+identity receives access. The default root is checked during preparation and
+whenever a run path is used, including for legacy records. Unsafe legacy roots
+leave their records preserved but prevent preparation, launch, and bundling.
+Stored roots outside `teams.workspaceDir` require a trusted teamwork anchor.
 
 Enable teams in the private host configuration and define the project's
 verification commands. Commands use executable/argument arrays, without an
@@ -514,8 +519,10 @@ dependencies each isolated copy needs. The source checkout remains unchanged.
 The run shows its branch, base, integrated commit and workspace for inspection.
 
 If the API and provider use different Unix identities, provision the workspace
-root with the intended shared group, setgid/default ACL inheritance and private
-permissions. Configure `teams.commandPrefix` so **all** Git, setup and check
+root owned by the API account with the intended shared group and setgid/default
+ACL inheritance. The root itself must not be group- or other-writable (for
+example, mode `2750`); existing deployments with a group-writable root must
+remove group write before teams can run. Configure `teams.commandPrefix` so **all** Git, setup and check
 commands execute as the provider's unprivileged identity. For example, a
 root-owned, constrained launcher can run commands under that account. The prefix
 is an executable/argument array like the other commands. Do not run

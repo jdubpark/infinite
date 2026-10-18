@@ -571,6 +571,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       let heads = "";
       try { heads = execFileSync("git", ["-C", root, "bundle", "list-heads", bundlePath, ref], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"], env: isolatedGitEnv({ LC_ALL: "C" }) }); }
       catch { throw new Error("The team result changed while it was being prepared. Refresh team status and retry."); }
+      // Refuse a branch that moved after the host's preflight, before fetching it locally.
       if (heads.trim().split(/\r?\n/).length !== 1 || heads.trim() !== `${teamHead} ${ref}`)
         throw new Error("The team result changed while it was being prepared. Refresh team status and retry.");
       try {

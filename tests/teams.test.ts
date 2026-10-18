@@ -14,25 +14,55 @@ import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team
 import { git, limitLineup, mixedLineup, fixture } from "./team-fixture.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 
-test("team runs use readable date, title slug, and ID names in default and teamwork roots", { timeout: 120000 }, async () => {
-  const f = await fixture("success");
+test("team runs use readable names and exact root permissions under a strict umask", { timeout: 120000 }, async () => {
+  const previousUmask = process.umask(0o077);
+  let f: Awaited<ReturnType<typeof fixture>> | undefined;
   try {
+    // The API subprocess inherits this umask, including after enrollment restarts it.
+    f = await fixture("success");
     const firstRequest = f.create();
     const firstCreated = await f.host.fetchApi("/teams", "owner", firstRequest);
     const first = await f.settled(firstCreated.body.id);
+    assert.equal(first.status, "ready-for-review", JSON.stringify(first));
     const firstName = `${first.createdAt.slice(0, 10)}-implement-a-small-feature-${first.id.slice(0, 8)}`;
-    assert.equal(first.workspace, join(f.host.config.teams!.workspaceDir, `rehearsal-${firstName}`, "integration"));
+    assert.equal(realpathSync(first.workspace), realpathSync(join(f.host.config.teams!.workspaceDir, `rehearsal-${firstName}`, "integration")));
     assert.equal(first.branch, `infinite/implement-a-small-feature-${first.id.slice(0, 8)}`);
+    assert.equal(statSync(f.host.config.teams!.workspaceDir).mode & 0o777, 0o750);
 
-    const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true });
+    const teamworkRoot = await f.enrollTeamwork({ sharedGroup: true }, "Projects/teamwork");
     const secondRequest = f.create();
     const secondCreated = await f.host.fetchApi("/teams", "owner", secondRequest);
     const second = await f.settled(secondCreated.body.id);
+    assert.equal(second.status, "ready-for-review", JSON.stringify(second));
     const secondName = `${second.createdAt.slice(0, 10)}-implement-a-small-feature-${second.id.slice(0, 8)}`;
-    assert.equal(second.workspace, join(teamworkRoot, secondName, "integration"));
+    assert.equal(realpathSync(second.workspace), realpathSync(join(teamworkRoot, secondName, "integration")));
     assert.equal(second.branch, `infinite/implement-a-small-feature-${second.id.slice(0, 8)}`);
-    assert.equal(statSync(teamworkRoot).mode & 0o022, 0, "a host-created teamwork root is not group- or other-writable");
-  } finally { await f.close(); }
+    assert.equal(statSync(teamworkRoot).mode & 0o777, 0o750);
+    assert.equal(statSync(dirname(teamworkRoot)).mode & 0o777, 0o750);
+  } finally { process.umask(previousUmask); await f?.close(); }
+});
+
+test("default runs refuse a group-writable root until its permissions are repaired", { timeout: 120000 }, async () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-team-root-"));
+  const workspaceDir = join(root, "teams");
+  mkdirSync(workspaceDir, { mode: 0o770 });
+  chmodSync(workspaceDir, 0o770);
+  let f: Awaited<ReturnType<typeof fixture>> | undefined;
+  try {
+    f = await fixture("success", undefined, { teams: { workspaceDir,
+      commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", root] },
+    } });
+    const refused = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.deepEqual([refused.status, refused.body.code], [409, "team-root-unsafe"]);
+    assert.deepEqual(readdirSync(workspaceDir), []);
+    assert.equal(statSync(workspaceDir).mode & 0o777, 0o770, "the host must not repair an existing unsafe root");
+
+    chmodSync(workspaceDir, 0o750);
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+  } finally { try { await f?.close(); } finally { rmSync(root, { recursive: true, force: true }); } }
 });
 
 test("teamwork preparation refuses a group-writable root parent", { timeout: 120000 }, async () => {

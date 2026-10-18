@@ -561,6 +561,7 @@ function serialize<T>(task: () => T | Promise<T>): Promise<T> {
 
 const CONTROL_TTL_MS = 30_000;
 let controller: { actorId: string; lease: ControlLease } | null = null;
+let controlChangeGeneration = 0;
 function currentControl(): ControlLease | null {
   if (controller && controller.lease.expiresAt <= Date.now()) {
     controller = null;
@@ -594,11 +595,14 @@ function changeControl(request: Extract<WorkerRequest, { op: "control" }>): Cont
         actorId: request.actor.id,
         lease: { id: randomUUID(), label: request.actor.label, expiresAt: Date.now() + CONTROL_TTL_MS },
       };
+      controlChangeGeneration++;
     } else controller!.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
   } else {
     if (!owns) throw new Refusal("control-lost");
-    if (request.action === "release") controller = null;
-    else controller!.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
+    if (request.action === "release") {
+      controller = null;
+      controlChangeGeneration++;
+    } else controller!.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
   }
   state = { ...state, control: controller?.lease ?? null };
   persist();
@@ -750,6 +754,7 @@ async function answer(
       throw new Refusal("prompt-changed");
     checkControl(teamRequest);
   } else checkControl(request);
+  const acceptedControlGeneration = controlChangeGeneration;
   const pty = child;
   if (state.status !== "running" || !pty)
     throw new Error("Session is not running");
@@ -838,7 +843,8 @@ async function answer(
   const beforeWrite = () => {
     if (teamRequest && invalidatedTeamPermissionDecisions.has(teamRequest.decisionId)) throw new Refusal("control-lost");
     if (teamRequest && Date.parse(teamRequest.expiresAt) <= Date.now()) throw new Refusal("prompt-changed");
-    checkControl(request);
+    if (teamRequest) checkControl(teamRequest);
+    else if (controlChangeGeneration !== acceptedControlGeneration) throw new Refusal("control-lost");
     if (state.status !== "running" || child !== pty) throw new Refusal("prompt-changed");
     if (teamRequest && (!session.team || session.team.runId !== teamRequest.assignment.runId ||
         session.team.memberId !== teamRequest.assignment.memberId || session.team.revision !== teamRequest.assignment.revision ||
@@ -1039,6 +1045,7 @@ const server = createServer((socket) => {
         invalidatedTeamPermissionDecisions.add(request.decisionId);
         if (controller?.actorId === `team-permission:${request.decisionId}`) {
           controller = null;
+          controlChangeGeneration++;
           state = { ...state, control: null };
           persist();
         }

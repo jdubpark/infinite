@@ -484,10 +484,11 @@ export function createApp(config: Config, key: Buffer) {
                   "input-intent",
                   "input-result",
                   "signal",
+                  "usage",
                 ]),
               )
               .min(1)
-              .max(5)
+              .max(6)
               .parse(req.query.types.split(",")),
           )
         : undefined;

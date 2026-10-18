@@ -53,24 +53,3 @@ export class JsonLineAssembler {
     return objects;
   }
 }
-
-/**
- * OpenCode can announce the same completed message more than once, with the final totals last.
- * This holds the newest record for the current message and releases it once a different message
- * completes or the run ends, so the journal gets one record per message.
- */
-export class LatestUsage {
-  private held: UsageRecord | undefined;
-
-  offer(record: UsageRecord): UsageRecord[] {
-    const released = this.held && this.held.messageId !== record.messageId ? [this.held] : [];
-    this.held = record;
-    return released;
-  }
-
-  drain(): UsageRecord[] {
-    const released = this.held ? [this.held] : [];
-    this.held = undefined;
-    return released;
-  }
-}

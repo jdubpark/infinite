@@ -570,7 +570,7 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
   }
 });
 
-test("OpenCode team members journal one usage record per message with its final tokens and cost", { timeout: 120000 }, async () => {
+test("OpenCode team members journal each completed message announcement, ending with the final tokens and cost", { timeout: 120000 }, async () => {
   const lineup = structuredClone(mixedLineup);
   lineup.implementers = [
     lineup.implementers[0],
@@ -590,17 +590,18 @@ test("OpenCode team members journal one usage record per message with its final 
       assert.ok(worker.argv.join(" ").includes("--format json"), "Headless OpenCode must be launched with JSON output");
       const usage: any[] = [];
       for (let after = 0, more = true; more;) {
-        const page = await f.host.fetchApi(`/sessions/${member.sessionId}/events?after=${after}&limit=200`);
+        const page = await f.host.fetchApi(`/sessions/${member.sessionId}/events?types=usage&after=${after}&limit=200`);
         assert.equal(page.status, 200);
         usage.push(...page.body.events.filter((event: any) => event.type === "usage"));
         ({ cursor: after, more } = page.body);
       }
-      assert.equal(usage.length, 1, "Streaming updates and repeated completions must not produce extra records");
-      assert.equal(usage[0].data.messageId, `msg_${member.taskId}`);
-      assert.equal(usage[0].data.reportedCost, 0.5);
-      assert.equal(usage[0].data.tokens.input, 1000);
-      assert.equal(usage[0].data.tokens.output, 500);
-      assert.equal(usage[0].data.modelId, member.modelProfile!.model.split("/")[1]);
+      assert.equal(usage.length, 2, "Every completed announcement is journaled; streaming updates are not");
+      const last = usage[usage.length - 1].data;
+      assert.equal(last.messageId, `msg_${member.taskId}`);
+      assert.equal(last.reportedCost, 0.5);
+      assert.equal(last.tokens.input, 1000);
+      assert.equal(last.tokens.output, 500);
+      assert.equal(last.modelId, member.modelProfile!.model.split("/")[1]);
     }
   } finally { await f.close(); }
 });

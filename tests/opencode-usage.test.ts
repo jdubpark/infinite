@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { JsonLineAssembler, LatestUsage, usageFromMessageUpdated } from "../packages/host/src/opencode-usage.js";
+import { JsonLineAssembler, usageFromMessageUpdated } from "../packages/host/src/opencode-usage.js";
 
 const completed = { type: "message.updated", properties: { info: { id: "msg_1", sessionID: "ses_1", role: "assistant", providerID: "deepseek", modelID: "deepseek-flash", cost: 0.0123,
   tokens: { input: 1200, output: 300, reasoning: 50, cache: { read: 100, write: 0 } }, time: { created: 1, completed: 2 } } } };
@@ -40,14 +40,4 @@ test("the assembler accepts CRLF endings and drops an oversize partial line", ()
   assert.deepEqual(assembler.push('{"a":1}\r\n'), [{ a: 1 }]);
   assert.deepEqual(assembler.push("x".repeat(1024 * 1024 + 1)), []);
   assert.deepEqual(assembler.push('tail\n{"b":2}\n'), [{ b: 2 }]);
-});
-
-test("a repeated completion of one message is released once, with its final values, when the next message or the end arrives", () => {
-  const record = (messageId: string, input: number) => usageFromMessageUpdated({ ...completed, properties: { info: { ...completed.properties.info, id: messageId, tokens: { input, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } } } })!;
-  const latest = new LatestUsage();
-  assert.deepEqual(latest.offer(record("m1", 400)), []);
-  assert.deepEqual(latest.offer(record("m1", 1000)), []);
-  assert.deepEqual(latest.offer(record("m2", 5)).map(r => [r.messageId, r.tokens.input]), [["m1", 1000]]);
-  assert.deepEqual(latest.drain().map(r => [r.messageId, r.tokens.input]), [["m2", 5]]);
-  assert.deepEqual(latest.drain(), []);
 });

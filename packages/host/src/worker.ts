@@ -39,7 +39,7 @@ import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
-import { JsonLineAssembler, LatestUsage, usageFromMessageUpdated } from "./opencode-usage.js";
+import { JsonLineAssembler, usageFromMessageUpdated } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
 import type {
   Bootstrap,
@@ -121,7 +121,6 @@ terminal.parser.registerOscHandler(9, (data) => {
 });
 let pending = "";
 const usageLines = provider === "opencode" && session.team ? new JsonLineAssembler() : undefined;
-const latestUsage = new LatestUsage();
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
 let snapshotQueue: (() => void)[] | undefined;
 let snapshotBytes = 0;
@@ -1092,7 +1091,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       try {
         if (usageLines) for (const event of usageLines.push(data)) {
           const usage = usageFromMessageUpdated(event);
-          if (usage) for (const done of latestUsage.offer(usage)) append("usage", { ...done });
+          if (usage) append("usage", { ...usage });
         }
         snapshots.observe(data);
         terminal.write(data);
@@ -1123,7 +1122,6 @@ server.listen(socketPath(runDir, session.id), async () => {
       hybrid?.close(); executor?.close();
       try {
         flush();
-        for (const done of latestUsage.drain()) append("usage", { ...done });
         controller = null;
         state = { ...state, status: "exited", exitCode, control: null };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));

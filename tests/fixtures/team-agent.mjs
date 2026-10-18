@@ -38,6 +38,9 @@ if (receipt.provider === "opencode") {
   if (args[0] !== "run" || boundary < 1 || boundary !== args.length - 2
     || args.slice(0, boundary).some(arg => ["--prompt", "--effort", "-c"].includes(arg)))
     throw new Error("OpenCode needs run mode with one positional prompt, not TUI or Codex arguments");
+  const format = args.indexOf("--format");
+  if (format < 1 || format >= boundary - 1 || args[format + 1] !== "json")
+    throw new Error("OpenCode team members must run with --format json so usage is reported");
   const model = args.indexOf("--model"), variant = args.indexOf("--variant");
   if (model < 1 || model >= boundary - 1 || !args[model + 1].includes("/"))
     throw new Error("OpenCode requires a provider/model selection");
@@ -114,7 +117,10 @@ async function main() {
       { id: "a", title: "Build the first file", instructions: "Write a.txt with the current revision", paths: ["a.txt"], dependsOn: [] },
       { id: "b", title: "Build the second file", instructions: "Write b.txt with the current revision", paths: ["b.txt"], dependsOn: [] },
     ];
-    if (scenario === "mixed") {
+    if (scenario === "usage") {
+      tasks[0].agentProfileId = "spark-high";
+      tasks[1].agentProfileId = "deepseek-high";
+    } else if (scenario === "mixed") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "astra-xhigh";
     } else if (scenario === "mixed-invalid") {
@@ -141,6 +147,21 @@ async function main() {
     await new Promise(resolve => setTimeout(resolve, 150));
     const name = scenario === "scope-escape" && assignment.taskId === "a" ? " a.txt" : `${assignment.taskId}.txt`;
     writeFileSync(name, `revision ${assignment.revision}\n`);
+    if (scenario === "usage" && receipt.provider === "opencode") {
+      // The `opencode run --format json` stream: a streaming update, two completions of the
+      // same message (the second holds the final totals), and unrelated plain text.
+      const [providerID, modelID] = receipt.model.split("/");
+      const message = (tokens, cost, completed) => JSON.stringify({ type: "message.updated", properties: { info: {
+        id: `msg_${assignment.taskId}`, sessionID: "ses_fixture", role: "assistant", providerID, modelID, cost, tokens,
+        time: completed ? { created: 1, completed } : { created: 1 } } } });
+      const none = { read: 0, write: 0 };
+      process.stdout.write([
+        message({ input: 50, output: 10, reasoning: 0, cache: none }, 0.01),
+        message({ input: 400, output: 100, reasoning: 0, cache: none }, 0.1, 1_700_000_000_000),
+        message({ input: 1000, output: 500, reasoning: 0, cache: none }, 0.5, 1_700_000_001_000),
+        "Implementation notes follow.",
+      ].join("\n") + "\n");
+    }
     receipt.finishedAt = Date.now();
     writeFileSync(receiptFile, JSON.stringify(receipt), { mode: 0o600 });
     await report({ kind: "result", summary: `Implemented ${assignment.taskId}.txt` });

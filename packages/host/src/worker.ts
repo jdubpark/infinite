@@ -39,6 +39,7 @@ import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
+import { JsonLineAssembler, LatestUsage, usageFromMessageUpdated } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
 import type {
   Bootstrap,
@@ -119,6 +120,8 @@ terminal.parser.registerOscHandler(9, (data) => {
   return false; // let xterm keep its default handling
 });
 let pending = "";
+const usageLines = provider === "opencode" && session.team ? new JsonLineAssembler() : undefined;
+const latestUsage = new LatestUsage();
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
 let snapshotQueue: (() => void)[] | undefined;
 let snapshotBytes = 0;
@@ -1066,6 +1069,7 @@ server.listen(socketPath(runDir, session.id), async () => {
         },
         onExit: () => { child?.kill("SIGTERM"); },
         onSignal: signal => { record(signal, "protocol"); return attention.prompt?.id; },
+        onUsage: usage => { append("usage", { ...usage }); },
         record: method => { append("input-intent", { op: "native", method }); },
       });
       env.OPENCODE_SERVER_PASSWORD = native.observerToken;
@@ -1086,6 +1090,10 @@ server.listen(socketPath(runDir, session.id), async () => {
     const output = (data: string) => {
       pending += data;
       try {
+        if (usageLines) for (const event of usageLines.push(data)) {
+          const usage = usageFromMessageUpdated(event);
+          if (usage) for (const done of latestUsage.offer(usage)) append("usage", { ...done });
+        }
         snapshots.observe(data);
         terminal.write(data);
       } catch {
@@ -1115,6 +1123,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       hybrid?.close(); executor?.close();
       try {
         flush();
+        for (const done of latestUsage.drain()) append("usage", { ...done });
         controller = null;
         state = { ...state, status: "exited", exitCode, control: null };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));

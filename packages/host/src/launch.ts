@@ -50,7 +50,10 @@ export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile):
       throw new Error("OpenCode team profiles support only --agent, --pure, --print-logs, --log-level, --format, --title, --thinking, and explicitly configured --auto; remove positional arguments, alternate commands, and session or directory overrides.");
     }
     const wrapper = profile.args.slice(0, profile.args.length - providerArgs.length);
-    return { ...profile, args: [...wrapper, "run", ...providerArgs, "--model", selection.model,
+    return { ...profile, args: [...wrapper, "run", ...providerArgs,
+      // JSON events carry the per-message token and cost usage the worker records.
+      ...(providerArgs.some(arg => arg === "--format" || arg.startsWith("--format=")) ? [] : ["--format", "json"]),
+      "--model", selection.model,
       ...(selection.variant ? ["--variant", selection.variant] : []),
     ] };
   }

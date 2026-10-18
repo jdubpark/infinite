@@ -70,7 +70,7 @@ export interface Session {
 export interface Event {
   seq: number;
   at: string;
-  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report";
+  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "usage";
   data: Record<string, unknown>;
 }
 export interface Project {

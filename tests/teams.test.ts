@@ -569,3 +569,38 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     await f.close();
   }
 });
+
+test("OpenCode team members journal one usage record per message with its final tokens and cost", { timeout: 120000 }, async () => {
+  const lineup = structuredClone(mixedLineup);
+  lineup.implementers = [
+    lineup.implementers[0],
+    { id: "deepseek-high", label: "DeepSeek implementer", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light", dataUse: "contributor" },
+  ];
+  const f = await fixture("usage", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    const implementers = finished.members.filter(member => member.role === "implementer");
+    assert.equal(implementers.length, 2);
+    for (const member of implementers) {
+      const worker = JSON.parse(readFileSync(join(f.receipts, `${member.memberId}.json`), "utf8"));
+      assert.equal(worker.provider, "opencode");
+      assert.ok(worker.argv.join(" ").includes("--format json"), "Headless OpenCode must be launched with JSON output");
+      const usage: any[] = [];
+      for (let after = 0, more = true; more;) {
+        const page = await f.host.fetchApi(`/sessions/${member.sessionId}/events?after=${after}&limit=200`);
+        assert.equal(page.status, 200);
+        usage.push(...page.body.events.filter((event: any) => event.type === "usage"));
+        ({ cursor: after, more } = page.body);
+      }
+      assert.equal(usage.length, 1, "Streaming updates and repeated completions must not produce extra records");
+      assert.equal(usage[0].data.messageId, `msg_${member.taskId}`);
+      assert.equal(usage[0].data.reportedCost, 0.5);
+      assert.equal(usage[0].data.tokens.input, 1000);
+      assert.equal(usage[0].data.tokens.output, 500);
+      assert.equal(usage[0].data.modelId, member.modelProfile!.model.split("/")[1]);
+    }
+  } finally { await f.close(); }
+});

@@ -104,10 +104,10 @@ final class MissionBoardTests: XCTestCase {
            {"id":"d0","question":"Earlier?","options":[],"createdAt":"","answer":"Yes","answeredAt":"","answeredBy":"coordinator"}],
          "steering":[],"events":[{"at":"2026-10-18T00:00:00.000Z","text":"Dispatched 2 subtasks."}]}
         """))
-        XCTAssertEqual(mission.openDecisions.map { $0["id"].string }, ["d1"])
+        XCTAssertEqual(mission.openDecisions.map(\.id), ["d1"])
         XCTAssertEqual(mission.answeredDecisions.map { $0["id"].string }, ["d0"])
         XCTAssertEqual(mission.origin(of: mission.openDecisions[0])?.title, "Banner")
-        XCTAssertNil(mission.origin(of: mission.answeredDecisions[0]))
+        XCTAssertNil(mission.origin(of: MissionDecision(mission.answeredDecisions[0])))
         XCTAssertEqual(mission.progress.done, 1)
         XCTAssertEqual(mission.progress.total, 2)
         XCTAssertEqual(mission.subtasks.map(\.sizeLabel), ["Team · up to 3", "Solo"])
@@ -120,6 +120,39 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertTrue(mission.canPause)
         XCTAssertFalse(mission.canResume)
         XCTAssertTrue(mission.canCancel)
+    }
+
+    /// A card and its draft follow the decision's host ID. When polling drops an answered question,
+    /// the remaining one keeps its own ID instead of inheriting the first card's position.
+    func testOpenDecisionsKeepTheirIdentityWhenAnEarlierOneIsAnswered() {
+        func mission(revision: Int, answeredA: Bool) -> Mission {
+            var a: [String: JSON] = ["id": .string("a"), "question": .string("Items or products?"), "options": .array([])]
+            if answeredA { a["answer"] = .string("Items") }
+            let b: JSON = .object(["id": .string("b"), "question": .string("Show the limit in the cart?"), "options": .array([])])
+            return Mission(.object(["id": .string("m"), "revision": .number(Double(revision)), "decisions": .array([.object(a), b, .object(["question": .string("No ID")])])]))
+        }
+        let before = mission(revision: 3, answeredA: false).openDecisions
+        let after = mission(revision: 4, answeredA: true).openDecisions
+        XCTAssertEqual(before.map(\.id), ["a", "b"])
+        XCTAssertEqual(after.map(\.id), ["b"])
+        XCTAssertEqual(after.first?.question, "Show the limit in the cart?")
+        XCTAssertEqual(Set(before.map(\.id)).count, before.count)
+    }
+
+    /// An answer names the decision and the revision the owner saw, whatever the mission says by the time it is sent.
+    func testRequestsPinTheDecisionAndTheObservedRevision() {
+        let answer = MissionRequest.answer(missionID: "m1", decisionID: "b", revision: 3, text: "Yes", requestID: "r1")
+        XCTAssertEqual(answer.path, "/missions/m1/answer/b")
+        XCTAssertEqual(answer.body, .object(["requestId": .string("r1"), "revision": .number(3), "text": .string("Yes")]))
+        let pause = MissionRequest.action(missionID: "m1", name: "pause", revision: 7, requestID: "r2")
+        XCTAssertEqual(pause.path, "/missions/m1/pause")
+        XCTAssertEqual(pause.body, .object(["requestId": .string("r2"), "revision": .number(7)]))
+        XCTAssertEqual(MissionRequest.action(missionID: "m1", name: "steer", revision: 7, text: "Smaller", requestID: "r3").body["text"], .string("Smaller"))
+    }
+
+    func testReviewCopyLeavesDeliveryToEachRepositoryPolicy() {
+        XCTAssertFalse(BoardColumn.review.subtitle.contains("nothing merges"))
+        XCTAssertTrue(BoardColumn.review.subtitle.contains("each repository's policy"))
     }
 
     /// Each mission status lands in the column the board contract names, and controls follow it.

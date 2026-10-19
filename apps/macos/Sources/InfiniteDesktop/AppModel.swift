@@ -389,6 +389,10 @@ struct TeamResumeFailure: Equatable {
         do { try drafts.save(DraftRecord(), identity: "\(activeID):create"); pendingCreation = DraftRecord() }
         catch { message = error.localizedDescription }
     }
+    func end(_ id: String) async {
+        guard let model = model(for: id) else { return }
+        await model.end(); await refresh()
+    }
     func forget() async {
         guard let active else { return }
         pollTask?.cancel()

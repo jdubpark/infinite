@@ -42,22 +42,23 @@ import InfiniteCore
     func steer() async {
         let text = direction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        await mutate(path: "/missions/\(mission.id)/steer", label: "Direction", text: text)
+        await mutate("Direction") { .action(missionID: self.mission.id, name: "steer", revision: self.mission.revision, text: text, requestID: $0) }
     }
-    func answer(_ decision: JSON, text: String) async {
+    /// Answers exactly the decision the owner saw, at the revision shown with it. If polling has
+    /// moved the mission on since, the host refuses the stale revision instead of misapplying it.
+    func answer(decisionID: String, revision: Int, text: String) async {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        await mutate(path: "/missions/\(mission.id)/answer/\(decision["id"].string)", label: "Answer", text: text)
+        guard !text.isEmpty, !decisionID.isEmpty else { return }
+        await mutate("Answer") { .answer(missionID: self.mission.id, decisionID: decisionID, revision: revision, text: text, requestID: $0) }
     }
     func perform(_ action: String) async {
-        await mutate(path: "/missions/\(mission.id)/\(action)", label: action == "cancel" ? "Cancellation" : action.capitalizedFirst)
+        await mutate(action == "cancel" ? "Cancellation" : action.capitalizedFirst) { .action(missionID: self.mission.id, name: action, revision: self.mission.revision, requestID: $0) }
     }
-    private func mutate(path: String, label: String, text: String? = nil) async {
+    private func mutate(_ label: String, _ request: (String) -> MissionRequest) async {
         guard !busy, pending == nil else { return }
         let requestID = UUID().uuidString.lowercased()
-        var fields: [String: JSON] = ["requestId": .string(requestID), "revision": .number(Double(mission.revision))]
-        if let text { fields["text"] = .string(text) }
-        await send(TeamMutation(requestID: requestID, path: path, body: .object(fields), label: label))
+        let built = request(requestID)
+        await send(TeamMutation(requestID: requestID, path: built.path, body: built.body, label: label))
     }
     func retry() async { guard let pending else { return }; await send(pending) }
     /// Only after the person has checked the mission: the host may already have applied the request.

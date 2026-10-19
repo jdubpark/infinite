@@ -154,10 +154,12 @@ struct TeamDetailView: View {
         let open = team.openDecisions
         if !open.isEmpty {
             section("Decisions for you", count: open.count) {
-                ForEach(Array(open.enumerated()), id: \.offset) { _, decision in
+                // Keyed by decision ID so a typed draft never moves to another question after a poll.
+                ForEach(open, id: \.["id"].string) { decision in
                     let asker = team.member(decision["memberId"].string).map { TeamRun.roleName($0["role"].string) } ?? "Team"
                     DecisionCard(decision: decision, caption: "\(asker) · revision \(decision["revision"].int) · \(teamDate(decision["createdAt"].string))",
                                  disabled: !model.canSteer || team.status == "paused") { text in Task { await model.answer(decision, text: text) } }
+                        .id(decision["id"].string)
                 }
             }
         }

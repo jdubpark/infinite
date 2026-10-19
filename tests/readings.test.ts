@@ -6,11 +6,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Attention } from "@infinite/attention";
 import type { Config, Provider, Session } from "../packages/host/src/types.js";
-import { Readings, candidateSentences, clipTitle, messageHash, type JevTransport, type ReadingRow } from "../packages/host/src/readings.js";
+import { Readings, candidateSentences, clipTitle, isWeakRuleLine, messageHash, type JevTransport, type ReadingRow } from "../packages/host/src/readings.js";
 import { Summarizer } from "../packages/host/src/summary.js";
 
 const longLine = "Investigate the database read path and compare its consistency guarantees across the worker, API, and phone clients before changing any behavior.";
-const longMessage = `Updated the session list to keep cached rows responsive while background readings are generated. ${"The rule-based attention state remains unchanged and the cached fallback still appears immediately. ".repeat(2)}I need you to choose whether to ship this behavior next.`;
+const longMessage = `## Summary\nUpdated the session list to keep cached rows responsive while background readings are generated. ${"The rule-based attention state remains unchanged and the cached fallback still appears immediately. ".repeat(2)}I need you to choose whether to ship this behavior next.`;
 const now = (lastMessage: string): Attention => ({ state: "turn-finished", since: new Date().toISOString(), source: "hook", now: "Done.", lastMessage, lastActivityAt: new Date().toISOString(), hooks: "active", hookErrors: 0, sawTurnEnd: true });
 
 function setup(options: { title?: string; prompt?: string; provider?: Provider; generatedTitle?: true; transport?: JevTransport; writer?: Pick<Summarizer, "titleFromPrompt">; lastMessage?: string } = {}) {
@@ -60,7 +60,8 @@ test("turn reading picks an agent sentence verbatim and applies the noul thresho
   const fake = responding({ best: "candidate1", waiting: 0.6 });
   const f = setup({ transport: fake.transport });
   try {
-    await f.readings.tick();
+    const immediate = f.readings.merge([f.row]);
+    assert.equal(immediate[0].attention.now, "Done.");
     await eventually(() => Boolean(f.readings.merge([f.row])[0].reading?.now));
     const reading = f.readings.merge([f.row])[0].reading!;
     assert.equal(reading.now?.text, candidateSentences(longMessage)[1]);
@@ -69,6 +70,8 @@ test("turn reading picks an agent sentence verbatim and applies the noul thresho
     assert.equal(reading.waitingOnYou, true);
     assert.equal(fake.calls.length, 1);
     assert.equal(fake.calls[0].questions.waiting.type, "noul");
+    assert.deepEqual(fake.calls[0].questions.best.criteria, Object.fromEntries(candidateSentences(longMessage).map((sentence, index) => [`candidate${index}`, sentence])));
+    assert.deepEqual(fake.calls[0].state, { lastSentence: candidateSentences(longMessage).at(-1) });
     await f.readings.tick();
     assert.equal(fake.calls.length, 1, "the populated hash is a cache hit on the next poll");
   } finally { f.dispose(); }
@@ -107,7 +110,7 @@ test("long generated titles ask Jev only with a writer and pass only the clipped
   const f = setup({ lastMessage: "Short.", title: "", generatedTitle: true, prompt, transport: fake.transport, writer });
   try {
     await f.readings.tick();
-    await eventually(() => Boolean(f.readings.merge([f.row])[0].reading?.title));
+    await eventually(() => f.readings.merge([f.row])[0].reading?.title?.source === "jev-first-line");
     assert.equal(fake.calls.length, 1);
     assert.equal(writerCalls, 0);
     const title = f.readings.merge([f.row])[0].reading?.title;
@@ -129,13 +132,23 @@ test("no writer means a long default title uses a word-boundary clip without a J
   } finally { f.dispose(); }
 });
 
-test("without Jev configuration the host makes no Jev calls", async () => {
+test("without Jev configuration start and tick do no polling, while merge derives titles locally", async () => {
   const fake = responding({});
-  const f = setup({ transport: fake.transport });
+  const f = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: fake.transport });
   try {
     const disabled = new Readings({ ...f.config, jev: undefined }, f.key, f.manager, undefined, fake.transport);
-    await disabled.tick();
-    await new Promise(resolve => setTimeout(resolve, 20));
+    let listCalls = 0;
+    f.manager.list = async () => { listCalls++; return [f.row]; };
+    const originalSetInterval = globalThis.setInterval;
+    let intervalCalls = 0;
+    globalThis.setInterval = ((...args: Parameters<typeof setInterval>) => { intervalCalls++; return originalSetInterval(...args); }) as typeof setInterval;
+    try { disabled.start(); await disabled.tick(); }
+    finally { globalThis.setInterval = originalSetInterval; disabled.stop(); }
+    const reading = disabled.merge([f.row])[0].reading;
+    assert.equal(reading?.title?.text, clipTitle(longLine));
+    assert.equal(reading?.title?.source, "first-line");
+    assert.equal(intervalCalls, 0, "the no-Jev service starts no polling timer");
+    assert.equal(listCalls, 0, "the no-Jev service never lists sessions in the background");
     assert.equal(fake.calls.length, 0);
   } finally { f.dispose(); }
 });
@@ -191,4 +204,23 @@ test("candidate and title clipping helpers remove Markdown framing and preserve 
   assert.equal(candidateSentences(many).length, 12);
   assert.equal(candidateSentences(many).at(-1), "Sentence 15.");
   assert.ok(clipTitle(`${"1234567890 ".repeat(6)}end`).length <= 60);
+});
+
+test("weak rule-line gate admits weak presentation and rejects clear rule-based prose", () => {
+  const clear = `Updated the retry handler to preserve the worker state after a transient connection loss. ${"The session now reconnects without replaying accepted input. ".repeat(3)}The list keeps serving the same recorded attention state.`;
+  const heading = `## Summary\n${clear}`;
+  const list = `- Updated the retry handler to preserve the worker state after a transient connection loss. ${"The session now reconnects without replaying accepted input. ".repeat(3)}`;
+  const table = `Component | Result\n${clear}`;
+  const code = `\`\`\`text\n${clear}`;
+  const clipped = `${"Updated the retry handler to preserve the worker state after a transient connection loss and keep accepted input stable ".repeat(2)}Additional detail follows.`;
+  assert.ok(clear.length > 200);
+  assert.equal(isWeakRuleLine(clear), false, "a clear substantive sentence should keep the zero-call path");
+  assert.equal(isWeakRuleLine(heading), true, "a heading-first response has a weak rule line");
+  assert.equal(isWeakRuleLine(list), true, "a list-first response has a weak rule line");
+  assert.equal(isWeakRuleLine(table), true, "a table-first response has a weak rule line");
+  assert.equal(isWeakRuleLine(code), true, "a code-fence-first response has a weak rule line");
+  assert.equal(isWeakRuleLine(`Done.\n${clear}`), true, "a filler opening has a weak rule line");
+  assert.equal(isWeakRuleLine(`Progress:\n${clear}`), true, "a colon-ended lead-in has a weak rule line");
+  assert.equal(isWeakRuleLine(`Changes made.\n${clear}`), true, "a filler summary lead-in has a weak rule line");
+  assert.equal(isWeakRuleLine(clipped), true, "a first sentence longer than the display cap has a weak rule line");
 });

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Questions, RequestOptions, SystemOneRequest, SystemOneResult, TypeSafeClient } from "@typesafe-ai/sdk";
+import { firstSentence } from "@infinite/attention";
 import type { Attention, Provider } from "@infinite/attention";
 import type { Summarizer } from "./summary.js";
 import type { Manager } from "./manager.js";
@@ -24,6 +25,7 @@ const CACHE_LIMIT = 500;
 const FAILURE_TTL = 10 * 60_000;
 const NOW_TTL = 4_000;
 const MAX_CANDIDATES = 12;
+const FILLER_LINE = /^(?:done|all set|summary|changes made|i['’]ve made the following changes|here['’]s what\b.*)$/i;
 
 export function messageHash(text: string) { return createHash("sha256").update(text).digest("hex"); }
 
@@ -59,6 +61,16 @@ function defaultTitle(title: string, provider: Provider, generatedTitle?: boolea
 function keyOf(id: string, type: Key, hash: string) { return `${id}:${type}:${hash}`; }
 function firstLine(prompt: string) { return prompt.split(/\r?\n/, 1)[0]?.trim() ?? ""; }
 
+/** True only when the rule-based turn line is likely to be unhelpful on the phone. */
+export function isWeakRuleLine(message: string): boolean {
+  const firstRawLine = message.split(/\r?\n/).find(line => line.trim() !== "")?.trim() ?? "";
+  const rawRuleLine = firstSentence(message) || "Finished a turn";
+  const displayLine = rawRuleLine.length > 140 ? `${rawRuleLine.slice(0, 139)}…` : rawRuleLine;
+  const filler = displayLine.replace(/[.!?…]+$/g, "").trim();
+  const structured = /^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|```|~~~)/.test(firstRawLine) || firstRawLine.includes("|");
+  return structured || rawRuleLine.length > 140 || displayLine.length < 25 || displayLine.endsWith(":") || FILLER_LINE.test(filler);
+}
+
 /**
  * Optional, asynchronous phone readings. The cache is the only path used by list
  * requests; model work is queued in the background and never awaited by merge().
@@ -87,6 +99,7 @@ export class Readings {
     this.restore();
   }
   start() {
+    if (!this.config.jev) return;
     void this.tick();
     this.timer = setInterval(() => void this.tick(), 2000);
     this.timer.unref();
@@ -95,7 +108,7 @@ export class Readings {
 
   /** Synchronous cache merge; stale message hashes and owner titles are omitted. */
   merge<T extends ReadingRow>(rows: T[]): T[] {
-    return rows.map(row => {
+    const merged = rows.map(row => {
       const reading: SessionReading = {};
       const message = row.attention.lastMessage ?? "";
       if (row.attention.state === "turn-finished" && message) {
@@ -110,40 +123,46 @@ export class Readings {
         const session = this.manager.meta(row.id).session;
         const prompt = session.initialPrompt;
         if (row.backend !== "cmux" && defaultTitle(session.title, session.provider, session.generatedTitle) && prompt !== undefined) {
-          const entry = this.get(keyOf(row.id, "title", messageHash(prompt)));
-          if (entry?.value?.title) reading.title = entry.value.title;
+          const line = firstLine(prompt);
+          if (line) {
+            const titleKey = keyOf(row.id, "title", messageHash(prompt));
+            const fallback = { text: line.length <= 60 ? line : clipTitle(line), source: "first-line" as const };
+            const entry = this.get(titleKey);
+            reading.title = entry?.value?.title ?? fallback;
+            if (this.config.jev && this.writer && line.length > 60) {
+              this.enqueue(titleKey, () => this.readTitle(row, prompt, line));
+            }
+          }
         }
       } catch { /* Native cmux rows have no Infinite metadata. */ }
+      if (this.config.jev) this.queueTurnReading(row);
       return Object.keys(reading).length ? { ...row, reading } : row;
     });
+    if (this.config.jev) this.drain();
+    return merged;
   }
 
   /** Captures session inputs and queues gated work. Repeated polls deduplicate pending calls. */
   async tick() {
+    if (!this.config.jev) return;
     let rows: ReadingRow[];
     try { rows = await this.manager.list({ includeFullMessage: true }) as ReadingRow[]; } catch { return; }
     for (const row of rows) {
-      const text = row.attention.lastMessage ?? "";
-      if (row.attention.state === "turn-finished" && text.length > 200 && candidateSentences(text).length >= 2 && this.config.jev) {
-        this.enqueue(keyOf(row.id, "now", messageHash(text)), () => this.readNow(row, text));
-      }
+      this.queueTurnReading(row);
       let session: Session;
       try { session = this.manager.meta(row.id).session; } catch { continue; }
       const prompt = session.initialPrompt ?? "";
       if (!defaultTitle(session.title, session.provider, session.generatedTitle) || !prompt) continue;
       const line = firstLine(prompt);
-      if (!line) continue;
-      const hash = messageHash(prompt);
-      const key = keyOf(row.id, "title", hash);
-      if (line.length <= 60) {
-        if (!this.get(key)) this.put({ key, value: { title: { text: line, source: "first-line" } } });
-      } else if (!this.config.jev || !this.writer) {
-        if (!this.get(key)) this.put({ key, value: { title: { text: clipTitle(line), source: "first-line" } } });
-      } else {
-        this.enqueue(key, () => this.readTitle(row, prompt, line));
-      }
+      if (line.length > 60 && this.writer) this.enqueue(keyOf(row.id, "title", messageHash(prompt)), () => this.readTitle(row, prompt, line));
     }
     this.drain();
+  }
+
+  private queueTurnReading(row: ReadingRow) {
+    const text = row.attention.lastMessage ?? "";
+    if (row.attention.state !== "turn-finished" || text.length <= 200 || candidateSentences(text).length < 2 || !isWeakRuleLine(text)) return;
+    this.enqueue(keyOf(row.id, "now", messageHash(text)), () => this.readNow(row, text));
   }
 
   private enqueue(key: string, work: () => Promise<void>) {
@@ -169,12 +188,12 @@ export class Readings {
     const candidates = candidateSentences(message);
     if (candidates.length < 2) return;
     const { choice, noul } = await this.sdk();
-    const keys = Object.fromEntries(candidates.map((_, index) => [`candidate${index}`, null]));
+    const options = Object.fromEntries(candidates.map((sentence, index) => [`candidate${index}`, sentence]));
     const result = await this.ask({
-      state: { candidates },
+      state: { lastSentence: candidates.at(-1)! },
       questions: {
-        best: choice("Choose the candidate that best tells the owner in one line what the agent did or needs from them. Use `candidates`; choose only a supplied candidate.", keys),
-        waiting: noul("Does the last sentence in `candidates` ask the owner to answer a question or make a decision before the agent continues?", { true: "The agent is waiting for an answer or decision.", false: "The agent can continue without an owner response." }),
+        best: choice("Choose the option that best tells the owner in one line what the agent did or needs from them. Each option description is the exact candidate sentence; choose only a supplied option.", options),
+        waiting: noul("Does `lastSentence` ask the owner to answer a question or make a decision before the agent continues?", { true: "The agent is waiting for an answer or decision.", false: "The agent can continue without an owner response." }),
       },
     });
     const best = result.answers.best;

@@ -167,7 +167,7 @@ export function createApp(config: Config, key: Buffer) {
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
-    const native = (await manager.list({ includeFullMessage: true })).map(session => {
+    const native = (await manager.list({ includeFullMessage: Boolean(config.jev) })).map(session => {
       const handoff = handoffs.view(session.id);
       return { ...session, handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
         resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };

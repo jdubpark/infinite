@@ -252,6 +252,51 @@ test("legacy tracking baselines survive restart while changed requirements still
   }
 });
 
+test("team objectives with bare URLs sync on create and lost-response reconciliation", { timeout: 45000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-url-"));
+  const config = { stateDir: join(root, "state"), linear: { apiKeyFile: join(root, "linear-key"), endpoint: linear.endpoint },
+    projects: [{ id: "url", name: "URL", path: root, linear: { teamId: linear.teamId } }] } as unknown as Config;
+  writeFileSync(config.linear!.apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const service = new LinearService(config, randomBytes(32));
+  const run = (objective: string) => ({ id: randomUUID(), projectId: "url", title: "Review example", objective, status: "implementing",
+    revision: 1, members: [], checks: [], steering: [], decisions: [] } as unknown as TeamRun);
+  try {
+    service.start();
+    const direct = run("Review https://example.com/example\n- First requirement\n  - Nested requirement\n");
+    service.updateTeam(direct, true);
+    const directStatus = await waitFor(async () => service.getTeam(direct.id)?.status, status => status === "synced" || status === "blocked", 15000);
+    assert.equal(directStatus, "synced");
+    const directIssueId = service.getTeam(direct.id)!.issue!.id;
+    const directIssue = linear.issues.get(directIssueId)!;
+    assert.match(directIssue.description, /\[https:\/\/example\.com\/example\]\(<https:\/\/example\.com\/example>\)/);
+    assert.match(directIssue.description, /\* First requirement\n  \* Nested requirement$/);
+    assert.ok(!directIssue.description.endsWith("\n"), "Linear drops the trailing newline on create");
+
+    linear.editIssue(directIssueId, { description: `${directIssue.description}\nChanged approved scope` });
+    service.updateTeam({ ...direct, members: [{ memberId: "refresh", status: "queued" }] } as unknown as TeamRun, true);
+    const editedStatus = await waitFor(async () => service.getTeam(direct.id)?.status,
+      status => status === "synced" || status === "blocked", 15000);
+    assert.equal(editedStatus, "blocked");
+    assert.match(service.getTeam(direct.id)!.reason!, /requirements or parent changed/);
+
+    linear.dropNextResponse("InfiniteLinearIssueCreate");
+    const recovered = run("Review https://example.com/example/recovered\n- Recovered requirement\n");
+    service.updateTeam(recovered, true);
+    await waitFor(async () => linear.lostResponses.length, count => count === 1, 15000);
+    linear.restore();
+    const recoveredStatus = await waitFor(async () => service.getTeam(recovered.id)?.status,
+      status => status === "synced" || status === "blocked", 20000);
+    assert.equal(recoveredStatus, "synced");
+    assert.equal(linear.lostResponses[0].id, service.getTeam(recovered.id)!.issue!.id);
+    const recoveredIssue = linear.issues.get(service.getTeam(recovered.id)!.issue!.id)!;
+    assert.match(recoveredIssue.description, /\[https:\/\/example\.com\/example\/recovered\]\(<https:\/\/example\.com\/example\/recovered>\)/);
+    assert.match(recoveredIssue.description, /\* Recovered requirement$/);
+    assert.ok(!recoveredIssue.description.endsWith("\n"), "Linear drops the trailing newline on recovered create");
+    assert.deepEqual(linear.violations, []);
+  } finally { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test("a blocked run's issue gets its reason, next step and a Blocked label until the run moves again", { timeout: 60000 }, async () => {
   const linear = await startLinearServer();
   const root = mkdtempSync(join(tmpdir(), "inf-linear-flag-"));

@@ -31,8 +31,10 @@ import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
 import { GoalService } from "./goals.js";
+import { ProjectGroupService } from "./project-groups.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
+import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
@@ -135,6 +137,7 @@ export function createApp(config: Config, key: Buffer) {
   // TeamService ticks on every host and drives the ledger from its own session listing.
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
+  const projectGroups = new ProjectGroupService(config, key);
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
   const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
@@ -359,6 +362,10 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
+  app.get("/api/project-groups", requireRole(["owner", "controller", "viewer"]), (_req, res) => res.json(projectGroups.list()));
+  app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(projectGroups.create(createProjectGroupSchema.parse(req.body))));
+  app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
+  app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body))));
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
     const body = createGoalSchema.parse(req.body);
     assertNoHandoff(body.projectId);

@@ -1,22 +1,43 @@
 import * as SecureStore from "expo-secure-store";
 import * as Crypto from "expo-crypto";
+import { useSyncExternalStore } from "react";
 import { connectionKey, type Connection } from "../api/client";
 
 /** Unchanged from the single-file app so existing pairings survive. */
 export const SECRET_KEY = "infinite.connection.v1";
 const PROFILES_KEY = "infinite.machines.v2";
 type SavedConnections = { active: string; profiles: Connection[] };
+const EMPTY: SavedConnections = { active: "", profiles: [] };
+let snapshot: SavedConnections | undefined;
+let loading: Promise<SavedConnections> | undefined;
+const listeners = new Set<() => void>();
+
+function publish(saved: SavedConnections) {
+  snapshot = saved;
+  listeners.forEach(listener => listener());
+}
+
+export function useConnections() {
+  return useSyncExternalStore(
+    listener => { listeners.add(listener); return () => listeners.delete(listener); },
+    () => snapshot ?? EMPTY,
+  );
+}
 
 export async function loadConnections(): Promise<SavedConnections> {
-  const value = await SecureStore.getItemAsync(PROFILES_KEY);
-  if (value) return JSON.parse(value) as SavedConnections;
-  const legacy = await SecureStore.getItemAsync(SECRET_KEY);
-  if (!legacy) return { active: "", profiles: [] };
-  const connection = { ...(JSON.parse(legacy) as Connection), id: Crypto.randomUUID() };
-  const saved = { active: connection.id, profiles: [connection] };
-  await persist(saved);
-  await SecureStore.deleteItemAsync(SECRET_KEY);
-  return saved;
+  if (snapshot) return snapshot;
+  loading ??= (async () => {
+    const value = await SecureStore.getItemAsync(PROFILES_KEY);
+    if (value) return JSON.parse(value) as SavedConnections;
+    const legacy = await SecureStore.getItemAsync(SECRET_KEY);
+    if (!legacy) return EMPTY;
+    const connection = { ...(JSON.parse(legacy) as Connection), id: Crypto.randomUUID() };
+    const saved = { active: connection.id, profiles: [connection] };
+    await persist(saved);
+    await SecureStore.deleteItemAsync(SECRET_KEY);
+    return saved;
+  })().then(saved => { publish(saved); return saved; }).finally(() => { loading = undefined; });
+  return loading;
 }
 
 async function persist(saved: SavedConnections) {
@@ -27,7 +48,12 @@ async function persist(saved: SavedConnections) {
 
 let writes: Promise<void> = Promise.resolve();
 function update(change: (saved: SavedConnections) => SavedConnections) {
-  const next = writes.then(async () => persist(change(await loadConnections())));
+  const next = writes.then(async () => {
+    await loadConnections();
+    const saved = change(snapshot ?? EMPTY);
+    publish(saved);
+    await persist(saved);
+  });
   writes = next.catch(() => {});
   return next;
 }
@@ -50,11 +76,24 @@ export async function selectConnection(id: string) {
   });
 }
 
-export async function clearConnection(id?: string) {
-  await update(saved => {
-    const profiles = saved.profiles.filter(profile => connectionKey(profile) !== (id ?? saved.active));
+export function clearConnection(id?: string) {
+  const target = id ?? snapshot?.active;
+  const remove = (saved: SavedConnections, key: string) => {
+    const profiles = saved.profiles.filter(profile => connectionKey(profile) !== key);
     return { active: profiles.some(profile => connectionKey(profile) === saved.active) ? saved.active : profiles[0] ? connectionKey(profiles[0]) : "", profiles };
+  };
+  // Publish removal before persistence so every mounted tab stops using the machine at once.
+  if (snapshot && target) publish(remove(snapshot, target));
+  const next = writes.then(async () => {
+    await loadConnections();
+    if (!snapshot) return;
+    const key = target ?? snapshot.active;
+    const saved = key && snapshot.profiles.some(profile => connectionKey(profile) === key) ? remove(snapshot, key) : snapshot;
+    publish(saved);
+    await persist(saved);
   });
+  writes = next.catch(() => {});
+  return next;
 }
 
 const CLIENT_KEY = "infinite.client.v1";

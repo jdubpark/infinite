@@ -3,17 +3,21 @@ import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 
 type Row = { id: string; title: string; provider: Provider; attention: Attention };
+type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean };
 const PUSH_STATES = new Set(["needs-you", "turn-finished", "exited", "recording-error"]);
 
 export class Notifier {
   private seen = new Map<string, string>();
+  private teamStatus = new Map<string, string>();
   private primed = false;
+  private teamsPrimed = false;
   private timer?: ReturnType<typeof setInterval>;
   constructor(
     private readonly manager: Pick<Manager, "list">,
     private readonly store: PushStore,
     private readonly sender: PushSender,
     private readonly options: { detail: "minimal" | "full"; events: string[]; intervalMs: number; machineId?: string },
+    private readonly teams?: { statuses(): TeamRow[] },
   ) {}
   start() { this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
   stop() { clearInterval(this.timer); }
@@ -28,10 +32,14 @@ export class Notifier {
       if (PUSH_STATES.has(row.attention.state) && this.options.events.includes(row.attention.state)) due.push(row);
     }
     this.primed = true;
-    if (!due.length) return;
+    const blocked = await this.blockedTeams();
+    if (!due.length && !blocked.length) return;
     const devices = this.store.list();
     if (!devices.length) return;
-    const messages = due.flatMap((row) => devices.map((d) => this.message(row, d.token)));
+    const messages = [
+      ...due.flatMap((row) => devices.map((d) => this.message(row, d.token))),
+      ...blocked.flatMap((team) => devices.map((d) => this.teamMessage(team, d.token))),
+    ];
     let tickets: Awaited<ReturnType<PushSender>>;
     try {
       tickets = await this.sender(messages);
@@ -46,6 +54,28 @@ export class Notifier {
       else failures.add(ticket.details?.error ?? ticket.message ?? "error");
     });
     if (failures.size) console.warn(`push: ${[...failures].join(", ")}`);
+  }
+  /** A run that waits for the owner is flagged once, when it becomes blocked. Runs already blocked at startup are not. */
+  private async blockedTeams() {
+    if (!this.teams) return [];
+    let teams: TeamRow[];
+    try { teams = this.teams.statuses(); } catch { return []; }
+    const due = teams.filter((team) => {
+      const previous = this.teamStatus.get(team.id);
+      this.teamStatus.set(team.id, team.status);
+      return this.teamsPrimed && team.status === "blocked" && previous !== "blocked" && this.options.events.includes("team-blocked");
+    });
+    this.teamsPrimed = true;
+    return due;
+  }
+  private teamMessage(team: TeamRow, to: string) {
+    const next = team.resumable ? " It can resume." : "";
+    return {
+      to, title: "Team blocked",
+      body: this.options.detail === "full" && team.reason ? `${team.title}: ${team.reason}${next}` : `${team.title} is blocked and waiting for you.${next}`,
+      data: { url: `/team/${team.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+      priority: "high" as const, collapseId: `team:${team.id}`,
+    };
   }
   private message(row: Row, to: string) {
     const name = PROVIDER_NAMES[row.provider] ?? row.provider;

@@ -302,7 +302,7 @@ else if (command === "plan-fleet") {
     const fd = openSync(lock, "wx", 0o600);
     writeFileSync(fd, String(process.pid));
     closeSync(fd);
-    const { sessions, pushStore, server, closeConnections } = createApp(config, key);
+    const { sessions, teams, pushStore, server, closeConnections } = createApp(config, key);
     server.listen(config.port, "127.0.0.1", () =>
       console.log(
         `Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`,
@@ -322,6 +322,7 @@ else if (command === "plan-fleet") {
           intervalMs: 2000,
           machineId: config.machine?.id,
         },
+        teams,
       ).start();
       console.log(`Push notifications: enabled (${config.push.detail} bodies)`);
     }

@@ -160,7 +160,7 @@ export class TeamService {
     const { members, ...run } = structuredClone(stored.run);
     // Queue evidence from this exact state before a goal can use its sync gate
     // to continue from a newly reviewed or no-change result.
-    const tracking = this.linear?.updateTeam(stored.run, stored.run.linearTracking === true);
+    const tracking = this.linear?.updateTeam(stored.run, stored.run.linearTracking === true, this.canResume(stored));
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
     const safeRun = {
       ...run,
@@ -176,6 +176,8 @@ export class TeamService {
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+  /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
+  statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) })); }
   get(id: string): TeamView { return this.view(this.record(id)); }
   async bundle(id: string) {
     const stored = this.record(id), run = stored.run;

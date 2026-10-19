@@ -98,3 +98,43 @@ test("a short ticket array becomes per-message errors and prunes nothing", async
   server.close();
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("a team run is flagged once when it becomes blocked, never for a run already blocked at startup", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "ios");
+  const sent: { title: string; body: string; data: { url: string; machineId?: string }; collapseId: string; priority: string }[][] = [];
+  const sender = async (messages: never[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const teams = [
+    { id: "t-old", title: "Old run", status: "blocked", reason: "Stopped earlier.", resumable: true },
+    { id: "t-new", title: "Smart alarm", status: "implementing", reason: undefined as string | undefined, resumable: false },
+  ];
+  const source = { statuses: () => teams };
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["needs-you", "team-blocked"], intervalMs: 100000, machineId: "m1" }, source);
+  await notifier.tick();                 // baseline: the run blocked before startup is not flagged
+  assert.equal(sent.length, 0);
+  teams[1].status = "blocked"; teams[1].reason = "An agent showed no activity twice on the same assignment."; teams[1].resumable = true;
+  await notifier.tick();
+  await notifier.tick();                 // still blocked: no second push
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0][0], { to: "ExponentPushToken[a]", title: "Team blocked", body: "Smart alarm is blocked and waiting for you. It can resume.",
+    data: { url: "/team/t-new", machineId: "m1" }, channelId: "attention", priority: "high", collapseId: "team:t-new" });
+  teams[1].status = "planning"; await notifier.tick();
+  teams[1].status = "blocked"; teams[1].resumable = false; await notifier.tick();
+  assert.equal(sent.length, 2, "A run that blocks again after resuming is flagged again");
+  assert.equal(sent[1][0].body, "Smart alarm is blocked and waiting for you.");
+  teams.push({ id: "t-fresh", title: "Fresh run", status: "blocked", reason: "The Linear issue changed.", resumable: false });
+  await notifier.tick();
+  assert.equal(sent.length, 3, "A run created after startup is flagged even if it is first seen blocked");
+
+  const full = new Notifier({ list: async () => [] } as never, store, sender, { detail: "full", events: ["team-blocked"], intervalMs: 100000 }, source);
+  teams[1].status = "planning"; await full.tick();
+  teams[1].status = "blocked"; teams[1].resumable = true; await full.tick();
+  assert.equal(sent.at(-1)![0].body, "Smart alarm: An agent showed no activity twice on the same assignment. It can resume.");
+  const off = new Notifier({ list: async () => [] } as never, store, sender, { detail: "full", events: ["needs-you"], intervalMs: 100000 }, source);
+  teams[1].status = "planning"; await off.tick();
+  const before = sent.length;
+  teams[1].status = "blocked"; await off.tick();
+  assert.equal(sent.length, before, "Without the team-blocked event nothing is sent");
+  rmSync(dir, { recursive: true, force: true });
+});

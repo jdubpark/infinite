@@ -8,7 +8,9 @@ import { stopSessionWorkers, waitFor } from "./helpers.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, type ProjectGroupLookup } from "../packages/host/src/missions.js";
-import { createReportEnvelope } from "../packages/host/src/team-report-client.js";
+import { createMissionReportEnvelope } from "../packages/host/src/team-report-client.js";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import type { Config } from "../packages/host/src/types.js";
 import type { TeamLineup } from "../packages/host/src/team-types.js";
 import type { CreateMission, Mission } from "../packages/host/src/mission-types.js";
@@ -183,15 +185,30 @@ test("a mission refuses invalid dispatches, and pausing and cancelling reach its
   } finally { await h.close(); }
 });
 
-test("a mission coordinator's report helper binds the mission envelope and refuses team reports", () => {
+test("a mission coordinator reports through its own MCP tool and envelope, separate from team reports", { timeout: 20000 }, async () => {
   const missionId = randomUUID(), memberId = randomUUID();
   const env = { INFINITE_HOOK_URL: "http://127.0.0.1:9/hook", INFINITE_HOOK_TOKEN: "capability",
-    INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId: missionId, memberId, revision: 3, role: "mission-coordinator" }) };
-  const envelope = createReportEnvelope({ kind: "result", summary: "Every subtask finished" }, env);
+    INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId: missionId, memberId, revision: 3, role: "mission-coordinator" }),
+    INFINITE_MISSION_ASSIGNMENT: JSON.stringify({ missionId, memberId, revision: 3 }) };
+  const envelope = createMissionReportEnvelope({ kind: "result", summary: "Every subtask finished" }, env);
   assert.deepEqual({ ...envelope, requestId: undefined }, { requestId: undefined, missionId, memberId, revision: 3, report: { kind: "result", summary: "Every subtask finished" } });
-  assert.equal(createReportEnvelope({ kind: "result", summary: "Every subtask finished" }, env).requestId, envelope.requestId, "A retried report keeps its identity");
-  assert.throws(() => createReportEnvelope({ kind: "review", verdict: "approved", summary: "A team report" }, env));
-  assert.throws(() => createReportEnvelope({ ...envelope, missionId: randomUUID() }, env), /does not match/);
-  const team = createReportEnvelope({ kind: "result", summary: "Team work" }, { ...env, INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId: missionId, memberId, revision: 3, role: "implementer" }) });
-  assert.equal("runId" in team && team.runId, missionId, "Team members keep the team envelope");
+  assert.equal(createMissionReportEnvelope({ kind: "result", summary: "Every subtask finished" }, env).requestId, envelope.requestId, "A retried report keeps its identity");
+  assert.throws(() => createMissionReportEnvelope({ kind: "review", verdict: "approved", summary: "A team report" }, env));
+  assert.throws(() => createMissionReportEnvelope({ ...envelope, missionId: randomUUID() }, env), /does not match/);
+  assert.throws(() => createMissionReportEnvelope({ kind: "result", summary: "No assignment" }, { ...env, INFINITE_MISSION_ASSIGNMENT: "" }), /unavailable/);
+
+  const tools = async (extra: NodeJS.ProcessEnv) => {
+    const child = spawn(process.execPath, ["--import", "tsx", resolve("packages/host/src/team-mcp.ts")], { stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, ...env, ...extra } });
+    const lines = createInterface({ input: child.stdout });
+    const replies: any[] = [];
+    lines.on("line", line => replies.push(JSON.parse(line)));
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1" } } }) + "\n");
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n");
+    await waitFor(async () => replies.length, count => count === 2);
+    child.kill("SIGKILL"); lines.close();
+    return replies[1].result.tools.map((tool: { name: string }) => tool.name);
+  };
+  assert.deepEqual(await tools({}), ["mission_report"]);
+  // Team members' launch config expands an unset mission assignment to an empty value.
+  assert.deepEqual(await tools({ INFINITE_MISSION_ASSIGNMENT: "", INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId: missionId, memberId, revision: 3, role: "implementer" }) }), ["report"]);
 });

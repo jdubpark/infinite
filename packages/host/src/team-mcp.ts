@@ -5,22 +5,21 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { teamReportSchema } from "./team-types.js";
+import { missionAssignment, reportErrorMessage, submitMissionReport, submitTeamReport } from "./team-report-client.js";
 import { missionReportSchema } from "./mission-types.js";
-import { missionReporter, reportErrorMessage, submitTeamReport } from "./team-report-client.js";
 
 const MAX_FRAME_BYTES = 256 * 1024;
 const PROTOCOL_VERSION = "2025-11-25";
 const COMPATIBLE_VERSIONS = new Set([PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"]);
-const mission = missionReporter();
-const argumentsSchema = mission ? z.object({ report: missionReportSchema }).strict() : z.object({ report: teamReportSchema }).strict();
+const argumentsSchema = z.object({ report: teamReportSchema }).strict();
 const tool = {
   name: "report",
-  description: mission
-    ? "Record this mission coordinator's structured report for this attempt. Wait for the durable success receipt, then stop work; the host starts a new attempt when the mission needs you again. A refusal requires user attention; never bypass it through a shell command or another tool."
-    : "Record this assigned team member's final structured report. Wait for the durable success receipt, then stop work. A refusal requires user attention; never bypass it through a shell command or another tool.",
+  description: "Record this assigned team member's final structured report. Wait for the durable success receipt, then stop work. A refusal requires user attention; never bypass it through a shell command or another tool.",
   inputSchema: z.toJSONSchema(argumentsSchema, { target: "draft-7" }),
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 };
+const missionArgumentsSchema = z.object({ report: missionReportSchema }).strict();
+const MISSION_INSTRUCTIONS = "Use the mission_report tool for this coordinator attempt only. Report once, wait for the durable receipt, then stop; the host starts a new attempt when the mission needs you. Never edit a repository, approve a permission, or bypass a refusal through a shell command.";
 type RequestId = string | number;
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const isId = (value: unknown): value is RequestId => typeof value === "string" ? value.length <= 200 : typeof value === "number" && Number.isSafeInteger(value);
@@ -28,9 +27,12 @@ const isId = (value: unknown): value is RequestId => typeof value === "string" ?
 /** A narrow newline-delimited MCP transport. Awaiting each frame also bounds stdin backpressure. */
 export async function runTeamMcp() {
   const handoff = Boolean(process.env.INFINITE_HANDOFF_SESSION);
+  const mission = !handoff && Boolean(missionAssignment());
   const selectedTool = handoff ? { name: "handoff", description: HANDOFF_INSTRUCTIONS,
     inputSchema: z.toJSONSchema(handoffRequestSchema, { target: "draft-7" }),
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } } : tool;
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } }
+    : mission ? { name: "mission_report", description: MISSION_INSTRUCTIONS, inputSchema: z.toJSONSchema(missionArgumentsSchema, { target: "draft-7" }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } } : tool;
   let initialized = false;
   const send = async (message: unknown) => {
     const frame = JSON.stringify(message) + "\n";
@@ -60,7 +62,7 @@ export async function runTeamMcp() {
         protocolVersion: COMPATIBLE_VERSIONS.has(params.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "infinite-team", version: "1.0.0" },
-        instructions: handoff ? HANDOFF_INSTRUCTIONS : "Use the report tool for the assigned member only. Permission decisions require owner authorization; a delegated coordinator may report only its assigned decision. Never approve your own request or bypass a denial. Stop on a denial; never attempt a shell workaround.",
+        instructions: handoff ? HANDOFF_INSTRUCTIONS : mission ? MISSION_INSTRUCTIONS : "Use the report tool for the assigned member only. Permission decisions require owner authorization; a delegated coordinator may report only its assigned decision. Never approve your own request or bypass a denial. Stop on a denial; never attempt a shell workaround.",
       });
       return;
     }
@@ -76,18 +78,24 @@ export async function runTeamMcp() {
     if (!isObject(params) || typeof params.name !== "string" || !isObject(params.arguments)) {
       await error(id, -32602, "A tool call requires a name and arguments object."); return;
     }
-    if (params.name !== selectedTool.name) { await error(id, -32602, "Unknown tool. Only report is available."); return; }
+    if (params.name !== selectedTool.name) { await error(id, -32602, `Unknown tool. Only ${selectedTool.name} is available.`); return; }
     try {
       if (handoff) {
         const envelope = await submitHandoff(params.arguments);
         await result(id, { content: [{ type: "text", text: "Handoff recorded. Stop work now; the host waits for client control to detach before transferring the clean checkpoint." }], structuredContent: { sessionId: envelope.sessionId }, isError: false });
         return;
       }
+      if (mission) {
+        const envelope = await submitMissionReport(missionArgumentsSchema.parse(params.arguments).report);
+        await result(id, { content: [{ type: "text", text: "Mission report recorded. Stop work on this attempt." }],
+          structuredContent: { requestId: envelope.requestId, missionId: envelope.missionId, memberId: envelope.memberId, revision: envelope.revision }, isError: false });
+        return;
+      }
       const input = argumentsSchema.parse(params.arguments);
       const envelope = await submitTeamReport(input.report);
       await result(id, {
         content: [{ type: "text", text: "Team report recorded. Stop work on this assignment." }],
-        structuredContent: { requestId: envelope.requestId, ...("missionId" in envelope ? { missionId: envelope.missionId } : { runId: envelope.runId }), memberId: envelope.memberId, revision: envelope.revision },
+        structuredContent: { requestId: envelope.requestId, runId: envelope.runId, memberId: envelope.memberId, revision: envelope.revision },
         isError: false,
       });
     } catch (failure) {

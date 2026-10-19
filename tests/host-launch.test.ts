@@ -100,6 +100,7 @@ test("Claude team launch exposes only its scoped report helper and preserves pro
       INFINITE_HOOK_URL: "${INFINITE_HOOK_URL}",
       INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}",
       INFINITE_TEAM_ASSIGNMENT: "${INFINITE_TEAM_ASSIGNMENT}",
+      INFINITE_MISSION_ASSIGNMENT: "${INFINITE_MISSION_ASSIGNMENT:-}",
     });
     assert.ok(!launch.args.some(arg => /allowedtools|permission-mode|skip-permissions|dangerously|autoallow/i.test(arg)), "Attaching the report tool must not grant provider permissions");
     assert.equal(launch.args.at(-1), "Implement this task");

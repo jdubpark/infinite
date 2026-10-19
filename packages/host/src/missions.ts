@@ -133,6 +133,8 @@ export class MissionService {
       if (!repos.some(repo => repo.teamReady)) throw new TeamError(409, "mission-project-not-configured", "Configure required checks, or authorize a team to establish them, in at least one repository of this project.");
       const lineup = structuredClone(this.config.teams!.lineup!), profile = this.config.agents[lineup.coordinator.provider];
       if (!profile) throw new TeamError(409, "provider-not-configured", "The coordinator provider must be configured and available on this host.");
+      // The mission report tool reaches Claude and Codex through the team MCP server.
+      if (!["claude", "codex"].includes(lineup.coordinator.provider)) throw new TeamError(409, "mission-coordinator-unsupported", "Missions need a Claude or Codex coordinator in the team lineup.");
       try { teamModelLaunch(profile, lineup.coordinator); }
       catch { throw new TeamError(409, "team-model-profile-conflict", "Move model, effort, and fallback-model arguments from provider profiles into the team lineup before starting a mission."); }
       const folder = this.missionFolder(request.requestId, repos);
@@ -416,7 +418,7 @@ export class MissionService {
   private readReport(stored: Stored, attempt: Attempt) {
     let page: ReturnType<Manager["events"]>;
     do {
-      page = this.manager.events(attempt.sessionId, attempt.cursor, 200, new Set(["team-report"]));
+      page = this.manager.events(attempt.sessionId, attempt.cursor, 200, new Set(["mission-report"]));
       attempt.cursor = page.cursor;
       for (const event of page.events) {
         const parsed = missionReportEnvelopeSchema.safeParse(event.data);

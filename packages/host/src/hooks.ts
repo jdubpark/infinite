@@ -1,8 +1,8 @@
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
-export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "team-handoff" | "transcript";
-const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "team-handoff", "transcript"]);
+export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "mission-report" | "team-handoff" | "transcript";
+const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "mission-report", "team-handoff", "transcript"]);
 const MAX_BODY = 256 * 1024;
 export class HookPayloadError extends Error {
   constructor(readonly status: number) { super("Hook payload was refused"); }

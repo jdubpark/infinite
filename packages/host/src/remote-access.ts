@@ -33,6 +33,13 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (["GET", "POST"].includes(method) && url.pathname === "/api/goals") return true;
   const goal = /^\/api\/goals\/([^/]+)(?:\/(steer|pause|resume|cancel|outcome))?$/.exec(url.pathname);
   if (goal && UUID.test(goal[1])) return method === "GET" ? !goal[2] : method === "POST" && Boolean(goal[2]);
+  if (method === "GET" && url.pathname === "/api/board") return true;
+  if (["GET", "POST"].includes(method) && url.pathname === "/api/project-groups") return true;
+  if (["PUT", "DELETE"].includes(method) && /^\/api\/project-groups\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
+  if (["GET", "POST"].includes(method) && url.pathname === "/api/missions") return true;
+  const mission = /^\/api\/missions\/([^/]+)(?:\/(steer|pause|resume|cancel|answer\/([^/]+)))?$/.exec(url.pathname);
+  if (mission && UUID.test(mission[1])) return method === "GET" ? !mission[2]
+    : method === "POST" && Boolean(mission[2]) && (!mission[3] || UUID.test(mission[3]));
   const team = /^\/api\/teams\/([^/]+)(?:\/(steer|pause|resume|cancel|decisions\/([^/]+)\/answer))?$/.exec(url.pathname);
   if (team && UUID.test(team[1])) return method === "GET" ? !team[2]
     : method === "POST" && Boolean(team[2]) && (!team[3] || UUID.test(team[3]));

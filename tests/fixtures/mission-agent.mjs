@@ -14,8 +14,9 @@ renameSync(receiptFile + ".tmp", receiptFile);
 process.stdin.resume();
 
 async function report(value) {
-  const binding = assignment.role === "mission-coordinator" ? { missionId: assignment.runId } : { runId: assignment.runId };
-  const response = await fetch(`${process.env.INFINITE_HOOK_URL}/team-report`, {
+  const mission = assignment.role === "mission-coordinator", binding = mission ? { missionId: assignment.runId } : { runId: assignment.runId };
+  if (mission && JSON.parse(process.env.INFINITE_MISSION_ASSIGNMENT).missionId !== assignment.runId) throw new Error("The coordinator lacks its mission assignment");
+  const response = await fetch(`${process.env.INFINITE_HOOK_URL}/${mission ? "mission-report" : "team-report"}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify({ requestId: randomUUID(), ...binding, memberId: assignment.memberId, revision: assignment.revision, report: value }),

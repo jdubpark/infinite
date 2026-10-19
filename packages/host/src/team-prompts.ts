@@ -116,6 +116,11 @@ export type MissionMessage =
   | { type: "refused"; kind: string; reason: string };
 export type MissionPromptRepo = { projectId: string; name: string; path: string; teamReady: boolean };
 
+/** Mission coordinators report only through the mission_report tool of the team MCP server. */
+function missionReportingInstructions(provider: Provider) {
+  const tool = provider === "claude" ? "mcp__infinite_team__mission_report" : "the mission_report tool of the infinite_team MCP server";
+  return `You MUST submit exactly one structured report for this attempt by calling ${tool} with {"report": <one report object from above>}. Wait for its durable success receipt. If that tool is unavailable or permission is denied, stop and request user attention. Never use a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this attempt.`;
+}
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max - 3)}...` : text;
 /**
  * Each coordinator attempt is one session that ends with one report, like a team member. The host
@@ -152,7 +157,7 @@ After the report, stop. The host starts a new attempt when a subteam opens a dec
     `Messages since your last attempt (JSON): ${JSON.stringify(recent)}`,
     `Escalate to the owner only what the objective and owner direction do not settle, such as product, scope, or risk decisions. A result means every subtask finished; it does not establish product impact or acceptance. Do not publish, merge, deploy, change repository remotes, or approve provider permissions; each subteam delivers only under its own repository's policy.`,
     `Write summaries and questions in plain English. Lead with concrete facts. Do not invent evidence or claim checks or outcomes you did not observe.`,
-    reportingInstructions(provider),
+    missionReportingInstructions(provider),
   ].filter(Boolean).join("\n\n");
   if (Buffer.byteLength(prompt) > 80 * 1024) throw new TeamError(409, "mission-prompt-too-large", "The mission state exceeds the coordinator prompt limit. Start a new mission with a consolidated objective.");
   return prompt;

@@ -19,7 +19,7 @@ struct CmuxWorkspaceView: View {
                     }.labelsHidden().frame(maxWidth: 220).disabled(model.connected || model.connecting || model.disconnecting || model.busy || model.selectedID != nil)
                 }
                 Spacer()
-                Label(model.connectionStatus, systemImage: model.connected ? "lock.shield" : "network").font(.caption).foregroundStyle(.secondary)
+                Label(model.connectionStatus, systemImage: model.connected ? "lock.shield" : "network").font(.caption).foregroundStyle(.secondary).lineLimit(1).frame(width: 205, alignment: .leading)
                 Button { showingConnection = true } label: { Image(systemName: "plus") }.help("Add a cmux server").disabled(model.connecting || model.disconnecting || model.busy)
                 if model.connected {
                     Button("Disconnect") { Task { do { try await model.disconnect() } catch { model.notice = error.localizedDescription } } }
@@ -28,13 +28,12 @@ struct CmuxWorkspaceView: View {
                 }
             }.padding(14)
             Divider()
-            if !model.notice.isEmpty {
-                HStack(alignment: .top) {
-                    Image(systemName: "info.circle")
-                    Text(model.notice).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                }.font(.caption).padding(10).background(Color.accentColor.opacity(0.06))
-            }
-            if !model.connected && !model.connecting {
+            HStack(alignment: .center) {
+                Image(systemName: model.catalogDisplayStale ? "wifi.exclamationmark" : "info.circle")
+                Text(model.catalogDisplayStale ? (model.catalogLoaded ? "Catalog is stale · last received data remains visible." : "Can't reach the server · the terminal catalog hasn't loaded.") : model.notice)
+                    .textSelection(.enabled).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+            }.font(.caption).padding(.horizontal, 10).frame(height: 44).background(Color.accentColor.opacity(0.06))
+            if !model.connected && !model.connecting && !model.hasConnected {
                 VStack(alignment: .leading, spacing: 16) {
                     Text("Your server’s real terminals").font(.title2.weight(.medium))
                     Text("Open Claude Code, Codex, or a shell inside a persistent cmux workspace. Server processes keep running after you disconnect.").foregroundStyle(.secondary).frame(maxWidth: 470)
@@ -107,7 +106,10 @@ struct CmuxWorkspaceView: View {
                 HStack {
                     Text(model.selected?.title ?? "Terminal").font(.headline).lineLimit(1)
                     Spacer()
-                    if !model.attached { Button("Reattach") { Task { await model.select(id) } }.disabled(model.busy || !model.connected) }
+                    Button { Task { await model.select(id) } } label: {
+                        Group { if model.attaching { ProgressView().controlSize(.small) } else { Text("Reattach") } }.frame(width: 68)
+                    }.opacity(!model.attached || model.attaching ? 1 : 0)
+                        .disabled(model.attached || model.attaching || model.busy || !model.connected)
                     Toggle("Enable input", isOn: Binding(get: { model.inputEnabled }, set: { model.setInputEnabled($0) })).toggleStyle(.checkbox).disabled(!model.attached || !model.connected || !model.snapshotReady)
                     Toggle("Direct keys", isOn: $model.directInput).toggleStyle(.checkbox).disabled(!model.inputEnabled)
                     Button { terminateID = id } label: { Image(systemName: "stop.circle") }.help("Terminate this server terminal").disabled(model.busy || !model.connected)
@@ -121,11 +123,11 @@ struct CmuxWorkspaceView: View {
                         .id(renderer).frame(width: area.size.width, height: area.size.height)
                 }.frame(minHeight: 100, maxHeight: .infinity).layoutPriority(-1).clipped()
                 Divider()
-                if model.draft.pendingID != nil {
+                if model.draft.pendingID != nil && !model.sending {
                     HStack {
                         Text("Pending send · no delivery receipt").font(.caption).foregroundStyle(.orange)
                         Spacer()
-                        Button("Clear after checking terminal") { model.clearPendingAfterReview() }.disabled(model.busy)
+                        Button("Clear after checking terminal") { model.clearPendingAfterReview() }.disabled(model.sending)
                     }.padding(.horizontal, 12).padding(.vertical, 8)
                 }
                 PromptEditor(text: Binding(get: { model.draft.text }, set: model.setDraft), enabled: model.canSend, submit: { Task { await model.send() } }).frame(height: 100)
@@ -135,7 +137,10 @@ struct CmuxWorkspaceView: View {
                     if model.draft.lastQueuedText != nil {
                         Button("Restore last queued") { model.restoreLastQueuedPrompt() }.font(.caption).disabled(!model.draft.text.isEmpty || model.draft.pendingID != nil || model.busy)
                     }
-                    Button("Send") { Task { await model.send() } }.buttonStyle(.borderedProminent).disabled(!model.canSend)
+                    Button { Task { await model.send() } } label: {
+                        Group { if model.sending { ProgressView().controlSize(.small) } else { Label("Send", systemImage: "arrow.up") } }
+                            .frame(width: 78)
+                    }.buttonStyle(.borderedProminent).disabled(!model.canSend)
                 }.padding(10)
             }
         } else {

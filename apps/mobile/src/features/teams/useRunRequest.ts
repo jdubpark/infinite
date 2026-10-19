@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as Crypto from "expo-crypto";
 import { api, ApiError, type Connection } from "../../api/client";
 import { runRequests, type RunRequest } from "../../store/requests";
@@ -18,10 +18,12 @@ export function useRunRequest<R extends { id: string; revision: number }>(connec
   const state = runRequests.use(key);
   const pending = state.pending;
   const [sending, setSending] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   // A send started before this screen remounted is still in flight; its result re-renders through the store.
   const busy = sending || Boolean(pending && inFlight.has(pending.requestId));
   const mounted = useRef(true);
   const latest = useRef(handlers);
+  const dismissMessage = useCallback(() => runRequests.clearMessage(key), [key]);
   useEffect(() => { latest.current = handlers; });
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   async function send(request: RunRequest) {
@@ -38,20 +40,22 @@ export function useRunRequest<R extends { id: string; revision: number }>(connec
       if (refused && mounted.current) latest.current.refused();
     } finally {
       inFlight.delete(request.requestId);
-      if (mounted.current) setSending(false);
+      if (mounted.current) { setRetrying(false); setSending(false); }
     }
   }
   return {
     pending,
     busy,
+    retrying,
     message: state.message,
     /** The last message reports a recorded result rather than a failure. */
     recorded: Boolean(state.result),
+    dismissMessage,
     send(path: string, label: string, revision: number, fields: Record<string, string> = {}) {
       if (busy || pending) return;
       void send(runRequests.begin(key, { requestId: Crypto.randomUUID(), revision, path, label, fields }));
     },
-    retry() { if (pending && !busy) void send(pending); },
+    retry() { if (pending && !busy) { setRetrying(true); void send(pending); } },
     /** Only after the person has checked the run: the host may already have applied the request. */
     discard() { if (!busy) runRequests.clear(key); },
   };

@@ -56,10 +56,9 @@ extension ISO8601DateFormatter {
     static let flexible: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
 }
 
-/// A list Resume that did not go through, shown beside its run until a later refresh or resume clears it.
+/// A list Resume that did not go through, shown beside its run until dismissed or another resume is attempted.
 struct TeamResumeFailure: Equatable {
     let message: String
-    let at: Date
 }
 
 @MainActor final class AppModel: ObservableObject {
@@ -74,6 +73,9 @@ struct TeamResumeFailure: Equatable {
     @Published private(set) var mounted: [String] = []
     @Published var connected = false
     @Published var connecting = false
+    @Published private(set) var sessionsDisplayStale = false
+    @Published private(set) var sessionsLoaded = false
+    @Published private(set) var connectionError = ""
     @Published var message = ""
     @Published var showingPair = false
     @Published var showingCreate = false
@@ -87,7 +89,9 @@ struct TeamResumeFailure: Equatable {
     @Published var showingCreateTeam = false
     @Published var pendingTeamCreation = DraftRecord()
     @Published private(set) var teamsFresh = false
-    /// List Resume: runs with a resume in flight, and the last failure per run until a later refresh succeeds.
+    @Published private(set) var teamsDisplayStale = false
+    @Published private(set) var teamsLoaded = false
+    /// List Resume: runs with a resume in flight, and the last failure per run until dismissed or retried.
     @Published private(set) var resumingTeams: Set<String> = []
     @Published private(set) var teamResumeFailures: [String: TeamResumeFailure] = [:]
     var teamModels: [String: TeamModel] = [:]
@@ -100,6 +104,8 @@ struct TeamResumeFailure: Equatable {
     var terminals: [String: SessionModel] = [:]
     private var pollTask: Task<Void, Never>?
     private var connectionGeneration = UUID()
+    private lazy var sessionFreshness = DisplayFreshness { [weak self] in self?.sessionsDisplayStale = $0 }
+    private lazy var teamFreshness = DisplayFreshness { [weak self] in self?.teamsDisplayStale = $0 }
     let drafts = DraftStore()
     var active: HostProfile? { profiles.first { $0.id == activeID } }
     var projects: [JSON] { me["projects"].array }
@@ -151,12 +157,15 @@ struct TeamResumeFailure: Equatable {
     func connect() async {
         if connecting && connectionProfileID == activeID { return }
         connectionProfileID = activeID
+        connectionError = ""
         let profile = active
         pollTask?.cancel(); connectionGeneration = UUID(); let generation = connectionGeneration
         let previousTerminals = Array(terminals.values); terminals.removeAll()
         let previousClient = client; client = nil
         connected = false; connecting = true; sessions = []; resources = .null; me = .null
         teams = []; selectedTeamID = nil; showingHome = true; teamModels.removeAll(); teamsFresh = false
+        sessionsLoaded = false; teamsLoaded = false
+        sessionFreshness.recovered(); teamFreshness.recovered()
         for terminal in previousTerminals { await terminal.detach() }
         await previousClient?.close()
         guard generation == connectionGeneration else { return }
@@ -170,6 +179,7 @@ struct TeamResumeFailure: Equatable {
             pendingCreation = try drafts.read("\(profile.id):create")
             pendingTeamCreation = try drafts.read("\(profile.id):create-team")
             connected = true; connecting = false; persistProfiles()
+            connectionError = ""
             pollTask = Task {
                 var count = 0
                 while !Task.isCancelled && generation == self.connectionGeneration {
@@ -177,7 +187,11 @@ struct TeamResumeFailure: Equatable {
                     count += 1; try? await Task.sleep(nanoseconds: 2_000_000_000)
                 }
             }
-        } catch { guard generation == connectionGeneration else { return }; connecting = false; message = error.localizedDescription }
+        } catch {
+            guard generation == connectionGeneration else { return }
+            connecting = false; message = error.localizedDescription; connectionError = error.localizedDescription
+            sessionFreshness.failed()
+        }
     }
     func refresh(includeResources: Bool = true) async {
         guard let client else { return }; let generation = connectionGeneration
@@ -191,7 +205,10 @@ struct TeamResumeFailure: Equatable {
             }
             // Every poll returns the whole list; only a real change may redraw the window.
             if next != sessions { sessions = next }
+            sessionsLoaded = true
             if !connected { connected = true }
+            sessionFreshness.recovered()
+            connectionError = ""
             if !message.isEmpty { message = "" }
             for session in sessions {
                 if let terminal = terminals[session.id] {
@@ -211,43 +228,46 @@ struct TeamResumeFailure: Equatable {
         } catch {
             guard generation == connectionGeneration else { return }
             connected = false; message = error.localizedDescription
+            sessionFreshness.failed()
             for terminal in terminals.values { terminal.connectionLost() }
         }
     }
     /// The team list is small and the whole list arrives each poll; only a real change redraws.
     private func refreshTeams(_ generation: UUID) async {
         guard let client else { return }
-        let started = Date()
         do {
             let response = try await client.request("/teams")
             guard generation == connectionGeneration else { return }
-            // A failure recorded while this refresh was in flight still stands; older ones are cleared.
-            teamResumeFailures = teamResumeFailures.filter { $0.value.at >= started }
             let next = TeamRun.blockedFirst(response["teams"].array.map(TeamRun.init).sorted {
                 if $0.needsYou != $1.needsYou { return $0.needsYou }
                 if $0.finished != $1.finished { return $1.finished }
                 return $0.createdAt > $1.createdAt
             })
             if next != teams { teams = next }
+            teamsLoaded = true
             for team in next { teamModels[team.id]?.observe(team) }
             if !teamsFresh { teamsFresh = true }
+            teamFreshness.recovered()
         } catch {
             guard generation == connectionGeneration else { return }
             if teamsFresh { teamsFresh = false }
+            teamFreshness.failed()
         }
     }
     /// Resume from the Home list: the same request as the team page, with its failure kept for the row.
     func resumeTeam(_ id: String) async {
         guard !resumingTeams.contains(id), let model = teamModel(for: id) else { return }
         guard !model.busy, model.pending == nil else {
-            teamResumeFailures[id] = TeamResumeFailure(message: "Another request for this team is unconfirmed or in progress. Open the team to check it.", at: Date())
+            teamResumeFailures[id] = TeamResumeFailure(message: "Another request for this team is unconfirmed or in progress. Open the team to check it.")
             return
         }
         resumingTeams.insert(id)
+        teamResumeFailures[id] = nil
         await model.perform("resume")
         resumingTeams.remove(id)
-        teamResumeFailures[id] = model.noticeIsError ? TeamResumeFailure(message: model.notice, at: Date()) : nil
+        teamResumeFailures[id] = model.noticeIsError ? TeamResumeFailure(message: model.notice) : nil
     }
+    func clearTeamResumeFailure(_ id: String) { teamResumeFailures[id] = nil }
     func teamModel(for id: String) -> TeamModel? {
         if let existing = teamModels[id] { return existing }
         guard let team = teams.first(where: { $0.id == id }), let client else { return nil }
@@ -331,6 +351,7 @@ struct TeamResumeFailure: Equatable {
     @Published var notice = ""
     @Published var attached = false
     @Published var busy = false
+    @Published private(set) var sending = false
     @Published var lease: JSON = .null
     @Published var directInput = false
     @Published var holder = ""
@@ -593,8 +614,9 @@ struct TeamResumeFailure: Equatable {
         let generation = attachGeneration
         let text = retry ? (draft.pendingText ?? draft.text) : draft.text
         let id = draft.pendingID ?? UUID().uuidString.lowercased()
+        sending = true
         draft.pendingID = id; draft.pendingText = text
-        do { try drafts.save(draft, identity: identity) } catch { notice = error.localizedDescription; return }
+        do { try drafts.save(draft, identity: identity) } catch { notice = error.localizedDescription; sending = false; return }
         busy = true
         do {
             let receipt = try await client.request("/sessions/\(session.id)/input", body: .object(["requestId": .string(id), "text": .string(text), "submit": .bool(true)]), controlID: lease["id"].string)
@@ -603,7 +625,7 @@ struct TeamResumeFailure: Equatable {
             if draft.text == text { draft.text = "" }; draft.pendingID = nil; draft.pendingText = nil; saveDraft()
             notice = "Delivered to the terminal."
         } catch { if generation == attachGeneration { notice = error.localizedDescription } }
-        if generation == attachGeneration { busy = false }
+        if generation == attachGeneration { busy = false; sending = false }
     }
     func clearPending() { if draft.text == draft.pendingText { draft.text = "" }; draft.pendingID = nil; draft.pendingText = nil; saveDraft(); notice = "Previous send cleared after your review." }
     func raw(_ text: String) {
@@ -650,7 +672,7 @@ struct TeamResumeFailure: Equatable {
     func connectionLost() {
         controlGeneration = UUID()
         let previous = streamID; streamID = nil; attachGeneration = UUID()
-        attached = false; busy = false; snapshotReady = false; rendererUnavailable = true; lease = .null; directInput = false; queuedRaw = Data(); renewal?.cancel()
+        attached = false; busy = false; sending = false; snapshotReady = false; rendererUnavailable = true; lease = .null; directInput = false; queuedRaw = Data(); renewal?.cancel()
         if let previous { Task { await client.closeTerminal(previous) } }
         notice = "Connection lost. Your draft stays here; reconnect to check server status."
     }
@@ -660,7 +682,7 @@ struct TeamResumeFailure: Equatable {
         stopChat(); markRead()
         controlGeneration = UUID()
         attachGeneration = UUID(); snapshotReady = false; rendererUnavailable = true
-        streamID = nil; attached = false; busy = false; lease = .null; directInput = false; queuedRaw = Data(); renewal?.cancel()
+        streamID = nil; attached = false; busy = false; sending = false; lease = .null; directInput = false; queuedRaw = Data(); renewal?.cancel()
         saveTask?.cancel(); saveDraft()
         if !previousLease["id"].string.isEmpty {
             _ = try? await client.request("/sessions/\(session.id)/control", body: .object(["action": .string("release"), "leaseId": previousLease["id"]]))

@@ -1,11 +1,13 @@
 import {
   ActivityIndicator,
+  Alert,
   KeyboardAvoidingView,
   ScrollView,
   StyleSheet,
   Text,
   View,
 } from "react-native";
+import { useState } from "react";
 import { useRouter } from "expo-router";
 import { PROVIDER_NAMES } from "@infinite/attention";
 import {
@@ -20,7 +22,7 @@ import { Button } from "../../components/Button";
 import { Composer } from "../../components/Composer";
 import { ControlBar } from "../../components/ControlBar";
 import { LiveStatus, TopBar } from "../../components/Glass";
-import { OfflineBanner } from "../../components/OfflineBanner";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
 import { useControlSync, useSessionControl } from "./useSessionControl";
 import { KEYS, useSteering } from "./useSteering";
@@ -36,8 +38,9 @@ export function Terminal({
   backLabel?: string;
 }) {
   const router = useRouter();
+  const [composerHeight, setComposerHeight] = useState(0);
   const control = useSessionControl(connection, id);
-  const { data, online, seen, refresh } = usePoll(
+  const { data, online, stale, seen, refresh } = usePoll(
     async () => {
       // A poll that started before a local control change must not undo it.
       const revision = control.generation();
@@ -66,6 +69,11 @@ export function Terminal({
   const controlled = !requiresControl || control.lease !== null;
   const canSteer =
     online && running && role !== undefined && role !== "viewer" && controlled;
+  const canSend = canSteer && !steering.busy && Boolean(steering.text.trim());
+  function send() {
+    if (!canSend) return;
+    void steering.send();
+  }
   async function takeControl(takeover: boolean) {
     await control.claim(takeover);
     refresh();
@@ -76,8 +84,11 @@ export function Terminal({
   }
   return (
     // Android runs edge-to-edge, so the window no longer resizes for the keyboard.
-    <KeyboardAvoidingView style={s.fill} behavior="padding">
-      <TopBar backLabel={backLabel} onBack={back} title="Terminal" right={<LiveStatus online={online} seen={seen} />} />
+    <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
+      <TopBar backLabel={backLabel} onBack={back} title="Terminal" right={<LiveStatus online={online} seen={seen} stale={stale} />} />
+      <FloatingNotice position="top" offset={58}
+        message={stale ? session ? "Last received view. Input is paused until the host reconnects." : "Can't reach this machine." : null}
+        actions={stale && !session ? <Button compact title="Refresh" secondary onPress={refresh} /> : null} />
       {!session ? (
         <View style={s.empty}>
           <ActivityIndicator />
@@ -86,15 +97,15 @@ export function Terminal({
       ) : (
         <>
           <View style={s.titleBlock}>
-            <Text style={s.title}>{session.title}</Text>
-            <Text style={s.small}>
+            <Text style={s.title} numberOfLines={1}>{session.title}</Text>
+            <Text style={s.small} numberOfLines={1}>
               {PROVIDER_NAMES[session.provider]} · {session.status}
             </Text>
-            <Text style={s.small}>
+            <Text style={s.small} numberOfLines={1}>
               {environment === "local" ? "Local host" : "Cloud host"} ·{" "}
               {session.pid ? `PID ${session.pid}` : "No live process"}
             </Text>
-            <Text style={s.small}>
+            <Text style={s.small} numberOfLines={1}>
               {connection.label || new URL(connection.url).host} ·{" "}
               {online
                 ? `Updated ${seen}`
@@ -103,10 +114,6 @@ export function Terminal({
                   : "Waiting for a fresh response…"}
             </Text>
           </View>
-          <OfflineBanner
-            online={online}
-            message="Last received view. Input is disabled until the host reconnects."
-          />
           <ControlBar
             role={role}
             requiresControl={requiresControl}
@@ -141,11 +148,10 @@ export function Terminal({
               }
               busy={steering.busy}
               pending={steering.pending}
-              receipt={steering.receipt}
-              error={steering.error}
               text={steering.text}
               onChangeText={steering.setText}
-              onSend={() => void steering.send()}
+              onSend={send}
+              onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
             >
               {KEYS.map((key) => (
                 <Button
@@ -161,12 +167,25 @@ export function Terminal({
           )}
         </>
       )}
+      <FloatingNotice position="bottom" offset={composerHeight + 10}
+        message={steering.error || (steering.pending && !steering.busy ? "Delivery is unconfirmed. Retry sends the same request ID." : steering.receipt)}
+        kind={steering.error ? "error" : steering.receipt ? "success" : "warning"}
+        onDismiss={steering.error || steering.receipt ? steering.dismissStatus : undefined}
+        actions={steering.pending && !steering.busy ? <View style={s.noticeActions}>
+          <Button compact title="Retry" disabled={!canSend} onPress={send} />
+          <Button compact title="Clear…" secondary onPress={() => Alert.alert("Clear the unconfirmed delivery?", "The host may have received it. Clearing only forgets the request on this phone.", [
+            { text: "Keep pending", style: "cancel" },
+            { text: "Clear", style: "destructive", onPress: steering.clearPending },
+          ])} />
+        </View> : null} />
     </KeyboardAvoidingView>
   );
 }
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
+  overlayRoot: { position: "relative" },
+  noticeActions: { flexDirection: "row", gap: 6 },
   small: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk },
   empty: { padding: 30, gap: 15 },
   body: {

@@ -355,6 +355,10 @@ small,
   padding-left: 26px;
   margin: 10px 0 2px;
   color: var(--muted);
+  min-height: 1.5em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .host-status small {
   display: block;
@@ -404,6 +408,8 @@ small,
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 100px;
+  white-space: nowrap;
   font-size: 12px;
   color: var(--green);
 }
@@ -416,6 +422,10 @@ small,
   align-items: center;
   gap: 12px;
 }
+.refresh-status { position: relative; }
+.is-refreshing { animation: refresh-spin 1s linear infinite; }
+@keyframes refresh-spin { to { transform: rotate(360deg); } }
+.stable-action { width: 210px; max-width: 100%; justify-content: center; white-space: nowrap; }
 .text-button {
   display: inline-flex;
   align-items: center;
@@ -437,10 +447,12 @@ small,
 }
 .control-bar > div:first-child {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: baseline;
   gap: 8px 14px;
   font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
 }
 .control-bar strong {
   font-weight: 600;
@@ -449,13 +461,13 @@ small,
 .control-bar small {
   color: var(--muted);
 }
+.control-bar .control-state { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .control-bar .primary {
   min-height: 44px;
   font-size: 12px;
   padding: 10px 14px;
 }
 .control-message {
-  margin-bottom: 8px;
   font-size: 12px;
 }
 .attention-summary {
@@ -472,13 +484,24 @@ small,
 .back {
   display: flex;
 }
+/* Floats under the top bar over the page's title text, never over its controls, and lets clicks through. */
 .connection-notice {
-  padding: 12px 35px;
+  position: absolute;
+  z-index: 5;
+  top: 84px;
+  left: 28px;
+  width: min(480px, calc(100% - 56px));
+  pointer-events: none;
+  padding: 12px 16px;
+  border: 1px solid #e3d0ad;
+  border-radius: 8px;
   background: #f7e8ce;
   color: #724314;
-  font-size: 13px;
+  font-size: 12px;
   line-height: 1.5;
+  box-shadow: 0 4px 14px rgba(34, 42, 39, .12);
 }
+.main { position: relative; }
 .overview {
   max-width: 1020px;
   width: 100%;
@@ -647,7 +670,11 @@ small,
   font-size: 12px;
   color: var(--muted);
   margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
+.session-freshness-label { min-width: 116px; flex: 0 0 116px; white-space: nowrap; }
 .session-meta span {
   color: #9da698;
 }
@@ -715,7 +742,9 @@ small,
   overflow: auto;
   color: #334431;
 }
-.screen-actions { display: flex; align-items: center; gap: 16px; color: var(--muted); font-size: 11px; }
+.screen-actions { display: flex; align-items: center; gap: 16px; color: var(--muted); font-size: 11px; min-width: 0; }
+.screen-actions > span, .screen-freshness { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.screen-actions > span { flex: 1; }
 .screen-actions .text-button { min-height: 44px; gap: 5px; font-size: 11px; }
 .screen:focus-visible { outline: 2px solid #518d75; outline-offset: 2px; }
 .activity-label {
@@ -763,6 +792,10 @@ small,
   background: var(--paper);
   border-top: 1px solid var(--rule);
 }
+.composer-feedback { min-height: 1.5em; max-height: 1.5em; overflow: hidden; margin-bottom: 8px; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; line-height: 1.5; }
+.composer-feedback > span { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: inherit; }
+.composer-feedback > .receipt svg { vertical-align: middle; margin-right: 8px; }
+.sync-status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .composer {
   border: 1px solid #bac6b4;
   border-radius: 12px;
@@ -797,7 +830,7 @@ small,
   display: grid;
   place-items: center;
 }
-.send-button span { font-size: 12px; padding: 0 6px; }
+.send-button { width: 44px; }
 .composer-footer {
   display: flex;
   justify-content: space-between;
@@ -829,7 +862,7 @@ small,
   gap: 8px;
   color: var(--green);
   font-size: 11px;
-  margin: 0 0 9px;
+  margin: 0;
 }
 .terminal-shell {
   padding: 18px;
@@ -1179,6 +1212,8 @@ small,
 .team-section-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 14px; }
 .team-section-heading h2 { margin-bottom: 0; }
 .team-section-heading > span { font-size: 11px; }
+.team-section-heading > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.team-list-page .team-section-heading > span, .goal-list-page .team-section-heading > span { flex: 0 0 100%; min-height: 1.5em; }
 .team-run-row { width: 100%; display: flex; align-items: center; gap: 18px; padding: 18px 0; border-bottom: 1px solid var(--rule); }
 .team-run-open { min-width: 0; flex: 1; display: flex; align-items: center; gap: 18px; padding: 6px 0; border: 0; background: transparent; text-align: left; }
 .team-run-open > div { min-width: 0; flex: 1; }
@@ -1187,10 +1222,12 @@ small,
 .team-run-row .team-run-model { overflow-wrap: anywhere; }
 .team-run-open > svg { flex-shrink: 0; color: var(--muted); }
 .team-run-row .team-run-reason { min-height: 2.6em; max-height: 2.6em; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; color: #9d382a; }
-.team-run-resume-wrap { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+.team-run-resume-wrap { position: relative; flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
 .team-run-resume { padding: 6px 12px; border: 1px solid var(--rule); border-radius: 999px; background: var(--paper); color: var(--ink); font: inherit; font-size: 12px; font-weight: 600; }
 .team-run-resume:disabled { opacity: .55; }
 .team-run-resume-error { max-width: 220px; color: #9d382a; font-size: 12px; }
+.team-run-resume { min-width: 110px; white-space: nowrap; }
+.team-run-resume-error { position: absolute; top: calc(100% + 4px); right: 0; z-index: 3; width: max-content; max-width: min(280px, 70vw); padding: 8px 10px; border-radius: 6px; background: #f7e8ce; box-shadow: 0 2px 8px rgba(34, 42, 39, .12); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .team-status { display: inline-flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
 .team-status .dot { background: #307d54; }
 .team-status.waiting { color: #724314; }
@@ -1225,6 +1262,7 @@ small,
 .team-summary h3 { margin-top: 18px; }
 .team-summary h3 .quiet, .team-summary-fold summary .quiet { font-weight: 400; margin-left: 4px; }
 .team-summary-fold summary { min-height: 44px; padding: 10px 0; cursor: pointer; color: var(--green); font-size: 13px; font-weight: 600; }
+.team-summary .team-section-heading > span { max-width: 50%; font-variant-numeric: tabular-nums; }
 .team-review-list { list-style: none; margin: 8px 0 18px; padding: 0; }
 .team-review-list li { padding: 12px 0; border-top: 1px solid var(--rule); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .team-review-list p { margin: 4px 0 0 32px; }
@@ -1241,6 +1279,8 @@ small,
 .team-run-details > summary { min-height: 48px; padding: 14px 0; cursor: pointer; font-size: 14px; color: var(--green); }
 .team-heading-actions .team-refresh { flex-shrink: 0; }
 .team-detail-meta { display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+.team-detail-meta .team-freshness { flex: 0 0 100%; min-height: 1.5em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.goal-active-cycle .team-section-heading .team-freshness { flex: 0 0 100%; min-height: 1.5em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .team-detail-body { padding: 0 42px 26px; overflow: auto; flex: 1; min-height: 0; }
 .team-section { padding: 28px 0; border-bottom: 1px solid var(--rule); }
 .team-section h2 { margin-bottom: 16px; }
@@ -1297,13 +1337,20 @@ small,
 .team-history p { font-size: 12px; line-height: 1.7; margin: 6px 0 0; overflow-wrap: anywhere; }
 .team-actions { display: flex; justify-content: space-between; padding-top: 18px; }
 .team-cancel { color: #9d382a; }
-.team-composer-area { padding: 18px 42px 22px; border-top: 1px solid var(--rule); flex-shrink: 0; }
+.team-composer-area { position: relative; padding: 18px 42px 22px; border-top: 1px solid var(--rule); flex-shrink: 0; }
 .team-composer-area > p { font-size: 12px; margin-bottom: 12px; }
 .team-composer-area > p:last-child { margin-bottom: 0; }
+.team-floating-notice { position: absolute; z-index: 6; bottom: calc(100% + 8px); left: 42px; right: 42px; display: flex; flex-direction: column; gap: 5px; padding: 8px 11px; border: 1px solid #dfc491; border-radius: 8px; background: #fff7e8; color: #724314; box-shadow: 0 4px 16px #1d291b20; font-size: 12px; line-height: 1.4; }
+.team-floating-notice.is-receipt { border-color: #c5d5bd; background: #f2f7ef; color: #3c5d38; }
+.team-floating-message { display: flex; align-items: flex-start; gap: 8px; }
+.team-floating-message > span { min-width: 0; flex: 1; }
+.team-notice-dismiss { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 22px; height: 22px; margin: -3px -5px -3px 0; padding: 0; border: 0; background: transparent; color: inherit; cursor: pointer; }
 .team-composer-area form { display: flex; align-items: flex-end; gap: 12px; }
 .team-composer-area textarea { min-width: 0; background: #fff; max-height: 180px; resize: vertical; font-size: 13px; }
 .team-composer-area .primary { flex-shrink: 0; font-size: 12px; gap: 12px; }
-.team-pending { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 12px; font-size: 12px; color: var(--muted); }
+.team-pending { display: flex; align-items: center; flex-wrap: nowrap; gap: 8px 16px; font-size: 12px; color: inherit; overflow: hidden; white-space: nowrap; }
+.team-pending > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.team-pending .text-button { flex: 0 0 auto; }
 @media (max-width: 1000px) {
   .team-detail-heading { flex-wrap: wrap; }
   .team-detail-heading > div:first-child { flex: 1 1 100%; }
@@ -1313,6 +1360,7 @@ small,
   .team-detail-heading { padding: 26px 25px 22px; }
   .team-detail-body { padding-left: 25px; padding-right: 25px; }
   .team-composer-area { padding: 16px 25px; }
+  .team-floating-notice { left: 25px; right: 25px; }
   .team-heading-actions { width: 100%; justify-content: space-between; }
   .team-refresh { font-size: 0; gap: 0; }
   .team-refresh svg { width: 18px; height: 18px; }
@@ -1339,6 +1387,7 @@ small,
   .team-output { grid-template-columns: 1fr; gap: 7px; }
   .team-output dd { margin-bottom: 12px; }
   .team-composer-area { padding: 14px 21px max(16px, env(safe-area-inset-bottom)); }
+  .team-floating-notice { left: 21px; right: 21px; }
   .team-composer-area form { flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
   .team-composer-area textarea { flex-basis: 100%; max-height: 120px; }
   .team-composer-area .primary { min-height: 44px; padding: 11px 14px; }
@@ -1347,6 +1396,7 @@ small,
 }
 @media (prefers-reduced-motion: reduce) {
   .workspace-navigation button, .team-page button, .team-detail button { transition: none; }
+  .is-refreshing { animation: none; }
 }
 
 /* Goals keep the approved scope and human assessment alongside each work cycle. */
@@ -1420,9 +1470,13 @@ small,
 .linear-workflow strong { font-weight: 500; }
 .linear-tracking-reason { margin: 12px 0; color: #724314; }
 .linear-freshness, .linear-tracking-note { margin: 12px 0 0; color: var(--muted); }
+.linear-freshness { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .linear-tracking details { margin-top: 10px; }
 .linear-tracking summary { min-height: 44px; padding: 12px 0; color: var(--green); cursor: pointer; }
 .linear-tracking.compact { padding: 12px 0 14px; margin: 18px 0; }
+.conversation-status { height: 1.6em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.dictation-status { display: inline-block; width: 172px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; vertical-align: middle; font-size: 11px; }
+.prompt-feedback { min-height: 1.5em; max-height: 1.5em; overflow: hidden; margin: 4px 0; white-space: nowrap; text-overflow: ellipsis; }
 @media (max-width: 700px) {
   .linear-tracking-heading a { min-height: 44px; }
 }

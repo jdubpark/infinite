@@ -82,6 +82,13 @@ export type TeamBriefStatus = {
     };
   };
 };
+export type TeamBriefRow = { sessionId: string; status: TeamBriefStatus; fetchError?: string };
+
+/** Keep a session's last written brief visible when its refresh fails. */
+export function failedTeamBriefRow(sessionId: string, error: string, previous: TeamBriefRow[] = []): TeamBriefRow {
+  const prior = previous.find(row => row.sessionId === sessionId && row.status.summary);
+  return prior ? { ...prior, fetchError: error } : { sessionId, status: { state: "unknown", error }, fetchError: error };
+}
 
 const roleRank = ["project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"];
 
@@ -181,7 +188,7 @@ export function canAskForBrief(team: any, rows: { sessionId: string; status: Tea
  * uses (outcome, system shape, ranked review questions, changes, checks, guidance, gaps).
  * The last line is the key bar or the next command; a watch pins it below the scrolled body.
  */
-export function teamSummaryText(team: any, rows: { sessionId: string; status: TeamBriefStatus }[], checkedAt = "", interactive = false, now?: number): string {
+export function teamSummaryText(team: any, rows: { sessionId: string; status: TeamBriefStatus }[], checkedAt = "", interactive = false, now?: number, repainted = false): string {
   const lines = teamHeading(team, "summary");
   if (team?.reason) lines.push(`Reason: ${short(team.reason, 400)}`);
   decisionLines(lines, team);
@@ -193,12 +200,12 @@ export function teamSummaryText(team: any, rows: { sessionId: string; status: Te
   const label = brief || chosen?.status.summary?.engine === "jevcode" ? "JEVCODE SUMMARY" : "SESSION SUMMARY";
   const when = briefWhen(chosen?.status);
   lines.push("", [label, member ? roleNames[member.role] ?? short(member.role, 24) : "", when ? briefTime(when, now) : ""].filter(Boolean).join(" · "));
-  const state = chosen?.status.state;
   if (!text) {
-    lines.push(state === "pending" || state === "running" ? "Jevcode is writing the summary." : short(chosen?.status.error || (rows.length ? "No Jevcode summary yet." : "No agent session is available for a summary."), 400));
+    const pending = chosen?.status.state === "pending" || chosen?.status.state === "running";
+    lines.push(pending && !repainted ? "Jevcode is writing the summary." : short(chosen?.status.error || (rows.length ? "No Jevcode summary yet." : "No agent session is available for a summary."), 400));
     if (interactive && canAskForBrief(team, rows)) lines.push("Press a to ask Jevcode for a summary.");
   } else {
-    if (state === "pending" || state === "running") lines.push("Jevcode is updating this summary.");
+    if (!repainted && (chosen?.status.state === "pending" || chosen?.status.state === "running")) lines.push("Jevcode is updating this summary.");
     lines.push(short(brief?.summary || text, 1200));
     section(lines, "SYSTEM SHAPE", (brief?.architecture ?? []).map(item => item?.text ?? ""));
     section(lines, "REVIEW FIRST", (brief?.review ?? []).map(item => [
@@ -224,8 +231,10 @@ export function visibleScreen(value: unknown, maxLines = 24): string {
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
-  const text = plain.split(/\r?\n/).slice(-maxLines).join("\n").trim();
-  return text || "No screen is recorded for this agent.";
+  // The recorded screen already has the terminal's fixed height; keeping its blank rows (rather than
+  // trimming them) keeps the block's height steady between polls without padding a short screen.
+  const lines = plain.split(/\r?\n/).slice(-maxLines);
+  return lines.some(line => line.trim()) ? lines.join("\n") : "No screen is recorded for this agent.";
 }
 
 export type TeamWatchCommand = "logs" | "summary" | "next" | "prev" | "ask" | "detach" | "up" | "down" | "pageUp" | "pageDown" | "top" | "bottom";
@@ -261,7 +270,7 @@ function clock(iso: unknown) {
 }
 
 /** One agent's screen and recent control lines, under a strip that names every agent you can switch to. */
-export function teamLogsText(team: any, agents: any[], member: any, screen: unknown, events: { at?: string; text?: string }[], checkedAt = "", interactive = false): string {
+export function teamLogsText(team: any, agents: any[], member: any, screen: unknown, events: { at?: string; text?: string }[], checkedAt = "", interactive = false, width = 80): string {
   const place = Math.max(0, agents.findIndex(item => item?.memberId === member?.memberId));
   const lines = teamHeading(team, `review logs · agent ${place + 1} of ${Math.max(agents.length, 1)}`);
   const strip = agents.slice(0, 8).map(item => {
@@ -269,7 +278,7 @@ export function teamLogsText(team: any, agents: any[], member: any, screen: unkn
     return item?.memberId === member?.memberId ? `[${name}]` : ` ${name} `;
   });
   if (agents.length > 8) strip.push(` +${agents.length - 8} more`);
-  lines.push("", `  ${strip.join("  ")}`);
+  lines.push("", `  ${strip.join("  ")}`.slice(0, Math.max(1, width)));
   const role = roleNames[member?.role] ?? short(member?.role, 24);
   lines.push("", `${role.toUpperCase()} · ${clean(member?.status)} · ${short(member?.title, 120)}${member?.taskId ? ` · ${short(member.taskId, 40)}` : ""}`);
   if (member?.stoppedReason) lines.push(`Stopped: ${short(member.stoppedReason, 240)}`);
@@ -286,7 +295,7 @@ export function teamLogsText(team: any, agents: any[], member: any, screen: unkn
 
 /** Word-wraps each line to `width`, keeping its indent and hanging continuation lines under a bullet or number. */
 export function wrapText(text: string, width: number): string[] {
-  const columns = Math.max(20, Math.floor(width) || 80);
+  const columns = Math.max(1, Math.floor(width) || 80);
   const out: string[] = [];
   for (const line of text.split("\n")) {
     if (line.length <= columns) { out.push(line); continue; }
@@ -315,13 +324,13 @@ const heading = /^(?:[A-Z][A-Z ]+[A-Z])(?= \(\d+\)$| · |$)/;
  * One full-screen frame: the wrapped body scrolled to `offset`, with the card's last line pinned as
  * a key bar. The frame never writes past the last row, so the terminal does not scroll.
  */
-export function teamWatchScreen(text: string, { rows, columns, offset, color }: { rows: number; columns: number; offset: number; color: boolean }) {
+export function teamWatchScreen(text: string, { rows, columns, offset, color, status = "" }: { rows: number; columns: number; offset: number; color: boolean; status?: string }) {
   const all = text.split("\n");
   const footer = all.pop() ?? "";
   while (all.length && !all[all.length - 1]!.trim()) all.pop();
-  const width = Math.max(20, columns || 80);
+  const width = Math.max(1, columns || 80);
   const body = wrapText(all.join("\n"), width);
-  const visible = Math.max(1, (rows || 24) - 2);
+  const visible = Math.max(0, Math.max(3, rows || 24) - 3);
   const maxOffset = Math.max(0, body.length - visible);
   const start = Math.min(Math.max(0, offset), maxOffset);
   const shown = body.slice(start, start + visible);
@@ -332,6 +341,7 @@ export function teamWatchScreen(text: string, { rows, columns, offset, color }: 
     : line.startsWith("DECISIONS FOR YOU") ? `\x1b[1;33m${line}\x1b[0m`
     : heading.test(line) ? `\x1b[1m${line}\x1b[0m`
     : line;
-  const lines = [...shown.map(paint), ...Array(Math.max(0, visible - shown.length)).fill(""), "", color ? `\x1b[7m${bar.padEnd(width)}\x1b[0m` : bar];
+  const statusLine = status.slice(0, width);
+  const lines = [...shown.map(paint), ...Array(Math.max(0, visible - shown.length)).fill(""), "", statusLine, color ? `\x1b[7m${bar.padEnd(width)}\x1b[0m` : bar];
   return { frame: `\x1b[H${lines.map(line => `${line}\x1b[K`).join("\n")}`, offset: start, page: Math.max(1, visible - 1) };
 }

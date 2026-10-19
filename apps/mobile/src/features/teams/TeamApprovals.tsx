@@ -4,6 +4,7 @@ import { api, type Connection, type Me, type SessionDetail } from "../../api/cli
 import { usePoll } from "../../api/usePoll";
 import { Avatar } from "../../components/Avatar";
 import { DecisionCard } from "../../components/DecisionCard";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
 import { useAnswer } from "../session/useAnswer";
 import { useControlSync, useSessionControl } from "../session/useSessionControl";
@@ -50,17 +51,17 @@ export function AgentApproval({ connection, member, agent, provider, decision, m
     </View>
     {decision?.status === "escalated" || decision?.status === "stale" || decision?.status === "uncertain"
       ? <Text style={s.reason} numberOfLines={3}>{decision.status === "escalated" ? "Escalated" : decision.status === "stale" ? "Coordinator's decision went stale" : "Coordinator unsure it landed"}{decision.reason ? `: ${decision.reason}` : ""}</Text> : null}
-    {answering.notice ? <Text accessibilityRole="alert" style={t.warning}>{answering.notice}</Text> : null}
     {control.message && !control.lease ? <Text style={t.note}>{control.message}</Text> : null}
     {prompt ? <DecisionCard key={prompt.id} prompt={prompt} backend={session?.backend} status={answering.status}
       canAnswer={permitted && poll.online && running && !control.busy} readOnly={!permitted && me !== null}
       onAnswer={(option, text) => void answer(option, text)} onRetry={answering.retry} onOpenTerminal={onOpenSession} />
       : <Text style={t.note}>{poll.loading ? "Loading…" : "No longer open."}</Text>}
+    <FloatingNotice position="bottom" offset={0} message={answering.notice} accessibilityRole="alert" onDismiss={answering.dismissNotice} />
   </View>;
 }
 
 const s = StyleSheet.create({
-  wrap: { gap: 8 },
+  wrap: { gap: 8, position: "relative" },
   head: { flexDirection: "row", alignItems: "center", gap: 8 },
   who: { flex: 1, fontSize: 12, fontWeight: "700", color: theme.colors.warningInk },
   reason: { fontSize: 13, lineHeight: 19, color: theme.colors.warningInk },

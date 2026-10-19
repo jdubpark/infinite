@@ -43,9 +43,6 @@ export function MomentRow({ moment }: { moment: Moment }) {
             {moment.detail}
           </Text>
         ) : null}
-        {moment.status === "running" ? (
-          <Text style={s.running}>running</Text>
-        ) : null}
         {open
           ? moment.expanded.map((x, i) => (
               <View key={i} style={s.expanded}>
@@ -56,8 +53,9 @@ export function MomentRow({ moment }: { moment: Moment }) {
               </View>
             ))
           : null}
-        <Text style={s.time}>
+        <Text style={s.time} numberOfLines={1}>
           {new Date(moment.at).toLocaleTimeString()}
+          {moment.status === "running" ? " · running" : ""}
           {moment.source === "screen" ? " · detected from screen" : ""}
         </Text>
       </View>
@@ -91,7 +89,6 @@ const s = StyleSheet.create({
   failed: { color: theme.colors.warningInk },
   destructive: { color: theme.colors.error },
   detail: { fontSize: 12, lineHeight: 18, color: theme.colors.mutedInk },
-  running: { fontSize: 11, lineHeight: 17, color: theme.colors.running },
   expanded: { gap: 2, marginTop: 4 },
   expandedLabel: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk },
   time: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk },

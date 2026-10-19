@@ -19,10 +19,12 @@ struct TeamMutation: Equatable {
     @Published private(set) var noticeIsError = false
     /// The last poll of this run succeeded, so its state is current and controls may act on it.
     @Published private(set) var fresh = false
+    @Published private(set) var displayStale = false
     @Published private(set) var pending: TeamMutation?
     let role: String
     private let client: RemoteClient
     private var pollTask: Task<Void, Never>?
+    private lazy var freshness = DisplayFreshness { [weak self] in self?.displayStale = $0 }
     init(run: TeamRun, client: RemoteClient, role: String) { self.run = run; self.client = client; self.role = role }
     var id: String { run.id }
     /// Newer revisions always win; within a revision the later update does.
@@ -41,8 +43,8 @@ struct TeamMutation: Equatable {
     }
     func stopPolling() { pollTask?.cancel(); pollTask = nil }
     func poll() async {
-        do { let value = try await client.request("/teams/\(run.id)"); observe(TeamRun(value)); if !fresh { fresh = true } }
-        catch { if fresh { fresh = false } }
+        do { let value = try await client.request("/teams/\(run.id)"); observe(TeamRun(value)); if !fresh { fresh = true }; freshness.recovered() }
+        catch { if fresh { fresh = false }; freshness.failed() }
     }
     var canSteer: Bool { fresh && role != "viewer" && run.status != "cancelled" && !busy && pending == nil }
     var canOwn: Bool { fresh && role == "owner" && !busy && pending == nil }

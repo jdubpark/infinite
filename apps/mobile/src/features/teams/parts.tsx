@@ -1,7 +1,8 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { ActivityIndicator, Alert, Linking, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { PROVIDER_NAMES, type Provider } from "@infinite/attention";
 import { Button } from "../../components/Button";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { Chip, GlassButton } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import type { StatusKind } from "../../status";
@@ -103,28 +104,37 @@ export function LinearChip({ tracking, fresh }: { tracking?: LinearTracking; fre
 }
 
 /** The outcome of the last request, and the controls for one whose delivery is unconfirmed. */
-export function RequestStatus({ request, canRetry, subject }: { request: RunRequestControl; canRetry: boolean; subject: string }) {
+export function RequestStatus({ request, canRetry, bottom = 0 }: { request: RunRequestControl; canRetry: boolean; bottom?: number }) {
   const pending = request.pending;
-  return <>
-    {request.message ? <Text accessibilityRole="alert" style={request.recorded ? t.note : t.warning}>{request.message}</Text> : null}
-    {pending ? <View style={s.pending}>
-      <Text style={t.note} numberOfLines={2}>{request.busy ? "Sending" : "Unconfirmed"} {pending.label.toLowerCase()} · revision {pending.revision}{pending.fields.text ? ` · “${pending.fields.text}”` : ""}</Text>
-      {!request.busy ? <View style={s.row}>
-        <Button compact title="Retry same request" disabled={!canRetry} onPress={request.retry} />
-        <Button compact title="Clear…" secondary onPress={() => Alert.alert("Clear the unconfirmed request?", `The host may have applied it. Clearing only forgets it here.`, [
+  useEffect(() => {
+    if (!request.recorded || !request.message) return;
+    const timer = setTimeout(request.dismissMessage, 4000);
+    return () => clearTimeout(timer);
+  }, [request.dismissMessage, request.recorded, request.message]);
+  if (pending && !request.busy) return <FloatingNotice position="bottom" offset={bottom}
+    message={`${request.message || `Unconfirmed ${pending.label.toLowerCase()} · revision ${pending.revision}${pending.fields.text ? ` · “${pending.fields.text}”` : ""}`}. Retry sends the same request.`}
+    accessibilityRole={request.message ? "alert" : undefined}
+    actions={<View style={s.requestActions}>
+      <Button compact title="Retry" disabled={!canRetry} onPress={request.retry} />
+      <Button compact title="Clear…" secondary onPress={() => Alert.alert("Clear the unconfirmed request?", "The host may have applied it. Clearing only forgets it here.", [
           { text: "Keep pending", style: "cancel" },
           { text: "Clear", style: "destructive", onPress: request.discard },
         ])} />
-      </View> : null}
-    </View> : null}
-  </>;
+    </View>} />;
+  if (!request.busy && request.message) return <FloatingNotice position="bottom" offset={bottom} message={request.message}
+    kind={request.recorded ? "success" : "error"} onDismiss={request.dismissMessage} />;
+  return null;
 }
 
 /** The floating direction field for a team or goal; `note` replaces it when steering is unavailable. */
 export function SteerBox({ value, onChange, placeholder, enabled, busy, note, onSend }: {
   value: string; onChange: (text: string) => void; placeholder: string; enabled: boolean; busy: boolean; note?: string; onSend: () => void;
 }) {
-  if (note) return <Text style={[t.note, s.steerNote]}>{note}</Text>;
+  if (note) return <Text style={[t.note, s.steerNote]} numberOfLines={1}>{note}</Text>;
+  if (busy) return <View style={s.steer}>
+    <TextInput accessibilityLabel="Direction" value={value} onChangeText={onChange} editable={false} multiline maxLength={8000} placeholder={placeholder} placeholderTextColor={theme.colors.placeholder} style={s.steerInput} />
+    <View accessible accessibilityRole="progressbar" accessibilityLabel="Sending direction" style={s.busyButton}><ActivityIndicator color={theme.colors.forest} /></View>
+  </View>;
   return <View style={s.steer}>
     <TextInput accessibilityLabel="Direction" value={value} onChangeText={onChange} editable={enabled && !busy} multiline maxLength={8000}
       placeholder={placeholder} placeholderTextColor={theme.colors.placeholder} style={s.steerInput} />
@@ -170,10 +180,12 @@ const s = StyleSheet.create({
   disclosed: { gap: 6, paddingBottom: 6 },
   lineup: { gap: 2 },
   pending: { gap: 6 },
+  requestActions: { flexDirection: "row", alignItems: "center", gap: 6 },
   row: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   wrap: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   steer: { flexDirection: "row", alignItems: "flex-end", gap: 8, padding: 5, paddingLeft: 6, borderRadius: 26,
     backgroundColor: theme.colors.glass, borderWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.glassRim, ...theme.lift },
   steerInput: { flex: 1, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 10, minHeight: 40, maxHeight: 130, color: theme.colors.ink, fontSize: 15 },
   steerNote: { textAlign: "center", paddingHorizontal: 8 },
+  busyButton: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
 });

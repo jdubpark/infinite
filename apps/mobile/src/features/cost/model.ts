@@ -69,22 +69,20 @@ function localDate(date: string) {
 export function monthName(start: string): string { return localDate(start).toLocaleDateString([], { month: "long" }); }
 export function shortDay(date: string): string { return localDate(date).toLocaleDateString([], { month: "short", day: "numeric" }); }
 
-/** Four hues validated for colour-vision separation on the paper sheet; stacks also keep a surface gap. */
-export const ACCOUNT_PALETTE = ["#1e8a5e", "#d9741f", "#3f6fd1", "#c24a7a"] as const;
+/** The shared account palette, in slot order; every client draws the same account in the same hue. */
+export const ACCOUNT_PALETTE = ["#3987E5", "#C98500", "#9085E9", "#199E70", "#D95926"] as const;
 export const OTHER_COLOR = "#8f978f";
-const FIXED_SLOTS: Record<string, number> = { deepseek: 0, meta: 1 };
+const KNOWN_COLORS: Record<string, string> = { deepseek: "#3987E5", meta: "#C98500", claude: "#9085E9", codex: "#199E70" };
 /**
- * Colour follows the account, never its position in one screen's list: known accounts keep a fixed
- * slot and unknown ones take the remaining slots in name order, so a project showing only Meta
- * draws it in the same hue as the overview.
+ * Colour follows the account, never its position in one screen's list. Known accounts keep their
+ * hue; any other account takes, in sorted id order, a slot no known account present is using, and
+ * muted once the slots run out. A project showing only Meta draws it as the overview does.
  */
 export function accountColors(accounts: string[]): Record<string, string> {
-  const free = ACCOUNT_PALETTE.map((_, index) => index).filter(index => !Object.values(FIXED_SLOTS).includes(index));
+  const taken = new Set(accounts.map(account => KNOWN_COLORS[account]).filter(Boolean));
+  const free = ACCOUNT_PALETTE.filter(color => !taken.has(color));
   const colors: Record<string, string> = {};
-  for (const account of [...accounts].sort()) {
-    const slot = FIXED_SLOTS[account] ?? free.shift();
-    colors[account] = slot === undefined ? OTHER_COLOR : ACCOUNT_PALETTE[slot]!;
-  }
+  for (const account of [...accounts].sort()) colors[account] = KNOWN_COLORS[account] ?? free.shift() ?? OTHER_COLOR;
   return colors;
 }
 

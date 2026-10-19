@@ -31,8 +31,8 @@ export function CostOverview({ connection }: { connection: Connection }) {
   const [balances, setBalances] = useState<"idle" | "busy" | "failed">("idle");
   const models = useModels(connection, role);
   const accounts = overview.data?.accounts ?? [];
-  // Only metered accounts draw in the bars, so only they take a hue; plans stay unmarked.
-  const colors = accountColors(accounts.filter(account => account.kind === "metered").map(account => account.id));
+  // Every account keeps its hue on its card; only metered ones appear in the bars and legend.
+  const colors = accountColors(accounts.map(account => account.id));
   const days = daily.data?.days ?? [], dailyAccounts = daily.data?.accounts ?? [];
   // Legend entries in the host's account order, limited to accounts that spent in the window.
   const shown = accounts.filter(account => dailyAccounts.includes(account.id)).map(account => account.id);

@@ -29,7 +29,8 @@ import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
-import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
+import { createTeamSchema, teamMutationSchema, teamActionSchema, teamTaskRatingSchema } from "./team-types.js";
+import { scorecard } from "./scorecard.js";
 import { GoalService } from "./goals.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
@@ -356,6 +357,13 @@ export function createApp(config: Config, key: Buffer) {
     }),
   );
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
+  app.get("/api/usage/models", (req, res) => {
+    const query = z.object({ role: z.string().trim().min(1).max(40).optional() }).strict().parse(req.query);
+    return res.json(scorecard(teams.list(), sessionId => {
+      const found = usage.session(sessionId);
+      return found.measured ? { cost: found.cost, tokens: found.tokens.input + found.tokens.output, unpriced: found.pricing.unknown } : undefined;
+    }, { role: query.role }));
+  });
   app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
@@ -370,6 +378,8 @@ export function createApp(config: Config, key: Buffer) {
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  app.post("/api/teams/:id/tasks/:taskId/rating", requireRole(["owner"]), (req, res) =>
+    res.json(teams.rateTask(id.parse(req.params.id), z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).parse(req.params.taskId), teamTaskRatingSchema.parse(req.body))));
   app.post("/api/teams/:id/permissions/revoke", requireRole(["owner"]), async (req, res) => res.json(await teams.revokePermissions(id.parse(req.params.id), teamActionSchema.parse(req.body))));
   app.get("/api/teams/:id/bundle", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;

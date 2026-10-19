@@ -157,6 +157,7 @@ export const createTeamSchema = z.object({
 export type CreateTeam = z.infer<typeof createTeamSchema>;
 export const teamMutationSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000) }).strict();
 export const teamActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
+export const teamTaskRatingSchema = z.object({ requestId: z.uuid(), score: z.number().int().min(1).max(5), note: z.string().trim().max(1000).optional() }).strict();
 const taskId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/);
 const ownedPath = z.string().min(1).max(300).refine(value => !value.startsWith("/") && !value.includes("\\") && !value.includes("\0") && !value.split("/").some(part => part === ".." || part === ".git" || part === "." || part === ""), "Use a repository-relative file or directory without glob syntax").refine(value => !/[*?\[\]:]/.test(value));
 export const teamGoalContextSchema = z.object({
@@ -202,7 +203,7 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("no-change"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), reason: z.string().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("result"), summary: z.string().min(1).max(8000) }).strict(),
-  z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional() }).strict(),
+  z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
   z.object({ kind: z.literal("delivery"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("delivery-repair"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]) }).strict(),
@@ -226,6 +227,7 @@ export interface TeamMember extends TeamAssignment {
   baseCommit: string;
   prompt: string;
   startedAt?: string;
+  reportedAt?: string;
   /** The latest attention activity the host observed for this member while it had no report. */
   lastActivityAt?: string;
   /** A provider limit was observed but the member has not yet been switched or stopped. */
@@ -245,6 +247,10 @@ export interface TeamTask extends TeamTaskPlan {
   memberId?: string;
   commit?: string;
   summary?: string;
+  rubric?: { version: 1; correctness: { score: number; why: string }; cleanliness: { score: number; why: string }; extensibility: { score: number; why: string }; docs: { score: number; why: string }; reviewerProfileId: string };
+  ownerRating?: { score: 1 | 2 | 3 | 4 | 5; note?: string; at: string };
+  diffStat?: { added: number; removed: number; files: number; docs: boolean; tests: boolean };
+  reviewRounds?: number;
   escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string };
   /** Each provider-limit switch of this task's member; a replacement can itself be switched. */
   limitSwitches?: { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string }[];

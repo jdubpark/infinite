@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
@@ -208,6 +208,7 @@ async function main() {
       tasks[0].agentProfileId = "spark-high";
       Object.assign(tasks[1], JSON.parse(readFileSync(join(receiptDir, "invalid-profile.json"), "utf8")));
     }
+    if (scenario === "rubric") { tasks[0].agentProfileId = "haiku"; tasks[1].agentProfileId = "codex-light"; tasks[0].paths.push("docs", "tests"); }
     const verification = { setup: { command: process.execPath, args: [process.argv[1], "--bootstrap-setup", scenario] },
       checks: [{ command: process.execPath, args: ["check.mjs"] }] };
     if (scenario === "bootstrap-change" && assignment.revision > 1)
@@ -316,6 +317,11 @@ async function main() {
     await new Promise(resolve => setTimeout(resolve, 150));
     const name = scenario === "scope-escape" && assignment.taskId === "a" ? " a.txt" : `${assignment.taskId}.txt`;
     writeFileSync(name, `revision ${assignment.revision}\n`);
+    if (scenario === "rubric" && assignment.taskId === "a") {
+      mkdirSync("docs", { recursive: true }); mkdirSync("tests", { recursive: true });
+      writeFileSync("docs/x.md", "Documentation evidence.\n");
+      writeFileSync("tests/y.test.ts", "export {};\n");
+    }
     if (scenario === "usage" && receipt.provider === "opencode") {
       // The `opencode run --format json` stream: one line per part event, with a step-finish
       // part for each step of the assistant message, then unrelated plain text.
@@ -370,7 +376,10 @@ async function main() {
       if (!readFileSync(name, "utf8").startsWith("revision ")) throw new Error("The review checkout lacks integrated work");
     if (scenario === "changed-after-check")
       writeFileSync(join(process.cwd(), "..", "..", "integration", "a.txt"), "Changed after verification\n");
-    await report({ kind: "review", verdict: "approved", summary: "Both requested files are present in the integrated checkout" });
+    await report({ kind: "review", verdict: "approved", summary: "Both requested files are present in the integrated checkout",
+      ...(scenario === "rubric" ? { rubric: ["a", "b"].map(taskId => ({ taskId,
+        correctness: { score: 5, why: "The assigned file is present." }, cleanliness: { score: 4, why: "The change is narrow." },
+        extensibility: { score: 4, why: "The structure is easy to extend." }, docs: { score: 3, why: "The task evidence is clear." } })) } : {}) });
   }
 }
 

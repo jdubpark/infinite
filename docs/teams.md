@@ -931,6 +931,16 @@ extend the goal first if it has.
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
+| `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
+
+## Model scorecard
+
+`GET /api/usage/models?role=implementer` returns per-profile task outcomes,
+metered usage, version 1 reviewer rubric means, separate owner ratings, Wilson
+95% integration intervals, and advisory comparisons once both profiles have
+at least ten attempts. Limit-switched attempts are excluded. The host never
+changes the configured model lineup; ratings and rubrics are not sent to
+implementers. The owner rating request is idempotent for a given `requestId`.
 
 Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route

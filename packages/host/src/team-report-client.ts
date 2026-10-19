@@ -58,10 +58,16 @@ export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = pr
 export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<TeamReportEnvelope> {
   const { endpoint, token } = reportEnvironment(env);
   const envelope = createReportEnvelope(input, env);
-  const response = await fetch(endpoint, {
-    method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
-  });
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
+    });
+  } catch {
+    // A rejection can follow a durable append whose acknowledgement was lost, so delivery stays unconfirmed, not failed.
+    throw new ReportError("Team report delivery was not confirmed: the report endpoint gave this process no answer. A sandbox or network policy may block local connections, or the acknowledgement was lost. Stop and request user attention; inspect this member's recorded report before retrying the identical report, and do not bypass or submit a different report.");
+  }
   await response.body?.cancel();
   if (response.status !== 204)
     throw new ReportError(`Report refused or unconfirmed (${response.status}). Stop and inspect this member's recorded report; do not bypass the refusal or submit a different report.`);

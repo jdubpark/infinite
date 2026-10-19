@@ -9,7 +9,7 @@ import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamPermissionDecision, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
-import { retargetPrompt, teamPrompt } from "./team-prompts.js";
+import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
 import { teamUsage } from "./team-usage.js";
@@ -976,7 +976,7 @@ export class TeamService {
     }
     const modelProfile = selected ? structuredClone(selected) : undefined;
     const provider = modelProfile?.provider ?? run.provider;
-    const instructions = prompt ?? teamPrompt(run, role, task, undefined, provider, modelProfile);
+    const instructions = prompt === undefined ? teamPrompt(run, role, task, undefined, provider, modelProfile) : refreshReportingInstructions(prompt, provider);
     if (Buffer.byteLength(instructions) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
     return { runId: run.id, memberId, revision: run.revision, role, provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, cursor: 0, stopRequestId: randomUUID() };
   }

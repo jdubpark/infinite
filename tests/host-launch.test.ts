@@ -178,6 +178,35 @@ test("codex dev relay runs the TypeScript file through an absolute tsx loader", 
   assert.deepEqual(notify, ["node", "--import", loader, "/repo/packages/host/src/hook-relay.ts", "codex-notify"]);
 });
 
+test("Codex team launch configures its authenticated MCP report tool and requires hooks", () => {
+  for (const relayPath of [relay, "/repo/packages/host/src/hook-relay.ts"]) {
+    const launch = buildLaunch("codex", { command: "codex", args: ["--sandbox", "workspace-write", "--ask-for-approval", "on-request", "-c", "sandbox_workspace_write.network_access=false"] }, "Implement this task", hooks, relayPath, enabled, true);
+    const settings = new Map<string, unknown>();
+    for (let index = 0; index < launch.args.length - 1; index++) {
+      if (launch.args[index] === "-c" && launch.args[index + 1].startsWith("mcp_servers.infinite_team.")) {
+        const override = launch.args[++index].slice("mcp_servers.infinite_team.".length);
+        const equals = override.indexOf("=");
+        settings.set(override.slice(0, equals), JSON.parse(override.slice(equals + 1)));
+      }
+    }
+    assert.equal(settings.size, 4);
+    assert.equal(settings.get("command"), process.execPath);
+    const serverArgs = settings.get("args") as string[];
+    assert.equal(serverArgs.at(-1), relayPath.replace("hook-relay", "team-mcp"));
+    if (relayPath.endsWith(".ts")) {
+      assert.equal(serverArgs[0], "--import");
+      assert.match(serverArgs[1], /^file:\/\/\/.+\/tsx\//);
+    }
+    assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT"]);
+    assert.equal(settings.get("tools.report.approval_mode"), "approve");
+    assert.ok(launch.args.includes("--sandbox") && launch.args.includes("workspace-write"));
+    assert.ok(launch.args.includes("sandbox_workspace_write.network_access=false"));
+    assert.ok(launch.args.includes("on-request"));
+    assert.equal(launch.args.at(-1), "Implement this task");
+  }
+  assert.throws(() => buildLaunch("codex", { command: "codex", args: [] }, "task", null, relay, enabled, true), /Codex team reporting/);
+});
+
 // A readable teamwork run path long enough that a terminal wraps it across lines.
 const memberFolder = `/srv/data/workspaces/Projects/sample/teamwork/2026-01-15-${"stop-ringing-once-i-am-up-".repeat(2)}3f2a9c1d/members/${randomUUID()}`;
 
@@ -186,10 +215,10 @@ test("a trusted member folder reaches Codex as one per-launch override for that 
   const index = trusted.args.indexOf(`projects={${JSON.stringify(memberFolder)}={trust_level="trusted"}}`);
   assert.ok(index > 0 && trusted.args[index - 1] === "-c", trusted.args.join(" "));
   assert.equal(trusted.args.at(-1), "do it");
-  const quoted = buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, true, undefined, undefined, '/srv/a "b"\\c');
+  const quoted = buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, false, undefined, undefined, '/srv/a "b"\\c');
   assert.deepEqual(quoted.args, ["-c", 'projects={"/srv/a \\"b\\"\\\\c"={trust_level="trusted"}}']);
   for (const folder of ["relative/member", "/srv/a\nb", "/srv/a/../b", "/"])
-    assert.throws(() => buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, true, undefined, undefined, folder), /absolute folder/);
+    assert.throws(() => buildLaunch("codex", { command: "codex", args: [] }, "", null, relay, enabled, false, undefined, undefined, folder), /absolute folder/);
   // Claude has no per-launch trust flag, and untrusted launches carry no override.
   assert.ok(!buildLaunch("claude", { command: "claude", args: [] }, "p", hooks, relay, enabled, true, undefined, undefined, memberFolder).args.some(arg => arg.includes("trust_level")));
   assert.ok(!buildLaunch("codex", { command: "codex", args: [] }, "p", hooks, relay, enabled, true).args.some(arg => arg.startsWith("projects=")));

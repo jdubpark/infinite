@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, symlinkSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { createHash, randomUUID } from "node:crypto";
-import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { captureWorkspace, encodeChunkBatch } from "../packages/host/src/workspace-checkpoint.js";
+import { uploadMissingChunks, type ChunkTransport } from "../packages/host/src/chunk-upload.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { inProcessHost, startHost, waitFor, type Host } from "./helpers.js";
 import { fixture as teamFixture } from "./team-fixture.js";
@@ -135,15 +136,29 @@ const putChunk = (host: Api, hash: string, body: Buffer) => fetch(`${host.origin
   method: "PUT", headers: { Authorization: `Bearer ${host.tokens.owner}`, "Content-Type": "application/octet-stream" }, body,
 });
 
+const putBatch = (host: Api, body: Buffer) => fetch(`${host.origin}/api/projects/rehearsal/sync/blobs`, {
+  method: "PUT", headers: { Authorization: `Bearer ${host.tokens.owner}`, "Content-Type": "application/octet-stream" }, body,
+});
+const ok = async (response: Response) => { assert.equal(response.status, 200, await response.text()); };
+/** The CLI's transport over the real routes; `batches` counts batch requests, and `legacy` answers them as a host without the route would. */
+function transport(host: Api, counts = { batches: 0, singles: 0 }, legacy = false): ChunkTransport {
+  return {
+    has: async hashes => (await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes })).body.missing,
+    putBatch: async body => {
+      counts.batches += 1;
+      if (legacy) return "unsupported";
+      await ok(await putBatch(host, body));
+    },
+    put: async (hash, bytes) => { counts.singles += 1; await ok(await putChunk(host, hash, bytes)); },
+  };
+}
+
 /** Capture the laptop tree, begin a generation, and upload the chunks the host lacks. */
-async function upload(host: Api, laptop: string, storeDir: string) {
+async function upload(host: Api, laptop: string, storeDir: string, chunks: ChunkTransport = transport(host)) {
   const manifest = await captureWorkspace({ roots: [laptop], cwd: laptop, storeDir });
   const begin = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {});
   assert.equal(begin.status, 200);
-  const hashes = [...new Set(manifest.entries.flatMap(e => e.chunks ?? []))];
-  const has = await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes });
-  for (const hash of has.body.missing as string[])
-    assert.equal((await putChunk(host, hash, Buffer.from(await readWorkspaceBlob(storeDir, hash), "base64"))).status, 200);
+  await uploadMissingChunks({ storeDir, hashes: manifest.entries.flatMap(e => e.chunks ?? []), transport: chunks });
   return { manifest, generation: begin.body.generation as string };
 }
 
@@ -172,7 +187,7 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
     const browser = { Cookie: login.headers.get("set-cookie")!.split(";")[0], Origin: host.origin, "Content-Type": "application/json" };
     assert.equal((await fetch(`${host.origin}/api/projects/rehearsal`, { headers: browser })).status, 200);
     const absent = "0".repeat(64);
-    for (const [method, route] of [["POST", "begin"], ["POST", "has"], ["PUT", `blob/${absent}`], ["GET", `blob/${absent}`], ["POST", "commit"], ["POST", "export"]])
+    for (const [method, route] of [["POST", "begin"], ["POST", "has"], ["PUT", `blob/${absent}`], ["PUT", "blobs"], ["GET", `blob/${absent}`], ["POST", "commit"], ["POST", "export"]])
       assert.equal((await fetch(`${host.origin}/api/projects/rehearsal/sync/${route}`, { method, headers: browser, body: method === "GET" ? undefined : "{}" })).status, 403, `${method} ${route}`);
     const missing = await host.fetchApi(`/projects/rehearsal/sync/blob/${absent}`);
     assert.equal(missing.status, 404);
@@ -184,6 +199,14 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
     // A body one byte over the chunk bound is refused as too large even when its hash is right.
     const oversize = Buffer.alloc(256 * 1024 + 1);
     assert.equal((await putChunk(host, createHash("sha256").update(oversize).digest("hex"), oversize)).status, 413);
+    // A batch is refused whole when any chunk misnames its content, when a frame is cut short, or when the body is over its bound.
+    const good = Buffer.from("batched\n"), goodHash = createHash("sha256").update(good).digest("hex");
+    const misnamed = await putBatch(host, encodeChunkBatch([{ hash: goodHash, bytes: good }, { hash: absent, bytes: Buffer.from("other\n") }]));
+    assert.deepEqual([misnamed.status, (await misnamed.json()).code], [400, "invalid-manifest"]);
+    assert.deepEqual((await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes: [goodHash] })).body.missing, [goodHash], "a refused batch stores none of its chunks");
+    const framed = encodeChunkBatch([{ hash: goodHash, bytes: good }]);
+    assert.equal((await putBatch(host, framed.subarray(0, framed.length - 1))).status, 400);
+    assert.equal((await putBatch(host, Buffer.alloc(2 * 1024 * 1024 + 1))).status, 413);
     // A manifest at the bound still fits the commit body with its generation, so the store judges it.
     const begun = (await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {})).body.generation;
     const atBound = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation: begun, manifest: "x".repeat(32 * 1024 * 1024 - 2) });
@@ -228,6 +251,31 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
     const hash = exported.body.manifest.entries.find((e: { path: string }) => e.path === "notes.md").chunks[0];
     const blob = await host.fetchApi(`/projects/rehearsal/sync/blob/${hash}`);
     assert.equal(Buffer.from(blob.body.base64, "base64").toString(), "v2\n");
+  } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("chunk upload batches a large tree into bounded requests and falls back to single chunks on an older host", { timeout: 60000 }, async () => {
+  const host = await startHost();
+  const root = realpathSync(mkdtempSync("/tmp/inf-psync-batch-"));
+  const laptop = join(root, "laptop"); mkdirSync(laptop);
+  try {
+    // Random content does not repeat; seven full chunks fill a 2 MiB batch, so twelve need two.
+    for (let index = 0; index < 12; index++) writeFileSync(join(laptop, `file-${index}.bin`), randomBytes(256 * 1024));
+    for (let index = 0; index < 300; index++) writeFileSync(join(laptop, `small-${index}.txt`), `small ${index}\n`);
+    const counts = { batches: 0, singles: 0 };
+    const { manifest, generation } = await upload(host, laptop, join(root, "store"), transport(host, counts));
+    assert.deepEqual(counts, { batches: 2, singles: 0 });
+    const committed = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation, manifest });
+    assert.equal(committed.body.appliedManifest, manifest.id);
+    assert.equal(readFileSync(join(host.config.projects[0].path, "small-299.txt"), "utf8"), "small 299\n");
+
+    writeFileSync(join(laptop, "small-0.txt"), "changed\n");
+    writeFileSync(join(laptop, "added.txt"), "added\n");
+    const legacy = { batches: 0, singles: 0 };
+    const second = await upload(host, laptop, join(root, "store"), transport(host, legacy, true));
+    assert.equal(legacy.singles, 2, "only the two new chunks are sent, one request each");
+    assert.equal((await host.fetchApi("/projects/rehearsal/sync/commit", "owner", second)).body.appliedManifest, second.manifest.id);
+    assert.equal(readFileSync(join(host.config.projects[0].path, "added.txt"), "utf8"), "added\n");
   } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
 });
 

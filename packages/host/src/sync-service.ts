@@ -5,7 +5,8 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { captureWorkspace, readWorkspaceBlob, type WorkspaceManifest } from "./workspace-checkpoint.js";
+import { captureWorkspace, type WorkspaceManifest } from "./workspace-checkpoint.js";
+import { uploadMissingChunks } from "./chunk-upload.js";
 
 export interface SyncServiceOptions {
   origin: string; token: string; projectId: string; root: string; stateFile: string; storeDir: string;
@@ -147,11 +148,14 @@ export async function startSyncService(options: SyncServiceOptions): Promise<Syn
 }
 
 class FatalSyncError extends Error {}
+/** A host older than a route answers its catch-all 404 without a code. */
+class MissingRouteError extends FatalSyncError {}
 /** A refusal the host explained: its status and code, and for a failed sync operation, a category. */
 class SyncRequestError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string, readonly category?: string) { super(message); }
 }
 const POLL = 3000;
+const BATCH_TIMEOUT = 120000;
 const BACKOFF_LIMIT = 5 * 60 * 1000;
 /** Apply failures the same content meets again; it is not pushed again until the laptop changes or the owner applies it. */
 const LASTING = new Set(["permission", "cross-device", "special-file", "missing-path"]);
@@ -159,6 +163,7 @@ async function refusal(response: Response): Promise<never> {
   const reply = await response.json().catch(() => ({})) as { error?: unknown; code?: unknown; category?: unknown };
   const reason = typeof reply.error === "string" ? reply.error : `HTTP ${response.status}`;
   // A revoked key, a removed project, or a manifest over the host's bound will not recover by retrying.
+  if (response.status === 404 && reply.code === undefined) throw new MissingRouteError(`Host refused sync (${response.status}): ${reason}`);
   if ([401, 403, 404, 413].includes(response.status)) throw new FatalSyncError(`Host refused sync (${response.status}): ${reason}`);
   throw new SyncRequestError(reason, response.status, typeof reply.code === "string" ? reply.code : undefined, typeof reply.category === "string" ? reply.category : undefined);
 }
@@ -249,18 +254,14 @@ async function runSyncService(): Promise<void> {
           pushing = true; held = false;
           progress();
           const { generation } = await api<{ generation: string }>(config, "begin", abort.signal, {});
-          const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
-          for (let offset = 0; offset < hashes.length; offset += 512) {
-            const batch = hashes.slice(offset, offset + 512);
-            progress();
-            const { missing } = await api<{ missing: unknown }>(config, "has", abort.signal, { hashes: batch });
-            // Upload only chunks this manifest named; the reply never selects other local content.
-            if (!Array.isArray(missing) || missing.some(hash => !batch.includes(hash))) throw new Error("Invalid sync transfer reply");
-            for (const hash of missing as string[]) {
-              await api(config, `blob/${hash}`, abort.signal, undefined, Buffer.from(await readWorkspaceBlob(config.storeDir, hash), "base64"));
-              progress();
-            }
-          }
+          await uploadMissingChunks({ storeDir: config.storeDir, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), signal: abort.signal, progress, transport: {
+            has: async (hashes, signal) => (await api<{ missing: unknown }>(config, "has", signal, { hashes })).missing,
+            putBatch: async (body, signal) => {
+              try { await api(config, "blobs", signal, undefined, body, BATCH_TIMEOUT); }
+              catch (error) { if (error instanceof MissingRouteError) return "unsupported"; throw error; }
+            },
+            put: async (hash, bytes, signal) => { await api(config, `blob/${hash}`, signal, undefined, bytes); },
+          } });
           // The host applies inside this request and reports nothing until it finishes; a heartbeat keeps startup alive meanwhile.
           const heartbeat = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
           try { await api(config, "commit", abort.signal, { generation, manifest }, undefined, COMMIT_TIMEOUT); }

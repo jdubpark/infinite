@@ -8,7 +8,8 @@ import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema, teamDeliverySchema, teamPermissionsSchema, type TeamDelivery } from "./team-types.js";
-import { captureWorkspace, readWorkspaceBlob } from "./workspace-checkpoint.js";
+import { captureWorkspace } from "./workspace-checkpoint.js";
+import { uploadMissingChunks } from "./chunk-upload.js";
 import { localProjectPath } from "./mirrored-projects.js";
 import { readSyncState, syncServiceRunning } from "./sync-service.js";
 import { canAskForBrief, chooseTeamBrief, orderedTeamMembers, summaryMember, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, wrapText, type TeamBriefStatus, type TeamWatchCommand } from "./team-watch.js";
@@ -426,6 +427,9 @@ async function postMutation(api: Api, receiptPath: string, key: string, endpoint
   return result;
 }
 
+const BATCH_TIMEOUT = 120000, CHUNK_TIMEOUT = 60000;
+/** A host without an endpoint answers its catch-all 404, which carries no code. */
+const olderHost = (error: unknown) => (error as { status?: unknown; code?: unknown })?.status === 404 && (error as { code?: unknown }).code === undefined;
 async function uploadCommit(api: Api, projectId: string, root: string, commit: string, tempStore: string, captured: (manifestId: string) => void) {
   const detail = await api.json<any>(`/projects/${projectId}`);
   if (detail.sync?.pendingGeneration) throw new Error("The cloud project has a pending sync generation. Resolve it before capturing local source.");
@@ -441,17 +445,15 @@ async function uploadCommit(api: Api, projectId: string, root: string, commit: s
     const manifest = await captureWorkspace({ roots: [cwd], cwd, storeDir: tempStore });
     captured(manifest.id);
     const { generation } = await api.json<{ generation: string }>(`/projects/${projectId}/sync/begin`, {});
-    const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
-    for (let offset = 0; offset < hashes.length; offset += 512) {
-      const batch = hashes.slice(offset, offset + 512);
-      const { missing } = await api.json<{ missing: string[] }>(`/projects/${projectId}/sync/has`, { hashes: batch });
-      if (!Array.isArray(missing) || missing.some(hash => !batch.includes(hash))) throw new Error("Host returned an invalid source upload request.");
-      for (const hash of missing) {
-        const bytes = Buffer.from(await readWorkspaceBlob(tempStore, hash), "base64");
-        const response = await api.request(`/projects/${projectId}/sync/blob/${hash}`, bytes, undefined, { "Content-Type": "application/octet-stream" }, "PUT");
-        await response.body?.cancel();
-      }
-    }
+    const octets = { "Content-Type": "application/octet-stream" };
+    await uploadMissingChunks({ storeDir: tempStore, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), transport: {
+      has: async (hashes, signal) => (await api.json<{ missing: unknown }>(`/projects/${projectId}/sync/has`, { hashes }, signal)).missing,
+      putBatch: async (body, signal) => {
+        try { await (await api.request(`/projects/${projectId}/sync/blobs`, body, AbortSignal.any([signal, AbortSignal.timeout(BATCH_TIMEOUT)]), octets, "PUT")).body?.cancel(); }
+        catch (error) { if (olderHost(error)) return "unsupported"; throw error; }
+      },
+      put: async (hash, bytes, signal) => { await (await api.request(`/projects/${projectId}/sync/blob/${hash}`, bytes, AbortSignal.any([signal, AbortSignal.timeout(CHUNK_TIMEOUT)]), octets, "PUT")).body?.cancel(); },
+    } });
     const commitResponse = await api.request(`/projects/${projectId}/sync/commit`, { generation, manifest }, AbortSignal.timeout(300000));
     const committed = await commitResponse.json() as any;
     const current = await api.json<any>(`/projects/${projectId}`);

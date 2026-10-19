@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { mkdirSync, readFileSync } from "node:fs";
 import { writeSealed, unseal } from "./vault.js";
 import { TeamError } from "./team-workspace.js";
@@ -143,7 +143,13 @@ export class ProjectGroupService {
     const projects = this.config.projects.filter(project => !grouped.has(project.id));
     const suggestions: ProjectGroupSuggestion[] = [];
     const seen = new Set<string>();
-    const excludedParents = new Set([resolve(this.config.sync?.homeDir ?? homedir()), ...(this.config.teams?.workspaceDir ? [resolve(this.config.teams.workspaceDir)] : [])]);
+    const home = resolve(this.config.sync?.homeDir ?? homedir());
+    const excludedParents = new Set([home, ...(this.config.teams?.workspaceDir ? [resolve(this.config.teams.workspaceDir)] : [])]);
+    // A folder directly below home (such as a projects folder) collects unrelated repositories.
+    const tooBroad = (parent: string) => {
+      const below = relative(home, parent);
+      return !below.startsWith("..") && !isAbsolute(below) && below.split(sep).length < 2;
+    };
     const add = (name: string, repos: Project[], reason: ProjectGroupSuggestion["reason"]) => {
       if (repos.length < 2) return;
       const key = repos.map(project => project.id).sort().join("\0");
@@ -154,7 +160,7 @@ export class ProjectGroupService {
     const byParent = new Map<string, Project[]>();
     for (const project of projects) {
       const parent = resolve(dirname(resolve(project.path)));
-      if (excludedParents.has(parent)) continue;
+      if (excludedParents.has(parent) || tooBroad(parent)) continue;
       byParent.set(parent, [...(byParent.get(parent) ?? []), project]);
     }
     for (const [parent, siblings] of byParent) add(basename(parent), siblings, "shared-parent");

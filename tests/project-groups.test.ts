@@ -17,6 +17,10 @@ function fixture() {
     { id: "beta", name: "Beta", path: join(root, "apps", "beta") },
     { id: "home-one", name: "Home One", path: join(root, "home", "one") },
     { id: "home-two", name: "Home Two", path: join(root, "home", "two") },
+    { id: "broad-one", name: "Broad One", path: join(root, "home", "projects", "one") },
+    { id: "broad-two", name: "Broad Two", path: join(root, "home", "projects", "two") },
+    { id: "shop-web", name: "Shop Web", path: join(root, "home", "work", "shop", "web") },
+    { id: "shop-api", name: "Shop API", path: join(root, "home", "work", "shop", "api") },
     { id: "workspace-one", name: "Workspace One", path: join(root, "workspace", "one") },
     { id: "workspace-two", name: "Workspace Two", path: join(root, "workspace", "two") },
     { id: "linear-one", name: "Linear One", path: join(root, "linear", "one"), linear: { teamId: randomUUID(), projectId: linearProjectId } },
@@ -91,6 +95,8 @@ test("group suggestions cover shared parents and Linear projects while excluding
     assert.ok(result.suggestions.some(s => s.reason === "shared-parent" && s.name === "apps" && s.repos.includes("rehearsal") && s.repos.includes("beta")));
     assert.ok(!result.suggestions.some(s => s.reason === "shared-parent" && s.repos.some(id => id.startsWith("home-"))));
     assert.ok(!result.suggestions.some(s => s.reason === "shared-parent" && s.repos.some(id => id.startsWith("workspace-"))));
+    assert.ok(!result.suggestions.some(s => s.repos.some(id => id.startsWith("broad-"))), "A folder directly below home is too broad to suggest.");
+    assert.ok(result.suggestions.some(s => s.reason === "shared-parent" && s.name === "shop" && s.repos.includes("shop-web") && s.repos.includes("shop-api")));
     assert.ok(result.suggestions.some(s => s.reason === "shared-linear-project" && s.name === "Linear One" && s.repos.includes("linear-one") && s.repos.includes("linear-two")));
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

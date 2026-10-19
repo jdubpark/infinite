@@ -62,7 +62,7 @@ public enum BoardColumn: String, CaseIterable, Sendable {
         switch self {
         case .needsInput: return "Waiting on your answer or to be unblocked"
         case .working: return "Agents are on it"
-        case .review: return "Agents report done · nothing merges until you do"
+        case .review: return "Results need your review · delivery follows each repository's policy"
         case .ended: return "Cancelled, merged, or stopped"
         }
     }
@@ -151,6 +151,36 @@ public struct MissionSubtask: Identifiable, Equatable, Sendable {
     }
 }
 
+/// One question the coordinator asked the owner. Its host ID is its identity: a card, its draft
+/// answer, and the request that answers it all follow the ID, never the question's position.
+public struct MissionDecision: Identifiable, Equatable, Sendable {
+    public let value: JSON
+    public init(_ value: JSON) { self.value = value }
+    public var id: String { value["id"].string }
+    public var question: String { value["question"].string }
+    public var subtaskID: String { value["subtaskId"].string }
+    public var answered: Bool { value["answer"] != .null }
+}
+
+/// One owner request for a mission: its path and body, pinned to the decision and revision the owner
+/// acted on. A retry resends the identical request, so the host applies it at most once.
+public struct MissionRequest: Equatable, Sendable {
+    public let path: String
+    public let body: JSON
+    public static func answer(missionID: String, decisionID: String, revision: Int, text: String, requestID: String) -> MissionRequest {
+        MissionRequest(path: "/missions/\(missionID)/answer/\(decisionID)", body: body(requestID, revision, text))
+    }
+    /// `steer` carries text; `pause`, `resume`, and `cancel` do not.
+    public static func action(missionID: String, name: String, revision: Int, text: String? = nil, requestID: String) -> MissionRequest {
+        MissionRequest(path: "/missions/\(missionID)/\(name)", body: body(requestID, revision, text))
+    }
+    private static func body(_ requestID: String, _ revision: Int, _ text: String?) -> JSON {
+        var fields: [String: JSON] = ["requestId": .string(requestID), "revision": .number(Double(revision))]
+        if let text { fields["text"] = .string(text) }
+        return .object(fields)
+    }
+}
+
 /// One mission as the host reports it. Values are read on demand so unknown fields pass through.
 public struct Mission: Identifiable, Equatable, Sendable {
     public let value: JSON
@@ -174,8 +204,8 @@ public struct Mission: Identifiable, Equatable, Sendable {
     public var steering: [JSON] { value["steering"].array }
     public var events: [JSON] { value["events"].array }
     public var result: JSON { value["result"] }
-    /// Decisions nobody has answered; the owner answers these first.
-    public var openDecisions: [JSON] { decisions.filter { $0["answer"] == .null } }
+    /// Decisions nobody has answered, in the host's order; the owner answers these first.
+    public var openDecisions: [MissionDecision] { decisions.map(MissionDecision.init).filter { !$0.answered && !$0.id.isEmpty } }
     public var answeredDecisions: [JSON] { decisions.filter { $0["answer"] != .null } }
     public var ended: Bool { status == "cancelled" }
     public var statusLabel: String { Self.labels[status] ?? status.replacingOccurrences(of: "-", with: " ").capitalizedFirstLetter }
@@ -198,5 +228,5 @@ public struct Mission: Identifiable, Equatable, Sendable {
     public var canCancel: Bool { status != "cancelled" }
     public func subtask(_ id: String) -> MissionSubtask? { subtasks.first { $0.id == id } }
     /// Which subtask raised an escalated decision, when one did.
-    public func origin(of decision: JSON) -> MissionSubtask? { decision["subtaskId"].string.isEmpty ? nil : subtask(decision["subtaskId"].string) }
+    public func origin(of decision: MissionDecision) -> MissionSubtask? { decision.subtaskID.isEmpty ? nil : subtask(decision.subtaskID) }
 }

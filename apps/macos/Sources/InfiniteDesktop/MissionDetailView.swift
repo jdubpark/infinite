@@ -87,18 +87,22 @@ struct MissionDetailView: View {
         let open = mission.openDecisions
         if !open.isEmpty {
             section("Decisions for you", count: open.count) {
-                ForEach(Array(open.enumerated()), id: \.offset) { _, decision in
-                    DecisionCard(decision: decision, caption: caption(decision), disabled: !model.canAct || mission.status == "paused") { text in
-                        Task { await model.answer(decision, text: text) }
+                // Keyed by decision ID: when polling drops an answered question, a typed draft stays
+                // with its own question instead of moving to the next card.
+                let revision = mission.revision
+                ForEach(open) { decision in
+                    DecisionCard(decision: decision.value, caption: caption(decision), disabled: !model.canAct || mission.status == "paused") { text in
+                        Task { await model.answer(decisionID: decision.id, revision: revision, text: text) }
                     }
+                    .id(decision.id)
                 }
             }
         }
     }
     /// The coordinator asks every owner question; one escalated from a subteam names it.
-    private func caption(_ decision: JSON) -> String {
+    private func caption(_ decision: MissionDecision) -> String {
         let asker = mission.origin(of: decision).map { "Coordinator, for \($0.title) in \(repoName($0.repoProjectID))" } ?? "Coordinator"
-        return "\(asker) · \(teamDate(decision["createdAt"].string))"
+        return "\(asker) · \(teamDate(decision.value["createdAt"].string))"
     }
 
     /// The coordinator's claim that every subtask finished. It is a report, not acceptance.

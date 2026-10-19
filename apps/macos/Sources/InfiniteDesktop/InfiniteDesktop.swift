@@ -93,17 +93,28 @@ struct DesktopView: View {
     @ObservedObject var app: AppModel
     @Environment(\.openWindow) private var openWindow
     @State private var search = ""
+    @State private var endID: String?
+    @State private var showEndedSessions = false
     private var searching: Bool { !search.isEmpty }
+    private var filteredSessions: [AgentSession] {
+        app.sessions.filter { search.isEmpty || [$0.title, $0.path, providerName($0.provider)].joined(separator: " ").localizedCaseInsensitiveContains(search) }
+    }
     private var filteredGroups: [ProjectGroup] {
         app.projectGroups.groups.filter { search.isEmpty || ([$0.name] + $0.repos.map(\.name)).joined(separator: " ").localizedCaseInsensitiveContains(search) }
     }
-    /// One list selects Home or a project; a project row carries a prefix so the two never collide.
-    /// While a mission, team, or session is open nothing is selected, so any row leads back to the board.
+    /// One list selects Home, a project, or a session; prefixes keep the three from colliding.
+    /// While a mission or team is open nothing is selected, so any row leads back.
     private var selection: Binding<String?> {
-        Binding(get: { app.showingHome ? app.projectFilter.map { "project:" + $0 } ?? "home" : nil }, set: { value in
+        Binding(get: {
+            if app.showingHome { return app.projectFilter.map { "project:" + $0 } ?? "home" }
+            if app.selectedTeamID == nil && app.selectedMissionID == nil, let id = app.selectedID { return "session:" + id }
+            return nil
+        }, set: { value in
             guard let value else { return }
-            if !app.showingHome && app.selectedTeamID == nil && app.selectedMissionID == nil, let current = app.selectedID { app.terminals[current]?.markRead() }
-            app.showHome(project: value.hasPrefix("project:") ? String(value.dropFirst(8)) : nil)
+            let leavingSession = !app.showingHome && app.selectedTeamID == nil && app.selectedMissionID == nil
+            if leavingSession, let current = app.selectedID, value != "session:" + current { app.terminals[current]?.markRead() }
+            if value.hasPrefix("session:") { app.openSession(String(value.dropFirst(8))) }
+            else { app.showHome(project: value.hasPrefix("project:") ? String(value.dropFirst(8)) : nil) }
         })
     }
     private var missionModel: MissionModel? { app.showingHome ? nil : app.selectedMissionID.flatMap(app.missionModel(for:)) }
@@ -143,12 +154,20 @@ struct DesktopView: View {
         .sheet(isPresented: $app.showingPair) { PairView(app: app) }
         .sheet(isPresented: $app.showingCreate) { CreateView(app: app) }
         .sheet(isPresented: $app.showingCreateTeam) { TeamCreateView(app: app) }
+        .alert("End this session?", isPresented: Binding(get: { endID != nil }, set: { if !$0 { endID = nil } })) {
+            Button("Cancel", role: .cancel) { endID = nil }
+            Button("End session", role: .destructive) { if let id = endID { Task { await app.end(id) } }; endID = nil }
+        } message: { Text("This stops the agent process on the server. Its recording stays available.") }
     }
 
-    /// Home, then every project. Sessions stay reachable from their team's page, not the sidebar.
+    /// Home, every project, then sessions: the person's own, plus any team member stopped on a
+    /// provider permission prompt, so no prompt is only reachable through its team's page.
     private var sidebar: some View {
         let groups = filteredGroups
         let waiting = app.board.count(.needsInput)
+        let sessions = filteredSessions.filter { $0.value["team"] == .null || $0.needsYou || searching }
+        let live = sessions.filter(\.running)
+        let ended = sessions.filter { !$0.running }
         return List(selection: selection) {
             if app.active != nil && !searching {
                 Label("Home", systemImage: "square.grid.2x2").tag("home").badge(waiting)
@@ -156,13 +175,18 @@ struct DesktopView: View {
             if !groups.isEmpty {
                 Section("Projects") { ForEach(groups) { group in ProjectSidebarRow(group: group, waiting: app.board.count(.needsInput, in: group)).tag("project:" + group.id) } }
             }
+            if !live.isEmpty { Section("Sessions") { rows(live) } }
+            if !ended.isEmpty {
+                if searching { Section("Ended sessions") { rows(ended) } }
+                else { Section(isExpanded: $showEndedSessions) { rows(ended) } header: { Text("Ended sessions") } }
+            }
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
         .background(Palette.sidebar)
-        .searchable(text: $search, placement: .sidebar, prompt: "Find a project")
+        .searchable(text: $search, placement: .sidebar, prompt: "Find a project or session")
         .overlay {
-            if searching && groups.isEmpty {
+            if searching && groups.isEmpty && sessions.isEmpty {
                 Text("No matches").foregroundStyle(.secondary).font(.callout)
             } else if app.active == nil {
                 Text("No server connected").foregroundStyle(.secondary).font(.callout)
@@ -196,6 +220,32 @@ struct DesktopView: View {
         .glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .padding(10)
     }
+    /// A session row says "Needs you" while its agent waits on a provider prompt; that is never answered for it.
+    private func rows(_ sessions: [AgentSession]) -> some View {
+        ForEach(sessions) { row in
+            HStack(spacing: 9) {
+                StatusGlyph(session: row, size: 12)
+                Text(row.title).lineLimit(1).foregroundStyle(row.running ? .primary : .secondary)
+                Spacer(minLength: 4)
+                if row.needsYou {
+                    Text("Needs you").font(.caption.weight(.medium)).foregroundStyle(Palette.attention)
+                        .padding(.horizontal, 6).padding(.vertical, 1).background(Palette.attention.opacity(0.15), in: Capsule())
+                } else if row.value["team"] != .null {
+                    Image(systemName: "person.3").font(.caption2).foregroundStyle(.secondary)
+                        .help("\(TeamRun.roleName(row.value["team"]["role"].string)) in team \(app.teams.first { $0.id == row.value["team"]["runId"].string }?.title ?? "run")")
+                }
+            }
+            .padding(.vertical, 1)
+            .help("\(providerName(row.provider)) · \(row.displayState)\(row.running && !row.now.isEmpty ? " · " + row.now : "")")
+            .accessibilityLabel("\(row.title), \(providerName(row.provider)), \(row.displayState)")
+            .tag("session:" + row.id)
+            .contextMenu {
+                Button("Open beside current") { app.openSession(app.selectedID ?? row.id); app.secondaryID = row.id }.disabled(app.selectedID == row.id || app.selectedID == nil)
+                if app.isOwner && row.running { Button("End session…", role: .destructive) { endID = row.id } }
+            }
+        }
+    }
+
     @ViewBuilder private var detail: some View {
         VStack(spacing: 0) {
             if !app.message.isEmpty {
@@ -216,7 +266,7 @@ struct DesktopView: View {
                             ContentUnavailableView {
                                 Label(app.sessions.isEmpty ? "No sessions yet" : "Choose a session", systemImage: "terminal")
                             } description: {
-                                Text(app.sessions.isEmpty ? "Start Claude Code or Codex in one of your projects, or hand a project a mission from Home." : "Open a session from a team's members.")
+                                Text(app.sessions.isEmpty ? "Start Claude Code or Codex in one of your projects, or hand a project a mission from Home." : "Pick a session from the sidebar.")
                             } actions: {
                                 Button("New session") { app.showingCreate = true }.disabled(!app.connected || !app.isOwner)
                             }

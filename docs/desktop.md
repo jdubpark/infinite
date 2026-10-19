@@ -20,9 +20,13 @@ search and **Home**, badged with the number of board rows that need input, then
 [missions](missions.md)), owner-created groups first with their repository
 count, then the implicit single-repository projects. A dot marks a project with
 a row waiting on the owner. Selecting a project shows Home narrowed to it.
-Sessions are not listed in the sidebar; they open from a team's members or
-attention list. A session whose attention state is exited, unreachable, or
-recording-error counts as ended whatever its stored status says. The footer
+**Sessions** follow: the person's own sessions, plus any team member session
+stopped on a provider permission prompt, which carries a **Needs you** badge so
+no prompt is reachable only through its team's page. Ended sessions are in a
+folded **Ended sessions** group, and search also finds team member sessions. A
+session's menu opens it beside the current one or ends it. A session whose
+attention state is exited, unreachable, or recording-error counts as ended
+whatever its stored status says. The footer
 names the connected server with its state in words, switches or adds servers,
 and opens Connections. A session shows its title, provider, state, and working
 directory above its content, with the prompt editor below. The toolbar holds a
@@ -75,7 +79,7 @@ seconds with the session list:
 | --- | --- |
 | Needs input | missions, team runs, and goals waiting on an answer or blocked |
 | Working | planning, working, and paused ones |
-| Ready for review | the agents report done; nothing merges until the owner does |
+| Ready for review | the agents report done; results need the owner's review, and delivery follows each repository's policy |
 | Ended | cancelled, merged, and otherwise stopped ones, folded until opened |
 
 Rows are newest-updated first. Each row is one line of status glyph, title,
@@ -239,8 +243,9 @@ and [terminal SDK contract](https://github.com/manaflow-ai/cmux/blob/main/cmux-t
 The Infinite connection lists managed sessions, configured projects, actual
 working directories, provider, observed state, and connection freshness. Owners
 can create, resume supported conversations, and explicitly **End session**.
-Closing a view detaches it; ending the process is separately labeled and
-confirmed from the session's menu.
+Two sessions can be displayed beside each other through the sidebar's **Open
+beside current**. Closing a view detaches it; ending the process is separately
+labeled and confirmed.
 
 Infinite terminal observation does not claim input control. The lease is claimed
 on the first send or when terminal typing is enabled, never while only watching.

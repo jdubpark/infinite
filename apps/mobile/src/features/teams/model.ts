@@ -4,6 +4,7 @@
  * revisions; these helpers only decide which controls to offer.
  */
 import type { StatusKind } from "../../status";
+import type { OwnerRating, Rubric, TaskUsage } from "../cost/model";
 
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
@@ -13,7 +14,7 @@ export type TeamLineup = { coordinator: ModelProfile; integrator: ModelProfile; 
 export type LinearTracking = { status: "pending" | "synced" | "blocked" | "error"; reason?: string; checkedAt?: string; issue?: { identifier: string; url: string; title: string; state: { name: string } } };
 export type TeamEvidence = { source: string; observation: string };
 export type TeamBrief = { title: string; problem: string; evidence: TeamEvidence[]; dataShape: string; acceptance: string[]; expectedOutcome: string; uiChanges: boolean };
-export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { toProfileId: string; reason: string } };
+export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { toProfileId: string; reason: string }; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
 export type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string };
 export type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string };
 /** The coordinator's recorded decision about one member's open provider prompt; the prompt itself stays host-private. */
@@ -64,6 +65,7 @@ export type ProductGoal = {
   lineup: TeamLineup; linear?: LinearTracking; activeTeamId?: string; cycles: GoalCycle[]; memberCount: number;
   steering: { text: string; revision: number; at: string }[]; events: { at: string; text: string }[];
   outcomes: { result: GoalResult; summary: string; evidence: string; at: string; revision: number }[];
+  tasks?: { teamId: string; taskId: string; title: string; usage?: TaskUsage }[];
 };
 
 export type DeviceRole = "owner" | "controller" | "viewer";

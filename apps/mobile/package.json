@@ -4,6 +4,7 @@
   "main": "expo-router/entry",
   "dependencies": {
     "@infinite/attention": "0.1.0",
+    "@infinite/remote": "0.1.0",
     "expo": "~57.0.26",
     "expo-constants": "~57.0.20",
     "expo-crypto": "~57.0.3",
@@ -18,7 +19,7 @@
     "react-native": "0.86.3",
     "react-native-safe-area-context": "~5.7.0",
     "react-native-screens": "~4.26.0",
-    "@infinite/remote": "0.1.0"
+    "react-native-svg": "15.15.4"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",

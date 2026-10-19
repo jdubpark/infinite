@@ -104,7 +104,10 @@ export function Inbox({
           <Text style={s.machineName} numberOfLines={1}>{machineName(connection)}</Text>
           <View style={s.toggle}><Glyph name={machineSheet ? "up" : "down"} size={11} color={theme.colors.secondaryInk} /></View>
         </Pressable>
-        <LiveStatus online={online} loading={loading} seen={seen} />
+        <View style={s.headerRight}>
+          {data?.me.usage?.enabled ? <GlassButton glyph="chart" label="Cost" size={36} onPress={() => router.push({ pathname: "/cost", params: { machine: connectionKey(connection) } })} /> : null}
+          <LiveStatus online={online} loading={loading} seen={seen} />
+        </View>
       </View>
       <OfflineBanner
         online={online || loading}
@@ -199,6 +202,7 @@ export function Inbox({
 const s = StyleSheet.create({
   fill: { flex: 1 },
   header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 16, paddingTop: 6, paddingBottom: 4, minHeight: 48 },
+  headerRight: { flexDirection: "row", alignItems: "center", gap: 8 },
   machine: { flexDirection: "row", alignItems: "center", gap: 7, flexShrink: 1, minHeight: 40 },
   machineName: { fontSize: 15, fontWeight: "600", color: theme.colors.ink, flexShrink: 1 },
   toggle: { width: 24, height: 24, borderRadius: 12, alignItems: "center", justifyContent: "center", backgroundColor: theme.colors.secondarySurface },

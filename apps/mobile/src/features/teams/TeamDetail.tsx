@@ -18,6 +18,8 @@ import { useRunRequest } from "./useRunRequest";
 import { AgentApproval } from "./TeamApprovals";
 import { AgentLog, JevcodeSummary } from "./TeamSummary";
 import { orderedMembers } from "./summary";
+import { CostLine, RatingControl, RubricLine } from "../cost/parts";
+import { useTaskRating } from "../cost/useCost";
 
 type Tab = "overview" | "tasks" | "agents" | "activity";
 const CHECK_KIND: Record<TeamCheck["status"], StatusKind> = { running: "progress", passed: "done", failed: "blocked", interrupted: "stopped" };
@@ -34,6 +36,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const router = useRouter();
   const machine = connectionKey(connection);
   const poll = usePoll(() => api<TeamView>(connection, `/teams/${id}`), 2000, [connection, id]);
+  const rating = useTaskRating(connection, id, poll.refresh);
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
   const { data: sessions } = usePoll(() => api<{ sessions: SessionRow[] }>(connection, "/sessions").then(value => value.sessions), 4000, [connection]);
   // A mutation's result shows at once; a poll that started before it cannot undo it.
@@ -228,6 +231,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
                 <View style={s.main}>
                   <Text style={s.rowTitle} numberOfLines={open ? undefined : 2}>{task.title}</Text>
                   <Text style={t.note} numberOfLines={1}>{[task.id, after.length ? `after ${after.join(", ")}` : "", assignee].filter(Boolean).join(" · ")}</Text>
+                  <CostLine usage={task.usage} />
                   {task.escalation ? <Text style={t.warning} numberOfLines={open ? undefined : 1}>Escalated to {task.escalation.toProfileId}: {task.escalation.reason}</Text> : null}
                 </View>
                 {assignee ? <Avatar label={assignee} provider={profile?.provider ?? member?.provider ?? team.provider} size={24} state={member ? agentState(member) : undefined} /> : <View style={s.unassigned} accessible accessibilityLabel="Unassigned" />}
@@ -238,6 +242,9 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
                 <Clamp text={task.instructions} lines={5} />
                 {task.paths.length ? <><Text style={t.label}>Owned paths</Text>{task.paths.map(path => <Text key={path} selectable style={t.mono}>{path}</Text>)}</> : null}
                 {profile ? <ProfileLine profile={profile} /> : null}
+                {task.rubric ? <RubricLine rubric={task.rubric} /> : null}
+                {me?.role === "owner" ? <RatingControl value={task.ownerRating} disabled={!fresh} busy={rating.busy === task.id} error={rating.error}
+                  onRate={score => void rating.rate(task.id, score)} /> : task.ownerRating ? <Text style={t.note}>Owner rating · {task.ownerRating.score}/5 · {shortDate(task.ownerRating.at)}</Text> : null}
                 {task.commit ? <Text selectable style={t.mono} numberOfLines={1} ellipsizeMode="middle">commit {task.commit}</Text> : null}
                 {member ? <Button compact secondary glyph="people" title={`${ROLE_NAMES[member.role]} log`} onPress={() => showAgent(member)} /> : null}
               </View> : null}

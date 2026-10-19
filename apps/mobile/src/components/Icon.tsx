@@ -8,7 +8,7 @@ import { theme } from "../theme";
  */
 export type GlyphName =
   | "back" | "forward" | "down" | "up" | "plus" | "close" | "check" | "search" | "terminal"
-  | "more" | "send" | "people" | "target" | "stack" | "pause" | "play" | "dot";
+  | "more" | "send" | "people" | "target" | "stack" | "pause" | "play" | "dot" | "chart";
 
 export function Glyph({ name, size = 18, color = theme.colors.ink }: { name: GlyphName; size?: number; color?: string }) {
   const w = Math.max(1.6, size / 11);
@@ -74,6 +74,12 @@ export function Glyph({ name, size = 18, color = theme.colors.ink }: { name: Gly
         borderTopWidth: size * 0.32, borderTopColor: "transparent", borderBottomWidth: size * 0.32, borderBottomColor: "transparent" }} /></View>;
     case "dot":
       return <View style={box}><View style={{ width: size * 0.42, height: size * 0.42, borderRadius: size, backgroundColor: color }} /></View>;
+    case "chart": {
+      const barWidth = w * 1.4, gap = size * 0.14;
+      return <View style={[box, { flexDirection: "row", alignItems: "flex-end", gap }]}>
+        {[0.45, 0.8, 0.6].map((height, index) => <View key={index} style={{ width: barWidth, height: size * height, borderRadius: w, backgroundColor: color }} />)}
+      </View>;
+    }
   }
 }
 

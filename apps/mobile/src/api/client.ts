@@ -139,6 +139,7 @@ export type Me = {
   capabilities?: { signals: boolean; answer: boolean; push: boolean };
   teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
   goals?: { enabled: boolean };
+  usage?: { enabled: boolean; budgets?: Record<string, unknown> };
 };
 export type LogEvent = {
   seq: number;

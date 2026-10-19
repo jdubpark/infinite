@@ -262,9 +262,15 @@ test("chunk upload batches a large tree into bounded requests and falls back to 
     // Random content does not repeat; seven full chunks fill a 2 MiB batch, so twelve need two.
     for (let index = 0; index < 12; index++) writeFileSync(join(laptop, `file-${index}.bin`), randomBytes(256 * 1024));
     for (let index = 0; index < 300; index++) writeFileSync(join(laptop, `small-${index}.txt`), `small ${index}\n`);
-    const counts = { batches: 0, singles: 0 };
-    const { manifest, generation } = await upload(host, laptop, join(root, "store"), transport(host, counts));
-    assert.deepEqual(counts, { batches: 2, singles: 0 });
+    // The first batch request loses its connection, as fetch reports a dropped socket; the uploader sends it again.
+    const counts = { batches: 0, singles: 0 }, base = transport(host, counts);
+    let dropped = false;
+    const flaky: ChunkTransport = { ...base, putBatch: async (body, signal) => {
+      if (!dropped) { dropped = true; counts.batches += 1; throw new TypeError("fetch failed"); }
+      return base.putBatch(body, signal);
+    } };
+    const { manifest, generation } = await upload(host, laptop, join(root, "store"), flaky);
+    assert.deepEqual(counts, { batches: 3, singles: 0 }, "two batches, one of them sent twice");
     const committed = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation, manifest });
     assert.equal(committed.body.appliedManifest, manifest.id);
     assert.equal(readFileSync(join(host.config.projects[0].path, "small-299.txt"), "utf8"), "small 299\n");

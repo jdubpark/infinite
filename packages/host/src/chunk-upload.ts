@@ -1,9 +1,11 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { CHUNK_FRAME_BYTES, encodeChunkBatch, readWorkspaceBlob, WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 
 /** Requests kept in flight. A remote host is often a long round trip away, so a serial upload is bound by latency, not bandwidth. */
 const BATCHES_IN_FLIGHT = 4;
 const CHUNKS_IN_FLIGHT = 16;
 const PRESENCE_BATCH = 512;
+const ATTEMPTS = 4;
 
 export interface ChunkTransport {
   /** The hashes in `hashes` the host lacks. */
@@ -11,6 +13,16 @@ export interface ChunkTransport {
   /** Store a framed batch, or report that the host predates batch upload. */
   putBatch(body: Buffer, signal: AbortSignal): Promise<"unsupported" | void>;
   put(hash: string, bytes: Buffer, signal: AbortSignal): Promise<void>;
+}
+
+/** Retry a dropped connection; fetch rejects with a TypeError then. Chunk requests are idempotent, and an HTTP refusal or a timeout is not retried. */
+async function retried<T>(send: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try { return await send(); } catch (error) {
+      if (attempt === ATTEMPTS || signal.aborted || !(error instanceof TypeError)) throw error;
+      await delay(250 * attempt, undefined, { signal });
+    }
+  }
 }
 
 async function pool<T, R>(items: T[], limit: number, run: (item: T) => Promise<R>, signal?: AbortSignal): Promise<R[]> {
@@ -37,7 +49,7 @@ export async function uploadMissingChunks(options: { storeDir: string; hashes: s
     const hashes = [...new Set(options.hashes)], groups: string[][] = [];
     for (let offset = 0; offset < hashes.length; offset += PRESENCE_BATCH) groups.push(hashes.slice(offset, offset + PRESENCE_BATCH));
     const missing = (await pool(groups, BATCHES_IN_FLIGHT, async group => {
-      const reply = await transport.has(group, signal);
+      const reply = await retried(() => transport.has(group, signal), signal);
       // Upload only chunks this manifest named; the reply never selects other local content.
       if (!Array.isArray(reply) || reply.some(hash => !group.includes(hash))) throw new Error("Host returned an invalid source upload request.");
       progress?.();
@@ -70,9 +82,10 @@ export async function uploadMissingChunks(options: { storeDir: string; hashes: s
         try {
           const chunks = await take();
           if (!chunks.length) return;
-          if (batched && await transport.putBatch(encodeChunkBatch(chunks), signal) !== "unsupported") { progress?.(); continue; }
+          const body = encodeChunkBatch(chunks);
+        if (batched && await retried(() => transport.putBatch(body, signal), signal) !== "unsupported") { progress?.(); continue; }
           batched = false;
-          await pool(chunks, CHUNKS_IN_FLIGHT / BATCHES_IN_FLIGHT, async ({ hash, bytes }) => { await transport.put(hash, bytes, signal); progress?.(); }, signal);
+          await pool(chunks, CHUNKS_IN_FLIGHT / BATCHES_IN_FLIGHT, async ({ hash, bytes }) => { await retried(() => transport.put(hash, bytes, signal), signal); progress?.(); }, signal);
         } catch (error) { failed = true; throw error; }
       }
     }));

@@ -59,6 +59,7 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(run(["decisions": .array([decision("open", revision: 2)])]).projectState, .pending)
         XCTAssertEqual(run(["status": .string("paused"), "decisions": .array([decision("open", revision: 2)])]).projectState, .paused)
         XCTAssertEqual(ProjectState.allCases.filter(\.closed), [.complete, .cancelled, .aborted])
+        XCTAssertEqual(ProjectState.allCases, [.stuck, .ongoing, .pending, .paused, .complete, .cancelled, .aborted])
     }
 
     func testStatusRingNeverDropsBelowThePhase() {
@@ -74,6 +75,28 @@ final class TeamRunTests: XCTestCase {
         let events: JSON = .array([["at": "2026-10-18T01:00:00.000Z", "text": "Plan reported."], ["at": "2026-10-18T02:30:00.000Z", "text": "Checks passed."]].map { .object($0.mapValues { .string($0) }) })
         XCTAssertEqual(run(["updatedAt": .string("2026-10-18T09:00:00.000Z"), "events": events]).lastActivityAt, "2026-10-18T02:30:00.000Z")
         XCTAssertEqual(run(["updatedAt": .string("2026-10-18T09:00:00.000Z")]).lastActivityAt, "2026-10-18T09:00:00.000Z")
+    }
+
+    func testBlockedRunsSortFirstAndKeepTheOrderWithinEachGroup() {
+        let ready = run(["id": .string("ready"), "status": .string("ready-for-review")])
+        let blockedA = run(["id": .string("blocked-a"), "status": .string("blocked")])
+        let working = run(["id": .string("working"), "status": .string("implementing")])
+        let blockedB = run(["id": .string("blocked-b"), "status": .string("blocked")])
+        let sorted = TeamRun.blockedFirst([ready, blockedA, working, blockedB])
+        XCTAssertEqual(sorted.map(\.id), ["blocked-a", "blocked-b", "ready", "working"])
+        XCTAssertEqual(TeamRun.blockedFirst([]).map(\.id), [])
+    }
+
+    func testOnlyAResumableBlockedRunWithoutGoalOrReceiptOffersResume() {
+        let receipt: JSON = .object(["id": .string("r1")])
+        XCTAssertTrue(run(["status": .string("blocked"), "resumable": .bool(true)]).offersResume)
+        XCTAssertTrue(run(["status": .string("blocked"), "resumable": .bool(true), "goal": .null, "deliveryReceipt": .null]).offersResume)
+        XCTAssertTrue(run(["status": .string("blocked"), "resumable": .bool(true), "goal": .string("")]).offersResume)
+        XCTAssertFalse(run(["status": .string("blocked"), "resumable": .bool(false)]).offersResume)
+        XCTAssertFalse(run(["status": .string("blocked")]).offersResume)
+        XCTAssertFalse(run(["status": .string("blocked"), "resumable": .bool(true), "goal": .string("Ship the export")]).offersResume)
+        XCTAssertFalse(run(["status": .string("blocked"), "resumable": .bool(true), "deliveryReceipt": receipt]).offersResume)
+        XCTAssertFalse(run(["status": .string("paused"), "resumable": .bool(true)]).offersResume)
     }
 
     func testFinishedRunsAndLineup() {

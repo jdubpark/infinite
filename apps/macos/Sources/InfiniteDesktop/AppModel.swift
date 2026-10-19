@@ -56,6 +56,12 @@ extension ISO8601DateFormatter {
     static let flexible: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
 }
 
+/// A list Resume that did not go through, shown beside its run until a later refresh or resume clears it.
+struct TeamResumeFailure: Equatable {
+    let message: String
+    let at: Date
+}
+
 @MainActor final class AppModel: ObservableObject {
     @Published var profiles: [HostProfile] = []
     @Published var activeID = ""
@@ -81,6 +87,9 @@ extension ISO8601DateFormatter {
     @Published var showingCreateTeam = false
     @Published var pendingTeamCreation = DraftRecord()
     @Published private(set) var teamsFresh = false
+    /// List Resume: runs with a resume in flight, and the last failure per run until a later refresh succeeds.
+    @Published private(set) var resumingTeams: Set<String> = []
+    @Published private(set) var teamResumeFailures: [String: TeamResumeFailure] = [:]
     var teamModels: [String: TeamModel] = [:]
     /// Resource samples are only fetched while a Resources window is showing them.
     var resourceWatchers = 0
@@ -208,14 +217,17 @@ extension ISO8601DateFormatter {
     /// The team list is small and the whole list arrives each poll; only a real change redraws.
     private func refreshTeams(_ generation: UUID) async {
         guard let client else { return }
+        let started = Date()
         do {
             let response = try await client.request("/teams")
             guard generation == connectionGeneration else { return }
-            let next = response["teams"].array.map(TeamRun.init).sorted {
+            // A failure recorded while this refresh was in flight still stands; older ones are cleared.
+            teamResumeFailures = teamResumeFailures.filter { $0.value.at >= started }
+            let next = TeamRun.blockedFirst(response["teams"].array.map(TeamRun.init).sorted {
                 if $0.needsYou != $1.needsYou { return $0.needsYou }
                 if $0.finished != $1.finished { return $1.finished }
                 return $0.createdAt > $1.createdAt
-            }
+            })
             if next != teams { teams = next }
             for team in next { teamModels[team.id]?.observe(team) }
             if !teamsFresh { teamsFresh = true }
@@ -223,6 +235,18 @@ extension ISO8601DateFormatter {
             guard generation == connectionGeneration else { return }
             if teamsFresh { teamsFresh = false }
         }
+    }
+    /// Resume from the Home list: the same request as the team page, with its failure kept for the row.
+    func resumeTeam(_ id: String) async {
+        guard !resumingTeams.contains(id), let model = teamModel(for: id) else { return }
+        guard !model.busy, model.pending == nil else {
+            teamResumeFailures[id] = TeamResumeFailure(message: "Another request for this team is unconfirmed or in progress. Open the team to check it.", at: Date())
+            return
+        }
+        resumingTeams.insert(id)
+        await model.perform("resume")
+        resumingTeams.remove(id)
+        teamResumeFailures[id] = model.noticeIsError ? TeamResumeFailure(message: model.notice, at: Date()) : nil
     }
     func teamModel(for id: String) -> TeamModel? {
         if let existing = teamModels[id] { return existing }

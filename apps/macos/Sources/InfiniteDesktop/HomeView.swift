@@ -185,22 +185,44 @@ struct ProjectRow: View {
         return parts.joined(separator: " · ")
     }
     var body: some View {
-        Button { app.selectedTeamID = team.id } label: {
-            HStack(spacing: 10) {
-                StatusGlyph(team: team)
-                Text(team.title).lineLimit(1).foregroundStyle(team.projectState.closed ? .secondary : .primary)
-                Spacer(minLength: 12)
-                Text(state).font(.callout).foregroundStyle(stateColor).lineLimit(1)
-                Text(shortAge(team.lastActivityAt)).font(.callout).foregroundStyle(.tertiary).monospacedDigit().frame(minWidth: 30, alignment: .trailing)
+        VStack(alignment: .leading, spacing: 4) {
+            rowLine
+            if let failure = app.teamResumeFailures[team.id] {
+                Text(failure.message).font(.caption).foregroundStyle(Palette.error).lineLimit(2).padding(.leading, 24)
             }
-            .padding(.horizontal, 10).padding(.vertical, 8)
-            .background(hovering ? Color.primary.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(hovering ? Color.primary.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .onHover { hovering = $0 }
         .help(details)
-        .accessibilityLabel("\(team.title), \(details)")
-        .accessibilityHint("Opens the team")
+    }
+    private var rowLine: some View {
+        HStack(spacing: 10) {
+            Button { app.selectedTeamID = team.id } label: {
+                HStack(spacing: 10) {
+                    StatusGlyph(team: team)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(team.title).lineLimit(1).foregroundStyle(team.projectState.closed ? .secondary : .primary)
+                        // A blocked run says why it stopped; the full reason stays in the tooltip.
+                        if team.status == "blocked" && !team.reason.isEmpty {
+                            Text(team.reason).font(.caption).foregroundStyle(Palette.error).lineLimit(2).truncationMode(.tail)
+                        }
+                    }
+                    Spacer(minLength: 12)
+                    Text(state).font(.callout).foregroundStyle(stateColor).lineLimit(1)
+                    Text(shortAge(team.lastActivityAt)).font(.callout).foregroundStyle(.tertiary).monospacedDigit().frame(minWidth: 30, alignment: .trailing)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(team.title), \(details)")
+            .accessibilityHint("Opens the team")
+            if team.offersResume && app.isOwner {
+                let resuming = app.resumingTeams.contains(team.id)
+                Button(resuming ? "Resuming…" : "Resume") { Task { await app.resumeTeam(team.id) } }
+                    .glassButton().controlSize(.small).disabled(!app.teamsFresh || resuming)
+                    .help("Resume this blocked team")
+            }
+        }
     }
 }

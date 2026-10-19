@@ -1,9 +1,9 @@
 import { useState, type ReactNode } from "react";
-import { Alert, Linking, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Linking, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { PROVIDER_NAMES, type Provider } from "@infinite/attention";
 import { Button } from "../../components/Button";
 import { Chip, GlassButton } from "../../components/Glass";
-import { Glyph } from "../../components/Icon";
+import { Glyph, StatusIcon } from "../../components/Icon";
 import type { StatusKind } from "../../status";
 import { theme } from "../../theme";
 import { profileSetting, type LinearTracking, type ModelProfile, type TeamLineup, type Tone } from "./model";
@@ -83,17 +83,23 @@ function linearKind(state: string): StatusKind {
 
 /**
  * The run's Linear issue as a chip that opens it. Linear's issue state is separate from the run's
- * execution state, and a cached record is not proof Linear is reachable, so tracking problems and
- * staleness are spelled out.
+ * execution state; the icon carries the issue's state and the label only its identifier. A pending
+ * sync or a cached record swaps the icon for a spinner rather than adding words, so the chip keeps
+ * its width; tracking problems turn it red. The state and any trouble are spoken in full.
  */
 export function LinearChip({ tracking, fresh }: { tracking?: LinearTracking; fresh: boolean }) {
   if (!tracking) return null;
   const issue = tracking.issue;
   const trouble = tracking.status === "blocked" || tracking.status === "error";
-  const label = `${issue ? `${issue.identifier} · ${issue.state.name}` : "Linear"}${tracking.status === "pending" ? " · pending" : trouble ? ` · tracking ${tracking.status}` : ""}${!fresh ? " · last received" : ""}`;
+  const loading = tracking.status === "pending" || !fresh;
+  const label = issue ? issue.identifier : "Linear";
+  const status = tracking.status === "pending" ? ", syncing" : trouble ? `, tracking ${tracking.status}` : !fresh ? ", last received" : "";
   const open = issue && /^https:\/\//.test(issue.url) ? () => void Linking.openURL(issue.url) : undefined;
-  return <Chip kind={issue ? linearKind(issue.state.name) : trouble ? "error" : "todo"} label={label} tone={trouble ? "error" : undefined}
-    onPress={open} accessibilityLabel={`Linear ${label}${issue ? `: ${issue.title}` : ""}${tracking.reason ? `. ${tracking.reason}` : ""}`} />;
+  const icon = trouble ? <StatusIcon kind="error" size={13} />
+    : loading ? <View style={s.spinner}><ActivityIndicator size="small" color={theme.colors.mutedInk} style={s.spinnerScale} /></View>
+      : <StatusIcon kind={issue ? linearKind(issue.state.name) : "todo"} size={13} />;
+  return <Chip icon={icon} label={label} tone={trouble ? "error" : undefined} onPress={open}
+    accessibilityLabel={`Linear ${label}${issue ? `, ${issue.state.name}` : ""}${status}${issue ? `: ${issue.title}` : ""}${tracking.reason ? `. ${tracking.reason}` : ""}`} />;
 }
 
 /** The outcome of the last request, and the controls for one whose delivery is unconfirmed. */
@@ -152,6 +158,8 @@ export const t = StyleSheet.create({
 
 const s = StyleSheet.create({
   section: { gap: 8, marginTop: 20 },
+  spinner: { width: 13, height: 13, alignItems: "center", justifyContent: "center" },
+  spinnerScale: { transform: [{ scale: 0.65 }] },
   sectionHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
   heading: { fontSize: 13, fontWeight: "700", color: theme.colors.ink },
   count: { fontWeight: "400", color: theme.colors.mutedInk },

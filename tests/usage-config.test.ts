@@ -36,3 +36,9 @@ test("usage config accepts per-million prices and provider budgets", () => {
   assert.equal(parsed.budgets.opencode?.period, "month");
   assert.equal(usageConfigSchema.safeParse({ prices: { "x/y": { input: -1, output: 0 } }, budgets: {} }).success, false);
 });
+test("usage accounts default empty and balance keys require absolute paths", () => {
+  assert.deepEqual(usageConfigSchema.parse({}).accounts, {});
+  const good = usageConfigSchema.parse({ accounts: { deepseek: { kind: "metered", match: ["deepseek/*"], balance: { source: "deepseek", apiKeyFile: "/private/key" } } } });
+  assert.equal(good.accounts.deepseek?.balance?.source, "deepseek");
+  assert.equal(usageConfigSchema.safeParse({ accounts: { deepseek: { kind: "metered", match: ["deepseek/*"], balance: { source: "deepseek", apiKeyFile: "relative-key" } } } }).success, false);
+});

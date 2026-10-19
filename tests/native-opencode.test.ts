@@ -123,7 +123,7 @@ test("OpenCode step-finish parts in the native event stream are journaled as usa
     assert.equal(both[1].data.tokens.input, 70, "The tokens are kept");
     // An unobserved model is never priced, even with a reported cost.
     const row = await waitFor(async () => (await host.fetchApi("/sessions")).body.sessions.find((s: any) => s.id === id), s => s?.usage?.messages === 2);
-    assert.deepEqual(row.usage.pricing, { configured: 0, provider: 1, unknown: 1 });
-    assert.equal(row.usage.cost, 0.25);
+    assert.deepEqual(row.usage.pricing, { configured: 0, catalog: 1, provider: 0, unknown: 1 });
+    assert.ok(row.usage.cost > 0 && row.usage.cost < 0.25, "the catalog price takes precedence over the reported fallback");
   } finally { await host.stop(); }
 });

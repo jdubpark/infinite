@@ -16,6 +16,7 @@ const nonNegative = z.number().min(0).finite();
 export const usageConfigSchema = z.object({
   /** USD per million tokens, keyed `provider/model`. */
   prices: z.record(z.string().min(1), z.object({ input: nonNegative, output: nonNegative, cacheRead: nonNegative.optional(), cacheWrite: nonNegative.optional() }).strict()).default({}),
+  accounts: z.record(z.string().min(1), z.object({ kind: z.enum(["metered", "subscription"]), match: z.array(z.string().min(1)).default([]), planUsd: nonNegative.optional(), balance: z.object({ source: z.literal("deepseek"), apiKeyFile: z.string().refine(isAbsolute, "Balance key file must be absolute") }).strict().optional() }).strict()).default({}),
   budgets: z.partialRecord(z.enum(["claude", "codex", "grok", "opencode", "demo"]), z.object({ usd: nonNegative, period: z.enum(["day", "week", "month"]).default("month") }).strict()).default({}),
 }).strict();
 export type UsageConfig = z.infer<typeof usageConfigSchema>;

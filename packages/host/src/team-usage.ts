@@ -11,7 +11,7 @@ export interface UsageRollup {
   unmeasuredMembers: number;
 }
 
-export const emptyUsage = (): UsageTotals => ({ cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, messages: 0, pricing: { configured: 0, provider: 0, unknown: 0 } });
+export const emptyUsage = (): UsageTotals => ({ cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, messages: 0, pricing: { configured: 0, catalog: 0, provider: 0, unknown: 0 } });
 
 export function addUsage(...parts: UsageTotals[]): UsageTotals {
   const sum = emptyUsage();
@@ -19,7 +19,7 @@ export function addUsage(...parts: UsageTotals[]): UsageTotals {
   for (const part of parts) {
     micro += Math.round(part.cost * 1_000_000);
     for (const key of Object.keys(sum.tokens) as (keyof UsageTotals["tokens"])[]) sum.tokens[key] += part.tokens[key];
-    for (const key of Object.keys(sum.pricing) as (keyof UsageTotals["pricing"])[]) sum.pricing[key] += part.pricing[key];
+    for (const key of Object.keys(sum.pricing) as (keyof UsageTotals["pricing"])[]) sum.pricing[key] += part.pricing[key] ?? 0;
     sum.messages += part.messages;
   }
   sum.cost = micro / 1_000_000;

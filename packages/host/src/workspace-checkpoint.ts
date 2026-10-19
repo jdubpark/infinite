@@ -282,7 +282,7 @@ export async function putWorkspaceBlobs(storeDir: string, chunks: { hash: string
   }
   // A chunk already present may come from an earlier request that failed before its sync, and a
   // concurrent request may have just created a shard, so sync every touched shard and the shard parent.
-  for (const shard of new Set(chunks.map(({ hash }) => join(store.blobs, hash.slice(0, 2))))) await syncDirectory(shard);
+  await Promise.all([...new Set(chunks.map(({ hash }) => join(store.blobs, hash.slice(0, 2))))].map(syncDirectory));
   await syncDirectory(store.blobs);
 }
 export async function readWorkspaceBlob(storeDir: string, hash: string): Promise<string> { return (await readBlob(await storeAt(storeDir), hash)).toString("base64"); }

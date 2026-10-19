@@ -254,14 +254,18 @@ async function runSyncService(): Promise<void> {
           pushing = true; held = false;
           progress();
           const { generation } = await api<{ generation: string }>(config, "begin", abort.signal, {});
-          await uploadMissingChunks({ storeDir: config.storeDir, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), signal: abort.signal, progress, transport: {
-            has: async (hashes, signal) => (await api<{ missing: unknown }>(config, "has", signal, { hashes })).missing,
-            putBatch: async (body, signal) => {
-              try { await api(config, "blobs", signal, undefined, body, BATCH_TIMEOUT); }
-              catch (error) { if (error instanceof MissingRouteError) return "unsupported"; throw error; }
-            },
-            put: async (hash, bytes, signal) => { await api(config, `blob/${hash}`, signal, undefined, bytes); },
-          } });
+          // A batch request reports nothing until the host has stored it; a heartbeat keeps startup alive meanwhile.
+          const uploading = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
+          try {
+            await uploadMissingChunks({ storeDir: config.storeDir, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), signal: abort.signal, progress, transport: {
+              has: async (hashes, signal) => (await api<{ missing: unknown }>(config, "has", signal, { hashes })).missing,
+              putBatch: async (body, signal) => {
+                try { await api(config, "blobs", signal, undefined, body, BATCH_TIMEOUT); }
+                catch (error) { if (error instanceof MissingRouteError) return "unsupported"; throw error; }
+              },
+              put: async (hash, bytes, signal) => { await api(config, `blob/${hash}`, signal, undefined, bytes); },
+            } });
+          } finally { clearInterval(uploading); }
           // The host applies inside this request and reports nothing until it finishes; a heartbeat keeps startup alive meanwhile.
           const heartbeat = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
           try { await api(config, "commit", abort.signal, { generation, manifest }, undefined, COMMIT_TIMEOUT); }

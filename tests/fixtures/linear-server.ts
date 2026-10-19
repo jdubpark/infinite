@@ -20,6 +20,8 @@ export async function startLinearServer() {
   const violations: string[] = [];
   let drop: { operation: WriteOperation; bodyIncludes?: string } | undefined, unavailable = false, clock = Date.now();
   const updatedAt = () => new Date(++clock).toISOString();
+  const linearDescription = (value: string) => value.replace(/(?<![\[(<])https?:\/\/[^\s)>]+/g, url => `[${url}](<${url}>)`)
+    .replace(/^([ \t]*)- /gm, "$1* ").trimEnd();
   const seedIssue = (input: { id?: string; title: string; description: string; parentId?: string }) => {
     const identifier = `TEST-${issues.size + 1}`;
     const issue: FixtureIssue = { id: input.id ?? randomUUID(), identifier,
@@ -60,7 +62,7 @@ export async function startLinearServer() {
             throw new Error("Incomplete issue creation");
           if (input.stateId !== undefined) throw new Error("The bridge must leave issue state to humans");
           if (issues.has(input.id)) { reply(200, { errors: [{ message: "Issue ID already exists" }] }); return; }
-          const issue = seedIssue(input);
+          const issue = seedIssue({ ...input, description: linearDescription(input.description) });
           writtenId = issue.id; data = { issueCreate: { success: true, issue } }; break;
         }
         case "InfiniteLinearComment": {

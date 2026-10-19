@@ -10,6 +10,7 @@ import {
   type SessionRow,
 } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
+import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
 import { GlassButton, GroupHeader, LiveStatus, Segmented, Sheet, SheetRow } from "../../components/Glass";
@@ -51,8 +52,11 @@ export function Inbox({
   const [view, setView] = useState<InboxView>(initialView);
   const [machineSheet, setMachineSheet] = useState(false);
   const [exitedOpen, setExitedOpen] = useState(false);
-  const { data, online, stale, loading, refreshing, seen, refresh } = usePoll(
-    async () => {
+  const { data, online, stale, loading, refreshing, seen, refresh } = useLive(connection, {
+    topics: ["sessions"],
+    intervalMs: 2500,
+    deps: [],
+    load: async () => {
       const [list, me] = await Promise.all([
         api<{ sessions: SessionRow[] }>(connection, "/sessions"),
         api<Me>(connection, "/me"),
@@ -66,15 +70,22 @@ export function Inbox({
         at: Date.now(),
       };
     },
-    2500,
-    [connection],
-  );
+    select: (topic, payload, previous) => {
+      if (topic !== "sessions" || !previous) return;
+      const list = payload as { sessions: SessionRow[] };
+      return { ...previous, sessions: [...list.sessions].sort((a, b) => b.createdAt.localeCompare(a.createdAt)), at: Date.now() };
+    },
+  });
   // Hosts that predate teams advertise no `teams` field and have no team routes to poll.
   const hasTeams = Boolean(data?.me.teams), hasGoals = Boolean(data?.me.goals);
   // Full run records are large, so only the visible tab polls quickly; the others refresh their counts slowly.
   const focused = useIsFocused();
   const pace = (tab: InboxView) => focused && view === tab ? 4000 : 20000;
-  const teamsPoll = usePoll(() => hasTeams ? api<{ teams: TeamView[] }>(connection, "/teams").then(value => value.teams) : Promise.resolve(null), pace("teams"), [connection, hasTeams]);
+  const teamsPoll = useLive<TeamView[] | null>(connection, {
+    topics: ["teams"], intervalMs: pace("teams"), deps: [hasTeams],
+    load: () => hasTeams ? api<{ teams: TeamView[] }>(connection, "/teams").then(value => value.teams) : Promise.resolve(null),
+    select: (topic, payload) => topic === "teams" && Array.isArray((payload as { teams?: unknown }).teams) ? (payload as { teams: TeamView[] }).teams : undefined,
+  });
   const goalsPoll = usePoll(() => hasGoals ? api<{ goals: ProductGoal[] }>(connection, "/goals").then(value => value.goals) : Promise.resolve(null), pace("goals"), [connection, hasGoals]);
   const teams = teamsPoll.data ?? [];
   const goals = goalsPoll.data ?? [];

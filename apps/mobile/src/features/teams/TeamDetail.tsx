@@ -3,6 +3,7 @@ import { ActivityIndicator, Alert, KeyboardAvoidingView, Linking, Pressable, Ref
 import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me, type SessionRow } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
+import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
 import { Card, Chip, GlassButton, GroupHeader, LiveStatus, ProgressBar, Segmented, TopBar } from "../../components/Glass";
@@ -34,7 +35,11 @@ const live = (member: TeamMember) => member.status === "running" || member.statu
 export function TeamDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
   const machine = connectionKey(connection);
-  const poll = usePoll(() => api<TeamView>(connection, `/teams/${id}`), 2000, [connection, id]);
+  const poll = useLive<TeamView>(connection, {
+    topics: ["teams"], intervalMs: 2000, deps: [id],
+    load: () => api<TeamView>(connection, `/teams/${id}`),
+    select: (topic, payload) => topic === "teams" ? (payload as { teams: TeamView[] }).teams.find(team => team.id === id) : undefined,
+  });
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
   const sessionsPoll = usePoll(() => api<{ sessions: SessionRow[] }>(connection, "/sessions").then(value => value.sessions), 4000, [connection]);
   const sessions = sessionsPoll.data;

@@ -37,6 +37,7 @@ import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./
 import type { Config, Role, Receipt } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
+import { LiveFeed, type LiveTopic } from "./live.js";
 
 const id = z.uuid();
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
@@ -175,6 +176,29 @@ export function createApp(config: Config, key: Buffer) {
     const external = cmux ? (await cmux.list()).filter(s => s.status !== "running" || !s.nativeSession || !s.pid || !known.has(`${s.provider}:${s.nativeSession.id}:${s.pid}`)) : [];
     return [...native, ...external.map(s => ({ ...s, backend: "cmux" as const, machineId: config.machine!.id, resumable: resumable(s) }))];
   };
+  const sessionDetail = async (sessionId: string) => {
+    if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
+      const session = await cmux.get(sessionId);
+      return { ...session, machineId: config.machine!.id, resumable: resumable(session) };
+    }
+    const session = { ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) };
+    const handoff = handoffs.view(sessionId);
+    return { ...session, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
+      resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
+  };
+  const sessionEvents = async (sessionId: string, after: number, limit = 200) => {
+    if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
+      await cmux.get(sessionId);
+      return cmux.events(sessionId, after, limit);
+    }
+    return manager.events(sessionId, after, limit);
+  };
+  const live = new LiveFeed({
+    sessions: async () => ({ sessions: await listSessions() }),
+    teams: () => ({ teams: teams.list() }),
+    session: sessionDetail,
+    events: (sessionId, after) => sessionEvents(sessionId, after),
+  });
   /**
    * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
    * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
@@ -533,6 +557,23 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/sessions", async (_req, res) =>
     res.json({ sessions: await listSessions() }),
   );
+  app.get("/api/events", (req, res) => {
+    const topicValues = z.array(z.union([z.literal("sessions"), z.literal("teams"), z.string().regex(/^session\/[0-9a-f-]{36}$/i)])).min(1).max(16)
+      .parse(z.string().min(1).max(4096).parse(req.query.topics).split(","));
+    const topics = topicValues.map(value => value === "sessions" || value === "teams" ? value : `session/${id.parse(value.slice(8))}`) as LiveTopic[];
+    if (new Set(topics).size !== topics.length) return void res.status(400).json({ error: "Duplicate live topic" });
+    const after = z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0).parse(req.query.after);
+    res.status(200).set({ "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", Connection: "keep-alive" });
+    res.flushHeaders();
+    res.write(": connected\n\n");
+    const stop = live.subscribe(topics, after, update => {
+      if (res.writableLength > 256 * 1024) return res.destroy();
+      res.write(`event: update\ndata: ${JSON.stringify(update)}\n\n`);
+    });
+    const heartbeat = setInterval(() => { if (res.writableLength <= 256 * 1024) res.write(": heartbeat\n\n"); else res.destroy(); }, 15000);
+    heartbeat.unref();
+    res.on("close", () => { clearInterval(heartbeat); stop(); });
+  });
   app.post("/api/sessions", requireRole(["owner"]), async (req, res) => {
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) return void res.status(400).json({ code: "invalid-create", error: "Invalid session details", details: parsed.error.issues.map(issue => ({ path: issue.path.join("."), message: issue.message })) });
@@ -603,14 +644,7 @@ export function createApp(config: Config, key: Buffer) {
     }
   });
   app.get("/api/sessions/:id", async (req, res) => {
-    const sessionId = id.parse(req.params.id);
-    const session = {
-      ...manager.meta(sessionId).session,
-      ...(await manager.state(sessionId, true)),
-    };
-    const handoff = handoffs.view(sessionId);
-    res.json({ ...session, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
-      resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) });
+    res.json(await sessionDetail(id.parse(req.params.id)));
   });
   app.get("/api/sessions/:id/handoff", (req, res) => res.json(handoffs.view(id.parse(req.params.id))));
   app.get("/api/sessions/:id/messages", async (req, res) => {
@@ -691,7 +725,7 @@ export function createApp(config: Config, key: Buffer) {
     const query = new URL(req.originalUrl, origin).search;
     proxyNativeHttp(req, res, new URL(backend.url + path + query), { Authorization: backend.token }, req.body === undefined ? undefined : Buffer.from(JSON.stringify(req.body)));
   });
-  app.get("/api/sessions/:id/events", (req, res) => {
+  app.get("/api/sessions/:id/events", async (req, res) => {
     const after = z.coerce
       .number()
       .int()
@@ -706,7 +740,7 @@ export function createApp(config: Config, key: Buffer) {
       .max(200)
       .default(200)
       .parse(req.query.limit);
-    const types =
+    const types: Set<string> | undefined =
       typeof req.query.types === "string"
         ? new Set(
             z
@@ -726,7 +760,9 @@ export function createApp(config: Config, key: Buffer) {
               .parse(req.query.types.split(",")),
           )
         : undefined;
-    res.json(manager.events(id.parse(req.params.id), after, limit, types));
+    const sessionId = id.parse(req.params.id);
+    const page = await sessionEvents(sessionId, after, limit);
+    res.json({ ...page, events: types ? page.events.filter(event => types.has(event.type)) : page.events });
   });
   app.post("/api/sessions/:id/control", requireRole(["owner", "controller"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);
@@ -1027,6 +1063,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { live.close(); handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

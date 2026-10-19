@@ -12,6 +12,8 @@ export const MAX_FRAME_BYTES = MAX_RESPONSE_BYTES * 2 + 4096;
 export const MAX_PENDING_REQUESTS = 8;
 export const MAX_TERMINAL_STREAMS = 4;
 export const MAX_TERMINAL_BUFFERED_BYTES = 256 * 1024;
+export const MAX_EVENTS_STREAMS = 4;
+export const MAX_EVENTS_BUFFERED_BYTES = 256 * 1024;
 export const HANDSHAKE_TIMEOUT_MS = 10000;
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -38,6 +40,12 @@ export type RemoteTerminalCommand =
 export type RemoteTerminalEvent =
   | { type: "terminal-event"; streamId: string; message: Record<string, unknown> }
   | { type: "terminal-closed"; streamId: string; code: number };
+export type RemoteEventsCommand =
+  | { type: "events-open"; id: string; token: string; topics: string[]; after: number }
+  | { type: "events-close"; id: string; token: string; streamId: string };
+export type RemoteEventsEvent =
+  | { type: "events-event"; streamId: string; topic: string; data: unknown }
+  | { type: "events-closed"; streamId: string; code: number };
 export interface CipherChannel { seal(value: unknown): CipherFrame; open(frame: unknown): unknown; destroy(): void }
 export type RelayEnvelope = { type: "open"; id: string } | { type: "close"; id: string } | { type: "data"; id: string; data: string };
 

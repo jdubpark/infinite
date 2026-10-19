@@ -332,13 +332,19 @@ The existing 96 KiB request ceiling is unchanged.
 | `terminal-close` | Detach `streamId`; does not terminate the session. |
 | `terminal-event` | Server message containing `streamId` and the original terminal page, snapshot, state, receipt, or refusal as `message`. |
 | `terminal-closed` | Server message containing `streamId` and a WebSocket-style close `code`. |
+| `events-open` | `id`, `token`, `topics`, and resume cursor `after`; normal response returns `{streamId: id}` and forwards the authenticated `/api/events` feed. |
+| `events-event` | Server message containing `streamId`, topic, and the changed topic snapshot. |
+| `events-close` | Detach `streamId` without changing host state. |
+| `events-closed` | Server message containing `streamId` and a WebSocket-style close `code`. |
 
 Client command IDs share the monotonically increasing request sequence. Tokens,
-session IDs, terminal contents, and stream commands are inside ciphertext. Each
-channel admits four terminal attachments. The host forwards only to its own
-authenticated loopback terminal gateway, retaining owner checks, lease enforcement,
-input validation, and durable receipts. Tampering, replay, revocation, or buffer
-limits close the channel. Attachments and uncertain input are not replayed.
+session IDs, terminal contents, and stream commands are inside ciphertext. Event
+stream limits, cursor recovery, and phone fallback are defined in
+[session ownership and protocol](architecture.md#delivery-contract). The host
+forwards terminals only to its own authenticated loopback gateway, retaining owner
+checks, lease enforcement, input validation, and durable receipts. Tampering,
+replay, revocation, or buffer limits close the channel. Attachments and uncertain
+input are not replayed.
 
 File routes are limited to configured projects: directory listing, hash-pinned
 reads, directory creation, staged upload begin/chunk/commit/abort, and

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import { createRemoteClient, RemoteError, type RemoteClient } from "@infinite/remote";
-import { MAX_FRAME_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
+import { MAX_FRAME_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_EVENTS_BUFFERED_BYTES } from "@infinite/remote/protocol";
 import { connectRemoteAccess } from "../packages/host/src/remote-access.js";
 import { createRelayServer } from "../packages/host/src/relay.js";
 import { hashToken } from "../packages/host/src/config.js";
@@ -84,6 +84,7 @@ test("encrypted relay creates and steers real sessions while retaining roles and
   const relay = createRelayServer({ registrations: [{ machineId, tokenHash: hashToken(registration) }] });
   const relayUrl = await listen(relay.server), proxy = await wireProxy(relayUrl);
   const clients: RemoteClient[] = [];
+  let live: { close(): void } | undefined;
   const host = await startHost({ config: { machine: { id: machineId, label: "Test machine" }, remote: { enabled: true, relay: { url: relayUrl, tokenFile } } } });
   try {
     const connect = (role: "owner" | "viewer" | "controller") => {
@@ -98,6 +99,13 @@ test("encrypted relay creates and steers real sessions while retaining roles and
     const session = await owner.request<{ id: string }>("/sessions", { body: create });
     assert.equal((await owner.request<{ id: string }>("/sessions", { body: create })).id, session.id, "the existing creation receipt still deduplicates retries");
     assert.equal((await viewer.request<{ sessions: { id: string }[] }>("/sessions")).sessions.some(item => item.id === session.id), true);
+    const sessionLists: { sessions: { id: string }[] }[] = [];
+    live = await owner.openEvents({ topics: ["sessions"], onEvent: event => sessionLists.push(event.data as { sessions: { id: string }[] }), onClose: () => {} });
+    await waitFor(async () => sessionLists, values => values.some(value => value.sessions.some(item => item.id === session.id)));
+    const pushStarted = Date.now();
+    const pushed = await owner.request<{ id: string }>("/sessions", { body: { ...create, requestId: randomUUID(), title: "Pushed session" } });
+    await waitFor(async () => sessionLists, values => values.some(value => value.sessions.some(item => item.id === pushed.id)), 2500);
+    assert.ok(Date.now() - pushStarted < 1000, "the encrypted relay stream delivers within about one second");
     const ownerHeaders = { "X-Infinite-Client": randomUUID() }, controllerHeaders = { "X-Infinite-Client": randomUUID() };
     const control = await owner.request<{ control: { id: string } }>(`/sessions/${session.id}/control`, { body: { action: "claim" }, headers: ownerHeaders });
     const steeringHeaders = { ...ownerHeaders, "X-Infinite-Control": control.control.id };
@@ -121,6 +129,7 @@ test("encrypted relay creates and steers real sessions while retaining roles and
     assert.equal((await fetch(`${relayUrl}/api/sessions`)).status, 404, "the relay does not expose runner APIs");
     for (const path of ["/", "/index.html"]) assert.equal((await fetch(`${relayUrl}${path}`)).status, 404, "the relay does not publish the web client");
   } finally {
+    live?.close();
     for (const client of clients) client.close();
     await host.stop(); proxy.close(); relay.close(); rmSync(privateFiles, { recursive: true, force: true });
   }
@@ -193,6 +202,35 @@ test("encrypted terminals carry real PTY output and receipts, enforce leases and
     assert.throws(() => terminal.send({ op: "raw", requestId: randomUUID(), text: "revoked\r", leaseId }), (error: RemoteError) => error.code === "disconnected");
     assert.equal((await viewer.request<{ status: string }>(`/sessions/${session.id}`)).status, "running", "device revocation closes its subscriptions without killing work");
   } finally { owner.close(); viewer.close(); closeRemote(); proxy.close(); await host.stop(); }
+});
+
+test("remote event streams enforce caps, close cleanly, reject revoked keys, and stop at the buffer limit", { timeout: 30000 }, async () => {
+  const host = await inProcessHost();
+  host.config.remote = { enabled: true };
+  const closeRemote = connectRemoteAccess(host.server, host.config);
+  const owner = createRemoteClient({ url: host.origin, token: host.tokens.owner });
+  const streams: { close(): void }[] = [];
+  try {
+    await owner.request("/me");
+    for (let index = 0; index < 4; index++) streams.push(await owner.openEvents({ topics: ["sessions"], onEvent: () => {}, onClose: () => {} }));
+    await assert.rejects(owner.openEvents({ topics: ["sessions"], onEvent: () => {}, onClose: () => {} }), (error: RemoteError) => error.status === 429 && error.code === "busy");
+    streams.splice(0).forEach(stream => stream.close());
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const teams = host.teams as unknown as { list(): unknown };
+    const originalList = teams.list;
+    teams.list = () => [{ title: "x".repeat(MAX_EVENTS_BUFFERED_BYTES + 1) }];
+    let closedCode: number | undefined;
+    await owner.openEvents({ topics: ["teams"], onEvent: () => {}, onClose: event => { closedCode = event.code; } });
+    await waitFor(async () => closedCode, code => code === 1013, 3000);
+    teams.list = originalList;
+
+    host.config.tokens = host.config.tokens.filter(device => device.role !== "owner");
+    await assert.rejects(owner.openEvents({ topics: ["sessions"], onEvent: () => {}, onClose: () => {} }), (error: RemoteError) => error.code === "disconnected");
+  } finally {
+    for (const stream of streams) stream.close();
+    owner.close(); closeRemote(); await host.stop();
+  }
 });
 
 async function httpRunner() {

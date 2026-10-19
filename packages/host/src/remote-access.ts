@@ -7,10 +7,10 @@ import { WebSocket, WebSocketServer } from "ws";
 import {
   createCipherChannel, createServerHello, equalBytes, HANDSHAKE_TIMEOUT_MS, keyFromHash,
   matchesClientHello, MAX_FRAME_BYTES, MAX_PENDING_REQUESTS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
-  MAX_TERMINAL_STREAMS, MAX_TERMINAL_BUFFERED_BYTES,
+  MAX_TERMINAL_STREAMS, MAX_TERMINAL_BUFFERED_BYTES, MAX_EVENTS_STREAMS, MAX_EVENTS_BUFFERED_BYTES,
   object, parseClientHello, parseRelayEnvelope, remoteSocketUrl, tokenKey, UUID,
   type CipherChannel, type RelayEnvelope, type RemoteMethod, type RemoteRequest, type RemoteResponse,
-  type RemoteTerminalCommand, type RemoteTerminalEvent,
+  type RemoteTerminalCommand, type RemoteTerminalEvent, type RemoteEventsCommand, type RemoteEventsEvent,
 } from "@infinite/remote/protocol";
 import { runtimeSecurity } from "./deployment.js";
 import type { Config } from "./types.js";
@@ -27,6 +27,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   // Reject normalization tricks and encoded route delimiters. File names belong in the query.
   if (url.pathname !== path.split("?")[0] || /%/i.test(url.pathname)) return false;
   if (method === "GET" && url.pathname === "/api/me") return true;
+  if (method === "GET" && url.pathname === "/api/events") return true;
   if (method === "GET" && url.pathname === "/api/machine/resources") return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/sessions") return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/teams") return true;
@@ -87,6 +88,21 @@ function parseTerminalCommand(value: unknown): RemoteTerminalCommand {
   return message as unknown as RemoteTerminalCommand;
 }
 
+function parseEventsCommand(value: unknown): RemoteEventsCommand {
+  const message = object(value);
+  if (typeof message.id !== "string" || !/^[1-9][0-9]{0,15}$/.test(message.id) || !Number.isSafeInteger(Number(message.id)) ||
+      typeof message.token !== "string" || !/^[\x21-\x7e]{32,200}$/.test(message.token) || Buffer.byteLength(JSON.stringify(message)) > MAX_REQUEST_BYTES)
+    throw new Error("Invalid events command");
+  if (message.type === "events-open") {
+    if (!Array.isArray(message.topics) || !message.topics.length || message.topics.length > 16 || new Set(message.topics).size !== message.topics.length ||
+        message.topics.some(topic => typeof topic !== "string" || (topic !== "sessions" && topic !== "teams" && !/^session\/[0-9a-f-]{36}$/i.test(topic))) ||
+        !Number.isSafeInteger(message.after) || Number(message.after) < 0 || Object.keys(message).length !== 5)
+      throw new Error("Invalid events subscription");
+  } else if (message.type !== "events-close" || typeof message.streamId !== "string" || !/^[1-9][0-9]{0,15}$/.test(message.streamId) || Object.keys(message).length !== 4)
+    throw new Error("Invalid events command");
+  return message as unknown as RemoteEventsCommand;
+}
+
 /** Existing HTTP authorization remains the authority for roles, revocation and input leases. */
 export function connectRemoteAccess(server: Server, config: Config): () => void {
   if (!config.remote?.enabled) return () => {};
@@ -100,10 +116,11 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
   const relayPeers = new Map<string, { receive: (text: string) => void; close: () => void }>();
   const tokenKeys = () => config.tokens.map(device => keyFromHash(device.hash));
 
-  const peer = (send: (text: string) => boolean, terminate: () => void) => {
+  const peer = (send: (text: string, onSent?: () => void) => boolean, terminate: () => void) => {
     let channel: CipherChannel | undefined, authenticatedKey: Uint8Array | undefined, dead = false, pending = 0, lastId = 0;
     const controllers = new Set<AbortController>();
     const terminals = new Map<string, WebSocket>();
+    const eventStreams = new Map<string, { controller: AbortController; buffered: number }>();
     const timeout = setTimeout(() => close(), HANDSHAKE_TIMEOUT_MS); timeout.unref();
     // Idle terminal subscriptions must also stop after their device is revoked.
     const revocation = setInterval(() => { if (authenticatedKey && !authorized()) close(); }, 1000); revocation.unref();
@@ -116,6 +133,8 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
       for (const controller of controllers) controller.abort();
       for (const terminal of terminals.values()) terminal.terminate();
       terminals.clear();
+      for (const stream of eventStreams.values()) stream.controller.abort();
+      eventStreams.clear();
       peers.delete(handle); terminate();
     }
     function authorized() {
@@ -128,11 +147,62 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
       clearTimeout(timeout); clearTimeout(idle);
       idle = setTimeout(close, 90000); idle.unref();
     }
-    function reply(response: RemoteResponse | RemoteTerminalEvent) {
+    function reply(response: RemoteResponse | RemoteTerminalEvent | RemoteEventsEvent, onSent?: () => void) {
       if (dead || !channel) return;
       if (!authorized()) { close(); return; }
-      try { if (!send(JSON.stringify(channel.seal(response)))) close(); }
+      try { if (!send(JSON.stringify(channel.seal(response)), onSent)) close(); }
       catch { close(); }
+    }
+    function stopEvents(streamId: string, code: number, notify = true) {
+      const stream = eventStreams.get(streamId);
+      if (!stream) return;
+      eventStreams.delete(streamId); stream.controller.abort();
+      if (notify) reply({ type: "events-closed", streamId, code });
+    }
+    async function events(command: RemoteEventsCommand) {
+      if (command.type === "events-close") { stopEvents(command.streamId, 1000); return; }
+      if (eventStreams.size >= MAX_EVENTS_STREAMS) {
+        reply({ type: "response", id: command.id, status: 429, body: { error: "Too many open event streams", code: "busy" } }); return;
+      }
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Runner is not listening");
+      const controller = new AbortController(), stream = { controller, buffered: 0 };
+      eventStreams.set(command.id, stream);
+      const query = new URLSearchParams({ topics: command.topics.join(","), after: String(command.after) });
+      try {
+        const response = await fetch(`http://127.0.0.1:${address.port}/api/events?${query}`, {
+          headers: { Authorization: `Bearer ${command.token}`, Accept: "text/event-stream" }, redirect: "error", signal: controller.signal,
+        });
+        if (!response.ok || !response.body || !response.headers.get("content-type")?.startsWith("text/event-stream")) {
+          const body = await response.json().catch(() => ({}));
+          eventStreams.delete(command.id);
+          reply({ type: "response", id: command.id, status: response.status || 502, body }); return;
+        }
+        reply({ type: "response", id: command.id, status: 200, body: { streamId: command.id } });
+        const reader = response.body.getReader(), decoder = new TextDecoder();
+        let pendingText = "";
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          pendingText += decoder.decode(chunk.value, { stream: true });
+          if (Buffer.byteLength(pendingText) > MAX_EVENTS_BUFFERED_BYTES) throw new Error("Events frame exceeds the remote limit");
+          let boundary: number;
+          while ((boundary = pendingText.indexOf("\n\n")) >= 0) {
+            const frame = pendingText.slice(0, boundary); pendingText = pendingText.slice(boundary + 2);
+            const data = frame.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
+            if (!data) continue;
+            const update = object(JSON.parse(data));
+            if (typeof update.topic !== "string" || !("data" in update)) throw new Error("Invalid live event");
+            const size = Buffer.byteLength(data);
+            if (stream.buffered + size > MAX_EVENTS_BUFFERED_BYTES) { stopEvents(command.id, 1013); return; }
+            stream.buffered += size;
+            reply({ type: "events-event", streamId: command.id, topic: update.topic, data: update.data }, () => { stream.buffered = Math.max(0, stream.buffered - size); });
+          }
+        }
+        stopEvents(command.id, 1000);
+      } catch {
+        if (eventStreams.has(command.id)) stopEvents(command.id, 1013);
+      }
     }
     function terminal(command: RemoteTerminalCommand) {
       if (command.type !== "terminal-open") {
@@ -236,7 +306,7 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
           return;
         }
         const value = object(channel.open(frame));
-        const request = value.type === "request" ? parseRequest(value) : parseTerminalCommand(value);
+        const request = value.type === "request" ? parseRequest(value) : value.type === "events-open" || value.type === "events-close" ? parseEventsCommand(value) : parseTerminalCommand(value);
         const suppliedKey = tokenKey(request.token);
         const matches = !!authenticatedKey && equalBytes(suppliedKey, authenticatedKey) && authorized();
         suppliedKey.fill(0);
@@ -245,6 +315,7 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
         // authentication only after a fresh encrypted request proves key possession.
         refreshIdle();
         lastId = Number(request.id);
+        if (request.type === "events-open" || request.type === "events-close") { void events(request); return; }
         if (request.type !== "request") { terminal(request); return; }
         if (!allowedPath(request.method, request.path)) {
           reply({ type: "response", id: request.id, status: 403, body: { error: "This endpoint is unavailable through remote machine access", code: "remote-endpoint-denied" } }); return;
@@ -277,9 +348,9 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
     // Browser Origins are intentionally accepted here: no cookies or plaintext bearer
     // are consumed, and every message requires the paired-key authenticated channel.
     sockets.handleUpgrade(req, socket, head, ws => {
-      const active = peer(text => {
+      const active = peer((text, onSent) => {
         if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount + Buffer.byteLength(text) > MAX_BUFFERED_BYTES) return false;
-        ws.send(text, error => { if (error) active.close(); }); return true;
+        ws.send(text, error => { if (error) active.close(); else onSent?.(); }); return true;
       }, () => ws.terminate());
       let alive = true;
       const heartbeat = setInterval(() => { if (!alive) active.close(); else { alive = false; ws.ping(); } }, 15000); heartbeat.unref();
@@ -322,10 +393,10 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
       if (ws.readyState !== WebSocket.OPEN || !alive) { drop(); return; }
       alive = false; ws.ping();
     }, 15000); heartbeat.unref();
-    const send = (frame: RelayEnvelope) => {
+    const send = (frame: RelayEnvelope, onSent?: () => void) => {
       const text = JSON.stringify(frame);
       if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount + Buffer.byteLength(text) > MAX_BUFFERED_BYTES) { drop(); return false; }
-      ws.send(text, error => { if (error) drop(); }); return true;
+      ws.send(text, error => { if (error) drop(); else onSent?.(); }); return true;
     };
     ws.on("open", () => { clearTimeout(connectTimeout); retryMs = 1000; });
     ws.on("pong", () => { alive = true; });
@@ -337,7 +408,7 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
         if (frame.type === "open") {
           if (relayPeers.has(frame.id)) throw new Error("Duplicate relay channel");
           if (peers.size >= MAX_CHANNELS) { send({ type: "close", id: frame.id }); return; }
-          const active = peer(text => send({ type: "data", id: frame.id, data: text }), () => {
+          const active = peer((text, onSent) => send({ type: "data", id: frame.id, data: text }, onSent), () => {
             relayPeers.delete(frame.id);
             if (!dropped) send({ type: "close", id: frame.id });
           });

@@ -56,6 +56,10 @@ Input carries a client-generated `requestId`. The worker durably appends intent,
 
 Each event has `seq`, `at`, `type`, and `data`. The encrypted journal uses 256-record segments. `GET /api/sessions/:id/events?after=N&limit=200` returns `{events,cursor,more}`. Clients advance only to a received cursor and page until `more=false`. Events are retained after native process exit. There is no automatic record deletion or retention quota yet.
 
+`GET /api/events?topics=sessions,teams,session/<id>&after=<cursor>` provides the shared live feed as authenticated `text/event-stream`. One host loop runs every 750 ms only while it has subscribers. Each tick reads each requested list or session state once, reads a session's journal page from the lowest active subscriber cursor, and emits only when the serialized topic data changes. `sessions` matches `GET /api/sessions`, `teams` matches `GET /api/teams`, and `session/<id>` contains the `GET /api/sessions/:id` detail plus a journal page shaped like `GET /api/sessions/:id/events`. The stream sends a comment heartbeat every 15 seconds, disables proxy buffering, and stops work when its last subscriber closes. It uses the same paired-device authentication and read roles as those GET routes.
+
+Phone clients carry `events-open`, `events-event`, `events-closed`, and `events-close` inside the existing encrypted remote channel for both direct and relayed connections. The relay forwards those ciphertext frames without interpreting them. A channel admits four event streams, each with a 256 KiB buffered-event limit; oversized or backpressured streams close and reconnect from the last received journal cursor. The phone shares subscriptions for the same connection and topics, closes them in the background, and reopens on foreground. While a stream is unavailable, Inbox and session state fall back to their existing 2.5-second and 1.5-second reads, team lists use their existing visible/hidden cadence, and conversation messages use a 15-second fallback. A healthy stream disables those timers. The web client may continue polling.
+
 ## API capabilities
 
 All API routes except login require a bearer key or same-origin HttpOnly cookie. The web UI and native client use this same API; automation has the same primitives.
@@ -67,6 +71,7 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | Browser login | `POST /api/login` | Valid key, matching Origin |
 | Device capabilities | `GET /api/me` | Any paired role |
 | List / inspect sessions | `GET /api/sessions`, `GET /api/sessions/:id` | Any |
+| Subscribe to live state | `GET /api/events?topics=...&after=...` | Any |
 | Create session | `POST /api/sessions` | Owner |
 | Read chat / preview a project file | `GET /api/sessions/:id/messages`, `/file?path=` | Any |
 | Read a model-written digest of the chat | `GET /api/sessions/:id/summary?after=` | Any, when `summaries` is configured |

@@ -61,7 +61,11 @@ test("readConfig validates the push access token file", () => {
     assert.throws(() => readConfig(write({ enabled: true, accessTokenFile: "rel/token" })), /Push access token file/);
     assert.throws(() => readConfig(write({ enabled: true, accessTokenFile: secret(join(root, "other", "loose"), 0o644) })), /Push access token file/);
     assert.throws(() => readConfig(write({ enabled: true, accessTokenFile: secret(join(root, "state", "inside"), 0o600) })), /Push access token file/);
-    assert.equal(readConfig(write({ enabled: true, accessTokenFile: secret(join(root, "other", "good"), 0o600) })).config.push?.enabled, true);
+    const defaults = readConfig(write({ enabled: true, accessTokenFile: secret(join(root, "other", "good"), 0o600) })).config.push;
+    assert.equal(defaults?.enabled, true);
+    assert.deepEqual(defaults?.events, ["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled"]);
+    assert.equal(defaults?.events.includes("turn-finished"), false);
+    assert.equal(defaults?.events.includes("exited"), false);
     assert.equal(readConfig(write({ enabled: false })).config.push?.enabled, false);
     assert.throws(() => readConfig(write({ enabled: false, acessTokenFile: "/x" })));
   } finally {

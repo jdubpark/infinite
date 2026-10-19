@@ -11,9 +11,10 @@ import {
 } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Avatar } from "../../components/Avatar";
+import { Button } from "../../components/Button";
 import { GlassButton, GroupHeader, LiveStatus, Segmented, Sheet, SheetRow } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
-import { OfflineBanner } from "../../components/OfflineBanner";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { age, SESSION_KIND, SESSION_LABELS, type StatusKind } from "../../status";
 import { theme } from "../../theme";
 import { goalGroup, pendingApprovals, ROLE_NAMES, teamGroup, type ProductGoal, type TeamView } from "../teams/model";
@@ -50,7 +51,7 @@ export function Inbox({
   const [view, setView] = useState<InboxView>(initialView);
   const [machineSheet, setMachineSheet] = useState(false);
   const [exitedOpen, setExitedOpen] = useState(false);
-  const { data, online, loading, refreshing, seen, refresh } = usePoll(
+  const { data, online, stale, loading, refreshing, seen, refresh } = usePoll(
     async () => {
       const [list, me] = await Promise.all([
         api<{ sessions: SessionRow[] }>(connection, "/sessions"),
@@ -104,13 +105,11 @@ export function Inbox({
           <Text style={s.machineName} numberOfLines={1}>{machineName(connection)}</Text>
           <View style={s.toggle}><Glyph name={machineSheet ? "up" : "down"} size={11} color={theme.colors.secondaryInk} /></View>
         </Pressable>
-        <LiveStatus online={online} loading={loading} seen={seen} />
+        <LiveStatus online={online} loading={loading} seen={seen} stale={stale} />
       </View>
-      <OfflineBanner
-        online={online || loading}
-        message="Offline · showing the last received view. Agents may still be running."
-      />
-      {shown !== "sessions" ? <OfflineBanner online={runs.online || runs.loading} message="Teams offline · last received state." /> : null}
+      <FloatingNotice position="top" offset={54}
+        message={stale && !data ? "Can't reach this machine." : shown !== "sessions" && runs.stale ? runs.data ? "Teams offline · last received state." : "Can't load teams." : stale ? "Offline · showing the last received view. Agents may still be running." : null}
+        actions={stale && !data ? <Button compact title="Refresh" secondary onPress={refreshAll} /> : null} />
       <ScrollView contentContainerStyle={s.list} keyboardShouldPersistTaps="handled"
         refreshControl={<RefreshControl refreshing={refreshing || runs.refreshing} onRefresh={refreshAll} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
         <Text style={s.title} accessibilityRole="header">{shown === "teams" ? "Teams" : shown === "goals" ? "Goals" : "Sessions"}</Text>
@@ -197,7 +196,7 @@ export function Inbox({
 }
 
 const s = StyleSheet.create({
-  fill: { flex: 1 },
+  fill: { flex: 1, position: "relative" },
   header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 16, paddingTop: 6, paddingBottom: 4, minHeight: 48 },
   machine: { flexDirection: "row", alignItems: "center", gap: 7, flexShrink: 1, minHeight: 40 },
   machineName: { fontSize: 15, fontWeight: "600", color: theme.colors.ink, flexShrink: 1 },

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, StyleSheet, Text, TextInput, View, type LayoutChangeEvent } from "react-native";
 import { theme } from "../theme";
 import { Button } from "./Button";
 import { GlassButton } from "./Glass";
@@ -17,8 +17,6 @@ export function Composer({
   canSteer,
   busy,
   pending,
-  receipt,
-  error,
   blocked,
   blockedPlaceholder = "Paused while a prompt is open",
   idleHint,
@@ -30,12 +28,11 @@ export function Composer({
   controlBusy = false,
   controlLabel = "Take control",
   children,
+  onLayout,
 }: {
   canSteer: boolean;
   busy: boolean;
   pending: boolean;
-  receipt: string;
-  error: string;
   blocked?: string;
   blockedPlaceholder?: string;
   idleHint?: string;
@@ -47,22 +44,12 @@ export function Composer({
   controlBusy?: boolean;
   controlLabel?: string;
   children?: ReactNode;
+  onLayout?: (event: LayoutChangeEvent) => void;
 }) {
   const canType = canSteer && !blocked;
   return (
-    <View style={s.area}>
-      {error ? (
-        <Text accessibilityRole="alert" style={s.error}>
-          {error}
-        </Text>
-      ) : null}
-      {receipt ? <Text style={s.receipt}>{receipt}</Text> : null}
+    <View style={s.area} onLayout={onLayout}>
       {blocked ? <Text style={s.hint}>{blocked}</Text> : null}
-      {pending ? (
-        <Text style={s.note}>
-          Unconfirmed delivery · Retry keeps the same request ID
-        </Text>
-      ) : null}
       <View style={s.row}>
         <TextInput
           accessibilityLabel="Message to agent"
@@ -83,24 +70,16 @@ export function Composer({
         />
         {onTakeControl ? <Button
           compact
-          title={controlBusy ? "Requesting…" : controlLabel}
+          busy={controlBusy}
+          title={controlLabel}
           onPress={onTakeControl}
           disabled={busy || controlBusy}
-        /> : pending ? <Button
-          compact
-          title={busy ? "Sending…" : "Retry"}
-          onPress={onSend}
-          disabled={!canType || busy || !text.trim()}
-        /> : <GlassButton
-          primary
-          glyph="send"
-          size={40}
-          label={busy ? "Sending" : "Send"}
-          onPress={onSend}
-          disabled={!canType || busy || !text.trim()}
-        />}
+        /> : <View style={s.sendControl}>
+          {busy ? <View accessible accessibilityRole="progressbar" accessibilityLabel={pending ? "Retrying delivery" : "Sending"} style={s.busyButton}><ActivityIndicator color={theme.colors.forest} /></View>
+            : pending ? <Button compact title="Retry" onPress={onSend} disabled={!canType || !text.trim()} />
+              : <GlassButton primary glyph="send" size={40} label="Send" onPress={onSend} disabled={!canType || !text.trim()} />}
+        </View>}
       </View>
-      {!pending && !blocked && text ? <Text style={s.draftNote}>Unsent draft</Text> : null}
       {onInterrupt || children ? (
         <View style={s.keys}>
           {onInterrupt ? (
@@ -125,28 +104,10 @@ const s = StyleSheet.create({
     paddingTop: 6,
     paddingBottom: 8,
   },
-  error: {
-    color: theme.colors.warningInk,
-    fontSize: 13,
-    lineHeight: 20,
-    marginVertical: 10,
-  },
   hint: {
     fontSize: 12,
     lineHeight: 18,
     color: theme.colors.warningInk,
-    marginBottom: theme.space.compact,
-  },
-  note: {
-    fontSize: 11,
-    lineHeight: 17,
-    color: theme.colors.mutedInk,
-    marginBottom: theme.space.compact,
-  },
-  receipt: {
-    fontSize: 11,
-    lineHeight: 17,
-    color: theme.colors.forest,
     marginBottom: theme.space.compact,
   },
   row: {
@@ -161,7 +122,8 @@ const s = StyleSheet.create({
     borderColor: theme.colors.glassRim,
     ...theme.lift,
   },
-  draftNote: { fontSize: 11, lineHeight: 16, color: theme.colors.mutedInk, marginTop: 6, paddingHorizontal: 12 },
+  sendControl: { width: 88, alignItems: "center", justifyContent: "center" },
+  busyButton: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
   message: {
     flex: 1,
     minHeight: 40,

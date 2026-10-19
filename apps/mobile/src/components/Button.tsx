@@ -1,4 +1,4 @@
-import { Pressable, StyleSheet, Text } from "react-native";
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import { theme } from "../theme";
 import { Glyph, type GlyphName } from "./Icon";
 
@@ -10,6 +10,7 @@ export function Button({
   secondary = false,
   compact = false,
   glyph,
+  busy,
 }: {
   title: string;
   onPress: () => void;
@@ -17,6 +18,7 @@ export function Button({
   secondary?: boolean;
   compact?: boolean;
   glyph?: GlyphName;
+  busy?: boolean;
 }) {
   const ink = secondary ? theme.colors.secondaryInk : theme.colors.white;
   return (
@@ -33,7 +35,8 @@ export function Button({
         (disabled || pressed) && s.dim,
       ]}
     >
-      {glyph ? <Glyph name={glyph} size={compact ? 13 : 15} color={ink} /> : null}
+      {busy !== undefined ? <View style={s.busySlot}>{busy ? <ActivityIndicator size="small" color={ink} /> : glyph ? <Glyph name={glyph} size={compact ? 13 : 15} color={ink} /> : null}</View>
+        : glyph ? <Glyph name={glyph} size={compact ? 13 : 15} color={ink} /> : null}
       <Text style={[s.text, compact && s.compactText, { color: ink }]} numberOfLines={1}>{title}</Text>
     </Pressable>
   );
@@ -60,4 +63,5 @@ const s = StyleSheet.create({
     borderColor: theme.colors.fieldRule,
   },
   dim: { opacity: 0.45 },
+  busySlot: { width: 15, height: 15, alignItems: "center", justifyContent: "center" },
 });

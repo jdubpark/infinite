@@ -32,11 +32,12 @@ export function TopBar({ backLabel, onBack, title, right }: { backLabel?: string
 }
 
 /** Connection freshness in words beside its dot, kept separate from any work state. */
-export function LiveStatus({ online, loading, seen }: { online: boolean; loading?: boolean; seen?: string }) {
-  const label = online ? "Live" : loading ? "Connecting" : seen ? `Offline · ${seen}` : "Offline";
-  return <View accessible accessibilityLabel={online ? `Up to date${seen ? `, updated ${seen}` : ""}` : label} style={[s.status, !online && !loading && s.statusOff]}>
-    <View style={[s.statusDot, !online && s.statusDotOff]} />
-    <Text style={[s.statusText, !online && !loading && s.statusTextOff]} numberOfLines={1}>{label}</Text>
+export function LiveStatus({ online, loading, seen, stale }: { online: boolean; loading?: boolean; seen?: string; stale?: boolean }) {
+  const label = online ? "Live" : stale ? seen ? `Offline · ${seen}` : "Offline" : loading || !seen ? "Connecting" : "Checking";
+  const offline = !online && Boolean(stale);
+  return <View accessible accessibilityLabel={online ? `Up to date${seen ? `, updated ${seen}` : ""}` : offline ? label : "Checking connection"} style={[s.status, offline && s.statusOff]}>
+    <View style={[s.statusDot, offline && s.statusDotOff]} />
+    <Text style={[s.statusText, offline && s.statusTextOff]} numberOfLines={1}>{label}</Text>
   </View>;
 }
 

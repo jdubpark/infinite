@@ -90,7 +90,7 @@ struct TeamStartBox: View {
             }.font(.caption)
         }
         if !error.isEmpty { Text(error).font(.caption).foregroundStyle(Palette.error).textSelection(.enabled) }
-        else if !app.isOwner && app.connected { Text("Only an owner device can start a team.").font(.caption).foregroundStyle(.secondary) }
+        else if !app.isOwner { Text("Only an owner device can start a team.").font(.caption).foregroundStyle(.secondary) }
         else if !project.isEmpty && !app.teamWorkspaceReady(project) { Text("This workspace needs required team checks in the host configuration.").font(.caption).foregroundStyle(.orange) }
         else if provider == "demo" { Text("Rehearsal runs a local test process, not an AI model.").font(.caption).foregroundStyle(.orange) }
     }
@@ -121,8 +121,6 @@ struct ProjectList: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            if app.teamsEnabled && !app.teamsFresh && app.connected { Text("Updates unavailable").font(.caption).foregroundStyle(Palette.attention) }
-            else if !app.connected && !app.teams.isEmpty { Text("Offline · last received").font(.caption).foregroundStyle(Palette.attention) }
             if app.me == .null {
                 // Without the server's identity the app cannot tell whether teams are on.
                 note(app.connecting ? "Connecting to \(app.active?.label ?? "the server")…" : "Not connected. Reconnect to load projects.")
@@ -132,6 +130,13 @@ struct ProjectList: View {
                 note("No projects yet.")
             } else {
                 ForEach(groups, id: \.state) { group in section(group.state, group.runs) }
+            }
+        }.overlay(alignment: .top) {
+            if (app.teamsEnabled && app.teamsDisplayStale) || app.sessionsDisplayStale {
+                Label(app.teamsLoaded ? "Updates unavailable · last received projects remain visible" : "Can't reach the server · projects haven't loaded", systemImage: "wifi.exclamationmark")
+                    .font(.caption).foregroundStyle(Palette.attention).padding(8)
+                    .background(.regularMaterial, in: Capsule())
+                    .allowsHitTesting(false)
             }
         }
     }
@@ -188,7 +193,12 @@ struct ProjectRow: View {
         VStack(alignment: .leading, spacing: 4) {
             rowLine
             if let failure = app.teamResumeFailures[team.id] {
-                Text(failure.message).font(.caption).foregroundStyle(Palette.error).lineLimit(2).padding(.leading, 24)
+                HStack(spacing: 6) {
+                    Text(failure.message).font(.caption).foregroundStyle(Palette.error).lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button { app.clearTeamResumeFailure(team.id) } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.plain).help("Dismiss resume failure")
+                }.padding(.leading, 24)
             }
         }
         .padding(.horizontal, 10).padding(.vertical, 8)

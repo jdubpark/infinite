@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { chooseTeamBrief, orderedTeamMembers, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, visibleScreen, wrapText } from "../packages/host/src/team-watch.ts";
+import { chooseTeamBrief, failedTeamBriefRow, orderedTeamMembers, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, visibleScreen, wrapText } from "../packages/host/src/team-watch.ts";
 import { chooseBrief, monitorMembers, summarySessionId, type BriefingView } from "../apps/web/src/team-monitor.ts";
 import { chooseBrief as choosePhoneBrief, orderedMembers, plainScreen } from "../apps/mobile/src/features/teams/summary.ts";
 
@@ -92,10 +92,18 @@ test("the summary card reads the coordinator brief and the log card returns to i
   assert.match(empty, /Press a to ask Jevcode/);
   assert.match(empty.split("\n").at(-1)!, /a ask Jevcode/);
   assert.doesNotMatch(teamSummaryText(detailed, [{ sessionId: "s-pm", status: { state: "pending" } }], "", true), /ask Jevcode/);
+  const writing = teamSummaryText(detailed, [{ sessionId: "s-pm", status: { state: "pending" } }]);
+  assert.match(writing, /Jevcode is writing the summary/);
+  assert.doesNotMatch(teamSummaryText(detailed, [{ sessionId: "s-pm", status: { state: "pending" } }], "", false, undefined, true), /Jevcode is writing the summary/);
+  const updating = { sessionId: "s-pm", status: { state: "running", summary: { text: "Last good brief" } } };
+  assert.match(teamSummaryText(detailed, [updating]), /Jevcode is updating this summary/);
+  assert.doesNotMatch(teamSummaryText(detailed, [updating], "", false, undefined, true), /Jevcode is updating this summary/);
   const screen = "\u001b[32mplanning the stop\u001b[0m\nnext step";
   assert.match(visibleScreen(screen), /planning the stop\nnext step/);
   assert.equal(plainScreen(screen), "planning the stop\nnext step");
   assert.doesNotMatch(visibleScreen(screen), /32m/);
+  assert.deepEqual(visibleScreen("top line\nsecond line\n\n", 4).split("\n"), ["top line", "second line", "", ""]);
+  assert.equal(visibleScreen("", 4), "No screen is recorded for this agent.");
   const agents = orderedTeamMembers(detailed).filter(member => member.sessionId);
   const logs = teamLogsText(detailed, agents, detailed.members[1], screen, [{ at: "10:00", text: "Coordinator started" }], "", true);
   assert.match(logs, /review logs · agent 1 of 3/);
@@ -139,9 +147,45 @@ test("a full-screen frame wraps the card, scrolls its body, and pins the key bar
   const lines = visible(top.frame);
   assert.equal(lines.length, 10);
   assert.equal(lines[0], "line 1");
-  assert.equal(lines.at(-1), "l logs · q quit · ↑↓ scroll 1-8 of 30");
+  assert.equal(lines.at(-1), "l logs · q quit · ↑↓ scroll 1-7 of 30");
   const end = teamWatchScreen(card, { rows: 10, columns: 40, offset: 999, color: false });
-  assert.equal(end.offset, 22);
-  assert.equal(visible(end.frame)[0], "line 23");
+  assert.equal(end.offset, 23);
+  assert.equal(visible(end.frame)[0], "line 24");
   assert.doesNotMatch(visible(teamWatchScreen("one\n\nl logs", { rows: 10, columns: 40, offset: 0, color: false }).frame).at(-1)!, /scroll/);
+});
+
+test("a fixed status row keeps body position and frame height stable", () => {
+  const card = "heading\nfirst body line\nsecond body line\n\nl logs · q quit";
+  const read = (status = "") => teamWatchScreen(card, { rows: 8, columns: 24, offset: 0, color: false, status }).frame
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").split("\n");
+  const blank = read();
+  const outage = read("Update failed: connection lost. Showing the last received card.");
+  assert.equal(blank.length, 8);
+  assert.equal(outage.length, 8);
+  assert.equal(blank[0], outage[0]);
+  assert.equal(blank[1], outage[1]);
+  assert.equal(outage[6], "Update failed: connectio");
+  assert.equal(blank[6], "");
+  assert.ok(outage.every(line => line.length <= 24));
+});
+
+test("recorded screens keep their terminal height without padding, and agent strips stay within width", () => {
+  // A terminal screen keeps its trailing blank rows, so its block height does not change as output fills it.
+  const rows = (text: string) => visibleScreen(text, 6).split("\n").length;
+  assert.equal(rows("one line\n\n\n\n"), rows("one line\ntwo lines\nthree\n\n"));
+  assert.equal(rows("only\n"), 2);
+  assert.equal(visibleScreen("\n\n\n", 6), "No screen is recorded for this agent.");
+  const members = orderedTeamMembers(team).filter(member => member.sessionId);
+  const logs = teamLogsText(team, members, team.members[1], "screen", [], "", true, 18);
+  const strip = logs.split("\n")[3];
+  assert.ok(strip);
+  assert.ok(strip.length <= 18);
+});
+
+test("a failed brief refresh retains that session's previous summary", () => {
+  const previous = { sessionId: "s-pm", status: { state: "ready", summary: { text: "Last good brief" } } };
+  const failed = failedTeamBriefRow("s-pm", "temporary timeout", [previous]);
+  assert.equal(failed.status.summary?.text, "Last good brief");
+  assert.equal(failed.fetchError, "temporary timeout");
+  assert.equal(failedTeamBriefRow("s-impl", "unavailable", [previous]).status.error, "unavailable");
 });

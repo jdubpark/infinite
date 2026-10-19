@@ -5,6 +5,7 @@ import * as Crypto from "expo-crypto";
 import { api, ApiError, connectionKey, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { TopBar } from "../../components/Glass";
 import { teamCreations } from "../../store/requests";
 import { theme } from "../../theme";
@@ -19,7 +20,7 @@ export function TeamCreate({ connection }: { connection: Connection }) {
   const machine = connectionKey(connection);
   const creation = teamCreations.use(machine);
   const pending = creation.pending;
-  const { data: me, online, refresh } = usePoll(() => api<Me>(connection, "/me"), 5000, [connection]);
+  const { data: me, online, stale, refresh } = usePoll(() => api<Me>(connection, "/me"), 5000, [connection]);
   const projects = me?.projects ?? [];
   const lineup = me?.teams?.lineup;
   const configured = me?.backendProviders?.infinite ?? me?.providers ?? [];
@@ -31,6 +32,7 @@ export function TeamCreate({ connection }: { connection: Connection }) {
   const [provider, setProvider] = useState(pending?.provider);
   const [parallelism, setParallelism] = useState(pending?.parallelism ?? 2);
   const [sending, setSending] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   // A send started before this screen remounted is still in flight; its result re-renders through the store.
   const busy = sending || Boolean(pending && inFlight.has(pending.requestId));
   const mounted = useRef(true);
@@ -52,6 +54,7 @@ export function TeamCreate({ connection }: { connection: Connection }) {
       requestId: Crypto.randomUUID(), projectId: projectId!, provider: selectedProvider!, useConfiguredLineup: lineupSelected,
       title: title.trim() || objective.trim().split("\n")[0].slice(0, 100), objective: objective.trim(), parallelism: Math.min(parallelism, maxParallelism),
     });
+    setRetrying(Boolean(pending));
     if (inFlight.has(request.requestId)) return;
     inFlight.add(request.requestId);
     setSending(true);
@@ -63,12 +66,12 @@ export function TeamCreate({ connection }: { connection: Connection }) {
       teamCreations.fail(machine, request.requestId, `${(error as Error).message}${rejected ? " Correct the request and try again." : " Delivery is unconfirmed. Check Teams or retry the same request."}`, rejected);
     } finally { inFlight.delete(request.requestId); if (mounted.current) setSending(false); }
   }
-  return <KeyboardAvoidingView style={s.fill} behavior="padding">
+  return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     <TopBar backLabel="Teams" onBack={() => router.canGoBack() ? router.back() : router.replace({ pathname: "/", params: { machine, view: "teams" } })} right={<Text style={t.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
+    <FloatingNotice position="top" offset={58} message={stale ? me ? "Waiting for a fresh machine connection." : "Can't reach this machine." : null} actions={stale ? <Button compact title="Refresh" secondary onPress={refresh} /> : null} />
     <ScrollView contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>New team</Text>
       <Text style={t.note}>A coordinator plans the work, implementers build it in isolated copies, and a reviewer checks the result. The team asks when it needs a decision.</Text>
-      {!online ? <View style={s.section}><Text style={t.warning}>Waiting for a fresh machine connection.</Text><Button title="Refresh" secondary onPress={refresh} /></View> : null}
       {me && me.role !== "owner" ? <Text style={t.warning}>An owner key is required to start a team.</Text> : null}
       {me && !me.teams?.enabled ? <Text style={t.warning}>Teams need host setup: enable teams and give a workspace its required checks.</Text> : null}
       {creation.result ? <View style={s.section}><Text style={t.note}>Team started.</Text><Button title="Open team" onPress={() => router.replace({ pathname: "/team/[id]", params: { id: creation.result!.id, machine } })} /></View> : null}
@@ -100,14 +103,15 @@ export function TeamCreate({ connection }: { connection: Connection }) {
       <Text style={t.label}>Parallel implementers</Text>
       <Choices values={Array.from({ length: maxParallelism }, (_, index) => index + 1)} selected={Math.min(parallelism, maxParallelism)} disabled={locked} label={String} onSelect={setParallelism} />
       <Text style={t.note}>Work runs on {me?.machine?.label || connection.label || "this machine"} in isolated workspaces with the provider permissions already configured there. A refused tool can stop a member; inspect its session before continuing.</Text>
-      {creation.message ? <Text style={t.warning} accessibilityRole="alert">{creation.message}</Text> : null}
-      <View style={s.section}><Button title={busy ? "Starting team…" : pending ? "Retry same request" : "Start team"} disabled={busy || !allowed} onPress={() => void submit()} /></View>
+      {creation.message ? <Text accessibilityRole="alert" style={t.warning}>{creation.message}</Text> : null}
+      <View style={s.section}><Button busy={busy} title={pending && (!busy || retrying) ? "Retry same request" : "Start team"} disabled={busy || !allowed} onPress={() => void submit()} /></View>
     </ScrollView>
   </KeyboardAvoidingView>;
 }
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
+  overlayRoot: { position: "relative" },
   body: { padding: 24, gap: 10, paddingBottom: 48 },
   title: { fontSize: 28, lineHeight: 34, color: theme.colors.ink, fontWeight: "700", letterSpacing: -0.6 },
   section: { marginVertical: 16, gap: 12 },

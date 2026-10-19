@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowUpRight, Check, ChevronRight, GitBranch, Plus, RefreshCw, Send, Users } from "lucide-react";
+import { ArrowUpRight, Check, ChevronRight, GitBranch, Plus, RefreshCw, Send, Users, X } from "lucide-react";
 import { ApiError, ago, clock, names, useApi, type LimitSwitch, type LogEvent, type ProviderLimit, type Me, type Session, type TeamLineup, type TeamModelProfile, type TeamBrief, type TeamEvidence, type LinearTrackingView, type TeamUsage, type UsageTotals } from "./api";
 import { SpendBlock, UsageFigure, UsageRollup, usageEnabled } from "./usage";
 import { briefText, chooseBrief, monitorMembers, summarySessionId, type BriefingView } from "./team-monitor";
@@ -114,8 +114,8 @@ export function TeamPicker({ teams, selected, loading, onSelect }: { teams: Team
   </nav>;
 }
 
-export function TeamList({ teams, me, fresh, loading, failed, seen, onCreate, onSelect, refresh }: {
-  teams: TeamView[]; me: Me; fresh: boolean; loading: boolean; failed: boolean; seen: string;
+export function TeamList({ teams, me, fresh, stale, loading, failed, seen, onCreate, onSelect, refresh }: {
+  teams: TeamView[]; me: Me; fresh: boolean; stale: boolean; loading: boolean; failed: boolean; seen: string;
   onCreate: () => void; onSelect: (id: string) => void; refresh: () => void;
 }) {
   return <div className="team-page team-list-page">
@@ -124,8 +124,7 @@ export function TeamList({ teams, me, fresh, loading, failed, seen, onCreate, on
     <SetupNotice me={me} />
     <ProviderLimitNotice limits={me.providerLimits} />
     <SpendBlock me={me} />
-    <div className="team-section-heading"><h2>Team runs <span className="quiet">{teams.length}</span></h2><span className="quiet">{!me.teams ? "Unavailable on this host" : fresh ? "Up to date" : failed ? "Team updates unavailable" : loading ? "Loading…" : "Checking…"}{seen && " · checked " + ago(seen)}</span></div>
-    {failed && <p className="team-notice" role="status">The host could not refresh team runs. Showing the last received state. <button className="text-button" onClick={refresh}>Try again</button></p>}
+    <div className="team-section-heading"><h2>Team runs <span className="quiet">{teams.length}</span></h2><span className="quiet" role="status">{!me.teams ? "Unavailable on this host" : fresh ? "Up to date" : stale ? seen ? "Team updates unavailable" : "Can’t reach the host. Teams haven’t loaded." : loading ? "Loading…" : "Checking…"}{seen && " · checked " + ago(seen)}{stale && seen && " · Showing last received state; controls are disabled."}</span></div>
     {blockedFirst(teams).map(team => <div className="team-run-row" key={team.id}>
       <button type="button" className="team-run-open" onClick={() => onSelect(team.id)}><div><strong>{team.title}</strong><p>{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)} · {date(team.createdAt)}</p>{team.lineup && <p className="team-run-model">Requested coordinator: <code>{team.lineup.coordinator.model}</code> · {profileSetting(team.lineup.coordinator)}</p>}{team.status === "blocked" && <p className="team-run-reason">{team.reason ?? " "}</p>}</div><Status status={team.status} /><ArrowUpRight size={18} /></button>
       {team.status === "blocked" && me.role === "owner" && team.resumable === true && !team.goal && !team.deliveryReceipt && <TeamListResume team={team} fresh={fresh} refresh={refresh} />}
@@ -159,9 +158,9 @@ function TeamListResume({ team, fresh, refresh }: { team: TeamView; fresh: boole
     } finally { inFlight.delete(body.requestId); setBusy(false); }
   }
   return <span className="team-run-resume-wrap">
-    {request.message && <span className="team-run-resume-error" role="status">{request.message}</span>}
+    {request.message && !busy && <span className="team-run-resume-error" role="status">{request.message}</span>}
     {pending && !busy && <button type="button" className="team-run-resume" disabled={!fresh} onClick={() => void resume()}>Retry same request</button>}
-    <button type="button" className="team-run-resume" disabled={busy || Boolean(pending) || !fresh} onClick={() => void resume()}>{busy ? "Resuming…" : "Resume"}</button>
+    <button type="button" className="team-run-resume" aria-busy={busy} disabled={busy || Boolean(pending) || !fresh} onClick={() => void resume()}>{busy ? "Resuming…" : "Resume"}</button>
   </span>;
 }
 
@@ -221,8 +220,8 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
       {project?.team && <details className="team-check-config"><summary>Required workspace checks</summary>{project.team.establishChecks && <p className="quiet">The coordinator will define build and test commands before implementation. The host must run them successfully before review.</p>}<ul>{project.team.checks.map((check, index) => <li key={index}><code>{[check.command, ...check.args].join(" ")}</code></li>)}</ul>{project.team.setup && <p className="quiet">Workspace setup: <code>{[project.team.setup.command, ...project.team.setup.args].join(" ")}</code></p>}</details>}
       <p className="form-note">Work runs on the selected host in isolated workspaces. The team uses the provider permissions already configured there. A refused tool can stop a member; inspect its session before continuing.</p>
       {!useConfiguredLineup && provider === "demo" && <p className="team-notice">Rehearsal uses a local test process. It does not call an AI model or implement a real feature.</p>}
-      {creation.message && <p className="error" role="alert">{creation.message}{pending && " Delivery is unconfirmed. Retry keeps the same creation request."}</p>}
-      <button className="primary" disabled={busy || !allowed || (!pending && !objective.trim())}>{busy ? "Starting team…" : pending ? "Retry same request" : "Start team"}<ArrowUpRight size={18} /></button>
+      {!busy && creation.message && <p className="error" role="alert">{creation.message}{pending && " Delivery is unconfirmed. Retry keeps the same creation request."}</p>}
+      <button className="primary stable-action" aria-busy={busy} disabled={busy || !allowed || (!pending && !objective.trim())}>{busy && <RefreshCw className="is-refreshing" size={16} />}{pending ? "Retry same request" : "Start team"}<ArrowUpRight size={18} /></button>
     </form>
     <RoleGuide />
   </div>;
@@ -252,10 +251,9 @@ function JevcodeSummary({ team, rows, failed, asking, error, onRequest }: {
   const canAsk = !text && (chosen?.status.state === "empty" || chosen?.status.state === "failed");
   const age = when ? ago(when) : "";
   return <section className="team-section team-summary" aria-live="polite">
-    <div className="team-section-heading"><h2>Jevcode summary</h2><span className="quiet">{[brief || chosen?.status.summary?.engine === "jevcode" ? "Jevcode" : "Session summary", member ? roles[member.role].name : "", when ? date(when) : "", age].filter(Boolean).join(" · ")}</span></div>
+    <div className="team-section-heading"><h2>Jevcode summary</h2><span className="quiet" title={updating ? "Jevcode is updating this summary." : undefined}>{[brief || chosen?.status.summary?.engine === "jevcode" ? "Jevcode" : "Session summary", member ? roles[member.role].name : "", when ? date(when) : "", age, updating ? "Updating" : ""].filter(Boolean).join(" · ")}</span></div>
     {!text && <p className="quiet">{failed ? "The Jevcode summary could not be loaded." : !rows.length ? (team.members.length ? "Loading the Jevcode summary…" : "No agent session is available for a Jevcode summary.") : updating ? "Jevcode is writing the summary." : chosen?.status.error || "No Jevcode summary yet."}</p>}
     {text && <>
-      {updating && <p className="quiet">Jevcode is updating this summary.</p>}
       <p className="team-summary-lead">{brief?.summary ?? text}</p>
       {brief?.architecture?.length ? <details className="team-summary-fold"><summary>System shape <span className="quiet">{brief.architecture.length}</span></summary><ul className="team-summary-list">{brief.architecture.map((item, index) => <li key={index}>{item.text}</li>)}</ul></details> : null}
       {brief?.review?.length ? <><h3>Review first <span className="quiet">{brief.review.length}</span></h3><ol className="team-review-list">{brief.review.map((item, index) => <li key={index}>
@@ -273,8 +271,8 @@ function JevcodeSummary({ team, rows, failed, asking, error, onRequest }: {
     {canAsk && coordinatorId && <button className="text-button" disabled={asking} onClick={() => onRequest(chosen?.sessionId ?? coordinatorId)}>{asking ? "Asking Jevcode… this can take a few minutes" : "Ask Jevcode for a summary"}</button>}
   </section>;
 }
-function TeamLogs({ member, session, events, failed, follow, setFollow, onOpen }: {
-  member: TeamMember; session: Session | null; events: LogEvent[]; failed: boolean; follow: boolean; setFollow: (value: boolean) => void; onOpen: () => void;
+function TeamLogs({ member, session, events, stale, follow, setFollow, onOpen }: {
+  member: TeamMember; session: Session | null; events: LogEvent[]; stale: boolean; follow: boolean; setFollow: (value: boolean) => void; onOpen: () => void;
 }) {
   const screenRef = useRef<HTMLPreElement>(null);
   useEffect(() => {
@@ -284,8 +282,7 @@ function TeamLogs({ member, session, events, failed, follow, setFollow, onOpen }
   return <section className="team-section team-logs">
     <div className="team-section-heading"><h2>{roles[member.role].name}</h2><button className="text-button" onClick={onOpen}>Open session <ArrowUpRight size={16} /></button></div>
     <p className="quiet">{member.title} · {member.status}{member.revision ? ` · revision ${member.revision}` : ""}{session?.attention?.now ? ` · ${session.attention.now}` : ""}</p>
-    {failed && <p className="team-notice" role="status">This agent’s log could not be refreshed.</p>}
-    <div className="screen-actions"><span>{session ? "Current screen" : "Loading the screen…"}</span><button className="text-button" aria-pressed={follow} onClick={() => setFollow(!follow)}>{follow ? "Following latest" : "Follow latest"}</button></div>
+    <div className="screen-actions"><span role="status">{stale ? session ? "Agent log could not be refreshed; showing the last received state." : "Can’t reach the host. This agent’s log hasn’t loaded." : session ? "Current screen" : "Loading the screen…"}</span><button className="text-button" aria-pressed={follow} onClick={() => setFollow(!follow)}>{follow ? "Following latest" : "Follow latest"}</button></div>
     <pre className="screen" ref={screenRef} tabIndex={0} aria-label={`${roles[member.role].name} terminal screen`} onScroll={event => {
       const node = event.currentTarget;
       setFollow(node.scrollHeight - node.scrollTop - node.clientHeight < 48);
@@ -304,9 +301,16 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   const request = mutations.use(key);
   const pending = request.pending;
   const [busy, setBusy] = useState(false);
+  const [dismissedMessage, setDismissedMessage] = useState("");
   const [direction, setDirection] = useState("");
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  useEffect(() => {
+    setDismissedMessage("");
+    if (!request.result || !request.message) return;
+    const timer = setTimeout(() => setDismissedMessage(request.message), 4000);
+    return () => clearTimeout(timer);
+  }, [request.message, request.result]);
   function receive(next: TeamView) { setTeam(previous => !previous || next.revision > previous.revision || (next.revision === previous.revision && next.updatedAt >= previous.updatedAt) ? next : previous); }
   const view = useLiveRefresh(async current => {
     try { const next = await api<TeamView>("/teams/" + id); if (current()) { receive(next); setLoadError(""); } }
@@ -401,11 +405,10 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   const attention = memberSessions.filter(session => session.attention?.state === "needs-you");
   const selectedMember = team.members.find(member => member.memberId === agentId);
   return <div className="team-detail">
-    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.objective.trim() || team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span>Up to {team.parallelism} implementers</span></div></div><div className="team-heading-actions"><div className="team-view-switch" role="group" aria-label="Team view"><button type="button" aria-pressed={mode === "summary"} onClick={() => setMode("summary")}>Summary</button><button type="button" aria-pressed={mode === "logs"} onClick={() => setMode("logs")}>Review logs</button></div><button className="text-button team-refresh" disabled={view.refreshing} onClick={view.refresh}><RefreshCw size={14} />{view.refreshing ? "Checking…" : "Refresh team"}</button></div></header>
-    {!fresh && <div className="connection-notice" role="status">{view.failed ? "Team updates are unavailable. Showing the last received state; controls are disabled." : "Checking the team’s current state…"}{view.seen && " Last checked " + date(view.seen) + "."}</div>}
+    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.objective.trim() || team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span>Up to {team.parallelism} implementers</span><span className="team-freshness" role="status">{view.stale ? "Showing last received state; controls are disabled." : ""}</span></div></div><div className="team-heading-actions"><div className="team-view-switch" role="group" aria-label="Team view"><button type="button" aria-pressed={mode === "summary"} onClick={() => setMode("summary")}>Summary</button><button type="button" aria-pressed={mode === "logs"} onClick={() => setMode("logs")}>Review logs</button></div><button className="text-button team-refresh" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh team</button></div></header>
     <div className="team-detail-body">
       {team.reason && <p className="team-notice" role="status">{team.reason}</p>}
-      <LinearTracking tracking={team.linear} fresh={fresh} />
+      <LinearTracking tracking={team.linear} stale={view.stale} />
       {team.deliveryReceipt && <p className="team-notice team-ready"><Check size={18} /><span>The delivery agent reports that <a href={team.deliveryReceipt.pullRequestUrl} target="_blank" rel="noreferrer">the pull request merged</a>. The host records this report; it does not independently verify GitHub or product impact.</span></p>}
       {team.status === "ready-for-review" && <p className="team-notice team-ready"><Check size={18} />The team reports that this run is ready for your review. Inspect the changes and evidence below before merging or publishing.</p>}
       {team.goal && <p className="goal-team-origin"><a href={goalHref}>Open goal</a> · cycle {team.goal.cycle} · goal revision {team.goal.revision}</p>}
@@ -420,7 +423,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
           const step = (by: number) => setAgentId(orderedMembers[(index + by + orderedMembers.length) % orderedMembers.length]!.memberId);
           return <div className="team-agent-stepper"><button type="button" className="text-button" onClick={() => step(-1)}>‹ Previous</button><span className="quiet">Agent {index + 1} of {orderedMembers.length}</span><button type="button" className="text-button" onClick={() => step(1)}>Next ›</button></div>;
         })()}
-        {selectedMember ? <TeamLogs member={selectedMember} session={logSession?.id === selectedMember.sessionId ? logSession : null} events={logEvents} failed={logs.failed} follow={followLog} setFollow={setFollowLog} onOpen={() => openSession(selectedMember.sessionId)} /> : <p className="quiet">This run has no agents yet.</p>}
+        {selectedMember ? <TeamLogs member={selectedMember} session={logSession?.id === selectedMember.sessionId ? logSession : null} events={logEvents} stale={logs.stale} follow={followLog} setFollow={setFollowLog} onOpen={() => openSession(selectedMember.sessionId)} /> : <p className="quiet">This run has no agents yet.</p>}
         <button type="button" className="text-button team-back-summary" onClick={() => setMode("summary")}>Back to summary</button>
       </> : <JevcodeSummary team={team} rows={briefs} failed={briefing.failed} asking={asking} error={briefError} onRequest={sessionId => void requestSummary(sessionId)} />}
       <details className="team-run-details"><summary>Run details</summary>
@@ -439,8 +442,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       {me.role === "owner" && !team.goal && team.status !== "cancelled" && <div className="team-actions">{showRunControl && <button className="text-button" disabled={!canOwn || busy || Boolean(pending)} onClick={() => action(resumeRun ? "resume" : "pause", resumeRun ? "Resume" : "Pause")}>{resumeRun ? "Resume team" : "Pause team"}</button>}<button className="text-button team-cancel" disabled={!canOwn || busy || Boolean(pending)} onClick={() => { if (window.confirm("Cancel this team run? This stops its agent sessions and keeps the recorded work.")) action("cancel", "Cancellation"); }}>Cancel team</button></div>}
     </div>
     <div className="team-composer-area">
-      {request.message && <p className={request.result ? "quiet" : "error"} role="status">{request.message}</p>}
-      {pending && <div className="team-pending"><span>{busy ? "Sending " : "Unconfirmed request: "}{pending.label.toLowerCase()} · revision {pending.revision}</span>{!busy && <button className="text-button" disabled={!fresh || me.role === "viewer" || (me.role !== "owner" && !pending.path.endsWith("/steer") && !pending.path.endsWith("/answer"))} onClick={() => void mutate(pending.path, pending.label, pending.text)}>Retry same request</button>}</div>}
+      {!busy && ((request.message && request.message !== dismissedMessage) || pending) && <div className={`team-floating-notice${request.result ? " is-receipt" : ""}`} role={request.result ? "status" : "alert"}>{request.message && request.message !== dismissedMessage && <div className="team-floating-message"><span>{request.message}</span><button type="button" className="team-notice-dismiss" aria-label="Dismiss notice" onClick={() => setDismissedMessage(request.message)}><X size={15} /></button></div>}{pending && <div className="team-pending" role="status"><span>Unconfirmed request: {pending.label.toLowerCase()} · revision {pending.revision}</span><button className="text-button" disabled={!fresh || me.role === "viewer" || (me.role !== "owner" && !pending.path.endsWith("/steer") && !pending.path.endsWith("/answer"))} onClick={() => void mutate(pending.path, pending.label, pending.text)}>Retry same request</button></div>}</div>}
       {me.role === "viewer" ? <p className="quiet">This device can view the team. An owner or controller can answer decisions and send direction.</p> : team.goal ? <p className="quiet goal-team-origin">Answer this cycle’s decisions above. <a href={goalHref}>Open the goal</a> to steer, pause, resume, or cancel its work.</p> : team.status === "cancelled" ? <p className="quiet">This run is cancelled. Its work and evidence remain available above.</p> : team.status === "delivering" || team.deliveryReceipt ? <p className="quiet">Delivery has started. Inspect its PR and recorded evidence before starting further work.</p> : <form onSubmit={event => { event.preventDefault(); if (direction.trim()) void mutate("/teams/" + id + "/steer", "Direction", direction.trim()); }}><label className="sr-only" htmlFor="team-direction">Steer this team</label><textarea id="team-direction" rows={2} maxLength={8000} placeholder="Give the team a direction or change the requirements…" value={direction} onChange={event => setDirection(event.target.value)} disabled={busy || Boolean(pending)} /><button className="primary" disabled={!canSteer || busy || Boolean(pending) || !direction.trim()}>Send direction <Send size={17} /></button></form>}
     </div>
   </div>;

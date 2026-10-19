@@ -9,6 +9,7 @@ let package = Package(
         .target(name: "InfiniteCore"),
         .executableTarget(name: "InfiniteDesktop", dependencies: ["InfiniteCore"], resources: [.copy("Resources")]),
         .testTarget(name: "InfiniteCoreTests", dependencies: ["InfiniteCore"]),
+        .testTarget(name: "InfiniteDesktopTests", dependencies: ["InfiniteDesktop"]),
     ],
     swiftLanguageModes: [.v5]
 )

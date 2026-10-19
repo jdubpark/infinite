@@ -50,32 +50,26 @@ export function DecisionCard({
   // Status sits right under the options, where the person just tapped.
   // Outcomes that outlive the prompt ("changed", refusals) are the Brief's notice.
   const statusLine = (
-    <>
+    <View style={s.statusSlot}>
       {busy ? (
-        <Text accessibilityLiveRegion="polite" style={s.status}>
+        <Text accessibilityLiveRegion="polite" numberOfLines={1} style={s.status}>
           Sent, waiting for the dialog to close…
         </Text>
       ) : null}
       {status.kind === "still-open" ? (
-        <Text accessibilityLiveRegion="polite" style={s.statusWarn}>
+        <Text accessibilityLiveRegion="polite" numberOfLines={1} style={s.statusWarn}>
           The dialog is still open. Check the terminal.
         </Text>
       ) : null}
       {status.kind === "error" ? (
         <>
-          <Text
-            accessibilityRole="alert"
-            accessibilityLiveRegion="polite"
-            style={s.statusWarn}
-          >
-            {status.message}
-          </Text>
-          {status.retry ? (
-            <Button compact title="Retry" disabled={!canAnswer} onPress={onRetry} />
-          ) : null}
+          <View style={s.statusActions}>
+            <Text accessibilityRole="alert" accessibilityLiveRegion="polite" numberOfLines={1} style={[s.statusWarn, s.statusText]}>{status.message}</Text>
+            {status.retry ? <Pressable accessibilityRole="button" accessibilityState={{ disabled: !canAnswer }} disabled={!canAnswer} onPress={onRetry} hitSlop={4} style={s.retry}><Text style={s.retryText}>Retry</Text></Pressable> : null}
+          </View>
         </>
       ) : null}
-    </>
+    </View>
   );
   return (
     <View style={s.card} accessibilityRole="summary">
@@ -226,5 +220,10 @@ const s = StyleSheet.create({
     backgroundColor: theme.colors.white,
   },
   status: { fontSize: 13, lineHeight: 19, color: theme.colors.mutedInk },
+  statusSlot: { height: 30, justifyContent: "center" },
+  statusActions: { flexDirection: "row", alignItems: "center", gap: 6 },
+  statusText: { flex: 1 },
   statusWarn: { fontSize: 13, lineHeight: 19, color: theme.colors.warningInk },
+  retry: { height: 26, minWidth: 52, alignItems: "center", justifyContent: "center", borderRadius: 13, backgroundColor: theme.colors.secondarySurface },
+  retryText: { fontSize: 12, fontWeight: "600", color: theme.colors.forest },
 });

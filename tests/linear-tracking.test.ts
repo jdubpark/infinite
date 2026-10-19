@@ -307,6 +307,21 @@ test("a blocked run's issue gets its reason, next step and a Blocked label until
     assert.equal(service.getTeam(second.id)?.status, "synced");
     linear.rateLimitLabelLookups(false);
 
+    // A rate-limited change on a cached label keeps its delay: no recovery lookup, no immediate retry.
+    linear.rateLimitLabelChanges(true);
+    const third = { ...run, id: randomUUID(), title: "Third run", status: "implementing", revision: 1, reason: undefined } as unknown as TeamRun;
+    service.updateTeam(third, true);
+    await waitFor(async () => service!.getTeam(third.id)?.status, status => status === "synced", 15000);
+    (service as unknown as { labels: Map<string, string> }).labels.set(linear.teamId, [...linear.labels.keys()][0]);
+    const before = { lookups: linear.calls.filter(call => call.operation === "InfiniteLinearLabels").length, adds: linear.calls.filter(call => call.operation === "InfiniteLinearIssueAddLabel").length };
+    third.status = "blocked"; third.reason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
+    service.updateTeam(third, true, true);
+    await waitFor(async () => linear.calls.filter(call => call.operation === "InfiniteLinearIssueAddLabel").length, count => count > before.adds, 15000);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    assert.equal(linear.calls.filter(call => call.operation === "InfiniteLinearIssueAddLabel").length, before.adds + 1, "The rate-limited add waits for its delay");
+    assert.equal(linear.calls.filter(call => call.operation === "InfiniteLinearLabels").length, before.lookups, "A rate limit is not mistaken for a deleted label");
+    linear.rateLimitLabelChanges(false);
+
     // A label failure never gates execution: tracking stays synced while the label waits to retry.
     linear.failLabelLookups(true);
     const fresh = new LinearService({ ...config, stateDir: join(root, "isolated-state") } as Config, randomBytes(32));

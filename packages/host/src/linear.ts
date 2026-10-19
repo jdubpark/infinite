@@ -171,7 +171,7 @@ export class LinearService {
     if (evidenceStatuses.has(run.status) && (run.status !== "blocked" || resumable !== undefined)) {
       const checks = run.checks.filter(check => check.revision === run.revision);
       // A goal's runs are resumed from the goal; the team resume route refuses them.
-      const flag = run.status === "blocked" ? `Reason: ${sharedText(run.reason ?? "not recorded")}\nNext step: ${run.goal ? "open the goal that owns this run; its runs are resumed from the goal."
+      const flag = run.status === "blocked" ? `Reason: ${sharedText(run.reason ?? "not recorded")}\nNext step: ${run.goal ? "inspect the goal that owns this run, then approve new work for it if it should continue."
         : resumable ? `run \`infinite team resume ${run.id}\` to replan from the integrated work.` : "inspect the run's evidence, then start a new run to continue."}\n` : "";
       this.comment(stored, `status:${run.revision}:${run.status}`, `Infinite feature execution\n\nStatus: ${run.status}\n${flag}Agent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`);
     }
@@ -334,7 +334,8 @@ export class LinearService {
     if (labelId) {
       try { await change(labelId); }
       catch (error) {
-        // A cached label may have been deleted in Linear: look it up once more before backing off.
+        // A rate limit keeps its delay; any other failure may mean the cached label was deleted in Linear.
+        if (error instanceof LinearFailure && error.retryAfterMs > 0) throw error;
         this.labels.delete(teamId);
         if (!cached || this.closed) throw error;
         labelId = await this.blockedLabel(teamId, adding);

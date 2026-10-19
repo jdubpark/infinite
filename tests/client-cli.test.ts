@@ -492,8 +492,8 @@ test("a lost child enrollment receipt preserves concurrent defaults and requires
     assert.deepEqual(currentParent.linear, { teamId: teamAfter, projectId: projectAfter }, "the successful child save merges with the latest parent defaults");
     assert.deepEqual((await run.host.fetchApi("/projects/race-target/team")).body.linear, { teamId: teamBefore, projectId: projectBefore });
 
-    // A first inherited request can commit even though its response is lost. Natural retry must
-    // preserve that uncertain request instead of creating another mutation.
+    // A first inherited request can commit even though its response is lost. Natural retry resumes
+    // that uncertain request under its own ID instead of creating another mutation.
     const lostArgs = [lostChild, "--project", "lost-target", "--check-json", JSON.stringify([{ command: "node", args: ["-e", "process.exit(0)"] }])];
     dropNextPut = true;
     let lostError: { stderr?: string } | undefined;
@@ -504,14 +504,15 @@ test("a lost child enrollment receipt preserves concurrent defaults and requires
     const saved = await run.host.fetchApi("/projects/lost-target/team");
     assert.deepEqual(saved.body.linear, { teamId: teamAfter, projectId: projectAfter });
     assert.equal(saved.body.revision, 1);
-    await assert.rejects(invoke(lostArgs), (error: { stderr: string }) => /earlier request has an uncertain result/.test(error.stderr) && error.stderr.includes(requestId));
-    assert.equal(putCount, 2, "the natural retry is stopped before another host mutation");
-    const replay = JSON.parse((await invoke([...lostArgs, "--request-id", requestId])).stdout);
-    assert.deepEqual(replay.linear, { teamId: teamAfter, projectId: projectAfter });
+    await assert.rejects(invoke([...lostArgs, "--request-id", randomUUID()]), (error: { stderr: string }) => /earlier request has an uncertain result/.test(error.stderr) && error.stderr.includes(requestId));
+    assert.equal(putCount, 2, "a different explicit request ID is stopped before another host mutation");
+    const retried = await invoke(lostArgs);
+    assert.ok(retried.stderr.includes(`Resuming earlier request ${requestId}`), retried.stderr);
+    assert.deepEqual(JSON.parse(retried.stdout).linear, { teamId: teamAfter, projectId: projectAfter });
     const afterReplay = await run.host.fetchApi("/projects/lost-target/team");
-    assert.equal(afterReplay.body.revision, saved.body.revision, "exact-ID replay returns the committed enrollment without a new revision");
+    assert.equal(afterReplay.body.revision, saved.body.revision, "the resumed request returns the committed enrollment without a new revision");
     assert.deepEqual(afterReplay.body.linear, { teamId: teamAfter, projectId: projectAfter });
-    assert.equal(putCount, 3, "only explicit replay sends another request, and the host deduplicates it");
+    assert.equal(putCount, 3, "the natural retry sends the saved request once more, and the host deduplicates it");
   } finally {
     releasePut?.(); enrollmentChild?.kill();
     proxy.closeAllConnections(); await new Promise<void>(resolve => proxy.close(() => resolve()));
@@ -547,7 +548,7 @@ test("repo init refuses to enroll a source snapshot while its sync generation is
     await assert.rejects(exec(entry[0], [...entry.slice(1), "repo", "init", localRoot, "--check-json", JSON.stringify([{ command: "git", args: ["status", "--short"] }])]), (error: { stderr: string }) => {
       assert.match(error.stderr, /source snapshot is pending \(session-running\)/);
       assert.match(error.stderr, /sync --apply --project/);
-      assert.match(error.stderr, /--request-id/);
+      assert.match(error.stderr, /rerun the same repo init command/);
       enrollmentRequestId = /\[Infinite\] Request ([a-f0-9-]{36})/.exec(error.stderr)?.[1];
       assert.ok(enrollmentRequestId, "source capture request ID is printed before upload");
       return true;
@@ -564,7 +565,7 @@ test("repo init refuses to enroll a source snapshot while its sync generation is
     assert.equal(applied.body.sync.pendingGeneration, undefined);
     assert.ok(applied.body.sync.appliedManifest);
     assert.equal(readFileSync(join(applied.body.path, "README.md"), "utf8"), "source snapshot\n");
-    const enrolled = JSON.parse((await exec(entry[0], [...entry.slice(1), "repo", "init", localRoot, "--check-json", JSON.stringify([{ command: "git", args: ["status", "--short"] }]), "--request-id", enrollmentRequestId!])).stdout);
+    const enrolled = JSON.parse((await exec(entry[0], [...entry.slice(1), "repo", "init", localRoot, "--check-json", JSON.stringify([{ command: "git", args: ["status", "--short"] }])])).stdout);
     assert.equal(enrolled.id, projectId);
     assert.equal(enrolled.team.checks[0].command, "git");
   } finally {
@@ -589,7 +590,7 @@ test("team request receipts stay bound to the paired host", { timeout: 120000 },
   } finally { await Promise.all([first.close(), second.close()]); }
 });
 
-test("an uncertain team start blocks a duplicate and shows the saved request ID", { timeout: 120000 }, async () => {
+test("an uncertain team start is resumed under its saved request ID instead of starting a duplicate", { timeout: 120000 }, async () => {
   const run = await teamFixture("success"), clientFile = join(run.host.root, "lost-start.json");
   let dropped = false;
   const proxy = createServer((req, res) => {
@@ -606,11 +607,8 @@ test("an uncertain team start blocks a duplicate and shows the saved request ID"
   const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile, "team", "start", "Unique retry objective", "--project", "rehearsal", "--provider", "demo"];
   try {
     await assert.rejects(exec(entry[0], entry.slice(1)), () => dropped);
-    await assert.rejects(exec(entry[0], entry.slice(1)), (error: { stderr: string }) => {
-      assert.match(error.stderr, /earlier request has an uncertain result/i);
-      assert.match(error.stderr, /'--request-id' '[a-f0-9-]{36}'/);
-      return true;
-    });
+    const retried = await exec(entry[0], entry.slice(1));
+    assert.match(retried.stderr, /Resuming earlier request [a-f0-9-]{36}/);
     const teams = (await run.host.fetchApi("/teams")).body.teams;
     assert.equal(teams.length, 1);
     assert.equal(teams[0].objective, "Unique retry objective");

@@ -895,6 +895,11 @@ export function createApp(config: Config, key: Buffer) {
     await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body);
     res.json({ stored: true });
   });
+  // A batch frames many chunks in one request, so an upload pays one round trip per batch instead of per chunk.
+  app.put("/api/projects/:id/sync/blobs", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.batchBytes }), async (req, res) => {
+    if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk batch as application/octet-stream" });
+    res.json({ stored: await projectSync.putBlobs(projectSchema.parse(req.params.id), req.body) });
+  });
   // The body wraps a manifest of up to the manifest bound with its generation; the store checks the manifest itself.
   app.post("/api/projects/:id/sync/commit", requireRole(["owner"]), requireOwnerCli, express.json({ limit: WORKSPACE_LIMITS.manifestBytes + 64 * 1024 }), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);

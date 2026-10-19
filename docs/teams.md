@@ -726,7 +726,11 @@ workspace root and every enrolled teamwork folder, branches named
 `infinite/team-*`, and, for `infinite team pull`, `git rev-parse --verify
 refs/heads/<branch>` and `git bundle create - refs/heads/<branch>` in a run's
 `integration/` checkout. Enrollment also runs `git rev-parse` and `git status`
-in the project source.
+in the project source. So that a new project needs no launcher edit, a launcher
+can allow those read-only checks anywhere below the sync home and recognize a
+teamwork run by its directory: the API account creates each one, named
+`DATE-SLUG-REQUEST8`, before any Git command runs in it, and the provider
+account cannot create a directory with that owner.
 
 The Ubuntu launcher must preserve `INFINITE_HOOK_URL`, `INFINITE_HOOK_TOKEN`,
 `INFINITE_TEAM_ASSIGNMENT` and `INFINITE_TRUSTED_WORKSPACE`; the supplied sudoers

@@ -8,7 +8,8 @@ import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema, teamDeliverySchema, teamPermissionsSchema, type TeamDelivery } from "./team-types.js";
-import { captureWorkspace, readWorkspaceBlob } from "./workspace-checkpoint.js";
+import { captureWorkspace } from "./workspace-checkpoint.js";
+import { uploadMissingChunks } from "./chunk-upload.js";
 import { localProjectPath } from "./mirrored-projects.js";
 import { readSyncState, syncServiceRunning } from "./sync-service.js";
 import { canAskForBrief, chooseTeamBrief, orderedTeamMembers, summaryMember, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, wrapText, type TeamBriefStatus, type TeamWatchCommand } from "./team-watch.js";
@@ -396,11 +397,20 @@ function receipt(path: string, key: string, body: unknown) {
   privateJson(path, records);
 }
 function shellQuote(value: string) { return `'${value.replace(/'/g, `'\\''`)}'`; }
-function requireSamePendingIntent(path: string, prefix: string, endpoint: string, intent: (body: any) => boolean, requestId: string | undefined, rawArgs: string[]) {
+/**
+ * The request ID to send. An earlier request with the same intent and an unconfirmed result is
+ * resumed under its own ID, so the host applies it at most once; only a different explicit ID is refused.
+ */
+function resumePendingIntent(path: string, prefix: string, endpoint: string, intent: (body: any) => boolean, requestId: string, explicit: boolean, rawArgs: string[]): string {
   const records = readPrivateJson(path, {}) as Record<string, any>;
   const prior = Object.entries(records).find(([key, value]) => key.startsWith(prefix) && value?.state === "pending" && value.endpoint === endpoint && intent(value.body));
-  if (!prior) return;
-  if (requestId === prior[1].requestId) return;
+  if (!prior || requestId === prior[1].requestId) return requestId;
+  // A later confirmed request to the same endpoint may have superseded it; then the owner decides.
+  const superseded = Object.values(records).some(value => value?.state === "confirmed" && value.endpoint === endpoint && String(value.createdAt) > String(prior[1].createdAt));
+  if (!explicit && !superseded) {
+    process.stderr.write(`[Infinite] Resuming earlier request ${prior[1].requestId}; its result was not confirmed.\n`);
+    return prior[1].requestId;
+  }
   const commandArgs = rawArgs.filter((value, index) => value !== "--request-id" && rawArgs[index - 1] !== "--request-id");
   const retry = `infinite ${[...commandArgs, "--request-id", prior[1].requestId].map(shellQuote).join(" ")}`;
   throw new Error(`An earlier request has an uncertain result. Inspect the current state first. If this is the same operation, retry with its saved request ID: ${retry}`);
@@ -426,6 +436,9 @@ async function postMutation(api: Api, receiptPath: string, key: string, endpoint
   return result;
 }
 
+const BATCH_TIMEOUT = 120000, CHUNK_TIMEOUT = 60000;
+/** A host without an endpoint answers its catch-all 404, which carries no code. */
+const olderHost = (error: unknown) => (error as { status?: unknown; code?: unknown })?.status === 404 && (error as { code?: unknown }).code === undefined;
 async function uploadCommit(api: Api, projectId: string, root: string, commit: string, tempStore: string, captured: (manifestId: string) => void) {
   const detail = await api.json<any>(`/projects/${projectId}`);
   if (detail.sync?.pendingGeneration) throw new Error("The cloud project has a pending sync generation. Resolve it before capturing local source.");
@@ -441,17 +454,15 @@ async function uploadCommit(api: Api, projectId: string, root: string, commit: s
     const manifest = await captureWorkspace({ roots: [cwd], cwd, storeDir: tempStore });
     captured(manifest.id);
     const { generation } = await api.json<{ generation: string }>(`/projects/${projectId}/sync/begin`, {});
-    const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
-    for (let offset = 0; offset < hashes.length; offset += 512) {
-      const batch = hashes.slice(offset, offset + 512);
-      const { missing } = await api.json<{ missing: string[] }>(`/projects/${projectId}/sync/has`, { hashes: batch });
-      if (!Array.isArray(missing) || missing.some(hash => !batch.includes(hash))) throw new Error("Host returned an invalid source upload request.");
-      for (const hash of missing) {
-        const bytes = Buffer.from(await readWorkspaceBlob(tempStore, hash), "base64");
-        const response = await api.request(`/projects/${projectId}/sync/blob/${hash}`, bytes, undefined, { "Content-Type": "application/octet-stream" }, "PUT");
-        await response.body?.cancel();
-      }
-    }
+    const octets = { "Content-Type": "application/octet-stream" };
+    await uploadMissingChunks({ storeDir: tempStore, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), transport: {
+      has: async (hashes, signal) => (await api.json<{ missing: unknown }>(`/projects/${projectId}/sync/has`, { hashes }, signal)).missing,
+      putBatch: async (body, signal) => {
+        try { await (await api.request(`/projects/${projectId}/sync/blobs`, body, AbortSignal.any([signal, AbortSignal.timeout(BATCH_TIMEOUT)]), octets, "PUT")).body?.cancel(); }
+        catch (error) { if (olderHost(error)) return "unsupported"; throw error; }
+      },
+      put: async (hash, bytes, signal) => { await (await api.request(`/projects/${projectId}/sync/blob/${hash}`, bytes, AbortSignal.any([signal, AbortSignal.timeout(CHUNK_TIMEOUT)]), octets, "PUT")).body?.cancel(); },
+    } });
     const commitResponse = await api.request(`/projects/${projectId}/sync/commit`, { generation, manifest }, AbortSignal.timeout(300000));
     const committed = await commitResponse.json() as any;
     const current = await api.json<any>(`/projects/${projectId}`);
@@ -540,7 +551,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const head = inspectSourceHead(root);
     const sourceRevision = head.commit || "unborn";
     const repoConfig = inferredProjectConfig(root, options, !head.commit && options["--check-json"] === undefined);
-    const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
+    let requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
     const linearTeam = explicitLinearTeam;
     const linearProject = explicitLinearProject;
     const handoff = String(options["--handoff"] ?? "auto");
@@ -598,7 +609,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
         records[uploadKey] = sourceReceipt; privateJson(receiptsPath, records);
       } else {
         const reason = clean(detail.sync?.pendingGeneration?.reason ?? "sync-state-changed");
-        throw new Error(`The source snapshot is not applied (${reason}). No team configuration was written. After the project is safe to apply, run infinite sync --apply --project ${selected}, then rerun repo init for this directory with --request-id ${sourceReceipt.requestId}. Do not force apply over cloud changes.`);
+        throw new Error(`The source snapshot is not applied (${reason}). No team configuration was written. After the project is safe to apply, run infinite sync --apply --project ${selected}, then rerun the same repo init command. Do not force apply over cloud changes.`);
       }
     }
     const uploadSource = sourceKind === "local" && !detail.sync?.appliedManifest && sourceReceipt?.state !== "confirmed";
@@ -632,7 +643,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     // still sends the original receipt body and request ID unchanged.
     const linearIntent = (request: Record<string, any>) => request.linear === undefined ? targetLinear ?? null : request.linear;
     const teamworkIntent = (request: Record<string, any>) => request.teamwork === undefined ? target.teamwork ?? null : request.teamwork;
-    requireSamePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)), options["--request-id"] === undefined ? undefined : requestId, rawArgs);
+    requestId = body.requestId = resumePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)), requestId, options["--request-id"] !== undefined, rawArgs);
     if (uploadSource) {
       assertSourceUnchanged();
       process.stderr.write(`[Infinite] Request ${requestId}\n`);
@@ -659,7 +670,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
             const pending = readPrivateJson(receiptsPath, {}) as Record<string, any>;
             pending[uploadKey] = { ...pending[uploadKey], state: "pending-apply", pendingReason: reason };
             privateJson(receiptsPath, pending);
-            throw new Error(`The source snapshot is pending (${reason}); repo init stopped before team configuration. After the project is safe to apply, run infinite sync --apply --project ${selected}, then rerun repo init for this directory with --request-id ${requestId}. Do not force apply over cloud changes.`);
+            throw new Error(`The source snapshot is pending (${reason}); repo init stopped before team configuration. After the project is safe to apply, run infinite sync --apply --project ${selected}, then rerun the same repo init command. Do not force apply over cloud changes.`);
           }
           const completed = readPrivateJson(receiptsPath, {}) as Record<string, any>;
           completed[uploadKey] = { ...completed[uploadKey], state: "confirmed" };
@@ -697,9 +708,9 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const me = await api.json<any>("/me");
     const provider = String(options["--provider"] ?? me.teams?.lineup?.coordinator?.provider ?? "");
     if (!provider) throw new Error("The host has no configured team lineup. Set one up on the host or use --provider PROVIDER for a single-provider team.");
-    const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
+    let requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
     const body = createTeamSchema.parse({ requestId, projectId, provider, useConfiguredLineup: options["--provider"] === undefined, title: String(options["--title"] ?? objective.split("\n")[0].slice(0, 100)), objective, parallelism: 2 });
-    requireSamePendingIntent(receiptsPath, "team-start:", "/teams", prior => prior.projectId === body.projectId && prior.provider === body.provider && prior.useConfiguredLineup === body.useConfiguredLineup && prior.title === body.title && prior.objective === body.objective, options["--request-id"] === undefined ? undefined : requestId, rawArgs);
+    requestId = body.requestId = resumePendingIntent(receiptsPath, "team-start:", "/teams", prior => prior.projectId === body.projectId && prior.provider === body.provider && prior.useConfiguredLineup === body.useConfiguredLineup && prior.title === body.title && prior.objective === body.objective, requestId, options["--request-id"] !== undefined, rawArgs);
     const team = await postMutation(api, receiptsPath, `team-start:${requestId}`, "/teams", body);
     outputTeam(team, Boolean(options["--json"])); return true;
   }
@@ -914,7 +925,8 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       if (rest.length) throw new Error(`Usage: infinite team ${subcommand} ID`);
       body = { requestId, revision: current.revision };
     }
-    requireSamePendingIntent(receiptsPath, `team-${subcommand}:`, endpoint, prior => subcommand === "steer" || subcommand === "answer" ? prior.text === body.text : true, options["--request-id"] === undefined ? undefined : requestId, rawArgs);
+    // These actions can repeat on purpose (pause, resume, pause), so an unconfirmed one is never resumed implicitly.
+    resumePendingIntent(receiptsPath, `team-${subcommand}:`, endpoint, prior => subcommand === "steer" || subcommand === "answer" ? prior.text === body.text : true, requestId, true, rawArgs);
     outputTeam(await postMutation(api, receiptsPath, `team-${subcommand}:${requestId}`, endpoint, body), Boolean(options["--json"])); return true;
   }
   throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|cancel|revoke-permissions ...");

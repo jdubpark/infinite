@@ -11,8 +11,13 @@ import { createWorkspaceWatch, type WorkspaceWatch } from "./workspace-watch.js"
 const CHUNK_BYTES = 256 * 1024;
 const MAX_ENTRIES = 500000;
 const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
-/** Upper bounds a transfer can check before it parses: one content chunk, and one manifest as JSON. */
-export const WORKSPACE_LIMITS = { chunkBytes: CHUNK_BYTES, manifestBytes: MAX_MANIFEST_BYTES } as const;
+// Small enough that a slow uplink still acknowledges each request well within its timeout.
+const BATCH_BYTES = 2 * 1024 * 1024;
+const BATCH_CHUNKS = 512;
+/** Upper bounds a transfer can check before it parses: one content chunk, one chunk batch, and one manifest as JSON. */
+export const WORKSPACE_LIMITS = { chunkBytes: CHUNK_BYTES, batchBytes: BATCH_BYTES, batchChunks: BATCH_CHUNKS, manifestBytes: MAX_MANIFEST_BYTES } as const;
+/** Bytes a batch spends on each chunk's frame: its 32-byte SHA-256 digest and a 4-byte big-endian length. */
+export const CHUNK_FRAME_BYTES = 36;
 const HASH = /^[a-f0-9]{64}$/;
 const execute = promisify(execFile);
 const verifiedBlobs = new Map<string, string>();
@@ -238,6 +243,47 @@ export async function putWorkspaceBlob(storeDir: string, hash: string, base64: s
   const data = Buffer.from(base64, "base64");
   if (data.toString("base64") !== base64 || data.length > CHUNK_BYTES) throw new Error("Invalid workspace blob encoding");
   await writeBlob(await storeAt(storeDir), hash, data);
+}
+/** Frame chunks for one transfer; each is its digest, its length, and its bytes. */
+export function encodeChunkBatch(chunks: { hash: string; bytes: Buffer }[]): Buffer {
+  const parts: Buffer[] = [];
+  for (const { hash, bytes } of chunks) {
+    if (!HASH.test(hash) || bytes.length > CHUNK_BYTES) throw new Error("Invalid workspace chunk");
+    const frame = Buffer.alloc(CHUNK_FRAME_BYTES);
+    frame.write(hash, 0, "hex"); frame.writeUInt32BE(bytes.length, 32);
+    parts.push(frame, bytes);
+  }
+  const body = Buffer.concat(parts);
+  if (chunks.length > BATCH_CHUNKS || body.length > BATCH_BYTES) throw new Error("Workspace chunk batch exceeds its bound");
+  return body;
+}
+export function decodeChunkBatch(body: Buffer): { hash: string; bytes: Buffer }[] {
+  const chunks: { hash: string; bytes: Buffer }[] = [];
+  if (body.length > BATCH_BYTES) throw new Error("Workspace chunk batch exceeds its bound");
+  for (let offset = 0; offset < body.length;) {
+    if (body.length - offset < CHUNK_FRAME_BYTES || chunks.length === BATCH_CHUNKS) throw new Error("Invalid workspace chunk batch");
+    const hash = body.toString("hex", offset, offset + 32), size = body.readUInt32BE(offset + 32);
+    offset += CHUNK_FRAME_BYTES;
+    if (!size || size > CHUNK_BYTES || size > body.length - offset) throw new Error("Invalid workspace chunk batch");
+    chunks.push({ hash, bytes: body.subarray(offset, offset + size) });
+    offset += size;
+  }
+  return chunks;
+}
+/** Store a batch and sync each touched shard once; every chunk is durable when this resolves. */
+export async function putWorkspaceBlobs(storeDir: string, chunks: { hash: string; bytes: Buffer }[]): Promise<void> {
+  if (chunks.length > BATCH_CHUNKS) throw new Error("Workspace chunk batch exceeds its bound");
+  const store: Store = { ...await storeAt(storeDir), unsynced: new Set() };
+  for (let offset = 0; offset < chunks.length; offset += 16) {
+    // Settle the whole group so no write is still running when a failure is reported.
+    const results = await Promise.allSettled(chunks.slice(offset, offset + 16).map(({ hash, bytes }) => writeBlob(store, hash, bytes)));
+    const failed = results.find(result => result.status === "rejected");
+    if (failed) throw failed.reason;
+  }
+  // A chunk already present may come from an earlier request that failed before its sync, and a
+  // concurrent request may have just created a shard, so sync every touched shard and the shard parent.
+  await Promise.all([...new Set(chunks.map(({ hash }) => join(store.blobs, hash.slice(0, 2))))].map(syncDirectory));
+  await syncDirectory(store.blobs);
 }
 export async function readWorkspaceBlob(storeDir: string, hash: string): Promise<string> { return (await readBlob(await storeAt(storeDir), hash)).toString("base64"); }
 export async function hasWorkspaceBlobs(storeDir: string, hashes: string[]): Promise<string[]> {

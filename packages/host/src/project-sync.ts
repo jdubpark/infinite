@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { unseal, writeSealed } from "./vault.js";
 import {
-  captureWorkspace, describeMaterializedTree, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob,
+  captureWorkspace, decodeChunkBatch, describeMaterializedTree, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, putWorkspaceBlobs, readWorkspaceBlob,
   validateWorkspaceManifest, WorkspaceCaptureChangedError, type WorkspaceEntry, type WorkspaceManifest,
 } from "./workspace-checkpoint.js";
 import type { Config } from "./types.js";
@@ -176,6 +176,15 @@ export class ProjectSync {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
     if (createHash("sha256").update(bytes).digest("hex") !== hash) throw new ProjectSyncError("The uploaded content does not match its hash", "invalid-manifest", 400);
     await putWorkspaceBlob(join(this.dir(projectId), "blobs"), hash, bytes.toString("base64"));
+  }
+  /** Store a framed batch; returns the number of chunks it held. */
+  async putBlobs(projectId: string, body: Buffer) {
+    let chunks: { hash: string; bytes: Buffer }[];
+    try { chunks = decodeChunkBatch(body); } catch { throw new ProjectSyncError("Invalid chunk batch", "invalid-manifest", 400); }
+    if (chunks.some(({ hash, bytes }) => createHash("sha256").update(bytes).digest("hex") !== hash))
+      throw new ProjectSyncError("The uploaded content does not match its hash", "invalid-manifest", 400);
+    await putWorkspaceBlobs(join(this.dir(projectId), "blobs"), chunks);
+    return chunks.length;
   }
   async readBlob(projectId: string, hash: string) {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);

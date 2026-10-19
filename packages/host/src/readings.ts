@@ -67,7 +67,7 @@ export function isWeakRuleLine(message: string): boolean {
   const rawRuleLine = firstSentence(message) || "Finished a turn";
   const displayLine = rawRuleLine.length > 140 ? `${rawRuleLine.slice(0, 139)}…` : rawRuleLine;
   const filler = displayLine.replace(/[.!?…]+$/g, "").trim();
-  const structured = /^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|```|~~~)/.test(firstRawLine) || firstRawLine.includes("|");
+  const structured = /^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|```|~~~|\|)/.test(firstRawLine);
   return structured || rawRuleLine.length > 140 || displayLine.length < 25 || displayLine.endsWith(":") || FILLER_LINE.test(filler);
 }
 

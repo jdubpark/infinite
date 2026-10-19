@@ -218,6 +218,7 @@ test("weak rule-line gate admits weak presentation and rejects clear rule-based 
   assert.equal(isWeakRuleLine(heading), true, "a heading-first response has a weak rule line");
   assert.equal(isWeakRuleLine(list), true, "a list-first response has a weak rule line");
   assert.equal(isWeakRuleLine(table), true, "a table-first response has a weak rule line");
+  assert.equal(isWeakRuleLine(`I piped the log through \`grep | sort\` and fixed the duplicate rows.\n${clear}`), false, "a pipe inside a clear sentence is not a table");
   assert.equal(isWeakRuleLine(code), true, "a code-fence-first response has a weak rule line");
   assert.equal(isWeakRuleLine(`Done.\n${clear}`), true, "a filler opening has a weak rule line");
   assert.equal(isWeakRuleLine(`Progress:\n${clear}`), true, "a colon-ended lead-in has a weak rule line");

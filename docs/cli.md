@@ -35,6 +35,29 @@ infinite close SESSION_ID  # confirm before ending its provider process
 
 `usage` prints one line per provider with spend, budget, the provider's own budget period and start date, and step and unmeasured-session counts. Providers that report no usage print `unmeasured`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
 
+## Projects, missions, and board
+
+```sh
+infinite projects [--json]
+infinite projects group NAME REPO_ID...
+infinite start [--project PROJECT_ID] "task"
+infinite mission status MISSION_ID [--json]
+infinite mission answer MISSION_ID DECISION_ID "text"
+infinite mission steer MISSION_ID "text"
+infinite mission pause|resume|cancel MISSION_ID
+infinite board [--project PROJECT_ID]
+```
+
+`projects` lists explicit groups and implicit single-repository projects, followed
+by suggested groups and the exact command to create each. `start` resolves the
+current Git root's enrolled repository binding and starts a mission in its
+containing group; `--project` selects a group directly. Mission controls read the
+current revision before submitting an action. `board` refreshes every two
+seconds in a terminal: use Up/Down to select a row, Tab to change the composer
+target, Enter to open the selected row or submit a mission, `a` to answer its
+open decision, and `q` or Ctrl+C to exit. Missions open their decision and
+subtask summary; team rows use `infinite team watch`.
+
 ## Team CLI
 
 Initialize a project from a clean Git checkout, then start and control teams from that directory:

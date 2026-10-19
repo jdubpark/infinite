@@ -31,10 +31,12 @@ import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
 import { GoalService } from "./goals.js";
-import { MissionService, missionBoard, type ProjectGroupLookup } from "./missions.js";
+import { MissionService, missionBoard } from "./missions.js";
 import { createMissionSchema, missionActionSchema, missionTextSchema } from "./mission-types.js";
+import { ProjectGroupService } from "./project-groups.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
+import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
@@ -137,13 +139,7 @@ export function createApp(config: Config, key: Buffer) {
   // TeamService ticks on every host and drives the ledger from its own session listing.
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
-  // TEMPORARY until ProjectGroupService is wired here: each enrolled repository is its own implicit
-  // project. The integrator replaces this lookup with the real project group service.
-  const projectGroups: ProjectGroupLookup = { get: groupId => {
-    const project = config.projects.find(item => item.id === groupId);
-    if (!project) throw new TeamError(404, "project-group-not-found", "This project does not exist.");
-    return { id: project.id, name: project.name, repos: [{ projectId: project.id, name: project.name, path: project.path }], implicit: true, revision: 1, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() };
-  } };
+  const projectGroups = new ProjectGroupService(config, key);
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   missions.useUsage(usage);
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
@@ -371,6 +367,10 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
+  app.get("/api/project-groups", requireRole(["owner", "controller", "viewer"]), (_req, res) => res.json(projectGroups.list()));
+  app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(projectGroups.create(createProjectGroupSchema.parse(req.body))));
+  app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
+  app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body))));
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
     const body = createGoalSchema.parse(req.body);
     assertNoHandoff(body.projectId);

@@ -40,6 +40,7 @@ struct WorkspaceCommands: Commands {
         }
         CommandMenu("Server") {
             Button("Home") { app.selectedTeamID = nil; app.showingHome = true }.keyboardShortcut("1").disabled(app.active == nil)
+            Button("Cost") { app.showCost() }.keyboardShortcut("5").disabled(app.active == nil || !app.usageEnabled)
             Button("Refresh") { Task { if app.connected { await app.refresh() } else { await app.connect() } } }.keyboardShortcut("r")
             Divider()
             Button("Resources") { openWindow(id: "resources") }.keyboardShortcut("2")
@@ -102,20 +103,22 @@ struct DesktopView: View {
     private var filteredTeams: [TeamRun] {
         app.teams.filter { search.isEmpty || [$0.title, $0.objective].joined(separator: " ").localizedCaseInsensitiveContains(search) }
     }
-    /// One list selects Home, a team, or a session; a team row carries a prefix so the three never collide.
+    /// One list selects Home, Cost, a team, or a session; a team row carries a prefix so they never collide.
     private var selection: Binding<String?> {
-        Binding(get: { app.showingHome ? "home" : app.selectedTeamID.map { "team:" + $0 } ?? app.selectedID }, set: { value in
+        Binding(get: { app.showingHome ? "home" : app.showingCost ? "cost" : app.selectedTeamID.map { "team:" + $0 } ?? app.selectedID }, set: { value in
             guard let value else { return }
-            let leavingSession = !app.showingHome && app.selectedTeamID == nil
-            if value == "home" || value.hasPrefix("team:"), leavingSession, let current = app.selectedID { app.terminals[current]?.markRead() }
+            let leavingSession = !app.showingHome && !app.showingCost && app.selectedTeamID == nil
+            if value == "home" || value == "cost" || value.hasPrefix("team:"), leavingSession, let current = app.selectedID { app.terminals[current]?.markRead() }
             if value == "home" { app.selectedTeamID = nil; app.showingHome = true }
+            else if value == "cost" { app.showCost() }
             else if value.hasPrefix("team:") { app.selectedTeamID = String(value.dropFirst(5)) }
-            else { app.selectedTeamID = nil; app.showingHome = false; app.selectedID = value }
+            else { app.selectedTeamID = nil; app.showingHome = false; app.showingCost = false; app.selectedID = value }
         })
     }
-    private var teamModel: TeamModel? { app.showingHome ? nil : app.selectedTeamID.flatMap(app.teamModel(for:)) }
+    private var teamModel: TeamModel? { app.showingHome || app.showingCost ? nil : app.selectedTeamID.flatMap(app.teamModel(for:)) }
     private var pageTitle: String {
         if app.showingHome { return "Home" }
+        if app.showingCost { return "Cost" }
         if let team = app.teams.first(where: { $0.id == app.selectedTeamID }) { return team.title }
         return app.sessions.first { $0.id == app.selectedID }?.title ?? "Infinite"
     }
@@ -167,6 +170,7 @@ struct DesktopView: View {
         return List(selection: selection) {
             if app.active != nil && !searching {
                 Label("Home", systemImage: "square.grid.2x2").tag("home").badge(pending)
+                if app.usageEnabled { Label("Cost", systemImage: "chart.bar.xaxis").tag("cost") }
             }
             if !teams.isEmpty {
                 Section("Projects") { ForEach(teams) { team in TeamRowView(team: team).tag("team:" + team.id) } }
@@ -249,7 +253,7 @@ struct DesktopView: View {
                 }.font(.caption).padding(10).background(Color.orange.opacity(0.12))
             }
             // Session panes stay mounted underneath Home and team dashboards, so switching back is instant.
-            let covered = app.active == nil || app.showingHome || teamModel != nil
+            let covered = app.active == nil || app.showingHome || app.showingCost || teamModel != nil
             ZStack {
                 Group {
                     if app.mounted.isEmpty {
@@ -268,6 +272,7 @@ struct DesktopView: View {
                 }.opacity(covered ? 0 : 1).allowsHitTesting(!covered).accessibilityHidden(covered)
                 if app.active == nil { welcome }
                 else if app.showingHome { HomeView(app: app) }
+                else if app.showingCost, let cost = app.costModel() { CostView(app: app, model: cost) }
                 else if let teamModel { TeamDetailView(app: app, model: teamModel).id(teamModel.id) }
             }
         }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Palette.background)

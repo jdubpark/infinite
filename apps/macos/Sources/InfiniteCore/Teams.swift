@@ -72,6 +72,23 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
     public var lastActivityAt: String { events.map { $0["at"].string }.max() ?? updatedAt }
     /// The Linear issue the host syncs this run to, when it tracks one.
     public var linearIssue: String { value["linear"]["issue"]["identifier"].string }
+    /// A blocked run the owner can resume from a list without the team page: the host marked it resumable,
+    /// and it has no goal or delivery receipt that a resume would have to preserve.
+    public var offersResume: Bool {
+        status == "blocked" && value["resumable"].bool && Self.absent(value["goal"]) && Self.absent(value["deliveryReceipt"])
+    }
+    /// Blocked runs first. A stable partition: the incoming order holds within the blocked and the other runs.
+    public static func blockedFirst(_ runs: [TeamRun]) -> [TeamRun] {
+        runs.filter { $0.status == "blocked" } + runs.filter { $0.status != "blocked" }
+    }
+    /// A field the host leaves out, or sends as null or an empty string, carries nothing.
+    private static func absent(_ value: JSON) -> Bool {
+        switch value {
+        case .null: return true
+        case .string(let text): return text.isEmpty
+        default: return false
+        }
+    }
     public static func roleName(_ role: String) -> String {
         ["project-manager": "Coordinator", "implementer": "Implementer", "integrator": "Integrator", "reviewer": "Reviewer"][role] ?? role.capitalizedFirstLetter
     }
@@ -185,7 +202,8 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
 
 /// Where a run sits on the home board, in the order the board lists them.
 public enum ProjectState: String, CaseIterable, Sendable {
-    case ongoing, pending, stuck, paused, complete, cancelled, aborted
+    /// Declaration order is the board order: blocked runs first, then the rest in their existing order.
+    case stuck, ongoing, pending, paused, complete, cancelled, aborted
     public var title: String {
         switch self {
         case .ongoing: return "Ongoing"

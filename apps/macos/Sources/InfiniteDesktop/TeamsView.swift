@@ -99,8 +99,9 @@ struct TeamDetailView: View {
                 .glassSurface(in: Capsule(), tint: teamColor(team))
             if model.role == "owner" && team.status != "cancelled" {
                 Menu {
-                    if !["blocked", "ready-for-review"].contains(team.status) {
-                        Button(team.status == "paused" ? "Resume team" : "Pause team") { Task { await model.perform(team.status == "paused" ? "resume" : "pause") } }.disabled(!model.canOwn)
+                    let resumes = team.status == "paused" || team.offersResume
+                    if resumes || !["blocked", "ready-for-review"].contains(team.status) {
+                        Button(resumes ? "Resume team" : "Pause team") { Task { await model.perform(resumes ? "resume" : "pause") } }.disabled(!model.canOwn)
                     }
                     Button("Cancel team…", role: .destructive) { confirmCancel = true }.disabled(!model.canOwn)
                 } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton).fixedSize().help("Team actions")

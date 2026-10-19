@@ -10,6 +10,10 @@ import { startHost, waitFor } from "./helpers.js";
 import type { TeamLineup } from "../packages/host/src/team-types.js";
 import { startLinearServer } from "./fixtures/linear-server.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
+import { LinearService } from "../packages/host/src/linear.js";
+import { fixture } from "./team-fixture.js";
+import type { Config } from "../packages/host/src/types.js";
+import type { TeamRun } from "../packages/host/src/team-types.js";
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const lineup: TeamLineup = {
@@ -246,4 +250,113 @@ test("legacy tracking baselines survive restart while changed requirements still
   } finally {
     await host.stop(); await linear.close(); rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("a blocked run's issue gets its reason, next step and a Blocked label until the run moves again", { timeout: 60000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "inf-linear-flag-"));
+  let service: LinearService | undefined;
+  try {
+    const apiKeyFile = join(root, "linear-key");
+    writeFileSync(apiKeyFile, linear.apiKey, { mode: 0o600 });
+    const config = { stateDir: join(root, "state"), linear: { apiKeyFile, endpoint: linear.endpoint },
+      projects: [{ id: "flagged", name: "Flagged", path: root, linear: { teamId: linear.teamId } }] } as unknown as Config;
+    service = new LinearService(config, randomBytes(32));
+    const run = { id: randomUUID(), projectId: "flagged", title: "Smart alarm", objective: "Stop alarms once I am awake.", status: "implementing",
+      revision: 3, members: [], checks: [], steering: [], decisions: [] } as unknown as TeamRun;
+    service.updateTeam(run, true); service.start();
+    await waitFor(async () => service!.getTeam(run.id)?.status, status => status === "synced", 15000);
+    const issueId = service.getTeam(run.id)!.issue!.id;
+    const applied = () => [...(linear.issueLabels.get(issueId) ?? [])].map(id => linear.labels.get(id)!.name);
+
+    run.status = "blocked"; run.reason = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
+    service.updateTeam(run, true);
+    assert.ok(![...linear.comments.values()].some(comment => comment.body.includes("Status: blocked")), "The blocked evidence waits for the host's resume answer");
+    service.updateTeam(run, true, true);
+    await waitFor(async () => applied(), names => names.includes("Blocked"), 15000);
+    const blocked = [...linear.comments.values()].find(comment => comment.body.includes("Status: blocked"))!;
+    assert.match(blocked.body, /Reason: An agent showed no activity twice on the same assignment\./);
+    assert.match(blocked.body, new RegExp(`Next step: run \`infinite team resume ${run.id}\` to replan`));
+    assert.equal(linear.labels.size, 1, "The label is created once in the run's team");
+
+    run.status = "planning"; run.revision = 4; run.reason = undefined;
+    service.updateTeam(run, true, false);
+    await waitFor(async () => applied(), names => names.length === 0, 15000);
+    assert.equal(linear.labels.size, 1);
+
+    // The cached label was deleted in Linear: the next block looks it up again instead of failing until restart.
+    linear.labels.clear();
+    run.status = "blocked"; run.revision = 5; run.reason = "The host restarted during a workspace or verification operation.";
+    service.updateTeam(run, true, false);
+    await waitFor(async () => applied(), names => names.includes("Blocked"), 15000);
+    assert.equal(linear.labels.size, 1, "A replacement label is created once");
+
+    // A rate-limited label request backs off only the label; other evidence keeps flowing.
+    linear.rateLimitLabelLookups(true);
+    const lookups = linear.calls.filter(call => call.operation === "InfiniteLinearLabels").length;
+    const second = { ...run, id: randomUUID(), title: "Second run", status: "implementing", revision: 1, reason: undefined } as unknown as TeamRun;
+    service.updateTeam(second, true);
+    await waitFor(async () => service!.getTeam(second.id)?.status, status => status === "synced", 15000);
+    second.status = "blocked"; second.reason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
+    (service as unknown as { labels: Map<string, string> }).labels.clear();
+    service.updateTeam(second, true, true);
+    await waitFor(async () => linear.calls.filter(call => call.operation === "InfiniteLinearLabels").length, count => count > lookups, 15000);
+    second.status = "paused"; second.revision = 2;
+    service.updateTeam(second, true, false);
+    await waitFor(async () => [...linear.comments.values()].some(comment => comment.issue.id === service!.getTeam(second.id)!.issue!.id && comment.body.includes("Status: paused")), Boolean, 15000);
+    assert.equal(service.getTeam(second.id)?.status, "synced");
+    linear.rateLimitLabelLookups(false);
+
+    // A rate-limited change on a cached label keeps its delay: no recovery lookup, no immediate retry.
+    linear.rateLimitLabelChanges(true);
+    const third = { ...run, id: randomUUID(), title: "Third run", status: "implementing", revision: 1, reason: undefined } as unknown as TeamRun;
+    service.updateTeam(third, true);
+    await waitFor(async () => service!.getTeam(third.id)?.status, status => status === "synced", 15000);
+    (service as unknown as { labels: Map<string, string> }).labels.set(linear.teamId, [...linear.labels.keys()][0]);
+    const before = { lookups: linear.calls.filter(call => call.operation === "InfiniteLinearLabels").length, adds: linear.calls.filter(call => call.operation === "InfiniteLinearIssueAddLabel").length };
+    third.status = "blocked"; third.reason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
+    service.updateTeam(third, true, true);
+    await waitFor(async () => linear.calls.filter(call => call.operation === "InfiniteLinearIssueAddLabel").length, count => count > before.adds, 15000);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    assert.equal(linear.calls.filter(call => call.operation === "InfiniteLinearIssueAddLabel").length, before.adds + 1, "The rate-limited add waits for its delay");
+    assert.equal(linear.calls.filter(call => call.operation === "InfiniteLinearLabels").length, before.lookups, "A rate limit is not mistaken for a deleted label");
+    linear.rateLimitLabelChanges(false);
+
+    // A label failure never gates execution: tracking stays synced while the label waits to retry.
+    linear.failLabelLookups(true);
+    const fresh = new LinearService({ ...config, stateDir: join(root, "isolated-state") } as Config, randomBytes(32));
+    const other = { ...run, id: randomUUID(), title: "Another run", status: "implementing", revision: 1 } as unknown as TeamRun;
+    fresh.updateTeam(other, true); fresh.start();
+    await waitFor(async () => fresh.getTeam(other.id)?.status, status => status === "synced", 15000);
+    other.status = "blocked"; other.reason = "The Linear issue changed.";
+    fresh.updateTeam(other, true, false);
+    await waitFor(async () => linear.calls.filter(call => call.operation === "InfiniteLinearLabels").length, count => count >= 2, 15000);
+    await waitFor(async () => fresh.getTeam(other.id)?.status, status => status === "synced", 15000);
+    await waitFor(async () => [...linear.comments.values()].find(comment => comment.issue.id === fresh.getTeam(other.id)!.issue!.id && comment.body.includes("Status: blocked")), Boolean, 15000);
+    assert.equal(linear.issueLabels.get(fresh.getTeam(other.id)!.issue!.id)?.size ?? 0, 0, "A failed lookup leaves the issue unlabelled until a later retry");
+    assert.match([...linear.comments.values()].find(comment => comment.issue.id === fresh.getTeam(other.id)!.issue!.id && comment.body.includes("Status: blocked"))!.body,
+      /Next step: inspect the run's evidence, then start a new run to continue\./);
+    fresh.close();
+    assert.deepEqual(linear.violations, []);
+  } finally { service?.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a run that blocks while no client is reading still gets its reason and next step on Linear", { timeout: 120000 }, async () => {
+  const linear = await startLinearServer();
+  const f = await fixture("unreported");
+  try {
+    const apiKeyFile = join(f.host.root, "linear-key");
+    writeFileSync(apiKeyFile, linear.apiKey, { mode: 0o600 });
+    f.host.config.linear = { apiKeyFile, endpoint: linear.endpoint };
+    f.host.config.projects[0].linear = { teamId: linear.teamId };
+    writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
+    await f.host.stopApi(); await f.host.start();
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    // No list or get from here on: only the scheduler can supply the blocked evidence.
+    const blocked = await waitFor(async () => [...linear.comments.values()].find(comment => comment.body.includes("Status: blocked")), Boolean, 90000);
+    assert.match(blocked!.body, /Reason: An agent exited without a valid structured report\./);
+    assert.match(blocked!.body, /Next step: inspect the run's evidence, then start a new run to continue\./);
+    await waitFor(async () => [...linear.issueLabels.values()].some(applied => applied.size > 0), Boolean, 15000);
+  } finally { await f.close(); await linear.close(); }
 });

@@ -13,6 +13,8 @@ type WriteOperation = "InfiniteLinearIssueCreate" | "InfiniteLinearCommentCreate
 export async function startLinearServer() {
   const apiKey = randomBytes(32).toString("hex"), teamId = randomUUID();
   const issues = new Map<string, FixtureIssue>(), comments = new Map<string, FixtureComment>();
+  const labels = new Map<string, { id: string; name: string; team: { id: string } | null }>(), issueLabels = new Map<string, Set<string>>();
+  let failLabels = false, rateLimitLabels = false, rateLimitLabelChanges = false;
   const calls: { operation: string; variables: Record<string, any> }[] = [];
   const lostResponses: { operation: WriteOperation; id: string }[] = [];
   const violations: string[] = [];
@@ -74,6 +76,30 @@ export async function startLinearServer() {
           comments.set(comment.id, comment); writtenId = comment.id;
           data = { commentCreate: { success: true, comment } }; break;
         }
+        case "InfiniteLinearLabels": {
+          const name = variables.filter?.name?.eqIgnoreCase;
+          if (typeof name !== "string") throw new Error("Label lookup requires a name");
+          if (failLabels) { reply(200, { errors: [{ message: "Fixture label failure" }] }); return; }
+          if (rateLimitLabels) { response.writeHead(200, { "Content-Type": "application/json", "retry-after": "120" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return; }
+          data = { issueLabels: { nodes: [...labels.values()].filter(label => label.name.toLowerCase() === name.toLowerCase()) } }; break;
+        }
+        case "InfiniteLinearLabelCreate": {
+          const input = variables.input;
+          if (!input?.name || input.teamId !== teamId) throw new Error("Label creation must name the run's team");
+          const label = { id: randomUUID(), name: input.name, team: { id: teamId } };
+          labels.set(label.id, label); data = { issueLabelCreate: { success: true, issueLabel: label } }; break;
+        }
+        case "InfiniteLinearIssueAddLabel":
+        case "InfiniteLinearIssueRemoveLabel": {
+          if (!issues.has(variables.id)) throw new Error("Label change needs a known issue");
+          if (rateLimitLabelChanges) { response.writeHead(200, { "Content-Type": "application/json", "retry-after": "120" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return; }
+          // Linear answers an unknown (for example deleted) label with an error, not a protocol violation.
+          if (!labels.has(variables.labelId)) { reply(200, { errors: [{ message: "Entity not found: IssueLabel" }] }); return; }
+          const applied = issueLabels.get(variables.id) ?? new Set<string>(), adding = operation === "InfiniteLinearIssueAddLabel";
+          if (adding) applied.add(variables.labelId); else applied.delete(variables.labelId);
+          issueLabels.set(variables.id, applied);
+          data = { [adding ? "issueAddLabel" : "issueRemoveLabel"]: { success: true } }; break;
+        }
         default: throw new Error(`Unexpected GraphQL operation: ${operation}`);
       }
       if (drop && operation === drop.operation && writtenId && (!drop.bodyIncludes || variables.input?.body?.includes(drop.bodyIncludes))) {
@@ -90,7 +116,10 @@ export async function startLinearServer() {
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Linear fixture needs a TCP address");
-  return { endpoint: `http://127.0.0.1:${address.port}/graphql`, apiKey, teamId, issues, comments, calls, lostResponses, violations, seedIssue,
+  return { endpoint: `http://127.0.0.1:${address.port}/graphql`, apiKey, teamId, issues, comments, calls, lostResponses, violations, seedIssue, labels, issueLabels,
+    failLabelLookups(value: boolean) { failLabels = value; },
+    rateLimitLabelLookups(value: boolean) { rateLimitLabels = value; },
+    rateLimitLabelChanges(value: boolean) { rateLimitLabelChanges = value; },
     dropNextResponse(operation: WriteOperation, bodyIncludes?: string) { drop = { operation, bodyIncludes }; },
     restore() { unavailable = false; },
     editIssue(id: string, changes: Partial<Pick<FixtureIssue, "title" | "description" | "state" | "archivedAt">>) {

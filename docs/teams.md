@@ -320,6 +320,12 @@ reachable. The issue's workflow state stays separate from local execution state,
 agent review, and product outcome assessments. Infinite does not automatically
 change that state or mark an issue Done when checks pass.
 
+When a tracked run becomes blocked, its status comment records the reason and
+the next step, and the issue gets a `Blocked` label. The host uses the team's
+own `Blocked` label, or a workspace label of that name, and creates one in the
+team when neither exists. It removes the label when the run moves again. A
+failed label update is retried later and never holds back the run.
+
 The host keeps issue creation and evidence delivery in a durable outbox.
 Requirements populate new issue descriptions; briefs, steering, questions and
 answers, user outcomes, and terminal check/review summaries are sent as comments.
@@ -820,6 +826,27 @@ interrupted workspace or check operation, still requires inspection and a new
 team. Stopping an agent does not prove that arbitrary detached tool
 descendants have stopped, and a current human input lease can prevent the
 scheduler from stopping a member. Such conflicts remain visible.
+
+## Blocked runs
+
+A blocked run waits for the owner, so the host flags it everywhere the owner
+looks:
+
+* **Phone push.** With push enabled, the host sends one high-priority
+  notification when a run becomes blocked. It names the run and says whether it
+  can resume, and opens the team when tapped. With `push.detail: "full"` it also
+  carries the reason. The `team-blocked` entry in `push.events` controls it and
+  is on by default. A run that was already blocked when the host started, or
+  that blocked while the host was down, is not announced again.
+* **Linear.** The tracked issue gets the reason, the next step and a `Blocked`
+  label (see [Linear tracking](#linear-tracking)).
+* **App lists.** Web, phone and Mac list blocked runs first, with the reason.
+  The list offers Resume when the run can resume, the same rule as the team
+  page.
+
+The host never resumes a blocked run itself. `infinite team resume ID` replans
+from the integrated work when the block allows it; otherwise inspect the run and
+start a new one.
 
 ## Reports and recovery
 

@@ -112,6 +112,11 @@ export type SessionRow = {
   team?: { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string };
   resumable?: boolean;
   title: string;
+  reading?: {
+    now?: { text: string; source: "jev"; for: string; at: string };
+    waitingOnYou?: boolean;
+    title?: { text: string; source: "first-line" | "jev-first-line" | "writer"; model?: string };
+  };
   provider: Provider;
   status: string;
   createdAt: string;

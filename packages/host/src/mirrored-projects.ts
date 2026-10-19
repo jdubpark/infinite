@@ -67,7 +67,7 @@ export class MirroredProjects {
     }
     // Refuse before persisting: a mapping that held a credential or the team root would fail startup validation.
     const protectedPaths = [this.config.stateDir, this.config.runDir, this.config.keyFile, this.config.teams?.workspaceDir,
-      this.config.linear?.apiKeyFile, this.config.push?.accessTokenFile, this.config.remote?.relay?.tokenFile, this.config.summaries?.apiKeyFile]
+      this.config.linear?.apiKeyFile, this.config.push?.accessTokenFile, this.config.remote?.relay?.tokenFile, this.config.summaries?.apiKeyFile, this.config.jev?.apiKeyFile]
       .filter((value): value is string => Boolean(value));
     if (protectedPaths.some(value => inside(destination, this.canonical(resolve(value))) || inside(this.canonical(resolve(value)), destination))) throw invalid();
     return destination;

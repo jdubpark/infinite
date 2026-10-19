@@ -6,7 +6,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { responseText, transcriptText } from "../packages/host/src/summary.js";
+import { responseText, Summarizer, transcriptText } from "../packages/host/src/summary.js";
 import { claimControl, startHost, waitFor } from "./helpers.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
@@ -38,6 +38,24 @@ test("transcript text and response parsing", () => {
   assert.equal(text, "Person: Fix it\n\nAgent ran Bash: npm test\n\nAgent: Done.");
   assert.equal(responseText({ output: [{ type: "message", content: [{ type: "output_text", text: " A " }, { type: "output_text", text: "B" }] }] }), "A B");
   assert.equal(responseText({ output: "junk" }), "");
+});
+
+test("title writer receives only the prompt and is bounded to eight words", async () => {
+  const model = await fakeModel();
+  const root = mkdtempSync(join(tmpdir(), "infinite-title-"));
+  const keyFile = join(root, "writer.key");
+  writeFileSync(keyFile, "fixture-key\n", { mode: 0o600 });
+  try {
+    const writer = new Summarizer({ model: "writer-model", apiKeyFile: keyFile, baseUrl: model.url });
+    const prompt = "Investigate consistency in the session list. Do not use later messages.";
+    const title = await writer.titleFromPrompt(prompt);
+    assert.equal(model.requests.length, 1);
+    assert.equal(model.requests[0].body.input, prompt);
+    assert.equal(model.requests[0].body.max_output_tokens, 32);
+    assert.equal(model.requests[0].body.store, false);
+    assert.ok(title.text.split(/\s+/).length <= 8);
+    assert.equal(title.model, "writer-model");
+  } finally { model.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test("a summary covers the chat after a cursor, names its model, and is cached per range", { timeout: 60000 }, async () => {

@@ -356,11 +356,13 @@ else if (command === "plan-fleet") {
       const provider = values.provider as Provider;
       if (!config.agents[provider])
         throw new Error("Choose a configured --provider");
+      const generatedTitle = !values.title?.trim();
       const session = await manager.create({
         requestId: randomUUID(),
         provider,
         projectId: values.project ?? config.projects[0].id,
-        title: values.title ?? `${provider} session`,
+        title: values.title?.trim() || `${provider} session`,
+        ...(generatedTitle ? { generatedTitle: true as const } : {}),
         prompt: values.prompt ?? "",
       });
       console.log(`${session.id}  ${session.status}`);

@@ -143,7 +143,7 @@ export function Inbox({
                 {folded ? null : group.rows.map((row) => (
                   <Pressable
                     accessibilityRole="button"
-                    accessibilityLabel={`Open ${row.title}, ${SESSION_LABELS[row.attention.state]}`}
+                    accessibilityLabel={`Open ${row.reading?.title?.text ?? row.title}, ${SESSION_LABELS[row.attention.state]}`}
                     key={row.id}
                     onPress={() => router.push({ pathname: "/session/[id]", params: { id: row.id, machine: connectionKey(connection) } })}
                     style={({ pressed }) => [listStyles.row, pressed && listStyles.pressed]}
@@ -151,7 +151,7 @@ export function Inbox({
                     <View style={listStyles.icon}><StatusIcon kind={SESSION_KIND[row.attention.state]} size={18} /></View>
                     <View style={listStyles.main}>
                       <View style={listStyles.line}>
-                        <Text style={listStyles.title} numberOfLines={1}>{row.title}</Text>
+                        <Text style={listStyles.title} numberOfLines={1}>{row.reading?.title?.text ?? row.title}</Text>
                         <Text style={listStyles.age}>{age(row.attention.since, now)}</Text>
                       </View>
                       <View style={listStyles.line}>
@@ -159,8 +159,9 @@ export function Inbox({
                         <Text style={[s.now, row.attention.state === "needs-you" && listStyles.attentionText]} numberOfLines={1}>
                           {row.attention.prompt?.destructive ? <Text style={s.destructive}>Destructive · </Text> : null}
                           {row.team ? <Text style={s.role}>{ROLE_NAMES[row.team.role]}{teamTitles.has(row.team.runId) && !row.title.includes(teamTitles.get(row.team.runId)!) ? ` · ${teamTitles.get(row.team.runId)}` : ""} · </Text> : null}
-                          {row.attention.now || SESSION_LABELS[row.attention.state]}
+                          {row.attention.state === "turn-finished" ? (row.reading?.now?.text ?? row.attention.now) || SESSION_LABELS[row.attention.state] : row.attention.now || SESSION_LABELS[row.attention.state]}
                         </Text>
+                        {row.attention.state === "turn-finished" && row.reading?.waitingOnYou ? <Text style={listStyles.meta}>Asks you</Text> : null}
                       </View>
                     </View>
                   </Pressable>

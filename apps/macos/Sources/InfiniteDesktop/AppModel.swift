@@ -314,7 +314,9 @@ struct TeamResumeFailure: Equatable {
         let profileID = activeID
         if pendingCreation.pendingID == nil {
             let requestID = UUID().uuidString.lowercased()
-            let body: JSON = .object(["requestId": .string(requestID), "provider": .string(provider), "projectId": .string(project), "title": .string(title.isEmpty ? "\(provider.capitalized) session" : title), "prompt": .string("")])
+            var fields: [String: JSON] = ["requestId": .string(requestID), "provider": .string(provider), "projectId": .string(project), "title": .string(title.isEmpty ? "\(provider.capitalized) session" : title), "prompt": .string("")]
+            if title.isEmpty { fields["generatedTitle"] = .bool(true) }
+            let body: JSON = .object(fields)
             var record = DraftRecord(); record.pendingID = requestID
             record.pendingText = String(decoding: try body.data(), as: UTF8.self)
             try drafts.save(record, identity: "\(profileID):create"); pendingCreation = record

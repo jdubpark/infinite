@@ -25,11 +25,13 @@ function elapsed(iso: string): string {
 export function NowCard({
   attention,
   provider,
+  pickedLine,
   exitCode,
   onOpenTerminal,
 }: {
   attention: Attention;
   provider: Provider;
+  pickedLine?: string;
   exitCode?: number;
   onOpenTerminal: () => void;
 }) {
@@ -59,6 +61,7 @@ export function NowCard({
       const long = message.length > PREVIEW_CHARS;
       return (
         <Card state="turn-finished" heading="Finished a turn">
+          {pickedLine ? <Text selectable style={s.headline}>{pickedLine}</Text> : null}
           <Text selectable style={s.body}>
             {!message
               ? "No closing message."
@@ -145,6 +148,7 @@ const s = StyleSheet.create({
   head: { flexDirection: "row", alignItems: "center", gap: 8 },
   heading: { fontSize: 15, fontWeight: "600", color: theme.colors.ink },
   body: { fontSize: 14, lineHeight: 21, color: theme.colors.ink },
+  headline: { fontSize: 15, lineHeight: 22, fontWeight: "600", color: theme.colors.ink },
   meta: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
   toggle: { minHeight: 40, justifyContent: "center", alignSelf: "flex-start" },
   pressed: { opacity: 0.6 },

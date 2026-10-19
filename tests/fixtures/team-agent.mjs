@@ -39,6 +39,7 @@ if (process.argv[2] === "--hold-check") {
 // must discover results, commits, and check outcomes through production paths.
 const [scenario, receiptDir] = process.argv.slice(2);
 const assignment = JSON.parse(process.env.INFINITE_TEAM_ASSIGNMENT ?? "null");
+if (scenario === "stall-slow-stop") process.on("SIGTERM", () => setTimeout(() => process.exit(0), 2000));
 if (!assignment || !process.env.INFINITE_HOOK_URL || !process.env.INFINITE_HOOK_TOKEN)
   throw new Error("The team worker did not provide its reporting capability");
 const receiptFile = join(receiptDir, `${assignment.memberId}.json`);
@@ -100,7 +101,7 @@ async function waitForPeer() {
 
 async function main() {
   process.stdin.resume();
-  if (scenario === "mcp") {
+  if (scenario === "mcp" || scenario === "stall-slow-stop") {
     // A private runtime receipt lets the test drive the actual worker capability
     // through a separate MCP child. It never enters a repository or API response.
     writeFileSync(join(receiptDir, "mcp-capability.json"), JSON.stringify({ assignment,

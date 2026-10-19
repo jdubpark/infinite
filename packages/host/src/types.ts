@@ -107,6 +107,8 @@ export interface Config {
     workspaceDir: string; commandPrefix?: import("./team-types.js").TeamCommand; lineup?: import("./team-types.js").TeamLineup;
     /** Owner trust in every team root: Claude and Codex members start trusted in their own folders. */
     trustWorkspaces?: boolean;
+    /** Minutes without attention activity before a member without a report is stopped and replaced. */
+    stallMinutes?: number;
   };
   machine?: { id: string; label: string };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };

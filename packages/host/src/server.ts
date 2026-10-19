@@ -32,7 +32,7 @@ import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
 import { GoalService } from "./goals.js";
 import { LinearService } from "./linear.js";
-import { createGoalSchema, goalActionSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
+import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
@@ -368,6 +368,7 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/goals/:id/outcome", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.outcome(id.parse(req.params.id), goalOutcomeSchema.parse(req.body))));
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
+  app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
   app.post("/api/teams/:id/permissions/revoke", requireRole(["owner"]), async (req, res) => res.json(await teams.revokePermissions(id.parse(req.params.id), teamActionSchema.parse(req.body))));
   app.get("/api/teams/:id/bundle", requireRole(["owner"]), requireOwnerCli, async (req, res) => {

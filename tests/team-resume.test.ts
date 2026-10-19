@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { blockedTeamCanResume, memberTimeLimitReason } from "../packages/host/src/teams.js";
+import { blockedTeamCanResume, memberStallReason, memberTimeLimitReason } from "../packages/host/src/teams.js";
 
 const ready = {
   status: "blocked",
@@ -23,4 +23,12 @@ test("a one-hour member stop can resume, and uncertain blocks cannot", () => {
   assert.equal(blockedTeamCanResume({ ...ready, linearStatus: "blocked" }), false);
   assert.equal(blockedTeamCanResume({ ...ready, reason: "An agent exited without a valid structured report. Its task is unresolved." }), false);
   assert.equal(blockedTeamCanResume({ ...ready, status: "paused" }), false);
+});
+
+test("a stalled member stop and a legacy one-hour stop can resume", () => {
+  assert.equal(blockedTeamCanResume({ ...ready, reason: memberStallReason }), true);
+  assert.equal(blockedTeamCanResume({ ...ready, reason: memberStallReason, pending: true }), false);
+  assert.equal(blockedTeamCanResume({ ...ready, reason: memberStallReason, prepared: false }), false);
+  assert.equal(blockedTeamCanResume({ ...ready, reason: memberStallReason, stopReason: "deadline" }), false);
+  assert.equal(blockedTeamCanResume({ ...ready, reason: memberStallReason, linearStatus: "blocked" }), false);
 });

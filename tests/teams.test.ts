@@ -5,16 +5,19 @@ import { createServer } from "node:http";
 import { createInterface } from "node:readline";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
-import { unseal, writeSealed } from "../packages/host/src/vault.js";
-import { memberTimeLimitReason } from "../packages/host/src/teams.js";
+import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
+import { memberStallReason } from "../packages/host/src/teams.js";
 import type { CreateTeam, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
 import { retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
 
 // The shared fallback lineup used by delivery and permission tests; the limit tests below define their own.
 import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
+import { schedulerFixture } from "./fixtures/team-scheduler.js";
+import { Manager } from "../packages/host/src/manager.js";
 
 test("team runs use readable names and exact root permissions under a strict umask", { timeout: 120000 }, async () => {
   const root = realpathSync(mkdtempSync("/tmp/inf-team-modes-"));
@@ -903,7 +906,108 @@ test("retargeting a member prompt keeps its answers, swaps reporting and profile
   assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek }), undefined);
 });
 
-test("a team blocked by the one-hour member limit resumes into a fresh plan", { timeout: 60000 }, async () => {
+for (const limited of [false, true])
+test(`a report written during a stall stop wins over replacement${limited ? " and a provider limit" : ""}`, async () => {
+  const f = schedulerFixture();
+  try {
+    const member = f.run.members[0];
+    const report = { kind: "question", question: "Which scope should this assignment use?", options: ["Keep the current scope"] };
+    f.manager.stopTeamSession = async () => {
+      if (f.state.status !== "exited") {
+        // The pre-stop journal is empty. The report arrives only while the stop RPC is in flight.
+        if (limited) f.journal.append("signal", { kind: "provider-limit", limit: "usage", confidence: "corroborated", provider: "demo", source: "protocol", message: "Usage exhausted" });
+        for (let index = 0; index < 205; index++) f.journal.append("signal", { kind: "notice", type: "fixture" });
+        const envelope = { requestId: randomUUID(), runId: f.run.id, memberId: member.memberId, revision: member.revision, report };
+        f.journal.append("team-report", { ...envelope, runId: randomUUID() });
+        f.journal.append("team-report", { ...envelope, memberId: randomUUID() });
+        f.journal.append("team-report", { ...envelope, revision: member.revision + 1 });
+        f.journal.append("team-report", envelope);
+        f.journal.append("lifecycle", { status: "exited" });
+        f.state.status = "exited";
+      }
+      return f.manager.state();
+    };
+    f.writeTeam();
+    const teams = f.openTeam(); teams.start();
+    const result = await waitFor(async () => teams.get(f.run.id), run => run.decisions.length > 0 || run.members.length > 1 || run.status === "blocked");
+    assert.equal(result.members.length, 1, "A final report must prevent a replacement launch");
+    assert.deepEqual(result.members[0].report, report);
+    assert.equal(result.members[0].stalledAt, undefined);
+    assert.equal(result.members[0].stoppedReason, undefined);
+    assert.equal(result.status, "needs-input");
+    assert.equal(result.decisions[0].question, report.question, "The ordinary reported path must consume the late report");
+  } finally { f.close(); }
+});
+
+for (const protection of ["activity", "needs-you", "pending-limit"] as const)
+test(`a refused stall stop rechecks ${protection} after the human lease is released`, async () => {
+  const f = schedulerFixture();
+  try {
+    let stops = 0;
+    f.manager.stopTeamSession = async () => {
+      stops++;
+      throw Object.assign(new Error("Input control is held"), { code: "control-busy" });
+    };
+    f.writeTeam();
+    const teams = f.openTeam(); teams.start();
+    const refused = await waitFor(async () => teams.get(f.run.id), run => run.members[0].status === "unavailable");
+    assert.equal(stops, 1);
+    assert.equal(refused.members[0].stalledAt, undefined, "A refused stop must not authorize a later stop");
+    assert.equal(refused.members[0].stoppedReason, undefined);
+    if (protection === "activity") f.state.attention.lastActivityAt = new Date().toISOString();
+    if (protection === "needs-you") f.state.attention.state = "needs-you";
+    if (protection === "pending-limit") f.state.attention.limit = { limit: "usage", confidence: "single-source", since: new Date().toISOString(), message: "Limit pending" };
+    f.manager.stopTeamSession = async () => { stops++; f.state.status = "exited"; return f.manager.state(); };
+    const reads = f.reads();
+    await waitFor(async () => f.reads(), value => value >= reads + 2);
+    const current = teams.get(f.run.id);
+    assert.equal(stops, 1, "Releasing the lease must not override current eligibility");
+    assert.equal(current.members.length, 1);
+    assert.equal(f.state.status, "running");
+  } finally { f.close(); }
+});
+
+for (const [protection, earlierStop, refusal] of [
+  ["activity", false, "manager"], ["needs-you", false, "manager"],
+  ["activity", true, "manager"], ["needs-you", true, "manager"], ["activity", true, "lease"],
+] as const)
+test(`a ${refusal} pre-delivery refusal with ${protection} ${earlierStop ? "retains an earlier uncertain stop" : "requires fresh eligibility"}`, async () => {
+  const f = schedulerFixture();
+  try {
+    let stops = 0;
+    const member = f.run.members[0];
+    f.manager.stopTeamSession = async () => {
+      stops++;
+      if (earlierStop && stops === 1) throw new Error("Worker response timed out; delivery may be uncertain");
+      if (refusal === "lease") throw Object.assign(new Error("Input control is held"), { code: "control-busy" });
+      // Exercise Manager's own state check after the scheduler observed a running member.
+      return Manager.prototype.stopTeamSession.call({
+        meta: () => ({ session: { team: member } }),
+        state: async () => ({ ...await f.manager.state(), status: "unavailable" }),
+      } as unknown as Manager, member.sessionId, member.stopRequestId, member);
+    };
+    f.writeTeam();
+    const teams = f.openTeam(); teams.start();
+    await waitFor(async () => teams.get(f.run.id), run => run.members[0].status === "unavailable");
+    if (protection === "activity") f.state.attention.lastActivityAt = new Date().toISOString();
+    else f.state.attention.state = "needs-you";
+    if (earlierStop) {
+      await waitFor(async () => stops, count => count >= 2);
+      assert.ok(teams.get(f.run.id).members[0].stalledAt, "An uncertain earlier delivery cannot be undone by a later preflight refusal");
+    } else {
+      assert.equal(teams.get(f.run.id).members[0].stalledAt, undefined);
+      assert.equal(teams.get(f.run.id).members[0].stoppedReason, undefined);
+      f.manager.stopTeamSession = async () => { stops++; f.state.status = "exited"; return f.manager.state(); };
+      const reads = f.reads();
+      await waitFor(async () => f.reads(), count => count >= reads + 2);
+      assert.equal(stops, 1, "Manager sent no stop, so eligibility must be checked again");
+      assert.equal(f.state.status, "running");
+      assert.equal(teams.get(f.run.id).members.length, 1);
+    }
+  } finally { f.close(); }
+});
+
+test("an old member that still shows activity is not stalled after a restart", { timeout: 60000 }, async () => {
   const f = await fixture("mcp");
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
@@ -918,15 +1022,114 @@ test("a team blocked by the one-hour member limit resumes into a fresh plan", { 
     for (const member of stored.run.members) member.startedAt = startedAt;
     writeSealed(file, key, `team:${id}`, stored);
     await f.host.start();
-    const blocked = await waitFor(() => f.get(id), run => run.status === "blocked" && run.reason === memberTimeLimitReason && run.resumable === true && run.members.every(member => !["queued", "running", "reported", "unavailable"].includes(member.status)), 30000);
-    const head = blocked.headCommit;
-    const resumed = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    // The host observes attention activity before deciding a member is stalled, so the observation is the proof.
+    const observed = await waitFor(() => f.get(id), run => run.members.some(member => member.lastActivityAt), 30000);
+    assert.notEqual(observed.status, "blocked", JSON.stringify(observed));
+    assert.ok(observed.members.some(member => member.status === "running"), JSON.stringify(observed.members));
+  } finally { await f.close(); }
+});
+
+test("stall detection drains the report tail before replacing a member", { timeout: 90000 }, async () => {
+  const root = mkdtempSync("/tmp/inf-stall-tail-");
+  const offset = join(root, "offset"), preload = join(root, "clock.mjs");
+  writeFileSync(offset, "0");
+  writeFileSync(preload, `import { readFileSync } from "node:fs";
+const offsetFile = process.env.INFINITE_TEST_CLOCK_FILE;
+const RealDate = Date;
+globalThis.Date = class extends RealDate {
+  static now() { return RealDate.now() + Number(readFileSync(offsetFile, "utf8")); }
+  constructor(...args) { super(...(args.length ? args : [globalThis.Date.now()])); }
+};
+`);
+  const env = { INFINITE_TEST_CLOCK_FILE: offset, NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${pathToFileURL(preload).href}`].filter(Boolean).join(" ") };
+  const f = await fixture("mcp", undefined, { teams: { stallMinutes: 5 } }, { env });
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create()), id = created.body.id;
+    const initial = await waitFor(() => f.get(id), run => run.members.some(member => member.status === "running" && member.startedAt), 30000);
+    const member = initial.members[0];
+    const capabilityFile = join(f.receipts, "mcp-capability.json");
+    await waitFor(async () => existsSync(capabilityFile), Boolean, 10000);
+    const capability = JSON.parse(readFileSync(capabilityFile, "utf8"));
+    await f.host.stopApi();
+    for (let index = 0; index < 110; index++) {
+      for (const hook_event_name of ["PreToolUse", "PostToolUse"]) {
+        const response = await fetch(`${capability.url}/claude`, { method: "POST", headers: { Authorization: `Bearer ${capability.token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ hook_event_name, tool_name: "Read", tool_input: { file_path: "original.txt" }, tool_response: { type: "text" } }) });
+        assert.equal(response.status, 204);
+      }
+    }
+    writeFileSync(offset, String(6 * 60 * 1000));
+    const report = { requestId: randomUUID(), runId: member.runId, memberId: member.memberId, revision: member.revision,
+      report: { kind: "plan", summary: "Read the project and prepare two scoped tasks", tasks: [
+        { id: "a", title: "Build the first file", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [] },
+        { id: "b", title: "Build the second file", instructions: "Write b.txt", paths: ["b.txt"], dependsOn: [] },
+      ] } };
+    const reported = await fetch(`${capability.url}/team-report`, { method: "POST", headers: { Authorization: `Bearer ${capability.token}`, "Content-Type": "application/json" }, body: JSON.stringify(report) });
+    assert.equal(reported.status, 204);
+    await f.host.start();
+    const drained = await waitFor(() => f.get(id), run => Boolean(run.members[0]?.report) || run.members.length > initial.members.length || run.status === "blocked", 30000);
+    assert.equal(drained.members.length, initial.members.length, "An unread event tail must not trigger a replacement");
+    assert.equal(drained.members[0].report?.kind, "plan", JSON.stringify(drained));
+    assert.notEqual(drained.status, "blocked", JSON.stringify(drained));
+  } finally { await f.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a stalled member is replaced once, and a second stall blocks a resumable run", { timeout: 90000 }, async () => {
+  const root = mkdtempSync("/tmp/inf-stall-clock-");
+  const offset = join(root, "offset");
+  const preload = join(root, "clock.mjs");
+  writeFileSync(offset, "0");
+  writeFileSync(preload, `import { readFileSync } from "node:fs";
+const offsetFile = process.env.INFINITE_TEST_CLOCK_FILE;
+const RealDate = Date;
+globalThis.Date = class extends RealDate {
+  static now() { return RealDate.now() + Number(readFileSync(offsetFile, "utf8")); }
+  constructor(...args) { super(...(args.length ? args : [globalThis.Date.now()])); }
+};
+`);
+  const env = {
+    INFINITE_TEST_CLOCK_FILE: offset,
+    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${pathToFileURL(preload).href}`].filter(Boolean).join(" "),
+  };
+  const f = await fixture("stall-slow-stop", undefined, { teams: { stallMinutes: 5 } }, { env });
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const id = created.body.id;
+    const first = await waitFor(() => f.get(id), run => run.members.some(member => member.status === "running" && member.startedAt), 30000);
+    await f.host.stopApi();
+    const key = readFileSync(f.host.config.keyFile);
+    const file = join(f.host.config.stateDir, "teams", `${id}.sealed`);
+    const scope = `team:${id}`;
+    const stored = unseal<{ run: { members: { startedAt?: string; lastActivityAt?: string }[] } }>(key, scope, readFileSync(file, "utf8"));
+    const lastActivityAt = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    for (const member of stored.run.members) { member.startedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); member.lastActivityAt = lastActivityAt; }
+    writeSealed(file, key, scope, stored);
+    writeFileSync(offset, String(6 * 60 * 1000));
+    await f.host.start();
+    const stopping = await waitFor(() => f.get(id), run => Boolean(run.members[0]?.stalledAt) && run.members.length === first.members.length, 10000);
+    const stillRunning = await f.host.fetchApi(`/sessions/${first.members[0].sessionId}`);
+    assert.equal(stillRunning.status, 200);
+    assert.equal(stillRunning.body.status, "running", "The stall intent is durable while SIGTERM is still settling");
+    assert.ok(stopping.members[0].stalledAt);
+    const replaced = await waitFor(() => f.get(id), run => run.members.length === first.members.length + 1, 30000);
+    const replacement = replaced.members.at(-1)!;
+    assert.equal(replacement.role, first.members[0].role);
+    assert.equal(replacement.taskId, first.members[0].taskId);
+    assert.equal(replacement.cwd, first.members[0].cwd, "The replacement uses the preserved workspace");
+    const saved = unseal<{ run: { members: { memberId: string; prompt: string }[] } }>(key, scope, readFileSync(file, "utf8"));
+    assert.match(saved.run.members.find(member => member.memberId === replacement.memberId)!.prompt, /stalled with no activity for 5 minutes.*workspace was preserved/);
+    assert.ok(replaced.members[0].stalledAt);
+    assert.ok(replaced.events.some(event => event.text.includes("workspace was preserved")));
+
+    await waitFor(() => f.get(id), run => run.members.some(member => member.memberId === replacement.memberId && member.status === "running" && member.startedAt), 30000);
+    writeFileSync(offset, String(12 * 60 * 1000));
+    const blocked = await waitFor(() => f.get(id), run => run.status === "blocked" && run.reason === memberStallReason && run.resumable && run.members.every(member => ["stopped", "waiting"].includes(member.status)), 30000);
+    assert.equal(blocked.members.filter(member => member.taskId === replacement.taskId).length, 2);
+    assert.equal(blocked.resumable, true);
+    const body = { requestId: randomUUID(), revision: blocked.revision };
+    const resumed = await waitFor(() => f.host.fetchApi(`/teams/${id}/resume`, "owner", body), response => response.status === 200, 30000);
     assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
     assert.equal(resumed.body.status, "planning");
     assert.equal(resumed.body.revision, blocked.revision + 1);
-    assert.equal(resumed.body.reason, undefined);
-    assert.equal(resumed.body.resumable, false);
-    assert.equal(resumed.body.headCommit, head);
-    assert.equal(resumed.body.members.length, blocked.members.length);
-  } finally { await f.close(); }
+  } finally { await f.close(); rmSync(root, { recursive: true, force: true }); }
 });

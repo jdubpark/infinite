@@ -17,11 +17,16 @@ export const createGoalSchema = z.object({
   evidence: z.array(z.string().trim().min(1).max(2000)).max(20).default([]),
   maxRuns: z.number().int().min(1).max(10).default(3),
   maxMinutes: z.number().int().min(5).max(1440).default(60),
+  /** Automatic extensions while an active agent shows activity; 0 disables them. */
+  extendMinutes: z.number().int().min(0).max(240).optional(),
+  /** Ceiling for the goal's whole time, including extensions. Defaults to maxMinutes. */
+  maxTotalMinutes: z.number().int().max(1440).optional(),
   maxMembers: z.number().int().min(4).max(200).default(24),
   parallelism: z.number().int().min(1).max(4).default(3),
-}).strict();
+}).strict().refine(value => value.maxTotalMinutes === undefined || value.maxTotalMinutes >= value.maxMinutes, { path: ["maxTotalMinutes"], message: "The total time ceiling cannot be shorter than the time limit." });
 export type CreateGoal = z.infer<typeof createGoalSchema>;
 export const goalActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
+export const goalExtendSchema = goalActionSchema.extend({ minutes: z.number().int().min(5).max(1440) }).strict();
 export const goalSteerSchema = goalActionSchema.extend({ text: z.string().trim().min(1).max(8000) }).strict();
 export const goalOutcomeSchema = goalActionSchema.extend({
   result: z.enum(["achieved", "not-achieved", "inconclusive"]),
@@ -52,10 +57,16 @@ export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
   id: string;
   revision: number;
   status: GoalStatus;
+  /** Structured budget stop reason; absent on legacy goals until migrated or stopped. */
+  stopReason?: "deadline" | "member-limit";
+  /** A deadline-stopped child should be replaced after an owner extends the goal. */
+  deadlineContinuation?: boolean;
   reason?: string;
   createdAt: string;
   updatedAt: string;
   deadlineAt: string;
+  /** Absent on goals recorded before time ceilings existed; they use createdAt plus maxTotalMinutes or maxMinutes. */
+  ceilingAt?: string;
   lineup: TeamLineup;
   activeTeamId?: string;
   cycles: GoalCycle[];

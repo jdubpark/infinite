@@ -12,7 +12,8 @@ import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { memberStallReason } from "../packages/host/src/teams.js";
 import type { CreateTeam, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
-import { retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
+import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
+import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
 
 // The shared fallback lineup used by delivery and permission tests; the limit tests below define their own.
 import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
@@ -380,6 +381,17 @@ test("mixed teams pin real worker launches across configuration changes, restart
         assert.ok(effortIndex > 0);
         assert.equal(args[effortIndex - 1], "-c");
         assert.ok(!args.includes("--effort") && !args.includes("--mcp-config"));
+        const settings = new Map<string, unknown>();
+        for (let index = 0; index < args.length - 1; index++) {
+          if (args[index] === "-c" && args[index + 1].startsWith("mcp_servers.infinite_team.")) {
+            const override = args[++index].slice("mcp_servers.infinite_team.".length), equals = override.indexOf("=");
+            settings.set(override.slice(0, equals), JSON.parse(override.slice(equals + 1)));
+          }
+        }
+        assert.equal(settings.get("command"), process.execPath);
+        assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT"]);
+        assert.equal(settings.get("tools.report.approval_mode"), "approve");
+        assert.match(worker.prompt ?? "", /report tool of the infinite_team MCP server/);
       } else {
         assert.equal(worker.model, expected.model);
         assert.equal(worker.variant, expected.variant);
@@ -899,11 +911,47 @@ test("retargeting a member prompt keeps its answers, swaps reporting and profile
   const [haiku, astra] = limitLineup.implementers, deepseek = limitLineup.fallbacks![0];
   const answered = (provider: TeamModelProfile["provider"], profile: TeamModelProfile) => `${teamPrompt(run, "implementer", undefined, undefined, provider, profile)}\n\nUser answered: Compact`;
   assert.equal(retargetPrompt(answered("claude", haiku), { provider: "opencode", profile: deepseek }), answered("opencode", deepseek));
-  // A prompt written by another release names a different report helper path.
-  const older = answered("codex", astra).replace(/to this command: [^\n]+?\. The helper/, "to this command: 'node' 'dist/team-report.js'. The helper");
-  assert.notEqual(older, answered("codex", astra));
-  assert.equal(retargetPrompt(older, { provider: "claude", profile: haiku }), answered("claude", haiku));
+  const oldHelper = teamPrompt(run, "implementer", undefined, undefined, "opencode", astra);
+  const refreshed = refreshReportingInstructions(oldHelper, "codex");
+  assert.match(refreshed, /report tool of the infinite_team MCP server/);
+  assert.doesNotMatch(refreshed, /Pipe a JSON object matching the above schema to this command:/);
+  assert.equal(retargetPrompt(oldHelper, { provider: "codex", profile: astra }), teamPrompt(run, "implementer", undefined, undefined, "codex", astra));
+  // A Codex prompt written by an earlier release names its helper, at another release's path.
+  const older = oldHelper.replace(/to this command: [^\n]+?\. The helper/, "to this command: 'node' 'dist/team-report.js'. The helper");
+  assert.notEqual(older, oldHelper);
+  assert.equal(refreshReportingInstructions(`${older}\n\nUser answered: Compact`, "codex"), `${refreshed}\n\nUser answered: Compact`);
+  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "codex", profile: astra }), answered("codex", astra));
+  assert.equal(retargetPrompt(answered("codex", astra), { provider: "opencode", profile: deepseek }), answered("opencode", deepseek));
   assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek }), undefined);
+});
+
+test("an unanswered report stays unconfirmed: a refused connection or a lost acknowledgement names the sandbox and requires inspection", async () => {
+  const env = (port: number) => ({
+    INFINITE_HOOK_URL: `http://127.0.0.1:${port}/hook`,
+    INFINITE_HOOK_TOKEN: "fixture-token",
+    INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId: randomUUID(), memberId: randomUUID(), revision: 1 }),
+  } as NodeJS.ProcessEnv);
+  const unconfirmed = (error: unknown) => {
+    const message = reportErrorMessage(error);
+    assert.match(message, /delivery was not confirmed/);
+    assert.match(message, /sandbox or network policy may block local connections, or the acknowledgement was lost/);
+    assert.match(message, /inspect this member's recorded report before retrying the identical report, and do not bypass/);
+    return true;
+  };
+  // Nothing listens: the request never left this process.
+  const closed = createServer();
+  await new Promise<void>(resolve => closed.listen(0, "127.0.0.1", resolve));
+  const closedPort = (closed.address() as { port: number }).port;
+  await new Promise<void>((resolve, reject) => closed.close(error => error ? reject(error) : resolve()));
+  await assert.rejects(submitTeamReport({ kind: "result", summary: "The fixture could not reach its closed endpoint." }, env(closedPort)), unconfirmed);
+  // The endpoint read the whole report, then dropped the connection before answering.
+  let received = 0;
+  const lost = createServer((request, response) => { request.resume(); request.on("end", () => { received++; response.destroy(); }); });
+  await new Promise<void>(resolve => lost.listen(0, "127.0.0.1", resolve));
+  try {
+    await assert.rejects(submitTeamReport({ kind: "result", summary: "The fixture lost its acknowledgement." }, env((lost.address() as { port: number }).port)), unconfirmed);
+    assert.equal(received, 1);
+  } finally { lost.closeAllConnections(); await new Promise<void>(resolve => lost.close(() => resolve())); }
 });
 
 for (const limited of [false, true])

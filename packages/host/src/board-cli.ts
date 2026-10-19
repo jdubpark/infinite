@@ -52,6 +52,7 @@ export function boardLines(
   now = Date.now(),
 ): string[] {
   const selectedProject = projects.find(project => project.id === targetProjectId);
+  const columns = Math.max(2, Number.isFinite(width) && width > 0 ? Math.floor(width) : process.stdout.columns || 80);
   const items = board.items;
   const sections: { column: BoardItem["column"]; title: string; subtitle: string }[] = [
     { column: "needs-input", title: "Needs input", subtitle: "Waiting on your decision or a blocker needs attention" },
@@ -65,15 +66,32 @@ export function boardLines(
     const rows = items.filter(item => item.column === section.column);
     if (!rows.length) lines.push("  Nothing here");
     for (const item of rows) {
-      const rest = [item.title, item.projectName, item.detail, age(item.updatedAt, now)].map(safe);
-      const row = short(rest.filter(Boolean).join("  "), Math.max(12, width - 2));
-      lines.push(rowIndex++ === selectedIndex ? `\x1b[7m${row}\x1b[0m` : ` ${row}`);
+      const progress = item.kind === "mission" && item.subtasks
+        ? `${Math.max(0, item.subtasks.done)}/${Math.max(0, item.subtasks.total)}`
+        : "";
+      const ageText = short(age(item.updatedAt, now) || "?", columns - 1);
+      const contentWidth = columns - ageText.length - 1;
+      const fields = [safe(item.title), safe(item.projectName), progress, safe(item.detail)];
+      const content = () => fields.filter(Boolean).join("  ");
+      const shrinkOrder = [3, 0, 1, 2];
+      while (content().length > contentWidth) {
+        const index = shrinkOrder.find(candidate => fields[candidate]!.length > 1)
+          ?? shrinkOrder.find(candidate => fields[candidate]!.length > 0);
+        if (index === undefined) break;
+        fields[index] = fields[index]!.length > 1 ? short(fields[index]!, fields[index]!.length - 1) : "";
+      }
+      const text = content();
+      const progressText = progress && fields[2] ? `\x1b[2m${fields[2]}\x1b[0m` : "";
+      const displayed = fields.map((field, index) => index === 2 && progressText ? progressText : field).filter(Boolean).join("  ");
+      const padding = " ".repeat(Math.max(0, contentWidth - text.length));
+      const row = ` ${displayed}${padding}${ageText}`;
+      lines.push(rowIndex++ === selectedIndex ? `\x1b[7m${row}\x1b[0m` : row);
     }
     lines.push("");
   }
   const ended = items.filter(item => item.column === "ended").length;
   lines.push(`Ended ${ended} (collapsed)`);
-  lines.push("─".repeat(Math.max(8, width)));
+  lines.push("─".repeat(Math.max(8, columns)));
   lines.push(`❯ ${composer || "describe a task for a new mission"}`);
   lines.push(`  Project: ${selectedProject?.name ?? "Choose a project"}  · Tab changes project  · ↑/↓ select  · a answer  · q quit`);
   return lines;

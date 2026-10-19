@@ -42,10 +42,11 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(daily.maxUsd, 1.5)
     }
 
+    /// `byKind` carries dollars, not counts: a fractional value must decode, and counts come from the rows.
     func testProjectDecodesTeamsWithoutAGoal() throws {
         let project = try decode(ProjectUsage.self, """
         {"id":"p1","name":"Infinite","total":{"usd":41.2,"unpriced":3},
-         "byKind":{"goals":1,"teams":2,"sessions":1,"briefings":4},
+         "byKind":{"goals":30,"teams":0.5,"sessions":0.61,"briefings":9.6},
          "goals":[{"id":"g1","title":"Ship cost view","total":{"usd":30,"unpriced":0},"tasks":6}],
          "teams":[{"id":"t1","title":"Cost view","goalId":"g1","total":{"usd":30,"unpriced":0}},{"id":"t2","title":"Fix lint","total":{"usd":1.2,"unpriced":3}}],
          "sessions":[{"id":"s1","title":"Chat","total":{"usd":0.4,"unpriced":0}}],
@@ -53,13 +54,43 @@ final class UsageTests: XCTestCase {
         """)
         XCTAssertEqual(project.teams[0].goalId, "g1")
         XCTAssertNil(project.teams[1].goalId)
+        XCTAssertEqual(project.byKind.teams, 0.5)
+        XCTAssertEqual(project.byKind.sessions, 0.61)
+        XCTAssertEqual(project.teams.count, 2)
+        XCTAssertNil(project.unmeasured)
         XCTAssertTrue(project.total.isFloor)
         XCTAssertEqual(project.total.label, "≥ $41.20")
         XCTAssertEqual(project.briefings.unmeasured, 1)
         let list = try decode(UsageProjects.self, """
-        {"projects":[{"id":"p1","name":"Infinite","total":{"usd":41.2,"unpriced":0},"month":{"usd":12,"unpriced":0},"spark":[0,0,1.5,0.25]}]}
+        {"projects":[{"id":"p1","name":"Infinite","total":{"usd":41.2,"unpriced":0},"month":{"usd":12,"unpriced":0},"spark":[0,0,1.5,0.25],"unmeasured":2},
+                     {"id":"p2","name":"Old host","total":{"usd":0,"unpriced":0},"month":{"usd":0,"unpriced":0},"spark":[]}]}
         """)
         XCTAssertEqual(list.projects[0].spark, [0, 0, 1.5, 0.25])
+        XCTAssertEqual(list.projects[0].unmeasured, 2)
+        XCTAssertNil(list.projects[1].unmeasured)
+    }
+
+    /// Nothing measured is "—", a partly measured figure is a floor, and only a fully priced figure is exact.
+    func testUnmeasuredWorkNeverShowsAsZero() {
+        XCTAssertEqual(Money(usd: 0, unpriced: 0).display(unmeasured: 3), .absent)
+        XCTAssertEqual(Money(usd: 0, unpriced: 2).display(), .absent)
+        XCTAssertEqual(Money(usd: 1.5, unpriced: 0).display(unmeasured: 1), .floor(1.5))
+        XCTAssertEqual(Money(usd: 1.5, unpriced: 1).display(), .floor(1.5))
+        XCTAssertEqual(Money(usd: 1.5, unpriced: 0).display(), .exact(1.5))
+        XCTAssertEqual(Money(usd: 0, unpriced: 0).display(), .exact(0))
+        XCTAssertEqual(Money(usd: 0, unpriced: 0).display(unmeasured: 3).label, "—")
+        XCTAssertEqual(Money(usd: 1.5, unpriced: 0).display(unmeasured: 1).label, "≥ $1.50")
+        XCTAssertEqual(Money(usd: 0, unpriced: 2).label, "—")
+    }
+
+    /// The host's month window starts at 00:00 UTC; a zone west of it must not relabel October as September.
+    func testMonthIsNamedInUTC() {
+        let english = Locale(identifier: "en_US_POSIX")
+        XCTAssertEqual(UsageFormat.monthName("2026-10-01T00:00:00.000Z", locale: english), "October")
+        XCTAssertEqual(UsageFormat.previousMonthName("2026-10-01T00:00:00.000Z", locale: english), "September")
+        XCTAssertEqual(UsageFormat.monthName("2026-01-01T00:00:00Z", locale: english), "January")
+        XCTAssertEqual(UsageFormat.previousMonthName("2026-01-01T00:00:00Z", locale: english), "December")
+        XCTAssertNil(UsageFormat.monthName("not a date", locale: english))
     }
 
     func testScorecardDecodesNullsForSubscriptionAndSmallSamples() throws {

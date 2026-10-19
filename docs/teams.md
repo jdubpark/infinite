@@ -850,9 +850,10 @@ start a new one.
 
 ## Reports and recovery
 
-Claude Code team members receive a scoped MCP tool, `mcp__infinite_team__report`,
-that accepts a typed report as data. Other providers receive a reporting command
-that accepts JSON on standard input. Reports include `plan`, `explore`,
+Claude Code and Codex team members receive a scoped MCP report tool
+(`mcp__infinite_team__report` in Claude Code and `infinite_team`'s `report` in
+Codex); OpenCode and other helper-command providers receive a command that
+accepts JSON on standard input. Reports include `plan`, `explore`,
 `findings`, `no-change`, `escalate`, `result`, `review`, `question`, and `blocked`;
 each role has a permitted subset. The report tool follows the configured provider
 profile, except for the dedicated permission coordinator: its constrained launch

@@ -2,6 +2,7 @@ import { appendFileSync, existsSync, readFileSync, readdirSync, renameSync, writ
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 
 if (process.argv[2] === "--command-prefix") {
   const [, receiptDir, command, ...args] = process.argv.slice(2);
@@ -34,9 +35,9 @@ if (process.argv[2] === "--hold-check") {
   process.exit(0);
 }
 
-// A real child process reports through its worker's authenticated hook. The
-// receipt directory only coordinates concurrent fixture processes; the runner
-// must discover results, commits, and check outcomes through production paths.
+// A real child process reports through its worker's authenticated report
+// channel. The receipt directory only coordinates concurrent fixture processes;
+// the runner must discover results, commits, and check outcomes through production paths.
 const [scenario, receiptDir] = process.argv.slice(2);
 const assignment = JSON.parse(process.env.INFINITE_TEAM_ASSIGNMENT ?? "null");
 if (scenario === "stall-slow-stop") process.on("SIGTERM", () => setTimeout(() => process.exit(0), 2000));
@@ -71,12 +72,60 @@ if (receipt.provider === "opencode") {
   receipt.prompt = args[boundary + 1];
   if (scenario === "integrator-limit" && assignment.role === "integrator")
     receipt.sawPartial = existsSync("repair.txt");
+} else if (receipt.provider === "codex") {
+  receipt.prompt = process.argv.at(-1);
 }
 // A limit fallback must start in the limited member's working copy, partial file included.
 if (scenario.startsWith("limit")) receipt.sawPartial = existsSync("a.txt");
 saveReceipt();
 
 async function report(value, overrides = {}) {
+  if (receipt.provider === "codex") {
+    const settings = new Map();
+    const args = process.argv.slice(providerIndex + 2);
+    for (let index = 0; index < args.length - 1; index++) {
+      if (args[index] === "-c" && args[index + 1].startsWith("mcp_servers.infinite_team.")) {
+        const item = args[++index].slice("mcp_servers.infinite_team.".length), equals = item.indexOf("=");
+        settings.set(item.slice(0, equals), JSON.parse(item.slice(equals + 1)));
+      }
+    }
+    if (settings.get("tools.report.approval_mode") !== "approve") throw new Error("Codex needs the approved team report tool");
+    // Only the variables Codex forwards through env_vars reach the server, so broken forwarding fails here.
+    const environment = Object.fromEntries(settings.get("env_vars").map(name => [name, process.env[name]]));
+    const server = spawn(settings.get("command"), settings.get("args"), { stdio: ["pipe", "pipe", "inherit"], env: { PATH: process.env.PATH ?? "", ...environment } });
+    const lines = createInterface({ input: server.stdout });
+    const iterator = lines[Symbol.asyncIterator]();
+    let id = 0;
+    const request = async (method, params) => {
+      const requestId = ++id;
+      server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: requestId, method, ...(params === undefined ? {} : { params }) }) + "\n");
+      const next = await iterator.next();
+      if (next.done) throw new Error("The Codex team MCP server stopped before its receipt");
+      const response = JSON.parse(next.value);
+      if (response.id !== requestId || response.error) throw new Error(response.error?.message ?? "The Codex team MCP response did not match its request");
+      return response.result;
+    };
+    try {
+      await request("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "team-fixture", version: "1.0.0" } });
+      server.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+      const listed = await request("tools/list");
+      if (!listed.tools.some(tool => tool.name === "report")) throw new Error("The Codex team MCP server did not expose report");
+      const result = await request("tools/call", { name: "report", arguments: { report: value } });
+      if (result.isError || result.structuredContent?.memberId !== assignment.memberId)
+        throw new Error(result.content?.[0]?.text ?? "The Codex team report was not confirmed");
+      server.stdin.end();
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.once("exit", code => code === 0 ? resolve() : reject(new Error(`Codex team MCP server exited with ${code}`)));
+      });
+      lines.close();
+      return;
+    } catch (error) {
+      server.kill();
+      lines.close();
+      throw error;
+    }
+  }
   const response = await fetch(`${process.env.INFINITE_HOOK_URL}/team-report`, {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },

@@ -41,8 +41,16 @@ const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(valu
 const terminalStatuses = new Set(["ready-for-review", "merged", "no-change", "no-opportunity", "blocked", "cancelled", "limit-reached", "achieved"]);
 const evidenceStatuses = new Set([...terminalStatuses, "needs-input", "paused"]);
 const normalized = (value: string | null) => (value ?? "").replace(/\r\n/g, "\n").trim();
-const createMatchNormalized = (value: string | null) => normalized(value).replace(/\[([^\]]+)\]\(<\1>\)/g, "$1").replace(/\[([^\]]+)\]\(\1\)/g, "$1")
-  .replace(/\\([!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])/g, "$1").replace(/^([ \t]*)[-*+](?= )/gm, "$1-");
+// Linear rewrites prose only; code keeps its bytes, so an edited diff marker or escape inside code still blocks.
+const createMatchNormalized = (value: string | null) => {
+  let fenced = false;
+  return normalized(value).split("\n").map(line => {
+    if (/^[ \t]*(?:```|~~~)/.test(line)) { fenced = !fenced; return line; }
+    if (fenced) return line;
+    return line.replace(/^([ \t]*)[-*+](?= )/, "$1-").split(/(`[^`]*`)/).map((part, index) => index % 2 ? part
+      : part.replace(/\[([^\]]+)\]\(<\1>\)/g, "$1").replace(/\[([^\]]+)\]\(\1\)/g, "$1").replace(/\\([!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])/g, "$1")).join("");
+  }).join("\n");
+};
 const scopeHash = (issue: Issue, linearProjectId?: string) => hash({ title: issue.title, description: normalized(issue.description), teamId: issue.team.id,
   ...(linearProjectId !== undefined ? { projectId: issue.project?.id ?? null } : {}), parentId: issue.parent?.id ?? null });
 

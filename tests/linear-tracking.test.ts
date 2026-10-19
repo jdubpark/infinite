@@ -293,6 +293,19 @@ test("team objectives with bare URLs sync on create and lost-response reconcilia
     assert.match(recoveredIssue.description, /\[https:\/\/example\.com\/example\/recovered\]\(<https:\/\/example\.com\/example\/recovered>\)/);
     assert.match(recoveredIssue.description, /\* Recovered requirement$/);
     assert.ok(!recoveredIssue.description.endsWith("\n"), "Linear drops the trailing newline on recovered create");
+
+    // Code is never rewritten by Linear, so an edit to it while the create acknowledgement is lost must still block.
+    for (const [index, [before, after]] of [["```diff\n- allowRemote = true\n```", "```diff\n+ allowRemote = true\n```"], ["Match `a\\.b` only", "Match `a.b` only"]].entries()) {
+      linear.dropNextResponse("InfiniteLinearIssueCreate");
+      const edited = run(`Review the code change\n${before}`);
+      service.updateTeam(edited, true);
+      await waitFor(async () => linear.lostResponses.length, count => count === index + 2, 15000);
+      linear.editIssue(linear.lostResponses[index + 1].id, { description: `Review the code change\n${after}` });
+      linear.restore();
+      const editedStatus = await waitFor(async () => service.getTeam(edited.id)?.status, status => status === "synced" || status === "blocked", 20000);
+      assert.equal(editedStatus, "blocked", `A code edit must not reconcile: ${after}`);
+      assert.match(service.getTeam(edited.id)!.reason!, /no longer matches the saved requirements/);
+    }
     assert.deepEqual(linear.violations, []);
   } finally { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
 });

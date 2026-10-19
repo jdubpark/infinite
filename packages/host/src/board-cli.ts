@@ -79,24 +79,6 @@ export function boardLines(
   return lines;
 }
 
-function projectLines(list: ProjectGroupList) {
-  const lines: string[] = [];
-  for (const group of list.groups) {
-    lines.push(`${group.name}  ${group.id}${group.implicit ? "  (single-repo)" : ""}`);
-    for (const repo of group.repos) lines.push(`  ${repo.name}  ${repo.projectId}`);
-  }
-  if (list.suggestions.length) {
-    lines.push("", "Suggested groups (accept with the command shown):");
-    for (const suggestion of list.suggestions) {
-      const command = ["infinite projects group", shellQuote(suggestion.name), ...suggestion.repos.map(shellQuote)].join(" ");
-      lines.push(`${suggestion.name}  (${suggestion.reason})`, `  ${command}`);
-    }
-  }
-  if (!lines.length) lines.push("No projects are enrolled.");
-  return lines.join("\n");
-}
-function shellQuote(value: string) { return `'${value.replaceAll("'", "'\\''")}'`; }
-
 function boardItem(board: Board, index: number) {
   const rows = board.items.filter(item => item.column !== "ended");
   return rows[Math.min(Math.max(index, 0), Math.max(0, rows.length - 1))];
@@ -153,12 +135,6 @@ export async function handleBoardClientCommand(
 ): Promise<boolean> {
   if (command === "projects") {
     const action = positional[0];
-    if (!action) {
-      if (positional.length !== 0) throw new Error("Usage: infinite projects [--json] | infinite projects group NAME REPO_ID...");
-      const list = await api.json<ProjectGroupList>("/project-groups");
-      console.log(options["--json"] ? JSON.stringify(list, null, 2) : projectLines(list));
-      return true;
-    }
     if (action !== "group" || positional.length < 3) throw new Error("Usage: infinite projects group NAME REPO_ID...");
     const body = { requestId: randomUUID(), name: positional[1], repos: positional.slice(2) };
     const group = await api.json<ProjectGroup>("/project-groups", body);

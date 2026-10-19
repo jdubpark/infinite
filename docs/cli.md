@@ -16,7 +16,11 @@ infinite opencode --model deepseek/deepseek-flash
 
 infinite list
 infinite list --json
-infinite usage             # spend per provider against its budget
+infinite usage                         # month totals, accounts, balances, and daily bars
+infinite usage projects
+infinite usage project PROJECT_ID
+infinite usage goal GOAL_ID
+infinite usage models [--role implementer]
 infinite usage --json
 infinite resources
 infinite resources --watch
@@ -33,7 +37,7 @@ infinite close SESSION_ID  # confirm before ending its provider process
 
 `close` requires an explicit session ID or unique prefix and an owner key. It shows the selected process and asks for confirmation; `--yes` confirms noninteractive use. Another client's active input lease blocks closing unless `--takeover` is explicitly supplied. A delivered receipt confirms the stop request reached the worker; check `list` for the resulting process status. An uncertain response is reported and never retried automatically. Closing ends the provider process; Ctrl+] only detaches the terminal client.
 
-`usage` prints one line per provider with spend, budget, the provider's own budget period and start date, and step and unmeasured-session counts. Providers that report no usage print `unmeasured`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
+`usage` prints the current and previous month, plan fees, account balances, and a 30-day bar chart in the local timezone. `projects`, `project`, `goal`, and `models` show the corresponding roll-up. Every form accepts `--json`; `models` accepts `--role ROLE`. Unpriced totals are marked `≥`. Balances are shown only when the provider returned one; otherwise the CLI prints `—`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
 
 ## Team CLI
 

@@ -468,7 +468,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
-  const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--relationship", "--delivery", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit"]);
+  const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--relationship", "--delivery", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
   const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
   const option = () => {
     const name = args.shift()!;
@@ -574,6 +574,20 @@ export function usageLines(summary: import("./usage-service.js").UsageSummary): 
   });
 }
 
+export function usageBars(values: number[]): string {
+  const levels = "▁▂▃▄▅▆▇█", max = Math.max(0, ...values);
+  return values.map(value => levels[max > 0 ? Math.max(0, Math.min(7, Math.floor(value / max * 7))) : 0]).join("");
+}
+function usageOverview(summary: import("./usage-service.js").UsageSummary, daily: { days: { date: string; usd: number }[] }) {
+  const money = (value: { usd: number; unpriced: number }) => `${value.unpriced ? "≥ " : ""}$${formatUsd(value.usd)}`;
+  const lines = [`Month ${money(summary.month.spent)} · previous ${money(summary.month.previous)} · plans $${formatUsd(summary.month.plansUsd)}`,
+    `Unmeasured sessions ${summary.month.unmeasuredSessions}`,
+    ...summary.accounts.map(account => `${account.id}  ${account.kind === "subscription" ? `plan $${formatUsd(account.planUsd ?? 0)}` : money(account.month ?? { usd: 0, unpriced: 0 })} · balance ${account.balance ? `${account.balance.currency} ${account.balance.amount.toFixed(2)}${account.balance.stale ? " stale" : ""} as of ${account.balance.asOf}` : "—"}`),
+    usageBars(daily.days.map(day => day.usd)),
+    ...(daily.days.length ? [`${daily.days[0].date} — ${daily.days.at(-1)!.date}`] : [])];
+  return lines;
+}
+
 export async function handleClientCommand(argv: string[]): Promise<boolean> {
   if (argv[0] === "cmux") {
     try {
@@ -628,9 +642,14 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       return true;
     }
     if (command === "usage") {
-      const summary = await api.json<import("./usage-service.js").UsageSummary>("/usage");
-      if (options["--json"]) console.log(JSON.stringify(summary, null, 2));
-      else for (const line of usageLines(summary)) console.log(line);
+      const sub = positional[0], tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", query = `?tz=${encodeURIComponent(tz)}`;
+      if (sub === "projects") { const result = await api.json("/usage/projects" + query); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }
+      if (sub === "project" || sub === "goal") { if (!positional[1]) throw new Error(`Usage: infinite usage ${sub} ID [--json]`); const result = await api.json(sub === "project" ? `/usage/projects/${encodeURIComponent(positional[1])}${query}` : `/goals/${encodeURIComponent(positional[1])}`); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }
+      if (sub === "models") { const result = await api.json(`/usage/models?role=${encodeURIComponent(String(options["--role"] ?? "implementer"))}`); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }
+      if (sub || positional.length) throw new Error("Usage: infinite usage [projects|project ID|goal ID|models [--role ROLE]] [--json]");
+      const [summary, daily] = await Promise.all([api.json<import("./usage-service.js").UsageSummary>("/usage"), api.json<{ days: { date: string; usd: number }[] }>(`/usage/daily?days=30&tz=${encodeURIComponent(tz)}`)]);
+      if (options["--json"]) console.log(JSON.stringify({ ...summary, daily }, null, 2));
+      else for (const line of usageOverview(summary, daily)) console.log(line);
       return true;
     }
     if (command === "resources") { await resources(api, options); return true; }

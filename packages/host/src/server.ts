@@ -38,6 +38,7 @@ import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./
 import type { Config, Role, Receipt } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
+import { BalanceService } from "./balances.js";
 
 const id = z.uuid();
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
@@ -133,9 +134,17 @@ export function createApp(config: Config, key: Buffer) {
   const linear = new LinearService(config, key);
   const teams = new TeamService(config, key, manager, startInProject, linear);
   const usage = new UsageService(config, key, manager);
+  const balances = new BalanceService(config.usage?.accounts ?? {});
+  usage.useBalances(balances);
   // TeamService ticks on every host and drives the ledger from its own session listing.
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
+  usage.useResolvers({
+    goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },
+    runTitle: runId => { try { return teams.get(runId).title; } catch { return undefined; } },
+    projectName: projectId => config.projects.find(project => project.id === projectId)?.name,
+    sessionTitle: sessionId => { try { return manager.meta(sessionId).session.title; } catch { return undefined; } },
+  });
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
   const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
@@ -211,6 +220,7 @@ export function createApp(config: Config, key: Buffer) {
   const repositoryBriefings = config.repositoryBriefings
     ? new RepositoryBriefings(config.repositoryBriefings, manager, config.projects, config.teams?.workspaceDir)
     : undefined;
+  repositoryBriefings?.useUsage(usage);
   async function inputAuthority(sessionId: string, res: express.Response) {
     // Retained workers from earlier releases hash the entire request. Adding
     // optional fields would make a pre-upgrade receipt impossible to retry.
@@ -364,6 +374,12 @@ export function createApp(config: Config, key: Buffer) {
       return found.measured ? { cost: found.cost, tokens: found.tokens.input + found.tokens.output, unpriced: found.pricing.unknown } : undefined;
     }, { role: query.role }));
   });
+  app.get("/api/usage/daily", (req, res, next) => {
+    try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); }
+  });
+  app.get("/api/usage/projects", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query); return void res.json(usage.projects({ tz: query.tz })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
+  app.get("/api/usage/projects/:id", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query), result = usage.project(String(req.params.id), { tz: query.tz }); if (!result) return void res.status(404).json({ error: "Project usage not found" }); return void res.json(result); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
+  app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
   app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
@@ -1028,8 +1044,9 @@ export function createApp(config: Config, key: Buffer) {
   server.once("listening", () => goals.start());
   server.once("listening", () => handoffs.start());
   if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });
+  server.once("listening", () => balances.start());
   server.once("close", () => teams.close());
-  server.once("close", () => usage.close());
+  server.once("close", () => { usage.close(); balances.close(); });
   server.once("close", () => goals.close());
   server.once("close", () => repositoryBriefings?.close());
   server.once("close", () => linear.close());
@@ -1037,6 +1054,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { handoffs.close(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

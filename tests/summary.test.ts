@@ -261,6 +261,31 @@ test("a failed automatic repository brief is safe and does not retry the same ch
   }
 });
 
+test("a repository briefing with mismatched provenance cannot record its usage", { timeout: 60000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-jevcode-provenance-"));
+  const receipt = join(root, "calls.jsonl"), fixture = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
+  const host = await startHost({ config: { attention, repositoryBriefings: {
+    command: process.execPath, args: [fixture, receipt, "provenance"], automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 10000,
+  } } });
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: host.config.projects[0].path });
+    execFileSync("git", ["-C", host.config.projects[0].path, "config", "user.email", "test@example.invalid"]);
+    execFileSync("git", ["-C", host.config.projects[0].path, "config", "user.name", "Test"]);
+    writeFileSync(join(host.config.projects[0].path, "README.md"), "fixture repository\n");
+    execFileSync("git", ["-C", host.config.projects[0].path, "add", "README.md"]);
+    execFileSync("git", ["-C", host.config.projects[0].path, "commit", "-qm", "fixture"]);
+    const id = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Wrong provenance", prompt: "hook dialog" });
+    const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+    const control = await claimControl(host, id, "owner");
+    await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
+    const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "failed", 20000);
+    assert.equal(status.body.state, "failed");
+    const project = await host.fetchApi("/usage/projects/rehearsal");
+    assert.ok(project.status === 404 || project.body.briefings.runs === 0, "a rejected briefing must not create a project usage row");
+  } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test("automatic brief uses the latest transcript after a delayed provider flush and labels its bounded activity", { timeout: 60000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "infinite-briefing-transcript-"));
   const transcript = join(root, "provider-session.jsonl");

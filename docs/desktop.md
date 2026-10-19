@@ -14,19 +14,21 @@ record below.
 
 ## Layout
 
-The main window is a sidebar beside one page. The sidebar starts with **Home**
-and search, then **Projects** (team runs that are still open) and **Sessions**
-(the person's own running sessions), with ended sessions in a folded **Ended**
-group. Team agents and closed projects leave the sidebar; Home and search still
-reach them. A session whose attention state is exited, unreachable, or
-recording-error counts as ended whatever its stored status says. Rows carry a
-Linear-style status glyph and the title; the state in words is beside it when the
-row needs a person and in its tooltip otherwise. The footer names the connected
-server with its state in words, switches or adds servers, and opens Connections.
-A session shows its title, provider, state, and working directory above its
-content, with the prompt editor below. The toolbar holds a **New** menu (team
-project, team with options, session) and a menu for Resources, Files & Sync, and
-cmux Workspaces, which open in their own windows; ⌘1 returns to Home.
+The main window is a sidebar beside one page. The sidebar starts with project
+search and **Home**, badged with the number of board rows that need input, then
+**Projects**: every project from `GET /api/project-groups` (see
+[missions](missions.md)), owner-created groups first with their repository
+count, then the implicit single-repository projects. A dot marks a project with
+a row waiting on the owner. Selecting a project shows Home narrowed to it.
+Sessions are not listed in the sidebar; they open from a team's members or
+attention list. A session whose attention state is exited, unreachable, or
+recording-error counts as ended whatever its stored status says. The footer
+names the connected server with its state in words, switches or adds servers,
+and opens Connections. A session shows its title, provider, state, and working
+directory above its content, with the prompt editor below. The toolbar holds a
+**New** menu (mission, single-repository team with options, session) and a menu
+for Resources, Files & Sync, and cmux Workspaces, which open in their own
+windows; ⌘1 returns to Home.
 
 The app follows Apple's Liquid Glass guidance: content (rows, records,
 terminals) stays flat, and controls that act on the whole page float as glass:
@@ -59,45 +61,57 @@ is not the agent's words; the digest attributes any claimed result to the agent
 and never marks work complete. Read positions are kept per server and session
 in this app's preferences, not sent anywhere.
 
-**Home** is the first page after connecting. When the host has agent teams
-enabled (see [teams](teams.md)), it opens on one text box that starts a team:
-Return starts it in the workspace chosen beside the box, with the host's
-configured lineup (or its first provider) and two implementers. The slider
-opens the full form for a name, agents, and parallelism. Below the box, every
-run is one line (status glyph, name, state in words, and the age of its latest
-history entry, since the host also rewrites a run's update time on routine
-passes) in groups by what it needs next:
+**Home** is the first page after connecting. An owner device sees one text box
+that hands a mission to a project: the picker beside it lists the projects
+(with a repository count for multi-repository ones) and defaults to the project
+the sidebar selects, and Return sends `POST /api/missions` with a request ID,
+the project's group ID, and the text as the objective. A creation whose delivery
+is unconfirmed is kept for retry under the same request identity, like a session
+creation; Home shows it under the box until it is confirmed or cleared after
+review. Below the box is the board from `GET /api/board`, polled every two
+seconds with the session list:
 
-| Group | Host states |
+| Section | Rows |
 | --- | --- |
-| Ongoing | planning, discovering, implementing, integrating, verifying, reviewing, delivering |
-| Pending | needs-input, ready-for-review, or any run with an open decision |
-| Stuck | blocked |
-| Paused | paused |
-| Complete | merged (an agent-reported delivery, labelled "Merge reported") |
-| Cancelled | cancelled |
-| Aborted | no-change (the coordinator stopped without proposing a change) |
+| Needs input | missions, team runs, and goals waiting on an answer or blocked |
+| Working | planning, working, and paused ones |
+| Ready for review | the agents report done; nothing merges until the owner does |
+| Ended | cancelled, merged, and otherwise stopped ones, folded until opened |
 
-A run waiting for review is pending, never complete. Complete, Cancelled, and
-Aborted start folded. A row's tooltip adds the workspace, integrated tasks out
-of the plan, the stop reason, and the Linear issue. Selecting a run opens its dashboard
-in place of the session panes, which stay mounted underneath: the request, the
-decisions members asked with their options and a free-text answer, member
-sessions stopped on a provider permission prompt with a button to open them,
-the work plan with each task's state, dependencies, owned paths and assigned
-agent, the members with their role, state and requested model, the host's own
-check results and the reviewer's report (labelled as an agent claim), the
-branch and commits to inspect, earlier directions and answers, and the run
-history. The composer at the bottom sends a direction, which records a new
-revision and makes the team replan; owners pause, resume or cancel from the
-run's menu. Every mutation carries the revision it was based on; a request the
-host refuses as stale refreshes the run, and one whose delivery is unconfirmed
-stays visible for a retry with the same request identity. Member sessions found
-by search carry a team glyph, and the dashboard polls its run every two seconds
-while it is shown. The full form (**New team with options** and ⇧⌘N) also takes
-a name and a longer brief. A creation whose delivery is unconfirmed is kept for
-retry under the same request identity, like a session creation; Home shows it
-under the start box until it is confirmed or cleared after review.
+Rows are newest-updated first. Each row is one line of status glyph, title,
+state in words, and age, over a dim line with the project, a mission's finished
+subtasks out of its total, and the host's one-line detail (the open question,
+the block reason, or the current step). A blocked team the host marks resumable
+offers **Resume** on its row. A goal has no Mac page; its row opens nothing.
+
+A mission row opens its page in place of the session panes, which stay mounted
+underneath: the coordinator's open decisions first, each with its options and a
+free-text answer (an escalated one names the subtask and repository it came
+from); the coordinator's result when it reports one, labelled as a report; the
+subtasks with their repository, size (solo, or a team with its parallelism),
+dependencies, and status, where a started subtask opens its subteam's team
+page with a way back; the request; earlier directions and answers; and the
+mission history. The composer at the bottom steers the coordinator, and the
+owner pauses, resumes, or cancels the mission from its menu. Mission actions
+are owner-only and carry the mission revision they were based on, with the same
+stale-refusal and unconfirmed-retry handling as team actions below. The page
+polls `GET /api/missions/:id` every two seconds while it is shown.
+
+A team run, opened from the board or a subtask, shows its dashboard the same
+way: the request, the decisions members asked with their options and a
+free-text answer, member sessions stopped on a provider permission prompt with
+a button to open them, the work plan with each task's state, dependencies,
+owned paths and assigned agent, the members with their role, state and
+requested model, the host's own check results and the reviewer's report
+(labelled as an agent claim), the branch and commits to inspect, earlier
+directions and answers, and the run history. The composer at the bottom sends a
+direction, which records a new revision and makes the team replan; owners
+pause, resume or cancel from the run's menu. Every mutation carries the
+revision it was based on; a request the host refuses as stale refreshes the
+run, and one whose delivery is unconfirmed stays visible for a retry with the
+same request identity. The dashboard polls its run every two seconds while it is
+shown. **New single-repo team…** (⇧⌘N) still starts a team directly in one
+workspace with a name, agents, parallelism, and a longer brief.
 
 Recent sessions stay attached and rendered off-screen, so switching back is
 immediate and keeps scrollback. Up to three terminals stay mounted; opening a
@@ -225,9 +239,8 @@ and [terminal SDK contract](https://github.com/manaflow-ai/cmux/blob/main/cmux-t
 The Infinite connection lists managed sessions, configured projects, actual
 working directories, provider, observed state, and connection freshness. Owners
 can create, resume supported conversations, and explicitly **End session**.
-Two sessions can be displayed beside each other through the sidebar's **Open
-beside current**. Closing a view detaches it; ending the process is separately
-labeled and confirmed.
+Closing a view detaches it; ending the process is separately labeled and
+confirmed from the session's menu.
 
 Infinite terminal observation does not claim input control. The lease is claimed
 on the first send or when terminal typing is enabled, never while only watching.

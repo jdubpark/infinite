@@ -11,13 +11,18 @@ function reportCommand() {
 }
 function reportingInstructions(provider: Provider, command = reportCommand()) {
   if (provider === "claude") return `You MUST explicitly submit exactly one final structured report by calling mcp__infinite_team__report with {"report": <the report object matching the above schema>}. Wait for its durable success receipt. If that tool is unavailable or permission is denied, stop and request user attention. Never use Bash, a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this member process.`;
+  if (provider === "codex") return `You MUST explicitly submit exactly one final structured report by calling the report tool of the infinite_team MCP server with {"report": <the report object matching the above schema>}. Wait for its success receipt. If the tool is unavailable or permission is denied, stop and request user attention. Never use a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this member process.`;
   return `You MUST explicitly submit exactly one final structured report. Pipe a JSON object matching the above schema to this command: ${command}. The helper adds the assignment identity and authenticates it. Wait for its success receipt. Do not infer successful reporting from terminal text. If a provider denies the helper or another required tool, stop and request user intervention; do not bypass the denial. OpenCode run mode may reject permission requests without an interactive prompt. After a successful report, stop work and wait; the host will stop this member process.`;
 }
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const [commandHead, commandTail] = reportingInstructions("opencode", "\0").split("\0");
-/** Either reporting paragraph, whatever helper path the release that wrote the prompt used. */
-const reportingPattern = () => new RegExp(`${escape(reportingInstructions("claude"))}|${escape(commandHead)}[^\\n]+?${escape(commandTail)}`, "g");
+/** Current MCP paragraphs and helper commands from prompts written by earlier releases. */
+const reportingPattern = () => new RegExp(`${escape(reportingInstructions("claude"))}|${escape(reportingInstructions("codex"))}|${escape(commandHead)}[^\\n]+?${escape(commandTail)}`, "g");
 const profilePattern = new RegExp(`Requested runtime profile: [^\\n]+?${escape(profileSuffix)}`);
+/** Refreshes a carried prompt's report channel without changing prompts that have no known paragraph. */
+export function refreshReportingInstructions(prompt: string, provider: Provider) {
+  return reportingPattern().test(prompt) ? prompt.replace(reportingPattern(), () => reportingInstructions(provider)) : prompt;
+}
 /**
  * Points a member's accumulated prompt, feedback and answers included, at another provider and
  * profile. Returns undefined when the prompt lacks a recognizable reporting paragraph or profile
@@ -25,7 +30,7 @@ const profilePattern = new RegExp(`Requested runtime profile: [^\\n]+?${escape(p
  */
 export function retargetPrompt(prompt: string, to: { provider: Provider; profile: TeamModelProfile }) {
   if (!reportingPattern().test(prompt) || !profilePattern.test(prompt)) return undefined;
-  return prompt.replace(reportingPattern(), () => reportingInstructions(to.provider)).replace(profilePattern, () => profileInstructions(to.profile));
+  return refreshReportingInstructions(prompt, to.provider).replace(profilePattern, () => profileInstructions(to.profile));
 }
 export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile) {
   const taskProfileExample = run.lineup ? `,"agentProfileId":${JSON.stringify(run.lineup.implementers[0].id)}` : "";

@@ -214,6 +214,17 @@ export function buildLaunch(
       },
     } } }));
   }
+  if (team && provider === "codex") {
+    if (!hooks) throw new Error("Codex team reporting requires its authenticated report channel");
+    const development = relayPath.endsWith(".ts");
+    const serverArgs = [...(development ? ["--import", import.meta.resolve("tsx")] : []), join(dirname(relayPath), development ? "team-mcp.ts" : "team-mcp.js")];
+    for (const [key, value] of Object.entries({
+      command: process.execPath,
+      args: serverArgs,
+      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT"],
+      "tools.report.approval_mode": "approve",
+    })) args.push("-c", `mcp_servers.infinite_team.${key}=${JSON.stringify(value)}`);
+  }
   // Dev runs the relay from TypeScript through tsx; builds run the compiled file. The tsx
   // loader is passed as an absolute URL because the agent's cwd is the project, not this repo.
   const relay = relayPath.endsWith(".ts")

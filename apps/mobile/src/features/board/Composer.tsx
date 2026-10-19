@@ -1,50 +1,14 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import { api, ApiError, connectionKey, type Connection, type Mission, type ProjectGroup } from "../../api/client";
 import { Button } from "../../components/Button";
 import { Sheet, SheetRow } from "../../components/Glass";
+import { missionCreations, type MissionCreationRequest } from "../../store/requests";
 import { theme } from "../../theme";
 
 const LAST_PROJECT_KEY = "infinite.mobile.last-project";
-type PendingMission = { requestId: string; groupId: string; objective: string };
-type MissionRequestState = { pending?: PendingMission; message: string };
-const EMPTY: MissionRequestState = { message: "" };
-const missionRequests = (() => {
-  const values = new Map<string, MissionRequestState>();
-  const listeners = new Map<string, Set<() => void>>();
-  const read = (key: string) => values.get(key) ?? EMPTY;
-  const write = (key: string, value: MissionRequestState) => {
-    if (!value.pending && !value.message) values.delete(key); else values.set(key, value);
-    listeners.get(key)?.forEach(listener => listener());
-  };
-  return {
-    read,
-    subscribe(key: string, listener: () => void) {
-      let group = listeners.get(key);
-      if (!group) { group = new Set(); listeners.set(key, group); }
-      group.add(listener);
-      return () => { group?.delete(listener); if (!group?.size) listeners.delete(key); };
-    },
-    begin(key: string, request: PendingMission) {
-      const pending = read(key).pending;
-      if (pending) return pending;
-      write(key, { pending: request, message: "" });
-      return request;
-    },
-    complete(key: string, requestId: string) {
-      if (read(key).pending?.requestId !== requestId) return false;
-      write(key, EMPTY);
-      return true;
-    },
-    fail(key: string, requestId: string, message: string, rejected: boolean) {
-      const state = read(key);
-      if (state.pending?.requestId !== requestId) return;
-      write(key, { pending: rejected ? undefined : state.pending, message });
-    },
-  };
-})();
 const inFlight = new Set<string>();
 
 /** A project-targeted mission creator. An uncertain retry reuses its stored request body and ID. */
@@ -52,7 +16,7 @@ export function Composer({ connection, groups, onCreated }: {
   connection: Connection; groups: ProjectGroup[]; onCreated: (mission: Mission) => void;
 }) {
   const machine = connectionKey(connection);
-  const state = useSyncExternalStore(listener => missionRequests.subscribe(machine, listener), () => missionRequests.read(machine));
+  const state = missionCreations.use(machine);
   const pending = state.pending;
   const [groupId, setGroupId] = useState("");
   const [objective, setObjective] = useState("");
@@ -80,18 +44,18 @@ export function Composer({ connection, groups, onCreated }: {
     void SecureStore.setItemAsync(LAST_PROJECT_KEY, group.id).catch(() => {});
   }
 
-  const transmit = useCallback(async (request: PendingMission) => {
+  const transmit = useCallback(async (request: MissionCreationRequest) => {
     const requestKey = `${machine}/${request.requestId}`;
     if (inFlight.has(requestKey)) return;
     inFlight.add(requestKey);
     setSending(true);
     try {
       const mission = await api<Mission>(connection, "/missions", { method: "POST", body: request });
-      const settled = missionRequests.complete(machine, request.requestId);
+      const settled = missionCreations.complete(machine, request.requestId, { id: mission.id });
       if (settled && mounted.current) { setObjective(""); latest.current(mission); }
     } catch (error) {
       const refused = error instanceof ApiError && error.status >= 400 && error.status < 500;
-      missionRequests.fail(machine, request.requestId, refused
+      missionCreations.fail(machine, request.requestId, refused
         ? `${(error as Error).message} Review the project and request before sending again.`
         : `${(error as Error).message} Delivery is unconfirmed. Retry sends this exact request.`, refused);
     } finally {
@@ -102,7 +66,7 @@ export function Composer({ connection, groups, onCreated }: {
 
   function submit() {
     if (!selected || busy || pending || !objective.trim()) return;
-    void transmit(missionRequests.begin(machine, {
+    void transmit(missionCreations.begin(machine, {
       requestId: Crypto.randomUUID(), groupId: selected.id, objective: objective.trim(),
     }));
   }

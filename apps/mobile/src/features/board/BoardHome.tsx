@@ -5,7 +5,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { api, closeConnection, connectionKey, type Connection, type Me } from "../../api/client";
 import { clearDrafts } from "../../store/drafts";
 import { clearConnection, identifyConnection, loadConnections, selectConnection } from "../../store/connection";
-import { creations, goalCreations, lifecycles, runRequests, teamCreations } from "../../store/requests";
+import { creations, goalCreations, missionCreations, lifecycles, runRequests, teamCreations } from "../../store/requests";
 import { registerForPush, unregisterPush, type PushState } from "../../push/register";
 import { Board } from "./Board";
 import { theme } from "../../theme";
@@ -65,7 +65,7 @@ export function BoardHome() {
     const key = connectionKey(connection);
     clearDrafts(key);
     creations.clear(key); lifecycles.clearMachine(key); teamCreations.clearMachine(key);
-    goalCreations.clearMachine(key); runRequests.clearMachine(key);
+    goalCreations.clearMachine(key); missionCreations.clearMachine(key); runRequests.clearMachine(key);
     await clearConnection(key);
     const remaining = await reload();
     if (!remaining.length) router.replace("/");

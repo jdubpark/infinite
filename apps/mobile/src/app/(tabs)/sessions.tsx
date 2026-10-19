@@ -6,7 +6,7 @@ import { closeConnection, connectionKey, type Connection } from "../../api/clien
 import { Inbox } from "../../features/inbox/Inbox";
 import { clearDrafts } from "../../store/drafts";
 import { clearConnection, loadConnections, selectConnection } from "../../store/connection";
-import { creations, goalCreations, lifecycles, runRequests, teamCreations } from "../../store/requests";
+import { creations, goalCreations, missionCreations, lifecycles, runRequests, teamCreations } from "../../store/requests";
 import { unregisterPush } from "../../push/register";
 import { theme } from "../../theme";
 
@@ -44,7 +44,7 @@ export default function Sessions() {
     const key = connectionKey(connection);
     clearDrafts(key);
     creations.clear(key); lifecycles.clearMachine(key); teamCreations.clearMachine(key);
-    goalCreations.clearMachine(key); runRequests.clearMachine(key);
+    goalCreations.clearMachine(key); missionCreations.clearMachine(key); runRequests.clearMachine(key);
     await clearConnection(key);
     const remaining = await reload();
     if (!remaining.length) router.replace("/");

@@ -133,7 +133,7 @@ Two things are not verified yet. The live Claude Code and Codex spikes (S1 and S
 Push setup, in order:
 
 1. Create an EAS project with `eas init` in `apps/mobile` and set its project id.
-2. Create a Firebase project for `dev.infinite.app`, download `google-services.json`, and point `android.googleServicesFile` at it.
+2. Create a Firebase project for `dev.infinite.app` and download `google-services.json`. Keep it out of the repository: store it as the EAS file variable `GOOGLE_SERVICES_JSON` for cloud builds, or at `apps/mobile/.local/google-services.json` for local builds. `app.config.ts` sets `android.googleServicesFile` from either.
 3. Upload an FCM V1 service-account key with `eas credentials`.
 4. Create an Expo access token and store it in a file with mode 0600 outside the state directory.
 5. Enable the `push` block in the host config:

@@ -40,11 +40,17 @@ const minutes = (value: number) => value >= 90 ? `${(value / 60).toFixed(1)} h` 
 const dayLabel = (date: string) => { const [y, m, d] = date.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString([], { month: "short", day: "numeric" }); };
 const monthName = (iso: string, style: "long" | "short" = "long") => new Date(iso).toLocaleDateString([], { month: style, timeZone: "UTC" });
 
-/** A figure that is a lower bound when any step had no price. The dotted mark is explained once, in the page legend. */
-export function Amount({ money, value, currency }: { money?: Money; value?: number; currency?: string }) {
+/**
+ * A money figure that stays honest about what it could not count. Unpriced steps or unmeasured runs make a
+ * non-zero figure a lower bound; a figure with nothing priced at all is "—", never $0. The marks are explained once, in the page legend.
+ */
+export function Amount({ money, value, currency, unmeasured = 0 }: { money?: Money; value?: number; currency?: string; unmeasured?: number }) {
   const amount = money ? money.usd : value ?? 0;
-  const lower = (money?.unpriced ?? 0) > 0;
-  return <span className={"cost-money" + (lower ? " lower" : "")} title={lower ? `${money!.unpriced} ${money!.unpriced === 1 ? "step" : "steps"} without a price` : undefined}>{lower && <span className="cost-ge" aria-label="at least">≥</span>}{usd(amount, currency)}</span>;
+  const unpriced = money?.unpriced ?? 0;
+  const gaps = [unpriced > 0 && `${unpriced} ${unpriced === 1 ? "step" : "steps"} without a price`, unmeasured > 0 && `${unmeasured} unmeasured`].filter(Boolean).join(" · ");
+  if (amount === 0 && gaps) return <span className="cost-money cost-dash" title={gaps} aria-label={`no priced spend; ${gaps}`}>—</span>;
+  const lower = Boolean(gaps);
+  return <span className={"cost-money" + (lower ? " lower" : "")} title={lower ? gaps : undefined}>{lower && <span className="cost-ge" aria-label="at least">≥</span>}{usd(amount, currency)}</span>;
 }
 function Unmeasured({ count, word = "session" }: { count: number; word?: string }) {
   if (!count) return null;
@@ -247,9 +253,9 @@ function Overview({ me }: { me: Me }) {
 
 function ProjectRow({ project, onOpen }: { project: UsageProjectRow; onOpen: () => void }) {
   return <button type="button" className="cost-project-row" onClick={onOpen}>
-    <span className="cost-project-name"><strong>{project.name}</strong><small><Amount money={project.month} /> this month</small></span>
+    <span className="cost-project-name"><strong>{project.name}</strong><small><Amount money={project.month} unmeasured={project.unmeasured} /> this month{project.unmeasured ? <> · <Unmeasured count={project.unmeasured} word="run" /></> : null}</small></span>
     <Sparkline values={project.spark} />
-    <span className="cost-project-total"><Amount money={project.total} /></span>
+    <span className="cost-project-total"><Amount money={project.total} unmeasured={project.unmeasured} /></span>
     <ChevronRight size={16} aria-hidden="true" />
   </button>;
 }
@@ -284,7 +290,7 @@ function ProjectDetail({ id, back }: { id: string; back: () => void }) {
     <button className="text-button cost-back" onClick={back}><ArrowLeft size={15} />All projects</button>
     <section className="cost-hero cost-hero-project">
       <h2>{project.name}</h2>
-      <p className="cost-hero-value"><Amount money={project.total} /></p>
+      <p className="cost-hero-value"><Amount money={project.total} unmeasured={project.unmeasured} />{project.unmeasured ? <Unmeasured count={project.unmeasured} word="run" /> : null}</p>
       <KindBar byKind={project.byKind} />
     </section>
     <section className="cost-section">
@@ -368,7 +374,7 @@ export function CostPicker({ selected, onSelect }: { selected: string | null; on
   return <nav className="session-list cost-picker" aria-label="Projects by cost">
     {projects?.map((project, index) => <button key={project.id} className={"session-row " + (selected === project.id ? "selected" : "")} aria-current={selected === project.id ? "page" : undefined} onClick={() => onSelect(project.id)}>
       <div className="row-top"><span className="cost-rank">{index + 1}</span><strong>{project.name}</strong><ChevronRight size={16} /></div>
-      <div className="row-meta"><span><Amount money={project.total} /></span><Sparkline values={project.spark} width={64} height={18} /></div>
+      <div className="row-meta"><span><Amount money={project.total} unmeasured={project.unmeasured} /></span><Sparkline values={project.spark} width={64} height={18} /></div>
     </button>)}
     {!projects?.length && <p className="rail-empty" role="status">{projects ? "No project has metered spend yet." : view.failed ? "Project costs are unavailable." : "Loading project costs…"}</p>}
   </nav>;

@@ -1437,13 +1437,14 @@ small,
 .cost-ge { font-size: 0.62em; color: var(--muted); font-weight: 500; margin-right: 0.18em; vertical-align: 0.12em; }
 .cost-hero-value .cost-ge { font-size: 0.42em; margin-right: 0.22em; vertical-align: 0.35em; }
 .cost-hero-value .cost-money.lower { text-decoration-thickness: 2px; text-underline-offset: 6px; }
+.cost-hero-value .cost-badge { font-size: 12px; }
 .cost-badge { display: inline-block; padding: 2px 7px; border-radius: 999px; background: #f7e8ce; color: #724314; font-size: 11px; font-weight: 600; letter-spacing: 0.01em; white-space: nowrap; }
 .cost-dash { color: var(--muted); }
 .cost-markers { display: flex; flex-wrap: wrap; gap: 8px 26px; margin: 34px 0 0; padding: 18px 0 0; border-top: 1px solid var(--rule); list-style: none; font-size: 12px; color: var(--muted); }
 .cost-markers li { display: flex; align-items: center; gap: 8px; }
 .cost-markers .cost-money, .cost-markers .cost-dash { color: var(--ink); font-weight: 500; }
 .cost-hero { padding: 6px 0 30px; }
-.cost-hero-value { font-size: 56px; font-weight: 500; letter-spacing: -0.035em; line-height: 1.05; margin: 0 0 12px; font-variant-numeric: normal; }
+.cost-hero-value { display: flex; flex-wrap: wrap; align-items: baseline; gap: 14px; font-size: 56px; font-weight: 500; letter-spacing: -0.035em; line-height: 1.05; margin: 0 0 12px; font-variant-numeric: normal; }
 .cost-hero-project h2 { font-size: 14px; font-weight: 500; color: var(--muted); margin-bottom: 10px; }
 .cost-hero-project .cost-hero-value { font-size: 44px; margin-bottom: 22px; }
 .cost-hero-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; font-size: 14px; color: var(--muted); margin: 0; }

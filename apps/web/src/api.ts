@@ -59,9 +59,10 @@ export type UsageSummary = {
   accounts: AccountView[];
 };
 export type UsageDaily = { tz: string; accounts: string[]; days: { date: string; usd: number; byAccount: Record<string, number> }[] };
-export type UsageProjectRow = { id: string; name: string; total: Money; month: Money; spark: number[] };
+/** `unmeasured` counts sessions and briefing runs that produced no usage data; older hosts omit it. */
+export type UsageProjectRow = { id: string; name: string; total: Money; month: Money; spark: number[]; unmeasured?: number };
 export type UsageProject = {
-  id: string; name: string; total: Money;
+  id: string; name: string; total: Money; unmeasured?: number;
   byKind: { goals: number; teams: number; sessions: number; briefings: number };
   goals: { id: string; title: string; total: Money; tasks: number }[];
   teams: { id: string; title: string; goalId?: string; total: Money }[];

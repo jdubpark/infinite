@@ -142,7 +142,7 @@ Push setup, in order:
 "push": { "enabled": true, "accessTokenFile": "/path/outside/state/expo-token", "detail": "minimal" }
 ```
 
-`detail` is `minimal` by default and `events` selects which states notify. Push messages go through Expo's push service, so enabling it adds an outbound dependency. Run `infinite doctor` to confirm the relay, hooks and push status.
+`detail` is `minimal` by default. `events` selects notifications: priority session attention (`needs-you`, `recording-error`) and goal/team lifecycle events are on by default; `turn-finished` and `exited` are opt-in. Stuck goal and team events need attention, and full detail may include their reason. Push messages go through Expo's push service, so enabling it adds an outbound dependency. Run `infinite doctor` to confirm the relay, hooks and push status.
 
 ## What is implemented
 

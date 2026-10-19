@@ -7,6 +7,7 @@ export type GoalCreationRequest = {
   requestId: string; projectId: string; linearIssueId?: string; title: string; objective: string; successCriteria: string;
   nonGoals: string[]; allowedPaths: string[]; evidence: string[]; maxRuns: number; maxMinutes: number; maxMembers: number; parallelism: number;
 };
+export type MissionCreationRequest = { requestId: string; groupId: string; objective: string };
 /** A steer, answer, lifecycle action or outcome for one team or goal, sent with the revision it was decided against. */
 export type RunRequest = { requestId: string; revision: number; path: string; label: string; fields: Record<string, string> };
 type RequestState<Request, Result> = { pending?: Request; result?: Result; message: string };
@@ -60,5 +61,6 @@ export const creations = requestStore<CreationRequest, { id: string }>();
 export const lifecycles = requestStore<LifecycleRequest, { id: string }>();
 export const teamCreations = requestStore<TeamCreationRequest, { id: string }>();
 export const goalCreations = requestStore<GoalCreationRequest, { id: string }>();
+export const missionCreations = requestStore<MissionCreationRequest, { id: string }>();
 /** Keyed by machine and run, so a pending request follows its team or goal across screens. */
 export const runRequests = requestStore<RunRequest, { id: string }>();

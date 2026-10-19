@@ -2,7 +2,7 @@ import type { Attention, Provider } from "@infinite/attention";
 import { createRemoteClient, RemoteError, type RemoteAccessToken } from "@infinite/remote";
 import * as Crypto from "expo-crypto";
 import { loadClientId } from "../store/connection";
-import type { TeamLineup, TeamProject, TeamRole } from "../features/teams/model";
+import type { TeamLineup, TeamProject, TeamRole, TeamStatus } from "../features/teams/model";
 
 export type Connection = { id?: string; machineId?: string; label?: string; url: string; token: string; relay?: { machineId: string }; access?: RemoteAccessToken };
 export const connectionKey = (connection: Connection) => connection.id ?? `${connection.url}/${connection.relay?.machineId ?? "direct"}`;
@@ -140,6 +140,57 @@ export type Me = {
   teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
   goals?: { enabled: boolean };
 };
+
+/** Project group contract mirrored from the host for the mobile project picker. */
+export type ProjectGroupRepo = { projectId: string; name: string; path: string };
+export type ProjectGroup = {
+  id: string; name: string; repos: ProjectGroupRepo[]; implicit: boolean; revision: number;
+  createdAt: string; updatedAt: string;
+};
+export type ProjectGroupList = {
+  groups: ProjectGroup[];
+  suggestions: { name: string; repos: string[]; reason: "shared-parent" | "shared-linear-project" }[];
+};
+export type MissionStatus = "planning" | "working" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "cancelled";
+export type CreateMissionRequest = {
+  requestId: string; groupId: string; title?: string; objective: string; maxSubtasks?: number; maxMinutes?: number;
+};
+export type MissionActionRequest = { requestId: string; revision: number };
+export type MissionTextRequest = MissionActionRequest & { text: string };
+export type MissionSubtask = {
+  id: string; repoProjectId: string; title: string; objective: string; size: "solo" | "team"; parallelism: number;
+  dependsOn: string[]; status: "queued" | "running" | "done" | "cancelled" | "blocked"; teamId?: string; teamStatus?: TeamStatus;
+};
+export type MissionDecision = {
+  id: string; question: string; options: string[]; createdAt: string; subtaskId?: string; childDecisionId?: string;
+  answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator";
+};
+export type MissionUsageTotals = {
+  cost: number; tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number };
+  messages: number; pricing: { configured: number; provider: number; unknown: number };
+};
+export type MissionUsage = {
+  total: MissionUsageTotals; byProfile: Record<string, MissionUsageTotals>;
+  byProvider: Partial<Record<Provider, MissionUsageTotals>>; unmeasuredMembers: number;
+};
+export type Mission = {
+  id: string; groupId: string; groupName: string; repoProjectIds: string[]; title: string; objective: string;
+  maxSubtasks: number; maxMinutes: number; deadlineAt: string; revision: number; status: MissionStatus;
+  reason?: string; createdAt: string; updatedAt: string; lineup: TeamLineup;
+  coordinator?: { memberId: string; sessionId: string; status: "running" | "waiting" | "stopped" };
+  dispatchSummary?: string; subtasks: MissionSubtask[]; decisions: MissionDecision[];
+  steering: { text: string; revision: number; at: string }[]; events: { at: string; text: string }[];
+  result?: { summary: string; revision: number; at: string };
+  usage?: MissionUsage;
+};
+export type BoardColumn = "needs-input" | "working" | "review" | "ended";
+export type BoardItem = {
+  kind: "mission" | "team" | "goal"; id: string; title: string; groupId?: string; projectName: string;
+  column: BoardColumn; status: string; detail: string; updatedAt: string;
+  subtasks?: { total: number; running: number; done: number };
+};
+export type Board = { items: BoardItem[] };
+
 export type LogEvent = {
   seq: number;
   at: string;

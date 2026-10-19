@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AppState } from "react-native";
 import { openEvents, type Connection } from "./client";
-import { LIVE_STALE_DELAY_MS, shouldMarkLiveStale } from "./liveStatus";
+import { canUseLiveFallback, isLiveOnline, LIVE_STALE_DELAY_MS, shouldMarkLiveStale, shouldRetryEmptyLiveLoad } from "./liveStatus";
 
 type Consumer = { after: () => number; onEvent(event: { topic: string; data: unknown }): void; onClose(): void };
 type SharedStream = { consumers: Set<Consumer>; stream?: { close(): void }; opening?: Promise<void> };
@@ -45,7 +45,8 @@ type LiveOptions<T> = {
   load(): Promise<T>;
   select(topic: string, payload: unknown, previous: T | null): T | undefined;
   after?: () => number;
-  refreshOnEvent?: boolean;
+  refreshOnEvent?: boolean | ((topic: string, payload: unknown) => boolean);
+  continuePolling?: (data: T | null) => boolean;
 };
 
 /** Event driven data with the existing polling result contract and a bounded fallback. */
@@ -64,7 +65,7 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
     let offlineSince: number | null = null;
     const stamp = () => new Date().toLocaleTimeString();
     const clearTimers = () => { clearTimeout(fallback); clearTimeout(retry); fallback = retry = undefined; };
-    const onlineNow = () => streamUp || lastLoadOk;
+    const onlineNow = () => isLiveOnline(streamUp, lastLoadOk);
     const delayStale = () => {
       if (onlineNow() || staleTimer !== undefined) return;
       offlineSince ??= Date.now();
@@ -91,7 +92,7 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
         const next = await current.current.load();
         if (active && readRevision === revision) {
           value.current = next; setData(next); setSeen(stamp());
-          if (!streamUp) { lastLoadOk = true; updateOnline(); }
+          lastLoadOk = true; updateOnline();
         }
       } catch {
         if (active && readRevision === revision && !streamUp) { lastLoadOk = false; updateOnline(); }
@@ -99,12 +100,18 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
       finally {
         polling = false;
         if (active) { setLoading(false); if (manual) setRefreshing(false); }
-        if (pollAgain && active && appActive && (!streamUp || current.current.refreshOnEvent)) { pollAgain = false; void load(); }
+        if ((pollAgain || shouldRetryEmptyLiveLoad(readRevision !== revision, value.current)) && active && appActive) {
+          pollAgain = false; void load();
+        }
       }
     };
     const scheduleFallback = () => {
       clearTimeout(fallback);
-      fallback = setTimeout(() => { if (active && appActive && !streamUp) { void load(); scheduleFallback(); } }, current.current.intervalMs);
+      if (!canUseLiveFallback(value.current, current.current.continuePolling)) return;
+      fallback = setTimeout(() => {
+        if (!active || !appActive || streamUp || !canUseLiveFallback(value.current, current.current.continuePolling)) return;
+        void load().finally(() => { if (active && appActive && !streamUp) scheduleFallback(); });
+      }, current.current.intervalMs);
     };
     const scheduleRetry = () => {
       clearTimeout(retry);
@@ -114,7 +121,8 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
     const failed = () => {
       if (!active || !appActive) return;
       streamUp = false; unsubscribe?.(); unsubscribe = undefined; updateOnline();
-      void load(); scheduleFallback(); scheduleRetry();
+      if (canUseLiveFallback(value.current, current.current.continuePolling)) void load();
+      scheduleFallback(); scheduleRetry();
     };
     const connect = async () => {
       if (!active || !appActive || connecting || streamUp) return;
@@ -125,11 +133,14 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
           after: () => current.current.after?.() ?? 0,
           onEvent(event) {
             if (!active || !appActive) return;
-            revision++;
             const next = current.current.select(event.topic, event.data, value.current);
+            const refreshOnEvent = typeof current.current.refreshOnEvent === "function"
+              ? current.current.refreshOnEvent(event.topic, event.data)
+              : current.current.refreshOnEvent;
+            if (next === undefined || next !== value.current || refreshOnEvent) revision++;
             if (next !== undefined) { value.current = next; setData(next); setLoading(false); }
             setSeen(stamp());
-            if (next === undefined || current.current.refreshOnEvent) void load();
+            if (next === undefined || refreshOnEvent) void load();
           },
           onClose() { if (active && appActive) failed(); },
         });

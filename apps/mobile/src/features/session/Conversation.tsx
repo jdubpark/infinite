@@ -2,14 +2,23 @@ import { useEffect, useRef } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { api, type ChatMessage, type Connection, type MessagesPage } from "../../api/client";
 import { useLive } from "../../api/useLive";
+import { conversationActivity, shouldRefreshConversation, type ConversationActivity } from "./liveState";
 import { theme } from "../../theme";
 
 export function Conversation({ connection, id, onStaleChange }: { connection: Connection; id: string; onStaleChange?: (stale: boolean) => void }) {
   const cursor = useRef<string | number>("");
   const eventCursor = useRef(0);
   const messages = useRef<ChatMessage[]>([]);
-  const { data, online, loading, stale } = useLive<MessagesPage>(connection, {
-    topics: [`session/${id}`], intervalMs: 15000, deps: [id], after: () => eventCursor.current, refreshOnEvent: true,
+  const activity = useRef<{ id: string; value: ConversationActivity | null }>({ id, value: null });
+  const { data, loading, stale } = useLive<MessagesPage>(connection, {
+    topics: [`session/${id}`], intervalMs: 15000, deps: [id], after: () => eventCursor.current,
+    refreshOnEvent(topic, payload) {
+      if (topic !== `session/${id}`) return false;
+      const previous = activity.current.id === id ? activity.current.value : null;
+      const refresh = shouldRefreshConversation(previous, payload);
+      activity.current = { id, value: conversationActivity(payload) };
+      return refresh;
+    },
     async load() {
       const page = await api<MessagesPage>(connection, `/sessions/${id}/messages?limit=100${cursor.current === "" ? "" : `&after=${encodeURIComponent(cursor.current)}`}`);
       cursor.current = page.cursor;

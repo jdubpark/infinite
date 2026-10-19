@@ -41,6 +41,18 @@ export type TeamView = {
   permissionDecisions?: PermissionDecision[];
 };
 
+/** Blocked runs lead the team list; each status group keeps its received order. */
+export function blockedTeamsFirst(teams: TeamView[]) {
+  return teams.map((team, index) => ({ team, index }))
+    .sort((a, b) => Number(b.team.status === "blocked") - Number(a.team.status === "blocked") || a.index - b.index)
+    .map(({ team }) => team);
+}
+
+/** List resume is only available for a standalone blocked run its owner can restart. */
+export function canResumeBlockedTeam(team: TeamView, role: DeviceRole | undefined) {
+  return role === "owner" && team.status === "blocked" && team.resumable === true && !team.goal && !team.deliveryReceipt;
+}
+
 export type GoalStatus = "running" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-opportunity" | "limit-reached" | "cancelled" | "achieved";
 export type GoalResult = "achieved" | "not-achieved" | "inconclusive";
 export type GoalCycle = { teamId: string; cycle: number; goalRevision: number; status: string; startedAt: string; finishedAt?: string; branch?: string; headCommit?: string; brief?: TeamBrief; reason?: string; memberCount: number };

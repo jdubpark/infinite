@@ -123,9 +123,43 @@ export function TeamList({ teams, me, fresh, loading, failed, seen, onCreate, on
     <SpendBlock me={me} />
     <div className="team-section-heading"><h2>Team runs <span className="quiet">{teams.length}</span></h2><span className="quiet">{!me.teams ? "Unavailable on this host" : fresh ? "Up to date" : failed ? "Team updates unavailable" : loading ? "Loading…" : "Checking…"}{seen && " · checked " + ago(seen)}</span></div>
     {failed && <p className="team-notice" role="status">The host could not refresh team runs. Showing the last received state. <button className="text-button" onClick={refresh}>Try again</button></p>}
-    {teams.map(team => <button className="team-run-row" key={team.id} onClick={() => onSelect(team.id)}><div><strong>{team.title}</strong><p>{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)} · {date(team.createdAt)}</p>{team.lineup && <p className="team-run-model">Requested coordinator: <code>{team.lineup.coordinator.model}</code> · {profileSetting(team.lineup.coordinator)}</p>}</div><Status status={team.status} /><ArrowUpRight size={18} /></button>)}
+    {[...teams].map((team, index) => ({ team, index })).sort((a, b) => Number(b.team.status === "blocked") - Number(a.team.status === "blocked") || a.index - b.index).map(({ team }) => <div className="team-run-row" key={team.id}>
+      <button type="button" className="team-run-open" onClick={() => onSelect(team.id)}><div><strong>{team.title}</strong><p>{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)} · {date(team.createdAt)}</p>{team.lineup && <p className="team-run-model">Requested coordinator: <code>{team.lineup.coordinator.model}</code> · {profileSetting(team.lineup.coordinator)}</p>}{team.status === "blocked" && <p className="team-run-reason">{team.reason ?? " "}</p>}</div><Status status={team.status} /><ArrowUpRight size={18} /></button>
+      {team.status === "blocked" && me.role === "owner" && team.resumable === true && !team.goal && !team.deliveryReceipt && <TeamListResume team={team} fresh={fresh} refresh={refresh} />}
+    </div>)}
     {!teams.length && !loading && !failed && <div className="team-empty"><Users size={32} strokeWidth={1.4} /><h2>No team runs yet.</h2><p>A coordinator will plan the work, then dispatch independent tasks to implementers.</p>{me.role !== "owner" && <p>An owner can start a team on this host.</p>}</div>}
   </div>;
+}
+
+function TeamListResume({ team, fresh, refresh }: { team: TeamView; fresh: boolean; refresh: () => void }) {
+  const api = useApi();
+  const machine = useMachines().active.id;
+  const key = machine + "/" + team.id;
+  const request = mutations.use(key);
+  const pending = request.pending;
+  const [busy, setBusy] = useState(false);
+  async function resume() {
+    if (busy || !fresh) return;
+    const body = pending ?? mutations.begin(key, { requestId: crypto.randomUUID(), revision: team.revision, path: "/teams/" + team.id + "/resume", label: "Resume" });
+    if (inFlight.has(body.requestId)) return;
+    inFlight.add(body.requestId);
+    setBusy(true);
+    try {
+      const { path, label, ...payload } = body;
+      const result = await api<TeamView>(path, payload);
+      mutations.complete(key, body.requestId, { id: result.id }, label + " recorded. Revision " + result.revision + ".");
+      refresh();
+    } catch (failure) {
+      const refused = rejected(failure);
+      mutations.fail(key, body.requestId, (failure as Error).message + (refused ? " Refresh the team before sending another request." : " Delivery is unconfirmed. Retry will use this exact request."), refused);
+      if (refused) refresh();
+    } finally { inFlight.delete(body.requestId); setBusy(false); }
+  }
+  return <span className="team-run-resume-wrap">
+    {request.message && <span className="team-run-resume-error" role="status">{request.message}</span>}
+    {pending && !busy && <button type="button" className="team-run-resume" disabled={!fresh} onClick={() => void resume()}>Retry same request</button>}
+    <button type="button" className="team-run-resume" disabled={busy || Boolean(pending) || !fresh} onClick={() => void resume()}>{busy ? "Resuming…" : "Resume"}</button>
+  </span>;
 }
 
 export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean; done: (id: string) => void }) {

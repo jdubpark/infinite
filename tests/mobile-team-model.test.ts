@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { approvalOwner, goalControls, goalGroup, groupRuns, newer, openDecisions, pendingApprovals, taskKind, teamControls, teamGroup, teamKind, teamPhases, type PermissionDecision, type ProductGoal, type TeamMember, type TeamTask, type TeamView } from "../apps/mobile/src/features/teams/model.ts";
+import { approvalOwner, blockedTeamsFirst, canResumeBlockedTeam, goalControls, goalGroup, groupRuns, newer, openDecisions, pendingApprovals, taskKind, teamControls, teamGroup, teamKind, teamPhases, type PermissionDecision, type ProductGoal, type TeamMember, type TeamTask, type TeamView } from "../apps/mobile/src/features/teams/model.ts";
 import { age, initials } from "../apps/mobile/src/status.ts";
 import { runRequests } from "../apps/mobile/src/store/requests.ts";
 
@@ -102,6 +102,17 @@ test("phone run lists put work waiting on a person first and fold stopped runs t
   assert.equal(goalGroup(goal({ status: "achieved" })), "closed");
   const runs = [team({ id: "a", status: "cancelled" }), team({ id: "b" }), team({ id: "c", status: "needs-input" }), team({ id: "d" })];
   assert.deepEqual(groupRuns(runs, teamGroup).map(group => [group.group, group.items.map(item => item.id)]), [["attention", ["c"]], ["active", ["b", "d"]], ["closed", ["a"]]]);
+});
+
+test("blocked team runs lead the list stably and only eligible owners can resume them", () => {
+  const runs = [team({ id: "active-1" }), team({ id: "blocked-1", status: "blocked" }), team({ id: "closed", status: "cancelled" }), team({ id: "blocked-2", status: "blocked" })];
+  assert.deepEqual(blockedTeamsFirst(runs).map(item => item.id), ["blocked-1", "blocked-2", "active-1", "closed"]);
+  const eligible = team({ status: "blocked", resumable: true });
+  assert.equal(canResumeBlockedTeam(eligible, "owner"), true);
+  assert.equal(canResumeBlockedTeam(eligible, "controller"), false);
+  assert.equal(canResumeBlockedTeam(team({ ...eligible, goal: { id: "goal", revision: 1, cycle: 1 } }), "owner"), false);
+  assert.equal(canResumeBlockedTeam(team({ ...eligible, deliveryReceipt: { revision: 2, headCommit: "head", pullRequestUrl: "https://example.com/pr", mergeCommit: "merge", summary: "Reported", reportedAt: "2026-01-01T00:00:00.000Z" } }), "owner"), false);
+  assert.equal(canResumeBlockedTeam(team({ status: "blocked" }), "owner"), false);
 });
 
 test("phone status icons show plan progress without reading a full ring as completion", () => {

@@ -1179,12 +1179,18 @@ small,
 .team-section-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 14px; }
 .team-section-heading h2 { margin-bottom: 0; }
 .team-section-heading > span { font-size: 11px; }
-.team-run-row { width: 100%; display: flex; align-items: center; gap: 18px; padding: 24px 0; border: 0; border-bottom: 1px solid var(--rule); background: transparent; text-align: left; }
-.team-run-row > div { min-width: 0; flex: 1; }
+.team-run-row { width: 100%; display: flex; align-items: center; gap: 18px; padding: 18px 0; border-bottom: 1px solid var(--rule); }
+.team-run-open { min-width: 0; flex: 1; display: flex; align-items: center; gap: 18px; padding: 6px 0; border: 0; background: transparent; text-align: left; }
+.team-run-open > div { min-width: 0; flex: 1; }
 .team-run-row strong { font-weight: 500; overflow-wrap: anywhere; }
 .team-run-row p { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
 .team-run-row .team-run-model { overflow-wrap: anywhere; }
-.team-run-row > svg { flex-shrink: 0; color: var(--muted); }
+.team-run-open > svg { flex-shrink: 0; color: var(--muted); }
+.team-run-row .team-run-reason { min-height: 2.6em; max-height: 2.6em; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; color: #9d382a; }
+.team-run-resume-wrap { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+.team-run-resume { padding: 6px 12px; border: 1px solid var(--rule); border-radius: 999px; background: var(--paper); color: var(--ink); font: inherit; font-size: 12px; font-weight: 600; }
+.team-run-resume:disabled { opacity: .55; }
+.team-run-resume-error { max-width: 220px; color: #9d382a; font-size: 12px; }
 .team-status { display: inline-flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
 .team-status .dot { background: #307d54; }
 .team-status.waiting { color: #724314; }
@@ -1319,8 +1325,9 @@ small,
   .team-detail-body { padding: 0 21px 22px; }
   .team-detail-meta { font-size: 11px; gap: 9px 14px; }
   .team-run-row { flex-wrap: wrap; gap: 10px; }
-  .team-run-row > div { flex-basis: calc(100% - 32px); }
-  .team-run-row > .team-status { flex: 1; }
+  .team-run-open { flex-basis: calc(100% - 32px); gap: 10px; }
+  .team-run-resume-wrap { margin-left: 32px; }
+  .team-run-open > .team-status { flex: 1; }
   .team-roles { gap: 18px 20px; }
   .team-form-grid { grid-template-columns: 1fr; gap: 23px; }
   .team-lineup > div { grid-template-columns: 1fr; gap: 8px; }

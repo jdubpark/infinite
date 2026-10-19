@@ -58,9 +58,14 @@ export const teamProjectSchema = z.object({
   establishChecks: z.literal(true).optional(),
   delivery: teamDeliverySchema.optional(),
   permissions: teamPermissionsSchema.optional(),
+  handoffMinutes: z.number().int().min(5).max(1440).optional(),
+  handoffExtendMinutes: z.number().int().min(0).max(240).optional(),
+  handoffMaxTotalMinutes: z.number().int().min(5).max(1440).optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
+  if (project.handoffMaxTotalMinutes !== undefined && project.handoffMaxTotalMinutes < (project.handoffMinutes ?? 60))
+    context.addIssue({ code: "custom", path: ["handoffMaxTotalMinutes"], message: "The handoff ceiling cannot be shorter than its time limit." });
 });
 export type TeamProject = z.infer<typeof teamProjectSchema>;
 export const teamVerificationSchema = z.object({
@@ -163,6 +168,10 @@ export const teamGoalContextSchema = z.object({
   sourceIssue: z.object({ id: z.uuid(), identifier: z.string().max(100), url: z.url(), title: z.string().max(1000), description: z.string().max(24000).nullable() }).strict().optional(),
   previousWork: z.array(z.string().trim().min(1).max(2000)).max(16),
   deadlineAt: z.iso.datetime(), maxMembers: z.number().int().min(1).max(60), parentRunId: z.uuid().optional(),
+  /** Owner-approved automatic extension; absent when the goal has no extension policy. */
+  extendMinutes: z.number().int().min(0).max(240).optional(), ceilingAt: z.iso.datetime().optional(),
+  /** Set only after an explicit owner extension to distinguish it from an unapproved deadline mismatch. */
+  ownerExtendedDeadlineAt: z.iso.datetime().optional(),
 }).strict();
 export type TeamGoalContext = z.infer<typeof teamGoalContextSchema>;
 export const teamEvidenceSchema = z.object({ source: z.string().trim().min(1).max(1000), observation: z.string().trim().min(1).max(2000) }).strict();
@@ -217,6 +226,12 @@ export interface TeamMember extends TeamAssignment {
   baseCommit: string;
   prompt: string;
   startedAt?: string;
+  /** The latest attention activity the host observed for this member while it had no report. */
+  lastActivityAt?: string;
+  /** A provider limit was observed but the member has not yet been switched or stopped. */
+  pendingLimit?: boolean;
+  /** Set when the member stopped for lack of activity; its replacement continues the same assignment. */
+  stalledAt?: string;
   report?: TeamReport;
   cursor: number;
   stopRequestId: string;

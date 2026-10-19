@@ -4,7 +4,8 @@ import { mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Config, Provider } from "./types.js";
-import type { Manager } from "./manager.js";
+import { TeamStopRefused, type Manager } from "./manager.js";
+import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamPermissionDecision, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
@@ -31,6 +32,7 @@ type Stored = {
   checkHead?: string;
   source?: { path: string; head?: string; startCommit?: string };
   handoffPolicy?: HandoffPolicy;
+  goalExtensions?: Record<string, { deadlineAt: string; ceilingAt: string }>;
 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const timestamp = () => new Date().toISOString();
@@ -43,7 +45,9 @@ const runEvent = (run: TeamRun, text: string) => {
   if (run.events.length > 300) run.events.splice(0, run.events.length - 300);
 };
 
+/** Written by hosts before stall detection; still resumable. */
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
+export const memberStallReason = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
 
 /**
  * The fallback for a member stopped at a provider limit. Its own provider counts as limited even when
@@ -53,7 +57,7 @@ export function switchFallback(lineup: TeamLineup, profileId: string, provider: 
   return resolveLimitFallback(lineup, profileId, new Set([...limited, provider]));
 }
 
-/** A one-hour member stop can replan. Interrupted workspace operations cannot. */
+/** A stalled or legacy one-hour member stop can replan. Interrupted workspace operations cannot. */
 export function blockedTeamCanResume(input: {
   status: string;
   reason?: string;
@@ -65,7 +69,7 @@ export function blockedTeamCanResume(input: {
   linearStatus?: string;
 }): boolean {
   return input.status === "blocked"
-    && input.reason === memberTimeLimitReason
+    && (input.reason === memberStallReason || input.reason === memberTimeLimitReason)
     && input.prepared
     && !input.pending
     && !input.deliveryAttempt
@@ -73,6 +77,8 @@ export function blockedTeamCanResume(input: {
     && !input.stopReason
     && input.linearStatus !== "blocked";
 }
+/** Milliseconds since the member last showed attention activity, or since it started before any was observed. */
+const quietFor = (member: TeamMember) => Date.now() - Date.parse(member.lastActivityAt ?? member.startedAt ?? timestamp());
 const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runId, memberId: member.memberId, revision: member.revision, role: member.role, ...(member.taskId ? { taskId: member.taskId } : {}) });
 
 /** Durable orchestration; reports describe agent claims, configured checks describe host evidence. */
@@ -450,10 +456,56 @@ export class TeamService {
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
   }
   close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const controller of this.commands.values()) controller.abort(); }
+  private stallWindow() { return (this.config.teams?.stallMinutes ?? 30) * 60000; }
+  /**
+   * Extends a deadline only under the owner's recorded policy, and only while an active member of this
+   * revision showed activity within the stall window. The extension never passes the policy's ceiling.
+   */
+  private extendDeadline(run: TeamRun, budget: TeamGoalContext | TeamHandoffContext) {
+    if (!budget.extendMinutes || !budget.ceilingAt) return false;
+    const ceiling = Date.parse(budget.ceilingAt);
+    if (Date.now() >= ceiling) return false;
+    const windowMs = this.stallWindow();
+    if (!run.members.some(member => member.revision === run.revision && member.status === "running" && !member.report && !member.pendingLimit && member.lastActivityAt && Date.now() - Date.parse(member.lastActivityAt) <= windowMs)) return false;
+    const requested = Math.max(Date.now(), Date.parse(budget.deadlineAt)) + budget.extendMinutes * 60000;
+    budget.deadlineAt = new Date(Math.min(requested, ceiling)).toISOString();
+    runEvent(run, `The time limit was extended by ${budget.extendMinutes} minutes under the approved extension policy (ceiling ${clock(budget.ceilingAt)}) because an agent showed activity within the ${this.config.teams?.stallMinutes ?? 30}-minute stall window.`);
+    const stored = this.records.get(run.id);
+    if (stored) this.save(stored);
+    return true;
+  }
+  /** Owner extensions reach the active goal team, so its own deadline check and the goal agree. */
+  goalExtension(teamId: string, requestId: string) {
+    const stored = this.record(teamId), receipt = stored.goalExtensions?.[requestId];
+    return receipt && { ...receipt, stopReason: stored.run.stopReason };
+  }
+  extendGoalTime(teamId: string, requestId: string, minutes: number, goalDeadlineAt: string, goalCeilingAt: string,
+    intent?: { deadlineAt: string; ceilingAt: string }) {
+    return this.enqueue(() => {
+      const stored = this.record(teamId);
+      const recorded = this.goalExtension(teamId, requestId);
+      if (recorded) return recorded;
+      if (!stored.run.goal) throw new TeamError(409, "not-a-goal-team", "This team does not belong to a goal.");
+      if (stored.run.stopReason && stored.run.stopReason !== "deadline") throw new TeamError(409, "team-stopped-at-limit", "The active team has already stopped at its member limit.");
+      const deadline = intent?.deadlineAt ?? new Date(Math.max(Date.now(), Date.parse(stored.run.goal.deadlineAt), Date.parse(goalDeadlineAt)) + minutes * 60000).toISOString();
+      const ceiling = intent?.ceilingAt ?? new Date(Math.max(Date.parse(stored.run.goal.ceilingAt ?? goalCeilingAt), Date.parse(goalCeilingAt), Date.parse(deadline))).toISOString();
+      const goal = { ...stored.run.goal };
+      goal.deadlineAt = new Date(Math.max(Date.parse(goal.deadlineAt), Date.parse(deadline))).toISOString();
+      goal.ceilingAt = new Date(Math.max(Date.parse(goal.ceilingAt ?? goalCeilingAt), Date.parse(ceiling), Date.parse(goal.deadlineAt))).toISOString();
+      goal.ownerExtendedDeadlineAt = goal.deadlineAt;
+      const receipt = { deadlineAt: goal.deadlineAt, ceilingAt: goal.ceilingAt };
+      const next = { ...stored, run: { ...stored.run, goal }, goalExtensions: { ...stored.goalExtensions, [requestId]: receipt } };
+      // Publish only after persistence: a failed write must not leave a replayable in-memory receipt.
+      this.save(next);
+      Object.assign(stored.run, next.run); stored.goalExtensions = next.goalExtensions;
+      return { ...receipt, stopReason: stored.run.stopReason };
+    });
+  }
   private assertBudget(run: TeamRun, addingMember = false) {
     const policy = this.records.get(run.id)?.handoffPolicy;
     if (policy) this.assertHandoffPolicy(policy);
-    if ((run.goal || run.handoff) && Date.now() >= Date.parse((run.goal ?? run.handoff)!.deadlineAt)) {
+    const budget = run.goal ?? run.handoff;
+    if (budget && Date.now() >= Date.parse(budget.deadlineAt) && !this.extendDeadline(run, budget)) {
       run.stopReason = "deadline";
       throw new TeamError(409, "goal-deadline", "The goal reached its deadline. Active work is being stopped and retained for inspection.");
     }
@@ -501,8 +553,8 @@ export class TeamService {
   }
   private async stopped(member: TeamMember) {
     const state = await this.manager.stopTeamSession(member.sessionId, member.stopRequestId, assignment(member));
-    if (state.status !== "exited") return false;
-    member.status = "stopped"; return true;
+    if (state.status !== "exited") return undefined;
+    member.status = "stopped"; return state;
   }
   private async stopObsoletePermissionCoordinators(stored: Stored) {
     const run = stored.run;
@@ -527,7 +579,7 @@ export class TeamService {
       }
       const wasUnavailable = member.status === "unavailable";
       let stopConfirmed = false;
-      try { stopConfirmed = await this.stopped(member); }
+      try { stopConfirmed = Boolean(await this.stopped(member)); }
       catch { /* Keep the member visible as unavailable until its process is confirmed stopped. */ }
       if (!stopConfirmed) {
         member.status = "unavailable";
@@ -549,6 +601,16 @@ export class TeamService {
         this.block(stored, new TeamError(409, "linear-issue-changed", tracking.reason ?? "The Linear issue no longer permits this work. Review its requirements before starting another team."));
       }
       const trackingReady = !tracking || tracking.status === "synced";
+      const budget = run.goal ?? run.handoff;
+      if (!stored.halt && budget?.extendMinutes && budget.ceilingAt && Date.now() >= Date.parse(budget.deadlineAt) && Date.now() < Date.parse(budget.ceilingAt)) {
+        for (const member of run.members.filter(item => item.revision === run.revision && item.status === "running" && !item.report)) {
+          const state = await this.manager.state(member.sessionId);
+          if (state.status !== "running") member.status = "unavailable";
+          member.lastActivityAt = state.attention.lastActivityAt;
+          member.pendingLimit = Boolean(state.attention.limit);
+        }
+        this.save(stored);
+      }
       if (!stored.halt && !["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) this.assertBudget(run);
       if (stored.halt) {
         let all = true;
@@ -586,27 +648,7 @@ export class TeamService {
             catch { member.status = "unavailable"; }
             this.event(stored, "The permission coordinator exceeded its review window; the request remains with the user."); this.save(stored); continue;
           }
-          if (member.startedAt && Date.now() - Date.parse(member.startedAt) > 60 * 60 * 1000) { this.block(stored, new TeamError(409, "member-time-limit", memberTimeLimitReason)); return; }
-          let page: ReturnType<Manager["events"]>, limit: LimitSwitch | undefined;
-          // A limit acts only on the whole journal: a report or recovery in an unread tail wins.
-          do {
-            page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
-            member.cursor = page.cursor;
-            for (const event of page.events) {
-              if (event.type === "signal") {
-                const data = event.data;
-                // Prefer a corroborated observation; a later successful turn means the member recovered.
-                if (switchesMember(data)) { if (!limit || (limit.confidence !== "corroborated" && data.confidence === "corroborated")) limit = { ...data, at: event.at, seq: event.seq }; }
-                else if (recoveryTurnEnd(data as unknown as SignalData) || (data.kind === "notice" && data.type === "quota_auto_resume_fired")) limit = undefined;
-                continue;
-              }
-              const parsed = teamReportEnvelopeSchema.safeParse(event.data);
-              if (!parsed.success) continue;
-              const envelope = parsed.data;
-              if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
-              member.report = envelope.report; member.status = "reported"; break;
-            }
-          } while (!member.report && limit && page.more);
+          const { page, limit } = this.readMemberJournal(run, member);
           if (!member.report && limit) {
             await this.switchLimitedMember(stored, member, limit);
             if (stored.pending || run.status === "blocked") return;
@@ -614,8 +656,16 @@ export class TeamService {
           }
           if (!member.report) {
             const state = await this.manager.state(member.sessionId);
+            member.lastActivityAt = state.attention.lastActivityAt;
+            member.pendingLimit = Boolean(state.attention.limit);
+            const journalDrained = !page.more && member.cursor >= state.seq;
             if (state.status === "exited" && (page.more || member.cursor < state.seq)) { this.save(stored); continue; }
             if (state.status === "exited") {
+              if (member.stalledAt && journalDrained) {
+                await this.replaceStalledMember(stored, member);
+                if (stored.pending || run.status === "blocked") return;
+                continue;
+              }
               member.status = "stopped";
               if (member.role === "permission-coordinator") {
                 const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
@@ -630,7 +680,13 @@ export class TeamService {
             if (["unavailable", "recording-error"].includes(state.status)) { member.status = "unavailable"; run.reason = runtimeUnavailableReason; }
             else if (state.attention.state === "needs-you") run.reason = providerInputReason;
             else member.status = "running";
-            this.save(stored); continue;
+            this.save(stored);
+            if (state.status === "running" && journalDrained && member.role !== "permission-coordinator" &&
+                (member.stalledAt || state.attention.state !== "needs-you" && !member.pendingLimit && quietFor(member) > this.stallWindow())) {
+              await this.replaceStalledMember(stored, member);
+              if (stored.pending || run.status === "blocked") return;
+            }
+            continue;
           }
           this.save(stored);
         }
@@ -911,6 +967,83 @@ export class TeamService {
     const instructions = prompt ?? teamPrompt(run, role, task, undefined, provider, modelProfile);
     if (Buffer.byteLength(instructions) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
     return { runId: run.id, memberId, revision: run.revision, role, provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, cursor: 0, stopRequestId: randomUUID() };
+  }
+  /**
+   * A limit acts only on the whole journal: a report or recovery in an unread tail wins.
+   * After a confirmed exit, drain the tail even without a limit before considering replacement.
+   */
+  private readMemberJournal(run: TeamRun, member: TeamMember, exited = false) {
+    let page: ReturnType<Manager["events"]>, limit: LimitSwitch | undefined;
+    do {
+      page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
+      member.cursor = page.cursor;
+      for (const event of page.events) {
+        if (event.type === "signal") {
+          const data = event.data;
+          // Prefer a corroborated observation; a later successful turn means the member recovered.
+          if (switchesMember(data)) { if (!limit || (limit.confidence !== "corroborated" && data.confidence === "corroborated")) limit = { ...data, at: event.at, seq: event.seq }; }
+          else if (recoveryTurnEnd(data as unknown as SignalData) || (data.kind === "notice" && data.type === "quota_auto_resume_fired")) limit = undefined;
+          continue;
+        }
+        const parsed = teamReportEnvelopeSchema.safeParse(event.data);
+        if (!parsed.success) continue;
+        const envelope = parsed.data;
+        if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
+        member.report = envelope.report; member.status = "reported"; member.stalledAt = undefined;
+        if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined;
+        break;
+      }
+    } while (!member.report && (exited || limit) && page.more);
+    return { page, limit };
+  }
+  /**
+   * Stops a member with no attention activity for the stall window and continues its assignment once in
+   * the same working copy. A second stall on the same assignment blocks the run for the owner.
+   */
+  private async replaceStalledMember(stored: Stored, member: TeamMember) {
+    const run = stored.run, minutes = this.stallWindow() / 60000;
+    const earlierStop = Boolean(member.stalledAt);
+    member.stalledAt ??= timestamp();
+    member.stoppedReason ??= `No activity for ${minutes} minutes`;
+    this.save(stored);
+    let exited;
+    try { exited = await this.stopped(member); if (!exited) { this.save(stored); return; } }
+    catch (error) {
+      // A preflight or lease refusal proves only this attempt sent nothing, not an earlier uncertain attempt.
+      const refused = error instanceof TeamStopRefused || error instanceof Error && ["control-busy", "control-lost"].includes((error as WorkerError).code ?? "");
+      if (refused && !earlierStop) {
+        member.stalledAt = undefined;
+        if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined;
+      }
+      member.status = "unavailable"; run.reason = "An agent could not be stopped. Release its input control or inspect its terminal before integration."; this.save(stored); return;
+    }
+    const { page, limit } = this.readMemberJournal(run, member, true);
+    if (member.report) { this.save(stored); return; }
+    if (page.more || member.cursor < exited.seq) { member.status = "unavailable"; this.save(stored); return; }
+    if (limit) {
+      member.stalledAt = undefined;
+      if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined;
+      await this.switchLimitedMember(stored, member, limit); return;
+    }
+    // A delivery member may already have published; a replacement must not repeat it unseen.
+    if (member.role === "delivery" && stored.deliveryAttempt) {
+      this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery agent stalled after a publication attempt. Inspect the remote branch and PR before replacing it.")); return;
+    }
+    if (run.members.some(item => item !== member && item.revision === member.revision && item.role === member.role && item.taskId === member.taskId && item.stalledAt)) {
+      this.block(stored, new TeamError(409, "member-stalled", memberStallReason)); return;
+    }
+    const task = member.role === "implementer" ? run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
+    if (member.role === "implementer" && !task) throw new TeamError(409, "invalid-task", "The implementer has no current task assignment.");
+    const scout = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
+    const prefix = this.config.teams?.commandPrefix, editing = member.role === "implementer" || member.role === "integrator";
+    const note = `The previous ${member.role} stalled with no activity for ${minutes} minutes before reporting. Its workspace was preserved. ${editing ? "Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing." : "Its working copy was checked unchanged; complete the same assignment."}`;
+    this.operation(stored, "result", signal => editing ? assertMemberScope(member.cwd, member.baseCommit, task ? task.paths : run.goal?.allowedPaths, prefix, signal) : assertMemberReadOnly(member.cwd, member.baseCommit, prefix, signal), () => {
+      const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, `${member.prompt}\n\n${note}`, member.modelProfile);
+      if (task) { task.memberId = next.memberId; task.status = "running"; }
+      if (scout) scout.memberId = next.memberId;
+      run.members.push(next);
+      this.event(stored, `${member.title} stalled with no activity for ${minutes} minutes; its workspace was preserved and a replacement continues the assignment.`);
+    });
   }
   /**
    * Stops a member whose provider hit a limit and continues its assignment on the profile's limit

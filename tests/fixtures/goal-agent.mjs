@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const [scenario, receipts, provider] = process.argv.slice(2);
+if (scenario === "goal-slow-stop") process.on("SIGTERM", () => setTimeout(() => process.exit(0), 2000));
+const cycleScenario = scenario === "cycles" || scenario === "goal-slow-stop";
 const assignment = JSON.parse(process.env.INFINITE_TEAM_ASSIGNMENT ?? "null");
 if (!assignment || !process.env.INFINITE_HOOK_URL || !process.env.INFINITE_HOOK_TOKEN)
   throw new Error("A goal member needs its worker's report capability");
@@ -39,7 +41,7 @@ async function until(ready) {
 
 async function main() {
   if (assignment.role === "project-manager") {
-    if (scenario === "cycles" && progress.completed === 0)
+    if (cycleScenario && progress.completed === 0)
       await until(() => existsSync(join(receipts, "release-first-plan")));
     if (scenario === "no-change") {
       await report({ kind: "no-change", summary: "The available evidence does not justify another change",
@@ -47,7 +49,7 @@ async function main() {
       return;
     }
     const discovery = join(receipts, `${assignment.runId}.discovery-requested`);
-    if (scenario === "cycles" && progress.completed === 0 && !existsSync(discovery)) {
+    if (cycleScenario && progress.completed === 0 && !existsSync(discovery)) {
       writeFileSync(discovery, "requested", { mode: 0o600 });
       await report({ kind: "explore", summary: "Inspect the data and its verification before planning", tasks: [
         { id: "data", title: "Inspect progress data", instructions: "Read the progress file and report its current value", agentProfileId: "light" },
@@ -55,7 +57,7 @@ async function main() {
       ] });
       return;
     }
-    if (scenario === "cycles" && progress.completed === 0
+    if (cycleScenario && progress.completed === 0
       && (!prompt.includes("progress starts at 0") || !prompt.includes("check.mjs validates progress")))
       throw new Error("The planning coordinator did not receive the scouts' recorded evidence");
     const target = progress.completed + 1;
@@ -82,12 +84,12 @@ async function main() {
     if (scenario === "bootstrap-goal" && progress.completed === 0)
       await until(() => existsSync(join(receipts, "release-first-implementation")));
     const model = process.argv[process.argv.indexOf("--model") + 1];
-    if (scenario === "cycles" && progress.completed === 0 && model !== "gpt-6-astra") {
+    if (cycleScenario && progress.completed === 0 && model !== "gpt-6-astra") {
       writeFileSync("features/progress.json", JSON.stringify({ completed: 0, draft: "Step prepared by the light worker" }) + "\n");
       await report({ kind: "escalate", agentProfileId: "strong", reason: "The partial step needs stronger reasoning; inspect the existing draft" });
       return;
     }
-    if (scenario === "cycles" && progress.completed === 0 && !progress.draft)
+    if (cycleScenario && progress.completed === 0 && !progress.draft)
       throw new Error("Escalation discarded the first worker's partial edit");
     writeFileSync("features/progress.json", JSON.stringify({ completed: progress.completed + 1 }) + "\n");
     await report({ kind: "result", summary: "Implemented the next scoped progress step" });

@@ -3,12 +3,15 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { startHost, waitFor, type Host } from "./helpers.js";
-import type { CreateGoal, ProductGoal } from "../packages/host/src/goal-types.js";
+import { createGoalSchema, type CreateGoal, type ProductGoal } from "../packages/host/src/goal-types.js";
 import type { TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { startLinearServer } from "./fixtures/linear-server.js";
+import { schedulerFixture } from "./fixtures/team-scheduler.js";
+import { GoalService } from "../packages/host/src/goals.js";
+import { TeamError } from "../packages/host/src/teams.js";
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const lineup: TeamLineup = {
@@ -376,6 +379,371 @@ test("goal pause and cancellation survive restart without allowing child control
     assert.equal((await f.team(child.id)).members.length, 1);
     assert.equal((await f.host.fetchApi(`/goals/${request.requestId}/resume`, "owner", { requestId: randomUUID(), revision: repeated.body.revision })).status, 409);
     assert.equal(git(f.source, "rev-parse", "HEAD"), f.base);
+  } finally { await f.close(); }
+});
+
+test("goal time ceilings must cover the time limit, and extensions default off", () => {
+  const base = { requestId: randomUUID(), projectId: "rehearsal", title: "Improve", objective: "Improve progress", successCriteria: "Progress moves", allowedPaths: ["features"], maxMinutes: 60 };
+  assert.throws(() => createGoalSchema.parse({ ...base, maxTotalMinutes: 30 }), /ceiling cannot be shorter/);
+  const plain = createGoalSchema.parse(base);
+  assert.equal(plain.extendMinutes, undefined);
+  assert.equal("extendMinutes" in plain, false, "Legacy parsed requests keep their original fingerprint shape");
+  assert.equal(plain.maxTotalMinutes, undefined);
+  assert.equal(createGoalSchema.parse({ ...base, maxTotalMinutes: 60, extendMinutes: 15 }).extendMinutes, 15);
+  assert.throws(() => createGoalSchema.parse({ ...base, extendMinutes: 241 }));
+});
+
+test("a legacy create fingerprint replays when extendMinutes is omitted", { timeout: 60000 }, async () => {
+  const f = await fixture("cycles");
+  try {
+    const request = f.create(), created = await f.host.fetchApi("/goals", "owner", request);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    await f.host.stopApi();
+    const key = readFileSync(f.host.config.keyFile), scope = `goal:${request.requestId}`;
+    const file = join(f.host.config.stateDir, "goals", `${request.requestId}.sealed`);
+    const stored = unseal<{ fingerprint: string }>(key, scope, readFileSync(file, "utf8"));
+    stored.fingerprint = createHash("sha256").update(JSON.stringify(createGoalSchema.parse(request))).digest("hex");
+    writeSealed(file, key, scope, stored);
+    await f.host.start();
+    const replay = await f.host.fetchApi("/goals", "owner", request);
+    assert.equal(replay.status, 200, JSON.stringify(replay.body));
+    assert.equal(replay.body.id, request.requestId);
+  } finally { await f.close(); }
+});
+
+test("an extension policy extends an active goal only while its team shows activity, stops at the ceiling, and an owner can extend a stopped goal", { timeout: 180000 }, async () => {
+  const f = await fixture("cycles");
+  try {
+    const request = { ...f.create(), maxMinutes: 5, extendMinutes: 5, maxTotalMinutes: 60 };
+    const created = await f.host.fetchApi("/goals", "owner", request);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const held = await f.held(request.requestId), child = held.team!;
+    const key = readFileSync(f.host.config.keyFile);
+    const goalScope = `goal:${request.requestId}`, goalFile = join(f.host.config.stateDir, "goals", `${request.requestId}.sealed`);
+    const teamScope = `team:${child.id}`, teamFile = join(f.host.config.stateDir, "teams", `${child.id}.sealed`);
+    // Recreate a team deadline that auto-extended before GoalService mirrored it.
+    await f.host.stopApi();
+    const priorGoal = unseal<{ goal: ProductGoal }>(key, goalScope, readFileSync(goalFile, "utf8"));
+    const priorTeam = unseal<{ run: { goal: { deadlineAt: string; ceilingAt?: string } } }>(key, teamScope, readFileSync(teamFile, "utf8"));
+    const goalDeadline = new Date(Date.now() + 10 * 60000).toISOString();
+    const teamDeadline = new Date(Date.now() + 20 * 60000).toISOString();
+    const teamCeiling = new Date(Date.now() + 60 * 60000).toISOString();
+    priorGoal.goal.deadlineAt = goalDeadline; priorGoal.goal.ceilingAt = teamCeiling;
+    priorTeam.run.goal.deadlineAt = teamDeadline; priorTeam.run.goal.ceilingAt = teamCeiling;
+    writeSealed(goalFile, key, goalScope, priorGoal); writeSealed(teamFile, key, teamScope, priorTeam);
+    await f.host.start();
+    const manual = { requestId: randomUUID(), revision: created.body.revision, minutes: 30 };
+    const manualExtension = await f.host.fetchApi(`/goals/${request.requestId}/extend`, "owner", manual);
+    assert.equal(manualExtension.status, 200, JSON.stringify(manualExtension.body));
+    const extendedTeam = await f.team(child.id);
+    assert.ok(Date.parse(manualExtension.body.deadlineAt) >= Date.parse(teamDeadline) + 30 * 60000, "Owner time starts after the later team deadline");
+    assert.equal(manualExtension.body.deadlineAt, extendedTeam.goal!.deadlineAt, "Goal and team retain the same effective extension");
+    // Move both saved deadlines into the past while the held member is still running.
+    const expire = async (ceilingAt?: string) => {
+      await f.host.stopApi();
+      const past = new Date(Date.now() - 1000).toISOString();
+      const storedGoal = unseal<{ goal: ProductGoal }>(key, goalScope, readFileSync(goalFile, "utf8"));
+      storedGoal.goal.deadlineAt = past; if (ceilingAt) storedGoal.goal.ceilingAt = ceilingAt;
+      writeSealed(goalFile, key, goalScope, storedGoal);
+      const storedTeam = unseal<{ run: { goal: { deadlineAt: string; ceilingAt?: string } } }>(key, teamScope, readFileSync(teamFile, "utf8"));
+      storedTeam.run.goal.deadlineAt = past; if (ceilingAt) storedTeam.run.goal.ceilingAt = ceilingAt;
+      writeSealed(teamFile, key, teamScope, storedTeam);
+      await f.host.start();
+    };
+    await expire();
+    const extended = await waitFor(() => f.team(child.id), run => Date.parse(run.goal!.deadlineAt) > Date.now(), 30000);
+    assert.notEqual(extended.status, "blocked", JSON.stringify(extended));
+    assert.ok(extended.events.some(event => event.text.includes("extension policy")), JSON.stringify(extended.events));
+    const following = await waitFor(() => f.goal(request.requestId), value => value.status === "running" && value.deadlineAt === extended.goal!.deadlineAt, 30000);
+    assert.ok(following.events.some(event => event.text.includes("extended the time limit")), "The goal must record the team's extension");
+
+    // A non-owner cannot extend, even a stopped goal.
+    await expire(new Date(Date.now() - 1000).toISOString());
+    const stopped = await f.settled(request.requestId);
+    assert.equal(stopped.status, "limit-reached", JSON.stringify(stopped));
+    assert.equal(stopped.stopReason, "deadline");
+    // A team-origin deadline may leave a different display reason; structured state governs eligibility.
+    await f.host.stopApi();
+    const stoppedRecord = unseal<{ goal: ProductGoal }>(key, goalScope, readFileSync(goalFile, "utf8"));
+    stoppedRecord.goal.reason = "The active team reached its deadline.";
+    writeSealed(goalFile, key, goalScope, stoppedRecord);
+    const lastTeamId = stopped.cycles.at(-1)!.teamId, lastTeamScope = `team:${lastTeamId}`;
+    const lastTeamFile = join(f.host.config.stateDir, "teams", `${lastTeamId}.sealed`);
+    const stoppedTeam = unseal<{ run: { stopReason?: string } }>(key, lastTeamScope, readFileSync(lastTeamFile, "utf8"));
+    stoppedTeam.run.stopReason = "deadline";
+    writeSealed(lastTeamFile, key, lastTeamScope, stoppedTeam);
+    await f.host.start();
+    const body = { requestId: randomUUID(), revision: stopped.revision, minutes: 30 };
+    assert.equal((await f.host.fetchApi(`/goals/${request.requestId}/extend`, "controller", body)).status, 403);
+    const owner = await f.host.fetchApi(`/goals/${request.requestId}/extend`, "owner", body);
+    assert.equal(owner.status, 200, JSON.stringify(owner.body));
+    assert.equal(owner.body.status, "running");
+    assert.ok(Date.parse(owner.body.deadlineAt) > Date.now());
+    assert.ok(Date.parse(owner.body.ceilingAt) >= Date.parse(owner.body.deadlineAt), "The owner extension must raise the ceiling to cover the new deadline");
+    assert.ok(owner.body.events.some(event => event.text === "The owner extended the time limit by 30 minutes."));
+    const replay = await f.host.fetchApi(`/goals/${request.requestId}/extend`, "owner", body);
+    assert.equal(replay.status, 200, "An identical extension retry is acknowledged without a second extension");
+    assert.equal(replay.body.revision, owner.body.revision);
+  } finally { await f.close(); }
+});
+
+test("a deadline-stopped child resumes the goal in a new cycle after an owner extends during shutdown", { timeout: 120000 }, async () => {
+  const f = await fixture("goal-slow-stop");
+  try {
+    const request = f.create(), created = await f.host.fetchApi("/goals", "owner", request);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const held = await f.held(request.requestId), child = held.team!;
+    const key = readFileSync(f.host.config.keyFile), goalScope = `goal:${request.requestId}`, teamScope = `team:${child.id}`;
+    const goalFile = join(f.host.config.stateDir, "goals", `${request.requestId}.sealed`), teamFile = join(f.host.config.stateDir, "teams", `${child.id}.sealed`);
+    await f.host.stopApi();
+    const storedGoal = unseal<{ goal: ProductGoal }>(key, goalScope, readFileSync(goalFile, "utf8"));
+    const storedTeam = unseal<{ run: { status: string; reason?: string; goal: { deadlineAt: string; ceilingAt?: string } }; halt?: string }>(key, teamScope, readFileSync(teamFile, "utf8"));
+    storedGoal.goal.deadlineAt = new Date(Date.now() - 1000).toISOString();
+    storedGoal.goal.status = "limit-reached"; storedGoal.goal.stopReason = "deadline"; storedGoal.goal.deadlineContinuation = true;
+    storedGoal.goal.reason = "The approved time limit has expired.";
+    storedTeam.run.status = "cancelled"; storedTeam.run.reason = "The goal reached its deadline."; storedTeam.halt = "cancel";
+    storedTeam.run.goal.deadlineAt = storedGoal.goal.deadlineAt;
+    writeSealed(goalFile, key, goalScope, storedGoal); writeSealed(teamFile, key, teamScope, storedTeam);
+    await f.host.start();
+    const stopping = await waitFor(() => f.goal(request.requestId), value => value.status === "limit-reached" && value.activeTeamId === child.id, 15000);
+    assert.equal(stopping.stopReason, "deadline");
+    const action = { requestId: randomUUID(), revision: stopping.revision, minutes: 30 };
+    const extended = await f.host.fetchApi(`/goals/${request.requestId}/extend`, "owner", action);
+    assert.equal(extended.status, 200, JSON.stringify(extended.body));
+    assert.equal(extended.body.status, "running");
+    assert.equal(extended.body.deadlineContinuation, true);
+    const continued = await waitFor(() => f.goal(request.requestId), value => value.cycles.length === 2 && value.activeTeamId !== child.id, 30000);
+    assert.equal(continued.cycles[0].teamId, child.id);
+    assert.ok(continued.activeTeamId, "A fresh team cycle replaces the cancelled child");
+  } finally { await f.close(); }
+});
+
+test("paused goals mirror a later team deadline before checking expiry", { timeout: 90000 }, async () => {
+  const f = await fixture("cycles");
+  try {
+    const request = f.create(), created = await f.host.fetchApi("/goals", "owner", request);
+    const held = await f.held(request.requestId), child = held.team!;
+    const pause = await f.host.fetchApi(`/goals/${request.requestId}/pause`, "owner", { requestId: randomUUID(), revision: created.body.revision });
+    assert.equal(pause.status, 200, JSON.stringify(pause.body));
+    await waitFor(async () => ({ goal: await f.goal(request.requestId), team: await f.team(child.id) }), value => value.goal.status === "paused" && value.team.status === "paused", 15000);
+    const key = readFileSync(f.host.config.keyFile), goalScope = `goal:${request.requestId}`, teamScope = `team:${child.id}`;
+    const goalFile = join(f.host.config.stateDir, "goals", `${request.requestId}.sealed`), teamFile = join(f.host.config.stateDir, "teams", `${child.id}.sealed`);
+    await f.host.stopApi();
+    const storedGoal = unseal<{ goal: ProductGoal }>(key, goalScope, readFileSync(goalFile, "utf8"));
+    const storedTeam = unseal<{ run: { goal: { deadlineAt: string; ceilingAt?: string; extendMinutes?: number } } }>(key, teamScope, readFileSync(teamFile, "utf8"));
+    storedGoal.goal.deadlineAt = new Date(Date.now() - 1000).toISOString();
+    storedGoal.goal.extendMinutes = 5;
+    const teamDeadline = new Date(Date.now() + 20 * 60000).toISOString(), ceilingAt = new Date(Date.now() + 60 * 60000).toISOString();
+    storedGoal.goal.ceilingAt = ceilingAt;
+    storedTeam.run.goal.deadlineAt = teamDeadline; storedTeam.run.goal.extendMinutes = 5; storedTeam.run.goal.ceilingAt = ceilingAt;
+    writeSealed(goalFile, key, goalScope, storedGoal); writeSealed(teamFile, key, teamScope, storedTeam);
+    await f.host.start();
+    const mirrored = await waitFor(() => f.goal(request.requestId), value => Date.parse(value.deadlineAt) > Date.now(), 15000);
+    assert.equal(mirrored.status, "paused");
+    assert.equal(mirrored.deadlineAt, teamDeadline);
+    assert.equal((await f.team(child.id)).status, "paused", "Expiry must not cancel the later-deadline paused team");
+  } finally { await f.close(); }
+});
+
+function extensionFixture() {
+  const f = schedulerFixture(), at = new Date().toISOString();
+  const goal: ProductGoal = { id: randomUUID(), projectId: f.run.projectId, title: "Inspect the fixture", objective: "Choose scoped work",
+    successCriteria: "The owner has evidence", nonGoals: [], allowedPaths: ["."], evidence: [], maxRuns: 2, maxMinutes: 60,
+    maxMembers: 4, parallelism: 1, revision: 1, status: "running", createdAt: at, updatedAt: at,
+    deadlineAt: new Date(Date.now() + 60 * 60000).toISOString(), lineup, activeTeamId: f.run.id, memberCount: 1,
+    cycles: [{ teamId: f.run.id, cycle: 1, goalRevision: 1, status: "planning", startedAt: at, memberCount: 1 }],
+    steering: [], events: [], outcomes: [] };
+  f.run.goal = { id: goal.id, revision: 1, cycle: 1, successCriteria: goal.successCriteria, nonGoals: [], allowedPaths: ["."], evidence: [], previousWork: [], deadlineAt: goal.deadlineAt, maxMembers: 1 };
+  const request = { requestId: randomUUID(), revision: 1, minutes: 30 };
+  const intent = { ...request, fingerprint: createHash("sha256").update(JSON.stringify({ action: "extend", ...request })).digest("hex"), teamId: f.run.id };
+  return { ...f, goal, request, intent,
+    writeGoal: (extra: object = {}) => f.writeRecord("goal", goal.id, { goal, receipts: {}, fingerprint: "fixture", ...extra }),
+  };
+}
+
+for (const recovering of [false, true])
+test(`a member-limit extension rejection ${recovering ? "during recovery" : "reaches its caller and"} cannot strand a cancelled goal`, async () => {
+  const f = extensionFixture();
+  let goals: GoalService | undefined;
+  try {
+    // The child stopped before the goal reflected the member limit.
+    f.run.status = "blocked"; f.run.stopReason = "member-limit"; f.run.members[0].status = "stopped";
+    f.writeTeam(); f.writeGoal(recovering ? { extensionIntent: f.intent } : {});
+    const teams = f.openTeam();
+    goals = new GoalService(f.config, f.key, teams);
+    if (!recovering) {
+      await assert.rejects(goals.extend(f.goal.id, f.request), (error: unknown) => error instanceof TeamError && error.code === "team-stopped-at-limit");
+      assert.equal(f.readRecord<{ extensionIntent?: unknown }>("goal", f.goal.id).extensionIntent, undefined);
+    }
+    await goals.cancel(f.goal.id, { requestId: randomUUID(), revision: 1 });
+    goals.start();
+    const reconciled = await waitFor(async () => goals!.get(f.goal.id), goal => !goal.activeTeamId);
+    assert.equal(reconciled.status, "cancelled");
+    assert.equal(reconciled.cycles[0].status, "blocked");
+    assert.ok(reconciled.events.some(event => /extension.*rejected/i.test(event.text)));
+    if (!recovering) assert.ok(reconciled.events.some(event => /extension.*member limit/i.test(event.text)));
+    assert.equal(f.readRecord<{ extensionIntent?: unknown }>("goal", f.goal.id).extensionIntent, undefined);
+  } finally { goals?.close(); f.close(); }
+});
+
+test("an applied extension receipt replays after the child reaches its member limit", async () => {
+  const f = extensionFixture();
+  let goals: GoalService | undefined;
+  try {
+    f.writeTeam(); f.writeGoal({ extensionIntent: f.intent });
+    const teams = f.openTeam();
+    const receipt = await teams.extendGoalTime(f.run.id, f.request.requestId, f.request.minutes, f.goal.deadlineAt, f.goal.deadlineAt);
+    teams.close();
+    // Crash after the real team receipt was saved but before the goal acknowledged it.
+    const stored = f.readRecord<{ run: TeamView }>("team", f.run.id);
+    stored.run.status = "blocked"; stored.run.stopReason = "member-limit"; stored.run.members[0].status = "stopped";
+    f.writeRecord("team", f.run.id, stored);
+    const restored = f.openTeam();
+    goals = new GoalService(f.config, f.key, restored); goals.start();
+    const recovered = await waitFor(async () => goals!.get(f.goal.id), goal => goal.revision === 2 && !goal.activeTeamId);
+    assert.equal(recovered.status, "limit-reached");
+    assert.equal(recovered.deadlineAt, receipt.deadlineAt);
+    assert.equal(restored.get(f.run.id).goal!.deadlineAt, receipt.deadlineAt);
+    const replay = await goals.extend(f.goal.id, f.request);
+    assert.equal(replay.deadlineAt, receipt.deadlineAt);
+    assert.equal(replay.events.filter(event => event.text === "The owner extended the time limit by 30 minutes.").length, 1);
+  } finally { goals?.close(); f.close(); }
+});
+
+for (const failedWrite of ["team", "goal"] as const)
+test(`an extension cannot acknowledge an unpersisted ${failedWrite} receipt after a failed save`, async t => {
+  const f = extensionFixture();
+  let goals: GoalService | undefined, unblock: (() => void) | undefined;
+  try {
+    f.writeTeam(); f.writeGoal();
+    const teams = f.openTeam(), extend = teams.extendGoalTime.bind(teams);
+    const interrupted = failedWrite === "goal" ? t.mock.method(teams, "extendGoalTime", async (...args: Parameters<typeof extend>) => {
+      const result = await extend(...args);
+      unblock = f.blockRecordWrites("goal", f.goal.id);
+      return result;
+    }) : undefined;
+    if (failedWrite === "team") unblock = f.blockRecordWrites("team", f.run.id);
+    goals = new GoalService(f.config, f.key, teams);
+    await assert.rejects(goals.extend(f.goal.id, f.request));
+    unblock!(); unblock = undefined; interrupted?.mock.restore();
+    const retried = await goals.extend(f.goal.id, f.request);
+    assert.ok(Date.parse(retried.deadlineAt) > Date.parse(f.goal.deadlineAt));
+    const durableTeam = f.readRecord<{ run: TeamView }>("team", f.run.id);
+    const durableGoal = f.readRecord<{ goal: ProductGoal; receipts: Record<string, string>; extensionIntent?: unknown }>("goal", f.goal.id);
+    assert.equal(durableTeam.run.goal!.deadlineAt, retried.deadlineAt, "A successful retry must survive a team restart");
+    assert.equal(durableGoal.goal.deadlineAt, retried.deadlineAt, "A successful retry must survive a goal restart");
+    assert.equal(durableGoal.receipts[f.request.requestId], f.intent.fingerprint);
+    assert.equal(durableGoal.extensionIntent, undefined);
+  } finally { unblock?.(); goals?.close(); f.close(); }
+});
+
+for (const action of ["pause", "steer", "cancel"] as const)
+for (const applied of [false, true])
+test(`extension recovery after ${action} ${applied ? "reconciles an applied receipt" : "rejects unapplied stale work"}`, async t => {
+  const f = extensionFixture();
+  let goals: GoalService | undefined;
+  try {
+    f.writeTeam(); f.writeGoal();
+    const teams = f.openTeam(), extend = teams.extendGoalTime.bind(teams);
+    const interrupted = t.mock.method(teams, "extendGoalTime", async (...args: Parameters<typeof extend>) => {
+      if (applied) await extend(...args);
+      throw new Error("Extension acknowledgement interrupted");
+    });
+    goals = new GoalService(f.config, f.key, teams);
+    await assert.rejects(goals.extend(f.goal.id, f.request), /interrupted/);
+    interrupted.mock.restore();
+    const control = { requestId: randomUUID(), revision: 1, text: "Keep the existing scope" };
+    if (action === "steer") await goals.steer(f.goal.id, control);
+    else await goals[action](f.goal.id, { requestId: control.requestId, revision: control.revision });
+    goals.start();
+    await waitFor(async () => f.readRecord<{ extensionIntent?: unknown; control?: unknown }>("goal", f.goal.id), stored => !stored.extensionIntent && !stored.control);
+    const current = goals.get(f.goal.id), child = teams.get(f.run.id);
+    assert.equal(current.status, action === "pause" ? "paused" : action === "cancel" ? "cancelled" : "running");
+    assert.equal(current.deadlineAt, child.goal!.deadlineAt);
+    if (applied) {
+      const replay = await goals.extend(f.goal.id, f.request);
+      assert.ok(Date.parse(replay.deadlineAt) > Date.parse(f.goal.deadlineAt));
+      assert.equal(replay.revision, 3, "Record the applied extension without overwriting the newer control");
+      assert.equal(replay.events.filter(event => event.text === "The owner extended the time limit by 30 minutes.").length, 1);
+    } else {
+      assert.equal(current.deadlineAt, f.goal.deadlineAt, "A newer owner action must prevent a stale extension side effect");
+      assert.equal(current.revision, 2);
+      assert.ok(current.events.some(event => /extension.*(rejected|abandoned)/i.test(event.text)));
+    }
+  } finally { goals?.close(); f.close(); }
+});
+
+test("transient extension recovery reports one failure, later recovers, and permits cancellation", async t => {
+  const f = extensionFixture();
+  let goals: GoalService | undefined;
+  try {
+    f.writeTeam(); f.writeGoal();
+    const teams = f.openTeam();
+    const attempts = t.mock.method(teams, "extendGoalTime", async () => { throw new Error("Team storage temporarily unavailable"); });
+    goals = new GoalService(f.config, f.key, teams);
+    await assert.rejects(goals.extend(f.goal.id, f.request), /temporarily unavailable/);
+    goals.start();
+    await waitFor(async () => attempts.mock.callCount(), count => count >= 2);
+    attempts.mock.restore();
+    const recovered = await waitFor(async () => goals!.get(f.goal.id), goal => goal.revision === 2);
+    assert.equal(recovered.events.filter(event => /time extension.*retry/i.test(event.text)).length, 1);
+    assert.ok(recovered.events.some(event => /time extension.*recovered/i.test(event.text)));
+    assert.equal(teams.get(f.run.id).goal!.deadlineAt, recovered.deadlineAt);
+    assert.equal((await goals.extend(f.goal.id, f.request)).revision, 2);
+    await goals.cancel(f.goal.id, { requestId: randomUUID(), revision: 2 });
+    teams.start();
+    const cancelled = await waitFor(async () => goals!.get(f.goal.id), goal => !goal.activeTeamId);
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(teams.get(f.run.id).status, "cancelled");
+    assert.equal(f.readRecord<{ extensionIntent?: unknown }>("goal", f.goal.id).extensionIntent, undefined);
+  } finally { goals?.close(); f.close(); }
+});
+
+test("persistent extension recovery is visible, bounded across restart, and releases the extension gate", async t => {
+  const f = extensionFixture();
+  let goals: GoalService | undefined;
+  try {
+    f.writeTeam(); f.writeGoal();
+    const teams = f.openTeam();
+    const attempts = t.mock.method(teams, "extendGoalTime", async () => { throw new Error("Team storage temporarily unavailable"); });
+    goals = new GoalService(f.config, f.key, teams);
+    for (let attempt = 0; attempt < 2; attempt++) await assert.rejects(goals.extend(f.goal.id, f.request), /temporarily unavailable/);
+    assert.equal(goals.get(f.goal.id).events.filter(event => /time extension.*retry/i.test(event.text)).length, 1);
+    goals.close(); goals = new GoalService(f.config, f.key, teams); goals.start();
+    await waitFor(async () => f.readRecord<{ extensionIntent?: unknown }>("goal", f.goal.id), stored => !stored.extensionIntent);
+    assert.equal(attempts.mock.callCount(), 3, "A restart must not reset the three-failure recovery budget");
+    const abandoned = goals.get(f.goal.id);
+    assert.ok(abandoned.events.some(event => /extension.*abandoned.*3/i.test(event.text)));
+    assert.equal(abandoned.deadlineAt, f.goal.deadlineAt);
+    attempts.mock.restore();
+    const retried = await goals.extend(f.goal.id, { ...f.request, requestId: randomUUID() });
+    assert.ok(Date.parse(retried.deadlineAt) > Date.parse(f.goal.deadlineAt));
+  } finally { goals?.close(); f.close(); }
+});
+
+test("a saved extension intent reapplies the same target after a restart", { timeout: 90000 }, async () => {
+  const f = await fixture("cycles");
+  try {
+    const request = f.create(), created = await f.host.fetchApi("/goals", "owner", request);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const held = await f.held(request.requestId), child = held.team!;
+    const key = readFileSync(f.host.config.keyFile), goalScope = `goal:${request.requestId}`;
+    const goalFile = join(f.host.config.stateDir, "goals", `${request.requestId}.sealed`);
+    await f.host.stopApi();
+    const stored = unseal<{ goal: ProductGoal; extensionIntent?: Record<string, unknown> }>(key, goalScope, readFileSync(goalFile, "utf8"));
+    const body = { requestId: randomUUID(), revision: created.body.revision, minutes: 30 };
+    const fingerprint = createHash("sha256").update(JSON.stringify({ action: "extend", ...body })).digest("hex");
+    const targetDeadlineAt = new Date(Date.now() + 30 * 60000).toISOString();
+    stored.extensionIntent = { ...body, fingerprint, teamId: child.id, targetDeadlineAt, targetCeilingAt: targetDeadlineAt };
+    writeSealed(goalFile, key, goalScope, stored);
+    await f.host.start();
+    const recovered = await waitFor(() => f.goal(request.requestId), value => value.events.some(event => event.text === "The owner extended the time limit by 30 minutes."), 15000);
+    assert.equal(recovered.deadlineAt, targetDeadlineAt);
+    const replay = await f.host.fetchApi(`/goals/${request.requestId}/extend`, "owner", body);
+    assert.equal(replay.status, 200, JSON.stringify(replay.body));
+    assert.equal(replay.body.deadlineAt, targetDeadlineAt, "Retry uses the persisted target instead of adding minutes again");
+    assert.equal(replay.body.revision, recovered.revision);
+    assert.equal((await f.team(child.id)).goal!.deadlineAt, targetDeadlineAt);
   } finally { await f.close(); }
 });
 

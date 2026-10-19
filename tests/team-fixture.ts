@@ -33,7 +33,7 @@ export const limitLineup: TeamLineup = {
 };
 
 /** `trustWorkspaces` also gives the host its own HOME, where a Claude member's trust is recorded. */
-export async function fixture(scenario = "success", lineup?: TeamLineup, config: Partial<Config> = {}, options: { trustWorkspaces?: boolean } = {}) {
+export async function fixture(scenario = "success", lineup?: TeamLineup, config: Partial<Config> = {}, options: { trustWorkspaces?: boolean; env?: NodeJS.ProcessEnv } = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-team-"));
   const home = join(root, "home");
   if (options.trustWorkspaces) mkdirSync(home, { mode: 0o700 });
@@ -78,9 +78,6 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
         } : {}),
       },
       config: {
-        teams: { workspaceDir: join(root, "teams"), ...(lineup ? { lineup } : {}), ...(options.trustWorkspaces ? { trustWorkspaces: true } : {}), ...(scenario === "success" ? {
-          commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },
-        } : {}) },
         remote: { enabled: true },
         projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
           team: { ...(scenario.startsWith("delivery") ? { delivery: { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}), ...(scenario.startsWith("permissions") ? { setup: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--permission-setup", receipts] } } : {}), ...(scenario.startsWith("permissions") && scenario !== "permissions-off" ? { permissions: { mode: "coordinator" as const, scope: "Approve only read access needed to inspect this project for the stated objective.", maxDecisions: 2 } } : {}), checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
@@ -88,8 +85,12 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
             ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
           ] }) } }],
         ...config,
+        teams: { workspaceDir: join(root, "teams"), ...(lineup ? { lineup } : {}), ...(options.trustWorkspaces ? { trustWorkspaces: true } : {}), ...(scenario === "success" ? {
+          commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },
+        } : {}), ...config.teams },
       },
       ...(options.trustWorkspaces ? { env: { HOME: home } } : {}),
+      ...(options.env ? { env: { ...(options.trustWorkspaces ? { HOME: home } : {}), ...options.env } } : {}),
     });
   } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
   const create = (): CreateTeam => ({ requestId: randomUUID(), projectId: "rehearsal", provider: lineup?.coordinator.provider ?? "demo",

@@ -119,7 +119,8 @@ export class HandoffService {
       record.status = "creating"; this.save(record);
       await this.teams.createForHandoff({ requestId: record.teamId, projectId: record.projectId, provider: record.policy.lineup.coordinator.provider,
         title: this.manager.meta(record.sessionId).session.title.slice(0, 100), objective, parallelism: record.request.parallelism },
-        { sourceSessionId: record.sessionId, checkpointHead: record.request.checkpointHead, deadlineAt: record.deadlineAt, maxMembers: record.policy.maxMembers, project: record.policy.project }, record.policy);
+        { sourceSessionId: record.sessionId, checkpointHead: record.request.checkpointHead, deadlineAt: record.deadlineAt, maxMembers: record.policy.maxMembers, project: record.policy.project,
+          extendMinutes: record.policy.extendMinutes ?? 0, ceilingAt: new Date(Date.parse(record.acceptedAt) + (record.policy.maxTotalMinutes ?? record.policy.maxMinutes) * 60000).toISOString() }, record.policy);
       // Keep admission fenced until the pinned copy is fully prepared.
       this.save(record);
     });

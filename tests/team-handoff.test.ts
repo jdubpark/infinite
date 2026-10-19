@@ -9,7 +9,7 @@ import { startHost, waitFor, claimControl } from "./helpers.js";
 import { git, mixedLineup } from "./team-fixture.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 
-async function fixture(optIn = true, externalCmux = false) {
+async function fixture(optIn = true, externalCmux = false, teamOptions: Record<string, unknown> = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-handoff-")), source = join(root, "source"), receipts = join(root, "receipts");
   mkdirSync(source); mkdirSync(receipts);
   git(source, "init", "--initial-branch=main"); writeFileSync(join(source, "original.txt"), "Preserve the source.\n");
@@ -33,7 +33,7 @@ async function fixture(optIn = true, externalCmux = false) {
     } } }));
   }
   const host = await startHost({ agents: { claude: profile, codex: profile }, config: {
-    projects: [...(externalCmux ? [{ id: "source-alias", name: "Source alias", path: source }] : []), { id: "rehearsal", name: "Rehearsal", path: source, team: { ...(optIn ? { handoff: "auto" as const } : {}), checks: [{ command: process.execPath, args: ["-e", "process.exit(0)"] }] } }],
+    projects: [...(externalCmux ? [{ id: "source-alias", name: "Source alias", path: source }] : []), { id: "rehearsal", name: "Rehearsal", path: source, team: { ...(optIn ? { handoff: "auto" as const } : {}), ...teamOptions, checks: [{ command: process.execPath, args: ["-e", "process.exit(0)"] }] } }],
     teams: { workspaceDir: join(root, "teams"), lineup },
     ...(externalCmux ? { cmux: { enabled: true, command: cmuxCommand, hooksDir } } : {}),
   } });
@@ -130,6 +130,30 @@ test("Codex handoff blocks changed checkpoints without stopping or overwriting t
     assert.equal(readFileSync(join(f.source, "late.txt"), "utf8"), "A later edit must survive.\n");
     assert.equal((await f.host.fetchApi("/teams")).body.teams.length, 0);
   } finally { await f.close(); }
+});
+
+test("handoff limits default to one hour without extension, and configured project minutes reach the policy", { timeout: 90000 }, async () => {
+  const policyOf = async (f: Awaited<ReturnType<typeof fixture>>, id: string) => {
+    const key = readFileSync(f.host.config.keyFile);
+    const file = join(f.host.config.stateDir, "sessions", id, "meta.sealed");
+    return unseal<{ session: { handoff: { policy: Record<string, unknown> } } }>(key, `${id}:meta`, readFileSync(file, "utf8")).session.handoff.policy;
+  };
+  const defaults = await fixture();
+  try {
+    const { id } = await defaults.create([]);
+    const policy = await policyOf(defaults, id);
+    assert.equal(policy.maxMinutes, 60);
+    assert.equal(policy.extendMinutes, undefined);
+    assert.equal(policy.maxTotalMinutes, undefined);
+  } finally { await defaults.close(); }
+  const configured = await fixture(true, false, { handoffMinutes: 10, handoffExtendMinutes: 5, handoffMaxTotalMinutes: 20 });
+  try {
+    const { id } = await configured.create([]);
+    const policy = await policyOf(configured, id);
+    assert.equal(policy.maxMinutes, 10);
+    assert.equal(policy.extendMinutes, 5);
+    assert.equal(policy.maxTotalMinutes, 20);
+  } finally { await configured.close(); }
 });
 
 test("handoff admission blocks policy source or project mismatches before stopping the source", { timeout: 60000 }, async () => {

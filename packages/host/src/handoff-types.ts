@@ -19,9 +19,11 @@ export interface HandoffPolicy {
   sourceSessionId: string; projectId: string; path: string; userRequest: string;
   lineup: TeamLineup; project: TeamProject; linear?: { teamId: string; projectId?: string };
   commandPrefix?: TeamCommand; workspaceDir: string;
-  maxMinutes: 60; maxMembers: 16; parallelism: 2;
+  maxMinutes: number; maxMembers: 16; parallelism: 2;
+  /** Owner-approved automatic extension. Absent on policies recorded before it existed. */
+  extendMinutes?: number; maxTotalMinutes?: number;
 }
-export interface TeamHandoffContext { sourceSessionId: string; checkpointHead: string; deadlineAt: string; maxMembers: number; project: TeamProject }
+export interface TeamHandoffContext { sourceSessionId: string; checkpointHead: string; deadlineAt: string; maxMembers: number; project: TeamProject; extendMinutes?: number; ceilingAt?: string }
 export interface HandoffView {
   status: "unavailable" | "available" | "requested" | "waiting-for-control" | "stopping" | "creating" | "started" | "blocked";
   teamId?: string; reason?: string;

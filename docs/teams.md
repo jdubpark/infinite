@@ -198,7 +198,11 @@ writer for the same task.
 
 The team inherits the source session's configured lineup, project checks and
 Linear mapping. It has at most two parallel implementers, sixteen member
-attempts, and sixty minutes from the accepted handoff. These are execution limits,
+attempts, and sixty minutes from the accepted handoff. A project can set
+`handoffMinutes` (5–1,440, default 60), `handoffExtendMinutes` (0–240, default 0)
+and `handoffMaxTotalMinutes` (at least `handoffMinutes`) in its `team` object.
+An extension works as it does for goals below: it applies only while an active
+member shows activity within the stall window. These are execution limits,
 not a token or currency cap. A recorded initial user request stays in its context.
 For an interactive session with no initial request, the agent's summary supplies
 the current task context and is labeled accordingly. It does not grant authority
@@ -229,11 +233,28 @@ coordinator to select and build work within those boundaries.
 | `allowedPaths` | `["."]` | Repository-relative files or folders; `.` permits the entire project. No globs or parent traversal. |
 | `maxRuns` | 3 | 1–10 sequential feature cycles |
 | `maxMinutes` | 60 | 5–1,440 minutes from creation |
+| `extendMinutes` | 0 | 0–240 minutes added each time the deadline arrives while an agent is active; 0 turns extensions off |
+| `maxTotalMinutes` | `maxMinutes` | 5–1,440 minutes, at least `maxMinutes`; the ceiling for the deadline, including extensions |
 | `maxMembers` | 24 | 4–200 member attempts across the goal, including scouts, questions resumed as new attempts, review, repair, and escalation |
 | `parallelism` | 3 | 1–4 concurrent workers within a cycle, subject to host session capacity |
 
 Pausing does not extend the deadline or restore consumed attempts. Steering can
 change the direction, but cannot expand the approved paths, deadline, or limits.
+
+With `extendMinutes` above 0, the host moves the deadline forward when it arrives,
+if the active team has a member with attention activity within the stall window
+(`teams.stallMinutes`, default 30). The new deadline is the later of now or the
+old deadline, plus `extendMinutes`, and never passes `maxTotalMinutes`. The goal
+and its team record each extension with the policy that allowed it. A goal
+without that policy, or whose agents are all quiet, stops at its deadline as before.
+Owners can also extend a running, paused, or time-stopped goal with
+`POST /api/goals/:id/extend`. A time-stopped goal returns to running once its
+stopped team has settled, and the ceiling rises to cover the new deadline.
+Failed extensions record recovery events and stop automatic retries after three
+failed attempts, including across host restarts. An unapplied request is abandoned;
+if the team already saved its receipt, retry the same request to reconcile it.
+Later owner controls invalidate an unapplied extension, while an applied receipt
+is reconciled without undoing those controls.
 Start a new goal to approve a larger scope or more work. Each cycle also has a
 maximum of 60 member attempts, bounded by the goal's remaining allowance. These
 are execution limits; they do not enforce a token or currency budget. A stop
@@ -784,9 +805,16 @@ For a standalone team, steering records a new requirements revision. Earlier
 member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated
 workspace with the new direction. Completed earlier integration remains visible;
 unfinished member copies are preserved. Pause, resume and cancel are owner
-actions. A team blocked only because a member reached the one-hour runtime
-limit can resume with `infinite team resume ID`. That starts a fresh plan from
-the preserved integration commit and keeps the stopped member workspace.
+actions. A member with no report and no attention activity for `teams.stallMinutes`
+(5–1,440, default 30) is stopped. One replacement then continues the same task in
+the preserved workspace, with feedback that the earlier attempt stalled. A second
+stall on the same assignment blocks the team with the reason "An agent showed no
+activity twice on the same assignment." Activity means attention activity from the
+member's terminal or hooks. Screen output also counts, so an agent stuck behind an
+animated spinner looks active. Older runs blocked by the former one-hour limit
+still resume. A team blocked only by a stall can resume with
+`infinite team resume ID`. That starts a fresh plan from the preserved
+integration commit and keeps the stopped member workspace.
 Resume waits until those members have stopped. Any other block, including an
 interrupted workspace or check operation, still requires inspection and a new
 team. Stopping an agent does not prove that arbitrary detached tool
@@ -845,13 +873,15 @@ mutation returns the current Goal or Team record.
 | `POST /api/goals` | Creation fields below | Owner |
 | `POST /api/goals/:id/steer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/goals/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner |
+| `POST /api/goals/:id/extend` | `requestId`, `revision`, `minutes` (5–1,440) | Owner |
 | `POST /api/goals/:id/outcome` | `requestId`, `revision`, `result`, `summary`, `evidence` | Owner/controller |
 
 Creation requires `requestId` (UUID), `projectId`, `title` (up to 100 characters),
 `objective` (12,000), and `successCriteria` (4,000). Optional arrays are
 `nonGoals` (20 entries, 1,000 characters each), `evidence` (20 entries, 2,000
 characters each), and `allowedPaths` (1–32 entries, 300 characters each).
-`maxRuns`, `maxMinutes`, `maxMembers`, and `parallelism` use the limits above.
+`maxRuns`, `maxMinutes`, `extendMinutes`, `maxTotalMinutes`, `maxMembers`, and
+`parallelism` use the limits above.
 The host also limits the combined creation request to 40 KiB. On a mapped
 project, optional `linearIssueId` accepts an existing issue UUID or identifier
 (up to 100 characters); omitting it creates a new parent issue.
@@ -860,8 +890,8 @@ Goal steering accepts up to 8,000 characters while running or awaiting input.
 It leaves scope and budgets unchanged. Outcome `result` is `achieved`,
 `not-achieved`, or `inconclusive`; `summary` permits 4,000 characters and
 `evidence` 8,000. An outcome requires a terminal goal with no active cycle or
-pending operation. Resume requires a paused goal whose original deadline has
-not expired.
+pending operation. Resume requires a paused goal whose deadline has not expired;
+extend the goal first if it has.
 
 ### Teams
 

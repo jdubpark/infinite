@@ -37,6 +37,9 @@ import type {
   LaptopWorkspace,
 } from "./types.js";
 
+/** This stop attempt was refused before any worker RPC could deliver it. */
+export class TeamStopRefused extends ContentError {}
+
 export interface CreateSession {
   requestId: string;
   provider: Provider;
@@ -259,10 +262,10 @@ export class Manager {
   async stopTeamSession(sessionId: string, requestId: string, team: TeamAssignment): Promise<WorkerState> {
     const stored = this.meta(sessionId).session.team;
     if (!stored || stored.runId !== team.runId || stored.memberId !== team.memberId || stored.revision !== team.revision)
-      throw new ContentError("This session does not belong to the team assignment", 403);
+      throw new TeamStopRefused("This session does not belong to the team assignment", 403);
     const state = await this.state(sessionId);
     if (state.status === "exited") return state;
-    if (state.status !== "running") throw new ContentError("The team member has not confirmed a controllable runtime");
+    if (state.status !== "running") throw new TeamStopRefused("The team member has not confirmed a controllable runtime");
     await workerCall(this.config.runDir, sessionId, { op: "stop", requestId });
     return this.state(sessionId);
   }
@@ -495,7 +498,9 @@ export class Manager {
             sourceSessionId: id, projectId: project.id, path: session.cwd, userRequest,
             lineup: this.config.teams.lineup, project: project.team, linear: project.linear,
             commandPrefix: this.config.teams.commandPrefix, workspaceDir: this.config.teams.workspaceDir,
-            maxMinutes: 60, maxMembers: 16, parallelism: 2,
+            maxMinutes: project.team.handoffMinutes ?? 60, maxMembers: 16, parallelism: 2,
+            ...(project.team.handoffExtendMinutes ? { extendMinutes: project.team.handoffExtendMinutes } : {}),
+            ...(project.team.handoffMaxTotalMinutes ? { maxTotalMinutes: project.team.handoffMaxTotalMinutes } : {}),
           }) };
         }
       }

@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 import { TeamError } from "./team-workspace.js";
 import type { TeamMember, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
+import type { Mission } from "./mission-types.js";
 const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 const profileSuffix = ". These are the host's configured model choices; they do not establish which backend actually served a turn. Do not switch models or change tool permissions.";
 const profileInstructions = (modelProfile: TeamModelProfile) => `Requested runtime profile: ${JSON.stringify(modelProfile)}${profileSuffix}`;
@@ -101,5 +102,58 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
     reportingInstructions(provider),
   ].filter(Boolean).join("\n\n");
   if (Buffer.byteLength(prompt) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
+  return prompt;
+}
+
+/** One event the host delivers to the next mission coordinator attempt. */
+export type MissionMessage =
+  | { type: "start" }
+  | { type: "child-decision"; subtaskId: string; teamId: string; decisionId: string; question: string; options: string[] }
+  | { type: "subtask-finished"; subtaskId: string; teamId?: string; status: "done" | "blocked" | "cancelled"; teamStatus?: string; reason?: string }
+  | { type: "owner-answer"; decisionId: string; question: string; answer: string; forwardedTo?: { subtaskId: string; childDecisionId: string } }
+  | { type: "owner-direction"; text: string }
+  | { type: "resumed" }
+  | { type: "refused"; kind: string; reason: string };
+export type MissionPromptRepo = { projectId: string; name: string; path: string; teamReady: boolean };
+
+const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max - 3)}...` : text;
+/**
+ * Each coordinator attempt is one session that ends with one report, like a team member. The host
+ * starts the next attempt when a subteam, the owner, or a refusal needs the coordinator again.
+ */
+export function missionPrompt(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile) {
+  const state = {
+    status: mission.status,
+    deadlineAt: mission.deadlineAt,
+    maxSubtasks: mission.maxSubtasks,
+    subtasks: mission.subtasks.map(subtask => ({ id: subtask.id, repoProjectId: subtask.repoProjectId, title: subtask.title, objective: clip(subtask.objective, 600),
+      size: subtask.size, parallelism: subtask.parallelism, dependsOn: subtask.dependsOn, status: subtask.status, teamStatus: subtask.teamStatus, teamId: subtask.teamId })),
+    decisions: mission.decisions.slice(-20).map(decision => ({ id: decision.id, question: clip(decision.question, 600), subtaskId: decision.subtaskId, childDecisionId: decision.childDecisionId,
+      answer: decision.answer && clip(decision.answer, 600), answeredBy: decision.answeredBy })),
+    dispatchSummary: mission.dispatchSummary && clip(mission.dispatchSummary, 1000),
+  };
+  const recent = messages.slice(-30).map(message => "question" in message ? { ...message, question: clip(message.question, 2000) } : message);
+  const prompt = [
+    `You are the main coordinator of a mission for the project "${mission.groupName}". This is coordinator attempt ${attempt}. Your working folder is the mission folder, outside every repository. You may keep short notes there; later attempts start in the same folder.`,
+    profileInstructions(modelProfile),
+    `Repositories in this project (inspect read-only at these host paths):\n${repos.map(repo => `- ${repo.projectId} (${repo.name}): ${repo.path}${repo.teamReady ? "" : " — not configured for subteams; do not dispatch to it"}`).join("\n")}\nDo not edit, commit, push, or run commands that change any repository. Every change goes through a subteam: an ordinary team run in one repository that keeps that repository's own checks, independent review, delivery policy, and permission rules.`,
+    `Mission objective:\n${mission.objective}`,
+    mission.steering.length ? `Owner direction:\n${mission.steering.map(item => item.text).join("\n\n")}` : "",
+    `Split the objective into subtasks for single repositories. Each subtask names its repository by project ID, a short id (lowercase letters, digits, and hyphens), a title, a self-contained objective, a size, and dependsOn subtask IDs. Size "solo" runs one implementer; size "team" lets that subteam's coordinator run up to "parallelism" (1–4) workers. Use solo unless parallel work in one repository clearly helps. A simple mission may be exactly one solo subtask. At most ${mission.maxSubtasks} subtasks in total across all dispatches. A subtask starts when every dependency is done; only one subteam per repository runs at a time. Order cross-repository work with dependsOn, for example a backend API before the frontend that calls it, and state the interface each side must honor in both objectives. A queued subtask whose dependency ends blocked or cancelled never starts; cancel it or dispatch a replacement.`,
+    `Report exactly one of these in this attempt:
+- {"kind":"dispatch","summary":"Plan and reasoning","subtasks":[{"id":"api-endpoint","repoProjectId":"${repos[0]?.projectId ?? "repo-id"}","title":"...","objective":"...","size":"solo","parallelism":1,"dependsOn":[]}]} adds subtasks. A later dispatch may add more.
+- {"kind":"answer-child","subtaskId":"...","decisionId":"...","text":"..."} answers an open subteam decision when the answer follows from the mission objective and owner direction.
+- {"kind":"question","question":"...","options":["..."],"subtaskId":"...","childDecisionId":"..."} asks the owner. Include subtaskId and childDecisionId to forward the owner's answer to that subteam decision; omit both for a mission-level question.
+- {"kind":"cancel-subtask","subtaskId":"...","reason":"..."} cancels a subtask and its subteam.
+- {"kind":"result","summary":"..."} is accepted only when no subtask is queued or running. Summarize what each subteam delivered and what still needs owner review.
+- {"kind":"blocked","summary":"..."} stops the mission when it cannot proceed safely.
+After the report, stop. The host starts a new attempt when a subteam opens a decision, becomes blocked, or finishes, or when the owner answers or gives direction.`,
+    `Mission state (JSON): ${JSON.stringify(state)}`,
+    `Messages since your last attempt (JSON): ${JSON.stringify(recent)}`,
+    `Escalate to the owner only what the objective and owner direction do not settle, such as product, scope, or risk decisions. A result means every subtask finished; it does not establish product impact or acceptance. Do not publish, merge, deploy, change repository remotes, or approve provider permissions; each subteam delivers only under its own repository's policy.`,
+    `Write summaries and questions in plain English. Lead with concrete facts. Do not invent evidence or claim checks or outcomes you did not observe.`,
+    reportingInstructions(provider),
+  ].filter(Boolean).join("\n\n");
+  if (Buffer.byteLength(prompt) > 80 * 1024) throw new TeamError(409, "mission-prompt-too-large", "The mission state exceeds the coordinator prompt limit. Start a new mission with a consolidated objective.");
   return prompt;
 }

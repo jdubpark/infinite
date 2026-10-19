@@ -39,6 +39,7 @@ import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
 import { startHookServer, HookPayloadError, type HookReply, type HookRoute } from "./hooks.js";
 import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
+import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
 import { buildLaunch } from "./launch.js";
@@ -346,10 +347,11 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void
     return;
   }
   if (route === "team-report") {
-    const parsed = teamReportEnvelopeSchema.safeParse(body);
+    // A mission coordinator reports through the same channel with the mission envelope.
+    const parsed = session.team?.role === "mission-coordinator" ? missionReportEnvelopeSchema.safeParse(body) : teamReportEnvelopeSchema.safeParse(body);
     if (!parsed.success || !session.team) throw new HookPayloadError(400);
     const report = parsed.data;
-    if (report.runId !== session.team.runId || report.memberId !== session.team.memberId || report.revision !== session.team.revision)
+    if (("missionId" in report ? report.missionId : report.runId) !== session.team.runId || report.memberId !== session.team.memberId || report.revision !== session.team.revision)
       throw new HookPayloadError(403);
     const digest = createHash("sha256").update(JSON.stringify(report)).digest("hex");
     if (teamReportReceipt) {

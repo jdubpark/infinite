@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { teamReportEnvelopeSchema, teamReportSchema, type TeamReportEnvelope } from "./team-types.js";
+import { missionReportEnvelopeSchema, missionReportSchema } from "./mission-types.js";
+
+type MissionReportEnvelope = z.infer<typeof missionReportEnvelopeSchema>;
 
 export class ReportError extends Error {}
 export const MAX_TEAM_REPORT_BYTES = 64 * 1024;
@@ -38,9 +41,28 @@ function reportIdentity(value: unknown) {
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
+/** Whether this process reports for a mission coordinator, whose envelope names the mission instead of a run. */
+export function missionReporter(env: NodeJS.ProcessEnv = process.env) {
+  try { return z.object({ role: z.literal("mission-coordinator") }).safeParse(JSON.parse(env.INFINITE_TEAM_ASSIGNMENT ?? "null")).success; }
+  catch { return false; }
+}
+function createMissionEnvelope(input: unknown, binding: z.infer<typeof bindingSchema>): MissionReportEnvelope {
+  const { runId: missionId, memberId, revision } = binding;
+  let envelope: MissionReportEnvelope;
+  if (input !== null && typeof input === "object" && !Array.isArray(input) && "report" in input) envelope = missionReportEnvelopeSchema.parse(input);
+  else {
+    const report = missionReportSchema.parse(input);
+    envelope = missionReportEnvelopeSchema.parse({ missionId, memberId, revision, report, requestId: reportIdentity({ missionId, memberId, revision, report }) });
+  }
+  if (envelope.missionId !== missionId || envelope.memberId !== memberId || envelope.revision !== revision)
+    throw new ReportError("The report does not match this coordinator's assigned mission and revision.");
+  if (Buffer.byteLength(JSON.stringify(envelope)) > MAX_TEAM_REPORT_BYTES) throw new ReportError("Report exceeds 64 KiB.");
+  return envelope;
+}
 /** Accept a raw report or an explicit retry envelope, always bound to this worker's assignment. */
-export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = process.env): TeamReportEnvelope {
+export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = process.env): TeamReportEnvelope | MissionReportEnvelope {
   const { binding } = reportEnvironment(env);
+  if (missionReporter(env)) return createMissionEnvelope(input, binding);
   let envelope: TeamReportEnvelope;
   if (input !== null && typeof input === "object" && !Array.isArray(input) && "report" in input) {
     envelope = teamReportEnvelopeSchema.parse(input);
@@ -54,7 +76,7 @@ export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = pr
   return envelope;
 }
 /** HTTP 204 is sent by the worker only after its authenticated journal append has succeeded. */
-export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<TeamReportEnvelope> {
+export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<TeamReportEnvelope | MissionReportEnvelope> {
   const { endpoint, token } = reportEnvironment(env);
   const envelope = createReportEnvelope(input, env);
   const response = await fetch(endpoint, {

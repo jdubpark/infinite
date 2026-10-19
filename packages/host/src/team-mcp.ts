@@ -5,15 +5,19 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { teamReportSchema } from "./team-types.js";
-import { reportErrorMessage, submitTeamReport } from "./team-report-client.js";
+import { missionReportSchema } from "./mission-types.js";
+import { missionReporter, reportErrorMessage, submitTeamReport } from "./team-report-client.js";
 
 const MAX_FRAME_BYTES = 256 * 1024;
 const PROTOCOL_VERSION = "2025-11-25";
 const COMPATIBLE_VERSIONS = new Set([PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"]);
-const argumentsSchema = z.object({ report: teamReportSchema }).strict();
+const mission = missionReporter();
+const argumentsSchema = mission ? z.object({ report: missionReportSchema }).strict() : z.object({ report: teamReportSchema }).strict();
 const tool = {
   name: "report",
-  description: "Record this assigned team member's final structured report. Wait for the durable success receipt, then stop work. A refusal requires user attention; never bypass it through a shell command or another tool.",
+  description: mission
+    ? "Record this mission coordinator's structured report for this attempt. Wait for the durable success receipt, then stop work; the host starts a new attempt when the mission needs you again. A refusal requires user attention; never bypass it through a shell command or another tool."
+    : "Record this assigned team member's final structured report. Wait for the durable success receipt, then stop work. A refusal requires user attention; never bypass it through a shell command or another tool.",
   inputSchema: z.toJSONSchema(argumentsSchema, { target: "draft-7" }),
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 };
@@ -83,7 +87,7 @@ export async function runTeamMcp() {
       const envelope = await submitTeamReport(input.report);
       await result(id, {
         content: [{ type: "text", text: "Team report recorded. Stop work on this assignment." }],
-        structuredContent: { requestId: envelope.requestId, runId: envelope.runId, memberId: envelope.memberId, revision: envelope.revision },
+        structuredContent: { requestId: envelope.requestId, ...("missionId" in envelope ? { missionId: envelope.missionId } : { runId: envelope.runId }), memberId: envelope.memberId, revision: envelope.revision },
         isError: false,
       });
     } catch (failure) {

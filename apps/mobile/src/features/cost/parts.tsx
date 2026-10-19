@@ -18,10 +18,10 @@ import {
  * and "—" where the provider gave no balance.
  */
 
-/** A figure that is never shown as exact when part of it is unpriced. */
-export function MoneyText({ value, style, prefixStyle }: { value: Money; style?: StyleProp<TextStyle>; prefixStyle?: StyleProp<TextStyle> }) {
+/** A figure that is never shown as exact when part of it is unpriced or unmeasured, and never as $0 when nothing was measured. */
+export function MoneyText({ value, style, prefixStyle }: { value: Money & { unmeasured?: number }; style?: StyleProp<TextStyle>; prefixStyle?: StyleProp<TextStyle> }) {
   const formatted = money(value);
-  return <Text accessibilityLabel={formatted.atLeast ? `at least ${formatted.text}` : formatted.text} style={style}>
+  return <Text accessibilityLabel={formatted.none ? "unmeasured" : formatted.atLeast ? `at least ${formatted.text}` : formatted.text} style={[style, formatted.none && s.none]}>
     {formatted.atLeast ? <Text style={[s.prefix, prefixStyle]}>≥ </Text> : null}{formatted.text}
   </Text>;
 }
@@ -82,15 +82,16 @@ export function AccountCard({ account, color, spark }: { account: AccountView; c
 export function ProjectRow({ project, onPress }: { project: ProjectCostRow; onPress: () => void }) {
   return <Pressable accessibilityRole="button" accessibilityLabel={`Open ${project.name}: ${usd(project.month.usd)} this month, ${usd(project.total.usd)} accrued`} onPress={onPress} hitSlop={6}
     style={({ pressed }) => [s.row, pressed && s.pressed]}>
-    <View style={s.rowMain}><Text style={s.rowTitle} numberOfLines={1}>{project.name}</Text><Text style={s.muted}><MoneyText value={project.total} /> accrued</Text></View>
+    <View style={s.rowMain}><Text style={s.rowTitle} numberOfLines={1}>{project.name}</Text><Text style={s.muted}><MoneyText value={{ ...project.total, unmeasured: project.unmeasured }} /> accrued{project.unmeasured ? ` · ${project.unmeasured} unmeasured` : ""}</Text></View>
     <Sparkline values={project.spark} color={theme.colors.forest} />
     <MoneyText value={project.month} style={s.rowFigure} /><Glyph name="forward" size={12} color={theme.colors.mutedInk} />
   </Pressable>;
 }
 
+/** Dollars by kind of work; kinds that spent nothing are left out. */
 export function KindChips({ byKind }: { byKind: { goals: number; teams: number; sessions: number; briefings: number } }) {
-  const items = [[byKind.goals, "goals"], [byKind.teams, "runs"], [byKind.sessions, "sessions"], [byKind.briefings, "briefings"]] as const;
-  return <View style={s.legend}>{items.filter(([count]) => count > 0).map(([count, label]) => <Chip key={label} label={`${count} ${label}`} />)}</View>;
+  const items = [["Goals", byKind.goals], ["Runs", byKind.teams], ["Sessions", byKind.sessions], ["Briefings", byKind.briefings]] as const;
+  return <View style={s.legend}>{items.filter(([, value]) => value > 0).map(([label, value]) => <Chip key={label} label={`${label} ${usd(value)}`} accessibilityLabel={`${label}: ${usd(value)}`} />)}</View>;
 }
 
 /** A task's metered cost on one line: dollars, tokens, and attempts beyond the first. */
@@ -150,6 +151,7 @@ const s = StyleSheet.create({
   muted: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
   mark: { fontWeight: "700", fontVariant: ["tabular-nums"] },
   prefix: { color: theme.colors.mutedInk },
+  none: { color: theme.colors.placeholder, fontWeight: "400" },
   hero: { gap: 2 },
   heroLine: { flexDirection: "row", alignItems: "center", gap: 10 },
   heroValue: { fontSize: 44, lineHeight: 50, fontWeight: "600", letterSpacing: -1.2, color: theme.colors.ink },

@@ -1,4 +1,5 @@
 import type { TeamMember, TeamRun, TeamTask } from "./team-types.js";
+import { formatUsd } from "./usage.js";
 
 export type ModelRow = { profileId: string; label: string; provider: string; role: string; metered: boolean;
   attempts: number; integrated: number; rate: number; rateInterval: [number, number] | null;
@@ -58,8 +59,8 @@ export function scorecard(runs: ScorecardRun[], usage: TaskUsage, options: { rol
     if (other === cheap || !other.enough || other.role !== cheap.role || (other.metered && (other.medianUsd === null || cheap.medianUsd! >= other.medianUsd))) continue;
     const a = cheap.rateInterval!, b = other.rateInterval!;
     if (a[1] < b[0]) continue;
-    const otherUsd = other.metered ? ` at a median $${other.medianUsd}` : "";
-    let text = `${cheap.label} integrated ${cheap.integrated}/${cheap.attempts} ${role} tasks at a median $${cheap.medianUsd}; ${other.label} ${other.integrated}/${other.attempts}${otherUsd}`;
+    const otherUsd = other.metered ? ` at a median $${formatUsd(other.medianUsd!)}` : "";
+    let text = `${cheap.label} integrated ${cheap.integrated}/${cheap.attempts} ${role} tasks at a median $${formatUsd(cheap.medianUsd!)}; ${other.label} ${other.integrated}/${other.attempts}${otherUsd}`;
     if (cheap.rubric && other.rubric && cheap.rubric.n >= 5 && other.rubric.n >= 5) {
       const quality = (row: ModelRow) => row.owner?.mean ?? (row.rubric!.correctness + row.rubric!.cleanliness + row.rubric!.extensibility + row.rubric!.docs) / 4;
       text += ` (rubric ${quality(cheap).toFixed(1)} vs ${quality(other).toFixed(1)})`;

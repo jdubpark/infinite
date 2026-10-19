@@ -1331,7 +1331,8 @@ export class TeamService {
     this.operation(stored, "result", async signal => {
       const commit = await captureMemberResult(member.cwd, member.baseCommit, member.role === "implementer" ? task!.paths : run.goal?.allowedPaths, this.config.teams?.commandPrefix, signal);
       const head = commit ? await integrateMemberResult(run.workspace, member.cwd, commit, this.config.teams?.commandPrefix, signal) : run.headCommit!;
-      const diff = commit ? await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--numstat", `${member.baseCommit}..${head}`]) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix) : undefined;
+      // Diff stats are scorecard evidence only: a launcher that refuses the command must not block integration.
+      const diff = commit ? await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--numstat", `${member.baseCommit}..${commit}`]) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined) : undefined;
       return { commit, head, diff: diff?.exitCode === 0 ? diff.stdout : undefined };
     }, ({ commit, head, diff }) => {
       run.headCommit = head; stored.checkHead = undefined; run.review = undefined;

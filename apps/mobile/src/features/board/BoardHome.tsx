@@ -2,10 +2,9 @@ import { useEffect, useState } from "react";
 import { ActivityIndicator, StyleSheet } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { api, closeConnection, connectionKey, type Connection, type Me } from "../../api/client";
-import { clearDrafts } from "../../store/drafts";
-import { clearConnection, identifyConnection, loadConnections, selectConnection } from "../../store/connection";
-import { creations, goalCreations, missionCreations, lifecycles, runRequests, teamCreations } from "../../store/requests";
+import { api, closeConnection, connectionKey, type Me } from "../../api/client";
+import { identifyConnection, loadConnections, selectConnection, useConnections } from "../../store/connection";
+import { forgetMachine } from "../../store/machines";
 import { registerForPush, unregisterPush, type PushState } from "../../push/register";
 import { Board } from "./Board";
 import { theme } from "../../theme";
@@ -19,25 +18,17 @@ const PUSH_NOTES: Record<PushState, string> = {
 export function BoardHome() {
   const router = useRouter();
   const { machine } = useLocalSearchParams<{ machine?: string }>();
-  const [profiles, setProfiles] = useState<Connection[]>([]);
-  const [active, setActive] = useState("");
+  const saved = useConnections();
+  const profiles = saved.profiles;
+  const active = profiles.some(profile => connectionKey(profile) === machine) ? machine! : saved.active;
   const [loaded, setLoaded] = useState(false);
   const [push, setPush] = useState<Record<string, PushState>>({});
   const connection = profiles.find(profile => connectionKey(profile) === active) ?? null;
-  async function reload(preferred?: string) {
-    const saved = await loadConnections();
-    setProfiles(saved.profiles);
-    setActive(saved.profiles.some(profile => connectionKey(profile) === preferred) ? preferred! : saved.active);
-    return saved.profiles;
-  }
   useEffect(() => {
     let live = true;
-    loadConnections().then(saved => {
+    loadConnections().then(current => {
       if (!live) return;
-      setProfiles(saved.profiles);
-      const next = saved.profiles.some(profile => connectionKey(profile) === machine) ? machine! : saved.active;
-      setActive(next);
-      if (!saved.profiles.some(profile => connectionKey(profile) === next)) router.replace("/");
+      if (!current.profiles.length) router.replace("/");
     }).finally(() => { if (live) setLoaded(true); });
     return () => { live = false; };
   }, [machine, router]);
@@ -55,20 +46,15 @@ export function BoardHome() {
   }, [profiles]);
   async function select(id: string) {
     await selectConnection(id);
-    setActive(id);
     router.setParams({ machine: id });
   }
   async function disconnect() {
     if (!connection) return;
+    const removal = forgetMachine(connection);
     await unregisterPush(connection);
     closeConnection(connection);
-    const key = connectionKey(connection);
-    clearDrafts(key);
-    creations.clear(key); lifecycles.clearMachine(key); teamCreations.clearMachine(key);
-    goalCreations.clearMachine(key); missionCreations.clearMachine(key); runRequests.clearMachine(key);
-    await clearConnection(key);
-    const remaining = await reload();
-    if (!remaining.length) router.replace("/");
+    await removal;
+    if (profiles.length === 1) router.replace("/");
   }
   if (!loaded || !connection) return <SafeAreaView style={s.safe}><ActivityIndicator style={s.loading} color={theme.colors.forest} /></SafeAreaView>;
   return <SafeAreaView style={s.safe}>

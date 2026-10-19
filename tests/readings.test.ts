@@ -197,6 +197,105 @@ test("a list row merge returns while Jev is still pending", async () => {
   } finally { f.readings.stop(); f.dispose(); }
 });
 
+test("an older poll result cannot replace a newer ineligible row", async () => {
+  const fake = responding({});
+  const f = setup({ transport: fake.transport });
+  let resolveList!: (rows: ReadingRow[]) => void;
+  f.manager.list = () => new Promise(resolve => { resolveList = resolve; });
+  try {
+    const poll = f.readings.tick();
+    const current = { ...f.row, attention: now("A short current status.") };
+    f.readings.merge([current]);
+    resolveList([f.row]);
+    await poll;
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(fake.calls.length, 0, "a stale poll cannot reopen the Jev gate after merge observed newer content");
+  } finally { f.dispose(); }
+});
+
+test("501 failed turn readings stay suppressed after the display LRU would have evicted entries", async () => {
+  let calls = 0;
+  const failing = { systemOne: async () => { calls++; throw new Error("provider unavailable"); } } as unknown as JevTransport;
+  const f = setup({ transport: failing });
+  const rows: ReadingRow[] = Array.from({ length: 501 }, (_, index) => {
+    const id = `session-${index}`;
+    const session = { ...f.session, id };
+    const message = `${longMessage} Session ${index}.`;
+    return { id, title: session.title, provider: session.provider, attention: now(message) };
+  });
+  const sessions = new Map(rows.map(row => [row.id, { ...f.session, id: row.id }]));
+  f.manager.meta = (id: string) => ({ session: sessions.get(id) });
+  try {
+    for (let offset = 0; offset < rows.length; offset += 25) {
+      const batch = rows.slice(offset, offset + 25);
+      f.readings.merge(batch);
+      const expected = offset + batch.length;
+      await eventually(() => calls === expected);
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    f.manager.list = async () => rows;
+    await f.readings.tick();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(calls, 501, "a full scan does not retry failures merely because the display cache is bounded");
+
+    f.manager.list = async () => rows.slice(0, 1);
+    await f.readings.tick();
+    const evaluations = (f.readings as unknown as { evaluations: Map<string, unknown> }).evaluations;
+    assert.equal(evaluations.size, 1, "evaluation/backoff entries are pruned with sessions that leave the live snapshot");
+  } finally { f.dispose(); }
+});
+
+test("many eligible rows keep pending Jev work within the 50-job cap", () => {
+  const pending = { systemOne: async () => new Promise<never>(() => {}) } as unknown as JevTransport;
+  const f = setup({ transport: pending });
+  const rows: ReadingRow[] = Array.from({ length: 5000 }, (_, index) => {
+    const id = `session-${index}`;
+    return { id, title: "Worker session", provider: "claude", attention: now(`${longMessage} Session ${index}.`) };
+  });
+  f.manager.meta = (id: string) => ({ session: { ...f.session, id } });
+  try {
+    f.readings.merge(rows);
+    const state = f.readings as unknown as { queue: Map<string, unknown>; active: Map<string, string> };
+    assert.equal(state.active.size, 2, "only two provider requests can run at once");
+    assert.ok(state.queue.size <= 50, `pending work was ${state.queue.size}, above the cap`);
+  } finally { f.dispose(); }
+});
+
+test("pending work coalesces to the newest hash and rechecks the gate before send", async () => {
+  const calls: any[] = [];
+  const releases: Array<(value: any) => void> = [];
+  const transport = { systemOne: (request: any) => {
+    calls.push(request);
+    return new Promise(resolve => releases.push(resolve));
+  } } as unknown as JevTransport;
+  const f = setup({ transport });
+  const blockerRows = ["blocker-a", "blocker-b"].map(id => ({
+    id, title: "Worker session", provider: "claude" as const, attention: now(`${longMessage} ${id}.`),
+  }));
+  const target = (id: string, attention: Attention): ReadingRow => ({ id, title: "Worker session", provider: "claude", attention });
+  const oldMessage = `${longMessage} Old queued sentence.`;
+  const newerMessage = `${longMessage} New queued sentence.`;
+  const gateMessage = `${longMessage} Gate held sentence.`;
+  const gatedRow = target("gated", now(gateMessage));
+  f.manager.meta = (id: string) => ({ session: { ...f.session, id } });
+  try {
+    f.readings.merge([...blockerRows, target("coalesced", now(oldMessage)), gatedRow]);
+    await eventually(() => calls.length === 2);
+    f.readings.merge([target("coalesced", now(newerMessage))]);
+    f.readings.merge([target("gated", { ...gatedRow.attention, state: "working" })]);
+
+    const answer = { model: "jev-latest", answers: {
+      best: { type: "choice", choice: "candidate0", confidence: 0.9, probabilities: {} },
+      waiting: { type: "noul", noul: 0.1 },
+    } };
+    releases.forEach(release => release(answer));
+    await eventually(() => calls.length === 3);
+    assert.equal(calls[2].state.lastSentence, "New queued sentence.", "the pending slot sends only its newest hash");
+    assert.equal(calls.some(request => request.state.lastSentence === "Gate held sentence."), false, "a message that no longer passes the turn-finished gate is skipped before send");
+    releases.slice(2).forEach(release => release(answer));
+  } finally { f.dispose(); }
+});
+
 test("candidate and title clipping helpers remove Markdown framing and preserve word boundaries", () => {
   assert.deepEqual(candidateSentences("# Summary\n- Changed the [session list](https://example.invalid).\n\nThe cache is sealed."), ["Changed the session list.", "The cache is sealed."]);
   assert.deepEqual(candidateSentences("Summary.\n```js\nconst hidden = true;\n```\nUpdated the cache."), ["Summary.", "Updated the cache."]);

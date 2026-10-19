@@ -108,7 +108,7 @@ export class TeamService {
           this.event(stored, stored.run.reason);
         }
         // Retain the intent so resume cannot disguise an ambiguous operation.
-        this.save(stored);
+        this.save(stored); this.trackBlocked(stored);
       }
       for (const decision of stored.run.permissionDecisions ?? []) if (decision.status === "answering") {
         decision.status = "uncertain";
@@ -177,7 +177,7 @@ export class TeamService {
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
-  statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) })); }
+  statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal })); }
   get(id: string): TeamView { return this.view(this.record(id)); }
   async bundle(id: string) {
     const stored = this.record(id), run = stored.run;
@@ -495,7 +495,11 @@ export class TeamService {
     stored.run.reason = stored.run.stopReason === "deadline" ? "The goal reached its deadline. Active work is being stopped and retained for inspection."
       : stored.run.stopReason === "member-limit" ? "The goal reached this run's agent attempt limit. Active work is being stopped and retained for inspection."
         : error instanceof TeamError ? error.message : "A team operation failed. Its workspaces and recorded evidence were preserved for inspection.";
-    this.event(stored, stored.run.reason); this.save(stored);
+    this.event(stored, stored.run.reason); this.save(stored); this.trackBlocked(stored);
+  }
+  /** Queue the blocked evidence with the host's resume answer, so it is written even when no client is reading. */
+  private trackBlocked(stored: Stored) {
+    if (stored.run.status === "blocked") this.linear?.updateTeam(stored.run, stored.run.linearTracking === true, this.canResume(stored));
   }
   private hasLaunch(member: TeamMember) {
     try { this.manager.meta(member.sessionId); return true; }

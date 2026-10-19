@@ -14,7 +14,7 @@ export async function startLinearServer() {
   const apiKey = randomBytes(32).toString("hex"), teamId = randomUUID();
   const issues = new Map<string, FixtureIssue>(), comments = new Map<string, FixtureComment>();
   const labels = new Map<string, { id: string; name: string; team: { id: string } | null }>(), issueLabels = new Map<string, Set<string>>();
-  let failLabels = false;
+  let failLabels = false, rateLimitLabels = false;
   const calls: { operation: string; variables: Record<string, any> }[] = [];
   const lostResponses: { operation: WriteOperation; id: string }[] = [];
   const violations: string[] = [];
@@ -80,6 +80,7 @@ export async function startLinearServer() {
           const name = variables.filter?.name?.eqIgnoreCase;
           if (typeof name !== "string") throw new Error("Label lookup requires a name");
           if (failLabels) { reply(200, { errors: [{ message: "Fixture label failure" }] }); return; }
+          if (rateLimitLabels) { response.writeHead(200, { "Content-Type": "application/json", "retry-after": "120" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return; }
           data = { issueLabels: { nodes: [...labels.values()].filter(label => label.name.toLowerCase() === name.toLowerCase()) } }; break;
         }
         case "InfiniteLinearLabelCreate": {
@@ -90,7 +91,9 @@ export async function startLinearServer() {
         }
         case "InfiniteLinearIssueAddLabel":
         case "InfiniteLinearIssueRemoveLabel": {
-          if (!issues.has(variables.id) || !labels.has(variables.labelId)) throw new Error("Label change needs a known issue and label");
+          if (!issues.has(variables.id)) throw new Error("Label change needs a known issue");
+          // Linear answers an unknown (for example deleted) label with an error, not a protocol violation.
+          if (!labels.has(variables.labelId)) { reply(200, { errors: [{ message: "Entity not found: IssueLabel" }] }); return; }
           const applied = issueLabels.get(variables.id) ?? new Set<string>(), adding = operation === "InfiniteLinearIssueAddLabel";
           if (adding) applied.add(variables.labelId); else applied.delete(variables.labelId);
           issueLabels.set(variables.id, applied);
@@ -114,6 +117,7 @@ export async function startLinearServer() {
   if (!address || typeof address === "string") throw new Error("Linear fixture needs a TCP address");
   return { endpoint: `http://127.0.0.1:${address.port}/graphql`, apiKey, teamId, issues, comments, calls, lostResponses, violations, seedIssue, labels, issueLabels,
     failLabelLookups(value: boolean) { failLabels = value; },
+    rateLimitLabelLookups(value: boolean) { rateLimitLabels = value; },
     dropNextResponse(operation: WriteOperation, bodyIncludes?: string) { drop = { operation, bodyIncludes }; },
     restore() { unavailable = false; },
     editIssue(id: string, changes: Partial<Pick<FixtureIssue, "title" | "description" | "state" | "archivedAt">>) {

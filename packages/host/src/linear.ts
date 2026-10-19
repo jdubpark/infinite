@@ -170,8 +170,9 @@ export class LinearService {
     }
     if (evidenceStatuses.has(run.status) && (run.status !== "blocked" || resumable !== undefined)) {
       const checks = run.checks.filter(check => check.revision === run.revision);
-      const flag = run.status === "blocked" ? `Reason: ${sharedText(run.reason ?? "not recorded")}\nNext step: ${resumable
-        ? `run \`infinite team resume ${run.id}\` to replan from the integrated work.` : "inspect the run's evidence, then start a new run to continue."}\n` : "";
+      // A goal's runs are resumed from the goal; the team resume route refuses them.
+      const flag = run.status === "blocked" ? `Reason: ${sharedText(run.reason ?? "not recorded")}\nNext step: ${run.goal ? "open the goal that owns this run; its runs are resumed from the goal."
+        : resumable ? `run \`infinite team resume ${run.id}\` to replan from the integrated work.` : "inspect the run's evidence, then start a new run to continue."}\n` : "";
       this.comment(stored, `status:${run.revision}:${run.status}`, `Infinite feature execution\n\nStatus: ${run.status}\n${flag}Agent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`);
     }
     // Flag a blocked run on its issue; the label follows the host's status, never the reverse.
@@ -285,12 +286,13 @@ export class LinearService {
         }
         this.success(stored);
       } catch (error) { this.failure(stored, error); continue; }
-      if (this.pendingLabel(stored)) {
+      if (this.pendingLabel(stored) && Date.now() >= this.retryUntil) {
         try { await this.applyLabel(stored); }
-        catch {
+        catch (error) {
           if (this.closed) return;
           stored.labelFailures = (stored.labelFailures ?? 0) + 1;
-          stored.labelRetryAt = Date.now() + Math.min(30 * 60000, 30000 * 2 ** Math.min(stored.labelFailures - 1, 6)); this.save(stored);
+          const backoff = Math.min(30 * 60000, 30000 * 2 ** Math.min(stored.labelFailures - 1, 6));
+          stored.labelRetryAt = Date.now() + Math.max(backoff, error instanceof LinearFailure ? error.retryAfterMs : 0); this.save(stored);
         }
       }
     }
@@ -319,14 +321,25 @@ export class LinearService {
     const result = z.object({ success: z.literal(true), issue: issueSchema }).parse(data.issueCreate);
     this.accept(stored, result.issue, generation);
   }
+  // Label requests are optional: a rate limit on them backs off only the label, never the shared transport.
   private async applyLabel(stored: Stored) {
-    const adding = stored.label === "add", labelId = await this.blockedLabel(stored.issue!.team.id, adding);
+    const adding = stored.label === "add", teamId = stored.issue!.team.id, cached = this.labels.has(teamId);
+    const change = async (labelId: string) => {
+      const mutation = adding ? "issueAddLabel" : "issueRemoveLabel", operation = adding ? "InfiniteLinearIssueAddLabel" : "InfiniteLinearIssueRemoveLabel";
+      const data = await this.graphql(operation, `mutation ${operation}($id: String!, $labelId: String!) { ${mutation}(id: $id, labelId: $labelId) { success } }`, { id: stored.issue!.id, labelId }, false);
+      z.object({ success: z.literal(true) }).parse(data[mutation]);
+    };
+    let labelId = await this.blockedLabel(teamId, adding);
     if (this.closed) return;
     if (labelId) {
-      const mutation = adding ? "issueAddLabel" : "issueRemoveLabel";
-      const data = await this.graphql(adding ? "InfiniteLinearIssueAddLabel" : "InfiniteLinearIssueRemoveLabel",
-        `mutation ${adding ? "InfiniteLinearIssueAddLabel" : "InfiniteLinearIssueRemoveLabel"}($id: String!, $labelId: String!) { ${mutation}(id: $id, labelId: $labelId) { success } }`, { id: stored.issue!.id, labelId });
-      z.object({ success: z.literal(true) }).parse(data[mutation]);
+      try { await change(labelId); }
+      catch (error) {
+        // A cached label may have been deleted in Linear: look it up once more before backing off.
+        this.labels.delete(teamId);
+        if (!cached || this.closed) throw error;
+        labelId = await this.blockedLabel(teamId, adding);
+        if (labelId) await change(labelId);
+      }
       if (this.closed) return;
     }
     stored.label = adding ? "added" : undefined; stored.labelFailures = 0; stored.labelRetryAt = 0; this.save(stored);
@@ -335,11 +348,11 @@ export class LinearService {
   private async blockedLabel(teamId: string, create: boolean) {
     const cached = this.labels.get(teamId);
     if (cached) return cached;
-    const data = await this.graphql("InfiniteLinearLabels", "query InfiniteLinearLabels($filter: IssueLabelFilter!) { issueLabels(filter: $filter, first: 50) { nodes { id name team { id } } } }", { filter: { name: { eqIgnoreCase: BLOCKED_LABEL } } });
+    const data = await this.graphql("InfiniteLinearLabels", "query InfiniteLinearLabels($filter: IssueLabelFilter!) { issueLabels(filter: $filter, first: 50) { nodes { id name team { id } } } }", { filter: { name: { eqIgnoreCase: BLOCKED_LABEL } } }, false);
     const nodes = z.object({ nodes: z.array(labelSchema).max(50) }).parse(data.issueLabels).nodes;
     let label = nodes.find(node => node.team?.id === teamId) ?? nodes.find(node => node.team === null);
     if (!label && create) {
-      const created = await this.graphql("InfiniteLinearLabelCreate", "mutation InfiniteLinearLabelCreate($input: IssueLabelCreateInput!) { issueLabelCreate(input: $input) { success issueLabel { id name team { id } } } }", { input: { name: BLOCKED_LABEL, color: "#eb5757", teamId } });
+      const created = await this.graphql("InfiniteLinearLabelCreate", "mutation InfiniteLinearLabelCreate($input: IssueLabelCreateInput!) { issueLabelCreate(input: $input) { success issueLabel { id name team { id } } } }", { input: { name: BLOCKED_LABEL, color: "#eb5757", teamId } }, false);
       label = z.object({ success: z.literal(true), issueLabel: labelSchema }).parse(created.issueLabelCreate).issueLabel;
     }
     if (label) this.labels.set(teamId, label.id);
@@ -380,7 +393,8 @@ export class LinearService {
     const result = z.object({ success: z.literal(true), comment: commentSchema }).parse(data.commentCreate);
     verify(result.comment);
   }
-  private async graphql(operationName: string, query: string, variables: unknown): Promise<Record<string, unknown>> {
+  /** `shared` rate limits pause every request; an optional request reports its delay to its caller instead. */
+  private async graphql(operationName: string, query: string, variables: unknown, shared = true): Promise<Record<string, unknown>> {
     if (this.closed) throw new LinearFailure();
     if (Date.now() < this.retryUntil) throw new LinearFailure(this.retryUntil - Date.now());
     const api = this.config.linear;
@@ -411,7 +425,8 @@ export class LinearService {
           const resets = ["x-ratelimit-requests-reset", "x-ratelimit-endpoint-requests-reset", "x-ratelimit-complexity-reset"].map(name => Number(response.headers.get(name))).filter(value => Number.isFinite(value) && value > Date.now());
           const retry = Number(response.headers.get("retry-after"));
           const delay = Math.max(1000, ...resets.map(value => value - Date.now()), Number.isFinite(retry) ? retry * 1000 : 0);
-          this.retryUntil = Date.now() + delay; throw new LinearFailure(delay);
+          if (shared) this.retryUntil = Date.now() + delay;
+          throw new LinearFailure(delay);
         }
         throw new LinearFailure();
       }

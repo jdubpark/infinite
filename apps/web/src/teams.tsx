@@ -100,9 +100,12 @@ function SetupNotice({ me }: { me: Me }) {
   return null;
 }
 
+/** Blocked runs lead every team list; each group keeps its received order. */
+const blockedFirst = (teams: TeamView[]) => [...teams.filter(team => team.status === "blocked"), ...teams.filter(team => team.status !== "blocked")];
+
 export function TeamPicker({ teams, selected, loading, onSelect }: { teams: TeamView[]; selected: string | null; loading: boolean; onSelect: (id: string) => void }) {
   return <nav className="session-list team-picker" aria-label="Agent teams">
-    {teams.map(team => <button className={"session-row " + (selected === team.id ? "selected" : "")} key={team.id} onClick={() => onSelect(team.id)} aria-current={selected === team.id ? "page" : undefined}>
+    {blockedFirst(teams).map(team => <button className={"session-row " + (selected === team.id ? "selected" : "")} key={team.id} onClick={() => onSelect(team.id)} aria-current={selected === team.id ? "page" : undefined}>
       <div className="row-top"><Users size={15} /><strong>{team.title}</strong><ChevronRight size={16} /></div>
       <div className="row-meta"><span>{leadLabel(team)}</span><span>{labels[team.status]}</span></div>
       <div className="row-meta session-id">Revision {team.revision} · {team.id.slice(0, 8)}</div>
@@ -123,7 +126,7 @@ export function TeamList({ teams, me, fresh, loading, failed, seen, onCreate, on
     <SpendBlock me={me} />
     <div className="team-section-heading"><h2>Team runs <span className="quiet">{teams.length}</span></h2><span className="quiet">{!me.teams ? "Unavailable on this host" : fresh ? "Up to date" : failed ? "Team updates unavailable" : loading ? "Loading…" : "Checking…"}{seen && " · checked " + ago(seen)}</span></div>
     {failed && <p className="team-notice" role="status">The host could not refresh team runs. Showing the last received state. <button className="text-button" onClick={refresh}>Try again</button></p>}
-    {[...teams].map((team, index) => ({ team, index })).sort((a, b) => Number(b.team.status === "blocked") - Number(a.team.status === "blocked") || a.index - b.index).map(({ team }) => <div className="team-run-row" key={team.id}>
+    {blockedFirst(teams).map(team => <div className="team-run-row" key={team.id}>
       <button type="button" className="team-run-open" onClick={() => onSelect(team.id)}><div><strong>{team.title}</strong><p>{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)} · {date(team.createdAt)}</p>{team.lineup && <p className="team-run-model">Requested coordinator: <code>{team.lineup.coordinator.model}</code> · {profileSetting(team.lineup.coordinator)}</p>}{team.status === "blocked" && <p className="team-run-reason">{team.reason ?? " "}</p>}</div><Status status={team.status} /><ArrowUpRight size={18} /></button>
       {team.status === "blocked" && me.role === "owner" && team.resumable === true && !team.goal && !team.deliveryReceipt && <TeamListResume team={team} fresh={fresh} refresh={refresh} />}
     </div>)}

@@ -67,6 +67,10 @@ export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = 
     // A rejection can follow a durable append whose acknowledgement was lost, so delivery stays unconfirmed, not failed.
     throw new ReportError("Team report delivery was not confirmed: the report endpoint gave this process no answer. A sandbox or network policy may block local connections, or the acknowledgement was lost. Stop and request user attention; inspect this member's recorded report before retrying the identical report, and do not bypass or submit a different report.");
   }
+  if (response.status >= 400 && response.status < 500) {
+    const detail = (await response.text()).trim().slice(0, 2000);
+    throw new ReportError(detail || `Report refused (${response.status}). Inspect this member's recorded report; do not bypass the refusal.`);
+  }
   await response.body?.cancel();
   if (response.status !== 204)
     throw new ReportError(`Report refused or unconfirmed (${response.status}). Stop and inspect this member's recorded report; do not bypass the refusal or submit a different report.`);

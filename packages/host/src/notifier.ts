@@ -41,7 +41,8 @@ export class Notifier {
     private readonly teams?: { statuses(): TeamRow[] },
     private readonly goals?: { statuses(): GoalRow[] },
   ) {}
-  start() { this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
+  /** Lifecycle baselines are taken now, synchronously, so a change during the first interval is not absorbed as startup state. */
+  start() { this.teamEvents(); this.goalEvents(); this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
   stop() { clearInterval(this.timer); }
   async tick() {
     const due: Row[] = [];
@@ -82,19 +83,9 @@ export class Notifier {
     if (!this.teams) return [];
     let teams: TeamRow[];
     try { teams = this.teams.statuses(); } catch { return []; }
-    const due: Lifecycle[] = [];
-    for (const team of teams) {
-      const previous = this.teamStatus.get(team.id);
-      this.teamStatus.set(team.id, team.status);
-      if (!this.teamsPrimed || previous === team.status || team.goal) continue;
-      const category = TEAM_EVENTS[team.status];
-      const event = previous === undefined ? "team-started" : category?.event;
-      if (!event || !this.enabled(event)) continue;
-      due.push({ id: team.id, title: team.title, status: team.status, reason: team.reason, resumable: team.resumable, kind: "team", event,
-        titleText: event === "team-started" ? "Team started" : category.title,
-        body: event === "team-started" ? "started" : category.body,
-        priority: event === "team-started" ? "default" : category.priority });
-    }
+    const due = this.lifecycle("team", teams.filter(team => !team.goal), this.teamStatus, this.teamsPrimed, TEAM_EVENTS, "Team started");
+    // Goal-owned runs still record their status so they never announce as new later.
+    for (const team of teams) if (team.goal) this.teamStatus.set(team.id, team.status);
     this.teamsPrimed = true;
     return due;
   }
@@ -102,20 +93,23 @@ export class Notifier {
     if (!this.goals) return [];
     let goals: GoalRow[];
     try { goals = this.goals.statuses(); } catch { return []; }
-    const due: Lifecycle[] = [];
-    for (const goal of goals) {
-      const previous = this.goalStatus.get(goal.id);
-      this.goalStatus.set(goal.id, goal.status);
-      if (!this.goalsPrimed || previous === goal.status) continue;
-      const category = GOAL_EVENTS[goal.status];
-      const event = previous === undefined ? "goal-started" : category?.event;
-      if (!event || !this.enabled(event)) continue;
-      due.push({ id: goal.id, title: goal.title, status: goal.status, reason: goal.reason, kind: "goal", event,
-        titleText: event === "goal-started" ? "Goal started" : category.title,
-        body: event === "goal-started" ? "started" : category.body,
-        priority: event === "goal-started" ? "default" : category.priority });
-    }
+    const due = this.lifecycle("goal", goals, this.goalStatus, this.goalsPrimed, GOAL_EVENTS, "Goal started");
     this.goalsPrimed = true;
+    return due;
+  }
+  /** A record first seen after priming announces its start and, if it is already stuck or done, that status too. */
+  private lifecycle(kind: "goal" | "team", rows: TeamRow[], statuses: Map<string, string>, primed: boolean, map: typeof TEAM_EVENTS, startedTitle: string) {
+    const due: Lifecycle[] = [];
+    for (const row of rows) {
+      const previous = statuses.get(row.id);
+      statuses.set(row.id, row.status);
+      if (!primed || previous === row.status) continue;
+      const base = { id: row.id, title: row.title, status: row.status, reason: row.reason, resumable: row.resumable, kind };
+      if (previous === undefined && this.enabled(`${kind}-started`))
+        due.push({ ...base, event: `${kind}-started`, titleText: startedTitle, body: "started", priority: "default" });
+      const category = map[row.status];
+      if (category && this.enabled(category.event)) due.push({ ...base, event: category.event, titleText: category.title, body: category.body, priority: category.priority });
+    }
     return due;
   }
   private enabled(event: string) { return this.options.events.includes(event) || (event === "team-stuck" && this.options.events.includes("team-blocked")); }

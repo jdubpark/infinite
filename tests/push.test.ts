@@ -232,3 +232,46 @@ test("a failing lifecycle source does not stop other sources", async () => {
   assert.deepEqual(sent[0].map(message => [message.title, message.data.url]), [["Goal started", "/goal/61111111-1111-4111-8111-111111111111"]]);
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("a record first seen already stuck or finished announces that status too", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "ios");
+  const sent: { title: string; priority: string }[][] = [];
+  const sender = async (messages: never[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const teams: { id: string; title: string; status: string; goal: boolean }[] = [];
+  const goals: { id: string; title: string; status: string }[] = [];
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["team-started", "team-stuck", "goal-finished"], intervalMs: 100000 }, { statuses: () => teams }, { statuses: () => goals });
+  await notifier.tick();
+  // A run can fail preparation, and a goal can finish, between two polls.
+  teams.push({ id: "71111111-1111-4111-8111-111111111111", title: "Failed setup", status: "blocked", goal: false });
+  goals.push({ id: "81111111-1111-4111-8111-111111111111", title: "Quick goal", status: "achieved" });
+  await notifier.tick();
+  assert.deepEqual(sent[0].map(message => [message.title, message.priority]), [["Team started", "default"], ["Team needs you", "high"], ["Goal finished", "default"]]);
+
+  const alias = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["team-blocked"], intervalMs: 100000 }, { statuses: () => teams });
+  await alias.tick();
+  teams.push({ id: "91111111-1111-4111-8111-111111111111", title: "Another failure", status: "blocked", goal: false });
+  await alias.tick();
+  assert.deepEqual(sent.at(-1)!.map(message => message.title), ["Team needs you"]);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("start() takes lifecycle baselines, so a change before the first poll is announced", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "ios");
+  const sent: { title: string }[][] = [];
+  const sender = async (messages: never[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const goals = [{ id: "a1111111-1111-4111-8111-111111111111", title: "Running goal", status: "running" }];
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["goal-stuck"], intervalMs: 100000 }, undefined, { statuses: () => goals });
+  notifier.start();
+  try {
+    goals[0].status = "blocked";
+    await notifier.tick();
+    assert.deepEqual(sent.map(batch => batch.map(message => message.title)), [["Goal needs you"]]);
+  } finally {
+    notifier.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

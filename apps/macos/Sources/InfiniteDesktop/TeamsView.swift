@@ -40,23 +40,35 @@ struct TeamDetailView: View {
     @ObservedObject var model: TeamModel
     @State private var confirmCancel = false
     @State private var confirmDiscard = false
+    @State private var expandedTasks: Set<String> = []
+    @State private var fullRequest = false
     private var team: TeamRun { model.run }
     var body: some View {
         VStack(spacing: 0) {
             header.padding(.horizontal, 14).padding(.vertical, 10)
             Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    banners
-                    decisions
-                    attention
-                    plan
-                    membersSection
-                    evidence
-                    output
-                    history
-                }.padding(20).frame(maxWidth: 900, alignment: .leading)
-            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 22) {
+                        banners
+                        if team.status == "ready-for-review" { reviewPanel }
+                        decisions
+                        attention
+                        section("Run map") {
+                            RunDiagram(team: team) { id in
+                                expandedTasks.insert(id)
+                                withAnimation { proxy.scrollTo(id, anchor: .top) }
+                            }
+                        }
+                        request
+                        plan
+                        evidence
+                        membersSection
+                        output
+                        history
+                    }.padding(20).frame(maxWidth: 900, alignment: .leading)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             Divider()
             composer.padding(12)
         }
@@ -101,11 +113,55 @@ struct TeamDetailView: View {
 
     @ViewBuilder private var banners: some View {
         if !team.reason.isEmpty { note(team.reason, color: .orange) }
-        if team.status == "ready-for-review" {
-            Label("The team reports this run is ready for your review. Inspect the changes and evidence before merging or publishing.", systemImage: "checkmark.circle")
-                .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading).background(Color.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// The team's claim of readiness, the evidence behind it at a glance, and what to do next.
+    /// Nothing here approves or merges; the person decides outside the host or sends a direction.
+    private var reviewPanel: some View {
+        let checks = team.currentChecks
+        let passed = checks.filter { $0["status"].string == "passed" }.count
+        let failed = checks.contains { $0["status"].string == "failed" }
+        let (done, total) = team.progress
+        let verdict = team.currentVerdict
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark.seal.fill").foregroundStyle(.blue)
+                Text("Ready for your review").font(.headline)
+                Spacer()
+                Text("Nothing merges until you do").font(.caption).foregroundStyle(.secondary)
+            }
+            HStack(spacing: 10) {
+                SignalTile(value: "\(done)/\(total)", label: "tasks integrated", source: "host", color: total > 0 && done == total ? .green : .orange)
+                SignalTile(value: checks.isEmpty ? "—" : "\(passed)/\(checks.count)", label: "checks passed", source: "host", color: failed ? .red : !checks.isEmpty && passed == checks.count ? .green : .secondary)
+                SignalTile(value: verdict == "approved" ? "Approved" : verdict == "changes-requested" ? "Changes" : "—", label: "reviewer", source: "agent claim",
+                           color: verdict == "approved" ? .green : verdict == "changes-requested" ? .red : .secondary)
+            }
+            Text("Your review").font(.subheadline.weight(.semibold))
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(team.reviewSteps.enumerated()), id: \.offset) { index, step in
+                    ReviewStepRow(number: index + 1, step: step, enabled: model.canSteer) { text in model.direction = text }
+                }
+            }
+            Divider()
+            HStack(spacing: 10) {
+                Text("Decide").font(.subheadline.weight(.semibold))
+                Button { copy(team.branch) } label: { Label("Looks good · copy branch", systemImage: "checkmark") }
+                    .disabled(team.branch.isEmpty).help("Copies the branch name to merge or publish yourself.")
+                Button { model.direction = "Please change: " } label: { Label("Request changes", systemImage: "arrow.uturn.backward") }
+                    .disabled(!model.canSteer).help("Drafts a direction below. The team replans when you send it.")
+            }.controlSize(.small)
+        }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.blue.opacity(0.25)))
+    }
+
+    private var request: some View {
+        section("Your request") {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(team.objective).font(.callout).textSelection(.enabled).lineLimit(fullRequest ? nil : 2).fixedSize(horizontal: false, vertical: true)
+                Button(fullRequest ? "Show less" : "Show all") { fullRequest.toggle() }.buttonStyle(.link).font(.caption)
+            }
         }
-        section("Your request") { Text(team.objective).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
     }
 
     @ViewBuilder private var decisions: some View {
@@ -142,12 +198,15 @@ struct TeamDetailView: View {
     @ViewBuilder private var plan: some View {
         section("Work plan", count: team.tasks.count) {
             if team.tasks.isEmpty { Text("The coordinator has not reported a work plan yet.").font(.callout).foregroundStyle(.secondary) }
-            ForEach(Array(team.tasks.enumerated()), id: \.offset) { _, task in TaskCard(task: task, team: team) }
+            ForEach(Array(team.tasks.enumerated()), id: \.offset) { _, task in
+                let id = task["id"].string
+                TaskCard(task: task, team: team, expanded: Binding(get: { expandedTasks.contains(id) }, set: { if $0 { expandedTasks.insert(id) } else { expandedTasks.remove(id) } })).id(id)
+            }
         }
     }
 
     @ViewBuilder private var membersSection: some View {
-        section("Team members", count: team.members.count) {
+        DisclosureGroup("Team members (\(team.members.count))") {
             if team.hasLineup { LineupView(lineup: team.lineup) }
             ForEach(Array(team.members.enumerated()), id: \.offset) { _, member in
                 let session = app.sessions.first { $0.id == member["sessionId"].string }
@@ -165,12 +224,11 @@ struct TeamDetailView: View {
                     Button("Open session") { app.openSession(member["sessionId"].string) }.controlSize(.small).disabled(session == nil)
                 }
             }
-        }
+        }.font(.subheadline.weight(.semibold))
     }
 
     @ViewBuilder private var evidence: some View {
-        section("Verification evidence") {
-            Text("Host check results and the reviewer's assessment are recorded separately. Reports are agent claims; checks are the host's own.").font(.caption).foregroundStyle(.secondary)
+        section("Checks · run by the host") {
             if team.checks.isEmpty { Text("No check results recorded yet.").font(.callout).foregroundStyle(.secondary) }
             ForEach(Array(team.checks.enumerated()), id: \.offset) { _, check in
                 DisclosureGroup {
@@ -186,24 +244,30 @@ struct TeamDetailView: View {
                     }
                 }
             }
-            HStack(spacing: 6) { Text("Reviewer assessment").font(.subheadline.weight(.semibold)); Text("agent report").font(.caption).foregroundStyle(.secondary) }.padding(.top, 4)
+        }
+        section("Reviewer · agent claim") {
             if team.review == .null { Text("No reviewer assessment recorded yet.").font(.callout).foregroundStyle(.secondary) }
             else {
-                Text("\(team.review["verdict"].string == "approved" ? "Approved by reviewer" : "Changes requested") · revision \(team.review["revision"].int)").font(.callout.weight(.medium))
-                Text(team.review["summary"].string).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                DisclosureGroup {
+                    Text(team.review["summary"].string).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+                } label: {
+                    Label("\(team.review["verdict"].string == "approved" ? "Approved" : "Changes requested") · revision \(team.review["revision"].int)",
+                          systemImage: team.review["verdict"].string == "approved" ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                        .font(.callout.weight(.medium)).foregroundStyle(team.review["verdict"].string == "approved" ? Color.green : .red)
+                }
             }
         }
     }
 
     @ViewBuilder private var output: some View {
-        section("Review the changes") {
+        DisclosureGroup("Branch and commits") {
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
                 GridRow { Text("Branch").foregroundStyle(.secondary); mono(team.branch) }
                 GridRow { Text("Workspace").foregroundStyle(.secondary); mono(team.workspace) }
                 GridRow { Text("Base commit").foregroundStyle(.secondary); mono(team.baseCommit) }
                 if !team.headCommit.isEmpty { GridRow { Text("Head commit").foregroundStyle(.secondary); mono(team.headCommit) } }
-            }.font(.caption)
-        }
+            }.font(.caption).padding(.top, 6)
+        }.font(.subheadline.weight(.semibold))
     }
 
     @ViewBuilder private var history: some View {
@@ -275,6 +339,9 @@ struct TeamDetailView: View {
     private func note(_ text: String, color: Color) -> some View {
         Text(text).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).padding(12).frame(maxWidth: .infinity, alignment: .leading).background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+    }
     private func mono(_ text: String) -> some View {
         Text(text.isEmpty ? "—" : text).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
     }
@@ -307,51 +374,175 @@ struct DecisionCard: View {
     private func submit() { let value = text; text = ""; answer(value) }
 }
 
+/// One line per task; expanding shows the agent's own report and the brief it worked from.
 struct TaskCard: View {
     let task: JSON
     let team: TeamRun
+    @Binding var expanded: Bool
     private var status: String { task["status"].string }
-    private var icon: (name: String, color: Color) {
-        switch status {
-        case "integrated": return ("checkmark.circle.fill", .green)
-        case "running": return ("circle.dotted.circle", .green)
-        case "waiting": return ("clock", .orange)
-        case "blocked": return ("exclamationmark.triangle", .orange)
-        default: return ("circle", .secondary)
-        }
-    }
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 8) {
-                Image(systemName: icon.name).foregroundStyle(icon.color)
-                Text(task["title"].string).font(.callout.weight(.medium))
-                Spacer()
-                Text(status).font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            Button { withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() } } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: taskIcon(status).name).foregroundStyle(taskIcon(status).color)
+                    Text(task["title"].string).font(.callout.weight(.medium)).lineLimit(1)
+                    Text(agentLabel(task, team)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Spacer()
+                    Text("\(task["paths"].array.count) file\(task["paths"].array.count == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary).rotationEffect(.degrees(expanded ? 90 : 0))
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain)
+            if expanded {
+                let depends = task["dependsOn"].array.map { id in team.task(id.string)?["title"].string ?? id.string }
+                if !depends.isEmpty { Text("After: \(depends.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary) }
+                assigned
+                HStack(spacing: 6) {
+                    Text("Owns").font(.caption).foregroundStyle(.secondary)
+                    ForEach(Array(task["paths"].array.enumerated()), id: \.offset) { _, path in Text(path.string).font(.system(size: 11, design: .monospaced)).lineLimit(1) }
+                }
+                if !task["summary"].string.isEmpty {
+                    Text(task["summary"].string).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        .padding(10).frame(maxWidth: .infinity, alignment: .leading).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+                }
+                DisclosureGroup("Task instructions") {
+                    Text(task["instructions"].string).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+                    if !task["commit"].string.isEmpty { Text("Integrated commit: \(task["commit"].string)").font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary) }
+                }.font(.caption)
             }
-            let depends = task["dependsOn"].array.map { id in team.task(id.string)?["title"].string ?? id.string }
-            Text(depends.isEmpty ? "No task dependencies" : "After: \(depends.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary)
-            assigned
-            HStack(spacing: 6) {
-                Text("Owns").font(.caption).foregroundStyle(.secondary)
-                ForEach(Array(task["paths"].array.enumerated()), id: \.offset) { _, path in Text(path.string).font(.system(size: 11, design: .monospaced)).lineLimit(1) }
-            }
-            if !task["summary"].string.isEmpty { Text(task["summary"].string).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
-            DisclosureGroup("Task instructions") {
-                Text(task["instructions"].string).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).padding(.top, 4)
-                if !task["commit"].string.isEmpty { Text("Integrated commit: \(task["commit"].string)").font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary) }
-            }.font(.caption)
-        }.padding(12).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+        }.padding(10).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
     }
     @ViewBuilder private var assigned: some View {
-        let member = task["memberId"].string.isEmpty ? nil : team.member(task["memberId"].string)
-        let profile = member.flatMap { $0["modelProfile"] == .null ? nil : $0["modelProfile"] }
-            ?? team.lineup["implementers"].array.first { $0["id"].string == task["agentProfileId"].string && !task["agentProfileId"].string.isEmpty }
         HStack(spacing: 6) {
             Text("Assigned agent").font(.caption).foregroundStyle(.secondary)
-            if let profile { ProfileLine(profile: profile) }
+            if let profile = taskProfile(task, team) { ProfileLine(profile: profile) }
             else if !task["agentProfileId"].string.isEmpty { Text("Profile \(task["agentProfileId"].string) · model details unavailable").font(.caption) }
             else if team.hasLineup { Text("Model assignment pending").font(.caption) }
-            else { Text(providerName(member?["provider"].string.isEmpty == false ? member!["provider"].string : team.provider)).font(.caption) }
+            else { Text(agentLabel(task, team)).font(.caption) }
+        }
+    }
+}
+
+private func taskIcon(_ status: String) -> (name: String, color: Color) {
+    switch status {
+    case "integrated": return ("checkmark.circle.fill", .green)
+    case "running": return ("circle.dotted.circle", .green)
+    case "waiting": return ("clock", .orange)
+    case "blocked": return ("exclamationmark.triangle", .orange)
+    default: return ("circle", .secondary)
+    }
+}
+private func taskProfile(_ task: JSON, _ team: TeamRun) -> JSON? {
+    let member = task["memberId"].string.isEmpty ? nil : team.member(task["memberId"].string)
+    return member.flatMap { $0["modelProfile"] == .null ? nil : $0["modelProfile"] }
+        ?? team.lineup["implementers"].array.first { $0["id"].string == task["agentProfileId"].string && !task["agentProfileId"].string.isEmpty }
+}
+private func agentLabel(_ task: JSON, _ team: TeamRun) -> String {
+    if let profile = taskProfile(task, team) { return profile["label"].string }
+    let member = task["memberId"].string.isEmpty ? nil : team.member(task["memberId"].string)
+    return providerName(member?["provider"].string.isEmpty == false ? member!["provider"].string : team.provider)
+}
+
+/// The run as a pipeline: plan, the tasks in dependency columns, then integration, checks,
+/// review, and the person. Tapping a task opens its card below.
+struct RunDiagram: View {
+    let team: TeamRun
+    let select: (String) -> Void
+    var body: some View {
+        let stages = team.stages
+        let columns = team.taskColumns
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .center, spacing: 0) {
+                StageNode(name: stages[0].name, state: stages[0].state)
+                arrow
+                if columns.isEmpty { StageNode(name: stages[1].name, state: stages[1].state); arrow }
+                ForEach(Array(columns.enumerated()), id: \.offset) { _, column in
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(column.enumerated()), id: \.offset) { _, task in
+                            Button { select(task["id"].string) } label: { taskNode(task) }.buttonStyle(.plain).help("Show this task's report")
+                        }
+                    }
+                    arrow
+                }
+                ForEach(2..<stages.count, id: \.self) { index in
+                    StageNode(name: stages[index].name, state: stages[index].state)
+                    if index < stages.count - 1 { arrow }
+                }
+            }.padding(.vertical, 2)
+        }
+    }
+    private var arrow: some View { Image(systemName: "arrow.right").font(.caption).foregroundStyle(.tertiary).padding(.horizontal, 6) }
+    private func taskNode(_ task: JSON) -> some View {
+        let icon = taskIcon(task["status"].string)
+        return HStack(spacing: 6) {
+            Image(systemName: icon.name).foregroundStyle(icon.color).font(.caption)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(task["title"].string).font(.caption.weight(.medium)).lineLimit(1)
+                Text("\(agentLabel(task, team)) · \(task["paths"].array.count) file\(task["paths"].array.count == 1 ? "" : "s")").font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }.padding(.horizontal, 8).padding(.vertical, 6).frame(width: 165, alignment: .leading)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(icon.color.opacity(0.45)))
+    }
+}
+
+struct StageNode: View {
+    let name: String
+    let state: TeamRun.StageState
+    var body: some View {
+        let style: (icon: String, color: Color) = switch state {
+        case .done: ("checkmark.circle.fill", .green)
+        case .active: (name == "You" ? "person.fill" : "circle.dotted.circle", name == "You" ? .blue : .orange)
+        case .failed: ("xmark.octagon.fill", .red)
+        case .pending: ("circle", .secondary)
+        }
+        VStack(spacing: 3) {
+            Image(systemName: style.icon).foregroundStyle(style.color)
+            Text(name).font(.caption.weight(state == .pending ? .regular : .medium)).foregroundStyle(state == .pending ? .secondary : .primary)
+        }.frame(minWidth: 58).padding(.vertical, 7).padding(.horizontal, 6)
+        .background(style.color.opacity(state == .pending ? 0.04 : 0.12), in: RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+/// One number with where it came from, so host facts and agent claims never blur.
+struct SignalTile: View {
+    let value: String
+    let label: String
+    let source: String
+    let color: Color
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(value).font(.system(size: 20, weight: .semibold, design: .rounded)).foregroundStyle(color)
+            Text(label).font(.caption)
+            Text(source).font(.system(size: 10)).foregroundStyle(.secondary)
+        }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+struct ReviewStepRow: View {
+    let number: Int
+    let step: TeamRun.ReviewStep
+    let enabled: Bool
+    let draft: (String) -> Void
+    @State private var copied = false
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text("\(number)").font(.caption.weight(.bold)).foregroundStyle(.white).frame(width: 18, height: 18)
+                .background(step.urgent ? Color.red : .blue, in: Circle())
+            VStack(alignment: .leading, spacing: 1) {
+                Text(step.title).font(.callout.weight(.medium))
+                Text(step.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Spacer(minLength: 8)
+            switch step.action {
+            case .direction(let text):
+                Button("Draft") { draft(text) }.controlSize(.small).disabled(!enabled).help("Puts this direction in the box below for you to edit and send.")
+            case .copy(let text):
+                Button(copied ? "Copied" : "Copy") {
+                    NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string); copied = true
+                }.controlSize(.small).help(text)
+            }
         }
     }
 }

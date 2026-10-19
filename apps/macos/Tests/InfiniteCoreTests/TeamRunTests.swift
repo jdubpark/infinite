@@ -83,4 +83,57 @@ final class TeamRunTests: XCTestCase {
         XCTAssertFalse(run([:]).hasLineup)
         XCTAssertTrue(run(["lineup": .object(["coordinator": .object(["label": .string("Opus")])])]).hasLineup)
     }
+
+    private func task(_ id: String, _ status: String, after: [String] = [], summary: String = "") -> JSON {
+        .object(["id": .string(id), "title": .string("Task " + id), "status": .string(status), "dependsOn": .array(after.map { .string($0) }), "paths": .array([.string("src/\(id).mjs")]), "summary": .string(summary)])
+    }
+    private func check(_ status: String, revision: Int = 2, args: [String] = ["test"], phase: String? = nil) -> JSON {
+        var fields: [String: JSON] = ["command": .object(["command": .string("npm"), "args": .array(args.map { .string($0) })]), "status": .string(status), "revision": .number(Double(revision)), "output": .string("")]
+        if let phase { fields["phase"] = .string(phase) }
+        return .object(fields)
+    }
+
+    func testTaskColumnsFollowDependencyDepthAndSurviveBadEdges() {
+        let team = run(["tasks": .array([task("a", "integrated"), task("b", "integrated"), task("c", "pending", after: ["a", "b"]), task("d", "pending", after: ["c", "missing"])])])
+        XCTAssertEqual(team.taskColumns.map { $0.map { $0["id"].string } }, [["a", "b"], ["c"], ["d"]])
+        // A cycle still shows both tasks instead of dropping them or looping forever.
+        let cycle = run(["tasks": .array([task("x", "pending", after: ["y"]), task("y", "pending", after: ["x"])])])
+        XCTAssertEqual(Set(cycle.taskColumns.flatMap { $0.map { $0["id"].string } }), ["x", "y"])
+    }
+
+    func testCurrentChecksKeepTheLatestResultPerCommandInThisRevision() {
+        let team = run(["checks": .array([check("passed", revision: 1), check("failed"), check("passed"), check("passed", args: ["run", "build"]), check("passed", args: ["ci"], phase: "setup")])])
+        XCTAssertEqual(team.currentChecks.map { "\(TeamRun.commandLine($0["command"])) \($0["status"].string)" }, ["npm test passed", "npm run build passed"])
+    }
+
+    func testStagesReflectEvidenceAndStaleVerdictsDoNotCount() {
+        let ready = run(["status": .string("ready-for-review"), "headCommit": .string("bbb"), "tasks": .array([task("a", "integrated")]), "checks": .array([check("passed")]),
+                         "review": .object(["verdict": .string("approved"), "revision": .number(2), "summary": .string("ok")])])
+        XCTAssertEqual(ready.stages.map(\.state), [.done, .done, .done, .done, .done, .active])
+        let stale = run(["status": .string("reviewing"), "tasks": .array([task("a", "integrated")]), "checks": .array([check("failed")]),
+                         "review": .object(["verdict": .string("approved"), "revision": .number(1), "summary": .string("ok")])])
+        XCTAssertNil(stale.currentVerdict)
+        XCTAssertEqual(stale.stages.map(\.state), [.done, .done, .pending, .failed, .active, .pending])
+        XCTAssertEqual(run(["status": .string("planning")]).stages.first?.state, .active)
+    }
+
+    func testLimitationsAreReadFromTheAgentsReportHeading() {
+        let summary = "Changes:\n- did things\n\nLimitations:\n- No Linear MCP tool was available,\n  so no comment was posted.\n\nNext: none"
+        XCTAssertEqual(TeamRun.limitations(summary), "No Linear MCP tool was available, so no comment was posted.")
+        XCTAssertEqual(TeamRun.limitations("Limitations: none known"), "none known")
+        XCTAssertNil(TeamRun.limitations("All good."))
+    }
+
+    func testReviewStepsPutBlockersFirstAndNeverInventApproval() {
+        let team = run(["status": .string("ready-for-review"), "baseCommit": .string("aaa"), "headCommit": .string("bbb"), "branch": .string("team/x"),
+                        "tasks": .array([task("a", "integrated", summary: "Limitations:\nNo fixture for empty input.")]), "checks": .array([check("failed")]),
+                        "review": .object(["verdict": .string("changes-requested"), "revision": .number(2), "summary": .string("fix")])])
+        let steps = team.reviewSteps
+        XCTAssertEqual(steps.map(\.title), ["Fix the failing check", "Address the reviewer's changes", "Resolve a flagged limitation", "Read the diff", "Ask for end-to-end proof", "Ask what could break"])
+        XCTAssertEqual(steps.prefix(2).map(\.urgent), [true, true])
+        XCTAssertEqual(steps[3].action, .copy("git diff aaa..bbb"))
+        let clean = run(["status": .string("ready-for-review"), "tasks": .array([task("a", "integrated")]), "checks": .array([check("passed")])])
+        XCTAssertFalse(clean.reviewSteps.contains { $0.urgent })
+        XCTAssertFalse(clean.reviewSteps.contains { $0.title == "Read the diff" })
+    }
 }

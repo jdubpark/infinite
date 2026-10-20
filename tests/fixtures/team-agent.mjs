@@ -191,6 +191,7 @@ async function main() {
       { id: "a", title: "Build the first file", instructions: "Write a.txt with the current revision", paths: ["a.txt"], dependsOn: [] },
       { id: "b", title: "Build the second file", instructions: "Write b.txt with the current revision", paths: ["b.txt"], dependsOn: [] },
     ];
+    if (scenario === "scale-up") tasks.push({ id: "c", title: "Build the third file", instructions: "Write c.txt with the current revision", paths: ["c.txt"], dependsOn: [] });
     if (scenario.startsWith("bootstrap")) tasks[0].paths.push("check.mjs");
     if (scenario === "usage") {
       tasks[0].agentProfileId = "spark-high";
@@ -251,7 +252,24 @@ async function main() {
       verdict: scenario === "permissions-escalate" ? "escalate" : "approve-once",
       summary: "The request is limited to reading the assigned project file for the stated objective." });
   } else if (assignment.role === "implementer") {
-    await waitForPeer();
+    if (scenario !== "live-limit") await waitForPeer();
+    if (scenario === "scale-up" && assignment.taskId === "a") {
+      const until = Date.now() + 20000;
+      while (!readdirSync(receiptDir).filter(name => name.endsWith(".json"))
+        .map(name => JSON.parse(readFileSync(join(receiptDir, name), "utf8")))
+        .some(value => value.runId === assignment.runId && value.revision === assignment.revision && value.role === "implementer" && value.taskId === "c")) {
+        if (Date.now() >= until) throw new Error("Task c did not start before task a finished");
+        await new Promise(resolve => setTimeout(resolve, 40));
+      }
+    }
+    if (scenario === "live-limit" && assignment.taskId === "a") {
+      writeFileSync(join(receiptDir, `${assignment.runId}.a-started`), "started", { mode: 0o600 });
+      const until = Date.now() + 30000;
+      while (!existsSync(join(receiptDir, `${assignment.runId}.release`))) {
+        if (Date.now() >= until) throw new Error("The test did not release the first implementer");
+        await new Promise(resolve => setTimeout(resolve, 40));
+      }
+    }
     const asked = join(receiptDir, `${assignment.runId}.${assignment.taskId}.asked`);
     if ((scenario === "mixed" || (scenario === "bootstrap-replan" || scenario === "bootstrap-change") && assignment.revision === 1) && assignment.taskId === "b" && !existsSync(asked)) {
       writeFileSync(asked, "asked", { mode: 0o600 });

@@ -443,6 +443,62 @@ test("review rubrics drop self-grading, integration records docs/tests, and owne
   } finally { await f.close(); }
 });
 
+test("a finished implementer releases its slot so a third independent task can start", { timeout: 120000 }, async () => {
+  const f = await fixture("scale-up", undefined, {}, { parallelism: 2 });
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.deepEqual(finished.tasks.map(task => task.status), ["integrated", "integrated", "integrated"]);
+    const workers = readdirSync(f.receipts).filter(name => name.endsWith(".json"))
+      .map(name => JSON.parse(readFileSync(join(f.receipts, name), "utf8")))
+      .filter(value => value.runId === finished.id && value.role === "implementer");
+    assert.deepEqual(workers.map(worker => worker.taskId).sort(), ["a", "b", "c"]);
+    assert.ok(workers.find(worker => worker.taskId === "c")!.startedAt < workers.find(worker => worker.taskId === "a")!.finishedAt,
+      "Task c must start while task a is still running");
+    const moments = workers.flatMap(worker => [[worker.startedAt, 1], [worker.finishedAt, -1] as [number, number]] as [number, number][]).sort((a, b) => a[0] - b[0]);
+    let running = 0, maximum = 0;
+    for (const [, delta] of moments) { running += delta; maximum = Math.max(maximum, running); }
+    assert.ok(maximum <= 2, `Observed ${maximum} overlapping implementers`);
+  } finally { await f.close(); }
+});
+
+test("an owner can raise a running team's worker limit and retries are scoped to their request body", { timeout: 120000 }, async () => {
+  const f = await fixture("live-limit", undefined, {}, { parallelism: 1 });
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    await waitFor(() => existsSync(join(f.receipts, `${created.body.id}.a-started`)), Boolean, 30000);
+    const before = await f.get(created.body.id);
+    assert.deepEqual(before.workers, { limit: 1, max: 4, running: 1, ready: 1 });
+    const request = { requestId: randomUUID(), revision: before.revision, parallelism: 2 };
+    const changed = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", request);
+    assert.equal(changed.status, 200, JSON.stringify(changed.body));
+    assert.equal(changed.body.revision, before.revision);
+    assert.equal(changed.body.workers.limit, 2);
+    const retry = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", request);
+    assert.equal(retry.status, 200);
+    assert.equal(retry.body.revision, before.revision);
+    const conflict = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", { ...request, parallelism: 1 });
+    assert.deepEqual([conflict.status, conflict.body.code], [409, "request-conflict"]);
+    const stale = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", { requestId: randomUUID(), revision: before.revision + 1, parallelism: 1 });
+    assert.deepEqual([stale.status, stale.body.code], [409, "stale-team-revision"]);
+    for (const role of ["controller", "viewer"] as const)
+      assert.equal((await f.host.fetchApi(`/teams/${before.id}/parallelism`, role, { requestId: randomUUID(), revision: before.revision, parallelism: 1 })).status, 403);
+    await waitFor(() => readdirSync(f.receipts).filter(name => name.endsWith(".json"))
+      .map(name => JSON.parse(readFileSync(join(f.receipts, name), "utf8")))
+      .some(value => value.runId === before.id && value.role === "implementer" && value.taskId === "b"), Boolean, 30000);
+    writeFileSync(join(f.receipts, `${before.id}.release`), "release", { mode: 0o600 });
+    const finished = await f.settled(before.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.workers.limit, 2);
+    assert.equal(finished.revision, before.revision);
+    const closed = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", { requestId: randomUUID(), revision: finished.revision, parallelism: 1 });
+    assert.deepEqual([closed.status, closed.body.code], [409, "team-not-running"]);
+  } finally { await f.close(); }
+});
+
 test("mixed teams pin real worker launches across configuration changes, restart, and a question retry", { timeout: 120000 }, async () => {
   const f = await fixture("mixed", mixedLineup, {}, { trustWorkspaces: true });
   try {

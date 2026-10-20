@@ -51,9 +51,10 @@ export function useRunRequest<R extends { id: string; revision: number }>(connec
     /** The last message reports a recorded result rather than a failure. */
     recorded: Boolean(state.result),
     dismissMessage,
-    send(path: string, label: string, revision: number, fields: Record<string, string> = {}) {
+    send(path: string, label: string, revision: number, fields: Record<string, string | number> = {}) {
       if (busy || pending) return;
-      void send(runRequests.begin(key, { requestId: Crypto.randomUUID(), revision, path, label, fields }));
+      // The request store's legacy field declaration is string-only; keep the runtime number intact for JSON.
+      void send(runRequests.begin(key, { requestId: Crypto.randomUUID(), revision, path, label, fields: fields as Record<string, string> }));
     },
     retry() { if (pending && !busy) { setRetrying(true); void send(pending); } },
     /** Only after the person has checked the run: the host may already have applied the request. */

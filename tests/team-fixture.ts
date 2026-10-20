@@ -33,7 +33,7 @@ export const limitLineup: TeamLineup = {
 };
 
 /** `trustWorkspaces` also gives the host its own HOME, where a Claude member's trust is recorded. */
-export async function fixture(scenario = "success", lineup?: TeamLineup, config: Partial<Config> = {}, options: { trustWorkspaces?: boolean; env?: NodeJS.ProcessEnv } = {}) {
+export async function fixture(scenario = "success", lineup?: TeamLineup, config: Partial<Config> = {}, options: { trustWorkspaces?: boolean; env?: NodeJS.ProcessEnv; parallelism?: number } = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-team-"));
   const home = join(root, "home");
   if (options.trustWorkspaces) mkdirSync(home, { mode: 0o700 });
@@ -95,7 +95,7 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
   } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
   const create = (): CreateTeam => ({ requestId: randomUUID(), projectId: "rehearsal", provider: lineup?.coordinator.provider ?? "demo",
     ...(lineup ? { useConfiguredLineup: true } : {}), title: "Implement a small feature",
-    objective: "Create two independent files and verify their integrated contents.", parallelism: 2 });
+    objective: "Create independent files and verify their integrated contents.", parallelism: options.parallelism ?? 2 });
   const get = async (id: string): Promise<TeamView> => {
     const response = await host.fetchApi(`/teams/${id}`);
     assert.equal(response.status, 200, JSON.stringify(response.body));

@@ -100,8 +100,9 @@ export function TeamCreate({ connection }: { connection: Connection }) {
         : <><Choices values={providers} selected={singleProvider} disabled={locked} label={providerName} onSelect={setProvider} />
           <Text style={t.note}>All roles use this provider with its host settings.</Text></>}
       {!lineupSelected && singleProvider === "demo" ? <Text style={t.warning}>Rehearsal uses a local test process. It does not call an AI model or implement a real feature.</Text> : null}
-      <Text style={t.label}>Parallel implementers</Text>
+      <Text style={t.label}>Worker limit</Text>
       <Choices values={Array.from({ length: maxParallelism }, (_, index) => index + 1)} selected={Math.min(parallelism, maxParallelism)} disabled={locked} label={String} onSelect={setParallelism} />
+      <Text style={t.note}>The team starts a worker when a task is ready and stops it when the task is done, up to this limit. You can change the limit while the team runs.</Text>
       <Text style={t.note}>Work runs on {me?.machine?.label || connection.label || "this machine"} in isolated workspaces with the provider permissions already configured there. A refused tool can stop a member; inspect its session before continuing.</Text>
       {creation.message ? <Text accessibilityRole="alert" style={t.warning}>{creation.message}</Text> : null}
       <View style={s.section}><Button busy={busy} title={pending && (!busy || retrying) ? "Retry same request" : "Start team"} disabled={busy || !allowed} onPress={() => void submit()} /></View>

@@ -158,6 +158,8 @@ export type CreateTeam = z.infer<typeof createTeamSchema>;
 export const teamMutationSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000) }).strict();
 export const teamActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export const teamTaskRatingSchema = z.object({ requestId: z.uuid(), score: z.number().int().min(1).max(5), note: z.string().trim().max(1000).optional() }).strict();
+export const teamParallelismSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), parallelism: z.number().int().min(1).max(4) }).strict();
+export type TeamParallelism = z.infer<typeof teamParallelismSchema>;
 const taskId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/);
 const ownedPath = z.string().min(1).max(300).refine(value => !value.startsWith("/") && !value.includes("\\") && !value.includes("\0") && !value.split("/").some(part => part === ".." || part === ".git" || part === "." || part === ""), "Use a repository-relative file or directory without glob syntax").refine(value => !/[*?\[\]:]/.test(value));
 export const teamGoalContextSchema = z.object({
@@ -241,6 +243,8 @@ export interface TeamMember extends TeamAssignment {
   stopRequestId: string;
   /** Why the host stopped this member without a report, such as a provider usage limit. */
   stoppedReason?: string;
+  /** Set only after stopped() confirms exit while the member waits for serialized integration. */
+  exitConfirmedAt?: string;
   /** Computed on read for members whose provider reports usage; never stored. */
   usage?: UsageTotals;
 }
@@ -344,5 +348,6 @@ export type TeamView = Omit<TeamRun, "members" | "permissionDecisions"> & {
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt">[];
   usage: UsageRollup;
   providerLimits: ProviderLimit[];
+  workers: { limit: number; max: number; running: number; ready: number };
   resumable: boolean;
 };

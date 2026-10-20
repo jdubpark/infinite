@@ -17,7 +17,7 @@ const LIMITS = [
   { key: "maxRuns", label: "Maximum cycles", min: 1, max: 10, initial: 3 },
   { key: "maxMinutes", label: "Time limit (minutes)", min: 5, max: 1440, initial: 60 },
   { key: "maxMembers", label: "Maximum agent members", min: 4, max: 200, initial: 24 },
-  { key: "parallelism", label: "Parallel workers", min: 1, max: 4, initial: 3 },
+  { key: "parallelism", label: "Worker limit", min: 1, max: 4, initial: 3 },
 ] as const;
 type LimitKey = (typeof LIMITS)[number]["key"];
 
@@ -117,6 +117,7 @@ export function GoalCreate({ connection }: { connection: Connection }) {
           editable={!locked} keyboardType="number-pad" maxLength={4} style={[t.input, s.number]} />
       </View>)}
       <Text style={t.note}>Limits cover the whole goal. The deadline starts when the host accepts it; pausing does not extend it.</Text>
+      <Text style={t.note}>The team starts a worker when a task is ready and stops it when the task is done, up to this limit. You can change the limit while the goal runs; a change applies to the active cycle and later cycles.</Text>
       {me?.teams?.lineup ? <Disclosure title="Configured agents and data use">
         <Text style={t.note}>The host records these requested settings when the goal starts. Provider policy may override them.</Text>
         <LineupView lineup={me.teams.lineup} />

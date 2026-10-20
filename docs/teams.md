@@ -249,7 +249,7 @@ coordinator to select and build work within those boundaries.
 | `extendMinutes` | 0 | 0–240 minutes added each time the deadline arrives while an agent is active; 0 turns extensions off |
 | `maxTotalMinutes` | `maxMinutes` | 5–1,440 minutes, at least `maxMinutes`; the ceiling for the deadline, including extensions |
 | `maxMembers` | 24 | 4–200 member attempts across the goal, including scouts, questions resumed as new attempts, review, repair, and escalation |
-| `parallelism` | 3 | 1–4 concurrent workers within a cycle, subject to host session capacity |
+| `parallelism` | 3 | 1–4 concurrent workers within a cycle, subject to host session capacity; the owner can change it while the goal runs |
 
 Pausing does not extend the deadline or restore consumed attempts. Steering can
 change the direction, but cannot expand the approved paths, deadline, or limits.
@@ -511,6 +511,32 @@ unknown profiles, missing dependencies, cycles, duplicate task IDs, and
 overlapping ownership between independent tasks. Dependent tasks wait for their
 prerequisites to be integrated. Independent workers run in parallel; integration
 is serialized.
+
+### Worker scaling
+
+The worker limit caps how many scouts and implementers run at once. The host
+starts one whenever a task is ready (its dependencies are integrated) and fewer
+workers than the limit hold a slot.
+
+A worker holds its slot until it reports and the host confirms its process
+stopped. A finished implementer waiting for serialized integration and a member
+waiting for a user answer do not hold slots. Once the answer is recorded, the
+member's replacement starts without waiting for a free slot, so the running count
+can briefly exceed the limit.
+
+The owner can raise or lower the limit while a team or goal runs. Raising it
+starts more ready tasks on the next scheduling pass. Lowering it never stops a
+running worker; it only holds new starts until fewer workers than the new limit
+are running. A change does not create a new team revision or discard reports.
+
+The limit counts concurrent workers, not member attempts. It does not change
+`maxMembers`, deadlines or spend. Host session capacity still applies. Handoff
+teams allow 1–2.
+
+The owner sets the limit; agents cannot change it.
+
+Team and goal views show "{running} of {limit} workers running", plus a note when
+ready tasks are waiting for a worker.
 
 A worker can request one escalation per task to a different profile in the
 approved escalation pool, with a reason and an account of partial work. The host
@@ -952,6 +978,7 @@ mutation returns the current Goal or Team record.
 | `POST /api/goals/:id/steer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/goals/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner |
 | `POST /api/goals/:id/extend` | `requestId`, `revision`, `minutes` (5–1,440) | Owner |
+| `POST /api/goals/:id/parallelism` | `requestId`, `revision`, `parallelism` (1–4) | Owner |
 | `POST /api/goals/:id/outcome` | `requestId`, `revision`, `result`, `summary`, `evidence` | Owner/controller |
 
 Creation requires `requestId` (UUID), `projectId`, `title` (up to 100 characters),
@@ -971,6 +998,10 @@ It leaves scope and budgets unchanged. Outcome `result` is `achieved`,
 pending operation. Resume requires a paused goal whose deadline has not expired;
 extend the goal first if it has.
 
+A parallelism change applies to the active cycle and later cycles. It is refused
+with `goal-not-running` for a goal that is not running, needing input or paused,
+and with `goal-launch-pending` while the next cycle is attaching.
+
 ### Teams
 
 | Method and endpoint | Body | Role |
@@ -982,6 +1013,7 @@ extend the goal first if it has.
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
+| `POST /api/teams/:id/parallelism` | `requestId`, `revision`, `parallelism` (1–4; 1–2 for handoff teams) | Owner; standalone teams |
 
 ## Model scorecard
 
@@ -996,9 +1028,17 @@ Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route
 remains available for its active cycle while the goal is running.
 
+A parallelism change is refused with `goal-owned-team` for a goal-owned team and
+with `team-not-running` for a cancelled, ready-for-review, merged or no-change
+team. A value above a handoff team's maximum is refused with
+`team-parallelism-limit`. Stale revisions and request conflicts follow the usual
+rules.
+
 `GET /api/me` advertises `teams: {enabled, maxParallelism, lineup?}`,
 `goals: {enabled}`, each project's configured checks, and optional
-`projects[].linear: {enabled}`. Goal and Team records include optional `linear`
+`projects[].linear: {enabled}`. Team records include
+`workers: {limit, max, running, ready}`, where `max` is the highest limit allowed
+for that team. Goal and Team records include optional `linear`
 tracking with `status` (`pending`, `synced`, `blocked`, or `error`), `reason`,
 `checkedAt`, and the latest issue snapshot when available. Goals are enabled
 only when the configured coordinator and reviewer both carry `tier: "strong"`.

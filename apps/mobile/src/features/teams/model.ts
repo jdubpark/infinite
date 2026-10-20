@@ -17,11 +17,13 @@ export type TeamBrief = { title: string; problem: string; evidence: TeamEvidence
 export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { toProfileId: string; reason: string }; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
 export type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string };
 export type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" };
+export type TeamWorkers = { limit: number; max: number; running: number; ready: number };
 /** The coordinator's recorded decision about one member's open provider prompt; the prompt itself stays host-private. */
 export type PermissionDecision = { id: string; revision: number; targetMemberId: string; targetSessionId: string; promptId: number; expiresAt: string; status: "pending" | "reviewing" | "approved" | "answering" | "answered" | "escalated" | "stale" | "uncertain"; reason?: string };
 export type TeamCheck = { command: TeamCommand; phase?: "setup"; status: "running" | "passed" | "failed" | "interrupted"; startedAt: string; finishedAt?: string; exitCode?: number | null; output: string; revision: number };
 export type TeamView = {
   id: string; projectId: string; provider: string; title: string; objective: string; parallelism: number;
+  workers?: TeamWorkers;
   revision: number; status: TeamStatus; createdAt: string; updatedAt: string; workspace: string;
   branch: string; baseCommit: string; headCommit?: string; tasks: TeamTask[]; members: TeamMember[];
   decisions: TeamDecision[]; checks: TeamCheck[]; steering: { text: string; revision: number; at: string }[];
@@ -41,6 +43,15 @@ export type TeamView = {
   permissionsRevokedAt?: string;
   permissionDecisions?: PermissionDecision[];
 };
+
+/** Live implementer capacity, with the creation limit as a fallback for older hosts. */
+export function workerStatus(team: Pick<TeamView, "parallelism" | "workers">): string {
+  if (!team.workers) return `Up to ${team.parallelism} workers`;
+  const { running, limit, ready } = team.workers;
+  const status = `${running} of ${limit} workers running`;
+  if (ready > 0 && running >= limit) return `${status} · ${ready} ready task${ready === 1 ? "" : "s"} waiting for a worker`;
+  return status;
+}
 
 /** Blocked runs lead the team list; each status group keeps its received order. */
 export function blockedTeamsFirst(teams: TeamView[]) {

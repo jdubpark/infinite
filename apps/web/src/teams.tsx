@@ -34,9 +34,11 @@ export type TeamView = {
   noChange?: { summary: string; evidence: TeamEvidence[] };
   stopReason?: "deadline" | "member-limit";
   resumable?: boolean;
+  /** Omitted by older hosts. */
+  workers?: { limit: number; max: number; running: number; ready: number };
 };
 type CreateRequest = { requestId: string; projectId: string; provider: string; title: string; objective: string; parallelism: number; useConfiguredLineup?: boolean };
-type MutationRequest = { requestId: string; revision: number; text?: string; path: string; label: string };
+type MutationRequest = { requestId: string; revision: number; text?: string; parallelism?: number; path: string; label: string };
 const creations = requestStore<CreateRequest, { id: string }>();
 const mutations = requestStore<MutationRequest, { id: string }>();
 const inFlight = new Set<string>();
@@ -56,6 +58,17 @@ const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"]
 function Status({ status }: { status: TeamStatus }) { return <span className={"team-status " + statusClass(status)}><span className="dot" />{labels[status]}</span>; }
 function RoleGuide() { return <div className="team-roles" aria-label="Team responsibilities">{Object.entries(roles).map(([id, role]) => <div key={id}><strong>{role.name}</strong><p>{role.description}</p></div>)}</div>; }
 const leadLabel = (team: TeamView) => team.lineup ? "Coordinator: " + team.lineup.coordinator.label : names[team.provider] ?? team.provider;
+export const teamWorkerLimitHelp = "The team starts a worker when a task is ready and stops it when the task is done, up to this limit. You can change the limit while the team runs.";
+export const goalWorkerLimitHelp = "The team starts a worker when a task is ready and stops it when the task is done, up to this limit. You can change the limit while the goal runs; a change applies to the active cycle and later cycles.";
+/** Older hosts omit worker counts, so the static limit stands in for the live status. */
+export function workerStatus(parallelism: number, workers?: NonNullable<TeamView["workers"]>) {
+  if (!workers) return `Up to ${parallelism} workers`;
+  const waiting = workers.ready > 0 && workers.running >= workers.limit ? ` · ${workers.ready} ready ${workers.ready === 1 ? "task" : "tasks"} waiting for a worker` : "";
+  return `${workers.running} of ${workers.limit} workers running${waiting}`;
+}
+export function WorkerLimitOptions({ max }: { max: number }) {
+  return <>{Array.from({ length: max }, (_, index) => index + 1).map(value => <option key={value} value={value}>{`Up to ${value} ${value === 1 ? "worker" : "workers"}`}</option>)}</>;
+}
 export function profileSetting(profile: TeamModelProfile) { return profile.provider === "opencode" ? profile.variant ? "variant: " + profile.variant : "provider default variant" : "effort: " + profile.effort; }
 export function ModelProfile({ profile }: { profile: TeamModelProfile }) {
   return <span className="team-model-profile"><strong>{profile.label}{profile.tier && <span className="team-profile-tier">{profile.tier}</span>}</strong><span>Requested: {names[profile.provider] ?? profile.provider} · <code>{profile.model}</code> · {profileSetting(profile)}</span>{profile.limitFallback && <span>On a usage limit: <code>{profile.limitFallback}</code></span>}{profile.dataUse === "contributor" && <span className="team-data-use">Contributor data use is enabled for this profile. Its provider’s contributor terms apply.</span>}</span>;
@@ -214,7 +227,7 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
         </div>
         {lineup && !useConfiguredLineup && <><label htmlFor="team-provider">Agent provider</label><select id="team-provider" value={provider} onChange={event => setProvider(event.target.value)}>{providers.map(value => <option key={value} value={value}>{names[value] ?? value}</option>)}</select><p className="form-note">All roles use this provider with its host settings.</p></>}
         {useConfiguredLineup && <div className="team-lineup-preview"><h2>Configured lineup</h2><p className="quiet">The coordinator assigns each task to a profile from this implementer pool. These are requested model settings; provider policy may override them.</p>{lineup ? <Lineup lineup={lineup} /> : <p className="team-notice">The host’s current lineup is unavailable. Retrying will preserve the original creation request.</p>}</div>}
-        <label htmlFor="team-parallelism">Parallel implementers</label><select id="team-parallelism" value={Math.min(parallelism, maxParallelism)} onChange={event => setParallelism(Number(event.target.value))}>{Array.from({ length: maxParallelism }, (_, index) => index + 1).map(value => <option key={value} value={value}>{value} {value === 1 ? "implementer" : "implementers"}</option>)}</select>
+        <label htmlFor="team-parallelism">Worker limit</label><select id="team-parallelism" aria-describedby="team-parallelism-help" value={Math.min(parallelism, maxParallelism)} onChange={event => setParallelism(Number(event.target.value))}><WorkerLimitOptions max={maxParallelism} /></select><p className="form-note" id="team-parallelism-help">{teamWorkerLimitHelp}</p>
       </fieldset>
       {me.teams?.enabled && !(project?.team?.checks.length || project?.team?.establishChecks) && <p className="team-notice">This workspace needs required team checks in the host configuration.</p>}
       {project?.linear?.enabled && <p className="form-note">This workspace tracks team work in Linear. Starting the team creates an issue; its workflow state remains under your control.</p>}
@@ -320,9 +333,9 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   const fresh = connected && view.fresh;
   const canSteer = fresh && me.role !== "viewer" && team?.status !== "cancelled" && team?.status !== "delivering" && !team?.deliveryReceipt;
   const canOwn = fresh && me.role === "owner";
-  async function mutate(path: string, label: string, text?: string) {
+  async function mutate(path: string, label: string, text?: string, parallelism?: number) {
     if (!team || busy || !fresh || me.role === "viewer") return;
-    const body = mutations.begin(key, { requestId: crypto.randomUUID(), revision: team.revision, path, label, ...(text ? { text } : {}) });
+    const body = mutations.begin(key, { requestId: crypto.randomUUID(), revision: team.revision, path, label, ...(text ? { text } : {}), ...(parallelism !== undefined ? { parallelism } : {}) });
     if (inFlight.has(body.requestId)) return;
     inFlight.add(body.requestId); setBusy(true);
     try {
@@ -405,8 +418,10 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   const memberSessions = sessions.filter(session => team.members.some(member => member.sessionId === session.id && member.revision === team.revision && ["running", "waiting"].includes(member.status)));
   const attention = memberSessions.filter(session => session.attention?.state === "needs-you");
   const selectedMember = team.members.find(member => member.memberId === agentId);
+  const workersText = workerStatus(team.parallelism, team.workers);
+  const limitEditable = me.role === "owner" && !team.goal && !["cancelled", "ready-for-review", "merged", "no-change"].includes(team.status);
   return <div className="team-detail">
-    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span>Up to {team.parallelism} implementers</span><span className="team-freshness" role="status">{view.stale ? "Showing last received state; controls are disabled." : ""}</span></div></div><div className="team-heading-actions"><div className="team-view-switch" role="group" aria-label="Team view"><button type="button" aria-pressed={mode === "summary"} onClick={() => setMode("summary")}>Summary</button><button type="button" aria-pressed={mode === "logs"} onClick={() => setMode("logs")}>Review logs</button></div><button className="text-button team-refresh" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh team</button></div></header>
+    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span className="team-workers" title={workersText}>{workersText}</span><span className="team-freshness" role="status">{view.stale ? "Showing last received state; controls are disabled." : ""}</span></div></div><div className="team-heading-actions"><div className="team-view-switch" role="group" aria-label="Team view"><button type="button" aria-pressed={mode === "summary"} onClick={() => setMode("summary")}>Summary</button><button type="button" aria-pressed={mode === "logs"} onClick={() => setMode("logs")}>Review logs</button></div><button className="text-button team-refresh" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh team</button></div></header>
     <div className="team-detail-body">
       {team.reason && <p className="team-notice" role="status">{team.reason}</p>}
       <LinearTracking tracking={team.linear} stale={view.stale} />
@@ -440,10 +455,11 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       {team.events.length > 0 && <section className="team-section"><div className="team-history"><h2>Run history</h2><ol>{team.events.map((event, index) => <li key={event.at + "/" + index}><time>{date(event.at)}</time><p>{event.text}</p></li>)}</ol></div></section>}
       </details>
       {team.resumable && <p className="quiet">Resume starts a fresh plan from the preserved integration commit. The stopped member workspace stays available.</p>}
+      {limitEditable && <div className="team-worker-limit"><label htmlFor="team-worker-limit">Worker limit</label><select id="team-worker-limit" aria-describedby="team-worker-limit-help" value={team.parallelism} disabled={!canOwn || busy || Boolean(pending)} onChange={event => void mutate("/teams/" + id + "/parallelism", "Worker limit", undefined, Number(event.target.value))}><WorkerLimitOptions max={team.workers?.max ?? 4} /></select><p className="form-note" id="team-worker-limit-help">{teamWorkerLimitHelp}</p></div>}
       {me.role === "owner" && !team.goal && team.status !== "cancelled" && <div className="team-actions">{showRunControl && <button className="text-button" disabled={!canOwn || busy || Boolean(pending)} onClick={() => action(resumeRun ? "resume" : "pause", resumeRun ? "Resume" : "Pause")}>{resumeRun ? "Resume team" : "Pause team"}</button>}<button className="text-button team-cancel" disabled={!canOwn || busy || Boolean(pending)} onClick={() => { if (window.confirm("Cancel this team run? This stops its agent sessions and keeps the recorded work.")) action("cancel", "Cancellation"); }}>Cancel team</button></div>}
     </div>
     <div className="team-composer-area">
-      {!busy && ((request.message && request.message !== dismissedMessage) || pending) && <div className={`team-floating-notice${request.result ? " is-receipt" : ""}`} role={request.result ? "status" : "alert"}>{request.message && request.message !== dismissedMessage && <div className="team-floating-message"><span>{request.message}</span><button type="button" className="team-notice-dismiss" aria-label="Dismiss notice" onClick={() => setDismissedMessage(request.message)}><X size={15} /></button></div>}{pending && <div className="team-pending" role="status"><span>Unconfirmed request: {pending.label.toLowerCase()} · revision {pending.revision}</span><button className="text-button" disabled={!fresh || me.role === "viewer" || (me.role !== "owner" && !pending.path.endsWith("/steer") && !pending.path.endsWith("/answer"))} onClick={() => void mutate(pending.path, pending.label, pending.text)}>Retry same request</button></div>}</div>}
+      {!busy && ((request.message && request.message !== dismissedMessage) || pending) && <div className={`team-floating-notice${request.result ? " is-receipt" : ""}`} role={request.result ? "status" : "alert"}>{request.message && request.message !== dismissedMessage && <div className="team-floating-message"><span>{request.message}</span><button type="button" className="team-notice-dismiss" aria-label="Dismiss notice" onClick={() => setDismissedMessage(request.message)}><X size={15} /></button></div>}{pending && <div className="team-pending" role="status"><span>Unconfirmed request: {pending.label.toLowerCase()} · revision {pending.revision}</span><button className="text-button" disabled={!fresh || me.role === "viewer" || (me.role !== "owner" && !pending.path.endsWith("/steer") && !pending.path.endsWith("/answer"))} onClick={() => void mutate(pending.path, pending.label, pending.text, pending.parallelism)}>Retry same request</button></div>}</div>}
       {me.role === "viewer" ? <p className="quiet">This device can view the team. An owner or controller can answer decisions and send direction.</p> : team.goal ? <p className="quiet goal-team-origin">Answer this cycle’s decisions above. <a href={goalHref}>Open the goal</a> to steer, pause, resume, or cancel its work.</p> : team.status === "cancelled" ? <p className="quiet">This run is cancelled. Its work and evidence remain available above.</p> : team.status === "delivering" || team.deliveryReceipt ? <p className="quiet">Delivery has started. Inspect its PR and recorded evidence before starting further work.</p> : <form onSubmit={event => { event.preventDefault(); if (direction.trim()) void mutate("/teams/" + id + "/steer", "Direction", direction.trim()); }}><label className="sr-only" htmlFor="team-direction">Steer this team</label><textarea id="team-direction" rows={2} maxLength={8000} placeholder="Give the team a direction or change the requirements…" value={direction} onChange={event => setDirection(event.target.value)} disabled={busy || Boolean(pending)} /><button className="primary" disabled={!canSteer || busy || Boolean(pending) || !direction.trim()}>Send direction <Send size={17} /></button></form>}
     </div>
   </div>;

@@ -265,6 +265,7 @@ export interface TeamDecision {
   options: string[];
   createdAt: string;
   answer?: string;
+  answeredBy?: "owner" | "coordinator";
   answeredAt?: string;
 }
 export interface TeamCheck {

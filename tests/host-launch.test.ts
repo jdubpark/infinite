@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync,
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
-import { buildLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
+import { buildLaunch, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
 import { claudeConfigPath, recordClaudeTrust } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -151,6 +151,28 @@ test("permission coordinator rejects conflicting Claude permission and tool sett
     ["--dangerously-skip-permissions"],
   ]) assert.throws(() => permissionCoordinatorLaunch("claude", { command: "claude", args }), /Permission coordinator/);
   assert.throws(() => permissionCoordinatorLaunch("codex", { command: "codex", args: [] }), /Claude Code/);
+});
+
+test("mission coordinators can only read repositories and report, for Claude and Codex", () => {
+  const claude = missionCoordinatorLaunch("claude", { command: "claude", args: ["--model", "opus"] });
+  assert.ok(claude.args.includes("--permission-mode") && claude.args[claude.args.indexOf("--permission-mode") + 1] === "plan");
+  assert.ok(claude.args.includes("--tools") && claude.args[claude.args.indexOf("--tools") + 1] === "Read,Glob,Grep,LS");
+  assert.deepEqual(claude.args.slice(claude.args.indexOf("--allowedTools") + 1), ["mcp__infinite_team__mission_report"]);
+  assert.ok(!claude.args.some(arg => /dangerously-skip|permission-mode.*acceptEdits|mcp__infinite_team__report/.test(arg)));
+
+  const codex = missionCoordinatorLaunch("codex", { command: "codex", args: ["--sandbox", "workspace-write", "--ask-for-approval", "on-request", "-c", "sandbox_workspace_write.network_access=false"] });
+  assert.ok(codex.args.includes("--sandbox") && codex.args[codex.args.indexOf("--sandbox") + 1] === "read-only");
+  assert.ok(codex.args.includes("--ask-for-approval") && codex.args[codex.args.indexOf("--ask-for-approval") + 1] === "never");
+  assert.ok(codex.args.includes("mcp_servers={}"), "Codex starts without inherited publication or session-control MCP servers");
+  assert.ok(codex.args.includes("sandbox_workspace_write.network_access=false"));
+  assert.throws(() => missionCoordinatorLaunch("codex", { command: "codex", args: ["-c", 'sandbox_mode="workspace-write"'] }), /sandbox_mode/);
+
+  for (const [provider, profile] of [["claude", claude], ["codex", codex]] as const) {
+    const launch = buildLaunch(provider, profile, "Report the mission", hooks, relay, enabled, true);
+    assert.ok(launch.args.at(-1) === "Report the mission");
+    if (provider === "codex") assert.ok(launch.args.includes("read-only"));
+    else assert.ok(claude.args.includes("mcp__infinite_team__mission_report"));
+  }
 });
 
 test("codex gets -c hook overrides, notify, osc notifications and trust bypass", () => {

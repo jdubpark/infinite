@@ -108,6 +108,7 @@ test("a team run is flagged once when it becomes blocked, never for a run alread
   const teams = [
     { id: "t-old", title: "Old run", status: "blocked", reason: "Stopped earlier.", resumable: true },
     { id: "t-new", title: "Smart alarm", status: "implementing", reason: undefined as string | undefined, resumable: false },
+    { id: "t-child", title: "Mission child", status: "implementing", reason: undefined as string | undefined, resumable: false, mission: true },
   ];
   const source = { statuses: () => teams };
   const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["needs-you", "team-blocked", "team-started"], intervalMs: 100000, machineId: "m1" }, source);
@@ -117,6 +118,9 @@ test("a team run is flagged once when it becomes blocked, never for a run alread
   await notifier.tick();
   await notifier.tick();                 // still blocked: no second push
   assert.equal(sent.length, 1);
+  teams[2].status = "blocked"; teams[2].reason = "Needs a decision.";
+  await notifier.tick();
+  assert.equal(sent.length, 1, "Mission children escalate through their coordinator, not owner lifecycle pushes");
   assert.deepEqual(sent[0][0], { to: "ExponentPushToken[a]", title: "Team needs you", body: "Smart alarm is blocked and waiting for you. It can resume.",
     data: { url: "/team/t-new", machineId: "m1" }, channelId: "attention", priority: "high", collapseId: "team:t-new" });
   teams[1].status = "planning"; await notifier.tick();

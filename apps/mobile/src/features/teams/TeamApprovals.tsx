@@ -27,7 +27,7 @@ export function AgentApproval({ connection, member, agent, provider, decision, m
     const session = await api<SessionDetail>(connection, `/sessions/${id}`);
     return { session, revision, receivedAt: Date.now() };
   }, 2000, [connection, id]);
-  useControlSync(control, poll.data, poll.online);
+  useControlSync(control, poll.data, poll.stale);
   const session = poll.data?.session ?? null;
   const requiresControl = session?.capabilities?.inputControl === 1;
   const prompt = session?.attention.state === "needs-you" ? session.attention.prompt : undefined;

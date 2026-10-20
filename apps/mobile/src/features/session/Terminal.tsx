@@ -55,7 +55,7 @@ export function Terminal({
     1500,
     [connection, id],
   );
-  useControlSync(control, data, online);
+  useControlSync(control, data, stale);
   const session = data?.session ?? null;
   const role = data?.me.role;
   const environment = data?.me.environment ?? "";

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
-import { AppState } from "react-native";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 import { useFocusEffect } from "expo-router";
+import { inForeground, onForegroundChange } from "../../api/foreground";
 import {
   api,
   ControlRefusal,
@@ -31,9 +31,9 @@ const sameLease = (a: ControlLease | null, b: ControlLease | null) =>
 
 /**
  * One session's input lease on this phone. The Brief and Terminal routes share it, so moving
- * between them keeps control. It is released when neither route is focused, when the app
- * leaves the foreground, or when a screen stops reaching the host. Nothing reacquires it
- * without the person asking.
+ * between them keeps control. It is released when neither route is focused, when its host lease
+ * expires, or when a screen stops reaching the host. Nothing reacquires it without the person
+ * asking.
  */
 class SessionControl {
   private state: ControlState = {
@@ -48,6 +48,7 @@ class SessionControl {
   private focused = 0;
   private claiming = false;
   private renewing = false;
+  private renewOnForeground = false;
   private renewTimer: ReturnType<typeof setInterval> | undefined;
   private expireTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -64,7 +65,14 @@ class SessionControl {
   };
   snapshot = () => this.state;
   generation = () => this.revision;
-  leaseId = () => this.state.lease?.id;
+  leaseId = () => {
+    const lease = this.state.lease;
+    if (lease && lease.expiresAt <= Date.now()) {
+      this.forget();
+      return undefined;
+    }
+    return lease?.id;
+  };
 
   private set(patch: Partial<ControlState>) {
     const next = { ...this.state, ...patch };
@@ -80,7 +88,7 @@ class SessionControl {
   }
 
   private active() {
-    return this.focused > 0 && AppState.currentState === "active";
+    return this.focused > 0 && inForeground();
   }
 
   private release(lease: ControlLease) {
@@ -98,7 +106,8 @@ class SessionControl {
       () => this.forget(),
       Math.max(0, lease.expiresAt - Date.now()),
     );
-    this.renewTimer = setInterval(() => void this.renew(), RENEW_MS);
+    if (inForeground())
+      this.renewTimer = setInterval(() => void this.renew(), RENEW_MS);
   }
 
   /** Drops the local lease; `release` also tells the host so another device can take over. */
@@ -142,8 +151,8 @@ class SessionControl {
         `/sessions/${this.id}/control`,
         { body: { action: "claim", ...(takeover ? { takeover: true } : {}) } },
       );
-      if (!this.active() || revision !== this.revision) {
-        // The person left the session or the app while the claim was in flight.
+      if (this.focused === 0 || revision !== this.revision) {
+        // The person left the session or changed control while the claim was in flight.
         if (result.control) this.release(result.control);
         return;
       }
@@ -168,9 +177,18 @@ class SessionControl {
 
   private async renew() {
     const held = this.state.lease;
-    if (this.renewing || !held || !this.active()) return;
+    if (held && held.expiresAt <= Date.now()) {
+      this.forget();
+      return;
+    }
+    if (this.renewing) {
+      if (this.active()) this.renewOnForeground = true;
+      return;
+    }
+    if (!held || !this.active()) return;
     this.renewing = true;
     const revision = this.revision;
+    let renewed = false;
     try {
       const result = await api<{ control: ControlLease | null }>(
         this.connection,
@@ -178,14 +196,20 @@ class SessionControl {
         { body: { action: "renew", leaseId: held.id } },
       );
       if (revision !== this.revision || this.state.lease?.id !== held.id) return;
-      if (result.control?.id === held.id && this.active()) {
+      if (result.control?.id === held.id) {
         this.revision++;
         this.hold(result.control);
+        renewed = true;
       } else this.forget();
     } catch {
-      if (revision === this.revision) this.forget();
+      // If return happened during this request, retry the same lease in `finally` before dropping it.
+      if (revision === this.revision && this.active() && !this.renewOnForeground) this.forget();
     } finally {
       this.renewing = false;
+      if (this.renewOnForeground) {
+        this.renewOnForeground = false;
+        if (!renewed && this.state.lease && this.active()) void this.renew();
+      }
     }
   }
 
@@ -201,9 +225,20 @@ class SessionControl {
     };
   };
 
-  /** Leaving the foreground releases control; returning only refreshes. */
-  appState = () => {
-    if (AppState.currentState !== "active") this.forget(true);
+  /** Pause renewals in the background; on return renew a held lease without claiming anew. */
+  foreground = (foreground: boolean) => {
+    if (!foreground) {
+      clearInterval(this.renewTimer);
+      this.renewTimer = undefined;
+      return;
+    }
+    const lease = this.state.lease;
+    if (!lease) return;
+    if (lease.expiresAt <= Date.now()) {
+      this.forget();
+      return;
+    }
+    void this.renew();
   };
 }
 
@@ -227,8 +262,7 @@ export function useSessionControl(connection: Connection, id: string) {
   const state = useSyncExternalStore(control.subscribe, control.snapshot);
   useFocusEffect(useCallback(() => control.focus(), [control]));
   useEffect(() => {
-    const listener = AppState.addEventListener("change", control.appState);
-    return () => listener.remove();
+    return onForegroundChange(control.foreground);
   }, [control]);
   return {
     ...state,
@@ -264,20 +298,18 @@ export function leaseFor(
 /**
  * Feeds one screen's session polls to the control: the holder shown is the host's, and a lease
  * the host no longer reports is dropped. When this screen stops reaching the host, the lease is
- * released: a stale view never keeps input control.
+ * released once that screen's view becomes stale: a stale view never keeps input control.
  */
 export function useControlSync(
   control: SessionControlHandle,
   poll: { session: SessionRow; revision: number } | null,
-  online: boolean,
+  stale: boolean,
 ) {
   const { observe, forget } = control;
   useEffect(() => {
     if (poll) observe(poll.session, poll.revision);
   }, [observe, poll]);
-  const wasOnline = useRef(false);
   useEffect(() => {
-    if (wasOnline.current && !online) forget(true);
-    wasOnline.current = online;
-  }, [forget, online]);
+    if (stale) forget(true);
+  }, [forget, stale]);
 }

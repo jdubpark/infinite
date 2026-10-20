@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AppState } from "react-native";
+import { inForeground, onForegroundChange } from "./foreground";
 
 /**
  * Polls `fn` every `intervalMs` while the app is in the foreground. The last
  * good value stays in `data` when a poll fails; `online` reports whether the
  * latest poll succeeded and `seen` is the local time of the last success.
- * Polling stops while the app is backgrounded and resumes on return; until
- * that first poll succeeds, `online` is false because `data` is a cached view.
+ * Polling stops in the background and runs immediately on return. A recent
+ * success keeps `online` unchanged during a brief switch; after a longer
+ * absence, `online` stays false until the return poll succeeds. If no poll
+ * succeeds within three seconds of returning, `online` turns false either way.
+ * `stale` turns true only after three foreground seconds without a successful
+ * poll.
  * `refresh()` cancels the pending timer and polls now (or right after the
  * poll in flight). The effect restarts when `intervalMs` or `deps` change.
  */
@@ -34,15 +38,18 @@ export function usePoll<T>(
       generation = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let staleTimer: ReturnType<typeof setTimeout> | undefined;
+    let lastSuccessAt = 0;
+    let staleDeadline = 0;
     const delayStale = () => {
       if (onlineNow.current || staleTimer !== undefined) return;
+      if (!staleDeadline) staleDeadline = Date.now() + 3000;
       staleTimer = setTimeout(() => {
         staleTimer = undefined;
         if (active && !onlineNow.current) setStale(true);
-      }, 3000);
+      }, Math.max(0, staleDeadline - Date.now()));
     };
     const poll = async () => {
-      if (!active || AppState.currentState !== "active") return;
+      if (!active || !inForeground()) return;
       if (polling) {
         again = true;
         return;
@@ -50,13 +57,15 @@ export function usePoll<T>(
       polling = true;
       again = false;
       const revision = generation;
-      const current = () => active && AppState.currentState === "active" && revision === generation;
+      const current = () => active && inForeground() && revision === generation;
       try {
         const value = await latest.current();
         if (current()) {
+          lastSuccessAt = Date.now();
           onlineNow.current = true;
           clearTimeout(staleTimer);
           staleTimer = undefined;
+          staleDeadline = 0;
           setStale(false);
           setData(value);
           setOnline(true);
@@ -73,29 +82,46 @@ export function usePoll<T>(
         if (current()) setLoading(false);
         if (active) {
           setRefreshing(false);
-          if (AppState.currentState === "active") timer = setTimeout(poll, again ? 0 : intervalMs);
+          if (inForeground()) timer = setTimeout(poll, again ? 0 : intervalMs);
         }
       }
     };
     pollNow.current = () => {
       clearTimeout(timer);
-      if (AppState.currentState === "active") setRefreshing(true);
+      if (inForeground()) setRefreshing(true);
       void poll();
     };
-    const listener = AppState.addEventListener("change", (state) => {
+    const removeForegroundListener = onForegroundChange((foreground) => {
       generation++;
       clearTimeout(timer);
-      onlineNow.current = false;
-      setOnline(false);
-      delayStale();
-      if (state === "active") void poll();
+      timer = undefined;
+      clearTimeout(staleTimer);
+      staleTimer = undefined;
+      if (!foreground) return;
+
+      const recentSuccess = Date.now() - lastSuccessAt <= intervalMs;
+      staleDeadline = Date.now() + 3000;
+      if (!recentSuccess) {
+        onlineNow.current = false;
+        setOnline(false);
+        setStale(false);
+      }
+      // A recent view expires after three foreground seconds without a fresh result too.
+      staleTimer = setTimeout(() => {
+        staleTimer = undefined;
+        if (!active) return;
+        onlineNow.current = false;
+        setOnline(false);
+        setStale(true);
+      }, 3000);
+      void poll();
     });
     void poll();
     return () => {
       active = false;
       clearTimeout(timer);
       clearTimeout(staleTimer);
-      listener.remove();
+      removeForegroundListener();
       pollNow.current = () => {};
     };
     // The caller owns the dependency list; `fn` is read through a ref.

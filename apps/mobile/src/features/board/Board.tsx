@@ -106,7 +106,7 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
         const current = key === machine;
         let label = profile.label;
         if (!label) { try { label = new URL(profile.url).host; } catch { label = "Machine"; } }
-        return <SheetRow key={key} selected={current} label={label} detail={current ? (poll.online ? "Connected" : "Offline") : undefined}
+        return <SheetRow key={key} selected={current} label={label} detail={current ? (poll.online ? "Connected" : poll.stale ? "Offline" : "Connecting") : undefined}
           icon={<Avatar label={label} size={26} />} onPress={() => { setMachineSheet(false); if (!current) onSelectMachine(key); }} />;
       })}
       <SheetRow glyph="plus" label="Add machine" onPress={() => { setMachineSheet(false); onAddMachine(); }} />

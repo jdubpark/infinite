@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useIsFocused } from "expo-router";
 import { openEvents, type Connection } from "./client";
 import { APP_BACKGROUND_GRACE_MS, inForeground, onForegroundChange } from "./foreground";
 import { canUseLiveFallback, invalidatesLiveLoad, isLiveOnline, LIVE_STALE_DELAY_MS, shouldMarkLiveStale, shouldRetryEmptyLiveLoad } from "./liveStatus";
@@ -77,13 +78,23 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
   const [data, setData] = useState<T | null>(null), [online, setOnline] = useState(false), [stale, setStale] = useState(false), [seen, setSeen] = useState("");
   const [loading, setLoading] = useState(true), [refreshing, setRefreshing] = useState(false);
   const current = useRef(options), value = useRef<T | null>(null), refreshRef = useRef<() => void>(() => {});
+  const focused = useIsFocused(), blurred = useRef(false);
   useEffect(() => { current.current = options; });
   const topicsKey = options.topics.join(",");
   useEffect(() => {
+    if (!focused) {
+      blurred.current = true;
+      refreshRef.current = () => {};
+      return;
+    }
+    // Regaining focus is a return like foregrounding: the view stays as received until a read or stream succeeds.
+    const refocused = blurred.current;
+    blurred.current = false;
     let active = true, appActive = inForeground(), streamUp = false, lastLoadOk = false, connecting = false, polling = false, appRevision = 0;
     let backgroundedAt: number | null = appActive ? null : Date.now();
     let resumeCatchup = false, resumeEventSeen = false;
     let unsubscribe: (() => void) | undefined, restartShared: (() => Promise<void>) | undefined, fallback: ReturnType<typeof setTimeout> | undefined, retry: ReturnType<typeof setTimeout> | undefined, staleTimer: ReturnType<typeof setTimeout> | undefined, backgroundGrace: ReturnType<typeof setTimeout> | undefined;
+    let resumeStateTimer: ReturnType<typeof setTimeout> | undefined;
     let retryMs = 500, revision = 0, pollAgain = false;
     let offlineSince: number | null = null;
     const stamp = () => new Date().toLocaleTimeString();
@@ -220,6 +231,15 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
       else { detach(); void connect(); }
     };
     refreshRef.current = () => { void load(true); };
+    if (refocused && appActive) {
+      resumeStateTimer = setTimeout(() => {
+        if (!active || !appActive) return;
+        if (!onlineNow()) setOnline(false);
+        setStale(false);
+      }, 0);
+      offlineSince = Date.now();
+      delayStale();
+    }
     void load();
     void connect();
     const removeForegroundListener = onForegroundChange(foreground => {
@@ -264,11 +284,11 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
       }
     });
     return () => {
-      active = false; clearTimers(); clearTimeout(staleTimer); clearTimeout(backgroundGrace); detach(); removeForegroundListener(); refreshRef.current = () => {};
+      active = false; clearTimers(); clearTimeout(staleTimer); clearTimeout(backgroundGrace); clearTimeout(resumeStateTimer); detach(); removeForegroundListener(); refreshRef.current = () => {};
     };
     // The caller owns the dependency list; callbacks are read through current.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connection, topicsKey, options.intervalMs, ...options.deps]);
+  }, [focused, connection, topicsKey, options.intervalMs, ...options.deps]);
   const refresh = useCallback(() => refreshRef.current(), []);
   return { data, online, stale: stale && !online, loading, refreshing, seen, refresh };
 }

@@ -66,6 +66,10 @@ extension ISO8601DateFormatter {
 /// A list Resume that did not go through, shown beside its run until dismissed or another resume is attempted.
 struct TeamResumeFailure: Equatable {
     let message: String
+
+    static func retainingExisting(_ failures: [String: TeamResumeFailure], teamIDs: Set<String>) -> [String: TeamResumeFailure] {
+        Dictionary(uniqueKeysWithValues: failures.filter { teamIDs.contains($0.key) })
+    }
 }
 
 @MainActor final class AppModel: ObservableObject {
@@ -80,6 +84,7 @@ struct TeamResumeFailure: Equatable {
     @Published private(set) var mounted: [String] = []
     @Published var connected = false
     @Published var connecting = false
+    @Published private(set) var displayVisible = false
     @Published private(set) var sessionsDisplayStale = false
     @Published private(set) var sessionsLoaded = false
     @Published private(set) var connectionError = ""
@@ -90,9 +95,19 @@ struct TeamResumeFailure: Equatable {
     /// Team runs the host reports, ordered with the ones waiting on a person first.
     @Published var teams: [TeamRun] = []
     /// A selected team shows its dashboard in place of the session panes, which stay mounted.
-    @Published var selectedTeamID: String? { didSet { if selectedTeamID != nil { showingHome = false; showingCost = false; selectedMissionID = nil } } }
+    @Published var selectedTeamID: String? {
+        didSet {
+            if selectedTeamID != oldValue, let oldValue { pruneTeamModel(oldValue) }
+            if selectedTeamID != nil { showingHome = false; showingCost = false; selectedMissionID = nil }
+        }
+    }
     /// A selected mission shows its detail the same way; a mission and a team are never both open.
-    @Published var selectedMissionID: String? { didSet { if selectedMissionID != nil { showingHome = false; showingCost = false; selectedTeamID = nil; teamOpenedFrom = nil } } }
+    @Published var selectedMissionID: String? {
+        didSet {
+            if selectedMissionID != oldValue, let oldValue { pruneMissionModel(oldValue) }
+            if selectedMissionID != nil { showingHome = false; showingCost = false; selectedTeamID = nil; teamOpenedFrom = nil }
+        }
+    }
     /// The mission whose subtask opened the current team page, so that page can lead back to it.
     @Published var teamOpenedFrom: String?
     /// Home, the project board, covers the session panes the same way; it is the first page after connecting.
@@ -127,6 +142,8 @@ struct TeamResumeFailure: Equatable {
     var terminals: [String: SessionModel] = [:]
     private var pollTask: Task<Void, Never>?
     private var connectionGeneration = UUID()
+    private var displayGeneration = UUID()
+    private var pollGeneration = UUID()
     private lazy var sessionFreshness = DisplayFreshness { [weak self] in self?.sessionsDisplayStale = $0 }
     private lazy var teamFreshness = DisplayFreshness { [weak self] in self?.teamsDisplayStale = $0 }
     let drafts = DraftStore()
@@ -141,7 +158,9 @@ struct TeamResumeFailure: Equatable {
     func costModel() -> CostModel? {
         if let cost { return cost }
         guard let client else { return nil }
-        let model = CostModel(client: client, owner: isOwner); cost = model; return model
+        let model = CostModel(client: client, owner: isOwner)
+        model.setDisplayVisible(displayVisible)
+        cost = model; return model
     }
     func showCost() { showingCost = true }
     var teamLineup: JSON { me["teams"]["lineup"] }
@@ -158,6 +177,41 @@ struct TeamResumeFailure: Equatable {
         activeID = UserDefaults.standard.string(forKey: "activeHost") ?? profiles.first?.id ?? ""
     }
     func start() { if active != nil { Task { await connect() } } }
+    func setDisplayVisible(_ visible: Bool) {
+        guard displayVisible != visible else { return }
+        displayVisible = visible
+        displayGeneration = UUID()
+        for terminal in terminals.values { terminal.setDisplayVisible(visible) }
+        for model in teamModels.values { model.setDisplayVisible(visible) }
+        for model in missionModels.values { model.setDisplayVisible(visible) }
+        cost?.setDisplayVisible(visible)
+        cmux.setDisplayVisible(visible)
+        if visible { startPolling() } else { stopPolling() }
+    }
+
+    /// Polling resumes after a failed refresh too: its next success reconnects the list, as before.
+    private func startPolling() {
+        guard pollTask == nil, client != nil, me != .null, displayVisible else { return }
+        let connection = connectionGeneration
+        let run = UUID(); pollGeneration = run
+        pollTask = Task { [weak self] in
+            var count = 0
+            while !Task.isCancelled {
+                guard let self, self.pollGeneration == run, self.connectionGeneration == connection, self.displayVisible else { break }
+                await self.refresh(includeResources: self.resourceWatchers > 0 && count % 3 == 0)
+                count += 1
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+            guard let self, self.pollGeneration == run else { return }
+            self.pollTask = nil
+        }
+    }
+
+    private func stopPolling() {
+        pollGeneration = UUID()
+        pollTask?.cancel(); pollTask = nil
+    }
+
     var visibleIDs: [String] { [selectedID, secondaryID].compactMap { $0 }.reduce(into: []) { if !$0.contains($1) { $0.append($1) } } }
     private func mount(_ id: String?) {
         var next = mounted.filter { $0 != id }
@@ -165,9 +219,23 @@ struct TeamResumeFailure: Equatable {
         // Visible panes always stay; the rest keep the most recent slots.
         let visible = visibleIDs
         let kept = next.filter { visible.contains($0) } + next.filter { !visible.contains($0) }
-        if kept != mounted { mounted = Array(kept.prefix(max(Self.keepAlive, visible.count))) }
+        let retained = Array(kept.prefix(max(Self.keepAlive, visible.count)))
+        let evicted = mounted.filter { !retained.contains($0) }
+        if retained != mounted { mounted = retained }
+        for id in evicted { evict(id) }
     }
-    func unmount(_ id: String) { mounted.removeAll { $0 == id } }
+    func unmount(_ id: String) {
+        mounted.removeAll { $0 == id }
+        evict(id)
+    }
+    /// A pane leaving the cache detaches. Its model stays only while it holds draft text or an
+    /// unconfirmed send, so a draft whose save failed is not lost with it; its screen and chat are released.
+    private func evict(_ id: String) {
+        guard let terminal = terminals[id] else { return }
+        let retained = !terminal.draft.text.isEmpty || terminal.draft.pendingID != nil
+        if !retained { terminals[id] = nil }
+        Task { await terminal.detach(); if retained { terminal.releaseDisplay() } }
+    }
     func persistProfiles() {
         UserDefaults.standard.set(try? JSONEncoder().encode(profiles), forKey: "hostProfiles")
         UserDefaults.standard.set(activeID, forKey: "activeHost")
@@ -190,11 +258,13 @@ struct TeamResumeFailure: Equatable {
         connectionProfileID = activeID
         connectionError = ""
         let profile = active
-        pollTask?.cancel(); connectionGeneration = UUID(); let generation = connectionGeneration
+        stopPolling(); connectionGeneration = UUID(); let generation = connectionGeneration
         let previousTerminals = Array(terminals.values); terminals.removeAll()
+        for model in teamModels.values { model.stopPolling() }
+        for model in missionModels.values { model.stopPolling() }
         let previousClient = client; client = nil
         connected = false; connecting = true; sessions = []; resources = .null; me = .null
-        teams = []; selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil; projectFilter = nil; showingHome = true; teamModels.removeAll(); teamsFresh = false
+        teams = []; selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil; projectFilter = nil; showingHome = true; teamModels.removeAll(); teamResumeFailures = [:]; teamsFresh = false
         projectGroups = .empty; board = .empty; boardFresh = false; boardError = ""; missionModels.removeAll(); cost = nil
         sessionsLoaded = false; teamsLoaded = false
         sessionFreshness.recovered(); teamFreshness.recovered()
@@ -213,13 +283,7 @@ struct TeamResumeFailure: Equatable {
             pendingMissionCreation = try drafts.read("\(profile.id):create-mission")
             connected = true; connecting = false; persistProfiles()
             connectionError = ""
-            pollTask = Task {
-                var count = 0
-                while !Task.isCancelled && generation == self.connectionGeneration {
-                    await self.refresh(includeResources: self.resourceWatchers > 0 && count % 3 == 0)
-                    count += 1; try? await Task.sleep(nanoseconds: 2_000_000_000)
-                }
-            }
+            startPolling()
         } catch {
             guard generation == connectionGeneration else { return }
             connecting = false; message = error.localizedDescription; connectionError = error.localizedDescription
@@ -227,10 +291,11 @@ struct TeamResumeFailure: Equatable {
         }
     }
     func refresh(includeResources: Bool = true) async {
-        guard let client else { return }; let generation = connectionGeneration
+        guard displayVisible, let client else { return }
+        let generation = connectionGeneration, visibility = displayGeneration
         do {
             let response = try await client.request("/sessions")
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             let next = response["sessions"].array.map(AgentSession.init).sorted {
                 if $0.needsYou != $1.needsYou { return $0.needsYou }
                 if $0.running != $1.running { return $0.running }
@@ -250,58 +315,71 @@ struct TeamResumeFailure: Equatable {
                 }
             }
             if selectedID == nil { selectedID = (sessions.first { $0.running } ?? sessions.first)?.id }
-            if teamsEnabled || !teams.isEmpty { await refreshTeams(generation) }
-            await refreshBoard(generation)
+            if teamsEnabled || !teams.isEmpty { await refreshTeams(generation, visibility) }
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
+            await refreshBoard(generation, visibility)
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             if includeResources {
-                do { let sample = try await client.request("/machine/resources"); if generation == connectionGeneration { resources = sample } }
+                guard visibility == displayGeneration, displayVisible else { return }
+                do {
+                    let sample = try await client.request("/machine/resources")
+                    if generation == connectionGeneration, visibility == displayGeneration, displayVisible { resources = sample }
+                }
                 catch {
-                    guard generation == connectionGeneration else { return }
+                    guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
                     resources = .object(["unavailable": .string(error.localizedDescription)])
                 }
             }
         } catch {
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             connected = false; message = error.localizedDescription
             sessionFreshness.failed()
             for terminal in terminals.values { terminal.connectionLost() }
         }
     }
     /// The team list is small and the whole list arrives each poll; only a real change redraws.
-    private func refreshTeams(_ generation: UUID) async {
-        guard let client else { return }
+    private func refreshTeams(_ generation: UUID, _ visibility: UUID) async {
+        guard displayVisible, generation == connectionGeneration, visibility == displayGeneration, let client else { return }
         do {
             let response = try await client.request("/teams")
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             let next = TeamRun.blockedFirst(response["teams"].array.map(TeamRun.init).sorted {
                 if $0.needsYou != $1.needsYou { return $0.needsYou }
                 if $0.finished != $1.finished { return $1.finished }
                 return $0.createdAt > $1.createdAt
             })
             if next != teams { teams = next }
+            if !teamResumeFailures.isEmpty {
+                let retained = TeamResumeFailure.retainingExisting(teamResumeFailures, teamIDs: Set(next.map(\.id)))
+                if retained != teamResumeFailures { teamResumeFailures = retained }
+            }
             teamsLoaded = true
             for team in next { teamModels[team.id]?.observe(team) }
+            pruneDetailModels()
             if !teamsFresh { teamsFresh = true }
             teamFreshness.recovered()
         } catch {
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             if teamsFresh { teamsFresh = false }
             teamFreshness.failed()
         }
     }
     /// Projects and the board arrive whole each poll; only a real change redraws.
-    private func refreshBoard(_ generation: UUID) async {
-        guard let client else { return }
+    private func refreshBoard(_ generation: UUID, _ visibility: UUID) async {
+        guard displayVisible, generation == connectionGeneration, visibility == displayGeneration, let client else { return }
         do {
             let groups = ProjectGroupList(try await client.request("/project-groups"))
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             let next = Board(try await client.request("/board"))
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             if groups != projectGroups { projectGroups = groups }
             if next != board { board = next }
             if let filter = projectFilter, groups.group(filter) == nil { projectFilter = nil }
             if !boardFresh { boardFresh = true }
             if !boardError.isEmpty { boardError = "" }
+            pruneDetailModels()
         } catch {
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             if boardFresh { boardFresh = false }
             let text = (error as? DesktopError)?.status == 404 ? "This server has no project board yet. Update the host to use projects and missions." : error.localizedDescription
             if text != boardError { boardError = text }
@@ -321,6 +399,7 @@ struct TeamResumeFailure: Equatable {
         let row = board.items.first { $0.id == id }
         let model = MissionModel(mission: Mission(.object(["id": .string(id), "title": .string(row?.title ?? ""), "status": .string(row?.status ?? ""), "groupName": .string(row?.projectName ?? "")])),
                                  client: client, role: me["role"].string)
+        model.setDisplayVisible(displayVisible)
         missionModels[id] = model; return model
     }
     /// Missions start from the owner's sentence in one project. Retrying resends the identical body,
@@ -360,6 +439,7 @@ struct TeamResumeFailure: Equatable {
         await model.perform("resume")
         resumingTeams.remove(id)
         teamResumeFailures[id] = model.noticeIsError ? TeamResumeFailure(message: model.notice) : nil
+        pruneTeamModel(id)
     }
     func clearTeamResumeFailure(_ id: String) { teamResumeFailures[id] = nil }
     func teamModel(for id: String) -> TeamModel? {
@@ -368,7 +448,21 @@ struct TeamResumeFailure: Equatable {
         // A subteam the team list has not reported yet starts from its ID; its first poll fills it in.
         let team = teams.first { $0.id == id } ?? TeamRun(.object(["id": .string(id)]))
         let model = TeamModel(run: team, client: client, role: me["role"].string)
+        model.setDisplayVisible(displayVisible)
         teamModels[id] = model; return model
+    }
+    /// A page left with an unsent direction or an unconfirmed request keeps its model.
+    private func pruneTeamModel(_ id: String) {
+        guard id != selectedTeamID, let model = teamModels[id], !model.busy, model.pending == nil, model.direction.isEmpty else { return }
+        model.stopPolling(); teamModels[id] = nil
+    }
+    private func pruneMissionModel(_ id: String) {
+        guard id != selectedMissionID, let model = missionModels[id], !model.busy, model.pending == nil, model.direction.isEmpty else { return }
+        model.stopPolling(); missionModels[id] = nil
+    }
+    private func pruneDetailModels() {
+        for id in Array(teamModels.keys) { pruneTeamModel(id) }
+        for id in Array(missionModels.keys) { pruneMissionModel(id) }
     }
     /// Leaving a team for one of its member sessions.
     func openSession(_ id: String) { selectedTeamID = nil; selectedMissionID = nil; showingHome = false; showingCost = false; selectedID = id }
@@ -403,6 +497,7 @@ struct TeamResumeFailure: Equatable {
         if let existing = terminals[id] { return existing }
         guard let session = sessions.first(where: { $0.id == id }), let client else { return nil }
         let model = SessionModel(session: session, client: client, profileID: activeID, drafts: drafts, role: me["role"].string, supportsStream: me["capabilities"]["remoteTerminal"].int == 1, summaryModel: summaryModel)
+        model.setDisplayVisible(displayVisible)
         terminals[id] = model; return model
     }
     func create(provider: String, project: String, title: String) async throws {
@@ -435,7 +530,7 @@ struct TeamResumeFailure: Equatable {
     }
     func forget() async {
         guard let active else { return }
-        pollTask?.cancel()
+        stopPolling()
         for terminal in terminals.values { await terminal.detach() }
         if let client { await client.close() }
         do { try DeviceKeychain.remove(active.id) } catch { message = error.localizedDescription; return }
@@ -470,6 +565,7 @@ struct TeamResumeFailure: Equatable {
     private var messagesCursor = ""
     private var chatTask: Task<Void, Never>?
     private var chatGeneration = UUID()
+    private var displayVisible = false
     /// Where the chat stood when this Mac last looked at it; the digest starts there.
     private var readCursor: String
     private static let readCursorsKey = "readCursors"
@@ -514,24 +610,35 @@ struct TeamResumeFailure: Equatable {
         if draft.pendingID != nil { notice = "A previous send was not confirmed. Inspect the terminal before retrying the same send or clearing it." }
     }
     func showScreen() { screenShown = true; view = .screen }
+    func setDisplayVisible(_ visible: Bool) {
+        guard displayVisible != visible else { return }
+        displayVisible = visible
+        if visible, observing { startChat() } else { stopChat() }
+    }
 
     // ---- Chat ---------------------------------------------------------------------------
     /// Polls the host's chat record while this session is observed. Messages are the provider's
     /// own transcript when the host has it, otherwise the prompts this device delivered.
     private func startChat() {
+        guard displayVisible, observing else { return }
         chatTask?.cancel()
         chatGeneration = UUID(); let generation = chatGeneration
-        chatTask = Task {
-            while !Task.isCancelled && generation == chatGeneration {
-                await pollChat(generation)
+        chatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.displayVisible, self.observing, generation == self.chatGeneration else { break }
+                await self.pollChat(generation)
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
+            guard let self, generation == self.chatGeneration else { return }
+            self.chatTask = nil
         }
     }
     private func stopChat() { chatTask?.cancel(); chatTask = nil; chatGeneration = UUID() }
     private func pollChat(_ generation: UUID) async {
+        guard generation == chatGeneration, displayVisible, observing else { return }
         var pages = 0, more = false
         repeat {
+            guard generation == chatGeneration, displayVisible, observing else { return }
             let query = messagesCursor.isEmpty ? "" : "&after=\(messagesCursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? messagesCursor)"
             let page: JSON
             do { page = try await client.request("/sessions/\(session.id)/messages?limit=100\(query)") }
@@ -609,7 +716,7 @@ struct TeamResumeFailure: Equatable {
     func saveDraft() { do { try drafts.save(draft, identity: identity) } catch { notice = error.localizedDescription } }
     func attach() async {
         observing = true
-        if chatTask == nil { startChat() }
+        if chatTask == nil, displayVisible { startChat() }
         // A mission-managed session's terminal stays readable; only its input waits for an open prompt.
         guard streamID == nil, !busy else { return }
         guard supportsStream && session.backend != "cmux" else { notice = "This host does not provide a live byte stream for this session. Update the host or use the cmux connection."; return }
@@ -794,6 +901,13 @@ struct TeamResumeFailure: Equatable {
             _ = try? await client.request("/sessions/\(session.id)/control", body: .object(["action": .string("release"), "leaseId": previousLease["id"]]))
         }
         if let previous { await client.closeTerminal(previous) }
+    }
+    /// Drops the screen and chat kept for display after this session left the pane cache. Attaching again reloads both.
+    func releaseDisplay() {
+        guard !observing else { return }
+        pipe.clear()
+        messages = []; messagesCursor = ""; messageSource = ""; unread = 0; summary = nil
+        chatNote = "Loading the conversation…"
     }
     private func lifecycle(_ action: String, controlID: String? = nil) async throws -> JSON {
         let key = "\(identity):\(action)"

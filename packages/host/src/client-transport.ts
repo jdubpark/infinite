@@ -24,25 +24,19 @@ export function terminalConnection(origin: string, token: string, sessionId: str
   let ended = false, error: Error | undefined, wake: (() => void) | undefined, bytes = 0, pendingBytes = 0;
   let lease: ControlLease | null = null;
   const queue: { page: TerminalPage; size: number }[] = [];
-  const pending = new Map<string, { at: number; size: number; resolve: () => void; reject: (error: Error) => void }>();
-  const controls = new Map<string, { at: number; resolve: (lease: ControlLease | null) => void; reject: (error: Error) => void }>();
+  const pending = new Map<string, { timer: ReturnType<typeof setTimeout>; size: number; resolve: () => void; reject: (error: Error) => void }>();
+  const controls = new Map<string, { timer: ReturnType<typeof setTimeout>; resolve: (lease: ControlLease | null) => void; reject: (error: Error) => void }>();
   const finish = (reason?: Error) => {
     if (ended) return;
     ended = true; error = reason;
-    clearInterval(deadline);
     signal.removeEventListener("abort", abort);
-    for (const item of pending.values()) item.reject(new Error("Input delivery is uncertain"));
-    for (const item of controls.values()) item.reject(new Error("Control acknowledgement was not received"));
+    for (const item of pending.values()) { clearTimeout(item.timer); item.reject(new Error("Input delivery is uncertain")); }
+    for (const item of controls.values()) { clearTimeout(item.timer); item.reject(new Error("Control acknowledgement was not received")); }
     pending.clear(); controls.clear(); pendingBytes = 0; lease = null;
     wake?.();
   };
   const fail = (reason: Error) => { finish(reason); socket.close(); };
   const abort = () => fail(new Error("Terminal disconnected"));
-  const deadline = setInterval(() => {
-    const first = pending.values().next().value ?? controls.values().next().value;
-    if (first && Date.now() - first.at >= 15000) fail(new Error("Terminal acknowledgement timed out"));
-  }, 1000);
-  deadline.unref();
   socket.addEventListener("open", () => {
     if (ended) { socket.close(); return; }
     socket.send(JSON.stringify({ token, ...(options.control ? { clientId: options.clientId ?? randomUUID() } : {}) }));
@@ -55,21 +49,21 @@ export function terminalConnection(origin: string, token: string, sessionId: str
       if (page.receipt) {
         const item = pending.get(page.receipt.requestId);
         if (!item || page.receipt.state !== "delivered") throw new Error("Uncertain input receipt");
-        pending.delete(page.receipt.requestId); pendingBytes -= item.size; item.resolve();
+        pending.delete(page.receipt.requestId); clearTimeout(item.timer); pendingBytes -= item.size; item.resolve();
         return;
       }
       if (page.requestId && Object.hasOwn(page, "control")) {
         const item = controls.get(page.requestId);
         if (!item) throw new Error("Unexpected control response");
-        controls.delete(page.requestId); lease = page.control ?? null; item.resolve(lease);
+        controls.delete(page.requestId); clearTimeout(item.timer); lease = page.control ?? null; item.resolve(lease);
         return;
       }
       if (page.refusal) {
         const id = page.refusal.requestId, refusal = new TerminalControlError(page.refusal.code, page.refusal.error);
         if (page.refusal.code === "control-lost") lease = null;
         const input = id ? pending.get(id) : undefined, control = id ? controls.get(id) : undefined;
-        if (input) { pending.delete(id!); pendingBytes -= input.size; input.reject(refusal); return; }
-        if (control) { controls.delete(id!); control.reject(refusal); return; }
+        if (input) { pending.delete(id!); clearTimeout(input.timer); pendingBytes -= input.size; input.reject(refusal); return; }
+        if (control) { controls.delete(id!); clearTimeout(control.timer); control.reject(refusal); return; }
         // Resize has no receipt; deliver its refusal to the attachment loop.
       }
       const size = Buffer.byteLength(event.data);
@@ -89,9 +83,11 @@ export function terminalConnection(origin: string, token: string, sessionId: str
     const size = Buffer.byteLength(text);
     if (pendingBytes + size > 256 * 1024 || pending.size >= 128 || socket.bufferedAmount > 256 * 1024) return Promise.reject(new Error("Input buffer limit reached"));
     return new Promise<void>((resolve, reject) => {
-      pending.set(requestId, { at: Date.now(), size, resolve, reject }); pendingBytes += size;
+      const timer = setTimeout(() => fail(new Error("Terminal acknowledgement timed out")), 15000);
+      timer.unref();
+      pending.set(requestId, { timer, size, resolve, reject }); pendingBytes += size;
       try { send({ op, requestId, text, ...(op === "input" ? { submit: false } : {}), ...(lease ? { leaseId: lease.id } : {}) }); }
-      catch (error) { pending.delete(requestId); pendingBytes -= size; reject(error); }
+      catch (error) { pending.delete(requestId); clearTimeout(timer); pendingBytes -= size; reject(error); }
     });
   };
   return {
@@ -100,9 +96,11 @@ export function terminalConnection(origin: string, token: string, sessionId: str
       const requestId = randomUUID();
       if (controls.size >= 4) return Promise.reject(new Error("A control request is already pending"));
       return new Promise((resolve, reject) => {
-        controls.set(requestId, { at: Date.now(), resolve, reject });
+        const timer = setTimeout(() => fail(new Error("Terminal acknowledgement timed out")), 15000);
+        timer.unref();
+        controls.set(requestId, { timer, resolve, reject });
         try { send({ op: "control", requestId, action, ...(lease ? { leaseId: lease.id } : {}), ...(takeover ? { takeover: true } : {}) }); }
-        catch (error) { controls.delete(requestId); reject(error); }
+        catch (error) { controls.delete(requestId); clearTimeout(timer); reject(error); }
       });
     },
     async *pages(): AsyncGenerator<TerminalPage> {

@@ -221,7 +221,7 @@ export function useDictation({ connection, value, onChange, maxLength, disabled 
   }, [state, start]);
 
   useEffect(() => {
-    if (!speech) return;
+    if (!speech || !focused) return;
     alive.current = true;
     // Events belong to the field that owns the recognizer, and not to a capture it already abandoned.
     const mine = () => recognizer.owner === self && !recognizer.drain;
@@ -258,7 +258,7 @@ export function useDictation({ connection, value, onChange, maxLength, disabled 
       // An error already finished the capture but its native `end` has not arrived, and this listener is gone.
       if (recognizer.owner === self) drain(self);
     };
-  }, [abandon, finish, self]);
+  }, [abandon, finish, focused, self]);
 
   // A send, a pending retry, a status change, or leaving the screen can lock the field while dictation
   // runs. The render that locks it resets the control, and the effect stops the recognizer and any cleanup in flight.

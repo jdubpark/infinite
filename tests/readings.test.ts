@@ -185,6 +185,17 @@ test("without Jev configuration start and tick do no polling, while merge derive
   } finally { f.dispose(); }
 });
 
+test("background polling retains compact session snapshots instead of full prompts and messages", async () => {
+  const f = setup({ title: "", generatedTitle: true, prompt: "p".repeat(100_000), lastMessage: "m".repeat(100_000) });
+  f.row.attention = { ...f.row.attention, state: "working" };
+  try {
+    await f.readings.tick();
+    const state = f.readings as unknown as { latestRows: Map<string, unknown>; latestSessions: Map<string, unknown> };
+    const retained = JSON.stringify({ rows: [...state.latestRows.values()], sessions: [...state.latestSessions.values()] });
+    assert.ok(retained.length < 2_048, `retained row and session snapshots were ${retained.length} bytes`);
+  } finally { f.dispose(); }
+});
+
 test("failures are held briefly, list merging stays synchronous, stale hashes drop, and cache survives restart", async () => {
   let calls = 0;
   const failing = { systemOne: async () => { calls++; throw new Error("timeout"); } } as unknown as JevTransport;

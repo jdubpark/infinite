@@ -40,6 +40,7 @@ final class DisplayFreshnessTests: XCTestCase {
     @MainActor func testFirstCatalogFailureEventuallyShowsOfflineWithoutCachedData() async throws {
         let model = CmuxViewModel()
         // No backend is connected: snapshot fails locally without accessing a server.
+        model.setDisplayVisible(true)
         await model.refresh()
         XCTAssertFalse(model.connected)
         XCTAssertFalse(model.catalogLoaded)

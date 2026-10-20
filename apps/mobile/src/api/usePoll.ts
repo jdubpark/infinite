@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useIsFocused } from "expo-router";
 import { inForeground, onForegroundChange } from "./foreground";
 
 /**
@@ -27,24 +28,48 @@ export function usePoll<T>(
   const [refreshing, setRefreshing] = useState(false);
   const latest = useRef(fn);
   const onlineNow = useRef(false);
+  const lastSuccessAt = useRef(0);
   const pollNow = useRef<() => void>(() => {});
+  const focused = useIsFocused();
+  const blurred = useRef(false);
   useEffect(() => {
     latest.current = fn;
   });
   useEffect(() => {
+    if (!focused) {
+      blurred.current = true;
+      pollNow.current = () => {};
+      return;
+    }
+    // Regaining focus is a return like foregrounding: a fresh view needs a poll that succeeds after it.
+    const refocused = blurred.current;
+    blurred.current = false;
     let active = true,
       polling = false,
       again = false,
       generation = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let staleTimer: ReturnType<typeof setTimeout> | undefined;
-    let lastSuccessAt = 0;
+    let resumeStateTimer: ReturnType<typeof setTimeout> | undefined;
     let staleDeadline = 0;
+    const scheduleStale = () => {
+      clearTimeout(staleTimer);
+      staleDeadline = Date.now() + 3000;
+      staleTimer = setTimeout(() => {
+        staleTimer = undefined;
+        staleDeadline = 0;
+        if (!active) return;
+        onlineNow.current = false;
+        setOnline(false);
+        setStale(true);
+      }, 3000);
+    };
     const delayStale = () => {
       if (onlineNow.current || staleTimer !== undefined) return;
       if (!staleDeadline) staleDeadline = Date.now() + 3000;
       staleTimer = setTimeout(() => {
         staleTimer = undefined;
+        staleDeadline = 0;
         if (active && !onlineNow.current) setStale(true);
       }, Math.max(0, staleDeadline - Date.now()));
     };
@@ -61,7 +86,7 @@ export function usePoll<T>(
       try {
         const value = await latest.current();
         if (current()) {
-          lastSuccessAt = Date.now();
+          lastSuccessAt.current = Date.now();
           onlineNow.current = true;
           clearTimeout(staleTimer);
           staleTimer = undefined;
@@ -99,34 +124,39 @@ export function usePoll<T>(
       staleTimer = undefined;
       if (!foreground) return;
 
-      const recentSuccess = Date.now() - lastSuccessAt <= intervalMs;
-      staleDeadline = Date.now() + 3000;
+      const recentSuccess = Date.now() - lastSuccessAt.current <= intervalMs;
       if (!recentSuccess) {
         onlineNow.current = false;
         setOnline(false);
         setStale(false);
       }
       // A recent view expires after three foreground seconds without a fresh result too.
-      staleTimer = setTimeout(() => {
-        staleTimer = undefined;
-        if (!active) return;
-        onlineNow.current = false;
-        setOnline(false);
-        setStale(true);
-      }, 3000);
+      scheduleStale();
       void poll();
     });
+    if (refocused && inForeground()) {
+      resumeStateTimer = setTimeout(() => {
+        if (!active || !inForeground()) return;
+        if (Date.now() - lastSuccessAt.current > intervalMs) {
+          onlineNow.current = false;
+          setOnline(false);
+        }
+        setStale(false);
+      }, 0);
+      scheduleStale();
+    }
     void poll();
     return () => {
       active = false;
       clearTimeout(timer);
       clearTimeout(staleTimer);
+      clearTimeout(resumeStateTimer);
       removeForegroundListener();
       pollNow.current = () => {};
     };
     // The caller owns the dependency list; `fn` is read through a ref.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intervalMs, ...deps]);
+  }, [focused, intervalMs, ...deps]);
   const refresh = useCallback(() => pollNow.current(), []);
   return { data, online, stale: stale && !online, loading, refreshing, seen, refresh };
 }

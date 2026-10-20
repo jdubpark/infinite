@@ -21,13 +21,13 @@ export function useSignals(connection: Connection, id: string): { events: Signal
       const previous = snapshot.current?.id === id ? snapshot.current : emptySnapshot(id);
       if (cursor.current.id !== id) cursor.current = { id, value: 0 };
       let after = cursor.current.value;
-      const events: SignalEvent[] = [];
+      let events = previous.events;
       let exited = previous.exited;
       let more = false;
       do {
         const page = await api<Page>(connection, `/sessions/${id}/events?after=${after}&limit=200&types=signal,lifecycle,input-intent,input-result`);
         after = page.cursor;
-        events.push(...page.events.filter(event => event.type === "signal").map(event => event as unknown as SignalEvent));
+        events = mergeSignalEvents(events, page.events.filter(event => event.type === "signal").map(event => event as unknown as SignalEvent));
         exited ||= hasExitedLifecycle(page.events);
         more = page.more;
       } while (more);

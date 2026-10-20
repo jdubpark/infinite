@@ -115,7 +115,8 @@ struct CmuxWorkspaceView: View {
                     Button { terminateID = id } label: { Image(systemName: "stop.circle") }.help("Terminate this server terminal").disabled(model.busy || !model.connected)
                 }.padding(10)
                 GeometryReader { area in
-                    TerminalSurface(pipe: model.pipe, acceptsInput: model.inputEnabled && model.directInput && model.connected && model.attached && model.snapshotReady, followsViewport: model.inputEnabled && model.attached,
+                    TerminalSurface(pipe: model.pipe, acceptsInput: model.inputEnabled && model.directInput && model.connected && model.attached && model.snapshotReady,
+                        followsViewport: model.inputEnabled && model.attached, isVisible: model.rendererVisible,
                         onInput: { text in if renderer == model.rendererGeneration { model.raw(text) } },
                         onResize: { cols, rows in Task { guard renderer == model.rendererGeneration else { return }; await model.resize(cols, rows) } },
                         onFailure: { message in if renderer == model.rendererGeneration { model.rendererFailed(message) } },

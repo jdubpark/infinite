@@ -41,7 +41,11 @@ function requestStore<Request extends { requestId: string }, Result>() {
       write(key, { ...current, pending: rejected ? undefined : current.pending, message });
     },
     clear(key: string) { write(key, empty); },
-    clearMessage(key: string) { const current = read(key); if (current.message) write(key, { ...current, result: undefined, message: "" }); },
+    clearMessage(key: string) {
+      const current = read(key);
+      if (!current.message && !current.result) return;
+      write(key, current.pending ? { pending: current.pending, message: "" } : empty);
+    },
     clearMachine(machine: string) {
       for (const key of values.keys()) if (key === machine || key.startsWith(`${machine}/`)) write(key, empty);
     },

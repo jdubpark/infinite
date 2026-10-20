@@ -19,6 +19,7 @@ import InfiniteCore
         }
         receive?(data, reset, columns, rows)
     }
+    func clear() { dimensions = (nil, nil); snapshot = Data(); history = Data(); replayAvailable = true }
     func replay() -> Bool {
         guard replayAvailable else { return false }
         receive?(snapshot + history, true, dimensions.0, dimensions.1); return true
@@ -30,6 +31,8 @@ struct TerminalSurface: NSViewRepresentable {
     var acceptsInput: Bool
     /// Fit the terminal to this view and resize the PTY; only a lease holder may.
     var followsViewport: Bool = false
+    /// Cursor animation runs only while this terminal is on a visible page.
+    var isVisible: Bool = true
     var onInput: (String) -> Void
     var onResize: (Int, Int) -> Void
     var onFailure: (String) -> Void = { _ in }
@@ -60,6 +63,7 @@ struct TerminalSurface: NSViewRepresentable {
         guard context.coordinator.ready else { return }
         context.coordinator.control(acceptsInput)
         context.coordinator.follow(followsViewport)
+        context.coordinator.render(isVisible)
     }
     static func dismantleNSView(_ view: WKWebView, coordinator: Coordinator) {
         coordinator.disposed = true; coordinator.ready = false
@@ -76,11 +80,17 @@ struct TerminalSurface: NSViewRepresentable {
         private var renderGeneration = UUID()
         private var controlled: Bool?
         private var following: Bool?
+        private var rendered: Bool?
         var disposed = false
         func follow(_ enabled: Bool) {
             guard !disposed, following != enabled else { return }
             following = enabled
             Task { try? await view?.callAsyncJavaScript("window.infiniteTerminal.follow(enabled)", arguments: ["enabled": enabled], in: nil, contentWorld: .page) }
+        }
+        func render(_ enabled: Bool) {
+            guard !disposed, rendered != enabled else { return }
+            rendered = enabled
+            Task { try? await view?.callAsyncJavaScript("window.infiniteTerminal.render(enabled)", arguments: ["enabled": enabled], in: nil, contentWorld: .page) }
         }
         func control(_ enabled: Bool) {
             guard !disposed else { return }
@@ -130,6 +140,7 @@ struct TerminalSurface: NSViewRepresentable {
                     return
                 }
                 control(parent.acceptsInput); follow(parent.followsViewport)
+                render(parent.isVisible)
                 if let cols = body["cols"] as? Int, let rows = body["rows"] as? Int { parent.onResize(cols, rows) }
             case "input": if ready, !overflowed, parent.acceptsInput, let text = body["text"] as? String { parent.onInput(text) }
             case "resize": if let cols = body["cols"] as? Int, let rows = body["rows"] as? Int { parent.onResize(cols, rows) }

@@ -50,6 +50,7 @@ import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/
 import { Readings } from "./readings.js";
 
 const id = z.uuid();
+const MAX_LOGIN_ATTEMPT_BUCKETS = 1024;
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
 function alive(pid: unknown) {
   if (!Number.isInteger(pid) || (pid as number) <= 1) return false;
@@ -324,9 +325,13 @@ export function createApp(config: Config, key: Buffer) {
     const ip = req.socket.remoteAddress ?? "unknown";
     const now = Date.now();
     const attempt = attempts.get(ip);
-    if (!attempt || now - attempt.start > 60000)
+    if (!attempt || now - attempt.start > 60000) {
+      if (attempts.size >= MAX_LOGIN_ATTEMPT_BUCKETS) {
+        for (const [address, bucket] of attempts) if (now - bucket.start > 60000) attempts.delete(address);
+        if (attempts.size >= MAX_LOGIN_ATTEMPT_BUCKETS) attempts.delete(attempts.keys().next().value!);
+      }
       attempts.set(ip, { start: now, count: 1 });
-    else if (++attempt.count > 10)
+    } else if (++attempt.count > 10)
       return res
         .status(429)
         .json({ error: "Too many attempts. Try again in one minute." });

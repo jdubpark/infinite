@@ -7,6 +7,8 @@ import { Chip, GlassButton } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import type { StatusKind } from "../../status";
 import { theme } from "../../theme";
+import { MicButton } from "../../dictation/DictationControls";
+import type { Dictation } from "../../dictation/useDictation";
 import { profileSetting, type LinearTracking, type ModelProfile, type TeamLineup, type Tone } from "./model";
 import type { RunRequestControl } from "./useRunRequest";
 
@@ -127,17 +129,21 @@ export function RequestStatus({ request, canRetry, bottom = 0 }: { request: RunR
 }
 
 /** The floating direction field for a team or goal; `note` replaces it when steering is unavailable. */
-export function SteerBox({ value, onChange, placeholder, enabled, busy, note, onSend }: {
-  value: string; onChange: (text: string) => void; placeholder: string; enabled: boolean; busy: boolean; note?: string; onSend: () => void;
+export function SteerBox({ value, onChange, placeholder, enabled, busy, note, onSend, dictation }: {
+  value: string; onChange: (text: string) => void; placeholder: string; enabled: boolean; busy: boolean; note?: string; onSend: () => void; dictation?: Dictation;
 }) {
   if (note) return <Text style={[t.note, s.steerNote]} numberOfLines={1}>{note}</Text>;
+  // The field is read-only whenever steering is off or a send is in flight, so the mic follows it.
+  const mic = dictation ? <MicButton dictation={dictation} size={40} disabled={!enabled || busy} /> : null;
   if (busy) return <View style={s.steer}>
     <TextInput accessibilityLabel="Direction" value={value} onChangeText={onChange} editable={false} multiline maxLength={8000} placeholder={placeholder} placeholderTextColor={theme.colors.placeholder} style={s.steerInput} />
+    {mic}
     <View accessible accessibilityRole="progressbar" accessibilityLabel="Sending direction" style={s.busyButton}><ActivityIndicator color={theme.colors.forest} /></View>
   </View>;
   return <View style={s.steer}>
     <TextInput accessibilityLabel="Direction" value={value} onChangeText={onChange} editable={enabled && !busy} multiline maxLength={8000}
       placeholder={placeholder} placeholderTextColor={theme.colors.placeholder} style={s.steerInput} />
+    {mic}
     <GlassButton primary glyph="send" label={busy ? "Sending" : "Send direction"} size={40} disabled={!enabled || busy || !value.trim()} onPress={onSend} />
   </View>;
 }

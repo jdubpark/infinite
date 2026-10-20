@@ -10,6 +10,8 @@ import { Button } from "../../components/Button";
 import { TopBar } from "../../components/Glass";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
+import { DictationNotice, MicButton } from "../../dictation/DictationControls";
+import { useDictation } from "../../dictation/useDictation";
 
 export function Create({ connection }: { connection: Connection }) {
   const router = useRouter();
@@ -55,6 +57,7 @@ export function Create({ connection }: { connection: Connection }) {
     ]);
   }
   const locked = busy || Boolean(request);
+  const dictation = useDictation({ connection, value: prompt, onChange: setPrompt, maxLength: 24000, disabled: locked });
   async function submit() {
     if (sending.current || !online || me?.role !== "owner" || !selectedProvider || !selectedProject || !title.trim()) return;
     sending.current = true;
@@ -73,6 +76,7 @@ export function Create({ connection }: { connection: Connection }) {
   return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     <TopBar backLabel="Sessions" onBack={() => router.replace({ pathname: "/", params: { machine } })} right={<Text style={s.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
     <FloatingNotice position="top" offset={58} message={stale ? me ? "Waiting for a fresh machine connection." : "Can't reach this machine." : null} actions={stale ? <Button compact title="Refresh" secondary onPress={refresh} /> : null} />
+    <DictationNotice dictation={dictation} position="top" offset={110} />
     <ScrollView contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>New session</Text>
       <Text style={s.note}>Runs on {me?.machine?.label || connection.label || "this machine"}. The machine must stay online.</Text>
@@ -91,7 +95,7 @@ export function Create({ connection }: { connection: Connection }) {
       {me && !providers.length ? <Text style={s.warning}>No agents are configured for this session host.</Text> : null}
       <Text style={s.label}>Session name</Text>
       <TextInput accessibilityLabel="Session name" value={title} onChangeText={setTitle} editable={!locked} style={s.input} placeholder="What are you working on?" placeholderTextColor={theme.colors.placeholder} maxLength={100} />
-      <Text style={s.label}>First request (optional)</Text>
+      <View style={s.labelRow}><Text style={[s.label, s.labelText]}>First request (optional)</Text><MicButton dictation={dictation} size={36} disabled={locked} /></View>
       <TextInput accessibilityLabel="First request" value={prompt} onChangeText={setPrompt} editable={!locked} multiline style={[s.input, s.prompt]} placeholder="Give the agent an outcome and useful context…" placeholderTextColor={theme.colors.placeholder} maxLength={24000} />
       <Text style={s.note}>You can use your keyboard’s microphone to dictate. Review the text before starting.</Text>
       {creation.message ? <Text accessibilityRole="alert" style={s.warning}>{creation.message}</Text> : null}
@@ -108,4 +112,6 @@ const s = StyleSheet.create({
   choices: { flexDirection: "row", flexWrap: "wrap", gap: 8 }, section: { marginVertical: 16, gap: 12 },
   input: { borderWidth: 1, borderColor: theme.colors.fieldRule, borderRadius: theme.radius.control, padding: 14, minHeight: 50, color: theme.colors.ink, fontSize: 15 },
   prompt: { minHeight: 140, textAlignVertical: "top" },
+  labelRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 16 },
+  labelText: { marginTop: 0 },
 });

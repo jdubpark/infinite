@@ -41,6 +41,7 @@ import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchem
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
+import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
 import { BalanceService } from "./balances.js";
 import { LiveFeed, type LiveTopic } from "./live.js";
@@ -254,6 +255,7 @@ export function createApp(config: Config, key: Buffer) {
     }
   };
   const pushStore = new PushStore(config.stateDir, key);
+  const dictationCleaner = config.dictation ? new DictationCleaner(config.dictation) : undefined;
   const repositoryBriefings = config.repositoryBriefings
     ? new RepositoryBriefings(config.repositoryBriefings, manager, config.projects, config.teams?.workspaceDir)
     : undefined;
@@ -405,6 +407,7 @@ export function createApp(config: Config, key: Buffer) {
         answer: ["owner", "controller"].includes(res.locals.role),
         push: Boolean(config.push?.enabled),
         ...(repositoryBriefings || summarizer ? { summaries: { model: repositoryBriefings?.model ?? summarizer!.model } } : {}),
+        ...(dictationCleaner ? { dictation: { model: dictationCleaner.config.model } } : {}),
         ...(repositoryBriefings ? { repositoryBriefings: { model: repositoryBriefings.model, automatic: config.repositoryBriefings!.automatic } } : {}),
         ...(config.remote?.enabled ? { remoteTerminal: 1 } : {}),
         desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: DESKTOP_LIMITS.chunkBytes, maxFileBytes: DESKTOP_LIMITS.maxFileBytes },
@@ -425,6 +428,16 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/usage/projects", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query); return void res.json(usage.projects({ tz: query.tz })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
   app.get("/api/usage/projects/:id", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query), result = usage.project(String(req.params.id), { tz: query.tz }); if (!result) return void res.status(404).json({ error: "Project usage not found" }); return void res.json(result); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
   app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
+  app.post("/api/dictation/cleanup", requireRole(["owner", "controller"]), async (req, res) => {
+    const body = z.object({ text: z.string().trim().min(1).max(32000) }).strict().parse(req.body);
+    if (!dictationCleaner) return void res.status(503).json({ code: "dictation-unavailable", error: "This host has no dictation model configured." });
+    try {
+      res.json(await dictationCleaner.clean(body.text));
+    } catch (error) {
+      if (error instanceof DictationError) return void res.status(502).json({ code: "dictation-failed", error: error.message });
+      throw error;
+    }
+  });
   app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));

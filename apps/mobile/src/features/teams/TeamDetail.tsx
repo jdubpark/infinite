@@ -11,6 +11,8 @@ import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import type { StatusKind } from "../../status";
 import { theme } from "../../theme";
+import { DictationNotice } from "../../dictation/DictationControls";
+import { useDictation } from "../../dictation/useDictation";
 import {
   MEMBER_LABELS, memberKind, newer, openDecisions, pendingApprovals, ROLE_NAMES, shortDate, TEAM_LABELS, taskGroups, taskKind, teamControls, teamKind, teamPhases, teamProgress, workerStatus,
   type ModelProfile, type PhaseState, type TeamCheck, type TeamDecision, type TeamMember, type TeamTask, type TeamView,
@@ -60,6 +62,14 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     refused: poll.refresh,
   });
   const fresh = poll.online;
+  // Created before the early return below, so it reads the steer rule directly rather than `controls`.
+  const dictation = useDictation({
+    connection,
+    value: direction,
+    onChange: setDirection,
+    maxLength: 8000,
+    disabled: !team || !teamControls(team, me?.role, fresh).steer || request.busy || Boolean(request.pending),
+  });
   function back() {
     if (router.canGoBack()) router.back();
     else router.replace({ pathname: "/", params: { machine, view: "teams" } });
@@ -146,6 +156,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     {top}
     <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : agentStale ? "Agent screen may be stale." : null} />
+    <DictationNotice dictation={dictation} position="top" offset={110} />
     <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled" stickyHeaderIndices={[1]}
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View style={s.head}>
@@ -332,7 +343,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </View> : null}
     </ScrollView>
     <View style={s.dock} onLayout={(event) => setDockHeight(event.nativeEvent.layout.height)}>
-      <SteerBox value={direction} onChange={setDirection} placeholder="Direct the team…"
+      <SteerBox value={direction} onChange={setDirection} dictation={dictation} placeholder="Direct the team…"
         enabled={controls.steer && !locked} busy={request.busy}
         note={team.status === "delivering" || team.status === "merged" || team.deliveryReceipt ? "Delivery started · check its PR first."
           : me?.role === "viewer" ? "View only."

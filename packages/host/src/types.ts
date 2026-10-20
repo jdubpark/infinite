@@ -126,6 +126,8 @@ export interface Config {
   summaries?: { model: string; apiKeyFile: string; baseUrl: string };
   /** Optional Jev readings for turn-finished lines and generated session titles. */
   jev?: { apiKeyFile: string; model: string; baseUrl: string };
+  /** Optional cleanup for dictated text through an OpenAI-compatible Responses API. */
+  dictation?: { model: string; apiKeyFile: string; baseUrl: string };
   /** Read-only repository briefs produced by an administrator-configured host wrapper. */
   repositoryBriefings?: { command: string; args: string[]; runner?: "muse" | "deepseek" | "codex"; model?: string; automatic: boolean; intervalMs: number; cooldownMs: number; timeoutMs: number };
   port: number;

@@ -29,7 +29,8 @@ import { useApi, ago, ApiError, isControlRefusal, names, pendingLabel, type Cont
 import { clearDrafts, readDraft, settleDraft, useSessionDraft, writeDraft, type PendingInput } from "./drafts";
 import { creations, lifecycles } from "./requests";
 import { MachinePicker, MachineProvider, useMachines } from "./machines";
-import { Conversation, ProjectFiles, Dictation, PromptDecision, SessionLifecycle } from "./session-extras";
+import { Conversation, ProjectFiles, PromptDecision, SessionLifecycle } from "./session-extras";
+import { DictationNotice, MicButton, useDictation } from "./dictation";
 import { SessionPicker, sessionStatus, useSessionLocation, type SessionTab } from "./session-navigation";
 import "@fontsource/instrument-sans/400.css";
 import "@fontsource/instrument-sans/500.css";
@@ -501,6 +502,7 @@ function Create({
   const [prompt, setPrompt] = useState(request?.prompt ?? "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const promptDictation = useDictation({ me, value: prompt, onChange: setPrompt, maxLength: 24000, disabled: busy || Boolean(request) || me.role !== "owner" });
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [applying, setApplying] = useState(false);
   // An apply failure belongs to the workspace it was sent for.
@@ -627,14 +629,14 @@ function Create({
           <label htmlFor="prompt">
             First request <span className="quiet">(optional)</span>
           </label>
-          <textarea
+          <div className="dictation-field"><div className="dictation-field-control"><textarea
             id="prompt"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             rows={5}
             placeholder="Give the agent an outcome and useful context…"
             maxLength={24000}
-          />
+          /><MicButton dictation={promptDictation} /></div><DictationNotice dictation={promptDictation} /></div>
         </fieldset>
         <p className="form-note">
           {provider === "demo"
@@ -748,6 +750,7 @@ function SessionView({
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const dictation = useDictation({ me, value: text, onChange: next => { setText(next); setNotice(""); setError(""); }, maxLength: 32000, disabled: busy || pendingInput || me.role === "viewer" });
   const [events, setEvents] = useState<LogEvent[]>(cached.current?.events ?? []);
   const cursor = useRef<number | null>(cached.current?.cursor ?? null);
   const composer = useRef<HTMLTextAreaElement>(null);
@@ -833,6 +836,7 @@ function SessionView({
     setBusy(true);
     setError("");
     setNotice("");
+    dictation.dismiss();
     const current = readDraft(cacheKey);
     const retrying = current.pending !== null;
     // Only the terminal views permit typing directly into an open dialog.
@@ -874,6 +878,7 @@ function SessionView({
     setBusy(true);
     setError("");
     setNotice("");
+    dictation.dismiss();
     try {
       const receipt = await api<{ state: string }>(`/sessions/${id}/key`,
         { requestId: crypto.randomUUID(), key }, undefined, control.owned.current?.id);
@@ -1064,9 +1069,10 @@ function SessionView({
           </div>
         </div>
         <div className="composer-feedback">
-          <span className={error ? "error" : control.message ? "quiet control-message" : "receipt"} role={error ? "alert" : "status"} title={error || control.message || notice}>
+          {/* One fixed slot: delivery errors, control messages, and receipts win; send, keys, and typing clear the dictation outcome. */}
+          {dictation.notice && !error && !control.message && !notice ? <DictationNotice dictation={dictation} /> : <span className={error ? "error" : control.message ? "quiet control-message" : "receipt"} role={error ? "alert" : "status"} title={error || control.message || notice}>
             {!error && !control.message && notice && <Check size={14} aria-hidden="true" />}{error || control.message || notice}
-          </span>
+          </span>}
         </div>
         {me.role === "viewer" ? (
           <p className="quiet">This device has view-only access.</p>
@@ -1076,7 +1082,7 @@ function SessionView({
               <label className="sr-only" htmlFor="message">
                 Message to agent
               </label>
-              <textarea
+              <div className="dictation-field-control composer-dictation-control"><textarea
                 id="message"
                 ref={composer}
                 rows={2}
@@ -1086,7 +1092,7 @@ function SessionView({
                     : "Draft here. Take control when you are ready to send…"
                 }
                 value={text}
-                onChange={(e) => { setText(e.target.value); setNotice(""); setError(""); }}
+                onChange={(e) => { setText(e.target.value); setNotice(""); setError(""); dictation.dismiss(); }}
                 onKeyDown={event => {
                   if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) {
                     event.preventDefault();
@@ -1095,7 +1101,7 @@ function SessionView({
                 }}
                 disabled={busy || pendingInput}
                 maxLength={32000}
-              />
+              /><MicButton dictation={dictation} /></div>
               <button
                 className="send-button"
                 aria-busy={busy}
@@ -1110,7 +1116,6 @@ function SessionView({
             <div className="composer-footer">
               <span>{pendingInput && !busy ? "Unconfirmed delivery · retry keeps the same request ID" : text ? "Unsent draft · kept in this tab" : "⌘ / Ctrl + Enter to send · Enter for a new line"}</span>
               <div>
-                <Dictation disabled={busy || pendingInput} onText={value => setText(current => `${current}${current ? " " : ""}${value}`)} />
                 <button
                   disabled={!canSteer || busy}
                   onClick={() => key("enter")}

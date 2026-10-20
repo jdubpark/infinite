@@ -8,6 +8,7 @@ import { useMachines } from "./machines";
 import { useLiveRefresh } from "./live-refresh";
 import { requestStore } from "./requests";
 import { LinearTracking } from "./linear";
+import { DictationNotice, MicButton, useDictation } from "./dictation";
 
 type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
@@ -197,6 +198,7 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
   const [objective, setObjective] = useState(pending?.objective ?? "");
   const [parallelism, setParallelism] = useState(pending?.parallelism ?? 2);
   const [busy, setBusy] = useState(false);
+  const objectiveDictation = useDictation({ me, value: objective, onChange: setObjective, maxLength: 24000, disabled: busy || Boolean(pending) || me.role !== "owner" });
   const project = me.projects.find(value => value.id === projectId);
   const configured = Boolean(me.teams?.enabled && (project?.team?.checks.length || project?.team?.establishChecks));
   const maxParallelism = Math.max(1, Math.min(4, me.teams?.maxParallelism ?? 4));
@@ -221,7 +223,7 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
     {creation.result && <p role="status">Team started. <button className="text-button" onClick={() => done(creation.result!.id)}>Open team</button></p>}
     <form onSubmit={submit}>
       <fieldset disabled={busy || Boolean(pending) || me.role !== "owner"}>
-        <label htmlFor="team-objective">Feature request or PRD</label><textarea id="team-objective" rows={8} required maxLength={24000} value={objective} onChange={event => setObjective(event.target.value)} placeholder="Describe the outcome, who it is for, and what should happen…" />
+        <label htmlFor="team-objective">Feature request or PRD</label><div className="dictation-field"><div className="dictation-field-control"><textarea id="team-objective" rows={8} required maxLength={24000} value={objective} onChange={event => setObjective(event.target.value)} placeholder="Describe the outcome, who it is for, and what should happen…" /><MicButton dictation={objectiveDictation} /></div><DictationNotice dictation={objectiveDictation} /></div>
         <label htmlFor="team-title">Team name <span className="quiet">(optional)</span></label><input id="team-title" maxLength={100} value={title} onChange={event => setTitle(event.target.value)} placeholder="Uses the first line of your request" />
         <div className="team-form-grid">
           <div><label htmlFor="team-project">Workspace</label><select id="team-project" value={projectId} onChange={event => setProjectId(event.target.value)}>{me.projects.map(value => <option key={value.id} value={value.id}>{value.name}{(value.team?.checks.length || value.team?.establishChecks) ? "" : " · setup required"}</option>)}</select></div>
@@ -319,6 +321,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   const [busy, setBusy] = useState(false);
   const [dismissedMessage, setDismissedMessage] = useState("");
   const [direction, setDirection] = useState("");
+  const directionDictation = useDictation({ me, value: direction, onChange: setDirection, maxLength: 8000, disabled: busy || Boolean(pending) || !team || me.role === "viewer" || team.status === "cancelled" || team.status === "delivering" || Boolean(team.deliveryReceipt) });
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
@@ -462,7 +465,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
     </div>
     <div className="team-composer-area">
       {!busy && ((request.message && request.message !== dismissedMessage) || pending) && <div className={`team-floating-notice${request.result ? " is-receipt" : ""}`} role={request.result ? "status" : "alert"}>{request.message && request.message !== dismissedMessage && <div className="team-floating-message"><span>{request.message}</span><button type="button" className="team-notice-dismiss" aria-label="Dismiss notice" onClick={() => setDismissedMessage(request.message)}><X size={15} /></button></div>}{pending && <div className="team-pending" role="status"><span>Unconfirmed request: {pending.label.toLowerCase()} · revision {pending.revision}</span><button className="text-button" disabled={!fresh || me.role === "viewer" || (me.role !== "owner" && !pending.path.endsWith("/steer") && !pending.path.endsWith("/answer"))} onClick={() => void mutate(pending.path, pending.label, pending.text, pending.parallelism)}>Retry same request</button></div>}</div>}
-      {me.role === "viewer" ? <p className="quiet">This device can view the team. An owner or controller can answer decisions and send direction.</p> : team.goal ? <p className="quiet goal-team-origin">Answer this cycle’s decisions above. <a href={goalHref}>Open the goal</a> to steer, pause, resume, or cancel its work.</p> : team.status === "cancelled" ? <p className="quiet">This run is cancelled. Its work and evidence remain available above.</p> : team.status === "delivering" || team.deliveryReceipt ? <p className="quiet">Delivery has started. Inspect its PR and recorded evidence before starting further work.</p> : <form onSubmit={event => { event.preventDefault(); if (direction.trim()) void mutate("/teams/" + id + "/steer", "Direction", direction.trim()); }}><label className="sr-only" htmlFor="team-direction">Steer this team</label><textarea id="team-direction" rows={2} maxLength={8000} placeholder="Give the team a direction or change the requirements…" value={direction} onChange={event => setDirection(event.target.value)} disabled={busy || Boolean(pending)} /><button className="primary" disabled={!canSteer || busy || Boolean(pending) || !direction.trim()}>Send direction <Send size={17} /></button></form>}
+      {me.role === "viewer" ? <p className="quiet">This device can view the team. An owner or controller can answer decisions and send direction.</p> : team.goal ? <p className="quiet goal-team-origin">Answer this cycle’s decisions above. <a href={goalHref}>Open the goal</a> to steer, pause, resume, or cancel its work.</p> : team.status === "cancelled" ? <p className="quiet">This run is cancelled. Its work and evidence remain available above.</p> : team.status === "delivering" || team.deliveryReceipt ? <p className="quiet">Delivery has started. Inspect its PR and recorded evidence before starting further work.</p> : <form onSubmit={event => { event.preventDefault(); if (direction.trim()) void mutate("/teams/" + id + "/steer", "Direction", direction.trim()); }}><label className="sr-only" htmlFor="team-direction">Steer this team</label><div className="dictation-field team-steer-dictation"><div className="dictation-field-control"><textarea id="team-direction" rows={2} maxLength={8000} placeholder="Give the team a direction or change the requirements…" value={direction} onChange={event => setDirection(event.target.value)} disabled={busy || Boolean(pending)} /><MicButton dictation={directionDictation} /><button className="primary" disabled={!canSteer || busy || Boolean(pending) || !direction.trim()}>Send direction <Send size={17} /></button></div><DictationNotice dictation={directionDictation} /></div></form>}
     </div>
   </div>;
 }

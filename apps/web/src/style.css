@@ -146,7 +146,33 @@ small,
   border: 0;
   background: transparent;
   border-radius: 8px;
+  cursor: pointer;
 }
+.dictation-field { min-width: 0; }
+.dictation-field-control { display: flex; align-items: flex-end; gap: 8px; min-width: 0; }
+.dictation-field-control > textarea { flex: 1 1 auto; min-width: 0; }
+.dictation-mic { position: relative; flex: 0 0 44px; width: 44px; height: 44px; margin-bottom: 2px; border: 1px solid var(--rule); color: var(--green); background: #fff; }
+.dictation-mic:hover:not(:disabled) { background: #f1f5ef; }
+.dictation-mic:disabled { opacity: .55; cursor: not-allowed; }
+.dictation-mic.is-listening { border-color: #b75b46; color: #a34332; background: #fff2ef; }
+.dictation-mic.is-cleaning { border-color: #a6b89d; background: #f2f7ef; }
+.dictation-mic.is-listening, .dictation-mic.is-cleaning { flex-direction: column; gap: 1px; }
+.dictation-button-state { display: block; width: auto; max-width: 44px; padding: 0; color: var(--muted); font-size: 8px; line-height: 1; white-space: nowrap; pointer-events: none; }
+.dictation-notice-slot { height: 24px; display: flex; align-items: center; overflow: hidden; }
+.dictation-notice { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.dictation-notice > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dictation-notice .text-button { flex: 0 0 auto; min-height: 24px; padding: 2px 5px; font-size: 11px; }
+.dictation-dismiss { display: inline-flex; flex: 0 0 24px; align-items: center; justify-content: center; width: 24px; height: 24px; border: 0; border-radius: 5px; background: transparent; color: inherit; cursor: pointer; }
+.dictation-dismiss:hover { background: #e8eee4; }
+.team-steer-dictation { flex: 1 1 auto; min-width: 0; }
+.team-steer-dictation .dictation-field-control { flex-wrap: nowrap; }
+.team-steer-dictation .dictation-field-control > textarea { flex-basis: auto; }
+.team-steer-dictation .dictation-mic { margin-bottom: 0; }
+.team-steer-dictation .primary { margin-left: auto; }
+.composer-dictation-control { flex: 1 1 auto; align-self: stretch; }
+.composer-dictation-control > textarea { flex: 1 1 auto; }
+.composer-dictation-control .dictation-mic { margin: 0 2px 0 0; align-self: flex-end; }
+.composer-feedback > .dictation-notice-slot { height: 1.5em; min-height: 1.5em; max-height: 1.5em; }
 .dot {
   height: 7px;
   width: 7px;
@@ -1395,6 +1421,8 @@ small,
   .team-composer-area { padding: 14px 21px max(16px, env(safe-area-inset-bottom)); }
   .team-floating-notice { left: 21px; right: 21px; }
   .team-composer-area form { flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+  .team-steer-dictation .dictation-field-control { flex-wrap: wrap; }
+  .team-steer-dictation .dictation-field-control > textarea { flex-basis: calc(100% - 52px); }
   .team-composer-area textarea { flex-basis: 100%; max-height: 120px; }
   .team-composer-area .primary { min-height: 44px; padding: 11px 14px; }
   .team-decision { padding: 16px; }
@@ -1482,7 +1510,6 @@ small,
 .linear-tracking summary { min-height: 44px; padding: 12px 0; color: var(--green); cursor: pointer; }
 .linear-tracking.compact { padding: 12px 0 14px; margin: 18px 0; }
 .conversation-status { height: 1.6em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.dictation-status { display: inline-block; width: 172px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; vertical-align: middle; font-size: 11px; }
 .prompt-feedback { min-height: 1.5em; max-height: 1.5em; overflow: hidden; margin: 4px 0; white-space: nowrap; text-overflow: ellipsis; }
 @media (max-width: 700px) {
   .linear-tracking-heading a { min-height: 44px; }

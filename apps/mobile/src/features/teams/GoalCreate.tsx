@@ -9,6 +9,8 @@ import { FloatingNotice } from "../../components/FloatingNotice";
 import { TopBar } from "../../components/Glass";
 import { goalCreations } from "../../store/requests";
 import { theme } from "../../theme";
+import { DictationNotice, MicButton } from "../../dictation/DictationControls";
+import { useDictation, type Dictation } from "../../dictation/useDictation";
 import { lines, teamReady, type ProductGoal } from "./model";
 import { Choices, Disclosure, LineupView, t } from "./parts";
 
@@ -51,6 +53,7 @@ export function GoalCreate({ connection }: { connection: Connection }) {
   const ready = Boolean(me?.goals?.enabled && me.teams?.lineup && teamReady(selectedProject));
   const complete = Boolean(objective.trim() && successCriteria.trim() && allowedPaths.trim());
   const allowed = online && me?.role === "owner" && (Boolean(pending) || (ready && complete));
+  const dictation = useDictation({ connection, value: objective, onChange: setObjective, maxLength: 12000, disabled: locked });
   async function submit() {
     if (busy || !allowed) return;
     setError("");
@@ -82,8 +85,11 @@ export function GoalCreate({ connection }: { connection: Connection }) {
       goalCreations.fail(machine, request.requestId, `${(failure as Error).message}${rejected ? " Correct the goal and try again." : " Delivery is unconfirmed. Check Goals or retry the same request."}`, rejected);
     } finally { inFlight.delete(request.requestId); if (mounted.current) setSending(false); }
   }
-  const field = (label: string, value: string, change: (text: string) => void, options: { placeholder?: string; multiline?: boolean; maxLength?: number; note?: string; literal?: boolean } = {}) => <>
-    <Text style={t.label}>{label}</Text>
+  const field = (label: string, value: string, change: (text: string) => void, options: { placeholder?: string; multiline?: boolean; maxLength?: number; note?: string; literal?: boolean; dictation?: Dictation } = {}) => <>
+    {options.dictation ? <View style={s.labelRow}>
+      <Text style={[t.label, s.labelText]}>{label}</Text>
+      <MicButton dictation={options.dictation} size={36} disabled={locked} />
+    </View> : <Text style={t.label}>{label}</Text>}
     <TextInput accessibilityLabel={label} value={value} onChangeText={change} editable={!locked} multiline={options.multiline} maxLength={options.maxLength}
       autoCapitalize={options.literal ? "none" : undefined} autoCorrect={!options.literal}
       placeholder={options.placeholder} placeholderTextColor={theme.colors.placeholder} style={[t.input, options.multiline && t.multiline]} />
@@ -92,13 +98,14 @@ export function GoalCreate({ connection }: { connection: Connection }) {
   return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     <TopBar backLabel="Goals" onBack={() => router.canGoBack() ? router.back() : router.replace({ pathname: "/", params: { machine, view: "goals" } })} right={<Text style={t.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
     <FloatingNotice position="top" offset={58} message={stale ? me ? "Waiting for a fresh machine connection." : "Can't reach this machine." : null} actions={stale ? <Button compact title="Refresh" secondary onPress={refresh} /> : null} />
+    <DictationNotice dictation={dictation} position="top" offset={110} />
     <ScrollView contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>New goal</Text>
       <Text style={t.note}>Give the team an outcome and the evidence it should use. Agents choose scoped improvements and build reviewed cycles within these limits.</Text>
       {me && me.role !== "owner" ? <Text style={t.warning}>An owner key is required to start a goal.</Text> : null}
       {me && (!me.goals?.enabled || !me.teams?.lineup) ? <Text style={t.warning}>Goals need a configured team lineup with strong coordinator and reviewer profiles.</Text> : null}
       {creation.result ? <View style={s.section}><Text style={t.note}>Goal started.</Text><Button title="Open goal" onPress={() => router.replace({ pathname: "/goal/[id]", params: { id: creation.result!.id, machine } })} /></View> : null}
-      {field("Desired outcome", objective, setObjective, { multiline: true, maxLength: 12000, placeholder: "Describe what should improve for the people using this product…" })}
+      {field("Desired outcome", objective, setObjective, { multiline: true, maxLength: 12000, dictation, placeholder: "Describe what should improve for the people using this product…" })}
       {field("Success criteria", successCriteria, setSuccessCriteria, { multiline: true, maxLength: 4000, placeholder: "What evidence would show the goal was achieved?" })}
       {field("Goal name (optional)", title, setTitle, { maxLength: 100, placeholder: "Uses the first line of the outcome" })}
       <Text style={t.label}>Workspace</Text>
@@ -138,4 +145,6 @@ const s = StyleSheet.create({
   limitsHeading: { fontSize: 16, marginTop: 24 },
   limit: { flexDirection: "row", alignItems: "center", gap: 12 },
   number: { width: 88, textAlign: "right" },
+  labelRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 12 },
+  labelText: { marginTop: 0 },
 });

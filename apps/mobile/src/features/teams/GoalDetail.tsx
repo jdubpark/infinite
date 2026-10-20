@@ -8,6 +8,8 @@ import { Card, Chip, LiveStatus, ProgressBar, TopBar } from "../../components/Gl
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
+import { DictationNotice } from "../../dictation/DictationControls";
+import { useDictation } from "../../dictation/useDictation";
 import {
   GOAL_LABELS, goalControls, goalKind, goalStopped, newer, openDecisions, OUTCOME_LABELS, shortDate, TEAM_LABELS, teamKind, teamTone, workerStatus,
   type GoalResult, type ProductGoal, type TeamStatus, type TeamView,
@@ -35,6 +37,14 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
     refused: poll.refresh,
   });
   const fresh = poll.online;
+  // Created before the early return below, so it reads the steer rule directly rather than `controls`.
+  const dictation = useDictation({
+    connection,
+    value: direction,
+    onChange: setDirection,
+    maxLength: 8000,
+    disabled: !goal || !goalControls(goal, me?.role, fresh, poll.data?.receivedAt).steer || request.busy || Boolean(request.pending),
+  });
   function back() {
     if (router.canGoBack()) router.back();
     else router.replace({ pathname: "/", params: { machine, view: "goals" } });
@@ -56,6 +66,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     {header}
     <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : active.stale ? activeTeam ? "Active cycle may be out of date." : "Can't load the active cycle." : null} />
+    <DictationNotice dictation={dictation} position="top" offset={110} />
     <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View style={s.titleBlock}>
@@ -169,7 +180,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
 
     </ScrollView>
     <View style={s.dock} onLayout={(event) => setDockHeight(event.nativeEvent.layout.height)}>
-      <SteerBox value={direction} onChange={setDirection} placeholder="Update the goal’s direction or add evidence…"
+      <SteerBox value={direction} onChange={setDirection} dictation={dictation} placeholder="Update the goal’s direction or add evidence…"
         enabled={controls.steer && !locked} busy={request.busy}
         note={me?.role === "viewer" ? "View only."
           : goal.status === "paused" ? !expired ? "Resume to steer." : "This goal’s time limit has expired. Start a new goal to approve more time."

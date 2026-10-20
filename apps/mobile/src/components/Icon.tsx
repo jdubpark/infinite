@@ -8,7 +8,7 @@ import { theme } from "../theme";
  */
 export type GlyphName =
   | "back" | "forward" | "down" | "up" | "plus" | "close" | "check" | "search" | "terminal"
-  | "more" | "send" | "people" | "target" | "stack" | "pause" | "play" | "dot" | "chart";
+  | "more" | "send" | "people" | "target" | "stack" | "pause" | "play" | "dot" | "chart" | "mic";
 
 export function Glyph({ name, size = 18, color = theme.colors.ink }: { name: GlyphName; size?: number; color?: string }) {
   const w = Math.max(1.6, size / 11);
@@ -80,6 +80,14 @@ export function Glyph({ name, size = 18, color = theme.colors.ink }: { name: Gly
         {[0.45, 0.8, 0.6].map((height, index) => <View key={index} style={{ width: barWidth, height: size * height, borderRadius: w, backgroundColor: color }} />)}
       </View>;
     }
+    case "mic":
+      return <View style={box}>
+        <View style={at({ left: size * 0.34, top: size * 0.08, width: size * 0.32, height: size * 0.52, borderRadius: size, borderWidth: w, borderColor: color })} />
+        <View style={at({ left: size * 0.2, top: size * 0.34, width: size * 0.6, height: size * 0.36, borderBottomWidth: w, borderLeftWidth: w, borderRightWidth: w,
+          borderColor: color, borderBottomLeftRadius: size, borderBottomRightRadius: size })} />
+        <View style={at({ left: size * 0.5 - w / 2, top: size * 0.7, width: w, height: size * 0.16, borderRadius: w, backgroundColor: color })} />
+        <View style={at({ left: size * 0.32, top: size * 0.86, width: size * 0.36, height: w, borderRadius: w, backgroundColor: color })} />
+      </View>;
   }
 }
 

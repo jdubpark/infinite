@@ -28,7 +28,7 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   /** The journal position read for turn signals, and the latest turn boundary seen there. */
   signalCursor?: number; turnSignal?: { kind: string; at: string } };
 /** A subteam action recorded before it is sent, so a restart replays it under the same request ID. */
-type ChildOp = { kind: "answer" | "pause" | "resume" | "cancel"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; by?: "owner" | "coordinator" };
+type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; by?: "owner" | "coordinator" };
 type Stored = {
   mission: Mission;
   fingerprint: string;
@@ -249,7 +249,7 @@ export class MissionService {
       mission.steering.push({ text: body.text, revision: mission.revision, at: now() });
       stored.ownerInputs = (stored.ownerInputs ?? 0) + 1;
       stored.inbox.push({ type: "owner-direction", text: body.text });
-      this.event(stored, "Owner direction recorded for the coordinator. Subtasks started later include it.");
+      this.event(stored, "Owner direction recorded for the coordinator. Subtasks started later include it; the coordinator decides whether to forward it to running ones.");
       this.save(stored); return this.view(stored);
     });
   }
@@ -303,6 +303,8 @@ export class MissionService {
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
   }
   close() { this.closed = true; if (this.timer) clearInterval(this.timer); }
+  /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
+  idle() { return this.serial.then(() => undefined); }
 
   private async step(stored: Stored) {
     if (this.closed) return;
@@ -467,28 +469,52 @@ export class MissionService {
     }
   }
   private async applyOps(stored: Stored) {
-    const remaining: ChildOp[] = [];
+    const remaining: ChildOp[] = [], steered: (string | undefined)[] = [];
     for (const op of [...stored.ops]) {
       let team: TeamView;
       try { team = this.teams.get(op.teamId); } catch (error) { if (notFound(error)) continue; throw error; }
       const settled = teamDone.has(team.status) || team.status === "cancelled";
       if ((op.kind === "cancel" && settled) || (op.kind === "pause" && (settled || ["paused", "blocked"].includes(team.status))) || (op.kind === "resume" && team.status !== "paused")) continue;
-      if (op.revision !== team.revision) { op.requestId = randomUUID(); op.revision = team.revision; this.save(stored); }
+      // Steering restarts a paused or blocked subteam, so direction waits until both it and the mission are running again.
+      if (op.kind === "steer" && (team.status === "paused" || stored.mission.status === "paused")) { remaining.push(op); continue; }
+      if (op.kind === "steer" && settled) { steered.push(`Subtask ${op.subtaskId} finished before the direction reached it.`); continue; }
+      // A delivered steer raises the team revision, so a steer already bound to a revision replays its request
+      // and is rebound only after the team refuses that revision as stale.
+      if (op.revision !== team.revision && !(op.kind === "steer" && op.revision !== undefined)) { op.requestId = randomUUID(); op.revision = team.revision; this.save(stored); }
       try {
         if (op.kind === "answer") await this.teams.answer(op.teamId, op.decisionId!, { requestId: op.requestId, revision: op.revision, text: op.text! }, undefined, op.by ?? "owner");
+        else if (op.kind === "steer") team = await this.teams.steer(op.teamId, { requestId: op.requestId, revision: op.revision!, text: op.text! });
         else await this.teams[op.kind](op.teamId, { requestId: op.requestId, revision: op.revision });
       } catch (error) {
         if (this.closed) return;
         if (!(error instanceof TeamError)) throw error;
-        if (["members-stopping", "team-operation-running", "team-paused", "stale-team-revision"].includes(error.code)) { remaining.push(op); continue; }
+        if (["members-stopping", "team-operation-running", "team-paused", "stale-team-revision"].includes(error.code)) {
+          if (op.kind === "steer" && error.code === "stale-team-revision") op.revision = undefined;
+          remaining.push(op); continue;
+        }
+        if (op.kind === "steer") { steered.push(`The direction for subtask ${op.subtaskId} was not applied: ${error.message}`); continue; }
         this.event(stored, `A ${op.kind} for subtask ${op.subtaskId} was not applied: ${error.message}`);
         if (op.kind === "answer" && op.by === "coordinator" && live.has(stored.mission.status)) stored.inbox.push({ type: "refused", kind: "answer-child", reason: error.message });
         continue;
       }
       if (op.kind === "answer") this.event(stored, `Decision ${op.decisionId} of subtask ${op.subtaskId} was answered by the ${op.by}.`);
+      if (op.kind === "steer") {
+        // Mirror the restarted subteam now, so a report consumed on this tick sees it working.
+        const subtask = stored.mission.subtasks.find(item => item.id === op.subtaskId);
+        if (subtask) Object.assign(subtask, { status: subtaskStatus(team.status), teamStatus: team.status });
+        steered.push(undefined);
+        this.event(stored, `Subtask ${op.subtaskId} received the coordinator's direction and is replanning.`);
+      }
     }
     if (this.closed) return;
     stored.ops = remaining;
+    // Steer outcomes apply in order once the queue is settled, so a resulting stop keeps its cancels: a delivered
+    // direction resets the refusal count, and an undelivered one counts as a refused report.
+    for (const reason of steered) {
+      if (reason === undefined) stored.refusals = 0;
+      else if (live.has(stored.mission.status)) this.refuse(stored, "steer-subtask", reason);
+      else this.event(stored, `A steer was not applied: ${reason}`);
+    }
     this.save(stored);
   }
 
@@ -748,6 +774,13 @@ export class MissionService {
         this.event(stored, "The coordinator asked the owner a question.");
         break;
       }
+      case "steer-subtask": {
+        if (!["running", "blocked"].includes(subtask!.status) || !subtask!.teamId)
+          return this.refuse(stored, report.kind, `Subtask ${subtask!.id} has no running or blocked subteam. A queued subtask receives owner direction when it starts; dispatch a follow-up subtask for finished work.`, false);
+        this.queueOp(stored, { kind: "steer", subtaskId: subtask!.id, teamId: subtask!.teamId, text: report.text });
+        this.event(stored, `The coordinator sent direction to subtask ${subtask!.id}.`);
+        break;
+      }
       case "cancel-subtask": {
         if (subtask!.status === "done" || subtask!.status === "cancelled") return this.refuse(stored, report.kind, `Subtask ${subtask!.id} has already finished.`, false);
         if (subtask!.teamId) this.queueOp(stored, { kind: "cancel", subtaskId: subtask!.id, teamId: subtask!.teamId });
@@ -793,7 +826,8 @@ export class MissionService {
         this.event(stored, "The coordinator reported that the mission is blocked.");
         break;
     }
-    stored.refusals = 0;
+    // A steer resets the refusal count only once its subteam accepts the direction.
+    if (report.kind !== "steer-subtask") stored.refusals = 0;
     this.settle(stored);
   }
 }

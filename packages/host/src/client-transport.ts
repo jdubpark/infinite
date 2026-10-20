@@ -6,12 +6,12 @@ export type TerminalPage = {
   state?: Pick<WorkerState, "status" | "exitCode" | "control" | "capabilities" | "runtime" | "nativeSession">;
   snapshot?: TerminalSnapshot; receipt?: Receipt; error?: string;
   requestId?: string; control?: ControlLease | null;
-  refusal?: { requestId?: string; code: string };
+  refusal?: { requestId?: string; code: string; error?: string };
 };
 export class TerminalAccessError extends Error {}
 export class TerminalControlError extends Error {
-  constructor(readonly code: string) {
-    super(code === "control-busy" ? "Another device controls this session. Press Ctrl+T to take over." : "Control changed or expired. This input was not sent.");
+  constructor(readonly code: string, message?: string) {
+    super(message ?? (code === "control-busy" ? "Another device controls this session. Press Ctrl+T to take over." : "Control changed or expired. This input was not sent."));
   }
 }
 
@@ -65,7 +65,7 @@ export function terminalConnection(origin: string, token: string, sessionId: str
         return;
       }
       if (page.refusal) {
-        const id = page.refusal.requestId, refusal = new TerminalControlError(page.refusal.code);
+        const id = page.refusal.requestId, refusal = new TerminalControlError(page.refusal.code, page.refusal.error);
         if (page.refusal.code === "control-lost") lease = null;
         const input = id ? pending.get(id) : undefined, control = id ? controls.get(id) : undefined;
         if (input) { pending.delete(id!); pendingBytes -= input.size; input.reject(refusal); return; }

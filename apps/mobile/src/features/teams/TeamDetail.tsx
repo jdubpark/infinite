@@ -24,6 +24,7 @@ import { AgentLog, JevcodeSummary } from "./TeamSummary";
 import { orderedMembers } from "./summary";
 import { CostLine, RatingControl, RubricLine } from "../cost/parts";
 import { useTaskRating } from "../cost/useCost";
+import { MissionManagedLine } from "../board/MissionManagedLine";
 
 type Tab = "overview" | "tasks" | "agents" | "activity";
 const CHECK_KIND: Record<TeamCheck["status"], StatusKind> = { running: "progress", passed: "done", failed: "blocked", interrupted: "stopped" };
@@ -75,7 +76,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     else router.replace({ pathname: "/", params: { machine, view: "teams" } });
   }
   const openSession = (sessionId: string) => router.push({ pathname: "/session/[id]", params: { id: sessionId, machine } });
-  const owns = me?.role === "owner" && team && !team.goal && team.status !== "cancelled";
+  // A mission's subteam is run by its coordinator: no owner run controls, and its questions are not the owner's.
+  const owns = me?.role === "owner" && team && !team.goal && !team.missionId && team.status !== "cancelled";
   const top = <TopBar backLabel="Teams" onBack={back} right={<LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />;
   if (!team) return <View style={[s.fill, s.overlayRoot]}>{top}<FloatingNotice position="top" offset={58} message={poll.stale ? "Can't reach this machine." : null} actions={poll.stale ? <Button compact title="Refresh" secondary onPress={poll.refresh} /> : null} /><View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading…" : "Could not load the team."}</Text></View></View>;
 
@@ -83,7 +85,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   // Which controls the run offers at all; a stale view disables them in place rather than removing them.
   const offered = teamControls(team, me?.role, true);
   const locked = request.busy || Boolean(request.pending);
-  const decisions = openDecisions(team);
+  const decisions: TeamDecision[] = team.missionId ? [] : openDecisions(team);
   const listed = new Map((sessions ?? []).map(session => [session.id, session]));
   const project = me?.projects?.find(value => value.id === team.projectId)?.name ?? team.projectId;
   const send = (path: string, label: string, fields?: Record<string, string | number>) => request.send(`/teams/${id}${path}`, label, team.revision, fields);
@@ -168,7 +170,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           <LinearChip tracking={team.linear} fresh={fresh} />
         </View>
         <Text style={s.workerStatus} numberOfLines={2}>{workerStatus(team)}</Text>
-        {owns && !team.missionId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(team.status) ? <View style={s.workerControl}>
+        {owns && !["cancelled", "ready-for-review", "merged", "no-change"].includes(team.status) ? <View style={s.workerControl}>
           <Text style={t.label}>Worker limit</Text>
           <Choices values={Array.from({ length: team.workers?.max ?? 4 }, (_, index) => index + 1)} selected={team.workers?.limit ?? team.parallelism} disabled={locked || !fresh}
             label={String} onSelect={parallelism => { if (parallelism !== team.parallelism) send("/parallelism", "Worker limit", { parallelism }); }} />
@@ -281,7 +283,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
                 {task.paths.length ? <><Text style={t.label}>Owned paths</Text>{task.paths.map(path => <Text key={path} selectable style={t.mono}>{path}</Text>)}</> : null}
                 {profile ? <ProfileLine profile={profile} /> : null}
                 {task.rubric ? <RubricLine rubric={task.rubric} /> : null}
-                {me?.role === "owner" ? <RatingControl value={task.ownerRating} disabled={!fresh} busy={rating.busy === task.id} error={rating.error}
+                {me?.role === "owner" && !team.missionId ? <RatingControl value={task.ownerRating} disabled={!fresh} busy={rating.busy === task.id} error={rating.error}
                   onRate={score => void rating.rate(task.id, score)} /> : task.ownerRating ? <Text style={t.note}>Owner rating · {task.ownerRating.score}/5 · {shortDate(task.ownerRating.at)}</Text> : null}
                 {task.commit ? <Text selectable style={t.mono} numberOfLines={1} ellipsizeMode="middle">commit {task.commit}</Text> : null}
                 {member ? <Button compact secondary glyph="people" title={`${ROLE_NAMES[member.role]} log`} onPress={() => showAgent(member)} /> : null}
@@ -343,13 +345,13 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </View> : null}
     </ScrollView>
     <View style={s.dock} onLayout={(event) => setDockHeight(event.nativeEvent.layout.height)}>
-      <SteerBox value={direction} onChange={setDirection} dictation={dictation} placeholder="Direct the team…"
+      {team.missionId ? <MissionManagedLine missionId={team.missionId} machine={machine} /> : <SteerBox value={direction} onChange={setDirection} dictation={dictation} placeholder="Direct the team…"
         enabled={controls.steer && !locked} busy={request.busy}
         note={team.status === "delivering" || team.status === "merged" || team.deliveryReceipt ? "Delivery started · check its PR first."
           : me?.role === "viewer" ? "View only."
           : team.goal ? "Steer from its goal."
             : team.status === "cancelled" ? "Cancelled." : undefined}
-        onSend={() => { const text = direction.trim(); if (text) send("/steer", "Direction", { text }); }} />
+        onSend={() => { const text = direction.trim(); if (text) send("/steer", "Direction", { text }); }} />}
     </View>
     <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|answer)$/.test(request.pending?.path ?? ""))} />
   </KeyboardAvoidingView>;

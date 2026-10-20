@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createServer as createNetServer } from "node:net";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
+import { WebSocket } from "ws";
 import { stopSessionWorkers, waitFor } from "./helpers.js";
+import { inProcessHost } from "./helpers.js";
+import { writeSealed } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, missionBoard, type ProjectGroupLookup } from "../packages/host/src/missions.js";
@@ -12,7 +16,7 @@ import { createMissionReportEnvelope } from "../packages/host/src/team-report-cl
 import { missionPromptWithMessageCount, type MissionOpenChildDecision, type MissionMessage } from "../packages/host/src/team-prompts.js";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import type { Config } from "../packages/host/src/types.js";
+import type { Config, Session } from "../packages/host/src/types.js";
 import type { CreateTeam, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { CreateMission, Mission, MissionReport } from "../packages/host/src/mission-types.js";
 import { emptyRollup } from "../packages/host/src/team-usage.js";
@@ -70,9 +74,15 @@ function harness() {
     ({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 });
   const release = (name: string) => writeFileSync(join(receipts, name), "go", { mode: 0o600 });
   const close = async () => {
+    const closing = services;
     shut();
-    await stopSessionWorkers(config);
-    // Workers exit 1.5 s after their child; wait so they never write into a removed directory.
+    // A tick already under way can still launch a coordinator attempt or subteam member after close().
+    await closing?.missions.idle(); await closing?.teams.idle();
+    // Workers exit 1.5 s after their child. Sweep until none answers, so no worker or provider outlives the test.
+    for (let pass = 1; await stopSessionWorkers(config); pass++) {
+      if (pass === 8) throw new Error("Session workers still answer after the mission test stopped them");
+      await new Promise(done => setTimeout(done, 500));
+    }
     await new Promise(done => setTimeout(done, 1700));
     rmSync(root, { recursive: true, force: true });
   };
@@ -83,6 +93,261 @@ const until = (read: () => Mission, accepts: (mission: Mission) => boolean, time
 const standaloneRequest = (projectId: string): CreateTeam => ({
   requestId: randomUUID(), projectId, provider: "claude", useConfiguredLineup: true,
   title: "Standalone run", objective: "Make an independent repository change", parallelism: 1,
+});
+
+test("mission-managed sessions refuse direct human input but keep answers, reads, and standalone access", { timeout: 15000 }, async () => {
+  const host = await inProcessHost();
+  const workers: ReturnType<typeof createNetServer>[] = [];
+  const workerRequests: { sessionId: string; request: Record<string, unknown> }[] = [];
+  const missionId = randomUUID(), subteamId = randomUUID(), standaloneId = randomUUID();
+  const coordinatorId = randomUUID(), subteamSessionId = randomUUID(), standaloneSessionId = randomUUID(), ordinarySessionId = randomUUID();
+  const refusal = { error: "This session is run by its mission coordinator. Talk to the coordinator from the mission.", code: "mission-managed" };
+  const lease = { id: randomUUID(), label: "Test owner", expiresAt: Date.now() + 30000 };
+  const assignment = (runId: string, role: TeamAssignment["role"], memberId = randomUUID()): TeamAssignment => ({ runId, memberId, revision: 1, role });
+  const sessions: Session[] = [
+    { id: coordinatorId, team: assignment(missionId, "mission-coordinator"), provider: "demo", title: "Coordinator", projectId: "rehearsal", cwd: host.config.projects[0].path, createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "", runtime: { id: randomUUID(), location: "local", transport: "pty" } },
+    { id: subteamSessionId, team: { ...assignment(subteamId, "implementer"), taskId: "api" }, provider: "demo", title: "Subteam member", projectId: "rehearsal", cwd: host.config.projects[0].path, createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "", runtime: { id: randomUUID(), location: "local", transport: "pty", nativeUi: "opencode" } },
+    { id: standaloneSessionId, team: { ...assignment(standaloneId, "implementer"), taskId: "api" }, provider: "demo", title: "Standalone member", projectId: "rehearsal", cwd: host.config.projects[0].path, createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "", runtime: { id: randomUUID(), location: "local", transport: "pty" } },
+    { id: ordinarySessionId, provider: "demo", title: "Ordinary session", projectId: "rehearsal", cwd: host.config.projects[0].path, createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "", runtime: { id: randomUUID(), location: "local", transport: "pty" } },
+  ];
+  const state = { status: "running", pid: 123, seq: 1, screen: "", attention: initialAttention(new Date().toISOString(), false), capabilities: { inputControl: 1 }, control: lease };
+  let providerPromptOpen = false;
+  const currentState = () => providerPromptOpen
+    ? { ...state, attention: { ...state.attention, state: "needs-you" as const } }
+    : state;
+  try {
+    assert.throws(() => host.teams.missionIdOf(randomUUID()), error => error instanceof TeamError && error.code === "team-not-found");
+    host.teams.get = (id: string) => {
+      if (id === subteamId) throw new Error("Team tracking update failed while building a view");
+      return { id, title: "Standalone team" } as ReturnType<typeof host.teams.get>;
+    };
+    host.teams.missionIdOf = (id: string) => id === subteamId ? missionId : undefined;
+    for (const session of sessions) {
+      const directory = join(host.config.stateDir, "sessions", session.id);
+      mkdirSync(directory, { recursive: true });
+      mkdirSync(join(directory, "events"), { recursive: true });
+      writeSealed(join(directory, "meta.sealed"), host.manager.key, `${session.id}:meta`, { session, fingerprint: "fixture" });
+      const worker = createNetServer(socket => {
+        let text = "";
+        socket.on("data", chunk => {
+          text += chunk.toString();
+          const end = text.indexOf("\n");
+          if (end < 0) return;
+          const request = JSON.parse(text.slice(0, end));
+          workerRequests.push({ sessionId: session.id, request });
+          const result = request.op === "state" ? currentState()
+            : request.op === "control" ? request.action === "release" ? null : lease
+              : { requestId: request.requestId, state: "delivered", seq: 2 };
+          socket.end(JSON.stringify({ result }) + "\n");
+        });
+      });
+      await new Promise<void>((resolve, reject) => { worker.once("error", reject); worker.listen(join(host.config.runDir, `${session.id}.sock`), resolve); });
+      workers.push(worker);
+    }
+
+    const listed = await host.fetchApi("/sessions");
+    assert.equal(listed.status, 200);
+    const rows = new Map(listed.body.sessions.map((session: { id: string }) => [session.id, session]));
+    assert.deepEqual((rows.get(coordinatorId) as any).managedBy, { kind: "mission", missionId });
+    assert.deepEqual((rows.get(subteamSessionId) as any).managedBy, { kind: "mission", missionId, teamId: subteamId });
+    assert.equal("managedBy" in (rows.get(standaloneSessionId) as object), false);
+    assert.equal("managedBy" in (rows.get(ordinarySessionId) as object), false);
+    assert.deepEqual((await host.fetchApi(`/sessions/${subteamSessionId}`)).body.managedBy, { kind: "mission", missionId, teamId: subteamId });
+
+    const roles = ["owner", "controller", "viewer"] as const;
+    for (const sessionId of [coordinatorId, subteamSessionId]) {
+      for (const role of roles) {
+        const response = await host.fetchApi(`/sessions/${sessionId}/input`, role, { requestId: randomUUID(), text: "direct input" });
+        assert.equal(response.status, 409, `${role} input to ${sessionId}`);
+        assert.deepEqual(response.body, refusal);
+      }
+    }
+    const encodedSubteamId = `%${subteamSessionId.charCodeAt(0).toString(16).padStart(2, "0")}${subteamSessionId.slice(1)}`;
+    for (const path of [
+      `/sessions/${subteamSessionId}/input/`,
+      `/sessions/${subteamSessionId}/INPUT`,
+      `/sessions/${encodedSubteamId}/input`,
+    ]) {
+      const response = await host.fetchApi(path, "owner", { requestId: randomUUID(), text: "path variant input" });
+      assert.equal(response.status, 409, `${path} cannot bypass the route guard`);
+      assert.deepEqual(response.body, refusal);
+    }
+    for (const role of roles) {
+      for (const [suffix, body] of [
+        ["key", { requestId: randomUUID(), key: "enter" }],
+        ["raw", { requestId: randomUUID(), text: "native bytes" }],
+        ["stop", { requestId: randomUUID() }],
+        ["resume", { requestId: randomUUID() }],
+      ] as const) {
+        const response = await host.fetchApi(`/sessions/${subteamSessionId}/${suffix}`, role, body);
+        assert.equal(response.status, 409, `${role} ${suffix}`);
+        assert.deepEqual(response.body, refusal);
+      }
+      const claim = await host.fetchApi(`/sessions/${subteamSessionId}/control`, role, { action: "claim" });
+      assert.equal(claim.status, 409, `${role} control claim`);
+      assert.deepEqual(claim.body, refusal);
+      const native = await host.fetchApi(`/sessions/${subteamSessionId}/native`, role);
+      assert.equal(native.status, 409, `${role} native attach`);
+      assert.deepEqual(native.body, refusal);
+      const opencode = await host.fetchApi(`/sessions/${subteamSessionId}/opencode/session/${randomUUID()}/prompt_async`, role, { parts: [] });
+      assert.equal(opencode.status, 409, `${role} OpenCode attach`);
+      assert.deepEqual(opencode.body, refusal);
+    }
+    const opencodeRead = await host.fetchApi(`/sessions/${subteamSessionId}/opencode/session/${randomUUID()}/event`, "owner", undefined, {}, "GET");
+    assert.equal(opencodeRead.status, 409, "OpenCode attachment reads are also closed for managed sessions");
+    assert.deepEqual(opencodeRead.body, refusal);
+    const trailingClaim = await host.fetchApi(`/sessions/${subteamSessionId}/control/`, "owner", { action: "claim" });
+    assert.equal(trailingClaim.status, 409, "a trailing slash cannot bypass the claim guard");
+    assert.deepEqual(trailingClaim.body, refusal);
+
+    providerPromptOpen = true;
+    const scopedRequestOffset = workerRequests.length;
+    const clientId = randomUUID();
+    const promptClaim = await host.fetchApi(`/sessions/${subteamSessionId}/control`, "owner", { action: "claim" }, { "X-Infinite-Client": clientId });
+    assert.equal(promptClaim.status, 200, "a managed session can claim control while a provider prompt is open");
+    const promptLease = promptClaim.body.control.id as string;
+    const promptHeaders = { "X-Infinite-Client": clientId, "X-Infinite-Control": promptLease };
+    for (const [suffix, body] of [
+      ["input", { requestId: randomUUID(), text: "provider prompt input" }],
+      ["key", { requestId: randomUUID(), key: "enter" }],
+      ["raw", { requestId: randomUUID(), text: "provider prompt bytes" }],
+    ] as const) {
+      const response = await host.fetchApi(`/sessions/${subteamSessionId}/${suffix}`, "owner", body, promptHeaders);
+      assert.equal(response.status, 200, `${suffix} is available while the provider prompt is open`);
+      assert.equal(response.body.state, "delivered");
+    }
+    const scopedWrites = workerRequests.slice(scopedRequestOffset).filter(({ sessionId, request }) => sessionId === subteamSessionId && ["input", "key", "raw"].includes(String(request.op)));
+    assert.equal(scopedWrites.length, 3);
+    for (const { request } of scopedWrites) {
+      assert.equal(request.leaseId, promptLease, "prompt fallback preserves normal worker lease fencing");
+      assert.ok(request.actor);
+    }
+    for (const { path, body, method } of [
+      { path: `/sessions/${subteamSessionId}/stop`, body: { requestId: randomUUID() } },
+      { path: `/sessions/${subteamSessionId}/resume`, body: { requestId: randomUUID() } },
+      { path: `/sessions/${subteamSessionId}/native`, method: "GET" },
+      { path: `/sessions/${subteamSessionId}/opencode/session/${randomUUID()}/prompt_async`, body: { parts: [] } },
+    ]) {
+      const response = await host.fetchApi(path, "owner", body, {}, method);
+      assert.equal(response.status, 409, `${path} remains refused while a provider prompt is open`);
+      assert.deepEqual(response.body, refusal);
+    }
+    providerPromptOpen = false;
+    for (const [suffix, body] of [
+      ["input", { requestId: randomUUID(), text: "after prompt closed" }],
+      ["key", { requestId: randomUUID(), key: "enter" }],
+      ["raw", { requestId: randomUUID(), text: "after prompt closed" }],
+    ] as const) {
+      const response = await host.fetchApi(`/sessions/${subteamSessionId}/${suffix}`, "owner", body, promptHeaders);
+      assert.equal(response.status, 409, `${suffix} returns to the mission-managed refusal after the prompt closes`);
+      assert.deepEqual(response.body, refusal);
+    }
+
+    providerPromptOpen = true;
+    const wsUrl = new URL(`/api/sessions/${subteamSessionId}/native?client=${randomUUID()}&lease=${randomUUID()}`, host.origin);
+    wsUrl.protocol = "ws:";
+    const websocketResponse = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const socket = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${host.tokens.owner}` } });
+      const timer = setTimeout(() => { socket.terminate(); reject(new Error("Native WebSocket did not refuse the managed session")); }, 3000);
+      socket.on("error", error => { if (socket.readyState !== WebSocket.CLOSED) { clearTimeout(timer); reject(error); } });
+      socket.once("open", () => { clearTimeout(timer); socket.terminate(); reject(new Error("Managed native WebSocket unexpectedly opened")); });
+      socket.once("unexpected-response", (_request, response) => {
+        let body = "";
+        response.on("data", chunk => { body += chunk.toString(); });
+        response.on("end", () => { clearTimeout(timer); socket.terminate(); resolve({ status: response.statusCode ?? 0, body }); });
+      });
+    });
+    assert.equal(websocketResponse.status, 409);
+    assert.deepEqual(JSON.parse(websocketResponse.body), refusal);
+    providerPromptOpen = false;
+
+    const closedClaimId = randomUUID(), openClaimId = randomUUID(), inputRequestId = randomUUID(), rawRequestId = randomUUID(), closedInputId = randomUUID();
+    const terminalFrames = await new Promise<{ sawState: boolean; closedClaim: unknown; openClaim: any; input: any; raw: any; closedInput: unknown }>((resolve, reject) => {
+      const url = new URL(`/api/sessions/${subteamSessionId}/terminal?after=0`, host.origin);
+      url.protocol = "ws:";
+      const socket = new WebSocket(url);
+      let sawState = false;
+      let sentClosedClaim = false, sentOpenClaim = false, sentPromptWrites = false, sentClosedInput = false;
+      let openedLease: string | undefined;
+      let closedClaim: unknown, openClaim: any, input: any, raw: any;
+      const timer = setTimeout(() => { socket.terminate(); reject(new Error("Managed terminal prompt-scoped frames did not complete")); }, 5000);
+      socket.once("open", () => socket.send(JSON.stringify({ token: host.tokens.owner, clientId: randomUUID() })));
+      socket.on("message", data => {
+        const frame = JSON.parse(data.toString());
+        sawState ||= Boolean(frame.state);
+        if (frame.state && !sentClosedClaim) {
+          sentClosedClaim = true;
+          socket.send(JSON.stringify({ op: "control", requestId: closedClaimId, action: "claim" }));
+        }
+        if (frame.refusal?.requestId === closedClaimId && !sentOpenClaim) {
+          closedClaim = frame.refusal;
+          providerPromptOpen = true;
+          sentOpenClaim = true;
+          socket.send(JSON.stringify({ op: "control", requestId: openClaimId, action: "claim" }));
+        }
+        if (frame.requestId === openClaimId && frame.control && !sentPromptWrites) {
+          openClaim = frame.control;
+          openedLease = frame.control.id;
+          sentPromptWrites = true;
+          socket.send(JSON.stringify({ op: "input", requestId: inputRequestId, text: "prompt terminal input", submit: false, leaseId: openedLease }));
+          socket.send(JSON.stringify({ op: "raw", requestId: rawRequestId, text: "prompt terminal bytes", leaseId: openedLease }));
+        }
+        if (frame.receipt?.requestId === inputRequestId) input = frame.receipt;
+        if (frame.receipt?.requestId === rawRequestId) raw = frame.receipt;
+        if (input && raw && !sentClosedInput) {
+          providerPromptOpen = false;
+          sentClosedInput = true;
+          socket.send(JSON.stringify({ op: "input", requestId: closedInputId, text: "after prompt closed", submit: false, leaseId: openedLease }));
+        }
+        if (frame.refusal?.requestId === closedInputId) {
+          clearTimeout(timer); socket.close(); resolve({ sawState, closedClaim, openClaim, input, raw, closedInput: frame.refusal });
+        }
+      });
+      socket.on("error", error => { clearTimeout(timer); reject(error); });
+      socket.once("close", () => { if (timer) { clearTimeout(timer); reject(new Error("Managed terminal closed before returning its refusal")); } });
+    });
+    assert.equal(terminalFrames.sawState, true, "managed terminal keeps its live read stream");
+    assert.deepEqual(terminalFrames.closedClaim, { requestId: closedClaimId, code: "mission-managed", error: refusal.error });
+    assert.equal(terminalFrames.openClaim.id, lease.id, "a terminal claim is accepted while the worker reports an open prompt");
+    assert.equal(terminalFrames.input.state, "delivered", "terminal input is accepted for the open prompt");
+    assert.equal(terminalFrames.raw.state, "delivered", "terminal raw input is accepted for the open prompt");
+    assert.deepEqual(terminalFrames.closedInput, { requestId: closedInputId, code: "mission-managed", error: refusal.error }, "terminal writes are refused again after the prompt closes");
+
+    const answer = await host.fetchApi(`/sessions/${coordinatorId}/answer`, "owner", { requestId: randomUUID(), promptId: 1, option: 0 });
+    assert.equal(answer.status, 200, "provider prompts remain answerable through the owner API");
+    assert.equal(answer.body.state, "delivered");
+    const controllerAnswer = await host.fetchApi(`/sessions/${coordinatorId}/answer`, "controller", { requestId: randomUUID(), promptId: 1, option: 0 });
+    assert.equal(controllerAnswer.status, 200, "the authorized controller can still answer provider prompts");
+    const viewerAnswer = await host.fetchApi(`/sessions/${coordinatorId}/answer`, "viewer", { requestId: randomUUID(), promptId: 1, option: 0 });
+    assert.equal(viewerAnswer.status, 403, "the managed-answer lease exception does not widen the role gate");
+    const managedAnswers = workerRequests.filter(({ sessionId, request }) => sessionId === coordinatorId && request.op === "answer");
+    assert.equal(managedAnswers.length, 2);
+    for (const { request } of managedAnswers) {
+      assert.equal(request.missionManaged, true, "the host marks mission answers for the worker's lease-free path");
+      assert.equal("leaseId" in request, false, "mission answers do not depend on a refused input lease");
+      assert.equal("actor" in request, false);
+    }
+    // A fallback lease is renewable only while a prompt is open, so it lapses after the prompt closes; release always works.
+    const closedRenew = await host.fetchApi(`/sessions/${subteamSessionId}/control`, "owner", { action: "renew", leaseId: lease.id });
+    assert.deepEqual([closedRenew.status, closedRenew.body.code], [409, "mission-managed"], "a lease cannot be kept alive after its prompt closes");
+    providerPromptOpen = true;
+    const openRenew = await host.fetchApi(`/sessions/${subteamSessionId}/control`, "owner", { action: "renew", leaseId: lease.id });
+    assert.equal(openRenew.status, 200, "a lease renews while the prompt is open");
+    providerPromptOpen = false;
+    const released = await host.fetchApi(`/sessions/${subteamSessionId}/control`, "owner", { action: "release", leaseId: lease.id });
+    assert.equal(released.status, 200, "release can drop a managed-session lease at any time");
+    for (const sessionId of [standaloneSessionId, ordinarySessionId]) {
+      const input = await host.fetchApi(`/sessions/${sessionId}/input`, "owner", { requestId: randomUUID(), text: "allowed input" });
+      assert.equal(input.status, 200, `input to ${sessionId} remains available`);
+    }
+    const resized = await host.fetchApi(`/sessions/${coordinatorId}/resize`, "owner", { cols: 80, rows: 24 });
+    assert.equal(resized.status, 200, "resize remains available");
+    const events = await host.fetchApi(`/sessions/${subteamSessionId}/events`);
+    assert.equal(events.status, 200, "read routes remain available");
+  } finally {
+    await host.stop();
+    await Promise.all(workers.map(worker => new Promise<void>(resolve => worker.close(() => resolve()))));
+  }
 });
 
 test("mission prompt keeps 21 open child questions under the byte limit without repeating their text", () => {
@@ -388,6 +653,9 @@ function scripted() {
   let resumeBusy = false;
   const created: { request: CreateTeam; options?: { baseRunId?: string } }[] = [];
   const answers: { teamId: string; decisionId: string; text: string; by?: string }[] = [];
+  const steers: { teamId: string; text: string }[] = [];
+  const steerReceipts = new Map<string, string>();
+  let steerLimit: boolean | Set<string> = false, steerBusy = false, loseSteerReply = false;
   const view = (run: FakeRun) => ({ ...structuredClone(run), title: run.id, tasks: [], usage: emptyRollup() }) as unknown as TeamView;
   const run = (id: string) => { const value = runs.get(id); if (!value) throw new TeamError(404, "team-not-found", "This team does not exist."); return value; };
   const set = (id: string, patch: Partial<FakeRun>) => Object.assign(run(id), patch, { updatedAt: new Date().toISOString() });
@@ -413,6 +681,22 @@ function scripted() {
       if (target.decisions.every(item => item.answer)) set(id, { status: "implementing" });
       return view(target);
     },
+    // Mirrors TeamService.steer: a known request replays, then busy, stale, and limit refusals, then a new revision.
+    async steer(id: string, body: { requestId: string; revision: number; text: string }) {
+      const fingerprint = JSON.stringify(body);
+      if (steerReceipts.has(body.requestId)) {
+        if (steerReceipts.get(body.requestId) !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
+        return view(run(id));
+      }
+      if (steerBusy) throw new TeamError(409, "team-operation-running", "A workspace operation is in progress. Retry steering after it settles.");
+      if (body.revision !== run(id).revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
+      if (steerLimit === true || (steerLimit && steerLimit.has(id))) throw new TeamError(409, "team-steering-limit", "This team reached its steering limit. Start a new team from the reviewed integration branch.");
+      steerReceipts.set(body.requestId, fingerprint);
+      steers.push({ teamId: id, text: body.text });
+      const steered = view(set(id, { status: "planning", revision: run(id).revision + 1 }));
+      if (loseSteerReply) { loseSteerReply = false; throw new TeamError(409, "team-operation-running", "The reply was lost after the steer was recorded."); }
+      return steered;
+    },
     async pause(id: string) { return view(set(id, { status: "paused" })); },
     async resume(id: string) {
       if (resumeBusy) throw new TeamError(409, "team-operation-running", "Another team operation is running.");
@@ -434,7 +718,13 @@ function scripted() {
   const attempt = async (n: number) => (await waitFor(async () => attempts[n - 1], value => Boolean(value), 20000))!;
   const parse = (prompt: string, label: string) => JSON.parse(prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
   return {
-    missions, runs, standalone, failing, created, answers, set,
+    missions, runs, standalone, failing, created, answers, steers, set,
+    /** Later steers of these subteams, or of every subteam, are refused at the steering limit. */
+    limitSteering: (teamIds?: string[]) => { steerLimit = teamIds ? new Set(teamIds) : true; },
+    /** Subteam steers are refused as busy until released. */
+    holdSteers: (held: boolean) => { steerBusy = held; },
+    /** The next steer is recorded by the subteam, but the mission sees a retryable error instead of its reply. */
+    loseNextSteerReply: () => { loseSteerReply = true; },
     remove: () => { removed = true; },
     attempts: () => attempts.length,
     attempt,
@@ -861,5 +1151,110 @@ test("messages beyond one attempt's limit wait for the next, and open subteam de
     assert.equal(delivered.filter((message: { type: string }) => message.type === "owner-direction").length, 20);
     await waitFor(async () => h.answers.length, count => count === 2, 20000);
     assert.ok(h.answers.every(answer => answer.by === "coordinator"));
+  } finally { h.close(); }
+});
+
+test("a coordinator forwards owner direction to a running subteam, held while it is paused and refused for queued work", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "API first, then web", subtasks: [plan("a", "api"), plan("b", "web", ["a"])] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    h.set(teamId, { status: "paused" });
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Return JSON, not text" });
+    assert.ok((await h.messages(2)).some((message: { type: string }) => message.type === "owner-direction"));
+    await h.report(2, { kind: "steer-subtask", subtaskId: "a", text: "The owner wants JSON responses" });
+    await until(() => h.get(id), mission => mission.events.some(event => /sent direction to subtask a/.test(event.text)));
+    await new Promise(done => setTimeout(done, 1200));
+    assert.deepEqual(h.steers, [], "A paused subteam is not restarted by forwarded direction");
+    h.set(teamId, { status: "implementing" });
+    await until(() => h.steers, steers => steers.length === 1);
+    assert.deepEqual(h.steers, [{ teamId, text: "The owner wants JSON responses" }]);
+    await until(() => h.get(id), mission => mission.events.some(event => /Subtask a received the coordinator's direction/.test(event.text)));
+
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Label the web button Check health" });
+    await h.report(3, { kind: "steer-subtask", subtaskId: "b", text: "Label the button Check health" });
+    await until(() => h.get(id), mission => mission.events.some(event => /steer-subtask report was refused: Subtask b has no running or blocked subteam/.test(event.text)));
+
+    h.limitSteering();
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Also log each request" });
+    await h.report(4, { kind: "steer-subtask", subtaskId: "a", text: "Log each request" });
+    const refused = (await h.messages(5)).find((message: { type: string; kind?: string }) => message.type === "refused" && message.kind === "steer-subtask");
+    assert.match(refused.reason, /steering limit/, "A subteam's refusal wakes the coordinator with the reason");
+    assert.equal(h.steers.length, 1);
+  } finally { h.close(); }
+});
+
+test("a steer whose reply was lost replays its request instead of steering the subteam twice", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Return JSON" });
+    h.loseNextSteerReply();
+    await h.report(2, { kind: "steer-subtask", subtaskId: "a", text: "The owner wants JSON responses" });
+    await until(() => h.get(id), mission => mission.events.some(event => /Subtask a received the coordinator's direction/.test(event.text)));
+    await new Promise(done => setTimeout(done, 1200));
+    assert.equal(h.steers.length, 1, "The retry replays the recorded request rather than sending a second direction");
+    assert.equal(h.runs.get(teamId)!.revision, 2);
+  } finally { h.close(); }
+});
+
+test("direction for a blocked subteam waits while the mission is paused, and is delivered after it resumes", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    h.set(teamId, { status: "blocked" });
+    assert.ok((await h.messages(2)).some((message: { type: string; status?: string }) => message.type === "subtask-finished" && message.status === "blocked"));
+    h.holdSteers(true);
+    await h.report(2, { kind: "steer-subtask", subtaskId: "a", text: "Use the cached client; it is allowed" });
+    await until(() => h.get(id), mission => mission.events.some(event => /sent direction to subtask a/.test(event.text)));
+    await h.missions.pause(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    h.holdSteers(false);
+    await new Promise(done => setTimeout(done, 1500));
+    assert.deepEqual(h.steers, [], "A paused mission does not restart its blocked subteam");
+    assert.equal(h.runs.get(teamId)!.status, "blocked");
+    await h.missions.resume(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    await until(() => h.steers, steers => steers.length === 1);
+    assert.equal(h.runs.get(teamId)!.status, "planning");
+  } finally { h.close(); }
+});
+
+test("three directions in a row that subteams refuse block the mission like other refused reports", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
+    h.limitSteering();
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Log each request" });
+    for (const n of [2, 3, 4]) await h.report(n, { kind: "steer-subtask", subtaskId: "a", text: "Log each request" });
+    const blocked = await until(() => h.get(id), mission => mission.status === "blocked", 20000);
+    assert.match(blocked.reason ?? "", /refused three times in a row.*steering limit/);
+  } finally { h.close(); }
+});
+
+test("a direction delivered between refused ones resets the refusal count in delivery order", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One change per repository", subtasks: [plan("a", "api"), plan("b", "web")] });
+    const started = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a") && teamOf(mission, "b")));
+    h.limitSteering([teamOf(started, "a")!]);
+    h.holdSteers(true);
+    // Four directions queue while subteams are busy; they are then delivered in one tick as refused, delivered, refused, refused.
+    for (const [n, subtaskId] of [[2, "a"], [3, "b"], [4, "a"], [5, "a"]] as const) {
+      await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: `Direction ${n}` });
+      await h.report(n, { kind: "steer-subtask", subtaskId, text: `Direction ${n}` });
+      await until(() => h.get(id), mission => mission.events.filter(event => /sent direction to subtask/.test(event.text)).length === n - 1);
+    }
+    h.holdSteers(false);
+    await until(() => h.steers, steers => steers.length === 1);
+    await new Promise(done => setTimeout(done, 1500));
+    assert.notEqual(h.get(id).status, "blocked", "Only two refusals follow the delivered direction");
+    assert.equal(h.get(id).events.filter(event => /steer-subtask report was refused/.test(event.text)).length, 3);
   } finally { h.close(); }
 });

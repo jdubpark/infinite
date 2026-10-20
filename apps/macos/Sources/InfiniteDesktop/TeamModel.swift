@@ -46,8 +46,10 @@ struct TeamMutation: Equatable {
         do { let value = try await client.request("/teams/\(run.id)"); observe(TeamRun(value)); if !fresh { fresh = true }; freshness.recovered() }
         catch { if fresh { fresh = false }; freshness.failed() }
     }
-    var canSteer: Bool { fresh && role != "viewer" && run.status != "cancelled" && !busy && pending == nil }
-    var canOwn: Bool { fresh && role == "owner" && !busy && pending == nil }
+    /// A mission's subteam is run by its coordinator: the owner reads it, and talks to the coordinator from the mission.
+    var managed: Bool { run.managedByMission }
+    var canSteer: Bool { !managed && fresh && role != "viewer" && run.status != "cancelled" && !busy && pending == nil }
+    var canOwn: Bool { !managed && fresh && role == "owner" && !busy && pending == nil }
     func steer() async {
         let text = direction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
@@ -62,7 +64,7 @@ struct TeamMutation: Equatable {
         await mutate(path: "/teams/\(run.id)/\(action)", label: action == "cancel" ? "Cancellation" : action.capitalizedFirst)
     }
     private func mutate(path: String, label: String, text: String? = nil) async {
-        guard !busy, pending == nil else { return }
+        guard !managed, !busy, pending == nil else { return }
         let requestID = UUID().uuidString.lowercased()
         var fields: [String: JSON] = ["requestId": .string(requestID), "revision": .number(Double(run.revision))]
         if let text { fields["text"] = .string(text) }

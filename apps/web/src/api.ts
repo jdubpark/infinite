@@ -26,6 +26,8 @@ export type Session = {
   execution?: { location: "laptop" | "cloud"; state: "connecting" | "online" | "offline" | "preparing" | "paused"; cloudReady: boolean; checkpoint?: { id: string; capturedAt: string }; reason?: string; reconciliation?: "available" };
   attention?: Attention;
   usage?: UsageTotals;
+  /** Set while a mission coordinator runs this session; people may only answer its provider prompts. */
+  managedBy?: { kind: "mission"; missionId: string; teamId?: string };
 };
 export type LogEvent = {
   seq: number;
@@ -115,6 +117,11 @@ export function isControlRefusal(error: unknown): error is ApiError {
   return error instanceof ApiError && error.status === 409 &&
     (error.code === "control-busy" || error.code === "control-lost");
 }
+/** The host refused input for a session or team that a mission coordinator runs. Its error text is the message to show. */
+export function isMissionManaged(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.status === 409 && error.code === "mission-managed";
+}
+export const missionManagedLine = "Run by its mission coordinator. Talk to the coordinator from the mission.";
 export async function api<T>(
   path: string,
   body?: unknown,

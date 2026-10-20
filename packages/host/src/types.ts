@@ -44,6 +44,7 @@ export interface ExecutionState {
 export interface Session {
   handoff?: { policy?: import("./handoff-types.js").HandoffPolicy; reason?: string };
   id: string;
+  managedBy?: { kind: "mission"; missionId: string; teamId?: string };
   /** Host-owned assignment; ordinary session creation cannot supply this. */
   team?: import("./team-types.js").TeamAssignment;
   teamModelProfile?: import("./team-types.js").TeamModelProfile;
@@ -211,6 +212,8 @@ export type WorkerRequest =
     } & InputControl)
   | ({
       op: "answer";
+      /** Set by the host only for owner-authorized answers on mission-managed sessions. */
+      missionManaged?: true;
       requestId: string;
       promptId: number;
       option?: number;

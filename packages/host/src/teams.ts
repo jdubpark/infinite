@@ -244,6 +244,8 @@ export class TeamService {
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
   statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal), mission: Boolean(stored.run.missionId) })); }
+  /** Read mission ownership without building a view or updating external tracking. */
+  missionIdOf(id: string): string | undefined { return this.record(id).run.missionId; }
   get(id: string): TeamView { return this.view(this.record(id)); }
   rateTask(id: string, taskId: string, input: { requestId: string; score: number; note?: string }) {
     const stored = this.record(id), task = stored.run.tasks.find(item => item.id === taskId);
@@ -570,6 +572,8 @@ export class TeamService {
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
   }
   close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const controller of this.commands.values()) controller.abort(); }
+  /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
+  idle() { return this.serial.then(() => undefined); }
   private stallWindow() { return (this.config.teams?.stallMinutes ?? 30) * 60000; }
   /**
    * Extends a deadline only under the owner's recorded policy, and only while an active member of this
@@ -763,10 +767,14 @@ export class TeamService {
         if (!member.report) {
           if (member.role === "permission-coordinator" && member.startedAt && Date.now() - Date.parse(member.startedAt) > 5 * 60 * 1000) {
             const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
-            if (decision && decision.status === "reviewing") { decision.status = "escalated"; decision.reason = "The five-minute review window expired without a decision."; }
+            const decisionChanged = decision?.status === "reviewing", before = member.status;
+            if (decision && decisionChanged) { decision.status = "escalated"; decision.reason = "The five-minute review window expired without a decision."; }
             try { if (!await this.stopped(member)) member.status = "unavailable"; }
             catch { member.status = "unavailable"; }
-            this.event(stored, "The permission coordinator exceeded its review window; the request remains with the user."); this.save(stored); continue;
+            // A coordinator that will not exit is retried each pass; report the expiry once.
+            if (decisionChanged || before !== "unavailable") this.event(stored, "The permission coordinator exceeded its review window; the request remains with the user.");
+            if (decisionChanged || member.status !== before) this.save(stored);
+            continue;
           }
           const { page, limit } = this.readMemberJournal(run, member);
           if (!member.report && limit) {
@@ -803,7 +811,10 @@ export class TeamService {
             // A prompt that waits on a person outranks one the coordinator is still reviewing.
             else if (state.attention.state === "needs-you")
               run.reason = underReview(run, member.sessionId, state.attention.prompt?.id) && run.reason !== providerInputReason ? permissionReviewReason : providerInputReason;
-            else member.status = "running";
+            // A coordinator back from an outage runs again only while its review is current; an obsolete or
+            // expired one (its decision already moved on) stays unavailable until its exit is confirmed.
+            else if (member.status !== "unavailable" || member.role !== "permission-coordinator" ||
+              run.permissionDecisions?.some(item => item.coordinatorMemberId === member.memberId && item.status === "reviewing")) member.status = "running";
             this.save(stored);
             if (state.status === "running" && journalDrained && member.role !== "permission-coordinator" &&
                 (member.stalledAt || state.attention.state !== "needs-you" && !member.pendingLimit && quietFor(member) > this.stallWindow())) {

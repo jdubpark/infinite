@@ -84,7 +84,7 @@ struct PromptCard: View {
     /// Dialogs the host cannot answer by option: multi-select, or no verified on-screen block.
     private var screenOnly: Bool { prompt["multiSelect"].bool || prompt["hash"].string.isEmpty || options.isEmpty }
     private var acceptsText: Bool { prompt["acceptsText"].bool && prompt["kind"].string != "yes-no" }
-    private var canAnswer: Bool { model.role != "viewer" && model.ready && !model.answering }
+    private var canAnswer: Bool { model.canAnswerPrompt }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {

@@ -13,6 +13,13 @@ struct AgentSession: Identifiable, Equatable {
     /// The host's one-line description of what the agent is doing now.
     var now: String { value["attention"]["now"].string }
     var backend: String { value["backend"].string }
+    /// The mission whose coordinator runs this session, when one does. Absent for sessions the owner runs.
+    var managedBy: SessionManagement? { try? value["managedBy"].decoded() }
+    /// Run by a mission coordinator: the owner sees it read-only and answers only its provider prompts.
+    var managed: Bool { managedBy != nil }
+    /// The owner may use this session's terminal fallback (attach, take control, keys, typed input). Always for a
+    /// session the owner runs; for a mission-managed one only while its provider prompt waits for the owner.
+    var terminalOpen: Bool { !managed || needsYou }
     /// The host reports these attention states once a session can no longer be reached, whatever its stored status says.
     private static let ended: Set<String> = ["exited", "unavailable", "recording-error"]
     var running: Bool { (status == "running" || status == "starting") && !Self.ended.contains(attention) }
@@ -491,6 +498,11 @@ struct TeamResumeFailure: Equatable {
     var ready: Bool { attached && session.running }
     var screenReady: Bool { ready && snapshotReady && !rendererUnavailable }
     var canSend: Bool { ready && !busy && draft.pendingID == nil && !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    /// A provider prompt is answered without the input lease or an attached terminal. A mission-managed session needs only that it is running.
+    var canAnswerPrompt: Bool { role != "viewer" && !answering && (managed ? session.running : ready) }
+    var managed: Bool { session.managed }
+    /// Whether the terminal fallback is open to the owner; see `AgentSession.terminalOpen`.
+    var terminalOpen: Bool { session.terminalOpen }
     /// The open dialog, when the host reports one.
     var prompt: JSON? { let value = session.value["attention"]["prompt"]; return value == .null ? nil : value }
     /// Another device currently holds the input lease.
@@ -570,13 +582,14 @@ struct TeamResumeFailure: Equatable {
     /// Answers the open dialog by option or text. The host presses keys on the dialog it shows
     /// and reports whether it closed; nothing here approves anything on its own.
     func answer(option: Int? = nil, text: String? = nil) async {
-        guard let prompt, !answering, await ensureControl() else { return }
+        guard let prompt, !answering else { return }
+        if !managed { guard await ensureControl() else { return } }
         answering = true
         var body: [String: JSON] = ["requestId": .string(UUID().uuidString.lowercased()), "promptId": .number(Double(prompt["id"].int))]
         if let option { body["option"] = .number(Double(option)) }
         if let text, !text.isEmpty { body["text"] = .string(text) }
         do {
-            let receipt = try await client.request("/sessions/\(session.id)/answer", body: .object(body), controlID: lease["id"].string)
+            let receipt = try await client.request("/sessions/\(session.id)/answer", body: .object(body), controlID: managed ? nil : lease["id"].string)
             let result = receipt["result"].string
             notice = result == "closed" ? "Answer delivered; the dialog closed." : result == "changed" ? "The dialog changed before the answer; check it again." : "Answer delivered; the dialog is still open. Check the screen."
         } catch { notice = error.localizedDescription }
@@ -597,6 +610,7 @@ struct TeamResumeFailure: Equatable {
     func attach() async {
         observing = true
         if chatTask == nil { startChat() }
+        // A mission-managed session's terminal stays readable; only its input waits for an open prompt.
         guard streamID == nil, !busy else { return }
         guard supportsStream && session.backend != "cmux" else { notice = "This host does not provide a live byte stream for this session. Update the host or use the cmux connection."; return }
         attachGeneration = UUID(); let current = attachGeneration
@@ -643,12 +657,13 @@ struct TeamResumeFailure: Equatable {
         if next != session { session = next }
         let control = value["control"]
         if control["label"].string != holder { holder = control["label"].string }
-        if !lease["id"].string.isEmpty && (control["id"] != lease["id"] || session.status != "running") {
+        if !lease["id"].string.isEmpty && (control["id"] != lease["id"] || session.status != "running" || !session.terminalOpen) {
             controlGeneration = UUID(); lease = .null; directInput = false; queuedRaw = Data(); sendingRaw = false; renewal?.cancel()
         }
     }
     func claim(takeover: Bool = false) async {
-        guard attached else { return }
+        // A mission-managed session accepts a control claim only while its provider prompt waits for the owner.
+        guard attached, terminalOpen else { return }
         let attachment = attachGeneration
         controlGeneration = UUID(); let operation = controlGeneration
         queuedRaw = Data(); sendingRaw = false
@@ -690,7 +705,7 @@ struct TeamResumeFailure: Equatable {
     /// Sending claims the input lease itself; a lease held elsewhere is taken over.
     func ensureControl() async -> Bool {
         if hasControl { return true }
-        guard ready else { return false }
+        guard ready, terminalOpen else { return false }
         await claim(takeover: !holder.isEmpty)
         return hasControl
     }
@@ -789,7 +804,7 @@ struct TeamResumeFailure: Equatable {
         return result
     }
     func end() async {
-        guard role == "owner" else { return }
+        guard role == "owner", !managed else { return }
         do {
             if !hasControl { await claim() }
             guard hasControl else { throw DesktopError("Take control before ending this session.") }
@@ -798,6 +813,7 @@ struct TeamResumeFailure: Equatable {
         } catch { notice = error.localizedDescription }
     }
     func resume() async {
+        guard !managed else { return }
         do {
             let response = try await lifecycle("resume")
             notice = "Resumed as \(response["id"].string.prefix(8)). Select the new session from the sidebar."

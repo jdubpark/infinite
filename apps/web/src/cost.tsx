@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowDown, ArrowLeft, ArrowUp, ArrowUpRight, ChevronRight, Minus, Pencil, RefreshCw, Star } from "lucide-react";
-import { ago, names, useApi, type AccountView, type Me, type Money, type ModelRow, type OwnerRating, type Scorecard, type TaskUsage, type UsageDaily, type UsageProject, type UsageProjectRow, type UsageSummary } from "./api";
+import { ago, isMissionManaged, names, useApi, type AccountView, type Me, type Money, type ModelRow, type OwnerRating, type Scorecard, type TaskUsage, type UsageDaily, type UsageProject, type UsageProjectRow, type UsageSummary } from "./api";
 import { useMachines } from "./machines";
 import { useLiveRefresh } from "./live-refresh";
 import type { CostView } from "./session-navigation";
@@ -484,7 +484,7 @@ export function TaskRating({ teamId, taskId, rating, canRate, onRated }: { teamI
       pending.current = null;
       setLocal({ score, at: new Date().toISOString() });
       onRated?.();
-    } catch (failure) { setError((failure as Error).message + " Choosing the same score retries this request."); }
+    } catch (failure) { setError(isMissionManaged(failure) ? failure.message : (failure as Error).message + " Choosing the same score retries this request."); }
     finally { setBusy(false); }
   }
   return <span className="cost-rating">
@@ -493,6 +493,7 @@ export function TaskRating({ teamId, taskId, rating, canRate, onRated }: { teamI
     {error && <small className="error" role="alert">{error}</small>}
   </span>;
 }
-export function TaskCostRow({ teamId, taskId, usage, rating, canRate, onRated, children }: { teamId: string; taskId: string; usage?: TaskUsage; rating?: OwnerRating; canRate: boolean; onRated?: () => void; children?: ReactNode }) {
-  return <div className="cost-task-row"><TaskCost usage={usage} />{children}<TaskRating teamId={teamId} taskId={taskId} rating={rating} canRate={canRate} onRated={onRated} /></div>;
+/** `ratable` false hides the rating control entirely; the cost and any children stay. */
+export function TaskCostRow({ teamId, taskId, usage, rating, canRate, ratable = true, onRated, children }: { teamId: string; taskId: string; usage?: TaskUsage; rating?: OwnerRating; canRate: boolean; ratable?: boolean; onRated?: () => void; children?: ReactNode }) {
+  return <div className="cost-task-row"><TaskCost usage={usage} />{children}{ratable && <TaskRating teamId={teamId} taskId={taskId} rating={rating} canRate={canRate} onRated={onRated} />}</div>;
 }

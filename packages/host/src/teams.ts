@@ -33,6 +33,7 @@ type Stored = {
   source?: { path: string; head?: string; startCommit?: string };
   handoffPolicy?: HandoffPolicy;
   goalExtensions?: Record<string, { deadlineAt: string; ceilingAt: string }>;
+  ratings?: Record<string, { fingerprint: string; result: TeamTask["ownerRating"] }>;
 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const timestamp = () => new Date().toISOString();
@@ -44,6 +45,16 @@ const runEvent = (run: TeamRun, text: string) => {
   run.events.push({ at: timestamp(), text });
   if (run.events.length > 300) run.events.splice(0, run.events.length - 300);
 };
+function diffStat(output?: string) {
+  if (output === undefined) return undefined;
+  const rows = output.split("\n").filter(Boolean).map(line => {
+    const [added, removed, path] = line.split("\t");
+    return { added: added === "-" ? 0 : Number(added), removed: removed === "-" ? 0 : Number(removed), path: path ?? "" };
+  });
+  return { added: rows.reduce((sum, row) => sum + row.added, 0), removed: rows.reduce((sum, row) => sum + row.removed, 0), files: rows.length,
+    docs: rows.some(row => row.path.startsWith("docs/") || row.path.endsWith(".md")),
+    tests: rows.some(row => /(^|\/)(tests?|__tests__)(\/|$)|\.(test|spec)\./i.test(row.path)) };
+}
 
 /** Written by hosts before stall detection; still resumable. */
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
@@ -176,7 +187,12 @@ export class TeamService {
       ...(run.permissionDecisions ? { permissionDecisions: run.permissionDecisions.map(({ prompt: _prompt, ...decision }) => decision) } : {}),
     };
     const withUsage = teamUsage(members.map(({ prompt: _prompt, ...member }) => member), run.provider, this.usage);
-    return { ...safeRun, members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active() };
+    return { ...safeRun, tasks: safeRun.tasks.map(task => { // Older records predate task.revision; steering clears the task list, so the retained run revision identifies their plan.
+      const revision = task.revision ?? safeRun.revision;
+      const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
+      const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
+      return { ...task, revision, ...(usage.length ? { usage: { usd: Math.round(usage.reduce((n, row) => n + row.cost, 0) * 1_000_000) / 1_000_000, unpriced: usage.reduce((n, row) => n + row.pricing.unknown, 0), tokens: usage.reduce((n, row) => n + Object.values(row.tokens).reduce((a, b) => a + b, 0), 0), attempts: attempts.length, profiles: [...new Set(attempts.map(member => member.modelProfile?.id).filter((id): id is string => Boolean(id)))].sort() } } : {}) };
+    }), members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active() };
   }
   private save(stored: Stored) {
     stored.run.updatedAt = timestamp();
@@ -187,6 +203,21 @@ export class TeamService {
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
   statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal, goal: Boolean(stored.run.goal) })); }
   get(id: string): TeamView { return this.view(this.record(id)); }
+  rateTask(id: string, taskId: string, input: { requestId: string; score: number; note?: string }) {
+    const stored = this.record(id), task = stored.run.tasks.find(item => item.id === taskId);
+    if (!task) throw new TeamError(404, "task-not-found", "The team task was not found.");
+    const fingerprint = digest({ taskId, score: input.score, ...(input.note ? { note: input.note } : {}) });
+    const prior = stored.ratings?.[input.requestId];
+    if (prior) {
+      if (prior.fingerprint !== fingerprint) throw new TeamError(409, "request-id-reused", "This request ID was already used for a different task rating.");
+      return task;
+    }
+    const rating = { score: input.score as 1 | 2 | 3 | 4 | 5, ...(input.note ? { note: input.note } : {}), at: timestamp() };
+    task.ownerRating = rating;
+    (stored.ratings ??= {})[input.requestId] = { fingerprint, result: rating };
+    this.event(stored, `The owner rated task ${taskId}.`); this.save(stored);
+    return task;
+  }
   async bundle(id: string) {
     const stored = this.record(id), run = stored.run;
     if (run.status !== "ready-for-review") throw new TeamError(409, "team-not-ready", "This team is not ready to pull.");
@@ -998,7 +1029,7 @@ export class TeamService {
         if (!parsed.success) continue;
         const envelope = parsed.data;
         if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
-        member.report = envelope.report; member.status = "reported"; member.stalledAt = undefined;
+        member.report = envelope.report; member.status = "reported"; member.reportedAt = timestamp(); member.stalledAt = undefined;
         if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined;
         break;
       }
@@ -1246,7 +1277,7 @@ export class TeamService {
         run.tasks = [];
         while (remaining.length) {
           const index = remaining.findIndex(task => task.dependsOn.every(id => run.tasks.some(done => done.id === id)));
-          run.tasks.push({ ...remaining.splice(index, 1)[0], status: "pending" });
+          run.tasks.push({ ...remaining.splice(index, 1)[0], revision: member.revision, reviewRounds: 0, status: "pending" });
         }
         run.brief = report.brief;
         if (report.verification && !run.verification) {
@@ -1295,7 +1326,23 @@ export class TeamService {
         throw new TeamError(409, "ui-review-evidence-required", "Approval of UI changes requires the reviewer's evidence from inspecting the runnable interface.");
       this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
         run.review = { verdict: report.verdict, summary: report.summary, revision: run.revision, ...(report.uiEvidence ? { uiEvidence: report.uiEvidence } : {}) };
-        if (report.verdict === "changes-requested") this.repair(stored, report.summary);
+        if (report.verdict === "approved" && report.rubric?.length) {
+          const reviewer = member.modelProfile ?? this.memberProfile(run, "reviewer");
+          for (const entry of report.rubric) {
+            const task = run.tasks.find(item => item.id === entry.taskId && item.status === "integrated");
+            if (!task) continue;
+            const implementer = run.members.find(candidate => candidate.memberId === task.memberId)?.modelProfile;
+            if (reviewer && implementer && reviewer.model === implementer.model) {
+              this.event(stored, `The rubric for task ${task.id} was dropped because reviewer and implementer use the same model.`);
+              continue;
+            }
+            task.rubric = { version: 1, correctness: entry.correctness, cleanliness: entry.cleanliness, extensibility: entry.extensibility, docs: entry.docs, reviewerProfileId: reviewer?.id ?? "unknown" };
+          }
+        }
+        if (report.verdict === "changes-requested") {
+          for (const task of run.tasks) if (task.status === "integrated") task.reviewRounds = (task.reviewRounds ?? 0) + 1;
+          this.repair(stored, report.summary);
+        }
         else run.status = "reviewing";
       }); return;
     }
@@ -1306,10 +1353,12 @@ export class TeamService {
     this.operation(stored, "result", async signal => {
       const commit = await captureMemberResult(member.cwd, member.baseCommit, member.role === "implementer" ? task!.paths : run.goal?.allowedPaths, this.config.teams?.commandPrefix, signal);
       const head = commit ? await integrateMemberResult(run.workspace, member.cwd, commit, this.config.teams?.commandPrefix, signal) : run.headCommit!;
-      return { commit, head };
-    }, ({ commit, head }) => {
+      // Diff stats are scorecard evidence only: a launcher that refuses the command must not block integration.
+      const diff = commit ? await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--numstat", `${member.baseCommit}..${commit}`]) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined) : undefined;
+      return { commit, head, diff: diff?.exitCode === 0 ? diff.stdout : undefined };
+    }, ({ commit, head, diff }) => {
       run.headCommit = head; stored.checkHead = undefined; run.review = undefined;
-      if (task) { task.status = "integrated"; task.commit = commit; task.summary = report.summary; }
+      if (task) { task.status = "integrated"; task.commit = commit; task.summary = report.summary; task.diffStat = diffStat(diff); }
       this.event(stored, `${member.title} reported a result; its validated changes were integrated.`);
       run.status = "implementing";
     });

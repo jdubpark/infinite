@@ -136,9 +136,13 @@ private struct Pie: Shape {
     }
 }
 
+private let plainISO: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f }()
 /// A compact age such as "now", "12m", "3h", or "5d", measured from an ISO time the host reported.
 func shortAge(_ iso: String, now: Date = Date()) -> String {
-    guard let date = ISO8601DateFormatter.flexible.date(from: iso) else { return "" }
+    guard let date = ISO8601DateFormatter.flexible.date(from: iso) ?? plainISO.date(from: iso) else { return "" }
+    return shortAge(date, now: now)
+}
+func shortAge(_ date: Date, now: Date = Date()) -> String {
     let seconds = max(0, now.timeIntervalSince(date))
     if seconds < 60 { return "now" }
     if seconds < 3600 { return "\(Int(seconds / 60))m" }

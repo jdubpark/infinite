@@ -4,7 +4,7 @@ import { addRollups, emptyRollup, emptyUsage, type UsageRollup } from "../packag
 import type { UsageTotals } from "../packages/host/src/usage.js";
 
 const totals = (cost: number, messages: number, pricing: Partial<UsageTotals["pricing"]>, input = 0): UsageTotals =>
-  ({ ...emptyUsage(), cost, messages, tokens: { ...emptyUsage().tokens, input }, pricing: { configured: 0, provider: 0, unknown: 0, ...pricing } });
+  ({ ...emptyUsage(), cost, messages, tokens: { ...emptyUsage().tokens, input }, pricing: { configured: 0, catalog: 0, provider: 0, unknown: 0, ...pricing } });
 
 test("merging cycle rollups adds overlapping keys, keeps distinct ones, and sums unmeasured members exactly", () => {
   const a: UsageRollup = {
@@ -25,10 +25,10 @@ test("merging cycle rollups adds overlapping keys, keeps distinct ones, and sums
   assert.equal(merged.total.tokens.input, 1050);
   assert.equal(merged.byProfile.ds.messages, 4);
   assert.equal(merged.byProfile.ds.cost, 0.502);
-  assert.deepEqual(merged.byProfile.ds.pricing, { configured: 2, provider: 2, unknown: 0 });
+  assert.deepEqual(merged.byProfile.ds.pricing, { configured: 2, catalog: 0, provider: 2, unknown: 0 });
   assert.equal(merged.byProfile.spark.messages, 1);
   assert.equal(merged.byProvider.opencode?.messages, 5);
-  assert.deepEqual(merged.total.pricing, { configured: 2, provider: 2, unknown: 1 });
+  assert.deepEqual(merged.total.pricing, { configured: 2, catalog: 0, provider: 2, unknown: 1 });
   assert.equal(merged.unmeasuredMembers, 5);
   assert.equal(a.byProfile.ds.messages, 2, "Merging must not mutate its inputs");
 });

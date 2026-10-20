@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { Manager } from "./manager.js";
 import type { ChatMessage } from "./session-content.js";
 import type { Project, Session } from "./types.js";
+import type { BriefingUsage } from "./usage-api.js";
 
 export interface RepositoryBriefingConfig {
   command: string;
@@ -40,6 +41,7 @@ const decisionSchema = z.object({
   action: z.enum(["skip", "run", "coalesced", "disabled", "failed"]), reason: z.string().max(1000),
   judge: z.enum(["jev", "heuristic"]).nullable(), worthwhile: z.number().min(0).max(1).nullable(), scope: z.enum(["skip", "update", "full"]).nullable(),
 }).strict();
+const briefingUsageSchema = z.object({ providerId: z.string().min(1), modelId: z.string().min(1), tokens: z.object({ input: z.number().finite().nonnegative(), output: z.number().finite().nonnegative(), reasoning: z.number().finite().nonnegative(), cacheRead: z.number().finite().nonnegative(), cacheWrite: z.number().finite().nonnegative() }).strict(), reportedCost: z.number().finite().nonnegative().optional() }).strict();
 const emptySchema = z.object({ decision: decisionSchema, repo: z.string().max(4096).nullable(), brief: z.null() }).strict();
 const envelopeSchema = z.object({
   decision: decisionSchema,
@@ -51,6 +53,7 @@ const envelopeSchema = z.object({
   brief: briefSchema,
   evidence: z.array(z.object({ source: z.string().max(1024), line: z.number().int().positive(), path: z.string().max(4096).nullable(), text: z.string().max(12000) }).strict()).max(200),
   coverage: z.array(z.string().max(500)).max(100),
+  usage: briefingUsageSchema.optional(),
 }).strict();
 
 export interface RepositoryBrief {
@@ -205,6 +208,7 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
 }
 
 export class RepositoryBriefings {
+  private usageRecorder?: { recordBriefing(projectId: string, sessionId: string, at: string, usage: BriefingUsage | null): void };
   private timer?: NodeJS.Timeout;
   private closed = false;
   private polling = false;
@@ -218,6 +222,7 @@ export class RepositoryBriefings {
   private readonly latest = new Map<string, BriefingStatus>();
   private readonly controllers = new Set<AbortController>();
   private readonly lastAttempt = new Map<string, number>();
+  useUsage(service: { recordBriefing(projectId: string, sessionId: string, at: string, usage: BriefingUsage | null): void }) { this.usageRecorder = service; }
   private readonly closeWaiters: (() => void)[] = [];
 
   constructor(
@@ -499,6 +504,7 @@ export class RepositoryBriefings {
       const parsed = envelopeSchema.parse(value);
       if (resolve(parsed.repo) !== job.location.root || (job.location.baseline !== null && parsed.base !== job.location.baseline))
         throw new Error("provenance");
+      if (parsed.decision.action === "run") this.usageRecorder?.recordBriefing(job.session.projectId, job.session.id, parsed.generatedAt, parsed.usage ?? null);
       const repository: RepositoryBrief = { decision: parsed.decision, head: parsed.head, base: parsed.base, fingerprint: parsed.fingerprint,
         generatedAt: parsed.generatedAt,
         coverage: [...parsed.coverage, `Session activity: ${activity.included} of ${job.observedMessages} recorded messages included${activity.truncated || job.truncated ? "; activity outside the bounded message or page limits omitted" : "."}`],

@@ -352,6 +352,37 @@ test("a team builds concurrently in isolated copies and produces checked, review
   } finally { owner.close(); viewer.close(); await f.close(); }
 });
 
+test("review rubrics drop self-grading, integration records docs/tests, and owner ratings are idempotent", { timeout: 120000 }, async () => {
+  const { limitFallback: _limitFallback, ...implementerProfile } = fallbackLineup.implementers[0];
+  const reviewerProfile = { ...implementerProfile, id: "rubric-reviewer", label: "Rubric reviewer", tier: "strong" as const };
+  const lineup: TeamLineup = { ...fallbackLineup, reviewer: reviewerProfile };
+  const f = await fixture("rubric", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    const taskA = finished.tasks.find(task => task.id === "a")!;
+    const taskB = finished.tasks.find(task => task.id === "b")!;
+    assert.equal(taskA.rubric, undefined);
+    assert.equal(taskB.rubric?.version, 1);
+    assert.equal(taskB.rubric?.reviewerProfileId, reviewerProfile.id);
+    assert.equal(taskA.diffStat?.docs, true);
+    assert.equal(taskA.diffStat?.tests, true);
+    assert.ok(finished.events.some(event => /rubric for task a was dropped/.test(event.text)));
+
+    const path = `/teams/${finished.id}/tasks/a/rating`, requestId = randomUUID();
+    const input = { requestId, score: 4, note: "Useful result" };
+    assert.equal((await f.host.fetchApi(path, "viewer", input)).status, 403);
+    const first = await f.host.fetchApi(path, "owner", input);
+    assert.equal(first.status, 200);
+    const at = first.body.ownerRating.at;
+    const retry = await f.host.fetchApi(path, "owner", input);
+    assert.equal(retry.status, 200);
+    assert.equal(retry.body.ownerRating.at, at);
+    assert.equal((await f.host.fetchApi(path, "owner", { ...input, score: 5 })).status, 409);
+  } finally { await f.close(); }
+});
+
 test("mixed teams pin real worker launches across configuration changes, restart, and a question retry", { timeout: 120000 }, async () => {
   const f = await fixture("mixed", mixedLineup, {}, { trustWorkspaces: true });
   try {

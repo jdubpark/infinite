@@ -4,16 +4,20 @@ import { clock, names, type Session } from "./api";
 import { cost } from "./usage";
 
 export type SessionTab = "chat" | "screen" | "terminal" | "files" | "context";
-type Location = { id: string | null; tab: SessionTab; creating: boolean; teams: boolean; teamId: string | null; creatingTeam: boolean; goals: boolean; goalId: string | null; creatingGoal: boolean };
+export type CostView = "overview" | "projects" | "models";
+type Location = { id: string | null; tab: SessionTab; creating: boolean; teams: boolean; teamId: string | null; creatingTeam: boolean; goals: boolean; goalId: string | null; creatingGoal: boolean; cost: boolean; costView: CostView; costProjectId: string | null };
 
 function readLocation(machine: string): Location {
   const hash = window.location.hash.replace(new RegExp(`^#/machines/${machine}(?=/|$)`), "#");
   const match = hash.match(/^#\/sessions\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})(?:\/(chat|screen|terminal|files|context))?$/i);
   const team = hash.match(/^#\/teams\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
   const goal = hash.match(/^#\/goals\/([a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i);
+  // Project IDs are host-configured slugs, so the cost routes accept any single path segment.
+  const cost = hash.match(/^#\/cost(?:\/(projects|models)(?:\/([^/]+))?)?$/);
   return { id: match?.[1] ?? null, tab: (match?.[2] as SessionTab) ?? "chat", creating: hash === "#/new",
     teams: hash === "#/teams" || hash === "#/teams/new" || Boolean(team), teamId: team?.[1] ?? null, creatingTeam: hash === "#/teams/new",
-    goals: hash === "#/goals" || hash === "#/goals/new" || Boolean(goal), goalId: goal?.[1] ?? null, creatingGoal: hash === "#/goals/new" };
+    goals: hash === "#/goals" || hash === "#/goals/new" || Boolean(goal), goalId: goal?.[1] ?? null, creatingGoal: hash === "#/goals/new",
+    cost: Boolean(cost), costView: (cost?.[1] as CostView | undefined) ?? "overview", costProjectId: cost?.[1] === "projects" && cost[2] ? decodeURIComponent(cost[2]) : null };
 }
 
 // Only the route lives in the URL. Drafts, output and credentials never do.
@@ -37,7 +41,8 @@ export function useSessionLocation(machine = "direct") {
     navigateTeam: (id: string | null) => { window.location.hash = `${prefix}/teams${id ? `/${id}` : ""}`; },
     createTeam: () => { window.location.hash = `${prefix}/teams/new`; },
     navigateGoal: (id: string | null) => { window.location.hash = `${prefix}/goals${id ? `/${id}` : ""}`; },
-    createGoal: () => { window.location.hash = `${prefix}/goals/new`; } };
+    createGoal: () => { window.location.hash = `${prefix}/goals/new`; },
+    navigateCost: (view: CostView = "overview", projectId?: string) => { window.location.hash = `${prefix}/cost${view === "overview" ? "" : `/${view}`}${projectId ? `/${encodeURIComponent(projectId)}` : ""}`; } };
 }
 
 export const sessionStatus = (session: Session) => session.attention?.state === "needs-you"

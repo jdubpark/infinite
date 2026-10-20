@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { periodStart, priceUsage, sumUsage, type UsageRecord } from "../packages/host/src/usage.js";
+import { accountOf, periodStart, priceUsage, sumUsage, type UsageRecord } from "../packages/host/src/usage.js";
 import type { UsageConfig } from "../packages/host/src/config.js";
 
 const base: UsageRecord = {
@@ -23,8 +23,8 @@ test("reasoning tokens bill at the output rate", () => {
 });
 
 test("reported cost is used without a table, and zero without a table is unknown", () => {
-  assert.deepEqual(priceUsage({ ...base, reportedCost: 0.02 }, undefined), { cost: 0.02, pricing: "provider" });
-  assert.deepEqual(priceUsage({ ...base, reportedCost: 0 }, {}), { cost: 0, pricing: "unknown" });
+  assert.deepEqual(priceUsage({ ...base, modelId: "unlisted-model", reportedCost: 0.02 }, undefined), { cost: 0.02, pricing: "provider" });
+  assert.deepEqual(priceUsage({ ...base, modelId: "unlisted-model", reportedCost: 0 }, {}), { cost: 0, pricing: "unknown" });
 });
 
 test("a record whose model was never observed is unknown, whatever its reported cost or the price table", () => {
@@ -56,6 +56,19 @@ test("sumUsage adds costs, tokens, and counts pricing sources", () => {
   ]);
   assert.deepEqual(totals, {
     cost: 0.75, messages: 3, tokens: { input: 20, output: 10, reasoning: 2, cacheRead: 4, cacheWrite: 6 },
-    pricing: { configured: 1, provider: 1, unknown: 1 },
+    pricing: { configured: 1, catalog: 0, provider: 1, unknown: 1 },
   });
+});
+
+test("catalog prices DeepSeek flash off peak and doubles at peak boundaries", () => {
+  const record = { ...base, tokens: { input: 1_000_000, output: 1_000_000, reasoning: 0, cacheRead: 1_000_000, cacheWrite: 0 } };
+  assert.deepEqual(priceUsage({ ...record, completedAt: "2026-10-17T02:00:00Z" }, undefined), { cost: 0.753, pricing: "catalog" });
+  assert.equal(priceUsage({ ...record, completedAt: "2026-10-16T03:59:59Z" }, undefined).cost, 1.506);
+  assert.equal(priceUsage({ ...record, completedAt: "2026-10-16T04:00:00Z" }, undefined).cost, 0.753);
+});
+
+test("configured price beats the built-in catalog and accounts match globs", () => {
+  assert.deepEqual(priceUsage({ ...base, tokens: { ...base.tokens, input: 1_000_000 } }, { "deepseek/deepseek-flash": { input: 3, output: 2 } }), { cost: 3, pricing: "configured" });
+  assert.equal(accountOf("deepseek", "deepseek-flash", { deepseek: { kind: "metered", match: ["deepseek/*"] } }), "deepseek");
+  assert.equal(accountOf("meta", "muse-spark", { deepseek: { kind: "metered", match: ["deepseek/*"] } }), "meta");
 });

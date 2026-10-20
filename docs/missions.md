@@ -41,7 +41,9 @@ Deleting a group does not affect its repositories or missions already running.
 
 ## Missions
 
-`POST /api/missions` (owner) creates a mission for a group. The host launches
+`POST /api/missions` (owner) creates a mission for a group. A retry with the
+same `requestId` returns the recorded mission before any admission check, so it
+succeeds even after the group was edited or deleted or a handoff started. The host launches
 the coordinator with the configured strong coordinator profile in a mission
 folder outside every repository, with each repository's host path listed in its
 prompt for reading. The coordinator must not edit repositories directly; all
@@ -52,29 +54,39 @@ The coordinator reports through its mission report tool:
 | Report | Effect |
 |---|---|
 | `dispatch` | Adds subtasks (up to `maxSubtasks` in total). A later dispatch may add more. |
-| `answer-child` | Answers an open subteam decision within the mission's objective and steering. Recorded as answered by the coordinator. |
+| `answer-child` | Answers an open subteam decision within the mission's objective and steering. Recorded as answered by the coordinator, in the mission and in the subteam. |
 | `question` | Opens a mission decision for the owner. With `subtaskId` and `childDecisionId`, the owner's answer is forwarded to that subteam decision. |
-| `cancel-subtask` | Cancels that subtask's subteam. |
-| `result` | Accepted only when no subtask is queued or running. Moves the mission to `ready-for-review`. |
+| `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. |
+| `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, and no owner decision is open. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
 | `blocked` | Moves the mission to `blocked` with the summary as its reason. |
 
 Size rules: a `solo` subtask starts a subteam with parallelism 1, and a `team`
 subtask uses its `parallelism` (1–4). The coordinator chooses the size; a simple
 mission may dispatch exactly one solo subtask.
 
-Scheduling: a subtask starts when every dependency is `done`. At most one
-subteam per repository is active at a time; others stay `queued`. A subtask is
+Scheduling: a subtask starts when every dependency is `done`. At most one team
+run per repository is active at a time across every mission and every run
+started outside a mission; others stay `queued`. A `blocked` run keeps its
+repository reserved until it is cancelled. A subtask that depends, directly or
+through other subtasks, on a finished subtask in its own repository starts from
+that run's workspace head rather than from the repository; with several such
+predecessors it uses the latest one in dependency order. A subtask is
 `done` when its subteam reaches `ready-for-review`, `merged`, or `no-change`;
 `blocked` when its subteam is blocked; `cancelled` when its subteam is cancelled.
 
 Escalation: when a subteam opens a decision or becomes blocked, the host sends
 the coordinator a message naming the subtask, the decision ID, and the question
-or reason. Only the coordinator's `question` report reaches the owner. Provider
+or reason. Each coordinator attempt receives at most 30 messages; the rest wait
+for the next attempt. Every open subteam decision is also listed in each
+attempt's mission state, read from the subteams, so none depends on a message. Only the coordinator's `question` report reaches the owner. Provider
 permission prompts are unaffected and keep their existing owner or delegated
 coordinator path per repository.
 
 Owner controls: answer, steer (forwarded to the coordinator), pause, resume, and
-cancel. Pause, resume, and cancel apply to the coordinator and every active
+cancel. All five are owner-only; a controller cannot answer or steer a mission. A
+coordinator `result` from an attempt that started before the owner's latest
+direction or answer is not applied; the host starts a new attempt with that
+input instead. Pause, resume, and cancel apply to the coordinator and every active
 subteam. The deadline stops the coordinator and active subteams like a team
 deadline.
 

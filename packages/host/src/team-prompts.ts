@@ -123,6 +123,12 @@ export type MissionMessage =
   | { type: "resumed" }
   | { type: "refused"; kind: string; reason: string };
 export type MissionPromptRepo = { projectId: string; name: string; path: string; teamReady: boolean };
+/** An unanswered subteam decision, read from the subteam each attempt. */
+export type MissionOpenChildDecision = { subtaskId: string; teamId: string; decisionId: string; question: string; options: string[];
+  /** The mission decision already waiting on the owner for this question. */
+  ownerDecisionId?: string;
+  /** An answer recorded and still being delivered to the subteam. */
+  answerPendingBy?: "owner" | "coordinator" };
 
 /** Mission coordinators report only through the mission_report tool of the team MCP server. */
 function missionReportingInstructions(provider: Provider) {
@@ -134,35 +140,39 @@ const clip = (text: string, max: number) => text.length > max ? `${text.slice(0,
  * Each coordinator attempt is one session that ends with one report, like a team member. The host
  * starts the next attempt when a subteam, the owner, or a refusal needs the coordinator again.
  */
-export function missionPrompt(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile) {
+export function missionPrompt(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile,
+  context: { openChildDecisions: MissionOpenChildDecision[]; waiting: number }) {
   const state = {
     status: mission.status,
     deadlineAt: mission.deadlineAt,
     maxSubtasks: mission.maxSubtasks,
     subtasks: mission.subtasks.map(subtask => ({ id: subtask.id, repoProjectId: subtask.repoProjectId, title: subtask.title, objective: clip(subtask.objective, 600),
       size: subtask.size, parallelism: subtask.parallelism, dependsOn: subtask.dependsOn, status: subtask.status, teamStatus: subtask.teamStatus, teamId: subtask.teamId })),
-    decisions: mission.decisions.slice(-20).map(decision => ({ id: decision.id, question: clip(decision.question, 600), subtaskId: decision.subtaskId, childDecisionId: decision.childDecisionId,
+    // Open owner decisions always appear; answered ones only among the latest 20.
+    decisions: mission.decisions.filter((decision, index, all) => !decision.answer || index >= all.length - 20).map(decision => ({ id: decision.id, question: clip(decision.question, 600), subtaskId: decision.subtaskId, childDecisionId: decision.childDecisionId,
       answer: decision.answer && clip(decision.answer, 600), answeredBy: decision.answeredBy })),
     dispatchSummary: mission.dispatchSummary && clip(mission.dispatchSummary, 1000),
+    openChildDecisions: context.openChildDecisions.map(decision => ({ ...decision, question: clip(decision.question, 2000) })),
   };
-  const recent = messages.slice(-30).map(message => "question" in message ? { ...message, question: clip(message.question, 2000) } : message);
+  const recent = messages.map(message => "question" in message ? { ...message, question: clip(message.question, 2000) } : message);
   const prompt = [
     `You are the main coordinator of a mission for the project "${mission.groupName}". This is coordinator attempt ${attempt}. Your working folder is the mission folder, outside every repository. You may keep short notes there; later attempts start in the same folder.`,
     profileInstructions(modelProfile),
     `Repositories in this project (inspect read-only at these host paths):\n${repos.map(repo => `- ${repo.projectId} (${repo.name}): ${repo.path}${repo.teamReady ? "" : " — not configured for subteams; do not dispatch to it"}`).join("\n")}\nDo not edit, commit, push, or run commands that change any repository. Every change goes through a subteam: an ordinary team run in one repository that keeps that repository's own checks, independent review, delivery policy, and permission rules.`,
     `Mission objective:\n${mission.objective}`,
     mission.steering.length ? `Owner direction:\n${mission.steering.map(item => item.text).join("\n\n")}` : "",
-    `Split the objective into subtasks for single repositories. Each subtask names its repository by project ID, a short id (lowercase letters, digits, and hyphens), a title, a self-contained objective, a size, and dependsOn subtask IDs. Size "solo" runs one implementer; size "team" lets that subteam's coordinator run up to "parallelism" (1–4) workers. Use solo unless parallel work in one repository clearly helps. A simple mission may be exactly one solo subtask. At most ${mission.maxSubtasks} subtasks in total across all dispatches. A subtask starts when every dependency is done; only one subteam per repository runs at a time. Order cross-repository work with dependsOn, for example a backend API before the frontend that calls it, and state the interface each side must honor in both objectives. A queued subtask whose dependency ends blocked or cancelled never starts; cancel it or dispatch a replacement.`,
+    `Split the objective into subtasks for single repositories. Each subtask names its repository by project ID, a short id (lowercase letters, digits, and hyphens), a title, a self-contained objective, a size, and dependsOn subtask IDs. Size "solo" runs one implementer; size "team" lets that subteam's coordinator run up to "parallelism" (1–4) workers. Use solo unless parallel work in one repository clearly helps. A simple mission may be exactly one solo subtask. At most ${mission.maxSubtasks} subtasks in total across all dispatches. A subtask starts when every dependency is done; only one team run per repository is active at a time, across every mission and the owner's own runs, and a blocked subtask keeps its repository reserved until you cancel it. A subtask that depends on finished work in its own repository starts from that work. Order cross-repository work with dependsOn, for example a backend API before the frontend that calls it, and state the interface each side must honor in both objectives. A queued subtask whose dependency ends blocked or cancelled never starts; cancel it or dispatch a replacement.`,
     `Report exactly one of these in this attempt:
 - {"kind":"dispatch","summary":"Plan and reasoning","subtasks":[{"id":"api-endpoint","repoProjectId":"${repos[0]?.projectId ?? "repo-id"}","title":"...","objective":"...","size":"solo","parallelism":1,"dependsOn":[]}]} adds subtasks. A later dispatch may add more.
 - {"kind":"answer-child","subtaskId":"...","decisionId":"...","text":"..."} answers an open subteam decision when the answer follows from the mission objective and owner direction.
 - {"kind":"question","question":"...","options":["..."],"subtaskId":"...","childDecisionId":"..."} asks the owner. Include subtaskId and childDecisionId to forward the owner's answer to that subteam decision; omit both for a mission-level question.
 - {"kind":"cancel-subtask","subtaskId":"...","reason":"..."} cancels a subtask and its subteam.
-- {"kind":"result","summary":"..."} is accepted only when no subtask is queued or running. Summarize what each subteam delivered and what still needs owner review.
+- {"kind":"result","summary":"..."} is accepted only when every subtask is done or cancelled and no owner decision is open. Cancel a blocked or stranded subtask explicitly with cancel-subtask first. Summarize what each subteam delivered and what still needs owner review.
 - {"kind":"blocked","summary":"..."} stops the mission when it cannot proceed safely.
 After the report, stop. The host starts a new attempt when a subteam opens a decision, becomes blocked, or finishes, or when the owner answers or gives direction.`,
     `Mission state (JSON): ${JSON.stringify(state)}`,
     `Messages since your last attempt (JSON): ${JSON.stringify(recent)}`,
+    context.waiting ? `${context.waiting} more message${context.waiting === 1 ? " is" : "s are"} waiting; the host delivers ${context.waiting === 1 ? "it" : "them"} in your next attempt. Open subteam decisions are always listed in the mission state as openChildDecisions.` : "",
     `Escalate to the owner only what the objective and owner direction do not settle, such as product, scope, or risk decisions. A result means every subtask finished; it does not establish product impact or acceptance. Do not publish, merge, deploy, change repository remotes, or approve provider permissions; each subteam delivers only under its own repository's policy.`,
     `Write summaries and questions in plain English. Lead with concrete facts. Do not invent evidence or claim checks or outcomes you did not observe.`,
     missionReportingInstructions(provider),

@@ -385,11 +385,15 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/missions/:id", (req, res) => res.json(missions.get(id.parse(req.params.id))));
   app.post("/api/missions", requireRole(["owner"]), async (req, res) => {
     const body = createMissionSchema.parse(req.body);
+    // A retry returns the recorded mission even if the group or a handoff changed since it was admitted.
+    const recorded = missions.replayCreate(body);
+    if (recorded) return res.json(recorded);
     for (const repo of projectGroups.get(body.groupId).repos) assertNoHandoff(repo.projectId);
     return res.json(await missions.create(body));
   });
-  app.post("/api/missions/:id/steer", requireRole(["owner", "controller"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
-  app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner", "controller"]), async (req, res) =>
+  // Mission controls and answers are owner-only, so every recorded mission answer is the owner's.
+  app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
+  app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner"]), async (req, res) =>
     res.json(await missions.answer(id.parse(req.params.id), id.parse(req.params.decisionId), missionTextSchema.parse(req.body))));
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/missions/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await missions[action](id.parse(req.params.id), missionActionSchema.parse(req.body))));

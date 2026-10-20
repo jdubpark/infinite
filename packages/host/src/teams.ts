@@ -60,6 +60,7 @@ function diffStat(output?: string) {
 /** Written by hosts before stall detection; still resumable. */
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
 export const memberStallReason = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
+export const checkTimeoutReason = "A configured check ran past the team check time limit (teams.checkMinutes) and was stopped. No correction round was used; the integrated work was preserved.";
 
 /**
  * The fallback for a member stopped at a provider limit. Its own provider counts as limited even when
@@ -81,7 +82,7 @@ export function blockedTeamCanResume(input: {
   linearStatus?: string;
 }): boolean {
   return input.status === "blocked"
-    && (input.reason === memberStallReason || input.reason === memberTimeLimitReason)
+    && (input.reason === memberStallReason || input.reason === memberTimeLimitReason || input.reason === checkTimeoutReason)
     && input.prepared
     && !input.pending
     && !input.deliveryAttempt
@@ -1392,7 +1393,7 @@ export class TeamService {
       for (const entry of commands) {
         const check: TeamRun["checks"][number] = { ...entry, status: "running", startedAt: timestamp(), output: "", revision };
         await this.enqueue(() => { if (!this.closed) { run.checks.push(check); this.save(stored); } });
-        const result = await teamCommand(entry.command, run.workspace, signal, 600000, this.config.teams?.commandPrefix);
+        const result = await teamCommand(entry.command, run.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix);
         Object.assign(check, { status: result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output });
         results.push(check);
         await this.enqueue(() => { if (!this.closed) this.save(stored); });
@@ -1404,6 +1405,9 @@ export class TeamService {
       if (revision !== run.revision || stored.halt || run.status === "paused" || run.status === "cancelled") return;
       if (results.length === commands.length && results.every(result => result.status === "passed")) {
         stored.checkHead = head; this.event(stored, "All configured verification commands passed against the integrated commit."); run.status = "reviewing";
+      } else if (results.some(result => result.status === "interrupted")) {
+        // A timeout is host evidence about the check, not the agents' work; it must not spend a correction round.
+        this.block(stored, new TeamError(409, "check-timeout", checkTimeoutReason));
       } else this.repair(stored, `Configured verification failed:\n${JSON.stringify(results)}`);
     });
   }

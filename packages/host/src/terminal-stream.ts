@@ -147,7 +147,8 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
           serial = serial.then(async () => {
             if (abort.signal.aborted) return;
             const state = await ready;
-            if (managed && (input.op === "raw" || input.op === "input" || input.op === "control" && input.action === "claim")) {
+            const promptScopedWrite = input.op === "raw" || input.op === "input" || input.op === "control" && input.action === "claim";
+            if (managed && promptScopedWrite && (await manager.state(match[1])).attention?.state !== "needs-you") {
               await send({ refusal: {
                 requestId: "requestId" in input ? input.requestId : undefined,
                 code: "mission-managed",

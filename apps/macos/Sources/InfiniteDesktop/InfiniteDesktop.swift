@@ -372,7 +372,8 @@ struct SessionPane: View {
             Divider()
             VStack(spacing: 10) {
                 if let prompt = model.prompt, model.session.needsYou { PromptCard(model: model, prompt: prompt).id(prompt["id"].int) }
-                if let management = session.managedBy { managedFooter(management) } else { composer }
+                if let management = session.managedBy { managedFooter(management) }
+                if model.terminalOpen { composer }
             }.padding(12).fixedSize(horizontal: false, vertical: true).layoutPriority(1)
         }.background(Palette.background)
         .task { await model.attach() }
@@ -432,7 +433,7 @@ struct SessionPane: View {
             HStack(spacing: 12) {
                 Text(footer.text).font(.system(size: 11)).foregroundStyle(footer.color).lineLimit(2).help(footer.text).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).frame(height: 28, alignment: .leading)
-                if model.role == "owner" && !model.managed {
+                if model.role == "owner" && model.terminalOpen {
                     Toggle("Type in terminal", isOn: Binding(get: { model.directInput }, set: model.setDirectInput))
                         .toggleStyle(.switch).controlSize(.mini).font(.caption).disabled(!model.screenReady || model.view != .screen)
                 }
@@ -449,11 +450,11 @@ struct SessionPane: View {
             }
         }
     }
-    /// Stands in for the composer on a mission-managed session. Its notice still shows, so a provider prompt answer is confirmed here.
+    /// The line every mission-managed session shows. While the terminal is closed its notice shows here, since the composer's footer is hidden.
     private func managedFooter(_ management: SessionManagement) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             MissionManagedNote(missionID: management.missionId, openMission: openMission)
-            if !model.notice.isEmpty {
+            if !model.terminalOpen && !model.notice.isEmpty {
                 Text(model.notice).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
             }
         }.frame(maxWidth: .infinity, alignment: .leading).frame(minHeight: 28, alignment: .topLeading)

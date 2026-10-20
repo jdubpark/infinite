@@ -244,6 +244,8 @@ export class TeamService {
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
   statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal), mission: Boolean(stored.run.missionId) })); }
+  /** Read mission ownership without building a view or updating external tracking. */
+  missionIdOf(id: string): string | undefined { return this.record(id).run.missionId; }
   get(id: string): TeamView { return this.view(this.record(id)); }
   rateTask(id: string, taskId: string, input: { requestId: string; score: number; note?: string }) {
     const stored = this.record(id), task = stored.run.tasks.find(item => item.id === taskId);

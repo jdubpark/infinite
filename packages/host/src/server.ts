@@ -388,8 +388,8 @@ export function createApp(config: Config, key: Buffer) {
     if (!assignment) return undefined;
     if (assignment.role === "mission-coordinator") return { kind: "mission", missionId: assignment.runId };
     try {
-      const team = teams.get(assignment.runId);
-      return team.missionId ? { kind: "mission", missionId: team.missionId, teamId: assignment.runId } : undefined;
+      const missionId = teams.missionIdOf(assignment.runId);
+      return missionId ? { kind: "mission", missionId, teamId: assignment.runId } : undefined;
     }
     catch (error) {
       if (error instanceof TeamError && error.code === "team-not-found") return undefined;
@@ -416,8 +416,21 @@ export function createApp(config: Config, key: Buffer) {
       next(error);
     }
   };
+  const refuseManagedOutsideProviderPrompt: express.RequestHandler = (req, res, next) => {
+    const param = req.params.id ?? req.params[0];
+    const sessionId = Array.isArray(param) ? param[0] : param;
+    if (!sessionId || !id.safeParse(sessionId).success) return next();
+    void (async () => {
+      if (!missionManagedSession(sessionId)) return next();
+      if ((await manager.state(sessionId)).attention?.state === "needs-you") return next();
+      res.status(409).json(missionManagedError);
+    })().catch(error => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") next();
+      else next(error);
+    });
+  };
   const refuseManagedClaim: express.RequestHandler = (req, res, next) =>
-    req.body?.action === "claim" ? refuseMissionManaged(req, res, next) : next();
+    req.body?.action === "claim" ? refuseManagedOutsideProviderPrompt(req, res, next) : next();
   app.get("/api/me", (_req, res) =>
     res.json({
       role: res.locals.role,
@@ -942,7 +955,7 @@ export function createApp(config: Config, key: Buffer) {
   });
   // Only a directly paired owner CLI can send terminal control bytes. Browser
   // cookies and controller/viewer keys retain their existing narrower inputs.
-  app.post("/api/sessions/:id/raw", refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
+  app.post("/api/sessions/:id/raw", refuseManagedOutsideProviderPrompt, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use native input" });
     const sessionId = id.parse(req.params.id);
     manager.meta(sessionId);
@@ -974,7 +987,7 @@ export function createApp(config: Config, key: Buffer) {
   });
   app.post(
     "/api/sessions/:id/input",
-    refuseMissionManaged,
+    refuseManagedOutsideProviderPrompt,
     requireRole(["owner", "controller"]),
     async (req, res) => {
       const sessionId = id.parse(req.params.id);
@@ -1030,7 +1043,7 @@ export function createApp(config: Config, key: Buffer) {
   );
   app.post(
     "/api/sessions/:id/key",
-    refuseMissionManaged,
+    refuseManagedOutsideProviderPrompt,
     requireRole(["owner", "controller"]),
     async (req, res) => {
       const sessionId = id.parse(req.params.id);

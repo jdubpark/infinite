@@ -654,7 +654,7 @@ function Create({
     </div>
   );
 }
-function TerminalView({ id, managed }: { id: string; managed: boolean }) {
+function TerminalView({ id, readOnly }: { id: string; readOnly: boolean }) {
   const api = useApi();
   const element = useRef<HTMLDivElement>(null);
   const [error, setError] = useState("");
@@ -711,7 +711,7 @@ function TerminalView({ id, managed }: { id: string; managed: boolean }) {
   return (
     <div className="terminal-shell">
       <div className="terminal-caption">
-        {managed ? "Recorded terminal · read-only" : "Recorded terminal · use the composer to send input"}
+        {readOnly ? "Recorded terminal · read-only" : "Recorded terminal · use the composer to send input"}
       </div>
       <div className="terminal" ref={element} />
       {error && (
@@ -813,13 +813,18 @@ function SessionView({
     composer.current.style.height = `${Math.min(170, composer.current.scrollHeight)}px`;
   }, [text, tab, session !== null]);
   const requiresControl = session?.capabilities?.inputControl === 1;
-  // A mission coordinator runs managed sessions; the host refuses people's input, keys, stop, resume and control claims.
+  // A mission coordinator runs managed sessions. People get the terminal fallback only while a provider prompt is open.
   const managed = Boolean(session?.managedBy);
+  const managedLocked = managed && session?.attention?.state !== "needs-you";
   const answerable = connected && view.fresh && session?.status === "running" && me.role !== "viewer";
   const controlled = !requiresControl || Boolean(control.lease);
-  const canSteer = answerable && !managed && controlled;
+  const canSteer = answerable && !managedLocked && controlled;
   // Provider prompts stay with the owner. Their answers need no control lease, because a managed session cannot be claimed.
   const canAnswer = answerable && (managed || controlled) && me.capabilities?.answer !== false;
+  // Input closes with the prompt, so a lease held across it goes back to the host.
+  useEffect(() => {
+    if (managedLocked && control.lease) void control.release();
+  }, [managedLocked, control.lease]);
   async function takeControl(takeover = false) {
     if (!view.fresh || session?.status !== "running") return;
     await control.claim(takeover);
@@ -1005,7 +1010,7 @@ function SessionView({
           setFollowing(false);
       }}>
         {tab === "chat" ? <Conversation id={id} /> : tab === "files" ? <ProjectFiles id={id} online={connected && view.fresh} /> : tab === "terminal" ? (
-          <TerminalView id={id} managed={managed} />
+          <TerminalView id={id} readOnly={managedLocked} />
         ) : tab === "context" ? (
           <Context session={session} me={me} connected={connected && view.fresh} />
         ) : (
@@ -1071,7 +1076,7 @@ function SessionView({
           <div className="control-actions">
             {!managed && <SessionLifecycle session={session} role={me.role} online={connected && view.fresh} controlId={control.lease?.id} refresh={view.refresh} />}
             <button className="text-button" onClick={view.refresh} disabled={view.refreshing} aria-label="Refresh this session" aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={16} /></button>
-            {!managed && requiresControl && me.role !== "viewer" && session.status === "running" && (
+            {!managedLocked && requiresControl && me.role !== "viewer" && session.status === "running" && (
               control.lease ? <button className="text-button" onClick={async () => { await control.release(); view.refresh(); }}>Stop controlling</button> :
                 <button className="primary stable-action" aria-busy={control.busy} disabled={!connected || !view.fresh || control.busy} onClick={() => takeControl(Boolean(control.holder))}>
                   {control.busy ? "Updating…" : control.holder ? "Take over" : "Take control"}
@@ -1087,7 +1092,7 @@ function SessionView({
         </div>
         {me.role === "viewer" ? (
           <p className="quiet">This device has view-only access.</p>
-        ) : managed ? null : (
+        ) : managedLocked ? null : (
           <>
             <form className="composer" onSubmit={send}>
               <label className="sr-only" htmlFor="message">

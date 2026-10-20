@@ -78,13 +78,16 @@ export function Brief({
   });
   const session = poll?.session ?? null;
   useControlSync(control, poll, stale);
-  // A mission coordinator runs this session: the phone sends no text, keys, stop, resume or control to it.
+  // A mission coordinator runs this session. While its provider prompt is open the person may answer in the
+  // terminal, so input and control are offered; otherwise the phone sends no text, keys, stop, resume or control.
   const missionId = session?.managedBy?.missionId;
-  // A lease this phone still holds on a managed session is released, so the coordinator keeps control.
+  const needsYou = session?.attention.state === "needs-you";
+  const missionLocked = Boolean(missionId) && !needsYou;
+  // A lease this phone still holds once a mission-run session no longer needs a person is released.
   const { forget } = control;
   useEffect(() => {
-    if (missionId) forget(true);
-  }, [forget, missionId]);
+    if (missionLocked) forget(true);
+  }, [forget, missionLocked]);
   // `/me` is read once; a failed read is retried after the next good poll.
   const [me, setMe] = useState<Me | null>(null);
   const needMe = me === null && online;
@@ -104,12 +107,12 @@ export function Brief({
 
   const { events: signals } = useSignals(connection, id);
   const moments = useMemo(() => deriveMoments(signals), [signals]);
-  // Workers that enforce control take input only from the device holding the lease; a managed session never grants one.
-  const requiresControl = !missionId && session?.capabilities?.inputControl === 1;
+  // Workers that enforce control take input only from the device holding the lease.
+  const requiresControl = !missionLocked && session?.capabilities?.inputControl === 1;
   const steering = useSteering(connection, id, refresh, control, {
     draftKey: `${connectionKey(connection)}/${id}/brief`,
     requiresControl,
-    managed: Boolean(missionId),
+    managed: missionLocked,
   });
   const prompt =
     session?.attention.state === "needs-you"
@@ -134,7 +137,7 @@ export function Brief({
   const readOnly = answering.forbidden || (me !== null && !permitted);
   const canAnswer = permitted && online && running && controlled;
   const canSteer =
-    online && running && me !== null && me.role !== "viewer" && controlled && !missionId;
+    online && running && me !== null && me.role !== "viewer" && controlled && !missionLocked;
   // Text and Enter would land in the open dialog and pick its highlighted option.
   // A running worker without attention cannot report one, so only the terminal types.
   const blocked = session?.attention.prompt
@@ -220,7 +223,7 @@ export function Brief({
             </Text>
             {tools ? <Text style={s.small} numberOfLines={1}>{tools}</Text> : null}
           </View>
-          {session.team || missionId ? null : <ControlBar
+          {missionLocked || (session.team && !missionId) ? null : <ControlBar
             role={me?.role}
             requiresControl={requiresControl}
             running={running}

@@ -20,9 +20,9 @@ export type SteeringKey = (typeof KEYS)[number];
  * Terminal does: there the person sees the dialog the text lands in.
  * Every send carries this phone's control lease, and nothing is sent without
  * one when the session `requiresControl`. The unsent text and an unconfirmed
- * request stay in memory under `draftKey` across navigation. A `managed`
- * session (run by a mission coordinator) takes no text or keys from this phone,
- * so nothing is sent.
+ * request stay in memory under `draftKey` across navigation. `managed` makes
+ * sends no-ops; callers set it only for a mission-run session with no provider
+ * prompt open, so an open prompt can still be answered from the terminal.
  */
 export function useSteering(
   connection: Connection,

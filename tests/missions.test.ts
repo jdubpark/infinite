@@ -105,10 +105,17 @@ test("mission-managed sessions refuse direct human input but keep answers, reads
     { id: ordinarySessionId, provider: "demo", title: "Ordinary session", projectId: "rehearsal", cwd: host.config.projects[0].path, createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "", runtime: { id: randomUUID(), location: "local", transport: "pty" } },
   ];
   const state = { status: "running", pid: 123, seq: 1, screen: "", attention: initialAttention(new Date().toISOString(), false), capabilities: { inputControl: 1 }, control: lease };
+  let providerPromptOpen = false;
+  const currentState = () => providerPromptOpen
+    ? { ...state, attention: { ...state.attention, state: "needs-you" as const } }
+    : state;
   try {
-    host.teams.get = (id: string) => (id === subteamId
-      ? { id, missionId, title: "Mission subteam" }
-      : { id, title: "Standalone team" }) as ReturnType<typeof host.teams.get>;
+    assert.throws(() => host.teams.missionIdOf(randomUUID()), error => error instanceof TeamError && error.code === "team-not-found");
+    host.teams.get = (id: string) => {
+      if (id === subteamId) throw new Error("Team tracking update failed while building a view");
+      return { id, title: "Standalone team" } as ReturnType<typeof host.teams.get>;
+    };
+    host.teams.missionIdOf = (id: string) => id === subteamId ? missionId : undefined;
     for (const session of sessions) {
       const directory = join(host.config.stateDir, "sessions", session.id);
       mkdirSync(directory, { recursive: true });
@@ -122,7 +129,7 @@ test("mission-managed sessions refuse direct human input but keep answers, reads
           if (end < 0) return;
           const request = JSON.parse(text.slice(0, end));
           workerRequests.push({ sessionId: session.id, request });
-          const result = request.op === "state" ? state
+          const result = request.op === "state" ? currentState()
             : request.op === "control" ? request.action === "release" ? null : lease
               : { requestId: request.requestId, state: "delivered", seq: 2 };
           socket.end(JSON.stringify({ result }) + "\n");
@@ -187,6 +194,50 @@ test("mission-managed sessions refuse direct human input but keep answers, reads
     assert.equal(trailingClaim.status, 409, "a trailing slash cannot bypass the claim guard");
     assert.deepEqual(trailingClaim.body, refusal);
 
+    providerPromptOpen = true;
+    const scopedRequestOffset = workerRequests.length;
+    const clientId = randomUUID();
+    const promptClaim = await host.fetchApi(`/sessions/${subteamSessionId}/control`, "owner", { action: "claim" }, { "X-Infinite-Client": clientId });
+    assert.equal(promptClaim.status, 200, "a managed session can claim control while a provider prompt is open");
+    const promptLease = promptClaim.body.control.id as string;
+    const promptHeaders = { "X-Infinite-Client": clientId, "X-Infinite-Control": promptLease };
+    for (const [suffix, body] of [
+      ["input", { requestId: randomUUID(), text: "provider prompt input" }],
+      ["key", { requestId: randomUUID(), key: "enter" }],
+      ["raw", { requestId: randomUUID(), text: "provider prompt bytes" }],
+    ] as const) {
+      const response = await host.fetchApi(`/sessions/${subteamSessionId}/${suffix}`, "owner", body, promptHeaders);
+      assert.equal(response.status, 200, `${suffix} is available while the provider prompt is open`);
+      assert.equal(response.body.state, "delivered");
+    }
+    const scopedWrites = workerRequests.slice(scopedRequestOffset).filter(({ sessionId, request }) => sessionId === subteamSessionId && ["input", "key", "raw"].includes(String(request.op)));
+    assert.equal(scopedWrites.length, 3);
+    for (const { request } of scopedWrites) {
+      assert.equal(request.leaseId, promptLease, "prompt fallback preserves normal worker lease fencing");
+      assert.ok(request.actor);
+    }
+    for (const { path, body, method } of [
+      { path: `/sessions/${subteamSessionId}/stop`, body: { requestId: randomUUID() } },
+      { path: `/sessions/${subteamSessionId}/resume`, body: { requestId: randomUUID() } },
+      { path: `/sessions/${subteamSessionId}/native`, method: "GET" },
+      { path: `/sessions/${subteamSessionId}/opencode/session/${randomUUID()}/prompt_async`, body: { parts: [] } },
+    ]) {
+      const response = await host.fetchApi(path, "owner", body, {}, method);
+      assert.equal(response.status, 409, `${path} remains refused while a provider prompt is open`);
+      assert.deepEqual(response.body, refusal);
+    }
+    providerPromptOpen = false;
+    for (const [suffix, body] of [
+      ["input", { requestId: randomUUID(), text: "after prompt closed" }],
+      ["key", { requestId: randomUUID(), key: "enter" }],
+      ["raw", { requestId: randomUUID(), text: "after prompt closed" }],
+    ] as const) {
+      const response = await host.fetchApi(`/sessions/${subteamSessionId}/${suffix}`, "owner", body, promptHeaders);
+      assert.equal(response.status, 409, `${suffix} returns to the mission-managed refusal after the prompt closes`);
+      assert.deepEqual(response.body, refusal);
+    }
+
+    providerPromptOpen = true;
     const wsUrl = new URL(`/api/sessions/${subteamSessionId}/native?client=${randomUUID()}&lease=${randomUUID()}`, host.origin);
     wsUrl.protocol = "ws:";
     const websocketResponse = await new Promise<{ status: number; body: string }>((resolve, reject) => {
@@ -202,32 +253,59 @@ test("mission-managed sessions refuse direct human input but keep answers, reads
     });
     assert.equal(websocketResponse.status, 409);
     assert.deepEqual(JSON.parse(websocketResponse.body), refusal);
+    providerPromptOpen = false;
 
-    const inputRequestId = randomUUID();
-    const terminalFrames = await new Promise<{ sawState: boolean; refusal: unknown }>((resolve, reject) => {
+    const closedClaimId = randomUUID(), openClaimId = randomUUID(), inputRequestId = randomUUID(), rawRequestId = randomUUID(), closedInputId = randomUUID();
+    const terminalFrames = await new Promise<{ sawState: boolean; closedClaim: unknown; openClaim: any; input: any; raw: any; closedInput: unknown }>((resolve, reject) => {
       const url = new URL(`/api/sessions/${subteamSessionId}/terminal?after=0`, host.origin);
       url.protocol = "ws:";
       const socket = new WebSocket(url);
       let sawState = false;
-      let sentInput = false;
-      const timer = setTimeout(() => { socket.terminate(); reject(new Error("Managed terminal did not remain readable and refuse input")); }, 5000);
+      let sentClosedClaim = false, sentOpenClaim = false, sentPromptWrites = false, sentClosedInput = false;
+      let openedLease: string | undefined;
+      let closedClaim: unknown, openClaim: any, input: any, raw: any;
+      const timer = setTimeout(() => { socket.terminate(); reject(new Error("Managed terminal prompt-scoped frames did not complete")); }, 5000);
       socket.once("open", () => socket.send(JSON.stringify({ token: host.tokens.owner, clientId: randomUUID() })));
       socket.on("message", data => {
         const frame = JSON.parse(data.toString());
         sawState ||= Boolean(frame.state);
-        if (frame.state && !sentInput) {
-          sentInput = true;
-          socket.send(JSON.stringify({ op: "input", requestId: inputRequestId, text: "direct terminal input", submit: false }));
+        if (frame.state && !sentClosedClaim) {
+          sentClosedClaim = true;
+          socket.send(JSON.stringify({ op: "control", requestId: closedClaimId, action: "claim" }));
         }
-        if (frame.refusal?.code === "mission-managed") {
-          clearTimeout(timer); socket.close(); resolve({ sawState, refusal: frame.refusal });
+        if (frame.refusal?.requestId === closedClaimId && !sentOpenClaim) {
+          closedClaim = frame.refusal;
+          providerPromptOpen = true;
+          sentOpenClaim = true;
+          socket.send(JSON.stringify({ op: "control", requestId: openClaimId, action: "claim" }));
+        }
+        if (frame.requestId === openClaimId && frame.control && !sentPromptWrites) {
+          openClaim = frame.control;
+          openedLease = frame.control.id;
+          sentPromptWrites = true;
+          socket.send(JSON.stringify({ op: "input", requestId: inputRequestId, text: "prompt terminal input", submit: false, leaseId: openedLease }));
+          socket.send(JSON.stringify({ op: "raw", requestId: rawRequestId, text: "prompt terminal bytes", leaseId: openedLease }));
+        }
+        if (frame.receipt?.requestId === inputRequestId) input = frame.receipt;
+        if (frame.receipt?.requestId === rawRequestId) raw = frame.receipt;
+        if (input && raw && !sentClosedInput) {
+          providerPromptOpen = false;
+          sentClosedInput = true;
+          socket.send(JSON.stringify({ op: "input", requestId: closedInputId, text: "after prompt closed", submit: false, leaseId: openedLease }));
+        }
+        if (frame.refusal?.requestId === closedInputId) {
+          clearTimeout(timer); socket.close(); resolve({ sawState, closedClaim, openClaim, input, raw, closedInput: frame.refusal });
         }
       });
       socket.on("error", error => { clearTimeout(timer); reject(error); });
       socket.once("close", () => { if (timer) { clearTimeout(timer); reject(new Error("Managed terminal closed before returning its refusal")); } });
     });
     assert.equal(terminalFrames.sawState, true, "managed terminal keeps its live read stream");
-    assert.deepEqual(terminalFrames.refusal, { requestId: inputRequestId, code: "mission-managed", error: refusal.error });
+    assert.deepEqual(terminalFrames.closedClaim, { requestId: closedClaimId, code: "mission-managed", error: refusal.error });
+    assert.equal(terminalFrames.openClaim.id, lease.id, "a terminal claim is accepted while the worker reports an open prompt");
+    assert.equal(terminalFrames.input.state, "delivered", "terminal input is accepted for the open prompt");
+    assert.equal(terminalFrames.raw.state, "delivered", "terminal raw input is accepted for the open prompt");
+    assert.deepEqual(terminalFrames.closedInput, { requestId: closedInputId, code: "mission-managed", error: refusal.error }, "terminal writes are refused again after the prompt closes");
 
     const answer = await host.fetchApi(`/sessions/${coordinatorId}/answer`, "owner", { requestId: randomUUID(), promptId: 1, option: 0 });
     assert.equal(answer.status, 200, "provider prompts remain answerable through the owner API");

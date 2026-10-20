@@ -9,6 +9,7 @@ import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, missionBoard, type ProjectGroupLookup } from "../packages/host/src/missions.js";
 import { createMissionReportEnvelope } from "../packages/host/src/team-report-client.js";
+import { missionPromptWithMessageCount, type MissionOpenChildDecision, type MissionMessage } from "../packages/host/src/team-prompts.js";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { Config } from "../packages/host/src/types.js";
@@ -78,6 +79,41 @@ function harness() {
 }
 
 const until = (read: () => Mission, accepts: (mission: Mission) => boolean, timeout = 60000) => waitFor(async () => read(), accepts, timeout);
+
+test("mission prompt keeps 21 open child questions under the byte limit without repeating their text", () => {
+  const openChildDecisions: MissionOpenChildDecision[] = Array.from({ length: 21 }, (_, index) => ({
+    subtaskId: `repo-${index % 7}-task-${Math.floor(index / 7)}`,
+    teamId: `team-${index}`,
+    decisionId: `decision-${index}`,
+    question: `Question ${index}: ${"q".repeat(2000 - `Question ${index}: `.length)}`,
+    options: [],
+  }));
+  const messages: MissionMessage[] = openChildDecisions.map(decision => ({
+    type: "child-decision", subtaskId: decision.subtaskId, teamId: decision.teamId,
+    decisionId: decision.decisionId, question: decision.question, options: decision.options,
+  }));
+  const mission = {
+    id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 21,
+    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "Coordinate repository work.",
+  } as unknown as Mission;
+  const repos = Array.from({ length: 7 }, (_, index) => ({ projectId: `repo-${index}`, name: `Repo ${index}`, path: `/repo/${index}`, teamReady: true }));
+  const result = missionPromptWithMessageCount(mission, repos, messages, 2, "claude", lineup.coordinator,
+    { openChildDecisions, waiting: 0 });
+
+  assert.ok(Buffer.byteLength(result.prompt) < 80 * 1024);
+  assert.equal(result.includedMessageCount, messages.length);
+  assert.equal(result.prompt.match(/Question 0:/g)?.length, 1, "The question text appears only in durable open-decision state");
+  assert.match(result.prompt, /See openChildDecisions for decision decision-0 in subtask repo-0-task-0/);
+
+  const oversizedMessages: MissionMessage[] = [...messages, ...Array.from({ length: 20 }, (_, index) => ({
+    type: "owner-direction" as const, text: `Direction ${index}: ${"d".repeat(3000)}`,
+  }))];
+  const bounded = missionPromptWithMessageCount(mission, repos, oversizedMessages, 2, "claude", lineup.coordinator,
+    { openChildDecisions, waiting: 0 });
+  assert.ok(Buffer.byteLength(bounded.prompt) < 80 * 1024);
+  assert.ok(bounded.includedMessageCount < oversizedMessages.length, "Messages that exceed the byte budget remain for a later attempt");
+  assert.match(bounded.prompt, new RegExp(`${oversizedMessages.length - bounded.includedMessageCount} more messages are waiting`));
+});
 
 test("a mission dispatches dependent subteams across two repositories, routes their questions, and reports only after every subtask finishes", { timeout: 240000 }, async () => {
   const h = harness();

@@ -145,6 +145,12 @@ const clip = (text: string, max: number) => text.length > max ? `${text.slice(0,
  */
 export function missionPrompt(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile,
   context: { openChildDecisions: MissionOpenChildDecision[]; waiting: number }) {
+  return missionPromptWithMessageCount(mission, repos, messages, attempt, provider, modelProfile, context).prompt;
+}
+
+/** Build a bounded prompt and report how many leading messages it includes so the caller can keep the rest queued. */
+export function missionPromptWithMessageCount(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile,
+  context: { openChildDecisions: MissionOpenChildDecision[]; waiting: number }) {
   const state = {
     status: mission.status,
     deadlineAt: mission.deadlineAt,
@@ -157,8 +163,15 @@ export function missionPrompt(mission: Mission, repos: MissionPromptRepo[], mess
     dispatchSummary: mission.dispatchSummary && clip(mission.dispatchSummary, 1000),
     openChildDecisions: context.openChildDecisions.map(decision => ({ ...decision, question: clip(decision.question, 2000) })),
   };
-  const recent = messages.map(message => "question" in message ? { ...message, question: clip(message.question, 2000) } : message);
-  const prompt = [
+  const openDecisionIds = new Set(context.openChildDecisions.map(decision => decision.decisionId));
+  const recent = messages.map(message => {
+    if (message.type === "child-decision" && openDecisionIds.has(message.decisionId)) {
+      return { type: message.type, decisionId: message.decisionId, subtaskId: message.subtaskId,
+        question: `See openChildDecisions for decision ${message.decisionId} in subtask ${message.subtaskId}.`, options: [] };
+    }
+    return "question" in message ? { ...message, question: clip(message.question, 2000) } : message;
+  });
+  const build = (included: number) => [
     `You are the main coordinator of a mission for the project "${mission.groupName}". This is coordinator attempt ${attempt}. Your working folder is the mission folder, outside every repository. You can read files and report; you cannot edit files or run commands, and the host carries mission state between attempts.`,
     profileInstructions(modelProfile),
     `Repositories in this project (inspect read-only at these host paths):\n${repos.map(repo => `- ${repo.projectId} (${repo.name}): ${repo.path}${repo.teamReady ? "" : " — not configured for subteams; do not dispatch to it"}`).join("\n")}\nDo not edit, commit, push, or run commands that change any repository. Every change goes through a subteam: an ordinary team run in one repository that keeps that repository's own checks, independent review, delivery policy, and permission rules.`,
@@ -174,12 +187,18 @@ export function missionPrompt(mission: Mission, repos: MissionPromptRepo[], mess
 - {"kind":"blocked","summary":"..."} stops the mission when it cannot proceed safely.
 After the report, stop. The host starts a new attempt when a subteam opens a decision, becomes blocked, or finishes, or when the owner answers or gives direction.`,
     `Mission state (JSON): ${JSON.stringify(state)}`,
-    `Messages since your last attempt (JSON): ${JSON.stringify(recent)}`,
-    context.waiting ? `${context.waiting} more message${context.waiting === 1 ? " is" : "s are"} waiting; the host delivers ${context.waiting === 1 ? "it" : "them"} in your next attempt. Open subteam decisions are always listed in the mission state as openChildDecisions.` : "",
+    `Messages since your last attempt (JSON): ${JSON.stringify(recent.slice(0, included))}`,
+    context.waiting + messages.length - included ? `${context.waiting + messages.length - included} more message${context.waiting + messages.length - included === 1 ? " is" : "s are"} waiting; the host delivers ${context.waiting + messages.length - included === 1 ? "it" : "them"} in your next attempt. Open subteam decisions are always listed in the mission state as openChildDecisions.` : "",
     `Escalate to the owner only what the objective and owner direction do not settle, such as product, scope, or risk decisions. A result means every subtask finished; it does not establish product impact or acceptance. Do not publish, merge, deploy, change repository remotes, or approve provider permissions; each subteam delivers only under its own repository's policy.`,
     `Write summaries and questions in plain English. Lead with concrete facts. Do not invent evidence or claim checks or outcomes you did not observe.`,
     missionReportingInstructions(provider),
   ].filter(Boolean).join("\n\n");
+  let includedMessageCount = recent.length;
+  let prompt = build(includedMessageCount);
+  while (Buffer.byteLength(prompt) > 80 * 1024 && includedMessageCount > 0) {
+    includedMessageCount--;
+    prompt = build(includedMessageCount);
+  }
   if (Buffer.byteLength(prompt) > 80 * 1024) throw new TeamError(409, "mission-prompt-too-large", "The mission state exceeds the coordinator prompt limit. Start a new mission with a consolidated objective.");
-  return prompt;
+  return { prompt, includedMessageCount };
 }

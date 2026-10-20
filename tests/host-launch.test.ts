@@ -153,7 +153,7 @@ test("permission coordinator rejects conflicting Claude permission and tool sett
   assert.throws(() => permissionCoordinatorLaunch("codex", { command: "codex", args: [] }), /Claude Code/);
 });
 
-test("mission coordinators can only read repositories and report, for Claude and Codex", () => {
+test("mission coordinators can only read repositories and report, and only on Claude Code", () => {
   const claude = missionCoordinatorLaunch("claude", { command: "claude", args: ["--model", "opus"] });
   assert.ok(claude.args.includes("--permission-mode") && claude.args[claude.args.indexOf("--permission-mode") + 1] === "dontAsk");
   assert.ok(claude.args.includes("--tools") && claude.args[claude.args.indexOf("--tools") + 1] === "Read,Glob,Grep");
@@ -165,19 +165,15 @@ test("mission coordinators can only read repositories and report, for Claude and
   assert.throws(() => missionCoordinatorLaunch("claude", { command: "claude", args: ["--dangerously-skip-permissions"] }), /cannot configure/);
   assert.ok(!claude.args.some(arg => /dangerously-skip|permission-mode.*acceptEdits|mcp__infinite_team__report/.test(arg)));
 
-  const codex = missionCoordinatorLaunch("codex", { command: "codex", args: ["--sandbox", "workspace-write", "--ask-for-approval", "on-request", "-c", "sandbox_workspace_write.network_access=false"] });
-  assert.ok(codex.args.includes("--sandbox") && codex.args[codex.args.indexOf("--sandbox") + 1] === "read-only");
-  assert.ok(codex.args.includes("--ask-for-approval") && codex.args[codex.args.indexOf("--ask-for-approval") + 1] === "never");
-  assert.ok(codex.args.includes("mcp_servers={}"), "Codex starts without inherited publication or session-control MCP servers");
-  assert.ok(codex.args.includes("sandbox_workspace_write.network_access=false"));
-  assert.throws(() => missionCoordinatorLaunch("codex", { command: "codex", args: ["-c", 'sandbox_mode="workspace-write"'] }), /sandbox_mode/);
+  // A stray value from a variadic flag must not become the positional prompt.
+  const variadic = missionCoordinatorLaunch("claude", { command: "claude", args: ["--tools", "Read", "Bash", "--mcp-config", "a.json", "b.json", "--model", "opus"] });
+  assert.ok(!variadic.args.includes("Bash") && !variadic.args.includes("a.json") && !variadic.args.includes("b.json") && variadic.args.includes("opus"));
+  // Codex merges inherited MCP servers, so it cannot yet be held to reading and reporting.
+  assert.throws(() => missionCoordinatorLaunch("codex", { command: "codex", args: [] }), /require Claude Code/);
 
-  for (const [provider, profile] of [["claude", claude], ["codex", codex]] as const) {
-    const launch = buildLaunch(provider, profile, "Report the mission", hooks, relay, enabled, true);
-    assert.ok(launch.args.at(-1) === "Report the mission");
-    if (provider === "codex") assert.ok(launch.args.includes("read-only"));
-    else assert.ok(claude.args.includes("mcp__infinite_team__mission_report"));
-  }
+  const launch = buildLaunch("claude", claude, "Report the mission", hooks, relay, enabled, true);
+  assert.ok(launch.args.at(-1) === "Report the mission");
+  assert.ok(launch.args.includes("mcp__infinite_team__mission_report"));
 });
 
 test("codex gets -c hook overrides, notify, osc notifications and trust bypass", () => {

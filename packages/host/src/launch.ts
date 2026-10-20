@@ -156,8 +156,9 @@ export function missionCoordinatorLaunch(provider: Provider, profile: AgentProfi
   if (provider === "claude") {
     // Like the permission coordinator: dontAsk denies anything not listed, so the coordinator can read and report only.
     const args: string[] = [];
-    const valueFlags = new Set(["--permission-mode", "--tools", "--mcp-config", "--settings", "--agents", "--plugin-dir", "--permission-prompt-tool"]);
-    const listFlags = new Set(["--allowedTools", "--allowed-tools"]);
+    const valueFlags = new Set(["--permission-mode", "--settings", "--agents", "--plugin-dir", "--permission-prompt-tool"]);
+    // Variadic flags lose every value, so no stray value can become the positional prompt.
+    const listFlags = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools", "--mcp-config"]);
     for (let index = 0; index < profile.args.length; index++) {
       const arg = profile.args[index], flag = arg.split("=")[0];
       if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"].includes(flag))
@@ -174,22 +175,9 @@ export function missionCoordinatorLaunch(provider: Provider, profile: AgentProfi
       "--allowedTools", "Read", "Glob", "Grep", "mcp__infinite_team__mission_report", "--strict-mcp-config", "--disable-slash-commands");
     return { ...profile, args };
   }
-  if (provider !== "codex") throw new Error("Mission coordinator requires Claude Code or Codex.");
-  const args: string[] = [];
-  const configured = [...profile.args];
-  for (let index = 0; index < configured.length; index++) {
-    const arg = configured[index];
-    if (["--sandbox", "--ask-for-approval"].includes(arg)) { index++; continue; }
-    if (/^--(?:sandbox|ask-for-approval)=/.test(arg)) continue;
-    if (["--yolo", "--full-auto", "--dangerously-bypass-approvals-and-sandbox"].includes(arg))
-      throw new Error(`Mission coordinator profile cannot configure ${arg}.`);
-    const config = arg === "-c" || arg === "--config" ? configured[index + 1]
-      : arg.startsWith("--config=") ? arg.slice(9) : arg.startsWith("-c") ? arg.slice(2) : undefined;
-    if (config && /^\s*["']?sandbox_mode["']?\s*=/.test(config))
-      throw new Error("Mission coordinator profile cannot configure sandbox_mode.");
-    args.push(arg);
-  }
-  return { ...profile, args: [...args, "-c", "mcp_servers={}", "--sandbox", "read-only", "--ask-for-approval", "never"] };
+  // Codex merges inherited MCP server tables, so a coordinator could keep write-capable tools
+  // outside its read-only sandbox. Codex coordinators wait until that can be enforced.
+  throw new Error("Mission coordinators require Claude Code.");
 }
 
 const CLAUDE_EVENTS = [

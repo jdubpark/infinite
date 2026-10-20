@@ -279,7 +279,7 @@ struct TeamDetailView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Decision · revision \(decision["revision"].int)").font(.caption).foregroundStyle(.secondary)
                         Text(decision["question"].string).font(.callout).fixedSize(horizontal: false, vertical: true)
-                        Text("Your answer: \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        Text("\(decision["answeredBy"].string == "coordinator" ? "Mission coordinator" : "Your answer"): \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }

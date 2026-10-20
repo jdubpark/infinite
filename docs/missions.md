@@ -47,7 +47,11 @@ succeeds even after the group was edited or deleted or a handoff started. The ho
 the coordinator with the configured strong coordinator profile in a mission
 folder outside every repository, with each repository's host path listed in its
 prompt for reading. The coordinator must not edit repositories directly; all
-changes go through subteams.
+changes go through subteams. The launch enforces this: a Claude Code coordinator
+runs in `dontAsk` mode with only Read, Glob, Grep, and its mission report tool,
+and only its report MCP server. Codex is refused as a coordinator for now,
+because Codex merges inherited MCP servers that could keep write-capable tools
+outside its read-only sandbox.
 
 The coordinator reports through its mission report tool:
 

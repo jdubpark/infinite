@@ -51,8 +51,9 @@ async function coordinator() {
   }
   if (held) return hold();
   const decision = messages.find(message => message.type === "child-decision");
+  const openDecision = decision && state.openChildDecisions.find(item => item.decisionId === decision.decisionId);
   if (decision?.subtaskId === "api-change") {
-    await report({ kind: "question", question: `The API subteam asks: ${decision.question}`, options: decision.options, subtaskId: decision.subtaskId, childDecisionId: decision.decisionId });
+    await report({ kind: "question", question: `The API subteam asks: ${openDecision?.question}`, options: openDecision?.options ?? [], subtaskId: decision.subtaskId, childDecisionId: decision.decisionId });
     return;
   }
   if (decision?.subtaskId === "web-change") {

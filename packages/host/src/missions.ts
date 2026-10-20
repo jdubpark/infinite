@@ -9,10 +9,10 @@ import type { CreateTeam, TeamAssignment, TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
-import { missionPrompt, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
+import { missionPromptWithMessageCount, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
-import { teamModelLaunch } from "./launch.js";
+import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory } from "./team-workspace.js";
 
 /** The mission's only view of projects; the project group service implements it. */
@@ -147,7 +147,9 @@ export class MissionService {
       const lineup = structuredClone(this.config.teams!.lineup!), profile = this.config.agents[lineup.coordinator.provider];
       if (!profile) throw new TeamError(409, "provider-not-configured", "The coordinator provider must be configured and available on this host.");
       // The mission report tool reaches Claude and Codex through the team MCP server.
-      if (!["claude", "codex"].includes(lineup.coordinator.provider)) throw new TeamError(409, "mission-coordinator-unsupported", "Missions need a Claude or Codex coordinator in the team lineup.");
+      if (lineup.coordinator.provider !== "claude") throw new TeamError(409, "mission-coordinator-unsupported", "Missions need a Claude Code coordinator in the team lineup; a Codex coordinator cannot yet be restricted to reading and reporting.");
+      try { missionCoordinatorLaunch(lineup.coordinator.provider, profile); }
+      catch (error) { throw new TeamError(409, "mission-coordinator-profile", `The coordinator profile cannot run as a read-only mission coordinator: ${(error as Error).message}`); }
       try { teamModelLaunch(profile, lineup.coordinator); }
       catch { throw new TeamError(409, "team-model-profile-conflict", "Move model, effort, and fallback-model arguments from provider profiles into the team lineup before starting a mission."); }
       const folder = this.missionFolder(request.requestId, repos);
@@ -543,9 +545,12 @@ export class MissionService {
     // Messages that need the coordinator go first; any beyond the limit wait for the next attempt rather than being dropped.
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
+    // The prompt keeps a byte budget by leaving trailing messages queued, so inbox messages lead and notes are deferred first.
+    const built = missionPromptWithMessageCount(mission, stored.repos, [...inbox, ...notes], revision, profile.provider, profile, { openChildDecisions: this.openChildDecisions(stored), waiting });
+    const fromInbox = Math.min(built.includedMessageCount, inbox.length), fromNotes = built.includedMessageCount - fromInbox;
     const attempt: Attempt = { memberId: randomUUID(), sessionId: randomUUID(), revision, cursor: 0, stopRequestId: randomUUID(), status: "queued", ownerInputs: stored.ownerInputs ?? 0,
-      prompt: missionPrompt(mission, stored.repos, [...notes, ...inbox], revision, profile.provider, profile, { openChildDecisions: this.openChildDecisions(stored), waiting }) };
-    stored.attempts.push(attempt); stored.inbox = stored.inbox.slice(inbox.length); stored.notes = stored.notes.slice(notes.length);
+      prompt: built.prompt };
+    stored.attempts.push(attempt); stored.inbox = stored.inbox.slice(fromInbox); stored.notes = stored.notes.slice(fromNotes);
     this.save(stored);
     await this.launch(stored, attempt);
   }

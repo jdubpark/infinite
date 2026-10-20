@@ -539,9 +539,10 @@ export class MissionService {
       if (!this.launched(attempt)) { attempt.status = "stopped"; this.save(stored); return; }
       attempt.status = "running";
     }
-    if (attempt.status === "running" && !attempt.missedReport) {
+    if (attempt.status === "running") {
+      // A report filed while a missed-report stop is pending or being retried still counts.
       this.readReport(stored, attempt);
-      if (attempt.status === "running" && live.has(mission.status)) {
+      if (attempt.status === "running" && !attempt.missedReport && live.has(mission.status)) {
         const state = await this.manager.state(attempt.sessionId);
         // A coordinator that ends its turn without a report, or goes quiet, would otherwise hold the attempt open
         // while subteam and owner messages wait behind it. A provider prompt waiting on the owner is not quiet.
@@ -563,6 +564,8 @@ export class MissionService {
     try { state = await this.manager.stopTeamSession(attempt.sessionId, attempt.stopRequestId, this.assignment(stored, attempt)); }
     catch { this.save(stored); return; }
     if (this.closed || state.status !== "exited") { this.save(stored); return; }
+    // The session can no longer write, so this read is the last chance for a report filed before the stop.
+    if (attempt.status === "running") this.readReport(stored, attempt);
     attempt.status = "stopped";
     if (attempt.report) {
       if (live.has(mission.status)) this.consume(stored, attempt.report, attempt);

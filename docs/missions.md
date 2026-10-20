@@ -70,7 +70,9 @@ without a report, or shows no activity for the team stall window while not
 waiting on a provider prompt, is stopped. A turn counts as ended only when the
 latest turn signal in the session's journal is a turn-end that has stood for
 five seconds; a quiet screen alone is not evidence, because the attention state
-keeps an earlier turn-end while a later turn continues. The next attempt starts with a
+keeps an earlier turn-end while a later turn continues. A report the session
+files before it confirms its exit, including across a host restart, is applied
+as usual and is not counted as missing. The next attempt starts with a
 refusal that says so, together with every message that arrived meanwhile.
 Three missed or refused reports in a row block the mission.
 

@@ -718,6 +718,24 @@ test("a coordinator still working after an earlier turn-end is not stopped when 
   } finally { h.close(); }
 });
 
+test("a report filed while a missed-report stop is still pending is applied, not charged as missing", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.holdStop(1);
+    await h.endTurn(1, new Date(Date.now() - 10000));
+    // The host decided the turn ended without a report and asked to stop the session, which has not exited yet.
+    await waitFor(() => h.stops(1), count => count > 0, 20000);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    await new Promise(done => setTimeout(done, 1000));
+    await h.releaseStop(1);
+    const started = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")), 20000);
+    assert.ok(!started.events.some(event => /missing report was refused/.test(event.text)));
+    await new Promise(done => setTimeout(done, 1000));
+    assert.equal(h.attempts(), 1, "The applied report leaves nothing to wake a new attempt");
+  } finally { h.close(); }
+});
+
 test("subtasks wait for a repository that another mission or a run outside any mission is using", { timeout: 60000 }, async () => {
   const h = scripted();
   try {

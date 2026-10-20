@@ -303,6 +303,8 @@ export class MissionService {
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
   }
   close() { this.closed = true; if (this.timer) clearInterval(this.timer); }
+  /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
+  idle() { return this.serial.then(() => undefined); }
 
   private async step(stored: Stored) {
     if (this.closed) return;

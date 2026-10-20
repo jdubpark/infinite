@@ -572,6 +572,8 @@ export class TeamService {
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
   }
   close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const controller of this.commands.values()) controller.abort(); }
+  /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
+  idle() { return this.serial.then(() => undefined); }
   private stallWindow() { return (this.config.teams?.stallMinutes ?? 30) * 60000; }
   /**
    * Extends a deadline only under the owner's recorded policy, and only while an active member of this

@@ -74,9 +74,15 @@ function harness() {
     ({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 });
   const release = (name: string) => writeFileSync(join(receipts, name), "go", { mode: 0o600 });
   const close = async () => {
+    const closing = services;
     shut();
-    await stopSessionWorkers(config);
-    // Workers exit 1.5 s after their child; wait so they never write into a removed directory.
+    // A tick already under way can still launch a coordinator attempt or subteam member after close().
+    await closing?.missions.idle(); await closing?.teams.idle();
+    // Workers exit 1.5 s after their child. Sweep until none answers, so no worker or provider outlives the test.
+    for (let pass = 1; await stopSessionWorkers(config); pass++) {
+      if (pass === 8) throw new Error("Session workers still answer after the mission test stopped them");
+      await new Promise(done => setTimeout(done, 500));
+    }
     await new Promise(done => setTimeout(done, 1700));
     rmSync(root, { recursive: true, force: true });
   };

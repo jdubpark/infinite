@@ -74,8 +74,9 @@ export function apiClient(origin: string, tokens: Record<Role, string>): Host["f
 }
 
 /** Stop every session worker recorded under `config.stateDir`, then wait for them to exit. */
+/** Asks every session worker under the state directory to stop; returns how many were still answering. */
 export async function stopSessionWorkers(config: Config) {
-  let ids: string[] = [];
+  let ids: string[] = [], answered = 0;
   try {
     ids = readdirSync(join(config.stateDir, "sessions")).filter((n) => /^[a-f0-9-]{36}$/.test(n));
   } catch {
@@ -85,12 +86,14 @@ export async function stopSessionWorkers(config: Config) {
     try {
       const actor = { id: "test-cleanup", label: "Test cleanup" };
       const state = await workerCall<{ capabilities?: { inputControl?: number } }>(config.runDir, id, { op: "state" });
+      answered++;
       const lease = state.capabilities?.inputControl
         ? await workerCall<ControlLease>(config.runDir, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
       await workerCall(config.runDir, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
     } catch {
       /* already exited */
     }
+  return answered;
 }
 
 /** Boots a real API (`cli.ts serve`) on a free port with owner, controller and viewer device keys. */

@@ -16,7 +16,8 @@ import { teamUsage } from "./team-usage.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
 import type { Readings } from "./readings.js";
-import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
+import type { ProjectSourceService } from "./project-source.js";
+import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberWorkspace, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, teamCommand, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { oneShotPermissionOption, permissionEvidenceHash, refusedBeforeSend } from "./team-permissions.js";
 export { TeamError } from "./team-workspace.js";
@@ -130,7 +131,7 @@ export class TeamService {
   private missionReservations?: MissionReservationLookup;
   private readonly limits: ProviderLimits;
   private reconciledAt = 0;
-  constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService, private readonly titler?: Pick<Readings, "requestTitle">) {
+  constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService, private readonly titler?: Pick<Readings, "requestTitle">, private readonly options?: { source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">; onMerged?: (projectId: string) => void }) {
     this.directory = join(config.stateDir, "teams");
     this.limits = new ProviderLimits(join(config.stateDir, "provider-limits.sealed"), key);
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
@@ -356,6 +357,7 @@ export class TeamService {
         throw new TeamError(409, goal ? "invalid-goal-parent" : "invalid-mission-base", goal ? "Continue only from a ready, recorded run of this goal and project." : "Continue only from a completed subtask in this mission and project with a recorded workspace head.");
       if (parent) this.assertRunPath(this.record(parent.id), parent.workspace);
       const source = { path: parent?.workspace ?? project.path, ...(parent ? { head: parent.headCommit!, ...(parent.status === "merged" ? { startCommit: parent.deliveryReceipt!.mergeCommit } : {}) } : internal?.handoff ? { head: internal.handoff.checkpointHead } : {}) };
+      const githubProject = project.source?.mode === "github" || this.options?.source?.isGithub(project.id) === true;
       const parentRevision = parent?.revision;
       const at = timestamp();
       const slug = parsed.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/g, "") || "team";
@@ -369,7 +371,7 @@ export class TeamService {
       const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: structuredClone(project.team.permissions), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
-          throw new TeamError(409, "delivery-lineup-required", "Automatic merge requires a configured strong coordinator and independent strong reviewer.");
+          throw new TeamError(409, "delivery-lineup-required", "Automatic delivery requires a configured strong coordinator and independent strong reviewer.");
         run.delivery = structuredClone(project.team.delivery);
       }
       if (parent?.establishChecks || project.team.establishChecks) {
@@ -385,7 +387,7 @@ export class TeamService {
       const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, root, ...(anchor ? { anchor } : {}), source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
       this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
       if (run.titleSource === "request" && this.titler) void this.nameRequest(run.id, parsed.objective);
-      this.operation(stored, "prepare", async signal => this.startInProject(run.projectId, async () => {
+      this.operation(stored, "prepare", async signal => {
         const assertParent = () => {
           if (parent && (!["ready-for-review", "merged", "no-change"].includes(parent.status) || parent.revision !== parentRevision || parent.headCommit !== source.head))
             throw new TeamError(409, "parent-workspace-changed", "The predecessor run changed while its continuation was being prepared.");
@@ -393,17 +395,51 @@ export class TeamService {
         assertParent();
         if (project.teamworkDir) assertTeamworkPath(this.config, root);
         this.assertRunPath(stored, teamWorkspacePath(root, directoryName), true);
-        const workspace = await prepareTeamWorkspace(source.path, root, directoryName, branch, this.config.teams?.commandPrefix, signal, source.head, anchor, source.startCommit);
-        assertParent();
-        if (project.team?.setup) {
-          const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
-          if (setup.exitCode !== 0 || setup.interrupted) throw new TeamError(409, "team-setup-failed", "The configured setup command failed. Inspect the isolated workspace before restarting.");
-          await assertMemberReadOnly(workspace.workspace, workspace.baseCommit, this.config.teams?.commandPrefix, signal);
+        let workspaceSource = source;
+        let fromMirror = false;
+        if (githubProject && !parent) {
+          const projectSource = this.options?.source;
+          if (!projectSource) throw new TeamError(409, "source-unavailable", "The host has no copy of this repository from GitHub yet; check the project's source status.");
+          const status = await projectSource.refresh(project.id);
+          if (!status.mirrorHead) throw new TeamError(409, "source-unavailable", "The host has no copy of this repository from GitHub yet; check the project's source status.");
+          workspaceSource = { path: projectSource.mirrorPath(project.id), head: status.mirrorHead };
+          fromMirror = true;
+          if (status.pending?.reason === "fetch-failed") {
+            const pendingCategory = status.pending.category;
+            const category = pendingCategory === "auth" || pendingCategory === "network" || pendingCategory === "not-found" || pendingCategory === "other" ? pendingCategory : "other";
+            run.baseStale = { ...(status.fetchedAt ? { fetchedAt: status.fetchedAt } : {}), reason: "fetch-failed", category };
+            this.event(stored, "GitHub could not be reached; the run starts from the last fetched base.");
+          }
+        } else if (githubProject && parent && this.options?.source) {
+          try { await this.options.source.refresh(project.id, { maxAgeMs: 60_000 }); } catch { /* A continuation keeps its parent's base when refresh is unavailable. */ }
+          try {
+            const mirrorHead = this.options.source.status(project.id).mirrorHead;
+            if (mirrorHead && mirrorHead !== parent.headCommit) {
+              const ancestry = await teamCommand({ command: "git", args: teamGitArgs(source.path, ["merge-base", "--is-ancestor", parent.headCommit!, mirrorHead]) }, source.path, signal, 30000, this.config.teams?.commandPrefix);
+              if (ancestry.exitCode === 0 && !ancestry.interrupted && !ancestry.truncated) run.baseBehind = { mirrorHead };
+            }
+          } catch { /* Refresh and ancestry checks do not move a continuation off its parent workspace. */ }
         }
-        assertParent();
-        if (source.head) await assertMemberReadOnly(source.path, source.head, this.config.teams?.commandPrefix, signal);
-        return workspace;
-      }), workspace => { Object.assign(run, workspace); run.headCommit = workspace.baseCommit; stored.prepared = true; this.event(stored, "Isolated project ready. Starting the project manager."); });
+        const prepareWorkspace = async () => {
+          assertParent();
+          if (project.teamworkDir) assertTeamworkPath(this.config, root);
+          this.assertRunPath(stored, teamWorkspacePath(root, directoryName), true);
+          const workspace = fromMirror
+            ? await prepareTeamWorkspaceFromMirror(workspaceSource.path, workspaceSource.head!, root, directoryName, branch, this.config.teams?.commandPrefix, signal, anchor)
+            : await prepareTeamWorkspace(workspaceSource.path, root, directoryName, branch, this.config.teams?.commandPrefix, signal, workspaceSource.head, anchor, workspaceSource.startCommit);
+          assertParent();
+          if (project.team?.setup) {
+            const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
+            if (setup.exitCode !== 0 || setup.interrupted) throw new TeamError(409, "team-setup-failed", "The configured setup command failed. Inspect the isolated workspace before restarting.");
+            await assertMemberReadOnly(workspace.workspace, workspace.baseCommit, this.config.teams?.commandPrefix, signal);
+          }
+          assertParent();
+          if (workspaceSource.head && !fromMirror) await assertMemberReadOnly(workspaceSource.path, workspaceSource.head, this.config.teams?.commandPrefix, signal);
+          return workspace;
+        };
+        // GitHub runs and parent continuations never read the project tree, so they do not hold its session/refresh gate.
+        return githubProject ? prepareWorkspace() : this.startInProject(run.projectId, prepareWorkspace);
+      }, workspace => { Object.assign(run, workspace); run.headCommit = workspace.baseCommit; stored.prepared = true; this.event(stored, "Isolated project ready. Starting the project manager."); });
       return this.view(stored);
     });
   }
@@ -1325,7 +1361,7 @@ export class TeamService {
       const task = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId) : run.tasks.find(item => item.id === member.taskId); if (task) task.status = "waiting";
       run.status = "needs-input"; this.event(stored, `${member.title} requested a user decision.`); this.save(stored); return;
     }
-    const expected = member.role === "project-manager" ? ["plan", "explore", "no-change"] : member.role === "scout" ? ["findings"] : member.role === "reviewer" ? ["review"] : member.role === "delivery" ? ["delivery", "delivery-repair"] : member.role === "implementer" ? ["result", "escalate"] : ["result"];
+    const expected = member.role === "project-manager" ? ["plan", "explore", "no-change"] : member.role === "scout" ? ["findings"] : member.role === "reviewer" ? ["review"] : member.role === "delivery" ? ["delivery", "delivery-repair", "pull-request"] : member.role === "implementer" ? ["result", "escalate"] : ["result"];
     if (!expected.includes(report.kind)) { this.block(stored, new TeamError(409, "wrong-agent-report", "An agent's report does not match its assigned role.")); return; }
     if (report.kind === "no-change") {
       if ((!run.goal && !run.handoff) || run.tasks.length) throw new TeamError(409, "invalid-no-change", "Only a goal coordinator can conclude that discovery found no justified change.");
@@ -1410,11 +1446,13 @@ export class TeamService {
         this.event(stored, `Project manager planned ${run.tasks.length} tasks.`);
       }); return;
     }
-    if (report.kind === "delivery" || report.kind === "delivery-repair") {
+    if (report.kind === "delivery" || report.kind === "delivery-repair" || report.kind === "pull-request") {
+      if ((report.kind === "delivery" && run.delivery?.mode !== "merge") || (report.kind === "pull-request" && run.delivery?.mode !== "pr"))
+        throw new TeamError(409, "delivery-mode-mismatch", "The delivery report kind does not match the configured delivery mode.");
       this.assertDelivery(stored);
       if (report.headCommit !== run.headCommit || member.baseCommit !== run.headCommit || stored.deliveryAttempt?.memberId !== member.memberId)
         throw new TeamError(409, "stale-delivery", "Delivery evidence must name the checked and independently reviewed commit for this attempt.");
-      if (report.kind === "delivery") {
+      if (report.kind === "delivery" || report.kind === "pull-request") {
         let url: URL;
         try { url = new URL(report.pullRequestUrl); } catch { throw new TeamError(409, "delivery-target-mismatch", "The delivery report must name a valid pull request URL."); }
         const prefix = `/${run.delivery!.repository}/pull/`.toLowerCase();
@@ -1436,9 +1474,14 @@ export class TeamService {
         stored.deliveryAttempt = undefined;
         if (report.kind === "delivery-repair") {
           this.repair(stored, `Delivery requires a scoped repair before checks and independent review run again. No merge was reported.\n${report.summary}`);
+        } else if (report.kind === "pull-request") {
+          run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, summary: report.summary, reportedAt: timestamp() };
+          run.status = "ready-for-review"; run.reason = undefined;
+          this.event(stored, "The delivery agent reported an open pull request for the reviewed commit. Review and merge it on GitHub; the host refreshes the project after the merge.");
         } else {
           run.status = "merged"; run.reason = undefined;
           this.event(stored, "The delivery agent reported a merged pull request for the reviewed commit. This is agent-reported delivery evidence, not proof of product impact.");
+          try { this.options?.onMerged?.(run.projectId); } catch { /* A refresh callback cannot undo a completed merge report. */ }
         }
       }); return;
     }

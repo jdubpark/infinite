@@ -12,6 +12,7 @@ import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
 import type { CreateTeam, TeamBrief, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
+import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
@@ -20,6 +21,110 @@ import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-
 import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { Manager } from "../packages/host/src/manager.js";
+
+test("a GitHub project run clones the mirror head without reading the project tree", { timeout: 90000 }, async () => {
+  const f = await fixture("success", undefined, {}, { noServer: true });
+  try {
+    writeFileSync(join(f.source, "untracked.txt"), "This must not affect a mirror-based run.\n");
+    const mirror = join(f.host.root, "source-mirror.git");
+    git(f.source, "clone", "--bare", f.source, mirror);
+    const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: f.base };
+    const refreshed: string[] = [];
+    const refreshOptions: unknown[] = [];
+    const source: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> = {
+      refresh: async (projectId, options) => { refreshed.push(projectId); refreshOptions.push(options); return status; },
+      mirrorPath: projectId => { assert.equal(projectId, "rehearsal"); return mirror; },
+      isGithub: projectId => projectId === "rehearsal",
+      status: () => status,
+    };
+    const teams = await f.openTeamService({ source });
+    const created = await teams.create(f.create());
+    const run = await waitFor(() => Promise.resolve(teams.get(created.id)), current => Boolean(current.baseCommit) || current.status === "blocked", 30000);
+    assert.equal(run.baseCommit, f.base);
+    assert.ok(run.events.some(event => event.text === "Isolated project ready. Starting the project manager."));
+    assert.equal(git(run.workspace, "remote"), "", "The integration clone must not retain the mirror as origin");
+    assert.deepEqual(refreshed, ["rehearsal"]);
+    assert.deepEqual(refreshOptions, [undefined], "A new run must force a refresh instead of applying a max-age cache");
+    assert.equal(git(f.source, "status", "--porcelain=v1", "--untracked-files=all"), "?? untracked.txt", "The project tree was not used as the team source");
+  } finally { await f.close(); }
+});
+
+test("a GitHub project blocks when its first refresh has no mirror head", { timeout: 90000 }, async () => {
+  const f = await fixture("success", undefined, {}, { noServer: true });
+  try {
+    const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main" };
+    const source: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> = {
+      refresh: async () => status,
+      mirrorPath: () => assert.fail("A missing mirror head must not be cloned"),
+      isGithub: () => true,
+      status: () => status,
+    };
+    const teams = await f.openTeamService({ source });
+    const created = await teams.create(f.create());
+    const blocked = await waitFor(() => Promise.resolve(teams.get(created.id)), current => current.status === "blocked", 30000);
+    assert.match(blocked.reason ?? "", /no copy of this repository from GitHub yet/);
+  } finally { await f.close(); }
+});
+
+test("a failed GitHub fetch records a stale base and event while using the last mirror head", { timeout: 90000 }, async () => {
+  const f = await fixture("success", undefined, {}, { noServer: true });
+  try {
+    const mirror = join(f.host.root, "source-mirror.git");
+    git(f.source, "clone", "--bare", f.source, mirror);
+    const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: f.base,
+      fetchedAt: "2026-10-20T12:00:00.000Z", pending: { reason: "fetch-failed", category: "network", since: "2026-10-20T12:01:00.000Z" } };
+    const source: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> = {
+      refresh: async () => status,
+      mirrorPath: () => mirror,
+      isGithub: () => true,
+      status: () => status,
+    };
+    const teams = await f.openTeamService({ source });
+    const created = await teams.create(f.create());
+    const run = await waitFor(() => Promise.resolve(teams.get(created.id)), current => Boolean(current.baseCommit) || current.status === "blocked", 30000);
+    assert.deepEqual(run.baseStale, { fetchedAt: status.fetchedAt, reason: "fetch-failed", category: "network" });
+    assert.ok(run.events.some(event => event.text === "GitHub could not be reached; the run starts from the last fetched base."));
+  } finally { await f.close(); }
+});
+
+test("a GitHub mission continuation keeps its parent head and records an ancestor mirror head", { timeout: 30000 }, async () => {
+  const f = await fixture("success", fallbackLineup, {}, { noServer: true });
+  try {
+    writeFileSync(join(f.source, "mirror-update.txt"), "The base advanced after the parent run started.\n");
+    git(f.source, "add", "mirror-update.txt");
+    git(f.source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Advance mirror base");
+    const mirrorHead = git(f.source, "rev-parse", "HEAD");
+    const mirror = join(f.host.root, "source-mirror.git");
+    git(f.source, "clone", "--bare", f.source, mirror);
+    const refreshOptions: unknown[] = [];
+    const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead };
+    const source: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> = {
+      refresh: async (_projectId, options) => { refreshOptions.push(options); return status; },
+      mirrorPath: () => mirror,
+      isGithub: () => true,
+      status: () => status,
+    };
+    const teams = await f.openTeamService({ source });
+    const parentId = randomUUID(), branch = "infinite/team-parent-test";
+    const parentWorkspace = join(f.host.config.teams!.workspaceDir, parentId, "integration");
+    mkdirSync(join(f.host.config.teams!.workspaceDir, parentId), { recursive: true });
+    git(f.source, "clone", "--no-local", "--no-hardlinks", "--", mirror, parentWorkspace);
+    git(parentWorkspace, "remote", "remove", "origin");
+    git(parentWorkspace, "checkout", "-b", branch, f.base);
+    const at = new Date().toISOString();
+    const parent: TeamRun = { id: parentId, projectId: "rehearsal", provider: "codex", missionId: "mission-test", title: "Parent run", objective: "Keep the parent base.",
+      parallelism: 1, revision: 1, status: "ready-for-review", createdAt: at, updatedAt: at, workspace: parentWorkspace, branch, baseCommit: f.base, headCommit: f.base,
+      tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+    const internal = teams as unknown as { records: Map<string, unknown> };
+    internal.records.set(parentId, { run: parent, fingerprint: "fixture", receipts: {}, prepared: true, root: f.host.config.teams!.workspaceDir });
+    const request = f.create();
+    const created = await teams.createForMission(request, "mission-test", fallbackLineup, { baseRunId: parentId });
+    const continuation = await waitFor(() => Promise.resolve(teams.get(created.id)), run => Boolean(run.baseCommit) || run.status === "blocked", 10000);
+    assert.equal(continuation.baseCommit, f.base);
+    assert.deepEqual(continuation.baseBehind, { mirrorHead });
+    assert.deepEqual(refreshOptions, [{ maxAgeMs: 60_000 }]);
+  } finally { await f.close(); }
+});
 
 test("team runs use readable names and exact root permissions under a strict umask", { timeout: 120000 }, async () => {
   const root = realpathSync(mkdtempSync("/tmp/inf-team-modes-"));

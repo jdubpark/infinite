@@ -165,6 +165,25 @@ export async function prepareTeamWorkspace(source: string, root: string, directo
     throw new TeamError(409, "project-changed", "The source project changed during capture. The team remains blocked with its isolated copy preserved.");
   return { workspace, branch, baseCommit };
 }
+export async function prepareTeamWorkspaceFromMirror(mirror: string, head: string, root: string, directoryName: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal, anchor?: string): Promise<{ workspace: string; branch: string; baseCommit: string }> {
+  if (anchor) ensureHostDirectory(anchor, root, 0o750);
+  else ensureDefaultTeamRoot(root, true);
+  const canonicalRoot = realpathSync(root);
+  const directory = join(canonicalRoot, directoryName);
+  if (existsSync(directory)) throw new TeamError(409, "workspace-exists", "This team workspace already exists and needs explicit reconciliation.");
+  mkdirSync(directory, { mode: 0o700 });
+  const members = join(directory, "members");
+  mkdirSync(members, { mode: 0o700 });
+  chmodDirectoryNoFollow(members, 0o2770);
+  chmodDirectoryNoFollow(directory, 0o2770);
+  const workspace = join(directory, "integration");
+  await git(directory, ["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", mirror, workspace], prefix, 120000, signal);
+  await git(workspace, ["remote", "remove", "origin"], prefix, 30000, signal);
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(head) || (await git(workspace, ["cat-file", "-t", head], prefix, 30000, signal)) !== "commit")
+    throw new TeamError(409, "source-unavailable", "The host has no copy of this repository from GitHub yet; check the project's source status.");
+  await git(workspace, ["checkout", "-b", branch, head], prefix, 30000, signal);
+  return { workspace, branch, baseCommit: head };
+}
 export async function prepareMemberWorkspace(workspace: string, memberId: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {
   const parent = join(workspace, "..", "members");
   let info;

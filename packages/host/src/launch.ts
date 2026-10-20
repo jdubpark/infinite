@@ -151,6 +151,35 @@ export function permissionCoordinatorLaunch(provider: Provider, profile: AgentPr
   return { ...profile, args: merged };
 }
 
+/** Keep a mission coordinator read-only while retaining only its structured report channel. */
+export function missionCoordinatorLaunch(provider: Provider, profile: AgentProfile): AgentProfile {
+  if (provider === "claude") {
+    // Like the permission coordinator: dontAsk denies anything not listed, so the coordinator can read and report only.
+    const args: string[] = [];
+    const valueFlags = new Set(["--permission-mode", "--settings", "--agents", "--plugin-dir", "--permission-prompt-tool"]);
+    // Variadic flags lose every value, so no stray value can become the positional prompt.
+    const listFlags = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools", "--mcp-config"]);
+    for (let index = 0; index < profile.args.length; index++) {
+      const arg = profile.args[index], flag = arg.split("=")[0];
+      if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"].includes(flag))
+        throw new Error(`Mission coordinator profile cannot configure ${flag}.`);
+      if (valueFlags.has(flag)) { if (!arg.includes("=")) index++; continue; }
+      if (listFlags.has(flag)) {
+        if (!arg.includes("=")) while (index + 1 < profile.args.length && !profile.args[index + 1].startsWith("-")) index++;
+        continue;
+      }
+      args.push(arg);
+    }
+    // A flag follows the variadic tool list so it cannot absorb a later positional prompt.
+    args.push("--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
+      "--allowedTools", "Read", "Glob", "Grep", "mcp__infinite_team__mission_report", "--strict-mcp-config", "--disable-slash-commands");
+    return { ...profile, args };
+  }
+  // Codex merges inherited MCP server tables, so a coordinator could keep write-capable tools
+  // outside its read-only sandbox. Codex coordinators wait until that can be enforced.
+  throw new Error("Mission coordinators require Claude Code.");
+}
+
 const CLAUDE_EVENTS = [
   "UserPromptSubmit",
   "PreToolUse",
@@ -211,6 +240,7 @@ export function buildLaunch(
         INFINITE_HOOK_URL: "${INFINITE_HOOK_URL}",
         INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}",
         INFINITE_TEAM_ASSIGNMENT: "${INFINITE_TEAM_ASSIGNMENT}",
+        INFINITE_MISSION_ASSIGNMENT: "${INFINITE_MISSION_ASSIGNMENT:-}",
       },
     } } }));
   }
@@ -221,8 +251,9 @@ export function buildLaunch(
     for (const [key, value] of Object.entries({
       command: process.execPath,
       args: serverArgs,
-      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT"],
+      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT"],
       "tools.report.approval_mode": "approve",
+      "tools.mission_report.approval_mode": "approve",
     })) args.push("-c", `mcp_servers.infinite_team.${key}=${JSON.stringify(value)}`);
   }
   // Dev runs the relay from TypeScript through tsx; builds run the compiled file. The tsx

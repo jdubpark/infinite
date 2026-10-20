@@ -202,7 +202,7 @@ export class TeamService {
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
-  statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal, goal: Boolean(stored.run.goal) })); }
+  statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal), mission: Boolean(stored.run.missionId) })); }
   get(id: string): TeamView { return this.view(this.record(id)); }
   rateTask(id: string, taskId: string, input: { requestId: string; score: number; note?: string }) {
     const stored = this.record(id), task = stored.run.tasks.find(item => item.id === taskId);
@@ -245,6 +245,12 @@ export class TeamService {
   createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup, linearTracking = false): Promise<TeamView> {
     return this.createRun(createTeamSchema.parse(request), { goal: teamGoalContextSchema.parse(goal), lineup: teamLineupSchema.parse(lineup) }, linearTracking);
   }
+  /** A mission subteam is an ordinary run of one repository under that repository's own policies; the mission pins its lineup. */
+  createForMission(request: CreateTeam, missionId: string, lineup: TeamLineup, options: { baseRunId?: string } = {}): Promise<TeamView> {
+    const parsed = createTeamSchema.parse(request);
+    const project = this.config.projects.find(item => item.id === parsed.projectId);
+    return this.createRun(parsed, { missionId, ...(options.baseRunId ? { baseRunId: options.baseRunId } : {}), lineup: teamLineupSchema.parse(lineup) }, Boolean(project?.linear));
+  }
   assertHandoffPolicy(policy: HandoffPolicy) {
     const project = this.config.projects.find(item => item.id === policy.projectId);
     if (!project || JSON.stringify(project.team) !== JSON.stringify(policy.project) || JSON.stringify(project.linear) !== JSON.stringify(policy.linear) || realpathSync(project.path) !== policy.path || this.config.teams?.workspaceDir !== policy.workspaceDir || JSON.stringify(this.config.teams?.commandPrefix) !== JSON.stringify(policy.commandPrefix))
@@ -262,7 +268,7 @@ export class TeamService {
     this.assertHandoffPolicy(policy);
     return this.createRun(parsed, { handoff, handoffPolicy: policy, lineup: policy.lineup }, Boolean(policy.linear));
   }
-  private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup }, linearTracking = false): Promise<TeamView> {
+  private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; missionId?: string; baseRunId?: string; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup }, linearTracking = false): Promise<TeamView> {
     return this.enqueue(async () => {
       // Preserve the fingerprints written before lineup selection existed.
       const { useConfiguredLineup, ...singleProviderRequest } = parsed;
@@ -294,9 +300,12 @@ export class TeamService {
       if (project.team.permissions && (!lineup || lineup.coordinator.tier !== "strong" ||
           lineup.coordinator.limitFallback !== undefined && lineupProfiles(lineup).find(profile => profile.id === lineup.coordinator.limitFallback)?.tier !== "strong"))
         throw new TeamError(409, "permission-lineup-required", "Delegated permissions require a strong coordinator and any configured coordinator fallback must also be strong.");
-      const parent = goal?.parentRunId ? this.record(goal.parentRunId).run : undefined;
-      if (parent && (parent.goal?.id !== goal!.id || parent.projectId !== parsed.projectId || !["ready-for-review", "merged"].includes(parent.status) || !parent.headCommit))
-        throw new TeamError(409, "invalid-goal-parent", "Continue only from a ready, recorded run of this goal and project.");
+      const parentId = goal?.parentRunId ?? internal?.baseRunId;
+      const parent = parentId ? this.record(parentId).run : undefined;
+      if (parent && (goal
+        ? parent.goal?.id !== goal.id || parent.projectId !== parsed.projectId || !["ready-for-review", "merged"].includes(parent.status) || !parent.headCommit
+        : parent.projectId !== parsed.projectId || parent.missionId !== internal?.missionId || !["ready-for-review", "merged", "no-change"].includes(parent.status) || !parent.headCommit))
+        throw new TeamError(409, goal ? "invalid-goal-parent" : "invalid-mission-base", goal ? "Continue only from a ready, recorded run of this goal and project." : "Continue only from a completed subtask in this mission and project with a recorded workspace head.");
       if (parent) this.assertRunPath(this.record(parent.id), parent.workspace);
       const source = { path: parent?.workspace ?? project.path, ...(parent ? { head: parent.headCommit!, ...(parent.status === "merged" ? { startCommit: parent.deliveryReceipt!.mergeCommit } : {}) } : internal?.handoff ? { head: internal.handoff.checkpointHead } : {}) };
       const parentRevision = parent?.revision;
@@ -307,7 +316,7 @@ export class TeamService {
       // The `infinite/team-` prefix keeps constrained launchers that allow only team branches working.
       const branch = `infinite/team-${slug}-${suffix}`;
       const root = project.teamworkDir ?? this.config.teams.workspaceDir;
-      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: structuredClone(project.team.permissions), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: structuredClone(project.team.permissions), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
           throw new TeamError(409, "delivery-lineup-required", "Automatic merge requires a configured strong coordinator and independent strong reviewer.");
@@ -327,8 +336,8 @@ export class TeamService {
       this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
       this.operation(stored, "prepare", async signal => this.startInProject(run.projectId, async () => {
         const assertParent = () => {
-          if (parent && (!["ready-for-review", "merged"].includes(parent.status) || parent.revision !== parentRevision || parent.headCommit !== source.head))
-            throw new TeamError(409, "parent-workspace-changed", "The previous goal run changed while its continuation was being prepared.");
+          if (parent && (!["ready-for-review", "merged", "no-change"].includes(parent.status) || parent.revision !== parentRevision || parent.headCommit !== source.head))
+            throw new TeamError(409, "parent-workspace-changed", "The predecessor run changed while its continuation was being prepared.");
         };
         assertParent();
         if (project.teamworkDir) assertTeamworkPath(this.config, root);
@@ -387,7 +396,7 @@ export class TeamService {
       return this.view(stored);
     });
   }
-  answer(id: string, decisionId: string, input: Mutation, authorizeNewAnswer?: () => void) {
+  answer(id: string, decisionId: string, input: Mutation, authorizeNewAnswer?: () => void, by: "owner" | "coordinator" = "owner") {
     const body = teamMutationSchema.parse(input);
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
@@ -399,8 +408,8 @@ export class TeamService {
       if (decision.answer) throw new TeamError(409, "decision-answered", "This decision already has an answer.");
       if (stored.halt || run.status === "paused") throw new TeamError(409, "team-paused", "Resume the team before answering its decision.");
       if (!this.mutation(stored, `answer:${decisionId}`, body)) return this.view(stored);
-      decision.answer = body.text; decision.answeredAt = timestamp();
-      this.event(stored, "A user decision was recorded. The requesting member will continue in a new attempt."); this.save(stored);
+      decision.answer = body.text; decision.answeredBy = by; decision.answeredAt = timestamp();
+      this.event(stored, by === "coordinator" ? "A mission coordinator decision was recorded. The requesting member will continue in a new attempt." : "A user decision was recorded. The requesting member will continue in a new attempt."); this.save(stored);
       return this.view(stored);
     });
   }
@@ -746,7 +755,8 @@ export class TeamService {
       for (const decision of run.decisions.filter(item => item.revision === run.revision && item.answer)) {
         const prior = run.members.find(member => member.memberId === decision.memberId)!;
         if (prior.status !== "waiting") continue;
-        const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, `${prior.prompt}\n\nUser answered: ${decision.answer}`, prior.modelProfile);
+        const answeredBy = decision.answeredBy === "coordinator" ? "Mission coordinator" : "User";
+        const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, `${prior.prompt}\n\n${answeredBy} answered: ${decision.answer}`, prior.modelProfile);
         // A limit substitution may have pinned a fallback profile on another provider.
         next.provider = next.modelProfile?.provider ?? prior.provider ?? run.provider;
         prior.status = "stopped"; run.members.push(next);
@@ -1127,7 +1137,7 @@ export class TeamService {
       // The prompt keeps its feedback and user answers. An unrecognized prompt is rebuilt with its answers.
       const configuredProject = this.config.projects.find(project => project.id === run.projectId)?.team;
       const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback, configuredProject),
-        ...run.decisions.filter(decision => decision.answer && run.members.some(prior => prior.memberId === decision.memberId && prior.role === member.role && prior.taskId === member.taskId && prior.revision === member.revision)).map(decision => `User answered: ${decision.answer}`)].join("\n\n");
+        ...run.decisions.filter(decision => decision.answer && run.members.some(prior => prior.memberId === decision.memberId && prior.role === member.role && prior.taskId === member.taskId && prior.revision === member.revision)).map(decision => `${decision.answeredBy === "coordinator" ? "Mission coordinator" : "User"} answered: ${decision.answer}`)].join("\n\n");
       const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, `${carried}\n\n${note}`, fallback);
       if (task) {
         (task.limitSwitches ??= []).push({ fromProfileId: from.id, toProfileId: fallback.id, reason: limit.message, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}), memberId: member.memberId, at: timestamp() });
@@ -1262,7 +1272,7 @@ export class TeamService {
         this.save(stored);
         // Carry the owner's answers to this revision's planning questions into the corrected plan.
         const answers = run.decisions.filter(decision => decision.answer && decision.revision === run.revision && run.members.some(prior => prior.memberId === decision.memberId && prior.role === "project-manager"))
-          .map(decision => `Earlier planning question: ${decision.question}\nUser answered: ${decision.answer}`);
+          .map(decision => `Earlier planning question: ${decision.question}\n${decision.answeredBy === "coordinator" ? "Mission coordinator" : "User"} answered: ${decision.answer}`);
         this.prepareMember(stored, "project-manager", undefined, [message, ...answers].join("\n\n"));
         return;
       }

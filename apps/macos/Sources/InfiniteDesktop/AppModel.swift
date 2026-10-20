@@ -83,12 +83,25 @@ struct TeamResumeFailure: Equatable {
     /// Team runs the host reports, ordered with the ones waiting on a person first.
     @Published var teams: [TeamRun] = []
     /// A selected team shows its dashboard in place of the session panes, which stay mounted.
-    @Published var selectedTeamID: String? { didSet { if selectedTeamID != nil { showingHome = false; showingCost = false } } }
+    @Published var selectedTeamID: String? { didSet { if selectedTeamID != nil { showingHome = false; showingCost = false; selectedMissionID = nil } } }
+    /// A selected mission shows its detail the same way; a mission and a team are never both open.
+    @Published var selectedMissionID: String? { didSet { if selectedMissionID != nil { showingHome = false; showingCost = false; selectedTeamID = nil; teamOpenedFrom = nil } } }
+    /// The mission whose subtask opened the current team page, so that page can lead back to it.
+    @Published var teamOpenedFrom: String?
     /// Home, the project board, covers the session panes the same way; it is the first page after connecting.
     @Published var showingHome = true { didSet { if showingHome { showingCost = false } } }
-    /// The cost view covers the panes like Home; one of Home, Cost, or a team shows at a time.
-    @Published var showingCost = false { didSet { if showingCost { showingHome = false; selectedTeamID = nil } } }
+    /// The cost view covers the panes like Home; one of Home, Cost, a mission, or a team shows at a time.
+    @Published var showingCost = false { didSet { if showingCost { showingHome = false; selectedTeamID = nil; selectedMissionID = nil } } }
     private(set) var cost: CostModel?
+    /// The project Home's board is narrowed to; nil shows every project.
+    @Published var projectFilter: String?
+    @Published private(set) var projectGroups = ProjectGroupList.empty
+    @Published private(set) var board = Board.empty
+    /// The last board poll succeeded; otherwise Home says why its rows may be old.
+    @Published private(set) var boardFresh = false
+    @Published private(set) var boardError = ""
+    @Published var pendingMissionCreation = DraftRecord()
+    var missionModels: [String: MissionModel] = [:]
     @Published var showingCreateTeam = false
     @Published var pendingTeamCreation = DraftRecord()
     @Published private(set) var teamsFresh = false
@@ -174,7 +187,8 @@ struct TeamResumeFailure: Equatable {
         let previousTerminals = Array(terminals.values); terminals.removeAll()
         let previousClient = client; client = nil
         connected = false; connecting = true; sessions = []; resources = .null; me = .null
-        teams = []; selectedTeamID = nil; showingHome = true; teamModels.removeAll(); teamsFresh = false; cost = nil
+        teams = []; selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil; projectFilter = nil; showingHome = true; teamModels.removeAll(); teamsFresh = false
+        projectGroups = .empty; board = .empty; boardFresh = false; boardError = ""; missionModels.removeAll(); cost = nil
         sessionsLoaded = false; teamsLoaded = false
         sessionFreshness.recovered(); teamFreshness.recovered()
         for terminal in previousTerminals { await terminal.detach() }
@@ -189,6 +203,7 @@ struct TeamResumeFailure: Equatable {
             me = identity
             pendingCreation = try drafts.read("\(profile.id):create")
             pendingTeamCreation = try drafts.read("\(profile.id):create-team")
+            pendingMissionCreation = try drafts.read("\(profile.id):create-mission")
             connected = true; connecting = false; persistProfiles()
             connectionError = ""
             pollTask = Task {
@@ -229,6 +244,7 @@ struct TeamResumeFailure: Equatable {
             }
             if selectedID == nil { selectedID = (sessions.first { $0.running } ?? sessions.first)?.id }
             if teamsEnabled || !teams.isEmpty { await refreshTeams(generation) }
+            await refreshBoard(generation)
             if includeResources {
                 do { let sample = try await client.request("/machine/resources"); if generation == connectionGeneration { resources = sample } }
                 catch {
@@ -265,6 +281,66 @@ struct TeamResumeFailure: Equatable {
             teamFreshness.failed()
         }
     }
+    /// Projects and the board arrive whole each poll; only a real change redraws.
+    private func refreshBoard(_ generation: UUID) async {
+        guard let client else { return }
+        do {
+            let groups = ProjectGroupList(try await client.request("/project-groups"))
+            let next = Board(try await client.request("/board"))
+            guard generation == connectionGeneration else { return }
+            if groups != projectGroups { projectGroups = groups }
+            if next != board { board = next }
+            if let filter = projectFilter, groups.group(filter) == nil { projectFilter = nil }
+            if !boardFresh { boardFresh = true }
+            if !boardError.isEmpty { boardError = "" }
+        } catch {
+            guard generation == connectionGeneration else { return }
+            if boardFresh { boardFresh = false }
+            let text = (error as? DesktopError)?.status == 404 ? "This server has no project board yet. Update the host to use projects and missions." : error.localizedDescription
+            if text != boardError { boardError = text }
+        }
+    }
+    /// Home for every project, or narrowed to one.
+    func showHome(project: String? = nil) {
+        selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil
+        projectFilter = project; showingHome = true
+    }
+    /// A team page, remembering the mission it was opened from.
+    func openTeam(_ id: String, from mission: String? = nil) { selectedTeamID = id; teamOpenedFrom = mission }
+    func missionModel(for id: String) -> MissionModel? {
+        if let existing = missionModels[id] { return existing }
+        guard let client else { return nil }
+        // Until its first poll, the mission shows what its board row reported.
+        let row = board.items.first { $0.id == id }
+        let model = MissionModel(mission: Mission(.object(["id": .string(id), "title": .string(row?.title ?? ""), "status": .string(row?.status ?? ""), "groupName": .string(row?.projectName ?? "")])),
+                                 client: client, role: me["role"].string)
+        missionModels[id] = model; return model
+    }
+    /// Missions start from the owner's sentence in one project. Retrying resends the identical body,
+    /// so the host either recovers its recorded outcome or applies it once.
+    func createMission(groupID: String, objective: String) async throws {
+        guard let client else { throw DesktopError("Connect to a server first.") }
+        let profileID = activeID
+        if pendingMissionCreation.pendingID == nil {
+            let requestID = UUID().uuidString.lowercased()
+            let body: JSON = .object(["requestId": .string(requestID), "groupId": .string(groupID), "objective": .string(objective.trimmingCharacters(in: .whitespacesAndNewlines))])
+            var record = DraftRecord(); record.pendingID = requestID
+            record.pendingText = String(decoding: try body.data(), as: UTF8.self)
+            try drafts.save(record, identity: "\(profileID):create-mission"); pendingMissionCreation = record
+        }
+        guard let payload = pendingMissionCreation.pendingText else { throw DesktopError("Review the pending mission request before starting another.") }
+        let result = try await client.request("/missions", body: JSON.parse(Data(payload.utf8)))
+        try drafts.save(DraftRecord(), identity: "\(profileID):create-mission")
+        guard profileID == activeID else { return }
+        pendingMissionCreation = DraftRecord()
+        await refresh()
+        let id = result["id"].string.isEmpty ? result["mission"]["id"].string : result["id"].string
+        if !id.isEmpty { selectedMissionID = id }
+    }
+    func clearMissionCreation() {
+        do { try drafts.save(DraftRecord(), identity: "\(activeID):create-mission"); pendingMissionCreation = DraftRecord() }
+        catch { message = error.localizedDescription }
+    }
     /// Resume from the Home list: the same request as the team page, with its failure kept for the row.
     func resumeTeam(_ id: String) async {
         guard !resumingTeams.contains(id), let model = teamModel(for: id) else { return }
@@ -281,12 +357,14 @@ struct TeamResumeFailure: Equatable {
     func clearTeamResumeFailure(_ id: String) { teamResumeFailures[id] = nil }
     func teamModel(for id: String) -> TeamModel? {
         if let existing = teamModels[id] { return existing }
-        guard let team = teams.first(where: { $0.id == id }), let client else { return nil }
+        guard let client else { return nil }
+        // A subteam the team list has not reported yet starts from its ID; its first poll fills it in.
+        let team = teams.first { $0.id == id } ?? TeamRun(.object(["id": .string(id)]))
         let model = TeamModel(run: team, client: client, role: me["role"].string)
         teamModels[id] = model; return model
     }
     /// Leaving a team for one of its member sessions.
-    func openSession(_ id: String) { selectedTeamID = nil; showingHome = false; showingCost = false; selectedID = id }
+    func openSession(_ id: String) { selectedTeamID = nil; selectedMissionID = nil; showingHome = false; showingCost = false; selectedID = id }
     func createTeam(projectID: String, provider: String, useLineup: Bool, title: String, objective: String, parallelism: Int) async throws {
         guard let client else { throw DesktopError("Connect to a server first.") }
         let profileID = activeID
@@ -337,7 +415,7 @@ struct TeamResumeFailure: Equatable {
         try drafts.save(DraftRecord(), identity: "\(profileID):create")
         guard profileID == activeID else { return }
         pendingCreation = DraftRecord()
-        await refresh(); selectedID = result["id"].string.isEmpty ? result["session"]["id"].string : result["id"].string
+        await refresh(); openSession(result["id"].string.isEmpty ? result["session"]["id"].string : result["id"].string)
         showingCreate = false
     }
     func clearCreation() {

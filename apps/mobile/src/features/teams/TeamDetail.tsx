@@ -305,7 +305,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
         </Section>
         {team.steering.length || answered.length ? <Section title="Your directions and decisions" count={team.steering.length + answered.length}>
           {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>Direction · rev {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
-          {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · rev {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>You: {decision.answer}</Text></View>)}
+          {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · rev {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>{decision.answeredBy === "coordinator" ? "Mission coordinator" : "You"}: {decision.answer}</Text></View>)}
         </Section> : null}
         {team.events.length ? <Section title="History" count={team.events.length}>
           {[...team.events].reverse().slice(0, 6).map((event, index) => <HistoryRow key={`${event.at}/${index}`} at={event.at} day={team.updatedAt} text={event.text} />)}

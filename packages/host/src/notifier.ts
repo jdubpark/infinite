@@ -3,7 +3,7 @@ import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 
 type Row = { id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } } };
-type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean };
+type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean };
 type GoalRow = { id: string; title: string; status: string; reason?: string };
 type Lifecycle = { id: string; title: string; status: string; reason?: string; resumable?: boolean; kind: "goal" | "team"; event: string; titleText: string; body: string; priority: "default" | "high" };
 const PUSH_STATES = new Set(["needs-you", "turn-finished", "exited", "recording-error"]);
@@ -83,9 +83,9 @@ export class Notifier {
     if (!this.teams) return [];
     let teams: TeamRow[];
     try { teams = this.teams.statuses(); } catch { return []; }
-    const due = this.lifecycle("team", teams.filter(team => !team.goal), this.teamStatus, this.teamsPrimed, TEAM_EVENTS, "Team started");
+    const due = this.lifecycle("team", teams.filter(team => !team.goal && !team.mission), this.teamStatus, this.teamsPrimed, TEAM_EVENTS, "Team started");
     // Goal-owned runs still record their status so they never announce as new later.
-    for (const team of teams) if (team.goal) this.teamStatus.set(team.id, team.status);
+    for (const team of teams) if (team.goal || team.mission) this.teamStatus.set(team.id, team.status);
     this.teamsPrimed = true;
     return due;
   }

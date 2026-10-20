@@ -19,6 +19,8 @@ import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWork
 import { readSyncState, startSyncService, stopSyncService, syncServiceRunning } from "./sync-service.js";
 import { localProjectPath } from "./mirrored-projects.js";
 import { boundTeamProject, forgetBoundTeamProject, handleTeamClientCommand } from "./team-cli.js";
+import { handleBoardClientCommand } from "./board-cli.js";
+import type { ProjectGroupList } from "./project-group-types.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
@@ -460,7 +462,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "list", "usage", "resources", "close", "sync", "pull", "team", "repo"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "list", "usage", "resources", "close", "sync", "pull", "team", "repo"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
@@ -555,6 +557,45 @@ function describeSync(sync: ProjectDetail["sync"]) {
   const pending = sync.pendingGeneration ? ` · pending (${describePending(sync.pendingGeneration)})` : "";
   const skipped = sync.skipped ? ` · ${sync.skipped} special file${sync.skipped === 1 ? "" : "s"} left out of the cloud scan` : "";
   return `synced ${age(sync.lastSyncedAt)} · applied ${age(sync.appliedAt)}${pending}${skipped}`;
+}
+async function listLegacyProjects(projects: Me["projects"], api: { json<T>(path: string): Promise<T> }) {
+  for (const project of projects) {
+    const detail = await api.json<ProjectDetail>(`/projects/${project.id}`).catch(() => undefined);
+    console.log(`${project.id}  ${clean(project.name)}${detail ? `  · ${describeSync(detail.sync)}` : ""}`);
+  }
+}
+function shellQuote(value: string) { return `'${value.replaceAll("'", "'\\''")}'`; }
+async function listProjects(groups: ProjectGroupList, api: { json<T>(path: string): Promise<T> }, json: boolean) {
+  if (json) {
+    console.log(JSON.stringify(groups, null, 2));
+    return;
+  }
+  for (const group of groups.groups) {
+    console.log(`${group.id}  ${clean(group.name)}${group.implicit ? "  (single-repo)" : ""}`);
+    for (const repo of group.repos) {
+      const detail = await api.json<ProjectDetail>(`/projects/${repo.projectId}`).catch(() => undefined);
+      console.log(`  ${repo.projectId}  ${clean(repo.name)}${detail ? `  · ${describeSync(detail.sync)}` : ""}`);
+    }
+  }
+  if (groups.suggestions.length) {
+    console.log("\nSuggested groups (accept with the command shown):");
+    for (const suggestion of groups.suggestions) {
+      const command = ["infinite projects group", shellQuote(suggestion.name), ...suggestion.repos.map(shellQuote)].join(" ");
+      console.log(`${suggestion.name}  (${suggestion.reason})\n  ${command}`);
+    }
+  }
+  if (!groups.groups.length && !groups.suggestions.length) console.log("No projects are enrolled.");
+}
+async function showProjects(me: Me, api: { json<T>(path: string): Promise<T> }, json: boolean) {
+  let groups: ProjectGroupList;
+  try {
+    groups = await api.json<ProjectGroupList>("/project-groups");
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.status !== 404) throw error;
+    await listLegacyProjects(me.projects, api);
+    return;
+  }
+  await listProjects(groups, api, json);
 }
 
 /** One line per provider. Period words come from each provider's own window, never a fixed "month". */
@@ -701,6 +742,10 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       return true;
     }
     if (command === "projects") {
+      if (positional[0] !== "forget") {
+        if (!positional.length) { await showProjects(me, api, Boolean(options["--json"])); return true; }
+        return await handleBoardClientCommand(command, positional, options, config, api, path);
+      }
       if (positional[0] === "forget") {
         if (me.capabilities?.mirrorForget !== 1) throw new Error("Upgrade the host before forgetting a mirrored project.");
         if (positional.length > 2) throw new Error("Usage: infinite projects forget [DIRECTORY] [--project ID]");
@@ -723,11 +768,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         console.log(`Forgot mirrored project ${clean(retained.id)} (${clean(retained.name)}). Server directory retained at ${clean(retained.path)}; cloud files were kept.`);
         return true;
       }
-      for (const p of me.projects) {
-        const detail = await api.json<ProjectDetail>(`/projects/${p.id}`).catch(() => undefined);
-        console.log(`${p.id}  ${clean(p.name)}${detail ? `  · ${describeSync(detail.sync)}` : ""}`);
-      }
-      return true;
+    }
+    if (["start", "mission", "board"].includes(command)) {
+      return await handleBoardClientCommand(command as "start" | "mission" | "board", positional, options, config, api, path);
     }
     if (command === "recover") {
       if (me.role !== "owner") throw new Error("Workspace recovery requires an owner device key");

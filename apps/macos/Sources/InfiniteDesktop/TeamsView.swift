@@ -12,26 +12,7 @@ func teamColor(_ team: TeamRun) -> Color {
     }
 }
 private let teamClock: DateFormatter = { let f = DateFormatter(); f.dateStyle = .short; f.timeStyle = .short; return f }()
-private func teamDate(_ value: String) -> String { ISO8601DateFormatter.flexible.date(from: value).map(teamClock.string(from:)) ?? value }
-
-/// A sidebar row: the run's status glyph and name; its state in words is in the tooltip and on Home.
-struct TeamRowView: View {
-    let team: TeamRun
-    var body: some View {
-        HStack(spacing: 9) {
-            StatusGlyph(team: team, size: 12)
-            Text(team.title).lineLimit(1).foregroundStyle(team.projectState.closed ? .secondary : .primary)
-            Spacer(minLength: 4)
-            if team.projectState == .pending || team.projectState == .stuck {
-                Text(team.projectState == .stuck ? "Stuck" : team.status == "ready-for-review" ? "Review" : "Needs you")
-                    .font(.caption).foregroundStyle(team.projectState == .stuck ? Palette.error : Palette.attention)
-            }
-        }
-        .padding(.vertical, 1)
-        .help(team.summaryLine)
-        .accessibilityLabel("\(team.title), \(team.summaryLine)")
-    }
-}
+func teamDate(_ value: String) -> String { ISO8601DateFormatter.flexible.date(from: value).map(teamClock.string(from:)) ?? value }
 
 /// Everything a person needs to follow and steer one run: open decisions, member sessions that
 /// need them, the work plan, the host's check and review evidence, and a direction composer.
@@ -87,6 +68,10 @@ struct TeamDetailView: View {
 
     private var header: some View {
         HStack(spacing: 10) {
+            if let mission = app.teamOpenedFrom {
+                Button { app.selectedMissionID = mission } label: { Image(systemName: "chevron.left") }
+                    .buttonStyle(.borderless).help("Back to the mission").accessibilityLabel("Back to the mission")
+            }
             StatusGlyph(team: team, size: 16)
             VStack(alignment: .leading, spacing: 2) {
                 Text(team.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
@@ -173,9 +158,12 @@ struct TeamDetailView: View {
         let open = team.openDecisions
         if !open.isEmpty {
             section("Decisions for you", count: open.count) {
-                ForEach(Array(open.enumerated()), id: \.offset) { _, decision in
-                    DecisionCard(decision: decision, asker: team.member(decision["memberId"].string).map { TeamRun.roleName($0["role"].string) } ?? "Team",
+                // Keyed by decision ID so a typed draft never moves to another question after a poll.
+                ForEach(open, id: \.["id"].string) { decision in
+                    let asker = team.member(decision["memberId"].string).map { TeamRun.roleName($0["role"].string) } ?? "Team"
+                    DecisionCard(decision: decision, caption: "\(asker) · revision \(decision["revision"].int) · \(teamDate(decision["createdAt"].string))",
                                  disabled: !model.canSteer || team.status == "paused") { text in Task { await model.answer(decision, text: text) } }
+                        .id(decision["id"].string)
                 }
             }
         }
@@ -291,7 +279,7 @@ struct TeamDetailView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Decision · revision \(decision["revision"].int)").font(.caption).foregroundStyle(.secondary)
                         Text(decision["question"].string).font(.callout).fixedSize(horizontal: false, vertical: true)
-                        Text("Your answer: \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        Text("\(decision["answeredBy"].string == "coordinator" ? "Mission coordinator" : "Your answer"): \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -355,10 +343,11 @@ struct TeamDetailView: View {
     }
 }
 
-/// A question a member asked, answered by its options or in words.
+/// A question a member or a mission coordinator asked, answered by its options or in words.
 struct DecisionCard: View {
     let decision: JSON
-    let asker: String
+    /// Who asked and when, above the question.
+    let caption: String
     let disabled: Bool
     let answer: (String) -> Void
     @State private var text = ""
@@ -366,7 +355,7 @@ struct DecisionCard: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: "questionmark.bubble").foregroundStyle(.orange)
-                Text("\(asker) · revision \(decision["revision"].int) · \(teamDate(decision["createdAt"].string))").font(.caption).foregroundStyle(.secondary)
+                Text(caption).font(.caption).foregroundStyle(.secondary)
             }
             Text(decision["question"].string).font(.system(size: 13, weight: .medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             let options = decision["options"].array.map(\.string)

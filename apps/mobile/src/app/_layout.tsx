@@ -19,7 +19,11 @@ export default function Layout() {
           headerShown: false,
           contentStyle: { backgroundColor: theme.colors.paper },
         }}
-      />
+      >
+        <Stack.Screen name="index" />
+        <Stack.Screen name="(tabs)" />
+        <Stack.Screen name="mission/[id]" />
+      </Stack>
     </SafeAreaProvider>
   );
 }

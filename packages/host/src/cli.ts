@@ -236,6 +236,11 @@ infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--
                                           First enrollment delegates to coordinator by default
 infinite repo init --permissions off        Disable delegation for future runs
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
+infinite projects [--json]                 List projects and suggested groups
+infinite projects group NAME REPO_ID...    Create a multi-repository project
+infinite start [--project ID] "task"       Start a mission
+infinite mission status|answer|steer|pause|resume|cancel ...
+infinite board [--project ID]              Watch the owner board
 infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
 infinite team status [ID] [--logs]          Show teams, or one team's Jevcode summary
 infinite team watch ID [--logs]             Follow the summary; l logs, n/p agents, b summary

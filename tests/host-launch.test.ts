@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync,
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
-import { buildLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
+import { buildLaunch, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
 import { claudeConfigPath, recordClaudeTrust } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -100,6 +100,7 @@ test("Claude team launch exposes only its scoped report helper and preserves pro
       INFINITE_HOOK_URL: "${INFINITE_HOOK_URL}",
       INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}",
       INFINITE_TEAM_ASSIGNMENT: "${INFINITE_TEAM_ASSIGNMENT}",
+      INFINITE_MISSION_ASSIGNMENT: "${INFINITE_MISSION_ASSIGNMENT:-}",
     });
     assert.ok(!launch.args.some(arg => /allowedtools|permission-mode|skip-permissions|dangerously|autoallow/i.test(arg)), "Attaching the report tool must not grant provider permissions");
     assert.equal(launch.args.at(-1), "Implement this task");
@@ -152,6 +153,29 @@ test("permission coordinator rejects conflicting Claude permission and tool sett
   assert.throws(() => permissionCoordinatorLaunch("codex", { command: "codex", args: [] }), /Claude Code/);
 });
 
+test("mission coordinators can only read repositories and report, and only on Claude Code", () => {
+  const claude = missionCoordinatorLaunch("claude", { command: "claude", args: ["--model", "opus"] });
+  assert.ok(claude.args.includes("--permission-mode") && claude.args[claude.args.indexOf("--permission-mode") + 1] === "dontAsk");
+  assert.ok(claude.args.includes("--tools") && claude.args[claude.args.indexOf("--tools") + 1] === "Read,Glob,Grep");
+  const allowed = claude.args.indexOf("--allowedTools");
+  assert.deepEqual(claude.args.slice(allowed + 1, allowed + 5), ["Read", "Glob", "Grep", "mcp__infinite_team__mission_report"]);
+  assert.ok(claude.args.includes("--strict-mcp-config"));
+  const wrapped = missionCoordinatorLaunch("claude", { command: "/usr/bin/sudo", args: ["-n", "-u", "agent", "--", "/usr/local/libexec/infinite/claude", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Edit"] });
+  assert.ok(!wrapped.args.includes("acceptEdits") && !wrapped.args.includes("Bash") && !wrapped.args.includes("Edit"));
+  assert.throws(() => missionCoordinatorLaunch("claude", { command: "claude", args: ["--dangerously-skip-permissions"] }), /cannot configure/);
+  assert.ok(!claude.args.some(arg => /dangerously-skip|permission-mode.*acceptEdits|mcp__infinite_team__report/.test(arg)));
+
+  // A stray value from a variadic flag must not become the positional prompt.
+  const variadic = missionCoordinatorLaunch("claude", { command: "claude", args: ["--tools", "Read", "Bash", "--mcp-config", "a.json", "b.json", "--model", "opus"] });
+  assert.ok(!variadic.args.includes("Bash") && !variadic.args.includes("a.json") && !variadic.args.includes("b.json") && variadic.args.includes("opus"));
+  // Codex merges inherited MCP servers, so it cannot yet be held to reading and reporting.
+  assert.throws(() => missionCoordinatorLaunch("codex", { command: "codex", args: [] }), /require Claude Code/);
+
+  const launch = buildLaunch("claude", claude, "Report the mission", hooks, relay, enabled, true);
+  assert.ok(launch.args.at(-1) === "Report the mission");
+  assert.ok(launch.args.includes("mcp__infinite_team__mission_report"));
+});
+
 test("codex gets -c hook overrides, notify, osc notifications and trust bypass", () => {
   const launch = buildLaunch("codex", { command: "codex", args: [] }, "do it", hooks, relay, enabled);
   const joined = launch.args.join(" ");
@@ -188,7 +212,7 @@ test("Codex team launch configures its authenticated MCP report tool and require
         settings.set(override.slice(0, equals), JSON.parse(override.slice(equals + 1)));
       }
     }
-    assert.equal(settings.size, 4);
+    assert.equal(settings.size, 5);
     assert.equal(settings.get("command"), process.execPath);
     const serverArgs = settings.get("args") as string[];
     assert.equal(serverArgs.at(-1), relayPath.replace("hook-relay", "team-mcp"));
@@ -196,8 +220,10 @@ test("Codex team launch configures its authenticated MCP report tool and require
       assert.equal(serverArgs[0], "--import");
       assert.match(serverArgs[1], /^file:\/\/\/.+\/tsx\//);
     }
-    assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT"]);
+    // A mission coordinator's assignment reaches the host-side MCP server, which reports over loopback for the sandboxed agent.
+    assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT"]);
     assert.equal(settings.get("tools.report.approval_mode"), "approve");
+    assert.equal(settings.get("tools.mission_report.approval_mode"), "approve");
     assert.ok(launch.args.includes("--sandbox") && launch.args.includes("workspace-write"));
     assert.ok(launch.args.includes("sandbox_workspace_write.network_access=false"));
     assert.ok(launch.args.includes("on-request"));

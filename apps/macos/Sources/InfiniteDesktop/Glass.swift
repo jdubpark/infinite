@@ -77,6 +77,20 @@ struct StatusGlyph: View {
         case .aborted: kind = .stopped
         }
     }
+    /// A board row by its column; a working mission's ring fills with its finished subtasks.
+    init(item: BoardItem, size: CGFloat = 14) { self.init(Self.board(item.column, item.status, item.progressFraction), size: size) }
+    init(mission: Mission, size: CGFloat = 14) {
+        let (done, total) = mission.progress
+        self.init(Self.board(mission.column, mission.status, total > 0 ? max(0.25, Double(done) / Double(total)) : 0.25), size: size)
+    }
+    private static func board(_ column: BoardColumn, _ status: String, _ fraction: Double) -> Kind {
+        switch column {
+        case .needsInput: return status == "blocked" ? .blocked : .attention
+        case .working: return status == "paused" ? .paused : .progress(fraction)
+        case .review: return .review
+        case .ended: return ["merged", "achieved"].contains(status) ? .done : status == "cancelled" ? .cancelled : .stopped
+        }
+    }
     init(session: AgentSession, size: CGFloat = 14) {
         self.size = size
         if session.recordingError { kind = .error }

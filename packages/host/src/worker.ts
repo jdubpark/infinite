@@ -39,6 +39,7 @@ import { Journal, writeSealed } from "./vault.js";
 import { socketPath } from "./ipc.js";
 import { startHookServer, HookPayloadError, type HookReply, type HookRoute } from "./hooks.js";
 import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
+import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
 import { buildLaunch } from "./launch.js";
@@ -347,7 +348,7 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void
   }
   if (route === "team-report") {
     const parsed = teamReportEnvelopeSchema.safeParse(body);
-    if (!parsed.success || !session.team) throw new HookPayloadError(400);
+    if (!parsed.success || !session.team || session.team.role === "mission-coordinator") throw new HookPayloadError(400);
     const report = parsed.data;
     if (report.runId !== session.team.runId || report.memberId !== session.team.memberId || report.revision !== session.team.revision)
       throw new HookPayloadError(403);
@@ -360,6 +361,23 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void
     if (session.team.role === "project-manager" && report.report.kind === "plan" && report.report.verification && session.team.verificationRefused)
       throw new HookPayloadError(409, "Plan rejected: this run uses the project's configured checks. Remove verification and submit a corrected plan. If the checks seem insufficient, explain that in the summary and assign tasks to run additional commands themselves and report results.");
     append("team-report", report);
+    teamReportReceipt = { requestId: report.requestId, digest };
+    return;
+  }
+  if (route === "mission-report") {
+    // A mission coordinator's assignment records the mission ID as its run ID.
+    const parsed = missionReportEnvelopeSchema.safeParse(body);
+    if (!parsed.success || session.team?.role !== "mission-coordinator") throw new HookPayloadError(400);
+    const report = parsed.data;
+    if (report.missionId !== session.team.runId || report.memberId !== session.team.memberId || report.revision !== session.team.revision)
+      throw new HookPayloadError(403);
+    const digest = createHash("sha256").update(JSON.stringify(report)).digest("hex");
+    if (teamReportReceipt) {
+      if (teamReportReceipt.requestId !== report.requestId || teamReportReceipt.digest !== digest) throw new HookPayloadError(409);
+      return;
+    }
+    if (state.status !== "running") throw new HookPayloadError(409);
+    append("mission-report", report);
     teamReportReceipt = { requestId: report.requestId, digest };
     return;
   }
@@ -1251,6 +1269,8 @@ server.listen(socketPath(runDir, session.id), async () => {
       // The verification flag is host policy; the agent's binding stays the stable assignment identity.
       const { verificationRefused: _refused, ...binding } = session.team;
       env.INFINITE_TEAM_ASSIGNMENT = JSON.stringify(binding);
+      if (session.team.role === "mission-coordinator")
+        env.INFINITE_MISSION_ASSIGNMENT = JSON.stringify({ missionId: session.team.runId, memberId: session.team.memberId, revision: session.team.revision });
       if (session.workspaceTrusted) {
         // A sudo profile's wrapper records Claude trust in the agent account; a provider in
         // this account reads this account's config, so the worker records it here.

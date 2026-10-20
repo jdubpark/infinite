@@ -408,6 +408,15 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     assert.equal(runner.requests.length, 1);
     assert.deepEqual(await client.request("/projects/project"), { count: 2, method: "GET", path: "/api/projects/project" });
     assert.deepEqual(await client.request("/projects/project/sync/apply", { body: {} }), { count: 3, method: "POST", path: "/api/projects/project/sync/apply" });
+    const missionId = randomUUID(), decisionId = randomUUID();
+    assert.deepEqual(await client.request("/board"), { count: 4, method: "GET", path: "/api/board" });
+    assert.deepEqual(await client.request("/project-groups"), { count: 5, method: "GET", path: "/api/project-groups" });
+    assert.deepEqual(await client.request("/missions", { body: {} }), { count: 6, method: "POST", path: "/api/missions" });
+    assert.deepEqual(await client.request(`/missions/${missionId}`), { count: 7, method: "GET", path: `/api/missions/${missionId}` });
+    assert.deepEqual(await client.request(`/missions/${missionId}/answer/${decisionId}`, { body: {} }), { count: 8, method: "POST", path: `/api/missions/${missionId}/answer/${decisionId}` });
+    assert.deepEqual(await client.request("/project-groups/shop", { method: "DELETE", body: {} }), { count: 9, method: "DELETE", path: "/api/project-groups/shop" });
+    for (const [method, path] of [["POST", `/missions/${missionId}/answer/not-a-uuid`], ["GET", `/missions/${missionId}/steer`], ["GET", "/project-groups/shop"], ["PUT", "/project-groups/Shop"]] as const)
+      await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
     runner.oversized();
     await assert.rejects(client.request("/me"), (error: RemoteError) => error.status === 413 && error.code === "response-too-large");
     const beforeRevoke = runner.requests.length;

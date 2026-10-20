@@ -79,7 +79,7 @@ export interface Session {
 export interface Event {
   seq: number;
   at: string;
-  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "team-handoff" | "usage" | "message";
+  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "mission-report" | "team-handoff" | "usage" | "message";
   data: Record<string, unknown>;
 }
 export interface Project {

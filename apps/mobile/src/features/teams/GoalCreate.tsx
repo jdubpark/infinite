@@ -121,7 +121,7 @@ export function GoalCreate({ connection }: { connection: Connection }) {
         <Text style={t.note}>The host records these requested settings when the goal starts. Provider policy may override them.</Text>
         <LineupView lineup={me.teams.lineup} />
       </Disclosure> : null}
-      <Text style={t.note}>The team works in isolated copies and carries reviewed changes into later cycles. It does not publish or deploy. Provider permissions remain in force.</Text>
+      <Text style={t.note}>Review the team’s results. Delivery follows each repository’s policy. Provider permissions remain in force.</Text>
       {error || creation.message ? <Text accessibilityRole="alert" style={t.warning}>{error || creation.message}</Text> : null}
       <View style={s.section}><Button busy={busy} title={pending && (!busy || retrying) ? "Retry same request" : "Start goal"} disabled={busy || !allowed} onPress={() => void submit()} /></View>
     </ScrollView>

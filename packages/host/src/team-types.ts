@@ -213,10 +213,12 @@ export type TeamReport = z.infer<typeof teamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: teamReportSchema }).strict();
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
 export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
-export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string; verificationRefused?: true };
+/** A mission coordinator's assignment carries the mission ID as `runId`; it reports `MissionReport`s. */
+export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true };
 /** `merged` is set only from an explicit delivery report; it is not host verification. */
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export interface TeamMember extends TeamAssignment {
+  role: TeamRole;
   /** Absent on legacy runs; their members use the run's original provider. */
   provider?: Provider;
   modelProfile?: TeamModelProfile;
@@ -271,6 +273,7 @@ export interface TeamDecision {
   options: string[];
   createdAt: string;
   answer?: string;
+  answeredBy?: "owner" | "coordinator";
   answeredAt?: string;
 }
 export interface TeamCheck {
@@ -305,6 +308,8 @@ export interface TeamRun {
   /** Immutable model choices; current provider credentials and permissions are not copied here. */
   lineup?: TeamLineup;
   goal?: TeamGoalContext;
+  /** Set when a mission started this run as one of its subteams; the board shows it only inside that mission. */
+  missionId?: string;
   handoff?: import("./handoff-types.js").TeamHandoffContext;
   brief?: TeamBrief;
   discovery?: { revision: number; summary: string; tasks: TeamScout[]; completedAt?: string };

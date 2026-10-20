@@ -428,6 +428,7 @@ test("mixed teams pin real worker launches across configuration changes, restart
     const answer = { requestId: randomUUID(), revision: waiting.revision, text: "Compact" };
     assert.equal((await f.host.fetchApi(answerPath, "controller", answer)).status, 200);
     assert.equal((await f.host.fetchApi(answerPath, "controller", answer)).status, 200);
+    assert.equal((await f.get(waiting.id)).decisions.find(item => item.id === decision.id)?.answeredBy, "owner");
     const finished = await f.settled(waiting.id);
     assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
     assert.deepEqual(finished.lineup, mixedLineup);
@@ -467,7 +468,7 @@ test("mixed teams pin real worker launches across configuration changes, restart
           }
         }
         assert.equal(settings.get("command"), process.execPath);
-        assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT"]);
+        assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT"]);
         assert.equal(settings.get("tools.report.approval_mode"), "approve");
         assert.match(worker.prompt ?? "", /report tool of the infinite_team MCP server/);
       } else {

@@ -7,7 +7,7 @@ import {
   Text,
   View,
 } from "react-native";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "expo-router";
 import { PROVIDER_NAMES } from "@infinite/attention";
 import {
@@ -26,6 +26,7 @@ import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
 import { DictationNotice } from "../../dictation/DictationControls";
 import { useDictation } from "../../dictation/useDictation";
+import { MissionManagedLine } from "../board/MissionManagedLine";
 import { useControlSync, useSessionControl } from "./useSessionControl";
 import { KEYS, useSteering } from "./useSteering";
 
@@ -57,20 +58,28 @@ export function Terminal({
   );
   useControlSync(control, data, stale);
   const session = data?.session ?? null;
+  // A mission coordinator runs this session: the phone sends no text, keys, stop, resume or control to it.
+  const missionId = session?.managedBy?.missionId;
   const role = data?.me.role;
   const environment = data?.me.environment ?? "";
-  // Workers that enforce control take input only from the device holding the lease.
-  const requiresControl = session?.capabilities?.inputControl === 1;
+  // Workers that enforce control take input only from the device holding the lease; a managed session never grants one.
+  const requiresControl = !missionId && session?.capabilities?.inputControl === 1;
+  // A lease this phone still holds on a managed session is released, so the coordinator keeps control.
+  const { forget } = control;
+  useEffect(() => {
+    if (missionId) forget(true);
+  }, [forget, missionId]);
   // The person sees the screen here, so text may go into an open dialog.
   const steering = useSteering(connection, id, refresh, control, {
     force: true,
     draftKey: `${connectionKey(connection)}/${id}/terminal`,
     requiresControl,
+    managed: Boolean(missionId),
   });
   const running = session?.status === "running";
   const controlled = !requiresControl || control.lease !== null;
   const canSteer =
-    online && running && role !== undefined && role !== "viewer" && controlled;
+    online && running && role !== undefined && role !== "viewer" && controlled && !missionId;
   const canSend = canSteer && !steering.busy && Boolean(steering.text.trim());
   // Drafts work without control, so dictation does too; it stops only where the text itself is locked.
   const dictation = useDictation({
@@ -124,7 +133,7 @@ export function Terminal({
                   : "Waiting for a fresh response…"}
             </Text>
           </View>
-          <ControlBar
+          {missionId ? null : <ControlBar
             role={role}
             requiresControl={requiresControl}
             running={running}
@@ -138,14 +147,15 @@ export function Terminal({
               control.forget(true);
               refresh();
             }}
-          />
+          />}
           <ScrollView style={s.fill} contentContainerStyle={s.scrollBody}>
             <Text style={s.label}>Current screen</Text>
             <Text selectable style={s.screen}>
               {session.screen || "This process has no current screen."}
             </Text>
           </ScrollView>
-          {role !== undefined && role !== "viewer" && (
+          {missionId ? <MissionManagedLine missionId={missionId} machine={connectionKey(connection)} style={s.managedLine}
+            onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)} /> : role !== undefined && role !== "viewer" && (
             <Composer
               canSteer={canSteer}
               onTakeControl={online && running && !controlled ? () => void takeControl(Boolean(control.holder)) : undefined}
@@ -198,6 +208,7 @@ const s = StyleSheet.create({
   fill: { flex: 1 },
   overlayRoot: { position: "relative" },
   noticeActions: { flexDirection: "row", gap: 6 },
+  managedLine: { marginHorizontal: 12, marginTop: 6, marginBottom: 10 },
   small: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk },
   empty: { padding: 30, gap: 15 },
   body: {

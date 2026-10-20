@@ -66,7 +66,7 @@ const inputSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("control"), requestId: z.uuid(), action: z.enum(["claim", "renew", "release"]), leaseId: z.uuid().optional(), takeover: z.boolean().optional() }).strict(),
 ]);
 
-export function connectTerminals(server: Server, manager: Manager, authenticate: (token: string) => PairedDevice | undefined) {
+export function connectTerminals(server: Server, manager: Manager, authenticate: (token: string) => PairedDevice | undefined, missionManaged?: (sessionId: string) => boolean | Promise<boolean>) {
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 192 * 1024, perMessageDeflate: false });
   const origin = new URL(manager.config.origin);
   server.on("upgrade", (req, socket, head) => {
@@ -84,7 +84,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
     sockets.handleUpgrade(req, socket, head, ws => {
       const abort = new AbortController();
       let device: PairedDevice | undefined, actor: ControlActor, legacy = true;
-      let ready: Promise<WorkerState>, leaseId: string | undefined;
+      let ready: Promise<WorkerState>, leaseId: string | undefined, managed = false;
       let serial = Promise.resolve(), pendingBytes = 0, pendingFrames = 0, alive = true;
       const fail = (code: number) => { abort.abort(); ws.close(code); };
       const authTimeout = setTimeout(() => fail(1008), 10000);
@@ -125,10 +125,14 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
             actor = controlActor(device, auth.clientId ?? randomUUID());
             legacy = !auth.clientId;
             manager.meta(match[1]);
-            ready = manager.state(match[1]);
+            ready = (async () => {
+              managed = Boolean(await missionManaged?.(match[1]));
+              return manager.state(match[1]);
+            })();
             clearTimeout(authTimeout);
             void (async () => {
               try {
+                await ready;
                 for await (const page of terminalPages(manager, match[1], after, abort.signal, url.searchParams.get("snapshot") === "1")) await send(page);
                 if (!abort.signal.aborted) ws.close(1000);
               } catch { fail(1011); }
@@ -143,6 +147,14 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
           serial = serial.then(async () => {
             if (abort.signal.aborted) return;
             const state = await ready;
+            if (managed && (input.op === "raw" || input.op === "input" || input.op === "control" && input.action === "claim")) {
+              await send({ refusal: {
+                requestId: "requestId" in input ? input.requestId : undefined,
+                code: "mission-managed",
+                error: "This session is run by its mission coordinator. Talk to the coordinator from the mission.",
+              } });
+              return;
+            }
             if (input.op === "control") {
               if (!state.capabilities?.inputControl) {
                 await send({ refusal: { requestId: input.requestId, code: "unsupported" } }); return;
@@ -153,7 +165,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
               await send({ requestId, control });
               return;
             }
-            if (state.capabilities?.inputControl && legacy && !leaseId) {
+            if (state.capabilities?.inputControl && legacy && !leaseId && !(managed && input.op === "resize")) {
               leaseId = (await workerCall<ControlLease>(manager.config.runDir, match[1], { op: "control", action: "claim", actor })).id;
             }
             const suppliedLease = legacy ? leaseId : input.leaseId;

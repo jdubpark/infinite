@@ -488,6 +488,7 @@ small,
   color: var(--muted);
 }
 .control-bar .control-state { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.control-bar > .control-managed { flex: 1 1 240px; min-width: 0; margin: 0; font-size: 12px; }
 .control-bar .primary {
   min-height: 44px;
   font-size: 12px;

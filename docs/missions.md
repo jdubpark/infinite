@@ -130,7 +130,8 @@ coordinator `result` from an attempt that started before the owner's latest
 direction or answer is not applied; the host starts a new attempt with that
 input instead. Pause, resume, and cancel apply to the coordinator and every active
 subteam. The deadline stops the coordinator and active subteams like a team
-deadline.
+deadline. Coordinator and subteam sessions are read-only to people; provider
+permission prompts continue to go to the owner or a delegated coordinator.
 
 Status honesty: `ready-for-review` means the coordinator reported a result after
 every subtask finished. It does not establish product impact or acceptance. Each

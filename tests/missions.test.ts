@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createServer as createNetServer } from "node:net";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
+import { WebSocket } from "ws";
 import { stopSessionWorkers, waitFor } from "./helpers.js";
+import { inProcessHost } from "./helpers.js";
+import { writeSealed } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, missionBoard, type ProjectGroupLookup } from "../packages/host/src/missions.js";
@@ -12,7 +16,7 @@ import { createMissionReportEnvelope } from "../packages/host/src/team-report-cl
 import { missionPromptWithMessageCount, type MissionOpenChildDecision, type MissionMessage } from "../packages/host/src/team-prompts.js";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import type { Config } from "../packages/host/src/types.js";
+import type { Config, Session } from "../packages/host/src/types.js";
 import type { CreateTeam, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { CreateMission, Mission, MissionReport } from "../packages/host/src/mission-types.js";
 import { emptyRollup } from "../packages/host/src/team-usage.js";
@@ -83,6 +87,178 @@ const until = (read: () => Mission, accepts: (mission: Mission) => boolean, time
 const standaloneRequest = (projectId: string): CreateTeam => ({
   requestId: randomUUID(), projectId, provider: "claude", useConfiguredLineup: true,
   title: "Standalone run", objective: "Make an independent repository change", parallelism: 1,
+});
+
+test("mission-managed sessions refuse direct human input but keep answers, reads, and standalone access", { timeout: 15000 }, async () => {
+  const host = await inProcessHost();
+  const workers: ReturnType<typeof createNetServer>[] = [];
+  const workerRequests: { sessionId: string; request: Record<string, unknown> }[] = [];
+  const missionId = randomUUID(), subteamId = randomUUID(), standaloneId = randomUUID();
+  const coordinatorId = randomUUID(), subteamSessionId = randomUUID(), standaloneSessionId = randomUUID(), ordinarySessionId = randomUUID();
+  const refusal = { error: "This session is run by its mission coordinator. Talk to the coordinator from the mission.", code: "mission-managed" };
+  const lease = { id: randomUUID(), label: "Test owner", expiresAt: Date.now() + 30000 };
+  const assignment = (runId: string, role: TeamAssignment["role"], memberId = randomUUID()): TeamAssignment => ({ runId, memberId, revision: 1, role });
+  const sessions: Session[] = [
+    { id: coordinatorId, team: assignment(missionId, "mission-coordinator"), provider: "demo", title: "Coordinator", projectId: "rehearsal", cwd: host.config.projects[0].path, createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "", runtime: { id: randomUUID(), location: "local", transport: "pty" } },
+    { id: subteamSessionId, team: { ...assignment(subteamId, "implementer"), taskId: "api" }, provider: "demo", title: "Subteam member", projectId: "rehearsal", cwd: host.config.projects[0].path, createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "", runtime: { id: randomUUID(), location: "local", transport: "pty", nativeUi: "opencode" } },
+    { id: standaloneSessionId, team: { ...assignment(standaloneId, "implementer"), taskId: "api" }, provider: "demo", title: "Standalone member", projectId: "rehearsal", cwd: host.config.projects[0].path, createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "", runtime: { id: randomUUID(), location: "local", transport: "pty" } },
+    { id: ordinarySessionId, provider: "demo", title: "Ordinary session", projectId: "rehearsal", cwd: host.config.projects[0].path, createdAt: new Date().toISOString(), status: "running", contextVersion: 0, context: "", initialPrompt: "", runtime: { id: randomUUID(), location: "local", transport: "pty" } },
+  ];
+  const state = { status: "running", pid: 123, seq: 1, screen: "", attention: initialAttention(new Date().toISOString(), false), capabilities: { inputControl: 1 }, control: lease };
+  try {
+    host.teams.get = (id: string) => (id === subteamId
+      ? { id, missionId, title: "Mission subteam" }
+      : { id, title: "Standalone team" }) as ReturnType<typeof host.teams.get>;
+    for (const session of sessions) {
+      const directory = join(host.config.stateDir, "sessions", session.id);
+      mkdirSync(directory, { recursive: true });
+      mkdirSync(join(directory, "events"), { recursive: true });
+      writeSealed(join(directory, "meta.sealed"), host.manager.key, `${session.id}:meta`, { session, fingerprint: "fixture" });
+      const worker = createNetServer(socket => {
+        let text = "";
+        socket.on("data", chunk => {
+          text += chunk.toString();
+          const end = text.indexOf("\n");
+          if (end < 0) return;
+          const request = JSON.parse(text.slice(0, end));
+          workerRequests.push({ sessionId: session.id, request });
+          const result = request.op === "state" ? state
+            : request.op === "control" ? request.action === "release" ? null : lease
+              : { requestId: request.requestId, state: "delivered", seq: 2 };
+          socket.end(JSON.stringify({ result }) + "\n");
+        });
+      });
+      await new Promise<void>((resolve, reject) => { worker.once("error", reject); worker.listen(join(host.config.runDir, `${session.id}.sock`), resolve); });
+      workers.push(worker);
+    }
+
+    const listed = await host.fetchApi("/sessions");
+    assert.equal(listed.status, 200);
+    const rows = new Map(listed.body.sessions.map((session: { id: string }) => [session.id, session]));
+    assert.deepEqual((rows.get(coordinatorId) as any).managedBy, { kind: "mission", missionId });
+    assert.deepEqual((rows.get(subteamSessionId) as any).managedBy, { kind: "mission", missionId, teamId: subteamId });
+    assert.equal("managedBy" in (rows.get(standaloneSessionId) as object), false);
+    assert.equal("managedBy" in (rows.get(ordinarySessionId) as object), false);
+    assert.deepEqual((await host.fetchApi(`/sessions/${subteamSessionId}`)).body.managedBy, { kind: "mission", missionId, teamId: subteamId });
+
+    const roles = ["owner", "controller", "viewer"] as const;
+    for (const sessionId of [coordinatorId, subteamSessionId]) {
+      for (const role of roles) {
+        const response = await host.fetchApi(`/sessions/${sessionId}/input`, role, { requestId: randomUUID(), text: "direct input" });
+        assert.equal(response.status, 409, `${role} input to ${sessionId}`);
+        assert.deepEqual(response.body, refusal);
+      }
+    }
+    const encodedSubteamId = `%${subteamSessionId.charCodeAt(0).toString(16).padStart(2, "0")}${subteamSessionId.slice(1)}`;
+    for (const path of [
+      `/sessions/${subteamSessionId}/input/`,
+      `/sessions/${subteamSessionId}/INPUT`,
+      `/sessions/${encodedSubteamId}/input`,
+    ]) {
+      const response = await host.fetchApi(path, "owner", { requestId: randomUUID(), text: "path variant input" });
+      assert.equal(response.status, 409, `${path} cannot bypass the route guard`);
+      assert.deepEqual(response.body, refusal);
+    }
+    for (const role of roles) {
+      for (const [suffix, body] of [
+        ["key", { requestId: randomUUID(), key: "enter" }],
+        ["raw", { requestId: randomUUID(), text: "native bytes" }],
+        ["stop", { requestId: randomUUID() }],
+        ["resume", { requestId: randomUUID() }],
+      ] as const) {
+        const response = await host.fetchApi(`/sessions/${subteamSessionId}/${suffix}`, role, body);
+        assert.equal(response.status, 409, `${role} ${suffix}`);
+        assert.deepEqual(response.body, refusal);
+      }
+      const claim = await host.fetchApi(`/sessions/${subteamSessionId}/control`, role, { action: "claim" });
+      assert.equal(claim.status, 409, `${role} control claim`);
+      assert.deepEqual(claim.body, refusal);
+      const native = await host.fetchApi(`/sessions/${subteamSessionId}/native`, role);
+      assert.equal(native.status, 409, `${role} native attach`);
+      assert.deepEqual(native.body, refusal);
+      const opencode = await host.fetchApi(`/sessions/${subteamSessionId}/opencode/session/${randomUUID()}/prompt_async`, role, { parts: [] });
+      assert.equal(opencode.status, 409, `${role} OpenCode attach`);
+      assert.deepEqual(opencode.body, refusal);
+    }
+    const opencodeRead = await host.fetchApi(`/sessions/${subteamSessionId}/opencode/session/${randomUUID()}/event`, "owner", undefined, {}, "GET");
+    assert.equal(opencodeRead.status, 409, "OpenCode attachment reads are also closed for managed sessions");
+    assert.deepEqual(opencodeRead.body, refusal);
+    const trailingClaim = await host.fetchApi(`/sessions/${subteamSessionId}/control/`, "owner", { action: "claim" });
+    assert.equal(trailingClaim.status, 409, "a trailing slash cannot bypass the claim guard");
+    assert.deepEqual(trailingClaim.body, refusal);
+
+    const wsUrl = new URL(`/api/sessions/${subteamSessionId}/native?client=${randomUUID()}&lease=${randomUUID()}`, host.origin);
+    wsUrl.protocol = "ws:";
+    const websocketResponse = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const socket = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${host.tokens.owner}` } });
+      const timer = setTimeout(() => { socket.terminate(); reject(new Error("Native WebSocket did not refuse the managed session")); }, 3000);
+      socket.on("error", error => { if (socket.readyState !== WebSocket.CLOSED) { clearTimeout(timer); reject(error); } });
+      socket.once("open", () => { clearTimeout(timer); socket.terminate(); reject(new Error("Managed native WebSocket unexpectedly opened")); });
+      socket.once("unexpected-response", (_request, response) => {
+        let body = "";
+        response.on("data", chunk => { body += chunk.toString(); });
+        response.on("end", () => { clearTimeout(timer); socket.terminate(); resolve({ status: response.statusCode ?? 0, body }); });
+      });
+    });
+    assert.equal(websocketResponse.status, 409);
+    assert.deepEqual(JSON.parse(websocketResponse.body), refusal);
+
+    const inputRequestId = randomUUID();
+    const terminalFrames = await new Promise<{ sawState: boolean; refusal: unknown }>((resolve, reject) => {
+      const url = new URL(`/api/sessions/${subteamSessionId}/terminal?after=0`, host.origin);
+      url.protocol = "ws:";
+      const socket = new WebSocket(url);
+      let sawState = false;
+      let sentInput = false;
+      const timer = setTimeout(() => { socket.terminate(); reject(new Error("Managed terminal did not remain readable and refuse input")); }, 5000);
+      socket.once("open", () => socket.send(JSON.stringify({ token: host.tokens.owner, clientId: randomUUID() })));
+      socket.on("message", data => {
+        const frame = JSON.parse(data.toString());
+        sawState ||= Boolean(frame.state);
+        if (frame.state && !sentInput) {
+          sentInput = true;
+          socket.send(JSON.stringify({ op: "input", requestId: inputRequestId, text: "direct terminal input", submit: false }));
+        }
+        if (frame.refusal?.code === "mission-managed") {
+          clearTimeout(timer); socket.close(); resolve({ sawState, refusal: frame.refusal });
+        }
+      });
+      socket.on("error", error => { clearTimeout(timer); reject(error); });
+      socket.once("close", () => { if (timer) { clearTimeout(timer); reject(new Error("Managed terminal closed before returning its refusal")); } });
+    });
+    assert.equal(terminalFrames.sawState, true, "managed terminal keeps its live read stream");
+    assert.deepEqual(terminalFrames.refusal, { requestId: inputRequestId, code: "mission-managed", error: refusal.error });
+
+    const answer = await host.fetchApi(`/sessions/${coordinatorId}/answer`, "owner", { requestId: randomUUID(), promptId: 1, option: 0 });
+    assert.equal(answer.status, 200, "provider prompts remain answerable through the owner API");
+    assert.equal(answer.body.state, "delivered");
+    const controllerAnswer = await host.fetchApi(`/sessions/${coordinatorId}/answer`, "controller", { requestId: randomUUID(), promptId: 1, option: 0 });
+    assert.equal(controllerAnswer.status, 200, "the authorized controller can still answer provider prompts");
+    const viewerAnswer = await host.fetchApi(`/sessions/${coordinatorId}/answer`, "viewer", { requestId: randomUUID(), promptId: 1, option: 0 });
+    assert.equal(viewerAnswer.status, 403, "the managed-answer lease exception does not widen the role gate");
+    const managedAnswers = workerRequests.filter(({ sessionId, request }) => sessionId === coordinatorId && request.op === "answer");
+    assert.equal(managedAnswers.length, 2);
+    for (const { request } of managedAnswers) {
+      assert.equal(request.missionManaged, true, "the host marks mission answers for the worker's lease-free path");
+      assert.equal("leaseId" in request, false, "mission answers do not depend on a refused input lease");
+      assert.equal("actor" in request, false);
+    }
+    for (const action of ["renew", "release"] as const) {
+      const response = await host.fetchApi(`/sessions/${subteamSessionId}/control`, "owner", { action, leaseId: lease.id });
+      assert.equal(response.status, 200, `${action} can drop a stale managed-session lease`);
+    }
+    for (const sessionId of [standaloneSessionId, ordinarySessionId]) {
+      const input = await host.fetchApi(`/sessions/${sessionId}/input`, "owner", { requestId: randomUUID(), text: "allowed input" });
+      assert.equal(input.status, 200, `input to ${sessionId} remains available`);
+    }
+    const resized = await host.fetchApi(`/sessions/${coordinatorId}/resize`, "owner", { cols: 80, rows: 24 });
+    assert.equal(resized.status, 200, "resize remains available");
+    const events = await host.fetchApi(`/sessions/${subteamSessionId}/events`);
+    assert.equal(events.status, 200, "read routes remain available");
+  } finally {
+    await host.stop();
+    await Promise.all(workers.map(worker => new Promise<void>(resolve => worker.close(() => resolve()))));
+  }
 });
 
 test("mission prompt keeps 21 open child questions under the byte limit without repeating their text", () => {

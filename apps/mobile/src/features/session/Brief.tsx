@@ -34,6 +34,7 @@ import { theme } from "../../theme";
 import { DictationNotice } from "../../dictation/DictationControls";
 import { useDictation } from "../../dictation/useDictation";
 import { ROLE_NAMES } from "../teams/model";
+import { MissionManagedLine } from "../board/MissionManagedLine";
 import { Conversation } from "./Conversation";
 import { Files } from "./Files";
 import { Lifecycle } from "./Lifecycle";
@@ -77,6 +78,13 @@ export function Brief({
   });
   const session = poll?.session ?? null;
   useControlSync(control, poll, stale);
+  // A mission coordinator runs this session: the phone sends no text, keys, stop, resume or control to it.
+  const missionId = session?.managedBy?.missionId;
+  // A lease this phone still holds on a managed session is released, so the coordinator keeps control.
+  const { forget } = control;
+  useEffect(() => {
+    if (missionId) forget(true);
+  }, [forget, missionId]);
   // `/me` is read once; a failed read is retried after the next good poll.
   const [me, setMe] = useState<Me | null>(null);
   const needMe = me === null && online;
@@ -96,11 +104,12 @@ export function Brief({
 
   const { events: signals } = useSignals(connection, id);
   const moments = useMemo(() => deriveMoments(signals), [signals]);
-  // Workers that enforce control take input only from the device holding the lease.
-  const requiresControl = session?.capabilities?.inputControl === 1;
+  // Workers that enforce control take input only from the device holding the lease; a managed session never grants one.
+  const requiresControl = !missionId && session?.capabilities?.inputControl === 1;
   const steering = useSteering(connection, id, refresh, control, {
     draftKey: `${connectionKey(connection)}/${id}/brief`,
     requiresControl,
+    managed: Boolean(missionId),
   });
   const prompt =
     session?.attention.state === "needs-you"
@@ -125,7 +134,7 @@ export function Brief({
   const readOnly = answering.forbidden || (me !== null && !permitted);
   const canAnswer = permitted && online && running && controlled;
   const canSteer =
-    online && running && me !== null && me.role !== "viewer" && controlled;
+    online && running && me !== null && me.role !== "viewer" && controlled && !missionId;
   // Text and Enter would land in the open dialog and pick its highlighted option.
   // A running worker without attention cannot report one, so only the terminal types.
   const blocked = session?.attention.prompt
@@ -211,7 +220,7 @@ export function Brief({
             </Text>
             {tools ? <Text style={s.small} numberOfLines={1}>{tools}</Text> : null}
           </View>
-          {session.team ? null : <ControlBar
+          {session.team || missionId ? null : <ControlBar
             role={me?.role}
             requiresControl={requiresControl}
             running={running}
@@ -232,7 +241,7 @@ export function Brief({
             keyboardShouldPersistTaps="handled"
             refreshControl={<RefreshControl refreshing={false} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}
           >
-            {prompt && session.team ? (
+            {prompt && session.team && !missionId ? (
               // A member's open prompt is approved from its team, beside the coordinator's review.
               <View style={s.pointer}>
                 <View style={s.pointerHead}>
@@ -289,9 +298,12 @@ export function Brief({
               </View>
             )}
             </>}
-            {session.team ? null : <Lifecycle connection={connection} session={session} role={me?.role} online={online} control={control.lease?.id} refresh={refresh} />}
+            {session.team || missionId ? null : <Lifecycle connection={connection} session={session} role={me?.role} online={online} control={control.lease?.id} refresh={refresh} />}
           </ScrollView>
-          {session.team ? (
+          {missionId ? (
+            <MissionManagedLine missionId={missionId} machine={connectionKey(connection)} style={s.managedLine}
+              onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)} />
+          ) : session.team ? (
             // A team member is the coordinator's to steer, pause, or stop; direction goes to the team.
             <View style={s.managed}>
               <Glyph name="people" size={16} color={theme.colors.secondaryInk} />
@@ -378,6 +390,7 @@ const s = StyleSheet.create({
     ...theme.lift,
   },
   managedText: { flex: 1, fontSize: 13, lineHeight: 18, color: theme.colors.secondaryInk },
+  managedLine: { marginHorizontal: 12, marginBottom: 10, marginTop: 6 },
   pointer: { gap: 8, padding: 14, borderRadius: theme.radius.card, backgroundColor: theme.colors.warningSurface, alignItems: "flex-start" },
   pointerHead: { flexDirection: "row", alignItems: "center", gap: 8 },
   pointerTitle: { fontSize: 15, fontWeight: "600", color: theme.colors.ink },

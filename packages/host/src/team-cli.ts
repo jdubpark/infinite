@@ -7,7 +7,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
-import { createTeamSchema, teamDeliverySchema, teamPermissionsSchema, type TeamDelivery } from "./team-types.js";
+import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamPermissionsSchema, type TeamDelivery } from "./team-types.js";
 import { captureWorkspace } from "./workspace-checkpoint.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
 import { localProjectPath } from "./mirrored-projects.js";
@@ -71,7 +71,7 @@ function inferGitHubRepository(root: string): string {
     } catch { /* The bounded error below avoids echoing remote URLs or credentials. */ }
   }
   if (ownerRepo?.endsWith(".git")) ownerRepo = ownerRepo.slice(0, -4);
-  const parsed = teamDeliverySchema.shape.repository.safeParse(ownerRepo);
+  const parsed = githubRepositorySchema.safeParse(ownerRepo);
   if (!parsed.success) throw new Error("Git origin must be an HTTPS or SSH github.com OWNER/REPO URL without credentials; supply --repository OWNER/REPO.");
   return parsed.data;
 }
@@ -83,7 +83,7 @@ function inferBaseBranch(root: string): string {
     if (!ref.startsWith(prefix) || ref.length === prefix.length)
       throw new Error("origin/HEAD does not name an origin branch; supply --base-branch BRANCH.");
     const branch = ref.slice(prefix.length);
-    return teamDeliverySchema.shape.baseBranch.parse(branch);
+    return gitBranchSchema.parse(branch);
   }
   let branch: string | undefined;
   try { branch = git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]); } catch { /* Detached HEAD requires explicit configuration. */ }
@@ -107,7 +107,7 @@ function requestedDelivery(root: string, options: Options, current: { revision: 
     mode,
     repository: options["--repository"] === undefined ? retained?.repository ?? inferGitHubRepository(root) : String(options["--repository"]),
     baseBranch: options["--base-branch"] === undefined ? retained?.baseBranch ?? inferBaseBranch(root) : String(options["--base-branch"]),
-    mergeMethod: options["--merge-method"] === undefined ? retained?.mergeMethod : String(options["--merge-method"]),
+    mergeMethod: options["--merge-method"] === undefined ? (retained?.mode === "merge" ? retained.mergeMethod : undefined) : String(options["--merge-method"]),
   });
 }
 function inspectSourceHead(root: string): { commit: string; branch?: string } {

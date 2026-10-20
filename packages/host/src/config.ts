@@ -32,6 +32,7 @@ const schema = z
     deployment: z.unknown().optional(),
     usage: usageConfigSchema.optional(),
     sync: z.object({ sharedGroup: z.boolean().optional(), homeDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
+    source: z.object({ mirrorDir: z.string().refine(isAbsolute).optional(), refreshMinutes: z.number().int().min(1).max(1440).optional(), remoteOverrides: z.record(z.string(), z.string()).optional() }).strict().optional(),
     // Model-written chat digests. The key file is read once at startup and never logged.
     summaries: z.object({
       model: z.string().min(1).max(100),

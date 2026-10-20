@@ -282,3 +282,23 @@ test("repo init stores an explicit delivery target, retains it when omitted, and
     assert.equal(git(primaryPath, "symbolic-ref", "refs/remotes/origin/HEAD"), primaryDefault);
   } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
 });
+
+test("repository enrollment stores a project source mode, restores it after a restart, and keeps it when omitted", async () => {
+  const f = fixture();
+  try {
+    const service = new RepoEnrollmentService(f.config(), f.key);
+    const team = { checks: [{ command: "node", args: ["-e", "0"] }] };
+    const github = { mode: "github" as const, repository: "example/product", baseBranch: "main" };
+    const saved = await service.put("example", { requestId: randomUUID(), revision: 0, team, source: github });
+    assert.deepEqual(saved.source, github);
+    const config = f.config();
+    const restarted = new RepoEnrollmentService(config, f.key);
+    assert.deepEqual(config.projects[0].source, github);
+    assert.deepEqual(restarted.get("example").source, github);
+    const kept = await restarted.put("example", { requestId: randomUUID(), revision: 1, team });
+    assert.deepEqual(kept.source, github);
+    const laptop = await restarted.put("example", { requestId: randomUUID(), revision: 2, team, source: { mode: "laptop" } });
+    assert.deepEqual(laptop.source, { mode: "laptop" });
+    assert.deepEqual(config.projects[0].source, { mode: "laptop" });
+  } finally { f.close(); }
+});

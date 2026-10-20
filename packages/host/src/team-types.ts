@@ -12,19 +12,31 @@ export const teamCommandSchema = z.object({
   args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]),
 }).strict();
 export type TeamCommand = z.infer<typeof teamCommandSchema>;
-const githubRepository = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/);
-const gitBranch = z.string().min(1).max(255).refine(value =>
+export const githubRepositorySchema = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/);
+const githubRepository = githubRepositorySchema;
+export const gitBranchSchema = z.string().min(1).max(255).refine(value =>
   value !== "@" && !value.startsWith("-") && !value.startsWith("/") && !value.endsWith("/") && !value.endsWith(".") && !value.includes("..") && !value.includes("@{") &&
   !value.includes("//") && !value.includes("\\") && !/[~^:?*\s\x00-\x1f\x7f]/.test(value) &&
   !value.includes("[") && !value.includes("]") &&
   value.split("/").every(part => part.length > 0 && !part.startsWith(".") && !part.endsWith(".lock")),
 "Use a safe Git branch name");
-export const teamDeliverySchema = z.object({
-  mode: z.literal("merge"),
-  repository: githubRepository,
-  baseBranch: gitBranch,
-  mergeMethod: z.enum(["squash", "merge", "rebase"]).default("squash"),
-}).strict();
+const gitBranch = gitBranchSchema;
+/** Where the host's copy of a project comes from. `github`: the host follows the base branch itself; `laptop`: workspace sync from the owner's computer. */
+export const projectSourceSchema = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("github"), repository: githubRepository, baseBranch: gitBranch }).strict(),
+  z.object({ mode: z.literal("laptop") }).strict(),
+]);
+export type ProjectSource = z.infer<typeof projectSourceSchema>;
+/** `merge`: the delivery member merges the reviewed head itself. `pr`: it pushes the branch and opens a pull request, and the owner merges on GitHub. */
+export const teamDeliverySchema = z.discriminatedUnion("mode", [
+  z.object({
+    mode: z.literal("merge"),
+    repository: githubRepository,
+    baseBranch: gitBranch,
+    mergeMethod: z.enum(["squash", "merge", "rebase"]).default("squash"),
+  }).strict(),
+  z.object({ mode: z.literal("pr"), repository: githubRepository, baseBranch: gitBranch }).strict(),
+]);
 export type TeamDelivery = z.infer<typeof teamDeliverySchema>;
 export const teamPermissionsSchema = z.object({
   mode: z.literal("coordinator"),
@@ -208,6 +220,7 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
   z.object({ kind: z.literal("delivery"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("delivery-repair"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("pull-request"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]) }).strict(),
   z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000) }).strict(),
 ]);
@@ -304,6 +317,12 @@ export interface TeamRun {
   delivery?: TeamDelivery;
   /** Agent-reported delivery evidence; this is not independently verified by the host. */
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
+  /** Agent-reported open pull request for a `pr` delivery; the owner merges it on GitHub. Not host verification. */
+  pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string };
+  /** The base came from the host mirror while the latest fetch from GitHub failed. */
+  baseStale?: { fetchedAt?: string; reason: "fetch-failed"; category: "auth" | "network" | "not-found" | "other" };
+  /** A continuation kept its parent's base while the mirror already holds a newer base-branch head. */
+  baseBehind?: { mirrorHead: string };
   /** Whether the current run title came from its request, a naming model, or the coordinator brief. */
   titleSource?: "request" | "model" | "brief";
   linearTracking?: boolean;

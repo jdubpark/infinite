@@ -94,7 +94,14 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const profileOf = (member?: TeamMember, task?: TeamTask): ModelProfile | undefined => member?.modelProfile
     ?? [...(team.lineup?.implementers ?? []), ...(team.lineup?.escalations ?? [])].find(value => value.id === task?.agentProfileId);
   const agentLabel = (member: TeamMember) => member.modelProfile?.label ?? providerName(member.provider ?? team.provider);
-  const agentState = (member: TeamMember) => listed.get(member.sessionId)?.attention.state === "needs-you" ? "attention" as const : member.status === "running" ? "live" as const : undefined;
+  // A person-owned prompt is attention; a live member whose prompt the coordinator is reviewing is live with a note instead.
+  const personOwned = new Set(approvals.map(item => item.member.memberId));
+  const coordinatorOwned = (member: TeamMember) => member.revision === team.revision && live(member) && listed.get(member.sessionId)?.attention.state === "needs-you" && !personOwned.has(member.memberId);
+  const agentState = (member: TeamMember) => personOwned.has(member.memberId) ? "attention" as const : coordinatorOwned(member) || member.status === "running" ? "live" as const : undefined;
+  const approvalCard = ({ member, session }: (typeof approvals)[number]) => <AgentApproval key={`${member.memberId}/${session.attention.prompt?.id ?? "open"}`} connection={connection} member={member} me={me ?? null}
+    agent={agentLabel(member)} provider={member.modelProfile?.provider ?? member.provider ?? team.provider}
+    decision={[...(team.permissionDecisions ?? [])].reverse().find(item => item.targetSessionId === member.sessionId && item.promptId === session.attention.prompt?.id)}
+    onOpenSession={() => openSession(member.sessionId)} />;
   const taskOf = (member: TeamMember) => team.tasks.find(task => task.id === member.taskId);
   // Member titles repeat the role id and often the run title; keep only what adds information.
   const work = (member: TeamMember) => {
@@ -110,6 +117,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const agentRow = (member: TeamMember) => {
     const open = agentId === member.memberId;
     const session = listed.get(member.sessionId);
+    const approval = approvals.find(item => item.member.memberId === member.memberId);
     return <View key={member.memberId}>
       <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={`${ROLE_NAMES[member.role]}, ${MEMBER_LABELS[member.status] ?? member.status}. ${open ? "Hide" : "Show"} log`}
         onPress={() => setAgentId(open ? "" : member.memberId)} style={({ pressed }) => [s.row, pressed && s.pressed]}>
@@ -122,12 +130,16 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             {member.revision !== team.revision ? <Text style={t.note}>rev {member.revision}</Text> : null}
           </View>
           <Text style={t.note} numberOfLines={1}>{[work(member), agentLabel(member)].filter(Boolean).join(" · ")}</Text>
-          {session?.attention.now ? <Text style={[s.now, session.attention.state === "needs-you" && s.attentionText]} numberOfLines={2}>{session.attention.now}</Text> : null}
+          {coordinatorOwned(member) ? <Text style={t.note} numberOfLines={2}>{`Coordinator reviewing${session?.attention.now ? `: ${session.attention.now}` : ""}`}</Text>
+            : session?.attention.now ? <Text style={[s.now, personOwned.has(member.memberId) && s.attentionText]} numberOfLines={2}>{session.attention.now}</Text> : null}
           {member.stoppedReason ? <Text style={t.warning} numberOfLines={2}>Stopped: {member.stoppedReason}</Text> : null}
         </View>
         <Glyph name={open ? "down" : "forward"} size={12} color={theme.colors.mutedInk} />
       </Pressable>
-      {open ? <AgentLog connection={connection} member={member} live={live(member)} onOpen={() => openSession(member.sessionId)} onStaleChange={setAgentStale} /> : null}
+      {open ? <>
+        {approval ? <View style={s.approval}>{approvalCard(approval)}</View> : null}
+        <AgentLog connection={connection} member={member} live={live(member)} onOpen={() => openSession(member.sessionId)} onStaleChange={setAgentStale} />
+      </> : null}
     </View>;
   };
 
@@ -198,10 +210,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           {decisions.map(decision => <DecisionCard key={decision.id} decision={decision} member={team.members.find(member => member.memberId === decision.memberId)}
             disabled={!controls.answer || locked} onAnswer={text => send(`/decisions/${decision.id}/answer`, "Answer", { text })} />)}
           {team.status === "paused" && decisions.length ? <Text style={t.note}>Resume to answer.</Text> : null}
-          {approvals.map(({ member, session }) => <AgentApproval key={`${member.memberId}/${session.attention.prompt?.id ?? "open"}`} connection={connection} member={member} me={me ?? null}
-            agent={agentLabel(member)} provider={member.modelProfile?.provider ?? member.provider ?? team.provider}
-            decision={[...(team.permissionDecisions ?? [])].reverse().find(item => item.targetSessionId === member.sessionId && item.promptId === session.attention.prompt?.id)}
-            onOpenSession={() => openSession(member.sessionId)} />)}
+          {approvals.map(approvalCard)}
         </Section> : null}
         {coordinatorHandling > 0 ? <Text style={[t.note, s.gapTop]}>Coordinator reviewing {coordinatorHandling === 1 ? "1 request" : `${coordinatorHandling} requests`}</Text> : null}
 
@@ -418,6 +427,7 @@ const s = StyleSheet.create({
   state: { fontSize: 12, fontWeight: "600", color: theme.colors.secondaryInk },
   now: { fontSize: 13, lineHeight: 18, color: theme.colors.ink },
   attentionText: { color: theme.colors.warningInk },
+  approval: { paddingBottom: 10 },
   role: { fontWeight: "700", color: theme.colors.ink },
   link: { fontSize: 13, fontWeight: "600", color: theme.colors.forest },
   unassigned: { width: 24, height: 24, borderRadius: 12, borderWidth: 1.5, borderStyle: "dashed", borderColor: theme.colors.fieldRule },

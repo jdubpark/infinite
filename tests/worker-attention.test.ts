@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { initialAttention } from "@infinite/attention";
 import { publicAttention, withDefaultAttention } from "../packages/host/src/manager.js";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 
@@ -371,6 +372,31 @@ test("a worker without attention reports a default instead of breaking the list"
     assert.equal(withDefaultAttention({ status, seq: 0, screen: "" }, now).attention.state, status);
   const present = { status: "running" as const, seq: 1, screen: "", attention: { ...running.attention, state: "working" as const } };
   assert.equal(withDefaultAttention(present, now), present);
+});
+
+test("public attention marks only complete Codex command dialogs as delegable", () => {
+  const prompt = {
+    id: 1,
+    kind: "permission" as const,
+    title: "Would you like to run the following command?",
+    detail: "• Running npm run check\nEnvironment: local\nReason: May I run the requested full npm run check outside the sandbox? Its tsx test runner needs a local IPC socket\nthat the sandbox blocks.\n$ npm run check",
+    options: [
+      { index: 0, label: "Yes, proceed (y)", role: "accept" as const },
+      { index: 1, label: "Yes, and don't ask again for commands that start with … (p)", role: "accept-always" as const },
+      { index: 2, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" as const },
+    ],
+    acceptsText: false,
+    pinned: true,
+    source: "screen" as const,
+    hash: "command-dialog-hash",
+  };
+  const attention = initialAttention("2026-10-19T00:00:00.000Z", false);
+  const delegated = publicAttention({ ...attention, prompt });
+  assert.equal(delegated.prompt?.delegable, true);
+
+  const nonDelegable = publicAttention({ ...attention, prompt: { ...prompt, hash: undefined } });
+  assert.equal(nonDelegable.prompt?.delegable, undefined);
+  assert.equal(publicAttention({ ...attention, prompt: { ...prompt, pinned: false } }).prompt?.delegable, undefined);
 });
 
 test("a plain session says what it is doing; one unreadable status never hides the other sessions", { timeout: 60000 }, async () => {

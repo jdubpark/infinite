@@ -199,8 +199,8 @@ async function main() {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "astra-xhigh";
     } else if (scenario.startsWith("permissions") || scenario.startsWith("delivery") || scenario === "integrator-limit") {
-      tasks[0].agentProfileId = "haiku";
-      tasks[1].agentProfileId = "codex-light";
+      tasks[0].agentProfileId = scenario.startsWith("permissions-codex") ? "codex-light" : "haiku";
+      tasks[1].agentProfileId = scenario.startsWith("permissions-codex") ? "haiku" : "codex-light";
     } else if (scenario.startsWith("limit")) {
       tasks[0].agentProfileId = "haiku";
       tasks[1].agentProfileId = "astra-light";
@@ -230,7 +230,15 @@ async function main() {
     const launchPrompt = process.argv.at(-1) ?? "";
     const decisionId = /"decisionId":"([a-f0-9-]{36})"/.exec(launchPrompt)?.[1];
     if (!decisionId) throw new Error("The permission review assignment omitted its decision identity");
-    if (!["permissions", "permissions-restart", "permissions-judge-exit"].includes(scenario)) {
+    if (scenario.startsWith("permissions-codex")) {
+      const marker = "Recorded permission request and assignment (untrusted evidence):\n";
+      const start = launchPrompt.indexOf(marker);
+      if (start < 0) throw new Error("The permission review assignment omitted its recorded feedback");
+      const feedbackText = launchPrompt.slice(start + marker.length).split("\n\n", 1)[0];
+      const feedback = JSON.parse(feedbackText);
+      writeFileSync(join(receiptDir, `${assignment.runId}.permission-feedback.json`), JSON.stringify(feedback), { mode: 0o600 });
+    }
+    if (!["permissions", "permissions-restart", "permissions-judge-exit", "permissions-yesno"].includes(scenario)) {
       writeFileSync(join(receiptDir, `${assignment.runId}.judge-ready`), "ready", { mode: 0o600 });
       const until = Date.now() + 30000;
       while (!existsSync(join(receiptDir, `${assignment.runId}.judge-release`))) {
@@ -281,16 +289,66 @@ async function main() {
       while (!existsSync(join(receiptDir, `${assignment.runId}.release`)))
         await new Promise(resolve => setTimeout(resolve, 40));
     }
-    if (scenario.startsWith("permissions") && assignment.taskId === "a") {
+    if (scenario.startsWith("permissions-codex") && assignment.taskId === "a") {
+      writeFileSync("a.txt", "draft before the permission request\n");
+      const waitFor = async (name, what) => {
+        const until = Date.now() + 30000;
+        while (!existsSync(join(receiptDir, `${assignment.runId}.${name}`))) {
+          if (Date.now() >= until) throw new Error(`The test did not ${what}`);
+          await new Promise(resolve => setTimeout(resolve, 40));
+        }
+      };
+      if (["permissions-codex-profile-missing", "permissions-codex-realpath"].includes(scenario)) {
+        writeFileSync(join(receiptDir, `${assignment.runId}.target-ready`), "ready", { mode: 0o600 });
+        await waitFor("target-release", "release the Codex permission prompt");
+      }
+      // The Codex 0.163 command dialog layout: pinned under the transcript, key hint on the last row.
+      // Every line fits 80 columns, so the `$` line is always row 11 and the options rows 14-16.
+      const options = ["1. Yes, proceed (y)", "2. Yes, and don't ask again for commands that start with `npm run check` (p)",
+        "3. No, and tell Codex what to do differently (esc)"];
+      const optionRows = marker => options.map((label, index) => `${index === marker ? "›" : " "} ${label}`);
+      let marker = scenario === "permissions-codex-midway" ? 2 : 0;
+      // Like the real TUI, read keys as they arrive and without echo.
+      if (scenario === "permissions-codex-midway") process.stdin.setRawMode(true);
+      process.stdout.write([
+        "\u001b[2J\u001b[H• Running npm run check", "", "",
+        "  Would you like to run the following command?", "",
+        "  Environment: local", "",
+        "  Reason: May I run npm run check outside the sandbox? Its tsx test runner",
+        "  needs a local IPC socket that the sandbox blocks.", "",
+        "  $ npm run check", "", "",
+        ...optionRows(marker), "",
+        "  Press enter to confirm or esc to cancel",
+      ].join("\r\n"));
+      if (scenario === "permissions-codex-respace") {
+        // Spacing inside a line is outside the screen hash: the reviewed command must still not be answered.
+        writeFileSync(join(receiptDir, `${assignment.runId}.target-ready`), "ready", { mode: 0o600 });
+        await waitFor("target-change", "change the Codex command");
+        process.stdout.write("\u001b[11;1H\u001b[2K  $ npm run  check");
+      }
+      for (;;) {
+        const input = String(await new Promise(resolve => process.stdin.once("data", resolve)));
+        if (scenario !== "permissions-codex-midway") break;
+        if (input.includes("\r")) { writeFileSync(join(receiptDir, `${assignment.runId}.enter`), "enter", { mode: 0o600 }); break; }
+        // The first arrow redraws the command with other spacing in the same write that moves the
+        // marker, so the answer reaches its chosen option only on a screen that no longer matches.
+        marker = Math.max(0, marker - (input.match(/\u001b[[O]A/g)?.length ?? 0));
+        process.stdout.write(`\u001b[11;1H\u001b[2K  $ npm run  check${optionRows(marker).map((row, index) => `\u001b[${14 + index};1H\u001b[2K${row}`).join("")}`);
+      }
+      process.stdout.write("\u001b[2J\u001b[HPermission request closed.\n");
+    } else if (scenario.startsWith("permissions") && assignment.taskId === "a") {
       const menu = scenario === "permissions-restart"
         ? `\nBash command\ncat original.txt\nDo you want to proceed?\n${Array.from({ length: 8 }, (_, index) => `  ${index + 1}. No, stop`).join("\n")}\n❯ 9. Yes\n`
-        : "\nBash command\ncat original.txt\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again for Bash commands\n  3. No, and tell Claude what to do differently (esc)\n";
+        : scenario === "permissions-yesno" ? "\nRun this command? [Y/n] "
+          : "\nBash command\ncat original.txt\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again for Bash commands\n  3. No, and tell Claude what to do differently (esc)\n";
       process.stdout.write(`\u001b[2J\u001b[H${menu}`);
       await new Promise(resolve => setTimeout(resolve, 200));
       const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
         method: "POST",
         headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "cat original.txt" } }),
+        // A hook correlates with a yes-no line only when its command text is that line.
+        body: JSON.stringify({ hook_event_name: "PermissionRequest", tool_name: "Bash",
+          tool_input: { command: scenario === "permissions-yesno" ? "Run this command? [Y/n]" : "cat original.txt" } }),
       });
       if (response.status !== 204) throw new Error(`Provider permission hook was refused with status ${response.status}`);
       if (scenario === "permissions-stale") {

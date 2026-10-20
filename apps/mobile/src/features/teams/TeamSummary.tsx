@@ -128,6 +128,9 @@ export function JevcodeSummary({ connection, team }: { connection: Connection; t
   </Card>;
 }
 
+/** 14 lines of 16 px fit the 260 px screen box after its 12 px padding; more would clip the bottom prompt. */
+const SCREEN_LINES = 14;
+
 /** One agent's current screen and recent control events. */
 export function AgentLog({ connection, member, live, onOpen, onStaleChange }: { connection: Connection; member: TeamMember; live: boolean; onOpen: () => void; onStaleChange?: (stale: boolean) => void }) {
   const poll = usePoll(async () => {
@@ -140,7 +143,7 @@ export function AgentLog({ connection, member, live, onOpen, onStaleChange }: { 
     return () => onStaleChange?.(false);
   }, [onStaleChange, poll.stale]);
   const log = poll.data?.sessionId === member.sessionId ? poll.data : null;
-  const screen = log ? plainScreen(log.screen, 30) : "";
+  const screen = log ? plainScreen(log.screen, SCREEN_LINES) : "";
   return <View style={s.log}>
     <ScrollView horizontal style={s.screen} contentContainerStyle={s.screenContent}>
       <Text selectable style={s.screenText}>{log ? screen || (live ? "Waiting for output…" : "No screen recorded.") : "Loading…"}</Text>

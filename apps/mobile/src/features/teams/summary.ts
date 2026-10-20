@@ -77,14 +77,16 @@ export function chooseBrief(rows: { sessionId: string; status: TeamBriefView }[]
   return newest ?? coordinator ?? rows[0];
 }
 
-/** Terminal text with color codes removed and blank lines at the ends dropped. */
+/** Terminal text with color codes removed. Trailing blank lines go before the last `maxLines` are kept, so a bottom prompt stays in view. */
 export function plainScreen(value: unknown, maxLines = 24): string {
   const raw = String(value ?? "");
   const plain = raw
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
-  return plain.split(/\r?\n/).slice(-maxLines).join("\n").trim();
+  const lines = plain.split(/\r?\n/);
+  while (lines.length && !lines.at(-1)?.trim()) lines.pop();
+  return lines.slice(-maxLines).join("\n").trim();
 }
 
 export function controlEventText(event: { type?: string; data?: Record<string, unknown> }): string {

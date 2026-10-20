@@ -334,3 +334,28 @@ test("the now line names the hook's command when the dialog shows it", () => {
   const elsewhere = { ...screenOnly, tool: { name: "Bash", input: { command: "git push --force" } } };
   assert.equal(describeNow(needsYou(elsewhere), "claude"), "Do you want to proceed? Process 42 stays alive when clients disconnect.");
 });
+
+test("the now line names a Codex command shown only in the screen dialog", () => {
+  const prompt: Prompt = {
+    id: 9,
+    kind: "permission",
+    title: "Would you like to run the following command?",
+    detail: [
+      "• Running npm run check",
+      "Environment: local",
+      "Reason: May I run the requested full npm run check outside the sandbox? Its tsx test runner needs a local IPC socket",
+      "that the sandbox blocks.",
+      "$ npm run check",
+    ].join("\n"),
+    options: [
+      { index: 0, label: "Yes, proceed", role: "accept" },
+      { index: 1, label: "Yes, and don't ask again for this command in this session", role: "accept-always" },
+      { index: 2, label: "No, and tell Codex what to do differently", role: "reject-with-feedback" },
+    ],
+    acceptsText: true,
+    source: "screen",
+    hash: "screen-hash",
+  };
+  const attention = { ...initialAttention("t", true), state: "needs-you" as const, prompt };
+  assert.equal(describeNow(attention, "codex"), "Would you like to run the following command? npm run check");
+});

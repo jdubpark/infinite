@@ -658,6 +658,13 @@ change the scope or set a limit from one to twenty. Existing runs remain unchang
 An older host without delegation support requires an upgrade or an explicit
 `--permissions off` choice.
 
+The default scope approves one-time repository read, edit, build and test
+operations for the accepted task in its assigned workspace, including a one-time
+run of the task's tests or accepted checks outside the provider sandbox. It
+escalates new credentials, other repositories, global settings, deployment,
+destructive operations, persistent approvals, other permission bypasses and
+unclear effects. Delivery keeps its separate pinned policy.
+
 A current one-shot tool prompt can start a separate turn on the run's strong
 Claude coordinator profile. The coordinator receives the task, owner scope and exact
 request, then reports approve-once or escalate. The host checks the assignment,
@@ -667,6 +674,19 @@ coordinator runs noninteractively with built-in tools disabled and only its
 assignment's report tool allowed. It escalates when the supplied evidence is
 insufficient. Worker provider modes, global trust settings and credentials
 remain unchanged. Other coordinator providers are not yet supported for this role.
+
+A request qualifies when its evidence is complete: hook tool input that storage
+did not truncate, or a Codex "Would you like to run the following command?"
+dialog that shows its whole `$` command. Codex hooks are off by default, so
+Codex members reach the coordinator through the dialog. The review also gets the
+files the member changed against its base and the accepted checks; see
+[security](security.md#delegated-team-permission-decisions) for the rule. Once a
+request qualifies, the host either starts the review or records an escalation
+with its reason, so clients show the prompt as the coordinator's only while it
+can act. Codex members are told their sandbox has no network, listeners or IPC
+sockets. They prefer checks that run inside it, ask to leave it only for a
+one-time run of the task's tests or an accepted check, and report what they
+skipped. The host runs the accepted checks after integration.
 
 Workspace trust, persistent allow rules, ambiguous prompts and unsupported native
 requests are never delegated; trust prompts disappear only when the owner trusts

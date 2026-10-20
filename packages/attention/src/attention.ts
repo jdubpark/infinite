@@ -4,6 +4,7 @@ import type { DetectedPrompt } from "./prompts.js";
 import { normalisedLines } from "./prompts.js";
 import { matchDestructive } from "./destructive.js";
 import { roleForLabel } from "./roles.js";
+import { dialogCommand } from "./delegation.js";
 
 const TERMINAL = new Set(["exited", "unavailable", "recording-error"]);
 
@@ -129,7 +130,7 @@ export function screenDecision(att: Attention, detected: DetectedPrompt | null, 
       open: {
         kind: detected.kind, title: detected.title, detail: detected.detail, options: detected.options,
         highlighted: detected.highlighted, acceptsText: detected.acceptsText, multiSelect: detected.multiSelect,
-        source: "screen", fingerprint: detected.fingerprint,
+        pinned: detected.pinned, source: "screen", fingerprint: detected.fingerprint,
       },
     };
   }
@@ -157,6 +158,7 @@ export function mergeScreenIntoPrompt(prompt: Prompt, detected: DetectedPrompt, 
     highlighted: detected.highlighted,
     acceptsText: detected.acceptsText,
     multiSelect: Boolean(prompt.multiSelect) || Boolean(detected.multiSelect),
+    pinned: detected.pinned,
     destructive: prompt.destructive ?? blockDestructive(detected),
     hash,
   };
@@ -235,8 +237,9 @@ export function describeNow(att: Attention, provider: Provider): string {
       const command = p?.tool?.input.command;
       const [commandLine] = normalisedLines(typeof command === "string" ? command : undefined);
       const shown = normalisedLines(p?.detail);
+      const [dialogLine] = normalisedLines(p ? dialogCommand(p) : undefined);
       // Name the command when the dialog shows it; otherwise the dialog's first detail line.
-      const head = (commandLine && shown.find((l) => l === commandLine)) ?? shown[0] ?? commandLine;
+      const head = (commandLine && shown.find((l) => l === commandLine)) ?? dialogLine ?? shown[0] ?? commandLine;
       text = p ? (head ? `${p.title} ${head}` : p.title) : `${name} needs you`;
       break;
     }

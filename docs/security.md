@@ -213,6 +213,27 @@ choice after verifying the target assignment, canonical workspace, prompt
 identity and evidence, owner policy, expiry and human control lease. It records
 intent before delivery and preserves uncertain acknowledgements without replay.
 
+A Codex command dialog ("Would you like to run the following command?") runs its
+command once outside the provider sandbox, with network access and local
+sockets. It qualifies for review only when the dialog is pinned to the bottom of
+the screen, with nothing but blank lines and key hints below its options. It
+must also show the complete command on a single `$` line and offer a single
+one-shot option. Agent output scrolls above the provider's input area, so a
+printed copy of a dialog never qualifies. The screen hash ignores spacing inside
+a line, so the worker also requires the reviewed title and detail exactly, and
+the dialog still pinned, before every key it sends. A redraw stops delivery.
+Delegated answers go only to menus: on a yes-no line the typed key changes the
+line before its Enter, so that Enter could not be checked. A refusal before the
+first key escalates the request; a failure after it is recorded as uncertain and
+never replayed. The review evidence adds `targetChangedPaths` (capped at 100),
+`targetChangedPathCount` and `acceptedChecks`. The coordinator may recommend
+approve-once only for a run of the task's tests or an accepted check in the
+target workspace with no install, download, publish, deploy, credential or
+global-setting effect. It escalates when a changed path defines what the command
+runs (package manifests or scripts, lockfiles, Makefiles, test, build or
+TypeScript configuration, scripts directories), when the path list is truncated,
+and when any evidence is missing or unclear.
+
 The permission coordinator runs noninteractively with no built-in tools and only
 the authenticated assignment report MCP server. Unexpected tool permissions are
 denied. Configurations that add conflicting launch or MCP flags are rejected.

@@ -141,13 +141,15 @@ test("phone avatars and ages stay short and stable", () => {
 });
 
 const member = (memberId: string, status = "running") => ({ memberId, sessionId: `s-${memberId}`, role: "implementer", revision: 2, title: memberId, status }) as TeamMember;
-const waiting = (memberId: string, prompt: { id: number; kind: string; destructive?: unknown }) => ({ id: `s-${memberId}`, attention: { state: "needs-you", prompt } });
+const waiting = (memberId: string, prompt: { id: number; kind: string; destructive?: unknown; multiSelect?: boolean; delegable?: boolean }) => ({ id: `s-${memberId}`, attention: { state: "needs-you", prompt } });
 const decided = (memberId: string, promptId: number, status: PermissionDecision["status"]) =>
   ({ id: `d-${memberId}-${promptId}`, revision: 2, targetMemberId: memberId, targetSessionId: `s-${memberId}`, promptId, expiresAt: "2026-01-01T00:05:00.000Z", status }) as PermissionDecision;
-const delegated = { permissions: { mode: "coordinator" as const, scope: "Read access", maxDecisions: 3 } };
+const lineup = (tier?: "light" | "strong") => ({ coordinator: { id: "pm", label: "Coordinator", provider: "codex", model: "gpt", tier }, integrator: { id: "int", label: "Integrator", provider: "codex", model: "gpt" }, reviewer: { id: "rev", label: "Reviewer", provider: "codex", model: "gpt" }, implementers: [] });
+const delegated = { permissions: { mode: "coordinator" as const, scope: "Read access", maxDecisions: 3 }, lineup: lineup("strong") };
 
 test("agent prompts reach a person only when the coordinator cannot or did not decide them", () => {
-  const permission = { id: 7, kind: "permission" };
+  // The host marks a prompt delegable only with the complete evidence a coordinator review needs.
+  const permission = { id: 7, kind: "permission", delegable: true };
   // Without delegation every open agent prompt waits on a person.
   assert.equal(approvalOwner(team(), "s-a", permission), "person");
   // A delegated one-shot permission is the coordinator's, until it escalates or its decision goes stale.
@@ -157,15 +159,21 @@ test("agent prompts reach a person only when the coordinator cannot or did not d
   assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: [decided("a", 7, "stale")] }), "s-a", permission), "person");
   // A decision about an earlier prompt does not cover a new one.
   assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: [decided("a", 6, "answered")] }), "s-a", permission), "coordinator");
-  // Questions, destructive commands, revoked delegation, and a spent decision budget stay with a person.
-  assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "question" }), "person");
-  assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "permission", destructive: { pattern: "rm-rf" } }), "person");
+  // Questions, destructive or multi-select commands, revoked delegation, and a spent decision budget stay with a person.
+  assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "question", delegable: true }), "person");
+  assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "permission", delegable: true, destructive: { pattern: "rm-rf" } }), "person");
+  assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "permission", delegable: true, multiSelect: true }), "person");
   assert.equal(approvalOwner(team({ ...delegated, permissionsRevokedAt: "2026-01-01T00:00:00.000Z" }), "s-a", permission), "person");
   const spent = ["x", "y", "z"].map((id, index) => decided(id, index, "answered"));
   assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: spent }), "s-a", permission), "person");
+  // A prompt without the host's delegable evidence (the INF-80 Codex command dialog had none) waits on a person, even under a strong coordinator.
+  assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "permission" }), "person");
+  // Only a strong coordinator reviews, so a light coordinator or a run without a lineup leaves the prompt with a person.
+  assert.equal(approvalOwner(team({ ...delegated, lineup: lineup("light") }), "s-a", permission), "person");
+  assert.equal(approvalOwner(team({ permissions: delegated.permissions }), "s-a", permission), "person");
 
   const run = team({ ...delegated, members: [member("a"), member("b"), member("c", "stopped"), { ...member("d"), revision: 1 }], permissionDecisions: [decided("b", 9, "escalated")] });
-  const sessions = [waiting("a", permission), waiting("b", { id: 9, kind: "permission" }), waiting("c", { id: 1, kind: "question" }), waiting("d", { id: 2, kind: "question" })];
+  const sessions = [waiting("a", permission), waiting("b", { id: 9, kind: "permission", delegable: true }), waiting("c", { id: 1, kind: "question" }), waiting("d", { id: 2, kind: "question" })];
   // Only live members of the current revision count; a's prompt is the coordinator's, b's was escalated.
   assert.deepEqual(pendingApprovals(run, sessions).map(item => item.member.memberId), ["b"]);
   assert.equal(teamGroup(run, 1), "attention");

@@ -1,16 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { claimControl, waitFor } from "./helpers.js";
 import { fixture, limitLineup } from "./team-fixture.js";
 import type { TeamLineup } from "../packages/host/src/team-types.js";
+import { refusedBeforeSend } from "../packages/host/src/team-permissions.js";
+import { ContentError } from "../packages/host/src/session-content.js";
 
 const permissionLineup: TeamLineup = {
   ...limitLineup,
   coordinator: { ...limitLineup.coordinator, id: "claude-coordinator", label: "Claude coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
 };
+
+test("only a preflight or named worker refusal counts as an answer that sent nothing", () => {
+  assert.equal(refusedBeforeSend(new ContentError("The assigned team member has no running managed terminal")), true);
+  for (const code of ["prompt-changed", "control-busy", "control-lost"])
+    assert.equal(refusedBeforeSend(Object.assign(new Error(code), { code })), true, code);
+  // A socket error can follow a delivered key, like a lost acknowledgement.
+  for (const code of ["ECONNRESET", "EPIPE", undefined])
+    assert.equal(refusedBeforeSend(Object.assign(new Error("Worker connection failed"), { code })), false, String(code));
+});
 
 test("an explicit permission policy reviews and answers only the recorded one-shot prompt", { timeout: 120000 }, async () => {
   const f = await fixture("permissions", permissionLineup);
@@ -34,6 +45,118 @@ test("an explicit permission policy reviews and answers only the recorded one-sh
       state: (await f.host.fetchApi(`/sessions/${member.sessionId}`)).body,
     })));
     assert.equal(finished.status, "ready-for-review", JSON.stringify({ run: finished, runtime }));
+  } finally { await f.close(); }
+});
+
+test("a Codex screen-only permission review includes the target's changed paths", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex", permissionLineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const reviewing = await waitFor(() => f.get(created.body.id), run =>
+      run.permissionDecisions?.some(decision => decision.status === "reviewing") &&
+      existsSync(join(f.receipts, `${run.id}.judge-ready`)) &&
+      existsSync(join(f.receipts, `${run.id}.permission-feedback.json`)), 60000);
+    // While the coordinator reviews, the run does not tell the person to answer the prompt.
+    await waitFor(() => f.get(reviewing.id), run => run.reason === "The permission coordinator is reviewing a provider request.", 10000);
+    writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
+
+    const answered = await waitFor(() => f.get(reviewing.id), run => run.permissionDecisions?.[0]?.status === "answered", 30000);
+    assert.equal(answered.permissionDecisions[0].receipt?.state, "delivered");
+    assert.equal(answered.permissionDecisions[0].receipt?.result, "closed");
+    const feedback = JSON.parse(readFileSync(join(f.receipts, `${reviewing.id}.permission-feedback.json`), "utf8"));
+    assert.ok(feedback.targetChangedPaths.includes("a.txt"), JSON.stringify(feedback.targetChangedPaths));
+    assert.equal(feedback.targetChangedPathCount, feedback.targetChangedPaths.length);
+    assert.deepEqual(feedback.acceptedChecks, [{ command: process.execPath, args: ["check.mjs"] }]);
+  } finally { await f.close(); }
+});
+
+test("a Codex command redrawn with different spacing is not answered with the reviewed approval", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex-respace", permissionLineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const reviewing = await waitFor(() => f.get(created.body.id), run =>
+      run.permissionDecisions?.some(decision => decision.status === "reviewing") &&
+      existsSync(join(f.receipts, `${run.id}.judge-ready`)) && existsSync(join(f.receipts, `${run.id}.target-ready`)), 60000);
+    const target = reviewing.members.find(member => member.memberId === reviewing.permissionDecisions[0].targetMemberId)!;
+    writeFileSync(join(f.receipts, `${reviewing.id}.target-change`), "change", { mode: 0o600 });
+    await waitFor(async () => (await f.host.fetchApi(`/sessions/${target.sessionId}`)).body.screen ?? "", screen => screen.includes("$ npm run  check"), 10000);
+    writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
+    const escalated = await waitFor(() => f.get(reviewing.id), run => run.permissionDecisions?.[0]?.status === "escalated", 30000);
+    assert.equal(escalated.permissionDecisions[0].receipt, undefined);
+    assert.match(escalated.permissionDecisions[0].reason ?? "", /nothing was sent/);
+    assert.equal(escalated.permissionDecisions.length, 1, "the redrawn prompt keeps its identity and stays with the user");
+  } finally { await f.close(); }
+});
+
+test("a Codex command redrawn while the answer is in progress receives no Enter", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex-midway", permissionLineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const reviewing = await waitFor(() => f.get(created.body.id), run =>
+      run.permissionDecisions?.some(decision => decision.status === "reviewing") && existsSync(join(f.receipts, `${run.id}.judge-ready`)), 60000);
+    writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
+    // Arrow keys reached the dialog before it changed, so the host cannot say nothing was sent.
+    const uncertain = await waitFor(() => f.get(reviewing.id), run => !["pending", "reviewing", "approved", "answering"].includes(run.permissionDecisions?.[0]?.status ?? "pending"), 30000);
+    assert.equal(uncertain.permissionDecisions[0].status, "uncertain", JSON.stringify(uncertain.permissionDecisions[0]));
+    assert.equal(uncertain.permissionDecisions[0].receipt?.state, "uncertain");
+    assert.equal(existsSync(join(f.receipts, `${reviewing.id}.enter`)), false, "the changed command must not be confirmed");
+  } finally { await f.close(); }
+});
+
+test("an approved permission shown as a yes-no line stays with the user without a key", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-yesno", permissionLineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const decided = await waitFor(() => f.get(created.body.id), run => ["escalated", "uncertain", "answered"].includes(run.permissionDecisions?.[0]?.status ?? ""), 60000);
+    const decision = decided.permissionDecisions[0];
+    assert.equal(decision.status, "escalated", JSON.stringify(decision));
+    assert.match(decision.reason ?? "", /nothing was sent/);
+    const target = decided.members.find(member => member.memberId === decision.targetMemberId)!;
+    assert.match((await f.host.fetchApi(`/sessions/${target.sessionId}`)).body.screen, /Run this command\? \[Y\/n\] *$/m);
+  } finally { await f.close(); }
+});
+
+test("a missing pinned coordinator provider records an escalation", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex-profile-missing", permissionLineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const waiting = await waitFor(() => f.get(created.body.id), run =>
+      run.members.some(member => member.role === "implementer" && member.taskId === "a") &&
+      existsSync(join(f.receipts, `${run.id}.target-ready`)), 60000);
+
+    await f.host.stopApi();
+    delete f.host.config.agents.claude;
+    writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
+    await f.host.start();
+    writeFileSync(join(f.receipts, `${waiting.id}.target-release`), "release", { mode: 0o600 });
+
+    const escalated = await waitFor(() => f.get(waiting.id), run => run.permissionDecisions?.[0]?.status === "escalated", 30000);
+    assert.match(escalated.permissionDecisions[0].reason ?? "", /pinned permission coordinator provider is not configured/i);
+    assert.equal(escalated.members.some(member => member.role === "permission-coordinator"), false);
+  } finally { await f.close(); }
+});
+
+test("an unresolved target workspace records an escalation", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex-realpath", permissionLineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const waiting = await waitFor(() => f.get(created.body.id), run =>
+      run.members.some(member => member.role === "implementer" && member.taskId === "a") &&
+      existsSync(join(f.receipts, `${run.id}.target-ready`)), 60000);
+    const target = waiting.members.find(member => member.role === "implementer" && member.taskId === "a")!;
+    const receipt = JSON.parse(readFileSync(join(f.receipts, `${target.memberId}.json`), "utf8"));
+    const movedWorkspace = `${receipt.cwd}.moved`;
+    renameSync(receipt.cwd, movedWorkspace);
+    writeFileSync(join(f.receipts, `${waiting.id}.target-release`), "release", { mode: 0o600 });
+
+    const escalated = await waitFor(() => f.get(waiting.id), run => run.permissionDecisions?.[0]?.status === "escalated", 30000);
+    assert.match(escalated.permissionDecisions[0].reason ?? "", /workspace could not be resolved/i);
   } finally { await f.close(); }
 });
 

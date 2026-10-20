@@ -7,7 +7,7 @@ import {
   Text,
   View,
 } from "react-native";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "expo-router";
 import { PROVIDER_NAMES } from "@infinite/attention";
 import {
@@ -26,6 +26,7 @@ import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
 import { DictationNotice } from "../../dictation/DictationControls";
 import { useDictation } from "../../dictation/useDictation";
+import { MissionManagedLine } from "../board/MissionManagedLine";
 import { useControlSync, useSessionControl } from "./useSessionControl";
 import { KEYS, useSteering } from "./useSteering";
 
@@ -57,20 +58,31 @@ export function Terminal({
   );
   useControlSync(control, data, stale);
   const session = data?.session ?? null;
+  // A mission coordinator runs this session. While its provider prompt is open the person may answer in the
+  // terminal, so input and control are offered; otherwise the phone sends no text, keys, stop, resume or control.
+  const missionId = session?.managedBy?.missionId;
+  const needsYou = session?.attention.state === "needs-you";
+  const missionLocked = Boolean(missionId) && !needsYou;
   const role = data?.me.role;
   const environment = data?.me.environment ?? "";
   // Workers that enforce control take input only from the device holding the lease.
-  const requiresControl = session?.capabilities?.inputControl === 1;
+  const requiresControl = !missionLocked && session?.capabilities?.inputControl === 1;
+  // A lease this phone still holds once a mission-run session no longer needs a person is released.
+  const { forget } = control;
+  useEffect(() => {
+    if (missionLocked) forget(true);
+  }, [forget, missionLocked]);
   // The person sees the screen here, so text may go into an open dialog.
   const steering = useSteering(connection, id, refresh, control, {
     force: true,
     draftKey: `${connectionKey(connection)}/${id}/terminal`,
     requiresControl,
+    managed: missionLocked,
   });
   const running = session?.status === "running";
   const controlled = !requiresControl || control.lease !== null;
   const canSteer =
-    online && running && role !== undefined && role !== "viewer" && controlled;
+    online && running && role !== undefined && role !== "viewer" && controlled && !missionLocked;
   const canSend = canSteer && !steering.busy && Boolean(steering.text.trim());
   // Drafts work without control, so dictation does too; it stops only where the text itself is locked.
   const dictation = useDictation({
@@ -124,7 +136,7 @@ export function Terminal({
                   : "Waiting for a fresh response…"}
             </Text>
           </View>
-          <ControlBar
+          {missionLocked ? null : <ControlBar
             role={role}
             requiresControl={requiresControl}
             running={running}
@@ -138,44 +150,47 @@ export function Terminal({
               control.forget(true);
               refresh();
             }}
-          />
+          />}
           <ScrollView style={s.fill} contentContainerStyle={s.scrollBody}>
             <Text style={s.label}>Current screen</Text>
             <Text selectable style={s.screen}>
               {session.screen || "This process has no current screen."}
             </Text>
           </ScrollView>
-          {role !== undefined && role !== "viewer" && (
-            <Composer
-              canSteer={canSteer}
-              onTakeControl={online && running && !controlled ? () => void takeControl(Boolean(control.holder)) : undefined}
-              controlBusy={control.busy}
-              controlLabel={control.holder ? "Take over" : "Take control"}
-              idleHint={
-                online && running && !controlled
-                  ? "Draft here. Take control when ready…"
-                  : undefined
-              }
-              busy={steering.busy}
-              pending={steering.pending}
-              text={steering.text}
-              onChangeText={steering.setText}
-              onSend={send}
-              onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
-              dictation={dictation}
-            >
-              {KEYS.map((key) => (
-                <Button
-                  key={key}
-                  compact
-                  title={key[0].toUpperCase() + key.slice(1)}
-                  onPress={() => steering.sendKey(key)}
-                  secondary
-                  disabled={!canSteer || steering.busy}
-                />
-              ))}
-            </Composer>
-          )}
+          {/* One measured block for the mission line and the composer, so the notice clears whichever is taller. */}
+          <View onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}>
+            {missionId ? <MissionManagedLine missionId={missionId} machine={connectionKey(connection)} style={s.managedLine} /> : null}
+            {role !== undefined && role !== "viewer" && !missionLocked ? (
+              <Composer
+                canSteer={canSteer}
+                onTakeControl={online && running && !controlled ? () => void takeControl(Boolean(control.holder)) : undefined}
+                controlBusy={control.busy}
+                controlLabel={control.holder ? "Take over" : "Take control"}
+                idleHint={
+                  online && running && !controlled
+                    ? "Draft here. Take control when ready…"
+                    : undefined
+                }
+                busy={steering.busy}
+                pending={steering.pending}
+                text={steering.text}
+                onChangeText={steering.setText}
+                onSend={send}
+                dictation={dictation}
+              >
+                {KEYS.map((key) => (
+                  <Button
+                    key={key}
+                    compact
+                    title={key[0].toUpperCase() + key.slice(1)}
+                    onPress={() => steering.sendKey(key)}
+                    secondary
+                    disabled={!canSteer || steering.busy}
+                  />
+                ))}
+              </Composer>
+            ) : null}
+          </View>
         </>
       )}
       <DictationNotice dictation={dictation} position="top" offset={110} />
@@ -198,6 +213,7 @@ const s = StyleSheet.create({
   fill: { flex: 1 },
   overlayRoot: { position: "relative" },
   noticeActions: { flexDirection: "row", gap: 6 },
+  managedLine: { marginHorizontal: 12, marginTop: 6, marginBottom: 10 },
   small: { fontSize: 11, lineHeight: 17, color: theme.colors.mutedInk },
   empty: { padding: 30, gap: 15 },
   body: {

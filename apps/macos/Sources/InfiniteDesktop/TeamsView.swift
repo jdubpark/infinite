@@ -32,7 +32,7 @@ struct TeamDetailView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 22) {
                         banners
-                        if team.status == "ready-for-review" { reviewPanel }
+                        if team.status == "ready-for-review" && !model.managed { reviewPanel }
                         decisions
                         attention
                         section("Run map") {
@@ -51,7 +51,11 @@ struct TeamDetailView: View {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             Divider()
-            composer.padding(12)
+            if model.managed {
+                MissionManagedNote(missionID: team.missionID) { app.selectedMissionID = $0 }.padding(12)
+            } else {
+                composer.padding(12)
+            }
         }
         .background(Palette.background)
         .onAppear { model.startPolling() }
@@ -86,7 +90,7 @@ struct TeamDetailView: View {
             }.padding(.horizontal, 9).padding(.vertical, 4)
                 .glassSurface(in: Capsule(), tint: teamColor(team))
                 .help(model.displayStale ? "Updates unavailable. Controls stay disabled until the next successful refresh." : "")
-            if model.role == "owner" && team.status != "cancelled" {
+            if model.role == "owner" && team.status != "cancelled" && !model.managed {
                 Menu {
                     let resumes = team.status == "paused" || team.offersResume
                     if resumes || !["blocked", "ready-for-review"].contains(team.status) {
@@ -154,9 +158,10 @@ struct TeamDetailView: View {
         }
     }
 
+    /// A mission's subteam answers its questions through the coordinator, so its open decisions carry no answer controls here.
     @ViewBuilder private var decisions: some View {
         let open = team.openDecisions
-        if !open.isEmpty {
+        if !open.isEmpty && !model.managed {
             section("Decisions for you", count: open.count) {
                 // Keyed by decision ID so a typed draft never moves to another question after a poll.
                 ForEach(open, id: \.["id"].string) { decision in
@@ -343,6 +348,26 @@ struct TeamDetailView: View {
     }
 }
 
+/// The one line that stands in for steering and owner controls on a run or session a mission's coordinator
+/// runs. With an opener it is a button that goes to the mission, where the owner talks to the coordinator.
+struct MissionManagedNote: View {
+    let missionID: String
+    var openMission: ((String) -> Void)? = nil
+    private let line = "Run by its mission coordinator. Talk to the coordinator from the mission."
+    var body: some View {
+        if let openMission {
+            Button { openMission(missionID) } label: {
+                HStack(spacing: 8) {
+                    Text(line).font(.caption).foregroundStyle(.secondary).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain).help("Open the mission").accessibilityHint("Opens the mission")
+        } else {
+            Text(line).font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
 /// A question a member or a mission coordinator asked, answered by its options or in words.
 struct DecisionCard: View {
     let decision: JSON
@@ -401,7 +426,7 @@ struct TaskCard: View {
                 if !depends.isEmpty { Text("After: \(depends.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary) }
                 assigned
                 if let usage { spend(usage) }
-                if rate != nil || rating != nil {
+                if !team.managedByMission && (rate != nil || rating != nil) {
                     HStack(spacing: 6) {
                         Text("Your rating").font(.caption).foregroundStyle(.secondary)
                         RatingControl(score: rating?.score, at: rating?.at, enabled: rate != nil && canRate) { score in rate?(score) }

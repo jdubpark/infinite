@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Prompt } from "@infinite/attention";
 import { RefreshCw } from "lucide-react";
-import { ApiError, isControlRefusal, useApi, type ChatMessage, type MessagesPage, type ProjectFile, type Session } from "./api";
+import { ApiError, isControlRefusal, isMissionManaged, useApi, type ChatMessage, type MessagesPage, type ProjectFile, type Session } from "./api";
 import { useMachines } from "./machines";
 import { lifecycles } from "./requests";
 
@@ -159,7 +159,7 @@ export function SessionLifecycle({ session, role, online, controlId, refresh }: 
       const settled = lifecycles.complete(key, request.requestId, request.action === "resume" && result.id ? { id: result.id } : undefined, request.action === "stop" ? "End requested. Refreshing." : "");
       if (settled && mounted.current && request.action === "resume" && result.id) window.location.hash = `${machine === "direct" ? "" : `/machines/${machine}`}/sessions/${result.id}/chat`;
       if (mounted.current) refresh();
-    } catch (error) { lifecycles.fail(key, request.requestId, `${(error as Error).message} Check the session state before retrying.`); }
+    } catch (error) { lifecycles.fail(key, request.requestId, isMissionManaged(error) ? error.message : `${(error as Error).message} Check the session state before retrying.`); }
     finally { inFlight.current.delete(request.requestId); if (mounted.current) setSendingId(current => current === request.requestId ? undefined : current); }
   }
   if (role !== "owner") return null;

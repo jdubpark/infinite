@@ -23,6 +23,8 @@ test("phone team controls follow the documented roles and goal ownership", () =>
   assert.deepEqual(teamControls(team(), "viewer", true), { answer: false, steer: false, pause: false, resume: false, cancel: false });
   // A goal-owned team is steered and stopped from its goal; its decisions stay answerable here.
   assert.deepEqual(teamControls(team({ goal: { id: "goal", revision: 1, cycle: 1 } }), "owner", true), { answer: true, steer: false, pause: false, resume: false, cancel: false });
+  // A mission subteam is run only by its coordinator; the owner talks to the coordinator instead.
+  assert.deepEqual(teamControls(team({ missionId: "mission", status: "blocked", resumable: true }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: false });
   // A stale view offers nothing until a poll succeeds.
   assert.deepEqual(teamControls(team(), "owner", false), { answer: false, steer: false, pause: false, resume: false, cancel: false });
   assert.deepEqual(teamControls(team({ status: "paused" }), "owner", true), { answer: false, steer: true, pause: false, resume: true, cancel: true });
@@ -128,6 +130,9 @@ test("phone status icons show plan progress without reading a full ring as compl
   // Planning has no tasks yet, but started work still shows a quarter.
   assert.deepEqual(teamKind(team({ status: "planning" })), { kind: "progress", fraction: 0.25 });
   assert.equal(teamKind(team({ status: "ready-for-review" })).kind, "review");
+  // A mission subteam waiting on its coordinator needs nothing from the owner, unless a provider prompt is open.
+  assert.equal(teamKind(team({ missionId: "mission", status: "needs-input" })).kind, "progress");
+  assert.equal(teamKind(team({ missionId: "mission", status: "needs-input" }), 1).kind, "attention");
   assert.equal(teamKind(team({ status: "paused", decisions: [question] })).kind, "paused");
   assert.equal(teamKind(team({ decisions: [question] })).kind, "attention");
   const tasks = [task("t1", "integrated"), task("t2", "pending", ["t1"]), task("t3", "pending", ["t2"]), task("t4", "waiting")];

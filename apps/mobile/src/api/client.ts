@@ -159,6 +159,8 @@ export type SessionRow = {
   projectId?: string;
   /** Present on a team member; the team scheduler owns its lifecycle. */
   team?: { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string };
+  /** Set on a session a mission coordinator runs (its coordinator or a subteam member). The host refuses input, stop, resume and control for it. */
+  managedBy?: { kind: "mission"; missionId: string; teamId?: string };
   resumable?: boolean;
   title: string;
   reading?: {

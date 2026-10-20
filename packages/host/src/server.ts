@@ -39,7 +39,7 @@ import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
-import type { Config, Role, Receipt } from "./types.js";
+import type { Config, Role, Receipt, Session } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
@@ -189,7 +189,8 @@ export function createApp(config: Config, key: Buffer) {
   const listSessions = async () => {
     const native = (await manager.list({ includeFullMessage: Boolean(config.jev) })).map(session => {
       const handoff = handoffs.view(session.id);
-      return { ...session, handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
+      const managed = managedBy(session);
+      return { ...session, ...(managed ? { managedBy: managed } : {}), handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
         resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
     });
     // Provider conversation IDs survive restarts and can exist in several
@@ -207,8 +208,9 @@ export function createApp(config: Config, key: Buffer) {
     }
     const session = { ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) };
     const handoff = handoffs.view(sessionId);
+    const managed = managedBy(session);
     const { generatedTitle: _generatedTitle, ...publicSession } = readings.merge([session])[0];
-    return { ...publicSession, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
+    return { ...publicSession, ...(managed ? { managedBy: managed } : {}), handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
       resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
   };
   const sessionEvents = async (sessionId: string, after: number, limit = 200) => {
@@ -381,6 +383,55 @@ export function createApp(config: Config, key: Buffer) {
           });
   const requireOwnerCli: express.RequestHandler = (_req, res, next) =>
     res.locals.bearer ? next() : void res.status(403).json({ error: "Workspace sync requires a paired owner CLI" });
+  const managedBy = (session: Pick<Session, "team">): Session["managedBy"] => {
+    const assignment = session.team;
+    if (!assignment) return undefined;
+    if (assignment.role === "mission-coordinator") return { kind: "mission", missionId: assignment.runId };
+    try {
+      const missionId = teams.missionIdOf(assignment.runId);
+      return missionId ? { kind: "mission", missionId, teamId: assignment.runId } : undefined;
+    }
+    catch (error) {
+      if (error instanceof TeamError && error.code === "team-not-found") return undefined;
+      throw error;
+    }
+  };
+  const missionManagedSession = (sessionId: string) => Boolean(managedBy(manager.meta(sessionId).session));
+  const missionManagedError = {
+    error: "This session is run by its mission coordinator. Talk to the coordinator from the mission.",
+    code: "mission-managed",
+  };
+  // Attach this after route matching and before role checks, using Express's
+  // decoded route params so case, escapes, and optional trailing slashes cannot
+  // skip the mission boundary.
+  const refuseMissionManaged: express.RequestHandler = (req, res, next) => {
+    const param = req.params.id ?? req.params[0];
+    const sessionId = Array.isArray(param) ? param[0] : param;
+    if (!sessionId || !id.safeParse(sessionId).success) return next();
+    try {
+      if (missionManagedSession(sessionId)) return void res.status(409).json(missionManagedError);
+      next();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return next();
+      next(error);
+    }
+  };
+  const refuseManagedOutsideProviderPrompt: express.RequestHandler = (req, res, next) => {
+    const param = req.params.id ?? req.params[0];
+    const sessionId = Array.isArray(param) ? param[0] : param;
+    if (!sessionId || !id.safeParse(sessionId).success) return next();
+    void (async () => {
+      if (!missionManagedSession(sessionId)) return next();
+      if ((await manager.state(sessionId)).attention?.state === "needs-you") return next();
+      res.status(409).json(missionManagedError);
+    })().catch(error => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") next();
+      else next(error);
+    });
+  };
+  // A fallback lease on a managed session lapses within its TTL once the prompt closes; release stays open.
+  const refuseManagedClaim: express.RequestHandler = (req, res, next) =>
+    req.body?.action === "claim" || req.body?.action === "renew" ? refuseManagedOutsideProviderPrompt(req, res, next) : next();
   app.get("/api/me", (_req, res) =>
     res.json({
       role: res.locals.role,
@@ -823,12 +874,12 @@ export function createApp(config: Config, key: Buffer) {
     if (session.workspace) throw new ContentError("Hybrid files must be inspected on their executor or through an explicit recovery copy");
     res.json(await sessionFile(session, z.string().parse(req.query.path)));
   });
-  app.post("/api/sessions/:id/resume", requireRole(["owner"]), async (req, res) => {
+  app.post("/api/sessions/:id/resume", refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);
     const { requestId } = z.object({ requestId: id }).strict().parse(req.body);
     res.json(await startInProject(manager.meta(sessionId).session.projectId, () => manager.resume(sessionId, requestId)));
   });
-  app.get("/api/sessions/:id/native", requireRole(["owner"]), async (req, res) => {
+  app.get("/api/sessions/:id/native", refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });
     const sessionId = id.parse(req.params.id);
     if (!manager.meta(sessionId).session.runtime?.nativeUi) return res.status(409).json({ error: "This session uses its original terminal transport" });
@@ -842,7 +893,7 @@ export function createApp(config: Config, key: Buffer) {
     if (request.method === "sync/blob" && !request.hash) return void res.status(400).json({ error: "A content hash is required" });
     res.json(await workerCall(config.runDir, sessionId, { op: "workspace-export", ...request }, 300000));
   });
-  app.all(/^\/api\/sessions\/([a-f\d-]{36})\/opencode(\/.*)?$/, requireRole(["owner"]), async (req, res) => {
+  app.all(/^\/api\/sessions\/([a-f\d-]{36})\/opencode(\/.*)?$/, refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer || req.headers.origin || !res.locals.leaseId) return void res.status(403).json({ error: "Native access requires an owner CLI and current control" });
     const sessionId = id.parse(req.params[0]);
     if (manager.meta(sessionId).session.runtime?.nativeUi !== "opencode") return void res.status(409).json({ error: "This session does not use an OpenCode server" });
@@ -891,7 +942,7 @@ export function createApp(config: Config, key: Buffer) {
     const page = await sessionEvents(sessionId, after, limit);
     res.json({ ...page, events: types ? page.events.filter(event => types.has(event.type)) : page.events });
   });
-  app.post("/api/sessions/:id/control", requireRole(["owner", "controller"]), async (req, res) => {
+  app.post("/api/sessions/:id/control", refuseManagedClaim, requireRole(["owner", "controller"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);
     manager.meta(sessionId);
     const body = z.object({
@@ -905,7 +956,7 @@ export function createApp(config: Config, key: Buffer) {
   });
   // Only a directly paired owner CLI can send terminal control bytes. Browser
   // cookies and controller/viewer keys retain their existing narrower inputs.
-  app.post("/api/sessions/:id/raw", requireRole(["owner"]), async (req, res) => {
+  app.post("/api/sessions/:id/raw", refuseManagedOutsideProviderPrompt, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use native input" });
     const sessionId = id.parse(req.params.id);
     manager.meta(sessionId);
@@ -937,6 +988,7 @@ export function createApp(config: Config, key: Buffer) {
   });
   app.post(
     "/api/sessions/:id/input",
+    refuseManagedOutsideProviderPrompt,
     requireRole(["owner", "controller"]),
     async (req, res) => {
       const sessionId = id.parse(req.params.id);
@@ -968,13 +1020,14 @@ export function createApp(config: Config, key: Buffer) {
       const sessionId = id.parse(req.params.id);
       manager.meta(sessionId);
       const body = answerSchema.parse(req.body);
+      const authority = missionManagedSession(sessionId) ? { missionManaged: true as const } : await inputAuthority(sessionId, res);
       try {
         // An answer waits for the dialog to redraw and close, so it gets more than the default 4 s.
         res.json(
           await workerCall(
             config.runDir,
             sessionId,
-            { op: "answer", ...body, ...await inputAuthority(sessionId, res) },
+            { op: "answer", ...body, ...authority },
             12000,
           ),
         );
@@ -991,6 +1044,7 @@ export function createApp(config: Config, key: Buffer) {
   );
   app.post(
     "/api/sessions/:id/key",
+    refuseManagedOutsideProviderPrompt,
     requireRole(["owner", "controller"]),
     async (req, res) => {
       const sessionId = id.parse(req.params.id);
@@ -1009,6 +1063,7 @@ export function createApp(config: Config, key: Buffer) {
   );
   app.post(
     "/api/sessions/:id/stop",
+    refuseMissionManaged,
     requireRole(["owner"]),
     async (req, res) => {
       const sessionId = id.parse(req.params.id);
@@ -1192,8 +1247,8 @@ export function createApp(config: Config, key: Buffer) {
   server.once("close", () => linear.close());
   server.once("close", () => handoffs.close());
   server.once("close", () => readings.stop());
-  const closeTerminals = connectTerminals(server, manager, authenticate);
-  const closeNative = connectNativeFrontends(server, manager, authenticate);
+  const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
+  const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
   const closeConnections = () => { live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };

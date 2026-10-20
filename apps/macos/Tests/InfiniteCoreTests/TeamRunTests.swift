@@ -87,6 +87,13 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(TeamRun.blockedFirst([]).map(\.id), [])
     }
 
+    func testMissionSubteamsAreManagedAndNeverOfferAListResume() {
+        let subteam = run(["status": .string("blocked"), "resumable": .bool(true), "missionId": .string("m-1")])
+        XCTAssertTrue(subteam.managedByMission)
+        XCTAssertFalse(subteam.offersResume)
+        XCTAssertFalse(run([:]).managedByMission)
+    }
+
     func testOnlyAResumableBlockedRunWithoutGoalOrReceiptOffersResume() {
         let receipt: JSON = .object(["id": .string("r1")])
         XCTAssertTrue(run(["status": .string("blocked"), "resumable": .bool(true)]).offersResume)

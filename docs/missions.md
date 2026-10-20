@@ -15,7 +15,9 @@ unit the owner manages.
 Every enrolled repository is a host project, as before. An owner groups
 repositories into a project with an explicit create. A repository outside every
 group appears as an implicit single-repository project whose ID is its host
-project ID. A repository belongs to at most one owner-created group.
+project ID. A repository belongs to at most one owner-created group. Deleting
+an owner-created group retires its ID permanently; a later group with the same
+name receives another available slug.
 
 Grouping grants a mission's coordinator read access to every repository in the
 group and lets it dispatch subteams to them. It does not merge project context,

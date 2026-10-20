@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { Config, Project } from "../packages/host/src/types.js";
 import { ProjectGroupService } from "../packages/host/src/project-groups.js";
 import { TeamError } from "../packages/host/src/team-workspace.js";
+import { writeSealed } from "../packages/host/src/vault.js";
 import { startHost, type Host } from "./helpers.js";
 
 function fixture() {
@@ -64,6 +65,122 @@ test("project group requests replay their stored result and reject request ID re
     const created = service.create(request);
     assert.deepEqual(service.create(request), created);
     assert.throws(() => service.create({ ...request, name: "Different" }), failWith(409, "request-conflict"));
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("project group persistence failures preserve memory and allow the same request to retry", () => {
+  const f = fixture();
+  try {
+    let failWrites = true;
+    const writer = (file: string, key: Buffer, scope: string, value: unknown) => {
+      if (failWrites) throw new Error("Persistence unavailable.");
+      writeSealed(file, key, scope, value);
+    };
+    const service = new ProjectGroupService(f.config, f.key, writer);
+    const request = { requestId: randomUUID(), name: "Recoverable", repos: ["rehearsal", "beta"] };
+
+    assert.throws(() => service.create(request), /Persistence unavailable/);
+    assert.throws(() => service.get("recoverable"), failWith(404, "project-group-not-found"));
+
+    failWrites = false;
+    const created = service.create(request);
+    assert.equal(created.id, "recoverable");
+    assert.deepEqual(new ProjectGroupService(f.config, f.key).get(created.id), created);
+
+    const updateRequest = { requestId: randomUUID(), revision: created.revision, name: "Recovered Update" };
+    failWrites = true;
+    assert.throws(() => service.update(created.id, updateRequest), /Persistence unavailable/);
+    assert.deepEqual(service.get(created.id), created);
+    failWrites = false;
+    const updated = service.update(created.id, updateRequest);
+    assert.equal(updated.name, "Recovered Update");
+    assert.deepEqual(new ProjectGroupService(f.config, f.key).get(created.id), updated);
+
+    const removeRequest = { requestId: randomUUID(), revision: updated.revision };
+    failWrites = true;
+    assert.throws(() => service.remove(created.id, removeRequest), /Persistence unavailable/);
+    assert.deepEqual(service.get(created.id), updated);
+    failWrites = false;
+    assert.deepEqual(service.remove(created.id, removeRequest), updated);
+    const restarted = new ProjectGroupService(f.config, f.key);
+    assert.throws(() => restarted.get(created.id), failWith(404, "project-group-not-found"));
+    assert.deepEqual(restarted.remove(created.id, removeRequest), updated);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a failed post-rename write is retried before a later mutation can replace its receipt", () => {
+  const f = fixture();
+  try {
+    let failAfterWrite = true;
+    let firstGroup: ReturnType<ProjectGroupService["create"]> | undefined;
+    const writer = (file: string, key: Buffer, scope: string, value: unknown) => {
+      if (failAfterWrite) {
+        firstGroup = structuredClone((value as { groups: Record<string, ReturnType<ProjectGroupService["create"]>> }).groups.first);
+        writeSealed(file, key, scope, value);
+        failAfterWrite = false;
+        throw new Error("Directory sync unavailable.");
+      }
+      writeSealed(file, key, scope, value);
+    };
+    const service = new ProjectGroupService(f.config, f.key, writer);
+    const firstRequest = { requestId: randomUUID(), name: "First", repos: ["rehearsal", "beta"] };
+    assert.throws(() => service.create(firstRequest), /Directory sync unavailable/);
+    assert.throws(() => service.get("first"), failWith(404, "project-group-not-found"));
+
+    const second = service.create({ requestId: randomUUID(), name: "Second", repos: ["home-one", "home-two"] });
+    assert.equal(second.id, "second");
+
+    const restarted = new ProjectGroupService(f.config, f.key);
+    assert.deepEqual(restarted.get("first"), firstGroup);
+    assert.deepEqual(restarted.create(firstRequest), firstGroup);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("deleting and recreating a group name allocates a new ID and rejects mutations to the old ID", () => {
+  const f = fixture();
+  try {
+    const service = new ProjectGroupService(f.config, f.key);
+    const created = service.create({ requestId: randomUUID(), name: "Repeated Group", repos: ["rehearsal", "beta"] });
+    service.remove(created.id, { requestId: randomUUID(), revision: created.revision });
+    const recreated = service.create({ requestId: randomUUID(), name: "Repeated Group", repos: ["rehearsal", "beta"] });
+
+    assert.notEqual(recreated.id, created.id);
+    assert.throws(
+      () => service.update(created.id, { requestId: randomUUID(), revision: created.revision, name: "Stale edit" }),
+      error => error instanceof TeamError && (error.status === 404 || error.status === 409),
+    );
+    assert.deepEqual(service.get(recreated.id), recreated);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("legacy receipts reserve IDs for groups deleted before tombstones were stored", () => {
+  const f = fixture();
+  try {
+    const request = { requestId: randomUUID(), name: "Archived Group", repos: ["rehearsal", "beta"] };
+    const deleted = new ProjectGroupService(f.config, f.key).create(request);
+    writeSealed(join(f.config.stateDir, "project-groups", "state.sealed"), f.key, "project-groups", {
+      groups: {},
+      receipts: { [request.requestId]: { fingerprint: "legacy", result: deleted } },
+    });
+
+    const migrated = new ProjectGroupService(f.config, f.key);
+    const recreated = migrated.create({ ...request, requestId: randomUUID() });
+    assert.notEqual(recreated.id, deleted.id);
+    assert.equal(recreated.id, `${deleted.id}-2`);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("project group updates reject duplicate repository IDs without changing the group", () => {
+  const f = fixture();
+  try {
+    const service = new ProjectGroupService(f.config, f.key);
+    const created = service.create({ requestId: randomUUID(), name: "Applications", repos: ["rehearsal", "beta"] });
+
+    assert.throws(
+      () => service.update(created.id, { requestId: randomUUID(), revision: created.revision, repos: ["rehearsal", "rehearsal"] }),
+      error => error instanceof Error && error.message.includes("List each repository once."),
+    );
+    assert.deepEqual(service.get(created.id), created);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

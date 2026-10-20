@@ -8,7 +8,9 @@ import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchem
 import type { Config, Project } from "./types.js";
 
 type GroupReceipt = { fingerprint: string; result: ProjectGroup };
-type Stored = { groups: Record<string, ProjectGroup>; receipts: Record<string, GroupReceipt> };
+type Stored = { groups: Record<string, ProjectGroup>; receipts: Record<string, GroupReceipt>; tombstones?: string[] };
+type CurrentStored = { groups: Record<string, ProjectGroup>; receipts: Record<string, GroupReceipt>; tombstones: string[] };
+type StateWriter = (file: string, key: Buffer, scope: string, value: unknown) => void;
 
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const now = () => new Date().toISOString();
@@ -18,22 +20,52 @@ const notFound = () => new TeamError(404, "project-group-not-found", "This proje
 export class ProjectGroupService {
   private readonly directory: string;
   private readonly file: string;
-  private readonly state: Stored;
+  private state: CurrentStored;
+  private pending?: CurrentStored;
 
-  constructor(private readonly config: Config, private readonly key: Buffer) {
+  constructor(private readonly config: Config, private readonly key: Buffer, private readonly writeState: StateWriter = writeSealed) {
     this.directory = resolve(config.stateDir, "project-groups");
     this.file = resolve(this.directory, "state.sealed");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     try {
-      this.state = unseal<Stored>(key, "project-groups", readFileSync(this.file, "utf8"));
-      if (!this.state || typeof this.state.groups !== "object" || typeof this.state.receipts !== "object") throw new Error("Invalid project-group state");
+      const stored = unseal<Stored>(key, "project-groups", readFileSync(this.file, "utf8"));
+      if (!stored || !stored.groups || typeof stored.groups !== "object" || Array.isArray(stored.groups)
+        || !stored.receipts || typeof stored.receipts !== "object" || Array.isArray(stored.receipts)) throw new Error("Invalid project-group state");
+      const tombstones = stored.tombstones === undefined
+        ? this.retiredIdsFromReceipts(stored.groups, stored.receipts)
+        : stored.tombstones;
+      if (!Array.isArray(tombstones) || tombstones.some(id => typeof id !== "string" || !projectGroupIdSchema.safeParse(id).success))
+        throw new Error("Invalid project-group tombstones");
+      this.state = { groups: stored.groups, receipts: stored.receipts, tombstones: [...new Set(tombstones)] };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") this.state = { groups: {}, receipts: {} };
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") this.state = { groups: {}, receipts: {}, tombstones: [] };
       else throw error;
     }
   }
 
-  private persist() { writeSealed(this.file, this.key, "project-groups", this.state); }
+  private retiredIdsFromReceipts(groups: Record<string, ProjectGroup>, receipts: Record<string, GroupReceipt>): string[] {
+    const retired = new Set<string>();
+    for (const receipt of Object.values(receipts)) {
+      const id = receipt?.result?.id;
+      if (typeof id === "string" && !Object.hasOwn(groups, id) && projectGroupIdSchema.safeParse(id).success) retired.add(id);
+    }
+    return [...retired];
+  }
+
+  private persist(candidate: CurrentStored) {
+    try {
+      this.writeState(this.file, this.key, "project-groups", candidate);
+    } catch (error) {
+      this.pending = candidate;
+      throw error;
+    }
+    this.state = candidate;
+    this.pending = undefined;
+  }
+
+  private reconcilePending() {
+    if (this.pending) this.persist(this.pending);
+  }
 
   private repo(id: string): Project {
     const project = this.config.projects.find(value => value.id === id);
@@ -61,9 +93,9 @@ export class ProjectGroupService {
     return structuredClone(receipt.result);
   }
 
-  private record(requestId: string, fingerprint: string, result: ProjectGroup) {
-    this.state.receipts[requestId] = { fingerprint, result: structuredClone(result) };
-    this.persist();
+  private record(candidate: CurrentStored, requestId: string, fingerprint: string, result: ProjectGroup) {
+    candidate.receipts[requestId] = { fingerprint, result: structuredClone(result) };
+    this.persist(candidate);
     return structuredClone(result);
   }
 
@@ -76,7 +108,7 @@ export class ProjectGroupService {
 
   private slug(name: string) {
     const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80).replace(/-+$/g, "") || "project";
-    const used = new Set([...Object.keys(this.state.groups), ...this.config.projects.map(project => project.id)]);
+    const used = new Set([...Object.keys(this.state.groups), ...this.state.tombstones, ...this.config.projects.map(project => project.id)]);
     if (!used.has(base)) return projectGroupIdSchema.parse(base);
     for (let suffix = 2; ; suffix++) {
       const tail = `-${suffix}`;
@@ -104,39 +136,46 @@ export class ProjectGroupService {
   create(input: CreateProjectGroup): ProjectGroup {
     const request = createProjectGroupSchema.parse(input);
     const fingerprint = digest({ action: "create", body: request });
+    this.reconcilePending();
     const replay = this.replay(request.requestId, fingerprint);
     if (replay) return replay;
     const projects = this.validateRepos(request.repos);
     const createdAt = now();
     const group: ProjectGroup = { id: this.slug(request.name), name: request.name, repos: projects.map(project => this.repoView(project)), implicit: false, revision: 1, createdAt, updatedAt: createdAt };
-    this.state.groups[group.id] = group;
-    return this.record(request.requestId, fingerprint, group);
+    const candidate = structuredClone(this.state);
+    candidate.groups[group.id] = group;
+    return this.record(candidate, request.requestId, fingerprint, group);
   }
 
   update(id: string, input: UpdateProjectGroup): ProjectGroup {
     projectGroupIdSchema.parse(id);
     const request = updateProjectGroupSchema.parse(input);
     const fingerprint = digest({ action: "update", id, body: request });
+    this.reconcilePending();
     const replay = this.replay(request.requestId, fingerprint);
     if (replay) return replay;
     const current = this.group(id);
     if (request.revision !== current.revision) throw new TeamError(409, "stale-project-group-revision", "The project group changed. Refresh it before sending this update.");
     const repos = request.repos === undefined ? current.repos : this.validateRepos(request.repos, id).map(project => this.repoView(project));
     const updated: ProjectGroup = { ...current, ...(request.name !== undefined ? { name: request.name } : {}), repos, revision: current.revision + 1, updatedAt: now() };
-    this.state.groups[id] = updated;
-    return this.record(request.requestId, fingerprint, updated);
+    const candidate = structuredClone(this.state);
+    candidate.groups[id] = updated;
+    return this.record(candidate, request.requestId, fingerprint, updated);
   }
 
   remove(id: string, input: { requestId: string; revision: number }): ProjectGroup {
     projectGroupIdSchema.parse(id);
     const request = updateProjectGroupSchema.pick({ requestId: true, revision: true }).parse(input);
     const fingerprint = digest({ action: "remove", id, body: request });
+    this.reconcilePending();
     const replay = this.replay(request.requestId, fingerprint);
     if (replay) return replay;
     const current = this.group(id);
     if (request.revision !== current.revision) throw new TeamError(409, "stale-project-group-revision", "The project group changed. Refresh it before deleting it.");
-    delete this.state.groups[id];
-    return this.record(request.requestId, fingerprint, current);
+    const candidate = structuredClone(this.state);
+    delete candidate.groups[id];
+    candidate.tombstones = [...new Set([...candidate.tombstones, id])];
+    return this.record(candidate, request.requestId, fingerprint, current);
   }
 
   private suggestions(grouped: Set<string>): ProjectGroupSuggestion[] {

@@ -1,20 +1,22 @@
 import { z } from "zod";
 
 const hostProjectId = z.string().regex(/^[a-z0-9-]{1,80}$/);
+const repoListSchema = z.array(hostProjectId).min(1).max(12)
+  .refine(value => new Set(value).size === value.length, { message: "List each repository once." });
 export const projectGroupIdSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
 
 /** An owner-created project made of one or more enrolled repositories (host projects). */
 export const createProjectGroupSchema = z.object({
   requestId: z.uuid(),
   name: z.string().trim().min(1).max(100),
-  repos: z.array(hostProjectId).min(1).max(12),
-}).strict().refine(value => new Set(value.repos).size === value.repos.length, { path: ["repos"], message: "List each repository once." });
+  repos: repoListSchema,
+}).strict();
 export type CreateProjectGroup = z.infer<typeof createProjectGroupSchema>;
 export const updateProjectGroupSchema = z.object({
   requestId: z.uuid(),
   revision: z.number().int().min(1),
   name: z.string().trim().min(1).max(100).optional(),
-  repos: z.array(hostProjectId).min(1).max(12).optional(),
+  repos: repoListSchema.optional(),
 }).strict();
 export type UpdateProjectGroup = z.infer<typeof updateProjectGroupSchema>;
 

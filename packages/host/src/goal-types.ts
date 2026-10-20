@@ -28,6 +28,7 @@ export type CreateGoal = z.infer<typeof createGoalSchema>;
 export const goalActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export const goalExtendSchema = goalActionSchema.extend({ minutes: z.number().int().min(5).max(1440) }).strict();
 export const goalSteerSchema = goalActionSchema.extend({ text: z.string().trim().min(1).max(8000) }).strict();
+export const goalParallelismSchema = goalActionSchema.extend({ parallelism: z.number().int().min(1).max(4) }).strict();
 export const goalOutcomeSchema = goalActionSchema.extend({
   result: z.enum(["achieved", "not-achieved", "inconclusive"]),
   summary: z.string().trim().min(1).max(4000),

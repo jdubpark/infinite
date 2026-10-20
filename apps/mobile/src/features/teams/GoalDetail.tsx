@@ -9,7 +9,7 @@ import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
 import {
-  GOAL_LABELS, goalControls, goalKind, goalStopped, newer, openDecisions, OUTCOME_LABELS, shortDate, TEAM_LABELS, teamKind, teamTone,
+  GOAL_LABELS, goalControls, goalKind, goalStopped, newer, openDecisions, OUTCOME_LABELS, shortDate, TEAM_LABELS, teamKind, teamTone, workerStatus,
   type GoalResult, type ProductGoal, type TeamStatus, type TeamView,
 } from "./model";
 import { Choices, Clamp, Disclosure, LinearChip, LineupView, RequestStatus, RunPill, Section, SteerBox, t } from "./parts";
@@ -51,7 +51,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   const decisions = activeTeam ? openDecisions(activeTeam) : [];
   const previous = goal.cycles.filter(cycle => cycle.teamId !== goal.activeTeamId);
   const project = me?.projects?.find(value => value.id === goal.projectId)?.name ?? goal.projectId;
-  const send = (action: string, label: string, fields?: Record<string, string>) => request.send(`/goals/${id}/${action}`, label, goal.revision, fields);
+  const send = (action: string, label: string, fields?: Record<string, string | number>) => request.send(`/goals/${id}/${action}`, label, goal.revision, fields);
 
   return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     {header}
@@ -88,7 +88,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
             {activeTeam ? <StatusIcon kind={teamKind(activeTeam).kind} fraction={teamKind(activeTeam).fraction} size={16} /> : null}
             <Text style={[t.strong, s.fill]}>{activeTeam?.title ?? "Team cycle"}</Text>
           </View>
-          {activeTeam ? <Text style={t.note}>{TEAM_LABELS[activeTeam.status]}</Text> : null}
+          {activeTeam ? <Text style={t.note}>{TEAM_LABELS[activeTeam.status]} · {workerStatus(activeTeam)}</Text> : null}
           {decisions.length ? <>
             <Text style={t.warning}>{decisions.length === 1 ? "1 decision needs" : `${decisions.length} decisions need`} your input.</Text>
             {decisions.map(decision => <Text key={decision.id} style={t.body} numberOfLines={3}>{decision.question}</Text>)}
@@ -105,7 +105,12 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
       </Section>
 
       <Section title="Work limits">
-        <Text style={t.body}>{goal.cycles.length}/{goal.maxRuns} cycles · {goal.memberCount}/{goal.maxMembers} agents · up to {goal.parallelism} parallel</Text>
+        <Text style={t.body}>{goal.cycles.length}/{goal.maxRuns} cycles · {goal.memberCount}/{goal.maxMembers} agents · Worker limit {goal.parallelism}</Text>
+        {owns && ["running", "needs-input", "paused"].includes(goal.status) ? <View style={s.workerControl}>
+          <Choices values={[1, 2, 3, 4]} selected={goal.parallelism} disabled={locked || !fresh}
+            label={String} onSelect={parallelism => { if (parallelism !== goal.parallelism) send("parallelism", "Worker limit", { parallelism }); }} />
+          <Text style={t.note}>The team starts a worker when a task is ready and stops it when the task is done, up to this limit. You can change the limit while the goal runs; a change applies to the active cycle and later cycles.</Text>
+        </View> : null}
         <Text style={t.note}>Deadline {shortDate(goal.deadlineAt)}: {goal.maxMinutes} minutes from creation. Pausing does not extend it.</Text>
       </Section>
 
@@ -196,6 +201,7 @@ const s = StyleSheet.create({
   overlayRoot: { position: "relative" },
   empty: { padding: 30, gap: 15, alignItems: "center" },
   titleBlock: { paddingBottom: 4, gap: 8 },
+  workerControl: { gap: 4 },
   metaRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
   body: { paddingHorizontal: 16, paddingTop: 2, gap: 10, paddingBottom: 24 },
   record: { gap: 4, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },

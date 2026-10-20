@@ -3,14 +3,14 @@ import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { writeSealed, unseal } from "./vault.js";
 import { TeamService, TeamError } from "./teams.js";
-import { createGoalSchema, goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalSteerSchema, type CreateGoal, type ProductGoal } from "./goal-types.js";
+import { createGoalSchema, goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, type CreateGoal, type ProductGoal } from "./goal-types.js";
 import type { Config } from "./types.js";
 import type { CreateTeam, TeamGoalContext, TeamView } from "./team-types.js";
 import { addRollups, emptyRollup } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
 
 type Action = { requestId: string; revision: number };
-type PendingControl = { action: "pause" | "resume" | "cancel" | "steer"; requestId: string; teamId: string; revision: number; text?: string };
+type PendingControl = { action: "pause" | "resume" | "cancel" | "steer" | "parallelism"; requestId: string; teamId: string; revision: number; text?: string; parallelism?: number };
 type GoalExtensionIntent = Action & { minutes: number; fingerprint: string; teamId?: string; targetDeadlineAt?: string; targetCeilingAt?: string; failures?: number };
 type Stored = {
   goal: ProductGoal;
@@ -158,11 +158,11 @@ export class GoalService {
     stored.receipts[body.requestId] = digest({ action, ...body });
     stored.goal.revision++;
   }
-  private setControl(stored: Stored, action: PendingControl["action"], text?: string) {
+  private setControl(stored: Stored, action: PendingControl["action"], options: { text?: string; parallelism?: number } = {}) {
     if (!stored.goal.activeTeamId) return;
     const team = this.teams.get(stored.goal.activeTeamId);
     if (["ready-for-review", "merged", "no-change", "cancelled", "blocked"].includes(team.status)) return;
-    stored.control = { action, requestId: randomUUID(), teamId: team.id, revision: team.revision, ...(text ? { text } : {}) };
+    stored.control = { action, requestId: randomUUID(), teamId: team.id, revision: team.revision, ...options };
   }
   pause(id: string, input: Action) { return this.action(id, "pause", goalActionSchema.parse(input)); }
   resume(id: string, input: Action) { return this.action(id, "resume", goalActionSchema.parse(input)); }
@@ -279,8 +279,26 @@ export class GoalService {
         throw new TeamError(409, "goal-steering-limit", "Start a new goal with consolidated directions.");
       this.admit(stored, "steer", body);
       goal.steering.push({ text: body.text, revision: goal.revision, at: now() });
-      this.setControl(stored, "steer", body.text);
+      this.setControl(stored, "steer", { text: body.text });
       this.event(stored, "Direction recorded. The approved scope and execution limits remain in force.");
+      this.save(stored); return structuredClone(goal);
+    });
+  }
+  setParallelism(id: string, input: Action & { parallelism: number }) {
+    const body = goalParallelismSchema.parse(input);
+    return this.enqueue(() => {
+      const stored = this.record(id), goal = stored.goal;
+      if (this.replay(stored, "parallelism", body)) return structuredClone(goal);
+      if (!["running", "needs-input", "paused"].includes(goal.status))
+        throw new TeamError(409, "goal-not-running", "Only a running or paused goal can change its worker limit.");
+      if (stored.launch) throw new TeamError(409, "goal-launch-pending", "The next feature is being attached. Retry after it appears.");
+      this.admit(stored, "parallelism", body);
+      if (goal.parallelism !== body.parallelism) {
+        const previous = goal.parallelism;
+        goal.parallelism = body.parallelism;
+        this.setControl(stored, "parallelism", { parallelism: body.parallelism });
+        this.event(stored, `The owner changed the worker limit from ${previous} to ${body.parallelism}. It applies to the active cycle and later cycles.`);
+      }
       this.save(stored); return structuredClone(goal);
     });
   }
@@ -339,17 +357,22 @@ export class GoalService {
     const body = { requestId: control.requestId, revision: control.revision };
     try {
       if (control.action === "steer") await this.teams.steer(control.teamId, { ...body, text: control.text! });
+      else if (control.action === "parallelism") await this.teams.setParallelism(control.teamId, { ...body, parallelism: control.parallelism! });
       else await this.teams[control.action](control.teamId, body);
     } catch (error) {
       if (this.closed) return false;
       if (!(error instanceof TeamError)) throw error;
       if (["members-stopping", "team-operation-running"].includes(error.code)) return false;
-      if (error.code === "stale-team-revision" && ["pause", "cancel"].includes(control.action)) {
+      if (error.code === "stale-team-revision" && ["pause", "cancel", "parallelism"].includes(control.action)) {
         const team = this.teams.get(control.teamId);
         stored.control = { ...control, requestId: randomUUID(), revision: team.revision };
         this.save(stored); return false;
       }
       stored.control = undefined;
+      if (control.action === "parallelism") {
+        this.event(stored, `The worker limit could not be applied to the active cycle: ${error.message}`);
+        this.save(stored); return false;
+      }
       if (!["paused", "cancelled", "limit-reached"].includes(stored.goal.status)) stored.goal.status = "blocked";
       stored.goal.reason = error.message;
       this.event(stored, `The goal action could not be applied: ${error.message}`); this.save(stored); return false;

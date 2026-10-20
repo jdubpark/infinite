@@ -8,7 +8,7 @@ import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamPermissionDecision, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
@@ -39,6 +39,9 @@ type Stored = {
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const timestamp = () => new Date().toISOString();
 const activeMember = (member: TeamMember) => ["queued", "running", "reported", "unavailable"].includes(member.status);
+const holdsWorkerSlot = (member: TeamMember, revision: number) => member.revision === revision &&
+  (member.role === "scout" || member.role === "implementer") &&
+  (["queued", "running", "unavailable"].includes(member.status) || member.status === "reported" && !member.exitConfirmedAt);
 const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
 const permissionReviewReason = "The permission coordinator is reviewing a provider request.";
 /** Whether a delegated permission decision still holds this member's open prompt. */
@@ -203,12 +206,16 @@ export class TeamService {
       ...(run.permissionDecisions ? { permissionDecisions: run.permissionDecisions.map(({ prompt: _prompt, ...decision }) => decision) } : {}),
     };
     const withUsage = teamUsage(members.map(({ prompt: _prompt, ...member }) => member), run.provider, this.usage);
+    const max = run.handoff ? 2 : 4;
+    const ready = run.tasks.filter(task => task.status === "pending" && task.dependsOn.every(id => run.tasks.find(item => item.id === id)?.status === "integrated")).length +
+      (run.discovery && run.discovery.revision === run.revision && !run.discovery.completedAt ? run.discovery.tasks.filter(task => task.status === "pending").length : 0);
+    const workers = { limit: run.parallelism, max, running: members.filter(member => holdsWorkerSlot(member, run.revision)).length, ready };
     return { ...safeRun, tasks: safeRun.tasks.map(task => { // Older records predate task.revision; steering clears the task list, so the retained run revision identifies their plan.
       const revision = task.revision ?? safeRun.revision;
       const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
       const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
       return { ...task, revision, ...(usage.length ? { usage: { usd: Math.round(usage.reduce((n, row) => n + row.cost, 0) * 1_000_000) / 1_000_000, unpriced: usage.reduce((n, row) => n + row.pricing.unknown, 0), tokens: usage.reduce((n, row) => n + Object.values(row.tokens).reduce((a, b) => a + b, 0), 0), attempts: attempts.length, profiles: [...new Set(attempts.map(member => member.modelProfile?.id).filter((id): id is string => Boolean(id)))].sort() } } : {}) };
-    }), members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active() };
+    }), members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active(), workers };
   }
   private save(stored: Stored) {
     stored.run.updatedAt = timestamp();
@@ -387,13 +394,13 @@ export class TeamService {
       return this.view(stored);
     });
   }
-  private replay(stored: Stored, operation: string, body: Action | Mutation) {
+  private replay(stored: Stored, operation: string, body: Action | Mutation | TeamParallelism) {
     const prior = stored.receipts[body.requestId];
     if (!prior) return false;
     if (prior !== digest({ operation, ...body })) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
     return true;
   }
-  private mutation(stored: Stored, operation: string, body: Action | Mutation) {
+  private mutation(stored: Stored, operation: string, body: Action | Mutation | TeamParallelism) {
     const fingerprint = digest({ operation, ...body });
     const prior = stored.receipts[body.requestId];
     if (prior) {
@@ -424,6 +431,26 @@ export class TeamService {
       stored.run.brief = undefined; stored.run.noChange = undefined;
       if (stored.run.discovery && !stored.run.discovery.completedAt) stored.run.discovery.completedAt = timestamp();
       this.event(stored, "User steering recorded. Earlier reports cannot satisfy the new revision."); this.save(stored);
+      return this.view(stored);
+    });
+  }
+  setParallelism(id: string, input: TeamParallelism) {
+    const body = teamParallelismSchema.parse(input);
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (this.replay(stored, "parallelism", body)) return this.view(stored);
+      if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
+      if (["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status))
+        throw new TeamError(409, "team-not-running", "The worker limit can only change while the team is running.");
+      if (run.handoff && body.parallelism > 2)
+        throw new TeamError(409, "team-parallelism-limit", "Handoff teams support at most two workers.");
+      if (!this.mutation(stored, "parallelism", body)) return this.view(stored);
+      if (run.parallelism !== body.parallelism) {
+        const previous = run.parallelism;
+        run.parallelism = body.parallelism;
+        this.event(stored, `The owner changed the worker limit from ${previous} to ${body.parallelism}.`);
+      }
+      this.save(stored);
       return this.view(stored);
     });
   }
@@ -778,10 +805,10 @@ export class TeamService {
         }
         try { if (!await this.stopped(member)) continue; }
         catch { member.status = "unavailable"; run.reason = "An agent could not be stopped. Release its input control or inspect its terminal before integration."; this.save(stored); continue; }
-        if (!trackingReady) { member.status = "reported"; this.save(stored); continue; }
+        if (!trackingReady) { member.status = "reported"; member.exitConfirmedAt ??= timestamp(); this.save(stored); continue; }
         if (member.role === "implementer" && member.report?.kind === "result") {
           const position = run.tasks.findIndex(task => task.id === member.taskId);
-          if (run.tasks.slice(0, position).some(task => task.status !== "integrated")) { member.status = "reported"; this.save(stored); continue; }
+          if (run.tasks.slice(0, position).some(task => task.status !== "integrated")) { member.status = "reported"; member.exitConfirmedAt ??= timestamp(); this.save(stored); continue; }
         }
         this.consume(stored, member);
         if (stored.pending || run.status === "blocked" || run.status === "no-change") return;
@@ -792,6 +819,8 @@ export class TeamService {
       for (const decision of run.decisions.filter(item => item.revision === run.revision && item.answer)) {
         const prior = run.members.find(member => member.memberId === decision.memberId)!;
         if (prior.status !== "waiting") continue;
+        // An answered scout or implementer keeps waiting, answer intact, until a worker slot frees under the current limit.
+        if ((prior.role === "scout" || prior.role === "implementer") && run.members.filter(member => holdsWorkerSlot(member, run.revision)).length >= run.parallelism) continue;
         const answeredBy = decision.answeredBy === "coordinator" ? "Mission coordinator" : "User";
         const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, `${prior.prompt}\n\n${answeredBy} answered: ${decision.answer}`, prior.modelProfile);
         // A limit substitution may have pinned a fallback profile on another provider.
@@ -805,7 +834,7 @@ export class TeamService {
       }
       if (run.discovery && !run.discovery.completedAt && run.discovery.revision === run.revision) {
         const scouts = run.discovery.tasks;
-        const active = run.members.filter(member => member.revision === run.revision && member.role === "scout" && activeMember(member)).length;
+        const active = run.members.filter(member => member.role === "scout" && holdsWorkerSlot(member, run.revision)).length;
         const next = scouts.find(scout => scout.status === "pending");
         if (next && active < run.parallelism) { this.prepareMember(stored, "scout", next); return; }
         if (scouts.every(scout => scout.status === "complete")) {
@@ -824,8 +853,9 @@ export class TeamService {
       }
       const pendingTasks = run.tasks.filter(task => task.status === "pending");
       const activeCount = run.members.filter(member => member.revision === run.revision && activeMember(member) && member.role !== "permission-coordinator").length;
+      const workerCount = run.members.filter(member => holdsWorkerSlot(member, run.revision)).length;
       const nextTask = pendingTasks.find(task => task.dependsOn.every(id => run.tasks.find(item => item.id === id)?.status === "integrated"));
-      if (nextTask && activeCount < run.parallelism) { this.prepareMember(stored, "implementer", nextTask); return; }
+      if (nextTask && workerCount < run.parallelism) { this.prepareMember(stored, "implementer", nextTask); return; }
       if (run.tasks.some(task => task.status !== "integrated")) {
         run.status = run.decisions.some(decision => decision.revision === run.revision && !decision.answer) ? "needs-input" : "implementing";
         this.save(stored); return;

@@ -29,14 +29,14 @@ import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
-import { createTeamSchema, teamMutationSchema, teamActionSchema, teamTaskRatingSchema } from "./team-types.js";
+import { createTeamSchema, teamMutationSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecard } from "./scorecard.js";
 import { GoalService } from "./goals.js";
 import { MissionService, missionBoard } from "./missions.js";
 import { createMissionSchema, missionActionSchema, missionTextSchema } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { LinearService } from "./linear.js";
-import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
+import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
 import type { Config, Role, Receipt } from "./types.js";
@@ -438,6 +438,7 @@ export function createApp(config: Config, key: Buffer) {
     return res.json(await startInProject(body.projectId, () => goals.create(body)));
   });
   app.post("/api/goals/:id/steer", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.steer(id.parse(req.params.id), goalSteerSchema.parse(req.body))));
+  app.post("/api/goals/:id/parallelism", requireRole(["owner"]), async (req, res) => res.json(await goals.setParallelism(id.parse(req.params.id), goalParallelismSchema.parse(req.body))));
   app.post("/api/goals/:id/outcome", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.outcome(id.parse(req.params.id), goalOutcomeSchema.parse(req.body))));
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
@@ -509,6 +510,8 @@ export function createApp(config: Config, key: Buffer) {
   };
   app.post("/api/teams/:id/steer", requireRole(["owner", "controller"]), async (req, res) =>
     res.json(await teams.steer(standaloneTeam(req.params.id), teamMutationSchema.parse(req.body))));
+  app.post("/api/teams/:id/parallelism", requireRole(["owner"]), async (req, res) =>
+    res.json(await teams.setParallelism(standaloneTeam(req.params.id), teamParallelismSchema.parse(req.body))));
   app.post("/api/teams/:id/decisions/:decisionId/answer", requireRole(["owner", "controller"]), async (req, res) => {
     const teamId = id.parse(req.params.id), decisionId = id.parse(req.params.decisionId), body = teamMutationSchema.parse(req.body);
     if (teams.get(teamId).missionId) throw new TeamError(409, "mission-owned-team", "The mission coordinator answers this subteam's decisions and escalates owner questions to the mission.");

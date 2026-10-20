@@ -382,6 +382,36 @@ test("goal pause and cancellation survive restart without allowing child control
   } finally { await f.close(); }
 });
 
+test("a goal worker limit updates its active cycle, replays safely, and stays owner-only", { timeout: 60000 }, async () => {
+  const f = await fixture("cycles");
+  try {
+    const request = f.create();
+    const created = await f.host.fetchApi("/goals", "owner", request);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const active = await f.held(created.body.id), child = active.team!;
+    const change = { requestId: randomUUID(), revision: active.goal.revision, parallelism: 4 };
+    assert.equal((await f.host.fetchApi(`/goals/${request.requestId}/parallelism`, "controller", change)).status, 403);
+    assert.equal((await f.host.fetchApi(`/goals/${request.requestId}/parallelism`, "viewer", change)).status, 403);
+    const changed = await f.host.fetchApi(`/goals/${request.requestId}/parallelism`, "owner", change);
+    assert.equal(changed.status, 200, JSON.stringify(changed.body));
+    assert.equal(changed.body.parallelism, 4);
+    assert.equal(changed.body.revision, active.goal.revision + 1);
+    assert.ok(changed.body.events.some((event: { text: string }) => event.text === "The owner changed the worker limit from 2 to 4. It applies to the active cycle and later cycles."));
+    const updated = await waitFor(() => f.team(child.id), team => team.parallelism === 4 && team.workers?.limit === 4);
+    assert.equal(updated.workers?.max, 4);
+    const direct = await f.host.fetchApi(`/teams/${child.id}/parallelism`, "owner", { requestId: randomUUID(), revision: updated.revision, parallelism: 1 });
+    assert.deepEqual([direct.status, direct.body.code], [409, "goal-owned-team"]);
+    const retry = await f.host.fetchApi(`/goals/${request.requestId}/parallelism`, "owner", change);
+    assert.equal(retry.status, 200);
+    assert.equal(retry.body.revision, changed.body.revision);
+    assert.equal(retry.body.events.filter((event: { text: string }) => event.text === "The owner changed the worker limit from 2 to 4. It applies to the active cycle and later cycles.").length, 1);
+    const stale = await f.host.fetchApi(`/goals/${request.requestId}/parallelism`, "owner", { requestId: randomUUID(), revision: active.goal.revision, parallelism: 3 });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.code, "stale-goal-revision");
+    assert.equal((await f.team(child.id)).parallelism, 4);
+  } finally { await f.close(); }
+});
+
 test("goal time ceilings must cover the time limit, and extensions default off", () => {
   const base = { requestId: randomUUID(), projectId: "rehearsal", title: "Improve", objective: "Improve progress", successCriteria: "Progress moves", allowedPaths: ["features"], maxMinutes: 60 };
   assert.throws(() => createGoalSchema.parse({ ...base, maxTotalMinutes: 30 }), /ceiling cannot be shorter/);

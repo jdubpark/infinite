@@ -107,7 +107,7 @@ test("authenticated handoff refuses dirty source, waits for its lease, and survi
     const team = await waitFor(async () => (await f.host.fetchApi(`/teams/${waiting.teamId}`)).body, value => ["no-change", "blocked"].includes(value.status), 30000);
     assert.equal(team.status, "no-change", JSON.stringify(team));
     assert.equal(team.handoff.sourceSessionId, id); assert.equal(team.handoff.maxMembers, 16);
-    assert.equal(team.parallelism, 2); assert.equal(team.baseCommit, head);
+    assert.equal(team.parallelism, 2); assert.equal(team.workers.max, 2); assert.equal(team.baseCommit, head);
     assert.ok(Date.parse(team.handoff.deadlineAt) - Date.parse(team.createdAt) <= 3600000);
     assert.equal((await f.host.fetchApi("/teams")).body.teams.length, 1);
     assert.equal((await f.host.fetchApi(`/sessions/${id}`)).body.status, "exited");

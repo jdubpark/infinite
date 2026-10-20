@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { approvalOwner, blockedTeamsFirst, canResumeBlockedTeam, goalControls, goalGroup, groupRuns, newer, openDecisions, pendingApprovals, taskKind, teamControls, teamGroup, teamKind, teamPhases, type PermissionDecision, type ProductGoal, type TeamMember, type TeamTask, type TeamView } from "../apps/mobile/src/features/teams/model.ts";
+import { approvalOwner, blockedTeamsFirst, canResumeBlockedTeam, goalControls, goalGroup, groupRuns, newer, openDecisions, pendingApprovals, taskKind, teamControls, teamGroup, teamKind, teamPhases, workerStatus, type PermissionDecision, type ProductGoal, type TeamMember, type TeamTask, type TeamView } from "../apps/mobile/src/features/teams/model.ts";
 import { age, initials } from "../apps/mobile/src/status.ts";
 import { runRequests } from "../apps/mobile/src/store/requests.ts";
 
@@ -38,6 +38,14 @@ test("phone team controls follow the documented roles and goal ownership", () =>
   assert.deepEqual(teamControls(team({ status: "blocked", deliveryReceipt: receipt }), "owner", true), { answer: true, steer: false, pause: false, resume: false, cancel: true });
   for (const status of ["blocked", "ready-for-review", "no-change"] as const) assert.equal(teamControls(team({ status }), "owner", true).pause, false, status);
   assert.deepEqual(teamControls(team({ status: "cancelled" }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: false });
+});
+
+test("phone worker status reports live capacity and waiting ready tasks", () => {
+  assert.equal(workerStatus(team({ parallelism: 3 })), "Up to 3 workers");
+  assert.equal(workerStatus(team({ workers: { limit: 2, max: 4, running: 1, ready: 1 } })), "1 of 2 workers running");
+  assert.equal(workerStatus(team({ workers: { limit: 2, max: 4, running: 2, ready: 0 } })), "2 of 2 workers running");
+  assert.equal(workerStatus(team({ workers: { limit: 2, max: 4, running: 2, ready: 1 } })), "2 of 2 workers running · 1 ready task waiting for a worker");
+  assert.equal(workerStatus(team({ workers: { limit: 2, max: 4, running: 2, ready: 3 } })), "2 of 2 workers running · 3 ready tasks waiting for a worker");
 });
 
 test("phone goal controls allow an outcome only after the goal has stopped", () => {

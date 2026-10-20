@@ -643,6 +643,35 @@ test("same-repository subtasks dispatched later are chained and start from the e
   } finally { h.close(); }
 });
 
+test("a coordinator cannot wait past a subteam decision it has not handled, or behind a repository only a paused run holds", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    h.runs.set("paused-web", { id: "paused-web", projectId: "web", missionId: "", status: "paused", revision: 1, decisions: [], updatedAt: new Date().toISOString() });
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One change per repository", subtasks: [plan("a", "api"), plan("b", "web")] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    const decisionId = randomUUID();
+    h.set(teamId, { status: "needs-input", decisions: [{ id: decisionId, memberId: randomUUID(), revision: 1, question: "Which format?", options: [], createdAt: new Date().toISOString() }] });
+    assert.ok((await h.messages(2)).some((message: { type: string }) => message.type === "child-decision"));
+    // The decision message woke this attempt once; waiting past it would leave the subteam and the mission waiting on each other.
+    await h.report(2, { kind: "wait", summary: "The API subteam is working" });
+    const open = (await h.messages(3)).find((message: { type: string }) => message.type === "refused");
+    assert.equal(open.kind, "wait");
+    assert.equal(open.reason, `Decision ${decisionId} of subtask a is still open. Answer it with answer-child, ask the owner with question, or cancel the subtask.`);
+    await h.report(3, { kind: "answer-child", subtaskId: "a", decisionId, text: "JSON" });
+    await waitFor(async () => h.answers.length, count => count === 1, 20000);
+
+    // Only a paused run outside the mission holds the web repository, so subtask b will not start by itself.
+    h.set(teamId, { status: "ready-for-review" });
+    assert.ok((await h.messages(4)).some((message: { type: string; subtaskId?: string }) => message.type === "subtask-finished" && message.subtaskId === "a"));
+    assert.equal(h.get(id).subtasks[1].status, "queued");
+    await h.report(4, { kind: "wait", summary: "Subtask b is queued" });
+    const held = (await h.messages(5)).find((message: { type: string }) => message.type === "refused");
+    assert.equal(held.kind, "wait");
+    assert.match(held.reason, /no later attempt would start/);
+  } finally { h.close(); }
+});
+
 test("subtasks wait for a repository that another mission or a run outside any mission is using", { timeout: 60000 }, async () => {
   const h = scripted();
   try {

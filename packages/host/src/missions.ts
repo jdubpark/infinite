@@ -585,6 +585,27 @@ export class MissionService {
     }
     return open;
   }
+  /**
+   * Whether something other than the coordinator will start a later attempt: an open owner decision, a subteam
+   * still working, or a queued subtask that can start without anyone acting. A paused subteam, or a repository
+   * held only by paused or blocked runs, waits on a person, so it does not count.
+   */
+  private willWake(stored: Stored) {
+    const mission = stored.mission;
+    if (mission.decisions.some(item => !item.answer)) return true;
+    const resuming = (teamId: string) => stored.ops.some(op => op.kind === "resume" && op.teamId === teamId);
+    if (mission.subtasks.some(item => item.status === "running" && (item.teamStatus !== "paused" || resuming(item.teamId!)))) return true;
+    const stalled = stalledSubtasks(mission);
+    const ready = mission.subtasks.filter(item => item.status === "queued" && !stalled.has(item.id) &&
+      item.dependsOn.every(id => mission.subtasks.find(other => other.id === id)?.status === "done"));
+    if (ready.some(item => stored.launches[item.id])) return true;
+    if (!ready.length) return false;
+    const runs = this.teams.list();
+    return ready.some(item => {
+      const holders = runs.filter(run => run.projectId === item.repoProjectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status));
+      return !holders.length || holders.some(run => !["paused", "blocked"].includes(run.status));
+    });
+  }
   private refuse(stored: Stored, kind: string, reason: string, wake = true) {
     stored.refusals++;
     this.event(stored, `The coordinator's ${kind} report was refused: ${reason}`);
@@ -717,11 +738,11 @@ export class MissionService {
         break;
       }
       case "wait": {
+        // A subteam decision wakes the coordinator once; waiting past it would leave the subteam waiting with nothing to wake either.
+        const unhandled = this.openChildDecisions(stored).find(item => !item.ownerDecisionId && !item.answerPendingBy);
+        if (unhandled) return this.refuse(stored, report.kind, `Decision ${unhandled.decisionId} of subtask ${unhandled.subtaskId} is still open. Answer it with answer-child, ask the owner with question, or cancel the subtask.`);
         // Waiting is accepted only when a subteam or the owner will start a later attempt.
-        const stalled = stalledSubtasks(mission);
-        const upcoming = mission.subtasks.some(item => item.status === "running" || (item.status === "queued" && !stalled.has(item.id))) ||
-          mission.decisions.some(item => !item.answer);
-        if (!upcoming) return this.refuse(stored, report.kind, "Nothing is running or waiting for the owner, so no later attempt would start. Dispatch, cancel, report a result, or report blocked.");
+        if (!this.willWake(stored)) return this.refuse(stored, report.kind, "Nothing is running or waiting for the owner, so no later attempt would start. Dispatch, cancel, report a result, ask the owner, or report blocked.");
         this.event(stored, "The coordinator is waiting for subteam progress or owner input.");
         break;
       }

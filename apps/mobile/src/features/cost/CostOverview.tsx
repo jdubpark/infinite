@@ -31,11 +31,10 @@ export function CostOverview({ connection }: { connection: Connection }) {
   const [balances, setBalances] = useState<"idle" | "busy" | "failed">("idle");
   const models = useModels(connection, role);
   const accounts = overview.data?.accounts ?? [];
-  // Every account keeps its hue on its card; only metered ones appear in the bars and legend.
-  const colors = accountColors(accounts.map(account => account.id));
   const days = daily.data?.days ?? [], dailyAccounts = daily.data?.accounts ?? [];
-  // Legend entries in the host's account order, limited to accounts that spent in the window.
-  const shown = accounts.filter(account => dailyAccounts.includes(account.id)).map(account => account.id);
+  // Every account that spent in the window is plotted, configured card or not; one hue map serves the bars and the cards.
+  const shown = dailyAccounts;
+  const colors = accountColors([...new Set([...dailyAccounts, ...accounts.map(account => account.id)])]);
   const selectedDay = days.find(day => day.date === selected);
   function back() { if (router.canGoBack()) router.back(); else router.replace({ pathname: "/", params: { machine } }); }
   const refresh = () => { overview.refresh(); daily.refresh(); projects.refresh(); me.refresh(); models.refresh(); };

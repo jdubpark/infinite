@@ -26,21 +26,23 @@ export function ProjectCost({ connection, id }: { connection: Connection; id: st
   const cost = project.data;
   const open = (pathname: "/goal/[id]" | "/team/[id]" | "/session/[id]", target: string) => router.push({ pathname, params: { id: target, machine } });
   const briefings = cost.briefings.runs > 0 || cost.briefings.unmeasured > 0;
+  // Older hosts report only the briefings' unmeasured count.
+  const unmeasured = cost.unmeasured ?? cost.briefings.unmeasured;
   return <View style={s.fill}>
     {top}
     {!project.online && !project.loading ? <Text style={t.banner}>Offline · last received figures.</Text> : null}
     <ScrollView style={s.fill} contentContainerStyle={s.body}
       refreshControl={<RefreshControl refreshing={project.refreshing || daily.refreshing} onRefresh={() => { project.refresh(); daily.refresh(); }} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <Text style={t.title} accessibilityRole="header">{cost.name}</Text>
-      <View style={s.head} accessible accessibilityLabel={`${cost.total.unpriced ? "at least " : ""}${usd(cost.total.usd)} accrued`}>
-        <MoneyText value={cost.total} style={s.total} prefixStyle={s.totalPrefix} />
-        <Text style={t.note}>accrued</Text>
+      <View style={s.head}>
+        <MoneyText value={{ ...cost.total, unmeasured }} style={s.total} prefixStyle={s.totalPrefix} />
+        <Text style={t.note}>accrued{unmeasured ? ` · ${unmeasured} unmeasured` : ""}</Text>
       </View>
       <KindChips byKind={cost.byKind} />
       <View style={s.chart}>
         <DayCaption day={days.find(day => day.date === selected)} days={days} accounts={accounts} colors={colors} />
         <StackedBars days={days} accounts={accounts} colors={colors} selected={selected} onSelect={setSelected} />
-        <Legend entries={accounts.map(account => ({ id: account, label: accountName(account), color: colors[account]! }))} atLeast={cost.total.unpriced > 0} unmeasured={cost.briefings.unmeasured} />
+        <Legend entries={accounts.map(account => ({ id: account, label: accountName(account), color: colors[account]! }))} atLeast={cost.total.unpriced > 0 || (unmeasured > 0 && cost.total.usd > 0)} unmeasured={unmeasured} />
       </View>
       {cost.goals.length ? <Section title="Goals" count={cost.goals.length}>
         {cost.goals.map(goal => <CostRow key={goal.id} label={goal.title} detail={`${goal.tasks} ${goal.tasks === 1 ? "task" : "tasks"}`} total={goal.total} onPress={() => open("/goal/[id]", goal.id)} />)}

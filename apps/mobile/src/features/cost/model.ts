@@ -6,10 +6,12 @@ export type AccountView = { id: string; kind: "metered" | "subscription"; month?
 export type UsageOverview = { month: { start: string; end: string; spent: Money; previous: Money; plansUsd: number; unmeasuredSessions: number }; accounts: AccountView[] };
 export type DailyPoint = { date: string; usd: number; byAccount: Record<string, number> };
 export type DailySeries = { tz: string; accounts: string[]; days: DailyPoint[] };
-export type ProjectCostRow = { id: string; name: string; total: Money; month: Money; spark: number[] };
+/** `unmeasured` counts sessions and briefings that ran without usage; older hosts omit it. */
+export type ProjectCostRow = { id: string; name: string; total: Money; month: Money; spark: number[]; unmeasured?: number };
 export type ProjectsList = { projects: ProjectCostRow[] };
 export type ProjectCost = {
-  id: string; name: string; total: Money;
+  id: string; name: string; total: Money; unmeasured?: number;
+  /** USD per kind of work, not counts. */
   byKind: { goals: number; teams: number; sessions: number; briefings: number };
   goals: { id: string; title: string; total: Money; tasks: number }[];
   teams: { id: string; title: string; goalId?: string; total: Money }[];
@@ -43,7 +45,15 @@ export function usd(value: number, opts?: { compact?: boolean }): string {
   return `$${value.toLocaleString([], { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-export function money(value: Money) { return { text: usd(value.usd), atLeast: value.unpriced > 0 }; }
+/**
+ * How a figure reads: exact, a lower bound ("≥") when steps were unpriced or some work went
+ * unmeasured beside measured dollars, or nothing at all ("—") when only unmeasured work exists.
+ */
+export function money(value: Money & { unmeasured?: number }) {
+  const unmeasured = value.unmeasured ?? 0;
+  const none = value.usd === 0 && value.unpriced === 0 && unmeasured > 0;
+  return { text: none ? "—" : usd(value.usd), atLeast: !none && (value.unpriced > 0 || (unmeasured > 0 && value.usd > 0)), none };
+}
 
 /** Change against last month: a percentage once last month reached a dollar, otherwise the amount. */
 export function delta(current: Money, previous: Money): { text: string; direction: "up" | "down" | "flat" } | null {

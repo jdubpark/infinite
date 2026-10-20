@@ -120,7 +120,10 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
       </Section>
 
       {goal.tasks?.length ? <Section title="Tasks" count={goal.tasks.length}>
-        <Text style={t.strong}>Total <MoneyText value={goal.tasks.reduce((total, task) => ({ usd: total.usd + (task.usage?.usd ?? 0), unpriced: total.unpriced + (task.usage?.unpriced ?? 0) }), { usd: 0, unpriced: 0 })} /></Text>
+        {/* Unmeasured tasks (Claude, Codex) never read as $0: the total is "—" without a measured task, a lower bound beside one. */}
+        <Text style={t.strong}>Total <MoneyText value={goal.tasks.reduce((total, task) => ({
+          usd: total.usd + (task.usage?.usd ?? 0), unpriced: total.unpriced + (task.usage?.unpriced ?? 0), unmeasured: total.unmeasured + (task.usage ? 0 : 1),
+        }), { usd: 0, unpriced: 0, unmeasured: 0 })} />{goal.tasks.some(task => !task.usage) ? <Text style={t.note}>  {goal.tasks.filter(task => !task.usage).length} unmeasured</Text> : null}</Text>
         {goal.tasks.map(task => <Pressable key={`${task.teamId}/${task.taskId}`} accessibilityRole="button" accessibilityLabel={`Open ${task.title}`} onPress={() => openTeam(task.teamId)} hitSlop={5}
           style={({ pressed }) => [s.taskRow, pressed && s.taskPressed]}>
           <View style={s.taskMain}><Text style={s.taskTitle} numberOfLines={2}>{task.title}</Text><CostLine usage={task.usage} /></View>

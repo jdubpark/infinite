@@ -31,6 +31,8 @@ export type TeamView = {
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
   /** Agent-reported merge evidence; it is not independently verified by the host. */
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
+  /** Agent-reported open pull request for a pr delivery; the owner merges it on GitHub. Not host verification. */
+  pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string };
   lineup?: TeamLineup; linear?: LinearTracking; brief?: TeamBrief;
   goal?: { id: string; revision: number; cycle: number };
   /** A mission subteam is controlled from its mission. */

@@ -228,6 +228,14 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           {/^https:\/\//.test(team.deliveryReceipt.pullRequestUrl) ? <Button compact secondary title="Open pull request" onPress={() => void Linking.openURL(team.deliveryReceipt!.pullRequestUrl)} /> : null}
         </Card> : null}
 
+        {team.pullRequest ? <Card style={s.gapTop}>
+          <View style={s.line}><StatusIcon kind="review" size={16} /><Text style={[t.strong, s.fill]}>Pull request open for the reviewed commit.</Text><Text style={t.note}>agent claim · unverified</Text></View>
+          <Clamp text={team.pullRequest.summary} lines={3} />
+          <Text style={t.note}>Revision {team.pullRequest.revision} · {shortDate(team.pullRequest.reportedAt)}</Text>
+          <Text selectable style={t.mono} numberOfLines={1} ellipsizeMode="middle">head {team.pullRequest.headCommit}</Text>
+          {/^https:\/\//.test(team.pullRequest.pullRequestUrl) ? <Button compact secondary title="Open pull request" onPress={() => void Linking.openURL(team.pullRequest!.pullRequestUrl)} /> : null}
+        </Card> : null}
+
         {decisions.length || approvals.length ? <Section title="Needs you" count={decisions.length + approvals.length}>
           {decisions.map(decision => <DecisionCard key={decision.id} decision={decision} member={team.members.find(member => member.memberId === decision.memberId)}
             disabled={!controls.answer || locked} onAnswer={text => send(`/decisions/${decision.id}/answer`, "Answer", { text })} />)}

@@ -3,7 +3,7 @@ import { Alert, ScrollView, StyleSheet, Text, TextInput, View } from "react-nati
 import { useRouter } from "expo-router";
 import * as Crypto from "expo-crypto";
 import { PROVIDER_NAMES } from "@infinite/attention";
-import { ago, api, ApiError, connectionKey, pendingLabel, type Connection, type Me, type ProjectDetail, type SessionRow } from "../../api/client";
+import { ago, api, ApiError, connectionKey, pendingLabel, sourceLabel, type Connection, type Me, type ProjectDetail, type SessionRow } from "../../api/client";
 import { creations } from "../../store/requests";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
@@ -43,6 +43,8 @@ export function Create({ connection }: { connection: Connection }) {
   const displayDetail = syncs ? polledDetail : null;
   const [applying, setApplying] = useState(false);
   const [syncError, setSyncError] = useState("");
+  const [refreshingSource, setRefreshingSource] = useState(false);
+  const [sourceError, setSourceError] = useState("");
   async function applyPending(force: boolean) {
     if (!selectedProject || applying) return;
     setApplying(true);
@@ -57,6 +59,14 @@ export function Create({ connection }: { connection: Connection }) {
       { text: "Keep cloud files", style: "cancel" },
       { text: "Replace", style: "destructive", onPress: () => void applyPending(true) },
     ]);
+  }
+  async function refreshSource() {
+    if (!selectedProject || refreshingSource) return;
+    setRefreshingSource(true);
+    setSourceError("");
+    try { await api(connection, `/projects/${selectedProject}/source/refresh`, { body: {} }); }
+    catch (error) { if (mounted.current) setSourceError((error as Error).message); }
+    finally { if (mounted.current) { setRefreshingSource(false); refreshDetail(); } }
   }
   const locked = busy || Boolean(request);
   const dictation = useDictation({ connection, value: prompt, onChange: setPrompt, maxLength: 24000, disabled: locked });
@@ -87,10 +97,14 @@ export function Create({ connection }: { connection: Connection }) {
       <Text style={s.label}>Session host</Text>
       <View style={s.choices}>{(me?.backends ?? ["infinite"]).map(value => <Button key={value} title={value === "cmux" ? "cmux" : "Infinite"} secondary={backend !== value} disabled={locked} onPress={() => { setBackend(value); setProvider(undefined); }} />)}</View>
       <Text style={s.label}>Project</Text>
-      <View style={s.choices}>{projects.map(item => <Button key={item.id} title={item.name} secondary={selectedProject !== item.id} disabled={locked} onPress={() => { setProject(item.id); setSyncError(""); }} />)}</View>
-      {displayDetail ? <Text style={s.note} numberOfLines={2}>Synced from laptop {ago(displayDetail.sync.lastSyncedAt)} · applied {ago(displayDetail.sync.appliedAt)}{displayDetail.sync.pendingGeneration ? ` · pending: ${pendingLabel(displayDetail.sync.pendingGeneration)}` : ""}</Text> : null}
+      <View style={s.choices}>{projects.map(item => <Button key={item.id} title={item.name} secondary={selectedProject !== item.id} disabled={locked} onPress={() => { setProject(item.id); setSyncError(""); setSourceError(""); }} />)}</View>
+      {displayDetail?.source?.mode === "github" ? <>
+        <Text style={s.note} numberOfLines={2}>{sourceLabel(displayDetail.source)}</Text>
+        {me?.role === "owner" ? <Button busy={refreshingSource} title={refreshingSource ? "Refreshing…" : "Refresh from GitHub"} secondary disabled={refreshingSource || !online} onPress={() => void refreshSource()} /> : null}
+      </> : displayDetail ? <Text style={s.note} numberOfLines={2}>Synced from laptop {ago(displayDetail.sync.lastSyncedAt)} · applied {ago(displayDetail.sync.appliedAt)}{displayDetail.sync.pendingGeneration ? ` · pending: ${pendingLabel(displayDetail.sync.pendingGeneration)}` : ""}</Text> : null}
       {detail?.sync.pendingGeneration && me?.role === "owner" ? <Button busy={applying} title={detail.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"} secondary disabled={applying || !online} onPress={() => confirmApply(detail.sync.pendingGeneration!.reason === "cloud-changed")} /> : null}
       {syncs && syncError ? <Text accessibilityRole="alert" style={s.warning}>{syncError}</Text> : null}
+      {syncs && sourceError ? <Text accessibilityRole="alert" style={s.warning}>{sourceError}</Text> : null}
       {me && !projects.length ? <Text style={s.warning}>Add an allowed project to this machine’s Infinite configuration first.</Text> : null}
       <Text style={s.label}>Agent</Text>
       <View style={s.choices}>{providers.map(value => <Button key={value} title={PROVIDER_NAMES[value]} secondary={selectedProvider !== value} disabled={locked} onPress={() => setProvider(value)} />)}</View>

@@ -25,7 +25,7 @@ import {
   Users,
   WifiOff,
 } from "lucide-react";
-import { useApi, ago, ApiError, isControlRefusal, isMissionManaged, missionManagedLine, names, pendingLabel, type ControlLease, type Me, type ProjectDetail, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
+import { useApi, ago, ApiError, isControlRefusal, isMissionManaged, missionManagedLine, names, pendingLabel, sourceLabel, type ControlLease, type Me, type ProjectDetail, type ProjectSourceStatus, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
 import { clearDrafts, readDraft, settleDraft, useSessionDraft, writeDraft, type PendingInput } from "./drafts";
 import { creations, lifecycles } from "./requests";
 import { MachinePicker, MachineProvider, useMachines } from "./machines";
@@ -399,6 +399,8 @@ function Create({
   const [applying, setApplying] = useState(false);
   // An apply failure belongs to the workspace it was sent for.
   const [syncError, setSyncError] = useState<{ projectId: string; message: string } | null>(null);
+  const [refreshingSource, setRefreshingSource] = useState(false);
+  const [sourceError, setSourceError] = useState<{ projectId: string; message: string } | null>(null);
   // The age text changes on every poll, so only a new pending reason or an applied generation is announced.
   const [syncNotice, setSyncNotice] = useState("");
   const syncSeen = useRef<{ projectId?: string; pending?: string; applied?: string }>({});
@@ -417,6 +419,7 @@ function Create({
   useEffect(() => {
     setProject(null);
     setSyncError(null);
+    setSourceError(null);
     setSyncNotice("");
     if (!projectId || !syncs) return;
     // Hiding the tab stops the 5-second read and starts a new generation, so an earlier reply cannot replace a later one.
@@ -451,6 +454,17 @@ function Create({
       if (mounted.current) setProject(previous => previous?.id === id ? { ...previous, sync } : previous);
     } catch (error) { if (mounted.current) setSyncError({ projectId: id, message: (error as Error).message }); }
     finally { if (mounted.current) setApplying(false); }
+  }
+  async function refreshSource() {
+    const id = projectId;
+    if (!id || refreshingSource) return;
+    setRefreshingSource(true);
+    setSourceError(null);
+    try {
+      const source = await api<ProjectSourceStatus>(`/projects/${id}/source/refresh`, {});
+      if (mounted.current) setProject(previous => previous?.id === id ? { ...previous, source } : previous);
+    } catch (error) { if (mounted.current) setSourceError({ projectId: id, message: (error as Error).message }); }
+    finally { if (mounted.current) setRefreshingSource(false); }
   }
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -515,7 +529,15 @@ function Create({
             ))}
           </select>
           {syncs && <p className="sr-only" role="status">{syncNotice}</p>}
-          {syncs && project && (
+          {syncs && project?.source?.mode === "github" && (
+            <p className="quiet sync-status">
+              {sourceLabel(project.source)}{" "}
+              {me.role === "owner" && <button type="button" className="text-button stable-action" aria-busy={refreshingSource} disabled={refreshingSource || !connected} onClick={() => void refreshSource()}>
+                {refreshingSource ? "Refreshing…" : "Refresh from GitHub"}</button>}
+            </p>
+          )}
+          {syncs && sourceError?.projectId === projectId && !refreshingSource && <p className="error" role="alert">{sourceError.message}</p>}
+          {syncs && project && project.source?.mode !== "github" && (
             <p className="quiet sync-status">
               Synced from laptop {ago(project.sync.lastSyncedAt)} · applied {ago(project.sync.appliedAt)}
               {project.sync.pendingGeneration && <> · pending: {pendingLabel(project.sync.pendingGeneration)}{" "}

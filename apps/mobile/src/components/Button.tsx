@@ -2,12 +2,16 @@ import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-nati
 import { theme } from "../theme";
 import { Glyph, type GlyphName } from "./Icon";
 
-/** A capsule action. `compact` draws smaller but keeps a 48-unit touch target through hit slop. */
+/**
+ * A capsule action. `compact` draws smaller but keeps a 48-unit touch target through hit slop.
+ * `destructive` is a secondary button in error ink for actions that remove something.
+ */
 export function Button({
   title,
   onPress,
   disabled,
   secondary = false,
+  destructive = false,
   compact = false,
   glyph,
   busy,
@@ -16,11 +20,12 @@ export function Button({
   onPress: () => void;
   disabled?: boolean;
   secondary?: boolean;
+  destructive?: boolean;
   compact?: boolean;
   glyph?: GlyphName;
   busy?: boolean;
 }) {
-  const ink = secondary ? theme.colors.secondaryInk : theme.colors.white;
+  const ink = destructive ? theme.colors.error : secondary ? theme.colors.secondaryInk : theme.colors.white;
   return (
     <Pressable
       accessibilityRole="button"
@@ -31,7 +36,7 @@ export function Button({
       style={({ pressed }) => [
         s.button,
         compact && s.compact,
-        secondary && s.secondary,
+        (secondary || destructive) && s.secondary,
         (disabled || pressed) && s.dim,
       ]}
     >

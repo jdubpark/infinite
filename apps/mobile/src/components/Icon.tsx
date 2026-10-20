@@ -8,7 +8,7 @@ import { theme } from "../theme";
  */
 export type GlyphName =
   | "back" | "forward" | "down" | "up" | "plus" | "close" | "check" | "search" | "terminal"
-  | "more" | "send" | "people" | "target" | "stack" | "pause" | "play" | "dot" | "chart" | "mic";
+  | "more" | "send" | "people" | "target" | "stack" | "pause" | "play" | "stop" | "dot" | "chart" | "mic";
 
 export function Glyph({ name, size = 18, color = theme.colors.ink }: { name: GlyphName; size?: number; color?: string }) {
   const w = Math.max(1.6, size / 11);
@@ -72,6 +72,8 @@ export function Glyph({ name, size = 18, color = theme.colors.ink }: { name: Gly
     case "play":
       return <View style={box}><View style={{ width: 0, height: 0, marginLeft: size * 0.12, borderLeftWidth: size * 0.5, borderLeftColor: color,
         borderTopWidth: size * 0.32, borderTopColor: "transparent", borderBottomWidth: size * 0.32, borderBottomColor: "transparent" }} /></View>;
+    case "stop":
+      return <View style={box}><View style={{ width: size * 0.5, height: size * 0.5, borderRadius: size * 0.1, backgroundColor: color }} /></View>;
     case "dot":
       return <View style={box}><View style={{ width: size * 0.42, height: size * 0.42, borderRadius: size, backgroundColor: color }} /></View>;
     case "chart": {

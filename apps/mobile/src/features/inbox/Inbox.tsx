@@ -23,7 +23,9 @@ import { GoalList, listStyles, TeamList } from "../teams/RunLists";
 
 export type InboxView = "sessions" | "teams" | "goals";
 
-const GROUP_KIND: Record<InboxGroup, StatusKind> = { "Needs you": "attention", Working: "progress", Finished: "review", Exited: "stopped" };
+const GROUP_KIND: Record<InboxGroup, StatusKind> = { "Needs you": "attention", Working: "progress", Finished: "review", Exited: "stopped", Archived: "backlog" };
+/** Closed records start folded so live work stays on the first screen. */
+const FOLDED: InboxGroup[] = ["Exited", "Archived"];
 const machineName = (connection: Connection) => connection.label || new URL(connection.url).host;
 
 /**
@@ -51,7 +53,7 @@ export function Inbox({
   const [query, setQuery] = useState("");
   const [view, setView] = useState<InboxView>(initialView);
   const [machineSheet, setMachineSheet] = useState(false);
-  const [exitedOpen, setExitedOpen] = useState(false);
+  const [open, setOpen] = useState<Partial<Record<InboxGroup, boolean>>>({});
   const { data, online, stale, loading, refreshing, seen, refresh } = useLive(connection, {
     topics: ["sessions"],
     intervalMs: 2500,
@@ -139,10 +141,11 @@ export function Inbox({
             </View> : null}
             {!matches.length && query ? <Text style={s.summary}>No matches.</Text> : null}
             {groupSessions(matches).map((group) => {
-              const folded = group.title === "Exited" && !exitedOpen && !query;
+              const foldable = FOLDED.includes(group.title) && !query;
+              const folded = foldable && !open[group.title];
               return <View key={group.title}>
                 <GroupHeader kind={GROUP_KIND[group.title]} title={group.title} count={group.rows.length}
-                  collapsed={group.title === "Exited" ? folded : undefined} onToggle={group.title === "Exited" && !query ? () => setExitedOpen(value => !value) : undefined} />
+                  collapsed={foldable ? folded : undefined} onToggle={foldable ? () => setOpen(value => ({ ...value, [group.title]: folded })) : undefined} />
                 {folded ? null : group.rows.map((row) => (
                   <Pressable
                     accessibilityRole="button"

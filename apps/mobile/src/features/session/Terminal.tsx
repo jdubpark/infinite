@@ -1,7 +1,6 @@
 import {
   ActivityIndicator,
   Alert,
-  KeyboardAvoidingView,
   ScrollView,
   StyleSheet,
   Text,
@@ -19,8 +18,8 @@ import {
 } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
-import { Composer } from "../../components/Composer";
-import { ControlBar } from "../../components/ControlBar";
+import { useKeyboardPadding } from "../../components/keyboard";
+import { Composer, type ComposerAccess } from "../../components/Composer";
 import { LiveStatus, TopBar } from "../../components/Glass";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
@@ -41,6 +40,7 @@ export function Terminal({
   backLabel?: string;
 }) {
   const router = useRouter();
+  const keyboardPadding = useKeyboardPadding();
   const [composerHeight, setComposerHeight] = useState(0);
   const control = useSessionControl(connection, id);
   const { data, online, stale, seen, refresh } = usePoll(
@@ -84,13 +84,15 @@ export function Terminal({
   const canSteer =
     online && running && role !== undefined && role !== "viewer" && controlled && !missionLocked;
   const canSend = canSteer && !steering.busy && Boolean(steering.text.trim());
-  // Drafts work without control, so dictation does too; it stops only where the text itself is locked.
+  // The field (and its mic) docks only while this phone may type; dictation stops with it.
+  const composerShown = role !== undefined && role !== "viewer" && !missionLocked && running;
+  const fieldShown = composerShown && controlled;
   const dictation = useDictation({
     connection,
     value: steering.text,
     onChange: steering.setText,
     maxLength: 32000,
-    disabled: steering.busy || steering.pending,
+    disabled: !fieldShown || steering.busy || steering.pending,
   });
   function send() {
     if (!canSend) return;
@@ -100,13 +102,18 @@ export function Terminal({
     await control.claim(takeover);
     refresh();
   }
+  // The dock names who may type: a claim line until this phone holds the lease, then the field with its release.
+  const access: ComposerAccess | undefined = !requiresControl
+    ? undefined
+    : control.lease
+      ? { kind: "held", onRelease: () => { control.forget(true); refresh(); } }
+      : { kind: "take", holder: control.holder?.label, busy: control.busy, disabled: !online, onTake: () => void takeControl(Boolean(control.holder)) };
   function back() {
     if (router.canGoBack()) router.back();
     else router.replace({ pathname: "/", params: { machine: connectionKey(connection) } });
   }
   return (
-    // Android runs edge-to-edge, so the window no longer resizes for the keyboard.
-    <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
+    <View style={[s.fill, s.overlayRoot, { paddingBottom: keyboardPadding }]}>
       <TopBar backLabel={backLabel} onBack={back} title="Terminal" right={<LiveStatus online={online} seen={seen} stale={stale} />} />
       <FloatingNotice position="top" offset={58}
         message={stale ? session ? "Last received view. Input is paused until the host reconnects." : "Can't reach this machine." : null}
@@ -136,21 +143,6 @@ export function Terminal({
                   : "Waiting for a fresh response…"}
             </Text>
           </View>
-          {missionLocked ? null : <ControlBar
-            role={role}
-            requiresControl={requiresControl}
-            running={running}
-            online={online}
-            lease={control.lease}
-            holder={control.holder}
-            busy={control.busy}
-            message={control.message}
-            onTake={(takeover) => void takeControl(takeover)}
-            onRelease={() => {
-              control.forget(true);
-              refresh();
-            }}
-          />}
           <ScrollView style={s.fill} contentContainerStyle={s.scrollBody}>
             <Text style={s.label}>Current screen</Text>
             <Text selectable style={s.screen}>
@@ -160,17 +152,10 @@ export function Terminal({
           {/* One measured block for the mission line and the composer, so the notice clears whichever is taller. */}
           <View onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}>
             {missionId ? <MissionManagedLine missionId={missionId} machine={connectionKey(connection)} style={s.managedLine} /> : null}
-            {role !== undefined && role !== "viewer" && !missionLocked ? (
+            {composerShown ? (
               <Composer
                 canSteer={canSteer}
-                onTakeControl={online && running && !controlled ? () => void takeControl(Boolean(control.holder)) : undefined}
-                controlBusy={control.busy}
-                controlLabel={control.holder ? "Take over" : "Take control"}
-                idleHint={
-                  online && running && !controlled
-                    ? "Draft here. Take control when ready…"
-                    : undefined
-                }
+                access={access}
                 busy={steering.busy}
                 pending={steering.pending}
                 text={steering.text}
@@ -195,9 +180,9 @@ export function Terminal({
       )}
       <DictationNotice dictation={dictation} position="top" offset={110} />
       <FloatingNotice position="bottom" offset={composerHeight + 10}
-        message={steering.error || (steering.pending && !steering.busy ? "Delivery is unconfirmed. Retry sends the same request ID." : steering.receipt)}
-        kind={steering.error ? "error" : steering.receipt ? "success" : "warning"}
-        onDismiss={steering.error || steering.receipt ? steering.dismissStatus : undefined}
+        message={control.message || steering.error || (steering.pending && !steering.busy ? "Delivery is unconfirmed. Retry sends the same request ID." : steering.receipt)}
+        kind={control.message || steering.error ? "error" : steering.receipt ? "success" : "warning"}
+        onDismiss={control.message ? control.dismiss : steering.error || steering.receipt ? steering.dismissStatus : undefined}
         actions={steering.pending && !steering.busy ? <View style={s.noticeActions}>
           <Button compact title="Retry" disabled={!canSend} onPress={send} />
           <Button compact title="Clear…" secondary onPress={() => Alert.alert("Clear the unconfirmed delivery?", "The host may have received it. Clearing only forgets the request on this phone.", [
@@ -205,7 +190,7 @@ export function Terminal({
             { text: "Clear", style: "destructive", onPress: steering.clearPending },
           ])} />
         </View> : null} />
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 
@@ -222,22 +207,22 @@ const s = StyleSheet.create({
     color: theme.colors.mutedInk,
     marginBottom: 20,
   },
-  titleBlock: { paddingHorizontal: 16, paddingBottom: 10, gap: 2 },
+  titleBlock: { paddingHorizontal: 16, paddingBottom: 6, gap: 1 },
   title: {
-    fontSize: 20,
-    lineHeight: 25,
+    fontSize: 19,
+    lineHeight: 24,
     fontWeight: "600",
     color: theme.colors.ink,
     letterSpacing: -0.3,
-    marginBottom: 4,
+    marginBottom: 3,
   },
-  scrollBody: { paddingHorizontal: 16, paddingTop: 4 },
+  scrollBody: { paddingHorizontal: 16, paddingTop: 2, paddingBottom: 12 },
   label: {
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: "600",
     color: theme.colors.ink,
-    marginBottom: 10,
-    marginTop: 17,
+    marginBottom: 6,
+    marginTop: 8,
   },
   screen: {
     fontFamily: theme.mono,

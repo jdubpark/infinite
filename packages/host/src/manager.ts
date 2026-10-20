@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readdirSync,
   existsSync,
+  rmSync,
   realpathSync,
   statSync,
 } from "node:fs";
@@ -57,6 +58,10 @@ export interface CreateSession {
 }
 interface StoredSession {
   session: Session;
+  fingerprint: string;
+}
+interface DeletedSessionReceipt {
+  id: string;
   fingerprint: string;
 }
 export function projectCwd(projectPath: string, cwd?: string): string {
@@ -155,6 +160,19 @@ export class Manager {
       recursive: true,
       mode: 0o700,
     });
+    const deletedDir = join(config.stateDir, "deleted-sessions");
+    mkdirSync(deletedDir, { recursive: true, mode: 0o700 });
+    for (const name of readdirSync(deletedDir).filter(name => /^[a-f0-9-]{36}\.sealed$/.test(name))) {
+      const id = name.slice(0, -7);
+      let receipt: DeletedSessionReceipt;
+      try {
+        receipt = unseal<DeletedSessionReceipt>(key, `deleted:${id}`, readFileSync(join(deletedDir, name), "utf8"));
+      } catch {
+        continue;
+      }
+      if (receipt.id !== id || !/^[a-f0-9]{64}$/.test(receipt.fingerprint)) continue;
+      rmSync(join(config.stateDir, "sessions", id), { recursive: true, force: true });
+    }
     mkdirSync(config.runDir, { recursive: true, mode: 0o700 });
     if (
       Buffer.byteLength(
@@ -165,7 +183,11 @@ export class Manager {
         "runDir is too long for a Unix socket; choose a shorter path",
       );
   }
+  private deletedReceiptPath(id: string) {
+    return join(this.config.stateDir, "deleted-sessions", `${id}.sealed`);
+  }
   meta(id: string): StoredSession {
+    if (existsSync(this.deletedReceiptPath(id))) throw Object.assign(new Error("Session not found"), { code: "ENOENT" });
     return unseal(
       this.key,
       `${id}:meta`,
@@ -174,6 +196,65 @@ export class Manager {
         "utf8",
       ),
     );
+  }
+  setArchived(id: string, archived: boolean): Promise<StoredSession["session"]> {
+    const operation = this.serial.then(async () => {
+      const stored = this.meta(id);
+      if (stored.session.team) throw new ContentError("Team sessions cannot be archived", 409);
+      if ((await this.state(id)).status !== "exited")
+        throw new ContentError("Only an exited session can be archived", 409);
+
+      const { archivedAt: _archivedAt, ...unarchived } = stored.session;
+      const session = archived
+        ? { ...stored.session, archivedAt: stored.session.archivedAt ?? new Date().toISOString() }
+        : unarchived;
+      writeSealed(
+        join(this.config.stateDir, "sessions", id, "meta.sealed"),
+        this.key,
+        `${id}:meta`,
+        { session, fingerprint: stored.fingerprint },
+      );
+      return session;
+    });
+    this.serial = operation.catch(() => {});
+    return operation;
+  }
+  remove(id: string): Promise<void> {
+    const operation = this.serial.then(async () => {
+      const stored = this.meta(id);
+      if (stored.session.team) throw new ContentError("Team sessions cannot be removed", 409);
+
+      let workerStateReadFailed = false;
+      try {
+        await workerCall(this.config.runDir, id, { op: "state" });
+      } catch {
+        workerStateReadFailed = true;
+      }
+      if (!workerStateReadFailed)
+        throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
+
+      const statusFile = join(this.config.stateDir, "sessions", id, "status.sealed");
+      if (!existsSync(statusFile))
+        throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
+      let saved: WorkerState;
+      try {
+        saved = unseal<WorkerState>(this.key, `${id}:status`, readFileSync(statusFile, "utf8"));
+      } catch {
+        throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
+      }
+      if (saved.status !== "exited")
+        throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
+
+      writeSealed(
+        this.deletedReceiptPath(id),
+        this.key,
+        `deleted:${id}`,
+        { id, fingerprint: stored.fingerprint } satisfies DeletedSessionReceipt,
+      );
+      rmSync(join(this.config.stateDir, "sessions", id), { recursive: true });
+    });
+    this.serial = operation.catch(() => {});
+    return operation;
   }
   async state(id: string, screen = false): Promise<WorkerState> {
     try {
@@ -211,7 +292,7 @@ export class Manager {
    */
   async list(options: { includeFullMessage?: boolean } = {}) {
     const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(
-      (n) => /^[a-f0-9-]{36}$/.test(n),
+      (n) => /^[a-f0-9-]{36}$/.test(n) && !existsSync(this.deletedReceiptPath(n)),
     );
     const rows = await Promise.allSettled(
       ids.map(async (id) => {
@@ -442,6 +523,13 @@ export class Manager {
       .update(JSON.stringify(request))
       .digest("hex");
     const dir = join(this.config.stateDir, "sessions", id);
+    const deletedPath = this.deletedReceiptPath(id);
+    if (existsSync(deletedPath)) {
+      const deleted = unseal<DeletedSessionReceipt>(this.key, `deleted:${id}`, readFileSync(deletedPath, "utf8"));
+      if (deleted.id !== id) throw new Error("Invalid deleted session receipt");
+      if (deleted.fingerprint !== fingerprint) throw new Error("Request ID already belongs to a different session");
+      throw new ContentError("This session was deleted and cannot be started again", 410);
+    }
     if (existsSync(join(dir, "meta.sealed"))) {
       const stored = this.meta(id);
       if (stored.fingerprint !== fingerprint)

@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
-  KeyboardAvoidingView,
   Alert,
   RefreshControl,
   ScrollView,
@@ -21,8 +20,8 @@ import {
 import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
-import { Composer } from "../../components/Composer";
-import { ControlBar } from "../../components/ControlBar";
+import { useKeyboardPadding } from "../../components/keyboard";
+import { Composer, ControlDock, type ComposerAccess } from "../../components/Composer";
 import { DecisionCard } from "../../components/DecisionCard";
 import { MomentRow } from "../../components/MomentRow";
 import { FloatingNotice } from "../../components/FloatingNotice";
@@ -52,6 +51,7 @@ export function Brief({
   id: string;
 }) {
   const router = useRouter();
+  const keyboardPadding = useKeyboardPadding();
   const [tab, setTab] = useState<"chat" | "activity" | "files">("chat");
   const [conversationStale, setConversationStale] = useState(false);
   const [composerHeight, setComposerHeight] = useState(0);
@@ -146,13 +146,16 @@ export function Brief({
       ? "This session predates the Brief. Use the terminal to type."
       : undefined;
   const canSend = canSteer && !session?.team && !blocked && !steering.busy && Boolean(steering.text.trim());
-  // Drafts work without control, so dictation does too; it stops only where the text itself is locked.
+  // The composer docks only for a person's own running session; its field (and mic) only once this phone may type.
+  const composerShown = me !== null && me.role !== "viewer" && running && !missionId && !session?.team;
+  const fieldShown = composerShown && controlled;
+  // Dictation stops whenever its field is locked or leaves the screen, so no capture outlives its stop control.
   const dictation = useDictation({
     connection,
     value: steering.text,
     onChange: steering.setText,
     maxLength: 32000,
-    disabled: Boolean(blocked) || steering.busy || steering.pending,
+    disabled: !fieldShown || Boolean(blocked) || steering.busy || steering.pending,
   });
   function send() {
     if (!canSend) return;
@@ -161,14 +164,20 @@ export function Brief({
   const controlGate =
     online && running && !controlled
       ? control.holder
-        ? `${control.holder.label} has control. Take over above to answer here.`
-        : "Take control above to answer from this phone."
+        ? `${control.holder.label} has control. Take over below to answer here.`
+        : "Take control below to answer from this phone."
       : undefined;
 
   async function takeControl(takeover: boolean) {
     await control.claim(takeover);
     refresh();
   }
+  // The dock names who may type: a claim line until this phone holds the lease, then the field with its release.
+  const access: ComposerAccess | undefined = !requiresControl
+    ? undefined
+    : control.lease
+      ? { kind: "held", onRelease: () => { control.forget(true); refresh(); } }
+      : { kind: "take", holder: control.holder?.label, busy: control.busy, disabled: !online, onTake: () => void takeControl(Boolean(control.holder)) };
   function back() {
     if (router.canGoBack()) router.back();
     else router.replace({ pathname: "/", params: { machine: connectionKey(connection) } });
@@ -188,8 +197,7 @@ export function Brief({
   ].filter(Boolean).join(" · ") : "";
 
   return (
-    // Android runs edge-to-edge, so the window no longer resizes for the keyboard.
-    <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
+    <View style={[s.fill, s.overlayRoot, { paddingBottom: keyboardPadding }]}>
       <TopBar backLabel="Sessions" onBack={back} right={<>
         <LiveStatus online={online} seen={seen} stale={stale} />
         <GlassButton glyph="terminal" label="Open terminal" onPress={openTerminal} />
@@ -216,6 +224,7 @@ export function Brief({
                 accessibilityLabel={`${ROLE_NAMES[session.team.role]} in a team. Open team`}
                 onPress={() => router.push({ pathname: "/team/[id]", params: { id: session.team!.runId, machine: connectionKey(connection) } })} /> : null}
               <Chip label={sourceLabel(session.attention.hooks, session.attention.source)} accessibilityLabel={`Status source: ${sourceLabel(session.attention.hooks, session.attention.source)}`} />
+              {session.archivedAt ? <Chip kind="backlog" label="Archived" /> : null}
               {me?.role === "viewer" ? <Chip label="View only" /> : null}
             </View>
             <Text style={s.small} numberOfLines={1}>
@@ -223,21 +232,6 @@ export function Brief({
             </Text>
             {tools ? <Text style={s.small} numberOfLines={1}>{tools}</Text> : null}
           </View>
-          {missionLocked || (session.team && !missionId) ? null : <ControlBar
-            role={me?.role}
-            requiresControl={requiresControl}
-            running={running}
-            online={online}
-            lease={control.lease}
-            holder={control.holder}
-            busy={control.busy}
-            message={control.message}
-            onTake={(takeover) => void takeControl(takeover)}
-            onRelease={() => {
-              control.forget(true);
-              refresh();
-            }}
-          />}
           <ScrollView
             style={s.fill}
             contentContainerStyle={s.scrollBody}
@@ -303,9 +297,14 @@ export function Brief({
             </>}
             {session.team || missionId ? null : <Lifecycle connection={connection} session={session} role={me?.role} online={online} control={control.lease?.id} refresh={refresh} />}
           </ScrollView>
+          {/* One measured dock for every state, so the notice offset follows whatever is docked, or nothing. */}
+          <View onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}>
           {missionId ? (
-            <MissionManagedLine missionId={missionId} machine={connectionKey(connection)} style={s.managedLine}
-              onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)} />
+            <>
+              {/* A mission prompt is answered from its card, but the answer still needs this phone's lease. */}
+              {needsYou && access && me && me.role !== "viewer" && running ? <ControlDock access={access} /> : null}
+              <MissionManagedLine missionId={missionId} machine={connectionKey(connection)} style={s.managedLine} />
+            </>
           ) : session.team ? (
             // A team member is the coordinator's to steer, pause, or stop; direction goes to the team.
             <View style={s.managed}>
@@ -313,20 +312,13 @@ export function Brief({
               <Text style={s.managedText}>Run by the coordinator</Text>
               <Button compact title="Team" onPress={() => router.push({ pathname: "/team/[id]", params: { id: session.team!.runId, machine: connectionKey(connection) } })} />
             </View>
-          ) : me && me.role !== "viewer" ? (
+          ) : composerShown ? (
             <Composer
               canSteer={canSteer}
-              onTakeControl={online && running && !controlled ? () => void takeControl(Boolean(control.holder)) : undefined}
-              controlBusy={control.busy}
-              controlLabel={control.holder ? "Take over" : "Take control"}
+              access={access}
               blocked={blocked}
               blockedPlaceholder={
                 session.attention.prompt ? undefined : "Type in the terminal"
-              }
-              idleHint={
-                online && running && !controlled
-                  ? "Draft here. Take control when ready…"
-                  : undefined
               }
               busy={steering.busy}
               pending={steering.pending}
@@ -334,18 +326,18 @@ export function Brief({
               onChangeText={steering.setText}
               onSend={send}
               onInterrupt={() => void steering.sendKey("interrupt")}
-              onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
               dictation={dictation}
             />
           ) : null}
+          </View>
         </>
       )}
       <DictationNotice dictation={dictation} position="top" offset={110} />
       <FloatingNotice position="bottom" offset={composerHeight + 10}
-        message={answering.notice || (steering.error ? steering.error : steering.pending && !steering.busy ? "Delivery is unconfirmed. Retry sends the same request ID." : steering.receipt)}
-        kind={steering.error ? "error" : steering.receipt && !answering.notice ? "success" : "warning"}
+        message={answering.notice || control.message || (steering.error ? steering.error : steering.pending && !steering.busy ? "Delivery is unconfirmed. Retry sends the same request ID." : steering.receipt)}
+        kind={steering.error || (control.message && !answering.notice) ? "error" : steering.receipt && !answering.notice ? "success" : "warning"}
         accessibilityRole={answering.notice ? "alert" : undefined}
-        onDismiss={answering.notice ? answering.dismissNotice : steering.error || steering.receipt ? steering.dismissStatus : undefined}
+        onDismiss={answering.notice ? answering.dismissNotice : control.message ? control.dismiss : steering.error || steering.receipt ? steering.dismissStatus : undefined}
         actions={steering.pending && !steering.busy && !answering.notice ? <View style={s.noticeActions}>
           <Button compact title="Retry" disabled={!canSend} onPress={send} />
           <Button compact title="Clear…" secondary onPress={() => Alert.alert("Clear the unconfirmed delivery?", "The host may have received it. Clearing only forgets the request on this phone.", [
@@ -353,13 +345,16 @@ export function Brief({
             { text: "Clear", style: "destructive", onPress: steering.clearPending },
           ])} />
         </View> : null} />
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 
-/** The source of the current status, independent of the terminal recording. */
+/**
+ * Where the status comes from. Hooks or provider events report the agent's own turns; without
+ * them the host can only read the terminal screen, so the state is an inference from what it shows.
+ */
 function sourceLabel(hooks: SessionDetail["attention"]["hooks"], source: SessionDetail["attention"]["source"]) {
-  return source === "protocol" ? "Provider events" : source === "screen" ? "From screen" : hooks === "active" ? "Hooks active" : "Screen only";
+  return source === "protocol" ? "Provider events" : source === "screen" ? "Read from screen" : hooks === "active" ? "Hooks active" : "No hooks · reads screen";
 }
 
 const s = StyleSheet.create({
@@ -368,11 +363,11 @@ const s = StyleSheet.create({
   noticeActions: { flexDirection: "row", gap: 6 },
   small: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
   empty: { padding: 30, gap: 15, alignItems: "center" },
-  head: { paddingHorizontal: 16, paddingBottom: 10, gap: 7 },
-  title: { fontSize: 22, lineHeight: 27, fontWeight: "600", color: theme.colors.ink, letterSpacing: -0.4 },
-  chips: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
-  scrollBody: { paddingHorizontal: 16, paddingTop: 4, paddingBottom: 16, gap: 10 },
-  tabs: { marginTop: 4 },
+  head: { paddingHorizontal: 16, paddingBottom: 6, gap: 5 },
+  title: { fontSize: 21, lineHeight: 26, fontWeight: "600", color: theme.colors.ink, letterSpacing: -0.4 },
+  chips: { flexDirection: "row", flexWrap: "wrap", gap: 5 },
+  scrollBody: { paddingHorizontal: 16, paddingTop: 4, paddingBottom: 16, gap: 8 },
+  tabs: { marginTop: 2 },
   notice: { fontSize: 12, lineHeight: 18, color: theme.colors.warningInk },
   emptyTimeline: { gap: 4, paddingVertical: 8 },
   placeholder: { fontSize: 13, lineHeight: 20, color: theme.colors.mutedInk },

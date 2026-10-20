@@ -117,7 +117,10 @@ class SessionControl {
       this.renewTimer = setInterval(() => void this.renew(), RENEW_MS);
   }
 
-  /** Drops the local lease; `release` also tells the host so another device can take over. */
+  /**
+   * Drops the local lease; `release` also tells the host so another device can take over.
+   * The dock shows the change itself, so no message is set here.
+   */
   forget = (release = false) => {
     this.revision++;
     const previous = this.state.lease;
@@ -126,12 +129,12 @@ class SessionControl {
       this.collect();
       return;
     }
-    this.set({
-      message: "Monitoring. Take control again when you are ready to send input.",
-    });
     if (release) this.release(previous);
     this.collect();
   };
+
+  /** Clears a refusal or error once the person has read it. */
+  dismiss = () => this.set({ message: "" });
 
   /** The host refused input for control: this phone no longer holds a lease there. */
   refused = () => this.forget();
@@ -170,11 +173,8 @@ class SessionControl {
       // Polls that started while this claim was awaiting its answer must not revoke it.
       this.revision++;
       this.hold(result.control);
-      this.set({
-        message: result.control
-          ? "This phone has control."
-          : "Control was not granted. Refresh and try again.",
-      });
+      // A granted lease shows in the dock; only a refusal needs words.
+      this.set({ message: result.control ? "" : "Control was not granted. Refresh and try again." });
     } catch (error) {
       if (this.active() && revision === this.revision) {
         this.forget();
@@ -283,6 +283,7 @@ export function useSessionControl(connection: Connection, id: string) {
     ...state,
     claim: control.claim,
     forget: control.forget,
+    dismiss: control.dismiss,
     refused: control.refused,
     observe: control.observe,
     generation: control.generation,

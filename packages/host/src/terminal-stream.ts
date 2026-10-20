@@ -97,6 +97,8 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
         if (legacy && leaseId) {
           const held = leaseId;
           serial = serial.then(async () => {
+            // A managed session's fallback lease is not kept alive past its provider prompt.
+            if (managed && (await manager.state(match[1])).attention?.state !== "needs-you") return;
             await workerCall(manager.config.runDir, match[1], { op: "control", action: "renew", actor, leaseId: held });
           }).catch(() => { leaseId = undefined; fail(1011); });
         }
@@ -147,7 +149,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
           serial = serial.then(async () => {
             if (abort.signal.aborted) return;
             const state = await ready;
-            const promptScopedWrite = input.op === "raw" || input.op === "input" || input.op === "control" && input.action === "claim";
+            const promptScopedWrite = input.op === "raw" || input.op === "input" || input.op === "control" && input.action !== "release";
             if (managed && promptScopedWrite && (await manager.state(match[1])).attention?.state !== "needs-you") {
               await send({ refusal: {
                 requestId: "requestId" in input ? input.requestId : undefined,

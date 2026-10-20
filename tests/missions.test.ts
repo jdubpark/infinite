@@ -321,10 +321,15 @@ test("mission-managed sessions refuse direct human input but keep answers, reads
       assert.equal("leaseId" in request, false, "mission answers do not depend on a refused input lease");
       assert.equal("actor" in request, false);
     }
-    for (const action of ["renew", "release"] as const) {
-      const response = await host.fetchApi(`/sessions/${subteamSessionId}/control`, "owner", { action, leaseId: lease.id });
-      assert.equal(response.status, 200, `${action} can drop a stale managed-session lease`);
-    }
+    // A fallback lease is renewable only while a prompt is open, so it lapses after the prompt closes; release always works.
+    const closedRenew = await host.fetchApi(`/sessions/${subteamSessionId}/control`, "owner", { action: "renew", leaseId: lease.id });
+    assert.deepEqual([closedRenew.status, closedRenew.body.code], [409, "mission-managed"], "a lease cannot be kept alive after its prompt closes");
+    providerPromptOpen = true;
+    const openRenew = await host.fetchApi(`/sessions/${subteamSessionId}/control`, "owner", { action: "renew", leaseId: lease.id });
+    assert.equal(openRenew.status, 200, "a lease renews while the prompt is open");
+    providerPromptOpen = false;
+    const released = await host.fetchApi(`/sessions/${subteamSessionId}/control`, "owner", { action: "release", leaseId: lease.id });
+    assert.equal(released.status, 200, "release can drop a managed-session lease at any time");
     for (const sessionId of [standaloneSessionId, ordinarySessionId]) {
       const input = await host.fetchApi(`/sessions/${sessionId}/input`, "owner", { requestId: randomUUID(), text: "allowed input" });
       assert.equal(input.status, 200, `input to ${sessionId} remains available`);

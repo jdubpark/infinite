@@ -429,8 +429,9 @@ export function createApp(config: Config, key: Buffer) {
       else next(error);
     });
   };
+  // A fallback lease on a managed session lapses within its TTL once the prompt closes; release stays open.
   const refuseManagedClaim: express.RequestHandler = (req, res, next) =>
-    req.body?.action === "claim" ? refuseManagedOutsideProviderPrompt(req, res, next) : next();
+    req.body?.action === "claim" || req.body?.action === "renew" ? refuseManagedOutsideProviderPrompt(req, res, next) : next();
   app.get("/api/me", (_req, res) =>
     res.json({
       role: res.locals.role,

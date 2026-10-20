@@ -224,7 +224,7 @@ test("repository briefings label an unrefreshed turn, read a missing or not-opte
         assert.equal(status.body.error, "No repository brief exists yet; one is generated after the next change.");
       } else {
         assert.equal(status.body.state, "unavailable");
-        assert.equal(status.body.error, "This repository is not opted in to repository briefings.");
+        assert.equal(status.body.error, "Repository briefings are turned off on this host.");
       }
     } finally { await host.stop(); }
   }

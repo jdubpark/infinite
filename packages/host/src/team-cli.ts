@@ -13,7 +13,7 @@ import type { ProjectSourceStatus } from "./project-source.js";
 import { captureWorkspace } from "./workspace-checkpoint.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
 import { localProjectPath } from "./mirrored-projects.js";
-import { readSyncState, syncServiceRunning } from "./sync-service.js";
+import { readSyncState, stopSyncService, syncServiceRunning } from "./sync-service.js";
 import { canAskForBrief, chooseTeamBrief, failedTeamBriefRow, orderedTeamMembers, summaryMember, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, wrapText, type TeamBriefRow, type TeamBriefStatus, type TeamWatchCommand } from "./team-watch.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
@@ -713,6 +713,11 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     assertSourceUnchanged();
     await postMutation(api, receiptsPath, `${key}:repo-init:${requestId}`, `/projects/${selected}/team`, body, "PUT", !uploadSource);
     if (sourceSupported && projectSource.mode === "github") {
+      // A project that follows GitHub refuses laptop uploads, so a service still running for it would only report errors.
+      const syncStateFile = join(dirname(configPath), "sync", `${selected}.json`);
+      const syncState = readSyncState(syncStateFile);
+      if (syncState && syncState.origin === config.origin && syncServiceRunning(syncState) && stopSyncService(syncStateFile))
+        process.stderr.write(`[Infinite] Stopped the laptop sync service for ${selected}; this project now follows GitHub.\n`);
       try {
         const refreshed = await api.json<ProjectSourceStatus>(`/projects/${selected}/source/refresh`, {}, undefined, undefined, "POST");
         process.stderr.write(`[Infinite] ${describeSource(refreshed)}\n`);

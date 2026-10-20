@@ -1,5 +1,5 @@
 import type { Attention, Provider } from "@infinite/attention";
-import { createRemoteClient, RemoteError, type RemoteAccessToken } from "@infinite/remote";
+import { createRemoteClient, RemoteError, type RemoteAccessToken, type RemoteEvents } from "@infinite/remote";
 import * as Crypto from "expo-crypto";
 import { loadClientId } from "../store/connection";
 import type { TeamLineup, TeamProject, TeamRole } from "../features/teams/model";
@@ -89,6 +89,15 @@ export async function api<T>(
   } finally {
     clearTimeout(timer);
   }
+}
+
+export function openEvents(connection: Connection, options: {
+  topics: string[];
+  after?: number;
+  onEvent(event: { topic: string; data: unknown }): void;
+  onClose(event: { code: number; error?: RemoteError }): void;
+}): Promise<RemoteEvents> {
+  return remote(connection).openEvents(options);
 }
 
 /** One device's input lease; the host refuses input from every other device while it lasts. */

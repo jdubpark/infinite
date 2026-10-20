@@ -98,15 +98,18 @@ after first pairing. Initial pairing still trusts the manually provisioned devic
 key and the identity it authenticates; this is not independent hardware attestation
 or an expiring enrollment protocol.
 
-The allowlist now includes terminal streams, resource observations, and bounded
-project file operations. `terminal-open`, `terminal-send`, and `terminal-close`
+The allowlist now includes terminal and live-event streams, resource observations,
+and bounded project file operations. `terminal-open`, `terminal-send`,
+`terminal-close`, and the `events-*` messages
 travel inside ciphertext, together with device credentials and session identifiers.
 Server `terminal-event` frames carry original output, snapshots, state, receipts,
 and refusals. The host connects only to its own loopback terminal gateway; it
 cannot forward an arbitrary destination. Raw input remains owner-only, and
 worker input leases and durable request identities remain authoritative. Each
-channel permits four attached terminals, with bounded input and output buffers.
-Closing an attachment does not terminate its agent.
+channel limits and event-buffer behavior are defined in the
+[session ownership and protocol](architecture.md#delivery-contract) and
+[remote protocol](desktop.md#remote-api-extension) references. Closing an attachment
+does not terminate its agent.
 
 Every encrypted request checks current device authorization. Active encrypted
 subscriptions also recheck authorization before output and periodically while

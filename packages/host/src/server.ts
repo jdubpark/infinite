@@ -37,6 +37,8 @@ import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./
 import type { Config, Role, Receipt } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
+import { LiveFeed, type LiveTopic } from "./live.js";
+import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/protocol";
 
 const id = z.uuid();
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
@@ -175,6 +177,29 @@ export function createApp(config: Config, key: Buffer) {
     const external = cmux ? (await cmux.list()).filter(s => s.status !== "running" || !s.nativeSession || !s.pid || !known.has(`${s.provider}:${s.nativeSession.id}:${s.pid}`)) : [];
     return [...native, ...external.map(s => ({ ...s, backend: "cmux" as const, machineId: config.machine!.id, resumable: resumable(s) }))];
   };
+  const sessionDetail = async (sessionId: string) => {
+    if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
+      const session = await cmux.get(sessionId);
+      return { ...session, machineId: config.machine!.id, resumable: resumable(session) };
+    }
+    const session = { ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) };
+    const handoff = handoffs.view(sessionId);
+    return { ...session, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
+      resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
+  };
+  const sessionEvents = async (sessionId: string, after: number, limit = 200) => {
+    if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
+      await cmux.get(sessionId);
+      return cmux.events(sessionId, after, limit);
+    }
+    return manager.events(sessionId, after, limit);
+  };
+  const live = new LiveFeed({
+    sessions: async () => ({ sessions: await listSessions() }),
+    teams: () => ({ teams: teams.list() }),
+    session: sessionDetail,
+    events: (sessionId, after) => sessionEvents(sessionId, after),
+  });
   /**
    * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
    * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
@@ -217,6 +242,7 @@ export function createApp(config: Config, key: Buffer) {
       ? { actor: res.locals.actor, leaseId: res.locals.leaseId } : {};
   }
   const cookies = new Map<string, { device: PairedDevice; expires: number }>();
+  const eventStreamCounts = new Map<string, number>();
   const attempts = new Map<string, { start: number; count: number }>();
   const origin = new URL(config.origin);
   app.disable("x-powered-by");
@@ -249,6 +275,22 @@ export function createApp(config: Config, key: Buffer) {
     return config.tokens.find((t) =>
       timingSafeEqual(digest, Buffer.from(t.hash, "hex")),
     );
+  }
+  function authenticateRequest(req: express.Request) {
+    const bearer = req.headers.authorization?.match(/^Bearer (.{32,200})$/)?.[1];
+    if (bearer) {
+      const device = authenticate(bearer);
+      return device ? { device, credentialHash: device.hash, instance: "legacy", bearer: true } : undefined;
+    }
+    const value = req.headers.cookie
+      ?.split(";")
+      .map((v) => v.trim())
+      .find((v) => v.startsWith("infinite="))
+      ?.slice(9);
+    const session = value ? cookies.get(hashToken(value)) : undefined;
+    if (!session || session.expires <= Date.now()) return undefined;
+    const device = config.tokens.find(token => token.hash === session.device.hash);
+    return device ? { device, credentialHash: device.hash, instance: hashToken(value!), bearer: false } : undefined;
   }
   app.post("/api/login", (req, res) => {
     const ip = req.socket.remoteAddress ?? "unknown";
@@ -284,33 +326,23 @@ export function createApp(config: Config, key: Buffer) {
     return res.json({ role: device.role });
   });
   app.use("/api", (req, res, next) => {
-    const bearer =
-      req.headers.authorization?.match(/^Bearer (.{32,200})$/)?.[1];
-    let device = bearer ? authenticate(bearer) : undefined;
-    let instance = "legacy";
-    if (!bearer) {
-      const value = req.headers.cookie
-        ?.split(";")
-        .map((v) => v.trim())
-        .find((v) => v.startsWith("infinite="))
-        ?.slice(9);
-      const session = value ? cookies.get(hashToken(value)) : undefined;
-      if (session && session.expires > Date.now()) {
-        device = session.device;
-        instance = hashToken(value!);
-      }
+    const auth = authenticateRequest(req);
+    const device = auth?.device;
+    const hasBearer = Boolean(req.headers.authorization?.match(/^Bearer (.{32,200})$/)?.[1]);
+    if (!hasBearer) {
       if (req.method !== "GET" && req.headers.origin !== origin.origin)
         return res
           .status(403)
           .json({ error: "Origin is required for browser changes" });
     }
-    if (!device)
+    if (!auth || !device)
       return res.status(401).json({ error: "Connect with a device key" });
     res.locals.role = device.role;
     res.locals.deviceId = device.id;
-    res.locals.bearer = Boolean(bearer);
+    res.locals.bearer = auth.bearer;
+    res.locals.authCredentialHash = auth.credentialHash;
     const clientId = req.get("X-Infinite-Client");
-    res.locals.actor = controlActor(device, clientId ? id.parse(clientId) : instance);
+    res.locals.actor = controlActor(device, clientId ? id.parse(clientId) : auth.instance);
     res.locals.leaseId = id.optional().parse(req.get("X-Infinite-Control"));
     next();
   });
@@ -533,6 +565,64 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/sessions", async (_req, res) =>
     res.json({ sessions: await listSessions() }),
   );
+  app.get("/api/events", (req, res) => {
+    const topicValues = z.array(z.union([z.literal("sessions"), z.literal("teams"), z.string().regex(/^session\/[0-9a-f-]{36}$/i)])).min(1).max(16)
+      .parse(z.string().min(1).max(4096).parse(req.query.topics).split(","));
+    const topics = topicValues.map(value => value === "sessions" || value === "teams" ? value : `session/${id.parse(value.slice(8))}`) as LiveTopic[];
+    if (new Set(topics).size !== topics.length) return void res.status(400).json({ error: "Duplicate live topic" });
+    const after = z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0).parse(req.query.after);
+    const credentialHash = res.locals.authCredentialHash as string;
+    const initial = authenticateRequest(req);
+    if (!initial || initial.credentialHash !== credentialHash) return void res.status(401).json({ error: "Connect with a device key" });
+    const streamCounts = eventStreamCounts;
+    const active = streamCounts.get(credentialHash) ?? 0;
+    if (active >= MAX_EVENTS_STREAMS) return void res.status(429).json({ code: "busy", error: "Too many live event streams for this device" });
+    streamCounts.set(credentialHash, active + 1);
+    res.status(200).set({ "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", Connection: "keep-alive" });
+    let stop = () => {};
+    let closed = false;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      if (heartbeat) clearInterval(heartbeat);
+      stop();
+      const count = (streamCounts.get(credentialHash) ?? 1) - 1;
+      if (count > 0) streamCounts.set(credentialHash, count); else streamCounts.delete(credentialHash);
+    };
+    const stillAuthenticated = () => {
+      const current = authenticateRequest(req);
+      return Boolean(current && current.credentialHash === credentialHash && current.device.id === initial.device.id && current.device.role === initial.device.role);
+    };
+    const terminate = (reason: "auth-revoked" | "buffer-limit") => {
+      close();
+      if (reason === "buffer-limit") {
+        const frame = `event: close\ndata: {"reason":"buffer-limit"}\n\n`;
+        if (res.writableLength + Buffer.byteLength(frame) <= MAX_EVENTS_BUFFERED_BYTES) return void res.end(frame);
+        res.once("error", () => {});
+        return void res.destroy(new Error("HTTP events buffer limit exceeded"));
+      }
+      res.end();
+    };
+    const writeFrame = (frame: string) => {
+      if (closed || res.destroyed || res.writableEnded) return false;
+      if (!stillAuthenticated()) { terminate("auth-revoked"); return false; }
+      if (res.writableLength + Buffer.byteLength(frame) > MAX_EVENTS_BUFFERED_BYTES) { terminate("buffer-limit"); return false; }
+      res.write(frame);
+      return true;
+    };
+    res.on("close", close);
+    res.flushHeaders();
+    if (!writeFrame(": connected\n\n")) return;
+    const unsubscribe = live.subscribe(topics, after, update => {
+      writeFrame(`event: update\ndata: ${JSON.stringify(update)}\n\n`);
+    });
+    if (closed) unsubscribe(); else stop = unsubscribe;
+    if (!closed) {
+      heartbeat = setInterval(() => { writeFrame(": heartbeat\n\n"); }, 15000);
+      heartbeat.unref();
+    }
+  });
   app.post("/api/sessions", requireRole(["owner"]), async (req, res) => {
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) return void res.status(400).json({ code: "invalid-create", error: "Invalid session details", details: parsed.error.issues.map(issue => ({ path: issue.path.join("."), message: issue.message })) });
@@ -603,14 +693,7 @@ export function createApp(config: Config, key: Buffer) {
     }
   });
   app.get("/api/sessions/:id", async (req, res) => {
-    const sessionId = id.parse(req.params.id);
-    const session = {
-      ...manager.meta(sessionId).session,
-      ...(await manager.state(sessionId, true)),
-    };
-    const handoff = handoffs.view(sessionId);
-    res.json({ ...session, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
-      resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) });
+    res.json(await sessionDetail(id.parse(req.params.id)));
   });
   app.get("/api/sessions/:id/handoff", (req, res) => res.json(handoffs.view(id.parse(req.params.id))));
   app.get("/api/sessions/:id/messages", async (req, res) => {
@@ -691,7 +774,7 @@ export function createApp(config: Config, key: Buffer) {
     const query = new URL(req.originalUrl, origin).search;
     proxyNativeHttp(req, res, new URL(backend.url + path + query), { Authorization: backend.token }, req.body === undefined ? undefined : Buffer.from(JSON.stringify(req.body)));
   });
-  app.get("/api/sessions/:id/events", (req, res) => {
+  app.get("/api/sessions/:id/events", async (req, res) => {
     const after = z.coerce
       .number()
       .int()
@@ -706,7 +789,7 @@ export function createApp(config: Config, key: Buffer) {
       .max(200)
       .default(200)
       .parse(req.query.limit);
-    const types =
+    const types: Set<string> | undefined =
       typeof req.query.types === "string"
         ? new Set(
             z
@@ -726,7 +809,9 @@ export function createApp(config: Config, key: Buffer) {
               .parse(req.query.types.split(",")),
           )
         : undefined;
-    res.json(manager.events(id.parse(req.params.id), after, limit, types));
+    const sessionId = id.parse(req.params.id);
+    const page = await sessionEvents(sessionId, after, limit);
+    res.json({ ...page, events: types ? page.events.filter(event => types.has(event.type)) : page.events });
   });
   app.post("/api/sessions/:id/control", requireRole(["owner", "controller"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);
@@ -1027,6 +1112,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { live.close(); handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

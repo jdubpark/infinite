@@ -92,12 +92,14 @@ function inferBaseBranch(root: string): string {
   if (branch === "main" || branch === "master") return branch;
   throw new Error("Could not infer the default branch from origin/HEAD or a local main/master branch; supply --base-branch BRANCH.");
 }
-export function inferProjectSource(root: string, option: string | undefined): ProjectSource {
+/** `baseBranch` is an explicit `--base-branch`; without it the branch comes from `origin/HEAD` or a local main/master. */
+export function inferProjectSource(root: string, option: string | undefined, baseBranch?: string): ProjectSource {
   if (option === "laptop") return { mode: "laptop" };
-  if (option === "github") return { mode: "github", repository: inferGitHubRepository(root), baseBranch: inferBaseBranch(root) };
+  const branch = () => baseBranch === undefined ? inferBaseBranch(root) : gitBranchSchema.parse(baseBranch);
+  if (option === "github") return { mode: "github", repository: inferGitHubRepository(root), baseBranch: branch() };
   if (option !== undefined) throw new Error("--source must be github or laptop.");
   try {
-    return { mode: "github", repository: inferGitHubRepository(root), baseBranch: inferBaseBranch(root) };
+    return { mode: "github", repository: inferGitHubRepository(root), baseBranch: branch() };
   } catch {
     return { mode: "laptop" };
   }
@@ -107,15 +109,14 @@ export function requestedDelivery(root: string, options: Options, current: { rev
   const mode = options["--delivery"] === undefined ? undefined : String(options["--delivery"]);
   if (mode === undefined) {
     if (options["--merge-method"] !== undefined) throw new Error("--merge-method requires --delivery merge.");
-    if (options["--repository"] !== undefined || options["--base-branch"] !== undefined)
-      throw new Error("--repository and --base-branch require --delivery merge or pr.");
+    // --base-branch also names the branch a GitHub-tracked source follows, so it needs no --delivery.
+    if (options["--repository"] !== undefined) throw new Error("--repository requires --delivery merge or pr.");
     return current.revision > 0 ? current.team?.delivery : undefined;
   }
   if (mode !== "merge" && mode !== "pr" && mode !== "review") throw new Error("--delivery must be merge, pr, or review.");
   if (mode === "review") {
     if (options["--merge-method"] !== undefined) throw new Error("--merge-method applies only to --delivery merge.");
-    if (options["--repository"] !== undefined || options["--base-branch"] !== undefined)
-      throw new Error("--repository and --base-branch apply only to --delivery merge or pr.");
+    if (options["--repository"] !== undefined) throw new Error("--repository applies only to --delivery merge or pr.");
     return undefined;
   }
   if (mode === "pr" && options["--merge-method"] !== undefined)
@@ -574,7 +575,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       return true;
     }
     const root = gitResult.root;
-    const projectSource = inferProjectSource(root, options["--source"] === undefined ? undefined : String(options["--source"]));
+    const projectSource = inferProjectSource(root, options["--source"] === undefined ? undefined : String(options["--source"]), options["--base-branch"] === undefined ? undefined : String(options["--base-branch"]));
     const teamwork = options["--teamwork"] === undefined ? undefined : String(options["--teamwork"]) === "none" ? null : canonicalTeamworkPath(String(options["--teamwork"]), process.cwd(), root);
     const status = git(root, ["status", "--porcelain", "--untracked-files=all"]);
     if (status) throw new Error("Repository must be clean before onboarding. Commit or remove tracked and untracked changes first.");

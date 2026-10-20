@@ -83,3 +83,19 @@ test("PR delivery rejects merge-method with its bounded option error", () => {
     "--merge-method": "squash",
   }, { revision: 0 }), { message: "--merge-method applies only to --delivery merge." });
 });
+
+test("repo init takes --base-branch as the followed branch when origin/HEAD is missing, with or without delivery", () => {
+  const root = makeRepository("https://github.com/example/product.git");
+  try {
+    execFileSync("git", ["-C", root, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"], { stdio: "ignore" });
+    // No origin/HEAD and a local branch that is neither main nor master: nothing to infer the followed branch from.
+    execFileSync("git", ["-C", root, "symbolic-ref", "HEAD", "refs/heads/trunk"], { stdio: "ignore" });
+    assert.deepEqual(inferProjectSource(root, undefined), { mode: "laptop" });
+    assert.deepEqual(inferProjectSource(root, "github", "trunk"), { mode: "github", repository: "example/product", baseBranch: "trunk" });
+    assert.deepEqual(inferProjectSource(root, undefined, "trunk"), { mode: "github", repository: "example/product", baseBranch: "trunk" });
+    assert.equal(requestedDelivery(root, { "--base-branch": "trunk" }, { revision: 0 }), undefined);
+    assert.throws(() => requestedDelivery(root, { "--repository": "example/product" }, { revision: 0 }), /--repository requires --delivery merge or pr/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -5,7 +5,7 @@ import type { Manager } from "./manager.js";
 import type { TeamAssignment } from "./team-types.js";
 import { writeSealed, unseal } from "./vault.js";
 import { accountOf, periodStart, priceUsage, sumUsage, type UsageRecord, type UsageTotals, type UsageTokens } from "./usage.js";
-import type { AccountView, Balance, BriefingUsage, Money, TaskUsage, UsageResolvers } from "./usage-api.js";
+import { usagePlanSchema, type AccountView, type Balance, type BriefingUsage, type Money, type TaskUsage, type UsageResolvers } from "./usage-api.js";
 
 type Period = "day" | "week" | "month";
 export interface SessionUsage extends UsageTotals { measured: true }
@@ -27,6 +27,7 @@ const PAGE = 200;
 const periodEnd = (period: Period, start: Date) => period === "month" ? new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1))
   : new Date(start.getTime() + (period === "week" ? 7 : 1) * 86_400_000);
 const SCOPE = "usage";
+const PLAN_SCOPE = "usage-plans";
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 
 /**
@@ -42,10 +43,13 @@ export class UsageService {
   private ticking = false;
   private readonly failed = new Set<string>();
   private readonly file: string;
+  private readonly planFile: string;
+  private planOverrides: Record<string, number> = Object.create(null) as Record<string, number>;
   private balances?: { get(id: string): Balance };
   private resolvers: UsageResolvers = { goalOfRun: () => undefined, runTitle: () => undefined, projectName: id => id, sessionTitle: () => undefined };
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager) {
     this.file = join(config.stateDir, "usage.sealed");
+    this.planFile = join(config.stateDir, "usage-plans.sealed");
     // The ledger is derived from session journals, so an unreadable one is rebuilt rather than fatal.
     if (existsSync(this.file)) try {
       const stored = unseal<Ledger>(key, SCOPE, readFileSync(this.file, "utf8"));
@@ -54,6 +58,14 @@ export class UsageService {
       this.ledger.briefings ??= {};
     } catch (error) {
       console.warn(`[Infinite] The usage ledger cannot be read and is rebuilt from session journals: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (existsSync(this.planFile)) try {
+      const stored = unseal<unknown>(key, PLAN_SCOPE, readFileSync(this.planFile, "utf8"));
+      if (!isRecord(stored) || Object.entries(stored).some(([id, value]) => !id || typeof value !== "number" || !usagePlanSchema.safeParse({ planUsd: value }).success))
+        throw new Error("unexpected plan overrides shape");
+      this.planOverrides = Object.assign(Object.create(null), stored) as Record<string, number>;
+    } catch (error) {
+      console.warn(`[Infinite] Owner usage plans cannot be read and are ignored: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   /**
@@ -69,6 +81,20 @@ export class UsageService {
   close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); }
   useBalances(service: { get(id: string): Balance }) { this.balances = service; }
   useResolvers(resolvers: UsageResolvers) { this.resolvers = resolvers; }
+
+  /** Updates a subscription plan override, retaining config as the default. */
+  setPlan(accountId: string, planUsd: number | null): "missing" | "metered" | "updated" {
+    const accounts = this.config.usage?.accounts;
+    const account = accounts && Object.hasOwn(accounts, accountId) ? accounts[accountId] : undefined;
+    if (!account) return "missing";
+    if (account.kind !== "subscription") return "metered";
+    const next = Object.assign(Object.create(null), this.planOverrides) as Record<string, number>;
+    if (planUsd === null) delete next[accountId];
+    else next[accountId] = planUsd;
+    writeSealed(this.planFile, this.key, PLAN_SCOPE, next);
+    this.planOverrides = next;
+    return "updated";
+  }
 
   /** Folds new journal usage into the ledger. `rows` is a listing the caller already took; without one, the manager is asked. */
   async tick(rows?: UsageSessionRow[]) {
@@ -246,7 +272,12 @@ export class UsageService {
     const accounts: AccountView[] = Object.entries(accountConfigs).map(([id, account]) => {
       const matching = (rows: typeof records) => rows.filter(({ record }) => accountOf(record.providerId, record.modelId, accountConfigs) === id);
       const monthRows = matching(inRange(monthStart, new Date(now.getTime() + 1)));
-      return { id, kind: account.kind, ...(account.kind === "metered" ? { month: this.money(monthRows) } : {}), ...(account.planUsd !== undefined ? { planUsd: account.planUsd } : {}), balance: this.balances?.get(id) ?? null };
+      const overridden = account.kind === "subscription" && Object.hasOwn(this.planOverrides, id);
+      const planUsd = overridden ? this.planOverrides[id] : account.planUsd;
+      const planSource = account.kind === "subscription" ? overridden ? "owner" as const : account.planUsd !== undefined ? "config" as const : undefined : undefined;
+      return { id, kind: account.kind, ...(account.kind === "metered" ? { month: this.money(monthRows) } : {}),
+        ...(planUsd !== undefined ? { planUsd } : {}), ...(planSource ? { planSource } : {}),
+        balance: this.balances?.get(id) ?? null };
     });
     const unmeasuredSessions = Object.values(this.ledger.sessions).filter(session => !session.measured && Date.parse(session.lastActiveAt ?? session.createdAt) >= monthStart.getTime() && Date.parse(session.lastActiveAt ?? session.createdAt) < end.getTime()).length + Object.values(this.ledger.briefings).filter(row => !row.record && Date.parse(row.at) >= monthStart.getTime() && Date.parse(row.at) <= now.getTime()).length;
     return { period: { start: monthStart.toISOString(), end: end.toISOString() }, providers,

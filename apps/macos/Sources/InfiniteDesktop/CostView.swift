@@ -62,6 +62,14 @@ import InfiniteCore
         if owner { do { _ = try await client.refreshBalances() } catch { self.error = error.localizedDescription } }
         await load()
     }
+    /// Owner only: sets a subscription's monthly fee (`nil` returns to the config default). The host's
+    /// reply replaces the account tiles at once; the month headline follows on the next load. A refusal
+    /// is thrown for the editor to show beside the field and never touches the view's figures.
+    func setPlan(account id: String, usd: Double?) async throws {
+        let accounts = try await client.setPlan(account: id, planUsd: usd)
+        if var overview { overview.accounts = accounts; self.overview = overview }
+        await load()
+    }
     var minAttempts: Int { scorecard?.minAttempts ?? 10 }
     var roles: [String] {
         var roles = scorecard?.roles ?? []
@@ -188,7 +196,9 @@ private struct OverviewSection: View {
                     DailyChart(daily: daily, colors: colors)
                 }
             }
-            if let overview = model.overview, !overview.accounts.isEmpty { AccountRow(accounts: overview.accounts, colors: colors) }
+            if let overview = model.overview, !overview.accounts.isEmpty {
+                AccountRow(accounts: overview.accounts, colors: colors, owner: model.owner) { id, usd in try await model.setPlan(account: id, usd: usd) }
+            }
             CostLegend()
         }
     }
@@ -294,6 +304,9 @@ struct DailyChart: View {
 private struct AccountRow: View {
     let accounts: [AccountView]
     let colors: [String: Color]
+    /// Only the owner may change a subscription's fee; everyone else sees the figure alone.
+    let owner: Bool
+    let setPlan: (String, Double?) async throws -> Void
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
             ForEach(Array(accounts.enumerated()), id: \.element.id) { index, account in
@@ -310,10 +323,16 @@ private struct AccountRow: View {
                 Text(account.metered ? "metered" : "plan").font(.caption).foregroundStyle(.tertiary)
             }
             VStack(alignment: .leading, spacing: 1) {
-                if let month = account.month { MoneyText(month).font(.system(size: 22, weight: .semibold, design: .rounded)) }
-                else if let plan = account.planUsd { Text(UsageFormat.usd(plan)).font(.system(size: 22, weight: .semibold, design: .rounded)) }
-                else { Text("—").font(.system(size: 22, weight: .semibold, design: .rounded)).foregroundStyle(.tertiary) }
-                Text(account.metered ? "this month" : "per month").font(.caption).foregroundStyle(.secondary)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    if let month = account.month { MoneyText(month).font(.system(size: 22, weight: .semibold, design: .rounded)) }
+                    else if let plan = account.planUsd { Text(UsageFormat.usd(plan)).font(.system(size: 22, weight: .semibold, design: .rounded)) }
+                    else { Text("—").font(.system(size: 22, weight: .semibold, design: .rounded)).foregroundStyle(.tertiary) }
+                    if owner, !account.metered { PlanFeeEditor(account: account, setPlan: setPlan) }
+                }
+                HStack(spacing: 4) {
+                    Text(account.metered ? "this month" : "per month")
+                    if account.planSetByOwner { Text("· set by you") }
+                }.font(.caption).foregroundStyle(.secondary)
             }
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
@@ -332,6 +351,61 @@ private struct AccountRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// The owner's pencil beside a subscription fee: a popover with the dollar field, Save, Cancel, and
+/// "Reset to default" once the owner has overridden the config. The figure is checked here the way the
+/// host checks it (0–100000, two decimals); a refusal from the host shows beneath the field verbatim.
+private struct PlanFeeEditor: View {
+    let account: AccountView
+    let setPlan: (String, Double?) async throws -> Void
+    @State private var open = false
+    @State private var text = ""
+    @State private var problem = ""
+    @State private var saving = false
+    var body: some View {
+        Button { text = account.planUsd.map { String(format: "%.2f", $0) } ?? ""; problem = ""; open = true } label: {
+            Image(systemName: "pencil").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary).frame(width: 18, height: 18).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Change the monthly fee for \(account.id)")
+        .accessibilityLabel("Edit \(account.id) monthly fee")
+        .popover(isPresented: $open, arrowEdge: .bottom) { editor }
+    }
+    private var editor: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Monthly fee · \(account.id)").font(.caption.weight(.medium)).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text("$").foregroundStyle(.secondary)
+                TextField("0.00", text: $text).textFieldStyle(.roundedBorder).frame(width: 110).monospacedDigit()
+                    .disabled(saving).onSubmit { save() }
+                    .accessibilityLabel("Monthly fee in dollars")
+            }
+            if !problem.isEmpty { Text(problem).font(.caption).foregroundStyle(Palette.error).fixedSize(horizontal: false, vertical: true).frame(maxWidth: 230, alignment: .leading) }
+            HStack(spacing: 8) {
+                if account.planSetByOwner {
+                    Button("Reset to default") { apply(nil) }.disabled(saving).help("Return to the fee in the host's config")
+                }
+                Spacer(minLength: 8)
+                if saving { ProgressView().controlSize(.small) }
+                Button("Cancel") { open = false }.keyboardShortcut(.cancelAction).disabled(saving)
+                Button("Save") { save() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(saving)
+            }
+            .controlSize(.small)
+        }
+        .padding(14).frame(minWidth: 250)
+    }
+    private func save() {
+        do { apply(try PlanFee.parse(text)) } catch { problem = error.localizedDescription }
+    }
+    private func apply(_ usd: Double?) {
+        problem = ""; saving = true
+        Task {
+            do { try await setPlan(account.id, usd); open = false }
+            catch { problem = error.localizedDescription }
+            saving = false
+        }
     }
 }
 

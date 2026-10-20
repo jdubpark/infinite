@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { ArrowDown, ArrowLeft, ArrowUp, ArrowUpRight, ChevronRight, Minus, RefreshCw, Star } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowUp, ArrowUpRight, ChevronRight, Minus, Pencil, RefreshCw, Star } from "lucide-react";
 import { ago, names, useApi, type AccountView, type Me, type Money, type ModelRow, type OwnerRating, type Scorecard, type TaskUsage, type UsageDaily, type UsageProject, type UsageProjectRow, type UsageSummary } from "./api";
 import { useMachines } from "./machines";
 import { useLiveRefresh } from "./live-refresh";
@@ -203,6 +203,57 @@ function Failure({ message, retry }: { message: string; retry: () => void }) {
   return <p className="cost-failure" role="status">{message} <button className="text-button" onClick={retry}><RefreshCw size={14} />Try again</button></p>;
 }
 
+const PLAN_MAX = 100000;
+/** The same rule the host applies: a whole-dollar or two-decimal figure from 0 to 100000. Returns the number or the reason. */
+export function parsePlanUsd(text: string): { value: number } | { error: string } {
+  // One comma is a decimal separator, as some keyboards type it; thousands grouping is refused rather than guessed.
+  const stripped = text.trim().replace(/^\$/, "");
+  if ((stripped.match(/,/g)?.length ?? 0) > 1 || (stripped.includes(",") && stripped.includes("."))) return { error: "Use one comma or dot for cents, without thousands separators." };
+  const cleaned = stripped.replace(",", ".");
+  if (!cleaned) return { error: "Enter a monthly fee in dollars." };
+  if (!/^\d+(\.\d{0,2})?$/.test(cleaned)) return { error: "Use a dollar figure with at most two decimals." };
+  const value = Number(cleaned);
+  if (value > PLAN_MAX) return { error: `The fee must be at most ${usd(PLAN_MAX)}.` };
+  return { value };
+}
+/**
+ * A subscription account's monthly fee. The owner can turn the figure into an inline input; everyone else just reads it.
+ * The host answers every change with the whole account list, so the card never guesses a figure it did not confirm.
+ */
+function PlanFee({ account, owner, onChanged }: { account: AccountView; owner: boolean; onChanged: (accounts: AccountView[]) => void }) {
+  const api = useApi();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const custom = account.planSource === "owner";
+  const open = () => { setDraft(String(account.planUsd ?? 0)); setError(""); setEditing(true); };
+  const close = () => { setEditing(false); setError(""); };
+  async function submit(planUsd: number | null) {
+    setBusy(true); setError("");
+    try {
+      const result = await api<{ accounts: AccountView[] }>(`/usage/accounts/${encodeURIComponent(account.id)}/plan`, { planUsd }, "PUT");
+      onChanged(result.accounts);
+      setEditing(false);
+    } catch (failure) { setError((failure as Error).message); }
+    finally { setBusy(false); }
+  }
+  if (!editing) return <>
+    <strong className="cost-account-figure">{usd(account.planUsd ?? 0)}<small>/mo</small>{owner && <button type="button" className="cost-plan-edit" aria-label={`Edit the ${accountName(account.id)} plan fee`} onClick={open}><Pencil size={13} aria-hidden="true" /></button>}</strong>
+    <span className="cost-account-sub">plan fee · no per-use dollars{custom && <span className="cost-plan-owner"> · set by you</span>}</span>
+    {error && <small className="error" role="alert">{error}</small>}
+  </>;
+  return <form className="cost-plan-form" onSubmit={event => { event.preventDefault(); const parsed = parsePlanUsd(draft); if ("error" in parsed) setError(parsed.error); else void submit(parsed.value); }}>
+    <label className="cost-plan-field"><span className="sr-only">Monthly fee in US dollars</span><span aria-hidden="true">$</span><input autoFocus inputMode="decimal" value={draft} disabled={busy} onChange={event => { setDraft(event.target.value); setError(""); }} onKeyDown={event => { if (event.key === "Escape") close(); }} /><small>/mo</small></label>
+    <span className="cost-plan-actions">
+      <button type="submit" className="text-button" disabled={busy}>{busy ? "Saving…" : "Save"}</button>
+      <button type="button" className="text-button" disabled={busy} onClick={close}>Cancel</button>
+      {custom && <button type="button" className="text-button quiet" disabled={busy} onClick={() => void submit(null)}>Reset to default</button>}
+    </span>
+    {error && <small className="error" role="alert">{error}</small>}
+  </form>;
+}
+
 function Overview({ me }: { me: Me }) {
   const api = useApi();
   const [summary, setSummary] = useState<UsageSummary | null>(null);
@@ -241,7 +292,7 @@ function Overview({ me }: { me: Me }) {
         const series = byAccount(account.id);
         return <li key={account.id} className="cost-account">
           <span className="cost-account-name"><i className="cost-swatch" style={{ background: colors[account.id] }} />{accountName(account.id)}<span className="quiet">{account.kind === "metered" ? "metered" : "subscription"}</span></span>
-          {account.kind === "subscription" ? <><strong className="cost-account-figure">{usd(account.planUsd ?? 0)}<small>/mo</small></strong><span className="cost-account-sub">plan fee · no per-use dollars</span></>
+          {account.kind === "subscription" ? <PlanFee account={account} owner={me.role === "owner"} onChanged={accounts => { setSummary(previous => previous ? { ...previous, accounts } : previous); view.refresh(); }} />
             : account.balance ? <><strong className="cost-account-figure">{usd(account.balance.amount, account.balance.currency)}</strong><span className="cost-account-sub">balance · as of {ago(account.balance.asOf)}{account.balance.stale && <em> · stale</em>}</span></>
             : <><strong className="cost-account-figure cost-dash">—</strong><span className="cost-account-sub">no balance from the provider</span></>}
           <span className="cost-account-foot"><span>{account.month ? <><Amount money={account.month} /> this month</> : <span className="quiet">no metered spend</span>}</span>{series.some(value => value > 0) && <Sparkline values={series} color={colors[account.id]} width={88} height={26} />}</span>

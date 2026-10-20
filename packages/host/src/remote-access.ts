@@ -29,6 +29,11 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (url.pathname !== path.split("?")[0] || /%/i.test(url.pathname)) return false;
   if (method === "GET" && url.pathname === "/api/me") return true;
   if (method === "GET" && url.pathname === "/api/machine/resources") return true;
+  // The phone's cost screen; the host still enforces each route's role.
+  if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects"].includes(url.pathname)) return true;
+  if (method === "GET" && /^\/api\/usage\/projects\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
+  if (method === "POST" && url.pathname === "/api/usage/balances/refresh") return true;
+  if (method === "PUT" && /^\/api\/usage\/accounts\/[A-Za-z0-9_.-]+\/plan$/.test(url.pathname)) return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/sessions") return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/teams") return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/goals") return true;

@@ -462,7 +462,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "list", "usage", "resources", "close", "sync", "pull", "team", "repo"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "list", "usage", "cost", "resources", "close", "sync", "pull", "team", "repo"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
@@ -623,10 +623,14 @@ function usageOverview(summary: import("./usage-service.js").UsageSummary, daily
   const money = (value: { usd: number; unpriced: number }) => `${value.unpriced ? "≥ " : ""}$${formatUsd(value.usd)}`;
   const lines = [`Month ${money(summary.month.spent)} · previous ${money(summary.month.previous)} · plans $${formatUsd(summary.month.plansUsd)}`,
     `Unmeasured sessions ${summary.month.unmeasuredSessions}`,
-    ...summary.accounts.map(account => `${account.id}  ${account.kind === "subscription" ? `plan $${formatUsd(account.planUsd ?? 0)}` : money(account.month ?? { usd: 0, unpriced: 0 })} · balance ${account.balance ? `${account.balance.currency} ${account.balance.amount.toFixed(2)}${account.balance.stale ? " stale" : ""} as of ${account.balance.asOf}` : "—"}`),
+    ...summary.accounts.map(usageAccountLine),
     usageBars(daily.days.map(day => day.usd)),
     ...(daily.days.length ? [`${daily.days[0].date} — ${daily.days.at(-1)!.date}`] : [])];
   return lines;
+}
+function usageAccountLine(account: import("./usage-api.js").AccountView) {
+  const money = (value: { usd: number; unpriced: number }) => `${value.unpriced ? "≥ " : ""}$${formatUsd(value.usd)}`;
+  return `${account.id}  ${account.kind === "subscription" ? `plan $${formatUsd(account.planUsd ?? 0)}` : money(account.month ?? { usd: 0, unpriced: 0 })} · balance ${account.balance ? `${account.balance.currency} ${account.balance.amount.toFixed(2)}${account.balance.stale ? " stale" : ""} as of ${account.balance.asOf}` : "—"}`;
 }
 
 export async function handleClientCommand(argv: string[]): Promise<boolean> {
@@ -682,7 +686,32 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       else printSessions(sessions, (await api.json<Me>("/me")).machine?.label || new URL(config.origin).hostname);
       return true;
     }
-    if (command === "usage") {
+    if (command === "cost" && positional[0] === "plan") {
+      if (positional.length !== 3) throw new Error("Usage: infinite cost plan ACCOUNT USD|reset");
+      const [, accountId, input] = positional;
+      let planUsd: number | null;
+      if (input === "reset") planUsd = null;
+      else {
+        if (!/^\d+(?:\.\d{1,2})?$/.test(input)) throw new Error("Plan fee must be a USD amount from 0 to 100000 with at most two decimal places, or reset.");
+        planUsd = Number(input);
+        if (!Number.isFinite(planUsd) || planUsd > 100000) throw new Error("Plan fee must be a USD amount from 0 to 100000 with at most two decimal places, or reset.");
+      }
+      let result: { accounts: import("./usage-api.js").AccountView[] };
+      try {
+        result = await api.json(`/usage/accounts/${encodeURIComponent(accountId)}/plan`, { planUsd }, undefined, undefined, "PUT");
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 400) throw new Error("The plan fee was rejected. Choose a subscription account and a USD amount from 0 to 100000 with at most two decimal places.");
+        if (error instanceof HttpError && error.status === 403) throw new Error("Setting a plan fee requires an owner device key.");
+        if (error instanceof HttpError && error.status === 404) throw new Error(`Usage account \"${clean(accountId)}\" was not found. Check the account ID with infinite cost.`);
+        throw error;
+      }
+      const account = result.accounts.find(item => item.id === accountId);
+      if (!account) throw new Error(`The host did not return usage account \"${clean(accountId)}\" after updating its plan fee. Refresh with infinite cost.`);
+      console.log(usageAccountLine(account));
+      return true;
+    }
+    if (command === "cost" && positional.length) throw new Error("Usage: infinite cost [plan ACCOUNT USD|reset] [--json]");
+    if (command === "usage" || command === "cost") {
       const sub = positional[0], tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", query = `?tz=${encodeURIComponent(tz)}`;
       if (sub === "projects") { const result = await api.json("/usage/projects" + query); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }
       if (sub === "project" || sub === "goal") { if (!positional[1]) throw new Error(`Usage: infinite usage ${sub} ID [--json]`); const result = await api.json(sub === "project" ? `/usage/projects/${encodeURIComponent(positional[1])}${query}` : `/goals/${encodeURIComponent(positional[1])}`); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }

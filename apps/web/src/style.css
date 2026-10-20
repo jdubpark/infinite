@@ -1578,6 +1578,18 @@ small,
 .cost-account-sub em { font-style: normal; color: #724314; }
 .cost-account-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; font-size: 12px; color: var(--muted); }
 .cost-account-foot .cost-money { color: var(--ink); font-weight: 500; }
+.cost-plan-edit { display: inline-grid; place-items: center; width: 26px; height: 26px; margin-left: 6px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); vertical-align: 0.2em; }
+.cost-plan-edit:hover:not(:disabled) { filter: none; background: #edf0e7; color: var(--green); }
+.cost-plan-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 6px; }
+.cost-plan-field { display: inline-flex; align-items: baseline; gap: 7px; margin: 0; font-size: 28px; font-weight: 500; letter-spacing: -0.02em; line-height: 1.1; font-variant-numeric: normal; }
+.cost-plan-field input { width: 7ch; min-height: 38px; padding: 4px 8px; border-radius: 6px; font-size: 22px; font-weight: 500; letter-spacing: -0.02em; text-align: right; }
+.cost-plan-field input:focus-visible { outline-width: 2px; outline-offset: 1px; }
+.cost-plan-field small { font-size: 14px; color: var(--muted); font-weight: 400; }
+.cost-plan-actions { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px; }
+.cost-plan-actions .text-button { min-height: 32px; padding: 4px 7px; }
+.cost-plan-actions .text-button.quiet { color: var(--muted); }
+.cost-plan-owner { color: var(--ink); }
+.cost-plan-form .error, .cost-account .error { flex-basis: 100%; font-size: 12px; }
 .cost-project-list { display: flex; flex-direction: column; }
 .cost-project-row { display: flex; align-items: center; gap: 22px; width: 100%; min-height: 64px; padding: 14px 0; border: 0; border-bottom: 1px solid var(--rule); background: transparent; text-align: left; }
 .cost-project-row:hover:not(:disabled) { filter: none; background: #f3f4ef; }

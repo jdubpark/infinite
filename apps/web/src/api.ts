@@ -51,7 +51,8 @@ export type UsageBudget = { usd: number; period: "day" | "week" | "month" };
 export type Money = { usd: number; unpriced: number };
 /** Only a provider's own API fills this in; it stays null otherwise and renders "—". */
 export type Balance = { amount: number; currency: string; asOf: string; stale: boolean } | null;
-export type AccountView = { id: string; kind: "metered" | "subscription"; month?: Money; planUsd?: number; balance: Balance };
+/** `planSource` says whether a subscription fee is the config default or an owner edit; older hosts omit it. */
+export type AccountView = { id: string; kind: "metered" | "subscription"; month?: Money; planUsd?: number; planSource?: "config" | "owner"; balance: Balance };
 export type UsageSummary = {
   period: { start: string; end: string };
   providers: Record<string, { measured: boolean; period: { start: string; end: string }; spent?: UsageTotals; previous?: UsageTotals; budget?: UsageBudget; unmeasuredSessions: number }>;

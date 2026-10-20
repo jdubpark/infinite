@@ -27,6 +27,7 @@ import { HandoffService } from "./handoffs.js";
 import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
+import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamMutationSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
@@ -427,6 +428,16 @@ export function createApp(config: Config, key: Buffer) {
   });
   app.get("/api/usage/projects", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query); return void res.json(usage.projects({ tz: query.tz })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
   app.get("/api/usage/projects/:id", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query), result = usage.project(String(req.params.id), { tz: query.tz }); if (!result) return void res.status(404).json({ error: "Project usage not found" }); return void res.json(result); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
+  app.put("/api/usage/accounts/:id/plan", requireRole(["owner"]), (req, res) => {
+    const accounts = config.usage?.accounts, accountId = String(req.params.id);
+    const account = accounts && Object.hasOwn(accounts, accountId) ? accounts[accountId] : undefined;
+    if (!account) return void res.status(404).json({ error: "Usage account not found" });
+    if (account.kind !== "subscription") return void res.status(400).json({ error: "Only subscription plans can be updated" });
+    const body = usagePlanSchema.safeParse(req.body);
+    if (!body.success) return void res.status(400).json({ error: "Invalid usage plan" });
+    usage.setPlan(accountId, body.data.planUsd);
+    return void res.json({ accounts: usage.summary().accounts });
+  });
   app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
   app.post("/api/dictation/cleanup", requireRole(["owner", "controller"]), async (req, res) => {
     const body = z.object({ text: z.string().trim().min(1).max(32000) }).strict().parse(req.body);

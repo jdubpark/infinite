@@ -2,7 +2,8 @@
 export type Pricing = "configured" | "catalog" | "provider" | "unknown";
 export type Money = { usd: number; unpriced: number };
 export type Balance = { amount: number; currency: string; asOf: string; stale: boolean } | null;
-export type AccountView = { id: string; kind: "metered" | "subscription"; month?: Money; planUsd?: number; balance: Balance };
+/** `planSource` says whether a subscription fee is the config default or one the owner set; older hosts omit it. */
+export type AccountView = { id: string; kind: "metered" | "subscription"; month?: Money; planUsd?: number; planSource?: "config" | "owner"; balance: Balance };
 export type UsageOverview = { month: { start: string; end: string; spent: Money; previous: Money; plansUsd: number; unmeasuredSessions: number }; accounts: AccountView[] };
 export type DailyPoint = { date: string; usd: number; byAccount: Record<string, number> };
 export type DailySeries = { tz: string; accounts: string[]; days: DailyPoint[] };
@@ -63,6 +64,23 @@ export function delta(current: Money, previous: Money): { text: string; directio
   const direction = change > 0 ? "up" : "down";
   const amount = previous.usd >= 1 ? `${Math.round(Math.abs(change / previous.usd) * 100)}%` : usd(Math.abs(change));
   return { text: `${change > 0 ? "+" : "−"}${amount}`, direction };
+}
+
+export const PLAN_USD_MAX = 100000;
+/**
+ * A typed monthly plan fee, checked by the host's rule before the round trip: dollars from 0 to
+ * 100,000 with at most two decimals. A leading "$" and a comma decimal separator are tolerated.
+ */
+export function parsePlanUsd(text: string): { ok: true; value: number } | { ok: false; error: string } {
+  // One comma is a decimal separator, as some keyboards type it; thousands grouping is refused rather than guessed.
+  const stripped = text.trim().replace(/^\$/, "");
+  if ((stripped.match(/,/g)?.length ?? 0) > 1 || (stripped.includes(",") && stripped.includes("."))) return { ok: false, error: "One comma or dot for cents" };
+  const raw = stripped.replace(",", ".");
+  if (!raw) return { ok: false, error: "Enter an amount" };
+  if (!/^\d*\.?\d{0,2}$/.test(raw) || !/\d/.test(raw)) return { ok: false, error: "Dollars, up to 2 decimals" };
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value > PLAN_USD_MAX) return { ok: false, error: `Must be $0 to $${PLAN_USD_MAX.toLocaleString()}` };
+  return { ok: true, value };
 }
 
 export function compactTokens(n: number): string {

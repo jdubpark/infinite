@@ -107,12 +107,14 @@ export class MirroredProjects {
     try {
       // Intermediate folders remain host-controlled even when agents can edit each applied project.
       const shared = this.config.sync?.sharedGroup, parent = dirname(project.path), home = this.home();
-      // An existing folder agents can write could swap a new folder for a symlink before the chmods below follow it.
-      if (shared && !existsSync(project.path))
+      // A folder agents can write could swap a folder below it for a symlink before the chmods below follow it.
+      // Check every existing ancestor up to the home folder, or to the first existing folder above a missing home.
+      if (shared)
         for (let dir = parent; ; dir = dirname(dir)) {
+          let exists = true;
           try { if (lstatSync(dir).mode & 0o022) throw invalid(); }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-          if (dir === home || dirname(dir) === dir) break;
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; exists = false; }
+          if ((exists && inside(dir, home)) || dirname(dir) === dir) break;
         }
       const firstParent = mkdirSync(parent, { recursive: true, mode: shared ? 0o2750 : 0o700 });
       const created = mkdirSync(project.path, { recursive: true, mode: shared ? 0o2770 : 0o700 });

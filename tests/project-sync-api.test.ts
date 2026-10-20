@@ -36,6 +36,8 @@ test("owner CLI resolves distinct home-relative projects without falling back to
     mkdirSync(join(home, "Shared"), { mode: 0o700 }); chmodSync(join(home, "Shared"), 0o2770);
     assert.equal((await host.fetchApi("/projects/resolve", "owner", { path: "Shared/new/sample" })).status, 400, "an agent-writable ancestor could swap new folders before their modes are set");
     assert.equal(existsSync(join(home, "Shared", "new")), false);
+    mkdirSync(join(home, "Shared", "old", "sample"), { recursive: true });
+    assert.equal((await host.fetchApi("/projects/resolve", "owner", { path: "Shared/old/sample" })).status, 400, "an existing folder does not skip the ancestor check");
     assert.equal((await host.fetchApi("/projects/resolve", "owner", { path: "Projects/sample/nested" })).status, 409, "overlapping sync roots cannot bypass each other's running-session fence");
     const login = await host.fetchApi("/login", null, { token: host.tokens.owner }, { Origin: host.config.origin });
     assert.equal(login.status, 200);

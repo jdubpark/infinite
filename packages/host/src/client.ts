@@ -571,10 +571,10 @@ async function listProjects(groups: ProjectGroupList, api: { json<T>(path: strin
     return;
   }
   for (const group of groups.groups) {
-    console.log(`${group.name}  ${group.id}${group.implicit ? "  (single-repo)" : ""}`);
+    console.log(`${group.id}  ${clean(group.name)}${group.implicit ? "  (single-repo)" : ""}`);
     for (const repo of group.repos) {
       const detail = await api.json<ProjectDetail>(`/projects/${repo.projectId}`).catch(() => undefined);
-      console.log(`  ${repo.name}  ${repo.projectId}${detail ? `  · ${describeSync(detail.sync)}` : ""}`);
+      console.log(`  ${repo.projectId}  ${clean(repo.name)}${detail ? `  · ${describeSync(detail.sync)}` : ""}`);
     }
   }
   if (groups.suggestions.length) {

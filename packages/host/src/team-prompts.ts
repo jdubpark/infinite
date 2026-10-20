@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { TeamError } from "./team-workspace.js";
-import type { TeamMember, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "./team-types.js";
+import type { TeamMember, TeamModelProfile, TeamProject, TeamRun, TeamScout, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
 const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 const profileSuffix = ". These are the host's configured model choices; they do not establish which backend actually served a turn. Do not switch models or change tool permissions.";
@@ -32,7 +32,7 @@ export function retargetPrompt(prompt: string, to: { provider: Provider; profile
   if (!reportingPattern().test(prompt) || !profilePattern.test(prompt)) return undefined;
   return refreshReportingInstructions(prompt, to.provider).replace(profilePattern, () => profileInstructions(to.profile));
 }
-export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile) {
+export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile, configuredProject?: Pick<TeamProject, "setup" | "checks">) {
   const implementerTask = task && role === "implementer" && "paths" in task
     ? (({ rubric: _rubric, ownerRating: _ownerRating, diffStat: _diffStat, reviewRounds: _reviewRounds, ...safeTask }) => safeTask)(task)
     : task;
@@ -71,6 +71,9 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
     roleInstructions,
     run.establishChecks && role === "project-manager" && !run.verification
       ? `The owner authorized this team to establish checks for a new project. Your plan MUST include verification: {"setup":{"command":"npm","args":["ci"]},"checks":[{"command":"npm","args":["run","check"]}]}. This is a format example, not a required stack. Choose commands for the actual project; omit setup when unnecessary. Include tasks that create the build/test scripts and meaningful integration or end-to-end coverage. Commands run under the host's configured execution identity after integration. They must verify the objective, not simply exit successfully. Do not use them to bypass a provider refusal, publish, deploy, or change permissions. The host will freeze these commands before implementation; later plans cannot weaken them.`
+      : "",
+    role === "project-manager" && !run.establishChecks && !run.verification
+      ? `Configured project setup and checks for this run: ${JSON.stringify({ setup: configuredProject?.setup ?? null, checks: configuredProject?.checks ?? [] })}. The checks run after integration and are fixed; your plan MUST NOT include verification. If they seem insufficient, say so in the summary and have tasks run additional commands (such as a workspace's lint or typecheck) themselves and report results.`
       : "",
     run.verification
       ? `Accepted verification commands (retained across retries, steering, and goal continuation):\n${JSON.stringify(run.verification)}\nThese commands execute after integration. Implement their scripts and dependencies in the assigned paths. The coordinator may omit verification from subsequent plans or repeat this exact value; it cannot replace it. Agents arrange any tools needed in their own workspace under their existing provider permissions. The host runs setup for the reviewer only after integration succeeds.`

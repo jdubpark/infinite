@@ -98,15 +98,18 @@ after first pairing. Initial pairing still trusts the manually provisioned devic
 key and the identity it authenticates; this is not independent hardware attestation
 or an expiring enrollment protocol.
 
-The allowlist now includes terminal streams, resource observations, and bounded
-project file operations. `terminal-open`, `terminal-send`, and `terminal-close`
+The allowlist now includes terminal and live-event streams, resource observations,
+and bounded project file operations. `terminal-open`, `terminal-send`,
+`terminal-close`, and the `events-*` messages
 travel inside ciphertext, together with device credentials and session identifiers.
 Server `terminal-event` frames carry original output, snapshots, state, receipts,
 and refusals. The host connects only to its own loopback terminal gateway; it
 cannot forward an arbitrary destination. Raw input remains owner-only, and
 worker input leases and durable request identities remain authoritative. Each
-channel permits four attached terminals, with bounded input and output buffers.
-Closing an attachment does not terminate its agent.
+channel limits and event-buffer behavior are defined in the
+[session ownership and protocol](architecture.md#delivery-contract) and
+[remote protocol](desktop.md#remote-api-extension) references. Closing an attachment
+does not terminate its agent.
 
 Every encrypted request checks current device authorization. Active encrypted
 subscriptions also recheck authorization before output and periodically while
@@ -191,7 +194,7 @@ Use encrypted off-host backups with restore testing. Keep the backup decryption 
 - Push is an optional outbound dependency of the host. Bodies are minimal by default and carry no session content; `push.detail: "full"` is opt-in. Messages go through Expo's push service and can be cached there. The Expo access token lives in a 0600 file outside the state directory. Push can be left disabled.
 - Signal payloads can contain commands and file contents. They are journaled encrypted like the rest of the recording and shown only to paired roles.
 - Transcript bytes reach the worker only through the authenticated hook relay, which runs as the agent and reads only a regular `.jsonl` file the provider's own hook named. The worker records them as `message` events in the encrypted journal, so chat carries the same plaintext the provider already stores in its home. On the Linux deployment the hook variables must be in sudo's `env_keep`, or hooks and transcripts never leave the agent account.
-- Chat summaries send recorded messages to the configured external model (`summaries`). The API key lives in a 0600 file outside the state directory; the host sends `store: false`, but the provider's own retention policy is a separate boundary. Leave `summaries` unset to send nothing.
+- Chat summaries send recorded messages to the configured external model (`summaries`). With `jev` configured, the host can also send candidate sentences from an agent's last message and the clipped first line of a long default-titled prompt to TypeSafe; the summary writer's provider receives that prompt only when Jev finds its clipped first line unclear. Configure `jev` with an absolute `apiKeyFile` to a private 0600 file outside the state directory, and optional `model` (default `jev-latest`) and `baseUrl` (default TypeSafe API URL). The summary writer's key file follows the same private-file rule. Provider retention policies remain separate boundaries. With no `jev` key configured, no TypeSafe calls occur.
 - Confidential VMs can narrow provider/hypervisor threats, but they do not protect against compromised software inside the trusted guest. Attestation and external key release would be a separate security project, not a box to check on this service. [Confidential VM model](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/about-cvm).
 
 Before putting private production repositories here, verify the isolation and storage controls on the selected host and repeat a real provider session through an actual laptop-network outage. Local synthetic continuity tests establish neither cloud hardening nor provider acceptance.

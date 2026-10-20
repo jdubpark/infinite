@@ -846,7 +846,8 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const requestId = randomUUID();
       console.error(`[Infinite] Launch ${requestId} on ${config.origin} · project ${projectId}`);
       progress.start(`Starting ${providerNames[command]} on ${new URL(config.origin).hostname}`);
-      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? `${command} session`), nativeArgs, ...((boundCwd ?? mapped?.cwd) ? { cwd: boundCwd ?? mapped!.cwd } : {}), ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
+      const generatedTitle = !String(options["--title"] ?? "").trim();
+      session = await api.json<Session>("/sessions", { requestId, provider: command, projectId, title: String(options["--title"] ?? "").trim() || `${command} session`, ...(generatedTitle ? { generatedTitle: true } : {}), nativeArgs, ...((boundCwd ?? mapped?.cwd) ? { cwd: boundCwd ?? mapped!.cwd } : {}), ...(options["--local-ui"] ? { localUi: true } : {}), ...(workspace ? { workspace } : {}) });
       if (workspace) {
         progress.start("Connecting the laptop executor");
         await startLaptopService({ ...config, sessionId: session.id, workspaceToken: workspace.token, cwd: workspace.cwd, roots: workspace.roots, configFile: path });

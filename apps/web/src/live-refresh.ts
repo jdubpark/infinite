@@ -19,12 +19,24 @@ export function useLiveRefresh(
   const [refreshing, setRefreshing] = useState(false);
   const [seen, setSeen] = useState("");
   const [failed, setFailed] = useState(false);
+  const [stale, setStale] = useState(false);
   useEffect(() => {
     let active = true, polling = false, queued = false, generation = 0;
     let timer: ReturnType<typeof setTimeout>;
+    let staleTimer: ReturnType<typeof setTimeout> | undefined;
+    const markStaleLater = () => {
+      if (!identity || staleTimer !== undefined) return;
+      staleTimer = setTimeout(() => { staleTimer = undefined; if (active) setStale(true); }, 3000);
+    };
+    const recover = () => {
+      clearTimeout(staleTimer);
+      staleTimer = undefined;
+      setStale(false);
+    };
     setFresh(false);
     setFailed(false);
     setSeen("");
+    setStale(false);
     const poll = async () => {
       clearTimeout(timer);
       if (!active || !identity || !foreground()) return;
@@ -36,9 +48,9 @@ export function useLiveRefresh(
       let delay = interval;
       try {
         delay = await taskRef.current(current) ?? interval;
-        if (current()) { setFresh(true); setFailed(false); setSeen(new Date().toISOString()); }
+        if (current()) { recover(); setFresh(true); setFailed(false); setSeen(new Date().toISOString()); }
       } catch {
-        if (current()) { setFresh(false); setFailed(true); unavailableRef.current?.(); }
+        if (current()) { setFresh(false); setFailed(true); markStaleLater(); unavailableRef.current?.(); }
       } finally {
         polling = false;
         if (active) {
@@ -51,6 +63,7 @@ export function useLiveRefresh(
     const resync = () => {
       generation++;
       setFresh(false);
+      markStaleLater();
       if (!navigator.onLine) setFailed(true);
       clearTimeout(timer);
       if (foreground()) void poll();
@@ -61,10 +74,12 @@ export function useLiveRefresh(
     window.addEventListener("online", resync);
     window.addEventListener("offline", resync);
     window.addEventListener("focus", resync);
+    if (identity && !navigator.onLine) { setFailed(true); markStaleLater(); }
     void poll();
     return () => {
       active = false;
       clearTimeout(timer);
+      clearTimeout(staleTimer);
       refreshRef.current = () => {};
       document.removeEventListener("visibilitychange", resync);
       window.removeEventListener("online", resync);
@@ -72,6 +87,6 @@ export function useLiveRefresh(
       window.removeEventListener("focus", resync);
     };
   }, [identity, interval]);
-  return { fresh, refreshing, seen, failed, refresh: useCallback(() => refreshRef.current(), []) };
+  return { fresh, refreshing, seen, failed, stale, refresh: useCallback(() => refreshRef.current(), []) };
 }
 

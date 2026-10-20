@@ -14,6 +14,8 @@ struct FilesView: View {
     @State private var remoteSelection = Set<String>()
     @State private var nextCursor: String?
     @State private var remoteTotal = 0
+    @State private var remoteLoaded = false
+    @State private var remoteLoadedPath: String?
     @State private var loadingRemote = false
     @State private var localError = ""
     @State private var remoteError = ""
@@ -44,7 +46,7 @@ struct FilesView: View {
                 Picker("Server project", selection: $projectID) {
                     Text("Choose project").tag("")
                     ForEach(Array(app.projects.enumerated()), id: \.offset) { _, project in Text(project["name"].string).tag(project["id"].string) }
-                }.frame(maxWidth: 260).disabled(busy)
+                }.frame(maxWidth: 260).disabled(busy || !app.connected)
                 Button { refresh() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh both folders").disabled(busy)
             }
             HSplitView {
@@ -59,21 +61,21 @@ struct FilesView: View {
             }
             Text("Transfers compare file versions before replacing anything. Previous versions are saved privately. Files are limited to 256 MiB.")
                 .font(.caption).foregroundStyle(.secondary)
-            if busy {
-                HStack {
-                    ProgressView(value: progress).frame(maxWidth: 180)
-                    Text(status).font(.caption).lineLimit(1).truncationMode(.middle)
-                    Spacer()
-                    Button(canceling ? "Canceling…" : "Cancel") { canceling = true; operation?.cancel() }.disabled(canceling)
-                }
-            } else if !status.isEmpty { Text(status).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
-            if !failure.isEmpty { Text(failure).foregroundStyle(.red).font(.callout).textSelection(.enabled) }
+            HStack {
+                ProgressView(value: busy ? progress : 0).frame(maxWidth: 180).opacity(busy ? 1 : 0)
+                Text(status).font(.caption).foregroundStyle(busy ? .primary : .secondary).lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+                Button(canceling ? "Canceling…" : "Cancel") { canceling = true; operation?.cancel() }
+                    .frame(width: 82).disabled(!busy || canceling).opacity(busy ? 1 : 0)
+            }.frame(height: 24)
+            Text(failure).foregroundStyle(.red).font(.callout).lineLimit(2).textSelection(.enabled)
+                .opacity(failure.isEmpty ? 0 : 1).frame(height: 34, alignment: .leading)
         }
         .padding(22)
         .onAppear { if projectID.isEmpty { projectID = app.projects.first?["id"].string ?? "" }; refresh() }
         .onChange(of: projectID) { _, _ in remotePath = ""; remoteSelection = []; plan = nil; refreshRemote() }
         .onChange(of: app.activeID) { _, _ in
-            operation?.cancel(); plan = nil; showingPlan = false; projectID = ""; remotePath = ""; remoteEntries = []; nextCursor = nil
+            operation?.cancel(); plan = nil; showingPlan = false; projectID = ""; remotePath = ""; remoteEntries = []; nextCursor = nil; remoteLoaded = false; remoteLoadedPath = nil
         }
         .onChange(of: app.projects.map { $0["id"].string }) { _, ids in
             if !ids.contains(projectID) { projectID = ids.first ?? "" }
@@ -108,25 +110,32 @@ struct FilesView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("Server", systemImage: "server.rack").font(.headline)
-                Spacer(); Text(app.connected ? "Encrypted connection" : "Disconnected").font(.caption).foregroundStyle(.secondary)
+                Spacer(); Text(app.connected ? "Encrypted connection" : app.active == nil ? "Not paired" : app.sessionsDisplayStale ? (remoteLoaded ? "Offline · last received" : "Can't reach server") : "Checking…")
+                    .font(.caption).foregroundStyle(app.sessionsDisplayStale ? Palette.attention : .secondary).lineLimit(1).frame(width: 150, alignment: .trailing)
             }.frame(height: 24)
             HStack {
-                Button { remotePath = parent(remotePath); remoteSelection = []; refreshRemote() } label: { Image(systemName: "arrow.up") }.disabled(remotePath.isEmpty || busy)
+                Button { remotePath = parent(remotePath); remoteSelection = []; refreshRemote() } label: { Image(systemName: "arrow.up") }.disabled(remotePath.isEmpty || busy || !app.connected)
                 Text(remotePath.isEmpty ? "/" : "/" + remotePath).font(.caption.monospaced()).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
             }
-            if !app.connected { stateView("Connect to a server to browse its projects.", symbol: "network.slash") }
-            else if projectID.isEmpty { stateView("Choose a server project.", symbol: "folder") }
-            else if !remoteError.isEmpty { stateView(remoteError, symbol: "exclamationmark.triangle") }
-            else if loadingRemote && remoteEntries.isEmpty { ProgressView("Loading server folder…").frame(maxWidth: .infinity, maxHeight: .infinity) }
-            else if remoteEntries.isEmpty { stateView("This server folder is empty.", symbol: "folder") }
-            else {
-                Table(remoteEntries, selection: $remoteSelection) {
-                    TableColumn("Name") { entry in entryName(entry) { remotePath = entry.path; remoteSelection = []; refreshRemote() } }
-                    TableColumn("Size") { entry in Text(size(entry)).foregroundStyle(.secondary) }.width(70)
+            if remoteLoaded {
+                if remoteEntries.isEmpty { stateView(remoteError.isEmpty ? "This server folder is empty." : remoteError, symbol: remoteError.isEmpty ? "folder" : "exclamationmark.triangle") }
+                else {
+                    Table(remoteEntries, selection: $remoteSelection) {
+                        TableColumn("Name") { entry in entryName(entry) { remotePath = entry.path; remoteSelection = []; refreshRemote() }.disabled(!app.connected) }
+                        TableColumn("Size") { entry in Text(size(entry)).foregroundStyle(.secondary) }.width(70)
+                    }
                 }
             }
+            else if !app.connected { stateView("Connect to a server to browse its projects.", symbol: "network.slash") }
+            else if projectID.isEmpty { stateView("Choose a server project.", symbol: "folder") }
+            else if !remoteError.isEmpty { stateView(remoteError, symbol: "exclamationmark.triangle") }
+            else if loadingRemote { ProgressView("Loading server folder…").frame(maxWidth: .infinity, maxHeight: .infinity) }
+            else {
+                stateView("Choose a server project.", symbol: "folder")
+            }
+            Text(remoteError).font(.caption).foregroundStyle(.orange).lineLimit(1).frame(height: 16, alignment: .leading)
             if nextCursor != nil {
-                HStack { Text("\(remoteEntries.count) of \(remoteTotal)").font(.caption).foregroundStyle(.secondary); Spacer(); Button(loadingRemote ? "Loading…" : "Load more") { refreshRemote(more: true) }.disabled(busy || loadingRemote) }
+                HStack { Text("\(remoteEntries.count) of \(remoteTotal)").font(.caption).foregroundStyle(.secondary); Spacer(); Button { refreshRemote(more: true) } label: { Text(loadingRemote ? "Loading…" : "Load more").frame(width: 88) }.disabled(busy || loadingRemote || !app.connected) }
             }
         }.padding(10)
     }
@@ -158,17 +167,20 @@ struct FilesView: View {
         catch { localEntries = []; localError = error.localizedDescription }
     }
     private func refreshRemote(more: Bool = false) {
+        let path = remotePath, cursor = more ? nextCursor : nil
+        let loadedKey = projectID + "\u{0}" + path
+        if loadedKey != remoteLoadedPath {
+            loadGeneration = UUID(); remoteEntries = []; remoteSelection = []; remoteLoaded = false; nextCursor = nil; loadingRemote = false; remoteError = ""
+        }
         guard let transfer, app.connected else { return }
         let generation = UUID(); loadGeneration = generation
-        let path = remotePath, cursor = more ? nextCursor : nil
-        if !more { remoteEntries = []; nextCursor = nil }
         remoteError = ""; loadingRemote = true
         Task {
             do {
                 let page = try await transfer.list(path: path, cursor: cursor)
                 guard generation == loadGeneration else { return }
                 remoteEntries = more ? remoteEntries + page.entries : page.entries
-                nextCursor = page.nextCursor; remoteTotal = page.total; loadingRemote = false
+                nextCursor = page.nextCursor; remoteTotal = page.total; remoteLoadedPath = loadedKey; remoteLoaded = true; loadingRemote = false
             } catch { if generation == loadGeneration { remoteError = error.localizedDescription; loadingRemote = false } }
         }
     }

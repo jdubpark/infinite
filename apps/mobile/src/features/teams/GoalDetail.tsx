@@ -6,6 +6,7 @@ import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { Card, Chip, LiveStatus, ProgressBar, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
 import {
   GOAL_LABELS, goalControls, goalKind, goalStopped, newer, openDecisions, OUTCOME_LABELS, shortDate, TEAM_LABELS, teamKind, teamTone,
@@ -28,6 +29,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   const active = usePoll(() => activeId ? api<TeamView>(connection, `/teams/${activeId}`) : Promise.resolve(null), 4000, [connection, activeId]);
   const activeTeam = active.data?.id === activeId ? active.data : null;
   const [direction, setDirection] = useState("");
+  const [dockHeight, setDockHeight] = useState(0);
   const request = useRunRequest<ProductGoal>(connection, `${machine}/goal/${id}`, {
     accepted: (result, sent) => { setRecorded(result); if (sent.path.endsWith("/steer")) setDirection(""); poll.refresh(); },
     refused: poll.refresh,
@@ -39,8 +41,8 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   }
   const openTeam = (teamId: string) => router.push({ pathname: "/team/[id]", params: { id: teamId, machine } });
   const owns = me?.role === "owner" && goal && !["cancelled", "achieved"].includes(goal.status);
-  const header = <TopBar backLabel="Goals" onBack={back} right={<LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} />} />;
-  if (!goal) return <View style={s.fill}>{header}<View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading goal…" : "The goal could not be loaded. Check the machine and try again."}</Text></View></View>;
+  const header = <TopBar backLabel="Goals" onBack={back} right={<LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />;
+  if (!goal) return <View style={[s.fill, s.overlayRoot]}>{header}<FloatingNotice position="top" offset={58} message={poll.stale ? "Can't reach this machine." : null} actions={poll.stale ? <Button compact title="Refresh" secondary onPress={poll.refresh} /> : null} /><View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading goal…" : "The goal could not be loaded. Check the machine and try again."}</Text></View></View>;
 
   const controls = goalControls(goal, me?.role, fresh, poll.data?.receivedAt);
   // Judged at the last good poll; the host makes the final decision.
@@ -51,9 +53,9 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   const project = me?.projects?.find(value => value.id === goal.projectId)?.name ?? goal.projectId;
   const send = (action: string, label: string, fields?: Record<string, string>) => request.send(`/goals/${id}/${action}`, label, goal.revision, fields);
 
-  return <KeyboardAvoidingView style={s.fill} behavior="padding">
+  return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     {header}
-    {!fresh ? <Text style={t.banner}>Offline · last received state. Controls paused.</Text> : null}
+    <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : active.stale ? activeTeam ? "Active cycle may be out of date." : "Can't load the active cycle." : null} />
     <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View style={s.titleBlock}>
@@ -70,9 +72,9 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
         </View>
         {goal.linear?.reason ? <Text style={t.warning}>{goal.linear.reason}</Text> : null}
         {owns ? <View style={s.metaRow}>
-          {goal.status === "paused" && !expired ? <Button compact glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("resume", "Resume")} />
-            : ["running", "needs-input"].includes(goal.status) ? <Button compact secondary glyph="pause" title="Pause" disabled={!controls.pause || locked} onPress={() => send("pause", "Pause")} /> : null}
-          <Button compact secondary glyph="close" title="Cancel…" disabled={!controls.cancel || locked} onPress={() => Alert.alert("Cancel this goal?", "Stops active work. Cycles stay.", [
+          {goal.status === "paused" && !expired ? <Button compact busy={Boolean(request.pending?.label === "Resume" && request.busy)} glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("resume", "Resume")} />
+            : ["running", "needs-input"].includes(goal.status) ? <Button compact busy={Boolean(request.pending?.label === "Pause" && request.busy)} secondary glyph="pause" title="Pause" disabled={!controls.pause || locked} onPress={() => send("pause", "Pause")} /> : null}
+          <Button compact busy={Boolean(request.pending?.label === "Cancellation" && request.busy)} secondary glyph="close" title="Cancel…" disabled={!controls.cancel || locked} onPress={() => Alert.alert("Cancel this goal?", "Stops active work. Cycles stay.", [
             { text: "Keep goal", style: "cancel" },
             { text: "Cancel goal", style: "destructive", onPress: () => send("cancel", "Cancellation") },
           ])} />
@@ -87,7 +89,6 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
             <Text style={[t.strong, s.fill]}>{activeTeam?.title ?? "Team cycle"}</Text>
           </View>
           {activeTeam ? <Text style={t.note}>{TEAM_LABELS[activeTeam.status]}</Text> : null}
-          {!active.online ? <Text style={t.note}>May be out of date.</Text> : null}
           {decisions.length ? <>
             <Text style={t.warning}>{decisions.length === 1 ? "1 decision needs" : `${decisions.length} decisions need`} your input.</Text>
             {decisions.map(decision => <Text key={decision.id} style={t.body} numberOfLines={3}>{decision.question}</Text>)}
@@ -149,7 +150,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
           <Clamp text={outcome.evidence} lines={3} />
         </View>) : <Text style={t.note}>Not assessed yet.</Text>}
         {me && me.role !== "viewer" ? goalStopped(goal)
-          ? <OutcomeForm key={goal.outcomes.length} disabled={!controls.outcome || locked} onSubmit={value => send("outcome", "Your outcome assessment", value)} />
+          ? <OutcomeForm key={goal.outcomes.length} disabled={!controls.outcome || locked} busy={request.busy} onSubmit={value => send("outcome", "Your outcome assessment", value)} />
           : <Text style={t.note}>Assess once the goal stops.</Text> : null}
       </Section>
 
@@ -162,8 +163,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
       </Disclosure> : null}
 
     </ScrollView>
-    <View style={s.dock}>
-      <RequestStatus request={request} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|outcome)$/.test(request.pending?.path ?? ""))} subject="goal" />
+    <View style={s.dock} onLayout={(event) => setDockHeight(event.nativeEvent.layout.height)}>
       <SteerBox value={direction} onChange={setDirection} placeholder="Update the goal’s direction or add evidence…"
         enabled={controls.steer && !locked} busy={request.busy}
         note={me?.role === "viewer" ? "View only."
@@ -171,11 +171,12 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
             : !["running", "needs-input"].includes(goal.status) ? goal.status === "achieved" ? "The achieved outcome was recorded by a person." : "This goal will start no further cycles. Start a new goal to approve further changes." : undefined}
         onSend={() => { const text = direction.trim(); if (text) send("steer", "Direction", { text }); }} />
     </View>
+    <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|outcome)$/.test(request.pending?.path ?? ""))} />
   </KeyboardAvoidingView>;
 }
 
 /** The person's judgment of the product outcome. It does not publish the changes. */
-function OutcomeForm({ disabled, onSubmit }: { disabled: boolean; onSubmit: (value: { result: GoalResult; summary: string; evidence: string }) => void }) {
+function OutcomeForm({ disabled, busy, onSubmit }: { disabled: boolean; busy: boolean; onSubmit: (value: { result: GoalResult; summary: string; evidence: string }) => void }) {
   const [result, setResult] = useState<GoalResult>("inconclusive");
   const [summary, setSummary] = useState("");
   const [evidence, setEvidence] = useState("");
@@ -186,12 +187,13 @@ function OutcomeForm({ disabled, onSubmit }: { disabled: boolean; onSubmit: (val
     <Text style={t.label}>Evidence for your assessment</Text>
     <TextInput accessibilityLabel="Evidence for your assessment" value={evidence} onChangeText={setEvidence} editable={!disabled} multiline maxLength={8000}
       placeholder="Measured results, review notes, or links supporting your conclusion…" placeholderTextColor={theme.colors.placeholder} style={[t.input, t.multiline]} />
-    <Button compact title="Record assessment" disabled={disabled || !summary.trim() || !evidence.trim()} onPress={() => onSubmit({ result, summary: summary.trim(), evidence: evidence.trim() })} />
+    <Button compact busy={busy} title="Record assessment" disabled={disabled || !summary.trim() || !evidence.trim()} onPress={() => onSubmit({ result, summary: summary.trim(), evidence: evidence.trim() })} />
   </Disclosure>;
 }
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
+  overlayRoot: { position: "relative" },
   empty: { padding: 30, gap: 15, alignItems: "center" },
   titleBlock: { paddingBottom: 4, gap: 8 },
   metaRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },

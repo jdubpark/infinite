@@ -8,6 +8,7 @@ import { creations } from "../../store/requests";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { TopBar } from "../../components/Glass";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
 
 export function Create({ connection }: { connection: Connection }) {
@@ -21,10 +22,11 @@ export function Create({ connection }: { connection: Connection }) {
   const [title, setTitle] = useState(request?.title ?? "");
   const [prompt, setPrompt] = useState(request?.prompt ?? "");
   const [busy, setBusy] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const sending = useRef(false);
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
-  const { data: me, online, refresh } = usePoll(() => api<Me>(connection, "/me"), 4000, [connection]);
+  const { data: me, online, stale, refresh } = usePoll(() => api<Me>(connection, "/me"), 4000, [connection]);
   const providers = me?.backendProviders?.[backend] ?? (backend === "infinite" ? me?.providers ?? [] : []);
   const selectedProvider = providers.find(value => value === provider) ?? providers[0];
   const projects = me?.projects ?? [];
@@ -32,8 +34,9 @@ export function Create({ connection }: { connection: Connection }) {
   // Only a cloud host receives laptop sync; a local host is the laptop.
   const syncs = me?.environment === "cloud";
   const { data: polledDetail, refresh: refreshDetail } = usePoll(() => syncs && selectedProject ? api<ProjectDetail>(connection, `/projects/${selectedProject}`) : Promise.resolve(null), 5000, [connection, selectedProject, syncs]);
-  // The poll keeps its last value across a project change; show only the selected project's status.
+  // Keep displaying the poll's previous project until the selected project's value arrives.
   const detail = syncs && polledDetail?.id === selectedProject ? polledDetail : null;
+  const displayDetail = syncs ? polledDetail : null;
   const [applying, setApplying] = useState(false);
   const [syncError, setSyncError] = useState("");
   async function applyPending(force: boolean) {
@@ -55,6 +58,7 @@ export function Create({ connection }: { connection: Connection }) {
   async function submit() {
     if (sending.current || !online || me?.role !== "owner" || !selectedProvider || !selectedProject || !title.trim()) return;
     sending.current = true;
+    setRetrying(Boolean(request));
     setBusy(true);
     const body = creations.begin(machine, { requestId: Crypto.randomUUID(), backend, provider: selectedProvider, projectId: selectedProject, title: title.trim(), prompt });
     try {
@@ -66,21 +70,21 @@ export function Create({ connection }: { connection: Connection }) {
       creations.fail(machine, body.requestId, `${(error as Error).message}${rejected ? " Correct the session details and try again." : " The result may be uncertain. Check Sessions or retry the same request."}`, rejected);
     } finally { sending.current = false; if (mounted.current) setBusy(false); }
   }
-  return <KeyboardAvoidingView style={s.fill} behavior="padding">
+  return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     <TopBar backLabel="Sessions" onBack={() => router.replace({ pathname: "/", params: { machine } })} right={<Text style={s.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
+    <FloatingNotice position="top" offset={58} message={stale ? me ? "Waiting for a fresh machine connection." : "Can't reach this machine." : null} actions={stale ? <Button compact title="Refresh" secondary onPress={refresh} /> : null} />
     <ScrollView contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>New session</Text>
       <Text style={s.note}>Runs on {me?.machine?.label || connection.label || "this machine"}. The machine must stay online.</Text>
-      {!online ? <View style={s.section}><Text style={s.warning}>Waiting for a fresh machine connection.</Text><Button title="Refresh" secondary onPress={refresh} /></View> : null}
       {me && me.role !== "owner" ? <Text style={s.warning}>An owner key is required to create sessions on this machine.</Text> : null}
       {creation.result ? <View style={s.section}><Text style={s.note}>Session created.</Text><Button title="Open created session" onPress={() => router.replace({ pathname: "/session/[id]", params: { id: creation.result!.id, machine } })} /></View> : null}
       <Text style={s.label}>Session host</Text>
       <View style={s.choices}>{(me?.backends ?? ["infinite"]).map(value => <Button key={value} title={value === "cmux" ? "cmux" : "Infinite"} secondary={backend !== value} disabled={locked} onPress={() => { setBackend(value); setProvider(undefined); }} />)}</View>
       <Text style={s.label}>Project</Text>
       <View style={s.choices}>{projects.map(item => <Button key={item.id} title={item.name} secondary={selectedProject !== item.id} disabled={locked} onPress={() => { setProject(item.id); setSyncError(""); }} />)}</View>
-      {detail ? <Text style={s.note}>Synced from laptop {ago(detail.sync.lastSyncedAt)} · applied {ago(detail.sync.appliedAt)}{detail.sync.pendingGeneration ? ` · pending: ${pendingLabel(detail.sync.pendingGeneration)}` : ""}</Text> : null}
-      {detail?.sync.pendingGeneration && me?.role === "owner" ? <Button title={applying ? "Applying…" : detail.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"} secondary disabled={applying || !online} onPress={() => confirmApply(detail.sync.pendingGeneration!.reason === "cloud-changed")} /> : null}
-      {syncs && syncError ? <Text style={s.warning} accessibilityRole="alert">{syncError}</Text> : null}
+      {displayDetail ? <Text style={s.note} numberOfLines={2}>Synced from laptop {ago(displayDetail.sync.lastSyncedAt)} · applied {ago(displayDetail.sync.appliedAt)}{displayDetail.sync.pendingGeneration ? ` · pending: ${pendingLabel(displayDetail.sync.pendingGeneration)}` : ""}</Text> : null}
+      {detail?.sync.pendingGeneration && me?.role === "owner" ? <Button busy={applying} title={detail.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"} secondary disabled={applying || !online} onPress={() => confirmApply(detail.sync.pendingGeneration!.reason === "cloud-changed")} /> : null}
+      {syncs && syncError ? <Text accessibilityRole="alert" style={s.warning}>{syncError}</Text> : null}
       {me && !projects.length ? <Text style={s.warning}>Add an allowed project to this machine’s Infinite configuration first.</Text> : null}
       <Text style={s.label}>Agent</Text>
       <View style={s.choices}>{providers.map(value => <Button key={value} title={PROVIDER_NAMES[value]} secondary={selectedProvider !== value} disabled={locked} onPress={() => setProvider(value)} />)}</View>
@@ -90,13 +94,14 @@ export function Create({ connection }: { connection: Connection }) {
       <Text style={s.label}>First request (optional)</Text>
       <TextInput accessibilityLabel="First request" value={prompt} onChangeText={setPrompt} editable={!locked} multiline style={[s.input, s.prompt]} placeholder="Give the agent an outcome and useful context…" placeholderTextColor={theme.colors.placeholder} maxLength={24000} />
       <Text style={s.note}>You can use your keyboard’s microphone to dictate. Review the text before starting.</Text>
-      {creation.message ? <Text style={s.warning} accessibilityRole="alert">{creation.message}</Text> : null}
-      <View style={s.section}><Button title={busy ? "Starting…" : request ? "Retry same request" : "Start session"} onPress={() => void submit()} disabled={busy || !online || me?.role !== "owner" || !selectedProvider || !selectedProject || !title.trim()} /></View>
+      {creation.message ? <Text accessibilityRole="alert" style={s.warning}>{creation.message}</Text> : null}
+      <View style={s.section}><Button busy={busy} title={request && (!busy || retrying) ? "Retry same request" : "Start session"} onPress={() => void submit()} disabled={busy || !online || me?.role !== "owner" || !selectedProvider || !selectedProject || !title.trim()} /></View>
     </ScrollView>
   </KeyboardAvoidingView>;
 }
 const s = StyleSheet.create({
   fill: { flex: 1 },
+  overlayRoot: { position: "relative" },
   body: { padding: 24, gap: 10 }, title: { fontSize: 28, lineHeight: 34, color: theme.colors.ink, fontWeight: "700", letterSpacing: -0.6 },
   label: { fontSize: 14, fontWeight: "600", color: theme.colors.ink, marginTop: 16 },
   note: { fontSize: 12, lineHeight: 19, color: theme.colors.mutedInk }, warning: { fontSize: 13, lineHeight: 20, color: theme.colors.warningInk },

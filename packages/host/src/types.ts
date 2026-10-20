@@ -57,6 +57,8 @@ export interface Session {
   resumeNativeSession?: { id: string; source: "hook" | "protocol" };
   provider: Provider;
   title: string;
+  /** Host-only marker for a title supplied by a CLI default, never a person. */
+  generatedTitle?: true;
   projectId: string;
   cwd: string;
   createdAt: string;
@@ -120,6 +122,8 @@ export interface Config {
   sync?: { sharedGroup?: boolean; homeDir?: string };
   /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
   summaries?: { model: string; apiKeyFile: string; baseUrl: string };
+  /** Optional Jev readings for turn-finished lines and generated session titles. */
+  jev?: { apiKeyFile: string; model: string; baseUrl: string };
   /** Read-only repository briefs produced by an administrator-configured host wrapper. */
   repositoryBriefings?: { command: string; args: string[]; runner?: "muse" | "deepseek" | "codex"; model?: string; automatic: boolean; intervalMs: number; cooldownMs: number; timeoutMs: number };
   port: number;

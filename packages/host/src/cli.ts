@@ -302,7 +302,7 @@ else if (command === "plan-fleet") {
     const fd = openSync(lock, "wx", 0o600);
     writeFileSync(fd, String(process.pid));
     closeSync(fd);
-    const { sessions, teams, pushStore, server, closeConnections } = createApp(config, key);
+    const { sessions, teams, goals, pushStore, server, closeConnections } = createApp(config, key);
     server.listen(config.port, "127.0.0.1", () =>
       console.log(
         `Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`,
@@ -323,6 +323,7 @@ else if (command === "plan-fleet") {
           machineId: config.machine?.id,
         },
         teams,
+        goals,
       ).start();
       console.log(`Push notifications: enabled (${config.push.detail} bodies)`);
     }
@@ -355,11 +356,13 @@ else if (command === "plan-fleet") {
       const provider = values.provider as Provider;
       if (!config.agents[provider])
         throw new Error("Choose a configured --provider");
+      const generatedTitle = !values.title?.trim();
       const session = await manager.create({
         requestId: randomUUID(),
         provider,
         projectId: values.project ?? config.projects[0].id,
-        title: values.title ?? `${provider} session`,
+        title: values.title?.trim() || `${provider} session`,
+        ...(generatedTitle ? { generatedTitle: true as const } : {}),
         prompt: values.prompt ?? "",
       });
       console.log(`${session.id}  ${session.status}`);

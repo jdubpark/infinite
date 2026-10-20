@@ -45,6 +45,7 @@ export interface CreateSession {
   provider: Provider;
   projectId: string;
   title: string;
+  generatedTitle?: true;
   prompt: string;
   nativeArgs?: string[];
   localUi?: boolean;
@@ -206,7 +207,7 @@ export class Manager {
    * that fails to answer) shows that row as unavailable instead of failing the whole list;
    * a session without readable metadata has no title or provider to show and is left out.
    */
-  async list() {
+  async list(options: { includeFullMessage?: boolean } = {}) {
     const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(
       (n) => /^[a-f0-9-]{36}$/.test(n),
     );
@@ -219,6 +220,7 @@ export class Manager {
         const {
           context: _context,
           initialPrompt: _prompt,
+          generatedTitle: _generatedTitle,
           nativeArgs: _nativeArgs,
           handoff: _handoff,
           ...summary
@@ -226,7 +228,7 @@ export class Manager {
         return {
           ...summary,
           ...state,
-          attention: publicAttention(state.attention),
+          attention: options.includeFullMessage ? state.attention : publicAttention(state.attention),
         };
       }),
     );
@@ -473,6 +475,7 @@ export class Manager {
       ...(request.resumedFrom ? { resumedFrom: request.resumedFrom, resumeNativeSession: request.resumeNativeSession } : {}),
       provider: request.provider,
       title: request.title,
+      ...(request.generatedTitle ? { generatedTitle: true as const } : {}),
       projectId: request.projectId,
       cwd: request.teamCwd ?? projectCwd(project.path, request.cwd),
       createdAt: new Date().toISOString(),

@@ -132,8 +132,10 @@ async function report(value, overrides = {}) {
     body: JSON.stringify({ requestId: randomUUID(), runId: assignment.runId,
       memberId: assignment.memberId, revision: assignment.revision, report: value, ...overrides }),
   });
-  if (!response.ok && Object.keys(overrides).length === 0)
-    throw new Error(`Team report was refused with status ${response.status}`);
+  if (!response.ok && Object.keys(overrides).length === 0) {
+    const detail = await response.text();
+    throw new Error(`Team report was refused with status ${response.status}${detail ? `: ${detail}` : ""}`);
+  }
 }
 
 async function waitForPeer() {
@@ -213,8 +215,17 @@ async function main() {
       checks: [{ command: process.execPath, args: ["check.mjs"] }] };
     if (scenario === "bootstrap-change" && assignment.revision > 1)
       verification.checks[0].args.push("--different");
-    await report({ kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
-      ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) });
+    const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
+      ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) };
+    if (scenario === "bootstrap-override") {
+      let rejection;
+      try { await report(plan); }
+      catch (error) { rejection = error instanceof Error ? error.message : String(error); }
+      if (rejection) {
+        writeFileSync(join(receiptDir, `${assignment.memberId}.rejection.txt`), rejection, { mode: 0o600 });
+        await report({ ...plan, verification: undefined });
+      }
+    } else await report(plan);
   } else if (assignment.role === "permission-coordinator") {
     const launchPrompt = process.argv.at(-1) ?? "";
     const decisionId = /"decisionId":"([a-f0-9-]{36})"/.exec(launchPrompt)?.[1];

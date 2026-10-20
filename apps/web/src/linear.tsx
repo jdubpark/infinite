@@ -12,7 +12,7 @@ function issueLink(value: string) {
 }
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 
-export function LinearTracking({ tracking, fresh, compact = false }: { tracking?: LinearTrackingView; fresh: boolean; compact?: boolean }) {
+export function LinearTracking({ tracking, stale, compact = false }: { tracking?: LinearTrackingView; stale: boolean; compact?: boolean }) {
   if (!tracking) return null;
   const issue = tracking.issue;
   const href = issue && issueLink(issue.url);
@@ -28,7 +28,7 @@ export function LinearTracking({ tracking, fresh, compact = false }: { tracking?
       <p className="linear-workflow">Linear workflow state: <strong>{issue.state.name}</strong></p>
     </>}
     {tracking.reason && <p className="linear-tracking-reason" role="status">{tracking.reason}</p>}
-    <p className="linear-freshness">{checked ? <>Last checked <time dateTime={checked} title={date(checked)}>{ago(checked)}</time></> : "No check recorded."}{!fresh && " · Showing cached host data."}</p>
+    <p className="linear-freshness" role="status">{checked ? <>Last checked <time dateTime={checked} title={date(checked)}>{ago(checked)}</time></> : "No check recorded."}{stale && " · Showing cached host data."}</p>
     {!compact && <>
       <p className="linear-tracking-note">Linear workflow state is separate from execution and product outcomes. Infinite does not change that state automatically.</p>
       {issue?.description && <details><summary>Issue description</summary><p className="team-prose">{issue.description}</p></details>}

@@ -262,9 +262,8 @@ function App() {
               onChange={(e) => setKey(e.target.value)}
               required
             />
-            <button className="primary" disabled={busy}>
-              {busy ? "Connecting…" : "Connect to Infinite"}
-              <ArrowUpRight size={18} />
+            <button className="primary stable-action" aria-busy={busy} disabled={busy}>
+              {busy && <RefreshCw className="is-refreshing" size={16} />}Connect to Infinite <ArrowUpRight size={18} />
             </button>
             {error && (
               <p role="alert" className="error">
@@ -374,8 +373,8 @@ function App() {
             </strong>
           </div>
           <div className="refresh-status">
-          <button className="text-button" onClick={() => { host.refresh(); if (me.teams) teamFeed.refresh(); if (me.goals) goalFeed.refresh(); }} disabled={host.refreshing}>
-            <RefreshCw size={14} /> {host.refreshing ? "Refreshing…" : "Refresh"}
+          <button className="text-button" onClick={() => { host.refresh(); if (me.teams) teamFeed.refresh(); if (me.goals) goalFeed.refresh(); }} disabled={host.refreshing} aria-busy={host.refreshing}>
+            <RefreshCw className={host.refreshing ? "is-refreshing" : ""} size={14} /> Refresh
           </button>
           <span className={`connection ${connected ? "" : "offline"}`}>
             <span className={`dot ${connected ? "running" : "unavailable"}`} />
@@ -383,13 +382,12 @@ function App() {
           </span>
           </div>
         </header>
-        {!connected && host.failed && (
+        {host.stale && (
           <div className="connection-notice" role="status">
-            This device is offline or the host is unreachable. Work may still be
-            running; controls are disabled until a fresh connection arrives.
+            {host.seen ? "This device is offline or the host is unreachable. Showing the last received state. Work may still be running; controls are disabled until a fresh connection arrives." : "Can’t reach the host. Sessions haven’t loaded; controls are disabled until a fresh connection arrives."}
           </div>
         )}
-        {route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsFresh={teamFeed.fresh} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} refresh={goalFeed.refresh} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
+        {route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
           <Create
             me={me}
             done={route.navigate}
@@ -609,14 +607,14 @@ function Create({
           </select>
           {syncs && <p className="sr-only" role="status">{syncNotice}</p>}
           {syncs && project && (
-            <p className="quiet">
+            <p className="quiet sync-status">
               Synced from laptop {ago(project.sync.lastSyncedAt)} · applied {ago(project.sync.appliedAt)}
               {project.sync.pendingGeneration && <> · pending: {pendingLabel(project.sync.pendingGeneration)}{" "}
-                {me.role === "owner" && <button type="button" className="text-button" disabled={applying || !connected} onClick={() => void applyPending(project.sync.pendingGeneration!.reason === "cloud-changed")}>
+                {me.role === "owner" && <button type="button" className="text-button stable-action" aria-busy={applying} disabled={applying || !connected} onClick={() => void applyPending(project.sync.pendingGeneration!.reason === "cloud-changed")}>
                   {applying ? "Applying…" : project.sync.pendingGeneration.reason === "cloud-changed" ? "Replace cloud files" : "Apply now"}</button>}</>}
             </p>
           )}
-          {syncs && syncError?.projectId === projectId && <p className="error" role="alert">{syncError.message}</p>}
+          {syncs && syncError?.projectId === projectId && !applying && <p className="error" role="alert">{syncError.message}</p>}
           <label htmlFor="title">Session name</label>
           <input
             id="title"
@@ -643,15 +641,9 @@ function Create({
             ? "Rehearsal is a local test process. It does not call an AI model."
             : "The agent uses the account and permissions configured on the host. A permission prompt can pause work until you respond."}
         </p>
-        {(error || creation.message) && (
-          <p className="error" role="alert">
-            {error || creation.message}{request ? " Retry will use the same creation request." : ""}
-          </p>
-        )}
-        <button className="primary" disabled={busy || !connected || me.role !== "owner" || !provider || !projectId || !title.trim()}>
-          {busy
-            ? "Starting…"
-            : request
+        {!busy && (error || creation.message) && <p className="error" role="alert">{error || creation.message}{!error && request ? " Retry will use the same creation request." : ""}</p>}
+        <button className="primary stable-action" aria-busy={busy} disabled={busy || !connected || me.role !== "owner" || !provider || !projectId || !title.trim()}>
+          {busy && <RefreshCw className="is-refreshing" size={16} />}{request
               ? "Retry same request"
               : "Start session"}
           <ArrowUpRight size={18} />
@@ -949,7 +941,7 @@ function SessionView({
           </p>
           {session.execution && (
             <p className="session-meta">
-              {connected && view.fresh ? "Tools: " : "Last received tools: "}{session.execution.location === "cloud" ? "Cloud" : "Laptop"} <span>·</span>{" "}
+              <span className="session-freshness-label">{view.stale ? "Last received tools:" : "Tools:"}</span>{" "}{session.execution.location === "cloud" ? "Cloud" : "Laptop"} <span>·</span>{" "}
               {session.execution.state === "online" ? "connected" : session.execution.state} <span>·</span>{" "}
               {session.execution.location === "cloud" ? "Cloud handoff complete" : session.execution.cloudReady ? "Ready for cloud handoff" : "Preparing cloud handoff"}
               {session.execution.checkpoint && <> · Checkpoint {Math.max(0, Math.floor((Date.now() - Date.parse(session.execution.checkpoint.capturedAt)) / 1000))}s ago</>}
@@ -1006,7 +998,7 @@ function SessionView({
             <div className="section-label">
               <h2>Current screen</h2>
               <div className="screen-actions">
-                <span>{view.fresh ? `Updated ${time(view.seen)}` : view.seen || cached.current?.seen ? `Saved view · ${time(view.seen || cached.current!.seen)}` : "Refreshing…"}</span>
+                <span className="screen-freshness">{view.fresh ? `Updated ${time(view.seen)}` : view.seen || cached.current?.seen ? `Saved view · ${time(view.seen || cached.current!.seen)}` : "Refreshing…"}</span>
                 <button className="text-button" aria-pressed={following} onClick={() => setFollowing(value => !value)}>
                   <ArrowDown size={14} />{following ? "Following latest" : "Follow latest"}
                 </button>
@@ -1058,31 +1050,24 @@ function SessionView({
         <div className="control-bar">
           <div>
             <strong>{requiresControl ? control.lease ? "You have control" : "Monitoring" : me.role === "viewer" ? "View only" : "Shared controls"}</strong>
-            <span>{!view.fresh || !connected ? "Refreshing before input…" : session.status !== "running" ? "Process is not running" : requiresControl && !control.lease ? control.holder ? `${control.holder.label} has control` : "Draft now, take control to send" : "Ready for input"}</span>
+            <span className="control-state" title={!view.fresh || !connected ? "Refreshing before input…" : session.status !== "running" ? "Process is not running" : requiresControl && !control.lease ? control.holder ? `${control.holder.label} has control` : "Draft now, take control to send" : "Ready for input"}>{!view.fresh || !connected ? "Refreshing before input…" : session.status !== "running" ? "Process is not running" : requiresControl && !control.lease ? control.holder ? `${control.holder.label} has control` : "Draft now, take control to send" : "Ready for input"}</span>
           </div>
           <div className="control-actions">
             <SessionLifecycle session={session} role={me.role} online={connected && view.fresh} controlId={control.lease?.id} refresh={view.refresh} />
-            <button className="text-button" onClick={view.refresh} disabled={view.refreshing} aria-label="Refresh this session"><RefreshCw size={16} /></button>
+            <button className="text-button" onClick={view.refresh} disabled={view.refreshing} aria-label="Refresh this session" aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={16} /></button>
             {requiresControl && me.role !== "viewer" && session.status === "running" && (
               control.lease ? <button className="text-button" onClick={async () => { await control.release(); view.refresh(); }}>Stop controlling</button> :
-                <button className="primary" disabled={!connected || !view.fresh || control.busy} onClick={() => takeControl(Boolean(control.holder))}>
+                <button className="primary stable-action" aria-busy={control.busy} disabled={!connected || !view.fresh || control.busy} onClick={() => takeControl(Boolean(control.holder))}>
                   {control.busy ? "Updating…" : control.holder ? "Take over" : "Take control"}
                 </button>
             )}
           </div>
         </div>
-        {control.message && <p className="quiet control-message" role="status">{control.message}</p>}
-        {error && (
-          <p className="error" role="alert">
-            {error}
-          </p>
-        )}
-        {notice && (
-          <p className="receipt" role="status">
-            <Check size={14} />
-            {notice}
-          </p>
-        )}
+        <div className="composer-feedback">
+          <span className={error ? "error" : control.message ? "quiet control-message" : "receipt"} role={error ? "alert" : "status"} title={error || control.message || notice}>
+            {!error && !control.message && notice && <Check size={14} aria-hidden="true" />}{error || control.message || notice}
+          </span>
+        </div>
         {me.role === "viewer" ? (
           <p className="quiet">This device has view-only access.</p>
         ) : (
@@ -1113,16 +1098,17 @@ function SessionView({
               />
               <button
                 className="send-button"
+                aria-busy={busy}
                 aria-label={
                   busy ? "Sending message" : pendingInput ? "Retry same message" : "Send message"
                 }
                 disabled={!canSteer || busy || !text.trim() || Boolean(session.attention?.prompt && tab !== "terminal" && tab !== "screen")}
               >
-                {busy ? <span>Sending…</span> : pendingInput ? <RefreshCw size={20} /> : <Send size={20} />}
+                {busy ? <RefreshCw className="is-refreshing" size={20} /> : pendingInput ? <RefreshCw size={20} /> : <Send size={20} />}
               </button>
             </form>
             <div className="composer-footer">
-              <span>{pendingInput ? "Unconfirmed delivery · retry keeps the same request ID" : text ? "Unsent draft · kept in this tab" : "⌘ / Ctrl + Enter to send · Enter for a new line"}</span>
+              <span>{pendingInput && !busy ? "Unconfirmed delivery · retry keeps the same request ID" : text ? "Unsent draft · kept in this tab" : "⌘ / Ctrl + Enter to send · Enter for a new line"}</span>
               <div>
                 <Dictation disabled={busy || pendingInput} onText={value => setText(current => `${current}${current ? " " : ""}${value}`)} />
                 <button

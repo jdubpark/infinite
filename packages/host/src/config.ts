@@ -38,6 +38,11 @@ const schema = z
       apiKeyFile: z.string().refine(isAbsolute, "Summary key file must be absolute"),
       baseUrl: z.url().default("https://api.openai.com"),
     }).strict().optional(),
+    jev: z.object({
+      apiKeyFile: z.string().refine(isAbsolute, "Jev key file must be absolute"),
+      model: z.string().min(1).max(100).default("jev-latest"),
+      baseUrl: z.url().default("https://api.typesafe.ai"),
+    }).strict().optional(),
     repositoryBriefings: z.object({
       command: z.string().refine(isAbsolute, "Repository briefing command must be absolute"),
       args: z.array(z.string().max(4096)).default([]),
@@ -103,8 +108,8 @@ const schema = z
         endpoint: z.url().default("https://exp.host/--/api/v2/push/send"),
         detail: z.enum(["minimal", "full"]).default("minimal"),
         events: z
-          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "team-blocked"]))
-          .default(["needs-you", "turn-finished", "exited", "recording-error", "team-blocked"]),
+          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked"]))
+          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled"]),
       })
       .strict()
       .optional(),
@@ -166,6 +171,20 @@ export function readConfig(file: string): { config: Config; key: Buffer } {
       throw new Error(message);
     if ((statSync(file).mode & 0o777) !== 0o600) throw new Error(message);
     if (!readFileSync(file, "utf8").trim()) throw new Error(message);
+  }
+  if (config.jev) {
+    const file = config.jev.apiKeyFile;
+    const message = "Jev API key must be a private 0600 file outside runtime state and project workspaces";
+    if (!isAbsolute(file)) throw new Error(message);
+    const info = statSync(file);
+    if (!info.isFile() || (info.mode & 0o777) !== 0o600) throw new Error(message);
+    const actual = realpathSync(file);
+    for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
+      let base: string;
+      try { base = realpathSync(directory); } catch { base = resolve(directory); }
+      const rel = relative(base, actual);
+      if (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel)) throw new Error(message);
+    }
   }
   const key = readFileSync(config.keyFile);
   if (key.length !== 32)

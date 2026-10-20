@@ -3,10 +3,12 @@ import { ActivityIndicator, Alert, KeyboardAvoidingView, Linking, Pressable, Ref
 import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me, type SessionRow } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
+import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
 import { Card, Chip, GlassButton, GroupHeader, LiveStatus, ProgressBar, Segmented, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import type { StatusKind } from "../../status";
 import { theme } from "../../theme";
 import {
@@ -35,16 +37,23 @@ const live = (member: TeamMember) => member.status === "running" || member.statu
 export function TeamDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
   const machine = connectionKey(connection);
-  const poll = usePoll(() => api<TeamView>(connection, `/teams/${id}`), 2000, [connection, id]);
+  const poll = useLive<TeamView>(connection, {
+    topics: ["teams"], intervalMs: 2000, deps: [id],
+    load: () => api<TeamView>(connection, `/teams/${id}`),
+    select: (topic, payload) => topic === "teams" ? (payload as { teams: TeamView[] }).teams.find(team => team.id === id) : undefined,
+  });
   const rating = useTaskRating(connection, id, poll.refresh);
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
-  const { data: sessions } = usePoll(() => api<{ sessions: SessionRow[] }>(connection, "/sessions").then(value => value.sessions), 4000, [connection]);
+  const sessionsPoll = usePoll(() => api<{ sessions: SessionRow[] }>(connection, "/sessions").then(value => value.sessions), 4000, [connection]);
+  const sessions = sessionsPoll.data;
   // A mutation's result shows at once; a poll that started before it cannot undo it.
   const [recorded, setRecorded] = useState<TeamView | null>(null);
   const team = poll.data ? newer(recorded, poll.data) : recorded;
   const [direction, setDirection] = useState("");
   const [tab, setTab] = useState<Tab>("overview");
   const [agentId, setAgentId] = useState("");
+  const [agentStale, setAgentStale] = useState(false);
+  const [dockHeight, setDockHeight] = useState(0);
   const [taskId, setTaskId] = useState("");
   const request = useRunRequest<TeamView>(connection, `${machine}/team/${id}`, {
     accepted: (result, sent) => { setRecorded(result); if (sent.path.endsWith("/steer")) setDirection(""); poll.refresh(); },
@@ -57,10 +66,12 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   }
   const openSession = (sessionId: string) => router.push({ pathname: "/session/[id]", params: { id: sessionId, machine } });
   const owns = me?.role === "owner" && team && !team.goal && team.status !== "cancelled";
-  const top = <TopBar backLabel="Teams" onBack={back} right={<LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} />} />;
-  if (!team) return <View style={s.fill}>{top}<View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading…" : "Could not load the team."}</Text></View></View>;
+  const top = <TopBar backLabel="Teams" onBack={back} right={<LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />;
+  if (!team) return <View style={[s.fill, s.overlayRoot]}>{top}<FloatingNotice position="top" offset={58} message={poll.stale ? "Can't reach this machine." : null} actions={poll.stale ? <Button compact title="Refresh" secondary onPress={poll.refresh} /> : null} /><View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading…" : "Could not load the team."}</Text></View></View>;
 
   const controls = teamControls(team, me?.role, fresh);
+  // Which controls the run offers at all; a stale view disables them in place rather than removing them.
+  const offered = teamControls(team, me?.role, true);
   const locked = request.busy || Boolean(request.pending);
   const decisions = openDecisions(team);
   const listed = new Map((sessions ?? []).map(session => [session.id, session]));
@@ -116,13 +127,13 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
         </View>
         <Glyph name={open ? "down" : "forward"} size={12} color={theme.colors.mutedInk} />
       </Pressable>
-      {open ? <AgentLog connection={connection} member={member} live={live(member)} onOpen={() => openSession(member.sessionId)} /> : null}
+      {open ? <AgentLog connection={connection} member={member} live={live(member)} onOpen={() => openSession(member.sessionId)} onStaleChange={setAgentStale} /> : null}
     </View>;
   };
 
-  return <KeyboardAvoidingView style={s.fill} behavior="padding">
+  return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     {top}
-    {!fresh ? <Text style={t.banner}>Offline · last received state. Controls paused.</Text> : null}
+    <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : agentStale ? "Agent screen may be stale." : null} />
     <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled" stickyHeaderIndices={[1]}
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View style={s.head}>
@@ -158,11 +169,11 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             <Text style={[t.body, s.fill]} numberOfLines={2}>{latest}</Text>
           </View> : null}
           {/* The host's reason for an open agent prompt points at the member session; the approvals below answer it here. */}
-          {team.reason && !approvals.length ? <Text style={kind === "blocked" ? t.error : t.warning}>{team.reason}</Text> : null}
+          {team.reason && !approvals.length && !sessionsPoll.loading ? <Text style={kind === "blocked" ? t.error : t.warning}>{team.reason}</Text> : null}
           {owns ? <View style={s.controls}>
-            {(team.status === "paused" || team.resumable) && !team.deliveryReceipt ? <Button compact glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
-              : controls.pause ? <Button compact secondary glyph="pause" title="Pause" disabled={locked} onPress={() => send("/pause", "Pause")} /> : null}
-            <Button compact secondary glyph="close" title="Cancel…" disabled={!controls.cancel || locked} onPress={() => Alert.alert("Cancel this team?", "Stops its agents. Work and evidence stay.", [
+            {(team.status === "paused" || team.resumable) && !team.deliveryReceipt ? <Button compact busy={Boolean(request.pending?.label === "Resume" && request.busy)} glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
+              : offered.pause ? <Button compact busy={Boolean(request.pending?.label === "Pause" && request.busy)} secondary glyph="pause" title="Pause" disabled={!controls.pause || locked} onPress={() => send("/pause", "Pause")} /> : null}
+            <Button compact busy={Boolean(request.pending?.label === "Cancellation" && request.busy)} secondary glyph="close" title="Cancel…" disabled={!controls.cancel || locked} onPress={() => Alert.alert("Cancel this team?", "Stops its agents. Work and evidence stay.", [
               { text: "Keep running", style: "cancel" },
               { text: "Cancel team", style: "destructive", onPress: () => send("/cancel", "Cancellation") },
             ])} />
@@ -304,8 +315,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
         </Section> : null}
       </View> : null}
     </ScrollView>
-    <View style={s.dock}>
-      <RequestStatus request={request} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|answer)$/.test(request.pending?.path ?? ""))} subject="team" />
+    <View style={s.dock} onLayout={(event) => setDockHeight(event.nativeEvent.layout.height)}>
       <SteerBox value={direction} onChange={setDirection} placeholder="Direct the team…"
         enabled={controls.steer && !locked} busy={request.busy}
         note={team.status === "delivering" || team.status === "merged" || team.deliveryReceipt ? "Delivery started · check its PR first."
@@ -314,6 +324,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             : team.status === "cancelled" ? "Cancelled." : undefined}
         onSend={() => { const text = direction.trim(); if (text) send("/steer", "Direction", { text }); }} />
     </View>
+    <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|answer)$/.test(request.pending?.path ?? ""))} />
   </KeyboardAvoidingView>;
 }
 
@@ -390,6 +401,7 @@ function HistoryRow({ at, day, text }: { at: string; day: string; text: string }
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
+  overlayRoot: { position: "relative" },
   empty: { padding: 30, gap: 15, alignItems: "center" },
   body: { paddingHorizontal: 16, paddingBottom: 24 },
   head: { gap: 8, paddingBottom: 12 },

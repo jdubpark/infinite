@@ -94,9 +94,13 @@ struct TeamDetailView: View {
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 8)
-            if !model.fresh { Text("Updates unavailable").font(.caption).foregroundStyle(.orange) }
-            Text(team.statusLabel).font(.caption.weight(.medium)).padding(.horizontal, 9).padding(.vertical, 4)
+            HStack(spacing: 5) {
+                Image(systemName: "wifi.exclamationmark").font(.caption).foregroundStyle(.orange)
+                    .frame(width: 12).opacity(model.displayStale ? 1 : 0)
+                Text(team.statusLabel).font(.caption.weight(.medium)).lineLimit(1)
+            }.padding(.horizontal, 9).padding(.vertical, 4)
                 .glassSurface(in: Capsule(), tint: teamColor(team))
+                .help(model.displayStale ? "Updates unavailable. Controls stay disabled until the next successful refresh." : "")
             if model.role == "owner" && team.status != "cancelled" {
                 Menu {
                     let resumes = team.status == "paused" || team.offersResume
@@ -220,7 +224,8 @@ struct TeamDetailView: View {
                             .font(.caption).foregroundStyle(.secondary)
                         if member["modelProfile"] != .null { ProfileLine(profile: member["modelProfile"]) }
                         else { Text(providerName(member["provider"].string.isEmpty ? team.provider : member["provider"].string)).font(.caption).foregroundStyle(.secondary) }
-                        if let session, session.running, !session.now.isEmpty { Text(session.now).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+                        Text(session?.running == true ? (session?.now ?? "") : "")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1).frame(height: 14, alignment: .leading)
                     }
                     Spacer()
                     Button("Open session") { app.openSession(member["sessionId"].string) }.controlSize(.small).disabled(session == nil)
@@ -307,12 +312,12 @@ struct TeamDetailView: View {
 
     private var composer: some View {
         VStack(spacing: 8) {
-            if let pending = model.pending {
+            if let pending = model.pending, !model.busy {
                 HStack {
                     Text("Unconfirmed request: \(pending.label.lowercased()) · revision \(pending.body["revision"].int)").font(.caption).foregroundStyle(.orange)
                     Spacer()
-                    Button("Retry same request") { Task { await model.retry() } }.disabled(model.busy || !model.fresh)
-                    Button("Clear…") { confirmDiscard = true }.disabled(model.busy)
+                    Button("Retry same request") { Task { await model.retry() } }.disabled(!model.fresh)
+                    Button("Clear…") { confirmDiscard = true }
                 }
             }
             if model.role == "viewer" { Text("This device can view the team. An owner or controller can answer decisions and send direction.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
@@ -324,9 +329,10 @@ struct TeamDetailView: View {
                 HStack(spacing: 12) {
                     Text(model.notice.isEmpty ? "A direction records a new revision; the team replans from its integrated work." : model.notice)
                         .font(.system(size: 11)).foregroundStyle(model.noticeIsError ? Color.orange : .secondary).lineLimit(2).textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Button { Task { await model.steer() } } label: { Label(model.busy ? "Sending…" : "Send direction", systemImage: "arrow.up") }
-                        .buttonStyle(.borderedProminent).disabled(!model.canSteer || model.direction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .frame(maxWidth: .infinity, alignment: .leading).frame(height: 28, alignment: .leading)
+                    Button { Task { await model.steer() } } label: {
+                        Group { if model.busy { ProgressView().controlSize(.small) } else { Label("Send direction", systemImage: "arrow.up") } }.frame(width: 112)
+                    }.buttonStyle(.borderedProminent).disabled(!model.canSteer || model.direction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
         }

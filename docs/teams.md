@@ -840,12 +840,12 @@ scheduler from stopping a member. Such conflicts remain visible.
 A blocked run waits for the owner, so the host flags it everywhere the owner
 looks:
 
-* **Phone push.** With push enabled, the host sends one high-priority
-  notification when a run becomes blocked. It names the run and says whether it
-  can resume, and opens the team when tapped. With `push.detail: "full"` it also
-  carries the reason. The `team-blocked` entry in `push.events` controls it and
-  is on by default. A run that was already blocked when the host started, or
-  that blocked while the host was down, is not announced again.
+* **Phone push.** With push enabled, the host announces new runs, completion,
+  cancellation and runs that need the owner. Stuck events are high priority;
+  blocked runs say whether they can resume. With `push.detail: "full"`, finished
+  and stuck events may include the reason. `team-stuck` controls stuck events;
+  `team-blocked` remains an alias. Runs already present when the host starts are
+  primed silently, and runs owned by a goal use goal notifications instead.
 * **Linear.** The tracked issue gets the reason, the next step and a `Blocked`
   label (see [Linear tracking](#linear-tracking)).
 * **App lists.** Web, phone and Mac list blocked runs first, with the reason.

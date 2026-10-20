@@ -213,7 +213,7 @@ export type TeamReport = z.infer<typeof teamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: teamReportSchema }).strict();
 export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
 export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
-export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string };
+export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string; verificationRefused?: true };
 /** `merged` is set only from an explicit delivery report; it is not host verification. */
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export interface TeamMember extends TeamAssignment {
@@ -291,6 +291,8 @@ export interface TeamRun {
   /** Owner opt-in is pinned at creation; accepted commands cannot change within this run. */
   establishChecks?: true;
   verification?: TeamVerification;
+  /** Revisions where an unauthorized verification plan already received its one correction. */
+  verificationCorrections?: number[];
   /** Owner-authorized repository delivery policy pinned when this run starts. */
   delivery?: TeamDelivery;
   /** Agent-reported delivery evidence; this is not independently verified by the host. */

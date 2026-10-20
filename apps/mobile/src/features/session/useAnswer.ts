@@ -189,6 +189,7 @@ export function useAnswer(
     status:
       prompt && card.promptId === prompt.id ? card.status : IDLE.status,
     notice: notice ? NOTICE_TEXT[notice.kind] : "",
+    dismissNotice: () => setNotice(null),
     forbidden,
     answer,
     retry,

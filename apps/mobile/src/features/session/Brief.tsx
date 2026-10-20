@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
+  Alert,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -17,15 +18,15 @@ import {
   type Me,
   type SessionDetail,
 } from "../../api/client";
-import { usePoll } from "../../api/usePoll";
+import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
 import { Composer } from "../../components/Composer";
 import { ControlBar } from "../../components/ControlBar";
 import { DecisionCard } from "../../components/DecisionCard";
 import { MomentRow } from "../../components/MomentRow";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { NowCard } from "../../components/NowCard";
-import { OfflineBanner } from "../../components/OfflineBanner";
 import { Chip, GlassButton, LiveStatus, Segmented, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { StatePill } from "../../components/StatePill";
@@ -49,22 +50,29 @@ export function Brief({
 }) {
   const router = useRouter();
   const [tab, setTab] = useState<"chat" | "activity" | "files">("chat");
+  const [conversationStale, setConversationStale] = useState(false);
+  const [composerHeight, setComposerHeight] = useState(0);
   const control = useSessionControl(connection, id);
   const {
     data: poll,
     online,
+    stale,
     seen,
     refresh,
-  } = usePoll(
-    async () => {
+  } = useLive(connection, {
+    topics: [`session/${id}`],
+    intervalMs: 1500,
+    deps: [id],
+    load: async () => {
       // A poll that started before a local control change must not undo it.
       const revision = control.generation();
       const session = await api<SessionDetail>(connection, `/sessions/${id}`);
       return { session, revision, receivedAt: Date.now() };
     },
-    1500,
-    [connection, id],
-  );
+    select: (topic, payload) => topic === `session/${id}`
+      ? { session: (payload as { state: SessionDetail }).state, revision: control.generation(), receivedAt: Date.now() }
+      : undefined,
+  });
   const session = poll?.session ?? null;
   useControlSync(control, poll, online);
   // `/me` is read once; a failed read is retried after the next good poll.
@@ -116,6 +124,18 @@ export function Brief({
   const canAnswer = permitted && online && running && controlled;
   const canSteer =
     online && running && me !== null && me.role !== "viewer" && controlled;
+  // Text and Enter would land in the open dialog and pick its highlighted option.
+  // A running worker without attention cannot report one, so only the terminal types.
+  const blocked = session?.attention.prompt
+    ? "Answer the prompt above, or reply instead."
+    : running && session?.attention.state === "unavailable"
+      ? "This session predates the Brief. Use the terminal to type."
+      : undefined;
+  const canSend = canSteer && !session?.team && !blocked && !steering.busy && Boolean(steering.text.trim());
+  function send() {
+    if (!canSend) return;
+    void steering.send();
+  }
   const controlGate =
     online && running && !controlled
       ? control.holder
@@ -147,11 +167,14 @@ export function Brief({
 
   return (
     // Android runs edge-to-edge, so the window no longer resizes for the keyboard.
-    <KeyboardAvoidingView style={s.fill} behavior="padding">
+    <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
       <TopBar backLabel="Sessions" onBack={back} right={<>
-        <LiveStatus online={online} seen={seen} />
+        <LiveStatus online={online} seen={seen} stale={stale} />
         <GlassButton glyph="terminal" label="Open terminal" onPress={openTerminal} />
       </>} />
+      <FloatingNotice position="top" offset={58}
+        message={stale ? session ? "Offline · last received view. Input is paused." : "Can't reach this machine." : tab === "chat" && conversationStale ? "Conversation may be stale." : null}
+        actions={stale && !session ? <Button compact title="Refresh" secondary onPress={refresh} /> : null} />
       {!session ? (
         <View style={s.empty}>
           <ActivityIndicator />
@@ -161,7 +184,7 @@ export function Brief({
         <>
           <View style={s.head}>
             <Text style={s.title} numberOfLines={2}>
-              {session.title}
+              {session.reading?.title?.text ?? session.title}
             </Text>
             <View style={s.chips}>
               <StatePill state={session.attention.state} />
@@ -176,12 +199,8 @@ export function Brief({
             <Text style={s.small} numberOfLines={1}>
               {toolsOn} · {online ? seen : seen ? `cached ${seen}` : "waiting…"}
             </Text>
-            {tools ? <Text style={s.small} numberOfLines={2}>{tools}</Text> : null}
+            {tools ? <Text style={s.small} numberOfLines={1}>{tools}</Text> : null}
           </View>
-          <OfflineBanner
-            online={online}
-            message="Offline · last received view. Input paused."
-          />
           {session.team ? null : <ControlBar
             role={me?.role}
             requiresControl={requiresControl}
@@ -203,15 +222,6 @@ export function Brief({
             keyboardShouldPersistTaps="handled"
             refreshControl={<RefreshControl refreshing={false} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}
           >
-            {answering.notice ? (
-              <Text
-                accessibilityRole="alert"
-                accessibilityLiveRegion="polite"
-                style={s.notice}
-              >
-                {answering.notice}
-              </Text>
-            ) : null}
             {prompt && session.team ? (
               // A member's open prompt is approved from its team, beside the coordinator's review.
               <View style={s.pointer}>
@@ -239,6 +249,7 @@ export function Brief({
                 key={session.attention.since}
                 attention={session.attention}
                 provider={session.provider}
+                pickedLine={session.reading?.now?.text}
                 exitCode={session.exitCode}
                 onOpenTerminal={openTerminal}
               />
@@ -248,7 +259,7 @@ export function Brief({
               { value: "activity", label: "Activity", count: moments.length },
               { value: "files", label: "Files" },
             ]} />
-            {tab === "chat" ? <Conversation connection={connection} id={id} /> : tab === "files" ? <Files connection={connection} id={id} online={online} /> : <>
+            {tab === "chat" ? <Conversation connection={connection} id={id} onStaleChange={setConversationStale} /> : tab === "files" ? <Files connection={connection} id={id} online={online} /> : <>
             {moments.length ? (
               <View>
                 {moments.map((m) => (
@@ -283,15 +294,7 @@ export function Brief({
               onTakeControl={online && running && !controlled ? () => void takeControl(Boolean(control.holder)) : undefined}
               controlBusy={control.busy}
               controlLabel={control.holder ? "Take over" : "Take control"}
-              // Text and Enter would land in the open dialog and pick its highlighted option.
-              // A running worker without attention cannot report one, so only the terminal types.
-              blocked={
-                session.attention.prompt
-                  ? "Answer the prompt above, or reply instead."
-                  : running && session.attention.state === "unavailable"
-                    ? "This session predates the Brief. Use the terminal to type."
-                    : undefined
-              }
+              blocked={blocked}
               blockedPlaceholder={
                 session.attention.prompt ? undefined : "Type in the terminal"
               }
@@ -302,16 +305,27 @@ export function Brief({
               }
               busy={steering.busy}
               pending={steering.pending}
-              receipt={steering.receipt}
-              error={steering.error}
               text={steering.text}
               onChangeText={steering.setText}
-              onSend={() => void steering.send()}
+              onSend={send}
               onInterrupt={() => void steering.sendKey("interrupt")}
+              onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
             />
           ) : null}
         </>
       )}
+      <FloatingNotice position="bottom" offset={composerHeight + 10}
+        message={answering.notice || (steering.error ? steering.error : steering.pending && !steering.busy ? "Delivery is unconfirmed. Retry sends the same request ID." : steering.receipt)}
+        kind={steering.error ? "error" : steering.receipt && !answering.notice ? "success" : "warning"}
+        accessibilityRole={answering.notice ? "alert" : undefined}
+        onDismiss={answering.notice ? answering.dismissNotice : steering.error || steering.receipt ? steering.dismissStatus : undefined}
+        actions={steering.pending && !steering.busy && !answering.notice ? <View style={s.noticeActions}>
+          <Button compact title="Retry" disabled={!canSend} onPress={send} />
+          <Button compact title="Clear…" secondary onPress={() => Alert.alert("Clear the unconfirmed delivery?", "The host may have received it. Clearing only forgets the request on this phone.", [
+            { text: "Keep pending", style: "cancel" },
+            { text: "Clear", style: "destructive", onPress: steering.clearPending },
+          ])} />
+        </View> : null} />
     </KeyboardAvoidingView>
   );
 }
@@ -323,6 +337,8 @@ function sourceLabel(hooks: SessionDetail["attention"]["hooks"], source: Session
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
+  overlayRoot: { position: "relative" },
+  noticeActions: { flexDirection: "row", gap: 6 },
   small: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
   empty: { padding: 30, gap: 15, alignItems: "center" },
   head: { paddingHorizontal: 16, paddingBottom: 10, gap: 7 },

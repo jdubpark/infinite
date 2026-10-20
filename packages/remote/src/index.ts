@@ -1,8 +1,8 @@
 import {
   acceptServerHello, createCipherChannel, createClientHello, HANDSHAKE_TIMEOUT_MS, MAX_FRAME_BYTES,
-  MAX_PENDING_REQUESTS, MAX_REQUEST_BYTES, MAX_TERMINAL_STREAMS, MAX_TERMINAL_BUFFERED_BYTES,
+  MAX_PENDING_REQUESTS, MAX_REQUEST_BYTES, MAX_TERMINAL_STREAMS, MAX_TERMINAL_BUFFERED_BYTES, MAX_EVENTS_STREAMS,
   object, remoteSocketUrl, systemRandomBytes, tokenKey, UUID,
-  type CipherChannel, type RandomBytes, type RemoteMethod, type RemoteRequest, type RemoteTerminalCommand, type TerminalInput,
+  type CipherChannel, type RandomBytes, type RemoteMethod, type RemoteRequest, type RemoteTerminalCommand, type RemoteEventsCommand, type TerminalInput,
 } from "./protocol.js";
 
 /** A Cloudflare Access service token; Cloudflare checks it before the connection reaches the relay. */
@@ -24,11 +24,19 @@ export interface RemoteTerminal {
   send(message: TerminalInput): void;
   close(): void;
 }
+export interface RemoteEventsOptions {
+  topics: string[];
+  after?: number;
+  onEvent(event: { topic: string; data: unknown }): void;
+  onClose(event: { code: number; error?: RemoteError }): void;
+}
+export interface RemoteEvents { close(): void }
 export type { TerminalInput } from "./protocol.js";
 export interface RemoteClient {
   request<T = unknown>(path: string, options?: RemoteRequestOptions): Promise<T>;
   /** Opens explicitly; disconnected terminals and uncertain input are never replayed. */
   openTerminal(sessionId: string, options: RemoteTerminalOptions): Promise<RemoteTerminal>;
+  openEvents(options: RemoteEventsOptions): Promise<RemoteEvents>;
   close(): void;
 }
 
@@ -57,10 +65,16 @@ export function createRemoteClient(connection: RemoteConnection, options: Remote
   let counter = 0;
   const pending = new Map<string, Pending>();
   const terminals = new Map<string, RemoteTerminalOptions>();
+  const eventStreams = new Map<string, RemoteEventsOptions>();
   const notifyClosed = (streamId: string, code: number, error?: RemoteError) => {
     const terminal = terminals.get(streamId);
     terminals.delete(streamId);
     try { terminal?.onClose({ code, error }); } catch { /* application callbacks do not affect channel integrity */ }
+  };
+  const notifyEventsClosed = (streamId: string, code: number, error?: RemoteError) => {
+    const stream = eventStreams.get(streamId);
+    eventStreams.delete(streamId);
+    try { stream?.onClose({ code, error }); } catch { /* application callbacks do not affect channel integrity */ }
   };
   const interrupted = (mutation: boolean) => new RemoteError(
     mutation ? "Connection interrupted. Delivery may be uncertain; refresh the session before retrying." : "Machine connection interrupted. Reconnect to refresh.",
@@ -73,6 +87,7 @@ export function createRemoteClient(connection: RemoteConnection, options: Remote
     for (const item of pending.values()) { item.cleanup(); item.reject(interrupted(item.mutation)); }
     pending.clear();
     for (const streamId of terminals.keys()) notifyClosed(streamId, 1006, interrupted(true));
+    for (const streamId of eventStreams.keys()) notifyEventsClosed(streamId, 1006, interrupted(false));
     try { previous?.close(); } catch { /* already disconnected */ }
   };
   const connect = () => {
@@ -115,6 +130,17 @@ export function createRemoteClient(connection: RemoteConnection, options: Remote
             }
             return;
           }
+          if (response.type === "events-event" || response.type === "events-closed") {
+            if (typeof response.streamId !== "string" || !/^[1-9][0-9]{0,15}$/.test(response.streamId)) throw new Error("Invalid events stream");
+            if (response.type === "events-closed") {
+              if (!Number.isInteger(response.code) || Number(response.code) < 1000 || Number(response.code) > 4999) throw new Error("Invalid events close");
+              notifyEventsClosed(response.streamId, Number(response.code));
+            } else {
+              if (typeof response.topic !== "string") throw new Error("Invalid events topic");
+              try { eventStreams.get(response.streamId)?.onEvent({ topic: response.topic, data: response.data }); } catch { /* isolate application callbacks */ }
+            }
+            return;
+          }
           if (response.type !== "response" || typeof response.id !== "string" || !Number.isInteger(response.status) || Number(response.status) < 100 || Number(response.status) > 599) throw new Error("Invalid remote response");
           const item = pending.get(response.id);
           // A locally canceled read may still finish at the runner.
@@ -137,7 +163,7 @@ export function createRemoteClient(connection: RemoteConnection, options: Remote
     if (!Number.isSafeInteger(counter + 1)) throw new RemoteError("Reconnect this machine before sending another request", 0, undefined, "closed");
     return `${++counter}`;
   };
-  const send = (message: RemoteRequest | RemoteTerminalCommand) => {
+  const send = (message: RemoteRequest | RemoteTerminalCommand | RemoteEventsCommand) => {
     if (!channel || socket?.readyState !== WebSocket.OPEN) throw new RemoteError("Machine disconnected before delivery", 0, undefined, "disconnected");
     if (new TextEncoder().encode(JSON.stringify(message)).length > MAX_REQUEST_BYTES) throw new RemoteError("Request is too large", 413, undefined, "request-too-large");
     const frame = JSON.stringify(channel.seal(message));
@@ -223,6 +249,35 @@ export function createRemoteClient(connection: RemoteConnection, options: Remote
           send({ type: "terminal-close", id: nextId(), token, streamId });
         },
       };
+    },
+    async openEvents(init) {
+      const after = init.after ?? 0;
+      if (!Array.isArray(init.topics) || !init.topics.length || init.topics.length > 16 || new Set(init.topics).size !== init.topics.length ||
+          !Number.isSafeInteger(after) || after < 0 || init.topics.some(topic => topic !== "sessions" && topic !== "teams" && !/^session\/[0-9a-f-]{36}$/i.test(topic)))
+        throw new RemoteError("Invalid events subscription", 400, undefined, "invalid-request");
+      await connect();
+      if (eventStreams.size >= MAX_EVENTS_STREAMS || pending.size >= MAX_PENDING_REQUESTS)
+        throw new RemoteError("Too many open event streams or requests", 429, undefined, "busy");
+      const streamId = nextId();
+      const request: RemoteEventsCommand = { type: "events-open", id: streamId, token, topics: init.topics, after };
+      eventStreams.set(streamId, init);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const activeSocket = socket;
+          const timer = setTimeout(() => { if (socket === activeSocket) disconnect(new RemoteError("Events subscription timed out", 0, undefined, "timeout")); }, timeout);
+          pending.set(streamId, { mutation: false, resolve: value => {
+            if (!value || typeof value !== "object" || (value as { streamId?: unknown }).streamId !== streamId) {
+              reject(new RemoteError("Invalid events subscription receipt")); disconnect(new RemoteError("Invalid events subscription receipt"));
+            } else resolve();
+          }, reject, cleanup: () => clearTimeout(timer) });
+          try { send(request); } catch (error) { pending.delete(streamId); clearTimeout(timer); reject(error); }
+        });
+      } catch (error) { eventStreams.delete(streamId); throw error; }
+      return { close() {
+        if (!eventStreams.has(streamId)) return;
+        eventStreams.delete(streamId);
+        try { send({ type: "events-close", id: nextId(), token, streamId }); } catch { /* disconnected streams are already closed at the host */ }
+      } };
     },
     close() { stopped = true; disconnect(new RemoteError("Machine connection closed", 0, undefined, "closed")); key.fill(0); },
   };

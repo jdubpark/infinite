@@ -197,7 +197,8 @@ struct DesktopView: View {
     /// The connected server, its state in words, and the way to switch or add one.
     private var footer: some View {
         HStack(spacing: 10) {
-            Circle().fill(app.connected ? Palette.connected : app.connecting ? Palette.attention : Color.secondary).frame(width: 7, height: 7)
+            Circle().fill(app.connected ? Palette.connected : app.connecting || app.sessionsDisplayStale ? Palette.attention : Color.secondary).frame(width: 7, height: 7)
+                .allowsHitTesting(false)
             Menu {
                 ForEach(app.profiles) { profile in
                     Button { app.activeID = profile.id; Task { await app.connect() } } label: {
@@ -210,10 +211,15 @@ struct DesktopView: View {
             } label: { Text(app.active?.label ?? "No server").font(.callout.weight(.medium)).lineLimit(1).truncationMode(.tail) }
             .menuStyle(.borderlessButton).tint(.primary)
             // The connection state always shows in full; a long server name truncates instead.
-            Text(app.connected ? "Connected" : app.connecting ? "Connecting…" : app.active == nil ? "Not paired" : "Offline")
-                .font(.caption).foregroundStyle(app.connected || app.connecting ? Color.secondary : .orange).lineLimit(1)
-                .fixedSize().layoutPriority(1)
+            Text(app.connected ? "Connected" : app.connecting ? "Connecting…" : app.active == nil ? "Not paired" : app.sessionsDisplayStale ? (app.sessionsLoaded ? "Offline" : "Unreachable") : "Checking…")
+                .font(.caption).foregroundStyle(app.sessionsDisplayStale && !app.connected ? .orange : .secondary).lineLimit(1)
+                .frame(width: 78, alignment: .leading)
+                .allowsHitTesting(false)
             Spacer(minLength: 4)
+            Button { Task { await app.connect() } } label: { Image(systemName: "arrow.clockwise").frame(width: 16) }
+                .buttonStyle(.borderless).accessibilityLabel("Reconnect")
+                .help("Reconnect. " + (app.sessionsLoaded ? "Showing last received sessions. " : "Can't reach the server; sessions haven't loaded. ") + (app.connectionError.isEmpty ? app.message : app.connectionError))
+                .opacity(app.sessionsDisplayStale ? 1 : 0).disabled(!app.sessionsDisplayStale || app.connecting)
             SettingsLink { Image(systemName: "gearshape") }.buttonStyle(.borderless).help("Connections")
         }
         .padding(.horizontal, 12).padding(.vertical, 9)
@@ -245,13 +251,6 @@ struct DesktopView: View {
 
     @ViewBuilder private var detail: some View {
         VStack(spacing: 0) {
-            if !app.message.isEmpty {
-                HStack {
-                    Image(systemName: "wifi.exclamationmark")
-                    Text(app.message).lineLimit(2); Spacer()
-                    Button("Reconnect") { Task { await app.connect() } }.disabled(app.connecting)
-                }.font(.caption).padding(10).background(Color.orange.opacity(0.12))
-            }
             // Session panes stay mounted underneath Home and team dashboards, so switching back is instant.
             let covered = app.active == nil || app.showingHome || app.showingCost || teamModel != nil
             ZStack {
@@ -362,9 +361,9 @@ struct SessionPane: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
                 HStack(spacing: 8) {
-                    Text("\(providerName(session.provider)) · \(session.displayState)").font(.caption).foregroundStyle(.secondary).lineLimit(1).fixedSize()
+                    Text("\(providerName(session.provider)) · \(session.displayState)").font(.caption).foregroundStyle(.secondary).lineLimit(1).frame(width: 175, alignment: .leading)
                     Text(session.path.isEmpty ? session.project : session.path).font(.system(size: 11, design: .monospaced)).foregroundStyle(.tertiary)
-                        .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                        .lineLimit(1).truncationMode(.middle).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             Spacer(minLength: 8)
@@ -402,18 +401,21 @@ struct SessionPane: View {
                 .frame(height: 76).glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             HStack(spacing: 12) {
                 Text(footer.text).font(.system(size: 11)).foregroundStyle(footer.color).lineLimit(2).help(footer.text).textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading).frame(height: 28, alignment: .leading)
                 if model.role == "owner" {
                     Toggle("Type in terminal", isOn: Binding(get: { model.directInput }, set: model.setDirectInput))
                         .toggleStyle(.switch).controlSize(.mini).font(.caption).disabled(!model.screenReady || model.view != .screen)
                 }
-                if model.draft.pendingID != nil {
-                    Button("Retry same send") { Task { await model.send(retry: true) } }.disabled(!model.ready || model.busy)
-                    Button("Clear…") { confirmClear = true }
-                } else {
-                    Button { Task { await model.send() } } label: { Label(model.busy ? "Sending…" : "Send", systemImage: "arrow.up") }
-                        .buttonStyle(.borderedProminent).disabled(!model.canSend || model.role == "viewer" || promptBlocks)
-                }
+                Button("Retry same send") { Task { await model.send(retry: true) } }
+                    .frame(width: 118).opacity(model.draft.pendingID != nil && !model.sending ? 1 : 0)
+                    .disabled(model.draft.pendingID == nil || !model.ready || model.sending)
+                Button("Clear…") { confirmClear = true }
+                    .frame(width: 62).opacity(model.draft.pendingID != nil && !model.sending ? 1 : 0)
+                    .disabled(model.draft.pendingID == nil || model.sending)
+                Button { Task { await model.send() } } label: {
+                    Group { if model.sending { ProgressView().controlSize(.small) } else { Label("Send", systemImage: "arrow.up") } }.frame(width: 72)
+                }.buttonStyle(.borderedProminent).opacity(model.draft.pendingID == nil || model.sending ? 1 : 0)
+                    .disabled(!model.canSend || model.role == "viewer" || promptBlocks)
             }
         }
     }
@@ -522,7 +524,10 @@ struct ConnectionsView: View {
                         Text(profile.relayMachineID == nil ? "Direct · end-to-end encrypted" : "Relay · end-to-end encrypted").font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if profile.id == app.activeID { Text(app.connected ? "Connected" : app.connecting ? "Connecting…" : "Disconnected").font(.caption).foregroundStyle(.secondary) }
+                    if profile.id == app.activeID {
+                        Text(app.connected ? "Connected" : app.connecting ? "Connecting…" : app.sessionsDisplayStale ? (app.sessionsLoaded ? "Offline" : "Unreachable") : "Checking…")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1).frame(width: 82, alignment: .trailing)
+                    }
                     else { Button("Connect") { app.activeID = profile.id; Task { await app.connect() } } }
                 }.padding(.vertical, 10)
                 Divider()
@@ -545,7 +550,12 @@ struct ResourceView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                HStack { Text("Server resources").font(.title.weight(.medium)); Spacer(); Text(app.connected ? "Live observations" : "Stale · reconnecting").font(.caption).foregroundStyle(app.connected ? Color.secondary : .orange) }
+                HStack {
+                    Text("Server resources").font(.title.weight(.medium)); Spacer()
+                    Text(app.connected ? "Live observations" : app.sessionsDisplayStale ? (resources == .null ? "Can't reach server" : "Stale · reconnecting") : "Checking…")
+                        .font(.caption).foregroundStyle(app.sessionsDisplayStale && !app.connected ? .orange : .secondary)
+                        .lineLimit(1).frame(width: 130, alignment: .trailing)
+                }
                 Text("Measurements belong to the execution server. Unavailable readings are never shown as zero.").foregroundStyle(.secondary)
                 if !resources["unavailable"].string.isEmpty { Text(resources["unavailable"].string).foregroundStyle(.orange) }
                 Grid(alignment: .leading, horizontalSpacing: 40, verticalSpacing: 16) {

@@ -41,6 +41,16 @@ const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(valu
 const terminalStatuses = new Set(["ready-for-review", "merged", "no-change", "no-opportunity", "blocked", "cancelled", "limit-reached", "achieved"]);
 const evidenceStatuses = new Set([...terminalStatuses, "needs-input", "paused"]);
 const normalized = (value: string | null) => (value ?? "").replace(/\r\n/g, "\n").trim();
+// Linear rewrites prose only; code keeps its bytes, so an edited diff marker or escape inside code still blocks.
+const createMatchNormalized = (value: string | null) => {
+  let fenced = false;
+  return normalized(value).split("\n").map(line => {
+    if (/^[ \t]*(?:```|~~~)/.test(line)) { fenced = !fenced; return line; }
+    if (fenced) return line;
+    return line.replace(/^([ \t]*)[-*+](?= )/, "$1-").split(/(`[^`]*`)/).map((part, index) => index % 2 ? part
+      : part.replace(/\[([^\]]+)\]\(<\1>\)/g, "$1").replace(/\[([^\]]+)\]\(\1\)/g, "$1").replace(/\\([!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])/g, "$1")).join("");
+  }).join("\n");
+};
 const scopeHash = (issue: Issue, linearProjectId?: string) => hash({ title: issue.title, description: normalized(issue.description), teamId: issue.team.id,
   ...(linearProjectId !== undefined ? { projectId: issue.project?.id ?? null } : {}), parentId: issue.parent?.id ?? null });
 
@@ -228,12 +238,12 @@ export class LinearService {
     if (this.isFresh(stored) && !this.pendingComments(stored)) { stored.error = undefined; stored.failures = 0; stored.retryAt = 0; }
     this.save(stored);
   }
-  private accept(stored: Stored, issue: Issue, generation: number) {
+  private accept(stored: Stored, issue: Issue, generation: number, created = false) {
     if (this.closed) return;
     if (issue.team.id !== stored.teamId || (stored.linearProjectId !== undefined && issue.project?.id !== stored.linearProjectId)
       || (!stored.existing && (issue.id !== stored.create.id || (issue.parent?.id ?? undefined) !== stored.create.parentId)))
       stored.blocked ??= "The Linear issue belongs to a different team, project, or parent. Its execution binding cannot be used.";
-    if (!stored.baseline && !stored.existing && (issue.title !== stored.create.title || normalized(issue.description) !== normalized(stored.create.description)))
+    if (!created && !stored.baseline && !stored.existing && (issue.title !== stored.create.title || createMatchNormalized(issue.description) !== createMatchNormalized(stored.create.description)))
       stored.blocked ??= "The created Linear issue no longer matches the saved requirements. Start a newly approved run.";
     if (stored.baseline && stored.baseline !== scopeHash(issue, stored.linearProjectId)) stored.blocked ??= "The Linear issue requirements or parent changed. Review the updated issue and start a newly approved run.";
     if (issue.archivedAt || !["triage", "backlog", "unstarted", "started"].includes(issue.state.type))
@@ -319,7 +329,7 @@ export class LinearService {
     const data = await this.graphql("InfiniteLinearIssueCreate", `mutation InfiniteLinearIssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { ${issueFields} } } }`, { input: stored.create });
     if (this.closed) return;
     const result = z.object({ success: z.literal(true), issue: issueSchema }).parse(data.issueCreate);
-    this.accept(stored, result.issue, generation);
+    this.accept(stored, result.issue, generation, true);
   }
   // Label requests are optional: a rate limit on them backs off only the label, never the shared transport.
   private async applyLabel(stored: Stored) {

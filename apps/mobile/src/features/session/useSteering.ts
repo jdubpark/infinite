@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as Crypto from "expo-crypto";
 import {
   api,
@@ -35,6 +35,12 @@ export function useSteering(
   const [receipt, setReceipt] = useState("");
   const draft = useSessionDraft(draftKey);
   const inFlight = useRef(false);
+
+  useEffect(() => {
+    if (!receipt) return;
+    const timer = setTimeout(() => setReceipt(""), 4000);
+    return () => clearTimeout(timer);
+  }, [receipt]);
 
   /** Resolves true once the host confirms delivery to the terminal. */
   async function send(): Promise<boolean> {
@@ -128,7 +134,9 @@ export function useSteering(
     receipt,
     pending: draft.pending !== null,
     text: draft.text,
-    setText: (value: string) => { writeDraft(draftKey, { ...readDraft(draftKey), text: value }); setReceipt(""); setError(""); },
+    setText: (value: string) => { writeDraft(draftKey, { ...readDraft(draftKey), text: value }); },
+    dismissStatus: () => { setReceipt(""); setError(""); },
+    clearPending: () => { const current = readDraft(draftKey); if (!inFlight.current) writeDraft(draftKey, { text: current.text, pending: null }); },
     send,
     sendKey,
   };

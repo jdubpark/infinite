@@ -270,7 +270,7 @@ The web client uses no decorative shadows. Canvas, paper, selected-row fills, pa
 
 Controls and web session rows share the `control` radius. Captured output, context blocks, provider initials, the terminal shell, and the web composer share the `panel` radius. The pairing sheet has a broader `pairing-sheet` radius. The native message field uses `native-message` rounding. Status dots remain small circles with adjacent labels.
 
-Dividers follow the content width. Session records remain rows rather than elevated cards. Fields have a visible one-pixel boundary; selected web tabs use a two-pixel underline. Web UI icons are line SVGs. Native icons are line glyphs drawn from views, plus Linear-style status circles: dashed for backlog, empty for to do, filled by quarters for progress, a check ring for review, a filled check for done, and filled marks for attention, blocked, and cancelled. Native buttons, chips, and segmented views are capsules. An icon-only control carries an accessibility label, and a status icon stays beside its state words.
+Dividers follow the content width. Session records remain rows rather than elevated cards. Fields have a visible one-pixel boundary; selected web tabs use a two-pixel underline. Web UI icons are line SVGs. Native icons are line glyphs drawn from views, plus Linear-style status circles: dashed for backlog, empty for to do, filled by quarters for progress, a check ring for review, a filled check for done, and filled marks for attention, blocked, and cancelled. Native buttons, chips, and segmented views are capsules. An icon-only control carries an accessibility label, and a status icon stays beside its state words. The Linear chip is the exception: its icon carries the issue state beside the issue identifier, and the state is spoken in its accessibility label.
 
 ## Components
 
@@ -315,6 +315,7 @@ A delivery receipt sits immediately above the composer. It describes delivery to
 - **Do** keep the warm sheet, ink hierarchy, and forest primary action consistent across pairing, lists, and detail.
 - **Do** place session titles before provider and status, and retain short stable IDs in list rows.
 - **Do** show connection freshness separately from process status and input delivery.
+- **Do** keep layout still while status changes. A stale or offline warning appears only after the view has stayed stale for about three seconds, and then floats over content or lives in an existing status element. A request in flight shows its busy state inside its own control. Receipts float and dismiss themselves, or sit in a slot that is always there. Controls still pause the moment a view goes stale.
 - **Do** preserve minimum 44px web and 48-unit native control targets, visible focus, and wrapping native command keys.
 - **Do** use platform system typography on native while preserving the web hierarchy and Instrument Sans identity.
 - **Do** respect reduced motion: web view entry has no blur animation when reduced motion is requested.
@@ -323,6 +324,7 @@ A delivery receipt sits immediately above the composer. It describes delivery to
 
 - **Don't** imply task completion from a running label, idle screen, connection indicator, or terminal delivery receipt.
 - **Don't** remove stale-view warnings while displaying cached session content.
+- **Don't** insert or remove lines, banners, or words in the flow for a temporary state such as loading, sending, a single failed poll, or a fresh receipt. Content should not jump up and down.
 - **Don't** substitute provider-colored page themes for the shared palette.
 - **Don't** treat the terminal’s dark surface as a delivered dark app theme.
 - **Don't** describe the inferred working-journal direction or seed assignment as user-approved visual identity.

@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import * as Crypto from "expo-crypto";
 import { createRemoteClient } from "@infinite/remote";
@@ -129,16 +129,19 @@ export function JevcodeSummary({ connection, team }: { connection: Connection; t
 }
 
 /** One agent's current screen and recent control events. */
-export function AgentLog({ connection, member, live, onOpen }: { connection: Connection; member: TeamMember; live: boolean; onOpen: () => void }) {
+export function AgentLog({ connection, member, live, onOpen, onStaleChange }: { connection: Connection; member: TeamMember; live: boolean; onOpen: () => void; onStaleChange?: (stale: boolean) => void }) {
   const poll = usePoll(async () => {
     const detail = await api<SessionDetail>(connection, `/sessions/${member.sessionId}`);
     const page = await api<{ events: LogEvent[] }>(connection, `/sessions/${member.sessionId}/events?after=${Math.max(0, detail.seq - 80)}&types=lifecycle,signal,input-result&limit=80`);
     return { sessionId: member.sessionId, screen: detail.screen ?? "", events: page.events ?? [] };
   }, 2500, [connection, member.sessionId]);
+  useEffect(() => {
+    onStaleChange?.(poll.stale);
+    return () => onStaleChange?.(false);
+  }, [onStaleChange, poll.stale]);
   const log = poll.data?.sessionId === member.sessionId ? poll.data : null;
   const screen = log ? plainScreen(log.screen, 30) : "";
   return <View style={s.log}>
-    {!poll.online && !poll.loading ? <Text style={t.warning}>Offline · last received screen.</Text> : null}
     <ScrollView horizontal style={s.screen} contentContainerStyle={s.screenContent}>
       <Text selectable style={s.screenText}>{log ? screen || (live ? "Waiting for output…" : "No screen recorded.") : "Loading…"}</Text>
     </ScrollView>

@@ -81,6 +81,8 @@ export class GoalService {
     stored.goal.events.push({ at: now(), text });
     if (stored.goal.events.length > 200) stored.goal.events.splice(0, stored.goal.events.length - 200);
   }
+  /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state or usage. */
+  statuses() { return [...this.records.values()].map(({ goal }) => ({ id: goal.id, title: goal.title, status: goal.status, reason: goal.reason })); }
   list() { return [...this.records.values()].map(({ goal }) => this.get(goal.id)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   get(id: string) {
     const goal = structuredClone(this.record(id).goal);

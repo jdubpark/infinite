@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { Prompt } from "@infinite/attention";
+import { RefreshCw } from "lucide-react";
 import { ApiError, isControlRefusal, useApi, type ChatMessage, type MessagesPage, type ProjectFile, type Session } from "./api";
 import { useMachines } from "./machines";
 import { lifecycles } from "./requests";
@@ -9,25 +10,40 @@ export function Conversation({ id }: { id: string }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [note, setNote] = useState("Loading conversation…");
   const [source, setSource] = useState("");
+  const [stale, setStale] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   useEffect(() => {
     let active = true, cursor: string | number = "";
     let timer: ReturnType<typeof setTimeout>;
+    let staleTimer: ReturnType<typeof setTimeout> | undefined;
+    setMessages([]);
+    setSource("");
+    setNote("Loading conversation…");
+    setStale(false);
+    setLoaded(false);
     const collected = new Map<string, ChatMessage>();
     async function poll() {
       try {
         const page = await api<MessagesPage>(`/sessions/${id}/messages?limit=100${cursor === "" ? "" : `&after=${encodeURIComponent(cursor)}`}`);
         if (!active) return;
+        setLoaded(true);
+        clearTimeout(staleTimer);
+        staleTimer = undefined;
+        setStale(false);
         for (const message of page.messages) collected.set(message.id, message);
         while (collected.size > 500) collected.delete(collected.keys().next().value!);
         cursor = page.cursor; setMessages([...collected.values()]); setSource(page.source ?? "");
         setNote(collected.size ? "" : "No structured messages are available yet. Open Terminal for the session output.");
         timer = setTimeout(poll, page.more ? 0 : 1500);
-      } catch (error) {
-        if (active) { setNote(`${(error as Error).message} Conversation may be stale.`); timer = setTimeout(poll, 2500); }
+      } catch {
+        if (active) {
+          if (staleTimer === undefined) staleTimer = setTimeout(() => { staleTimer = undefined; if (active) setStale(true); }, 3000);
+          timer = setTimeout(poll, 2500);
+        }
       }
     }
     void poll();
-    return () => { active = false; clearTimeout(timer); };
+    return () => { active = false; clearTimeout(timer); clearTimeout(staleTimer); };
   }, [api, id]);
   return <div className="conversation">
     <p className="quiet">{source === "recording" ? "Recorded messages and signals. Open Terminal for complete output." : "Provider conversation"}</p>
@@ -35,7 +51,7 @@ export function Conversation({ id }: { id: string }) {
       <div className="chat-meta"><strong>{message.toolName || (message.role === "assistant" ? "Agent" : message.role === "user" ? "You" : message.role)}</strong>{message.ts && <time>{new Date(message.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}</div>
       <div className="chat-text">{message.text}</div>
     </article>)}
-    {note && <p className="quiet" role="status">{note}</p>}
+    <p className="conversation-status quiet" role="status">{stale ? loaded ? "Conversation may be stale; showing the last received messages." : "Can’t reach the host. Conversation hasn’t loaded." : note}</p>
   </div>;
 }
 
@@ -58,8 +74,8 @@ export function ProjectFiles({ id, online }: { id: string; online: boolean }) {
   }
   return <div className="project-files">
     <h2>Project files</h2><p className="quiet">Open a file inside this session’s project. Content is displayed as text or a supported image.</p>
-    <form onSubmit={open}><label htmlFor="project-file">Project-relative path</label><div className="file-path"><input id="project-file" value={path} onChange={event => setPath(event.target.value)} placeholder="src/index.ts" autoComplete="off" /><button className="primary" disabled={busy || !online || !path.trim()}>{busy ? "Opening…" : "Open file"}</button></div></form>
-    {error && <p className="error" role="alert">{error}</p>}
+    <form onSubmit={open}><label htmlFor="project-file">Project-relative path</label><div className="file-path"><input id="project-file" value={path} onChange={event => setPath(event.target.value)} placeholder="src/index.ts" autoComplete="off" /><button className="primary stable-action" aria-busy={busy} disabled={busy || !online || !path.trim()}>{busy && <RefreshCw className="is-refreshing" size={16} />}Open file</button></div></form>
+    {!busy && error && <p className="error" role="alert">{error}</p>}
     {file && <><p className="quiet">{file.path} · {file.size.toLocaleString()} bytes{!online ? " · cached" : ""}</p>
       {file.text !== undefined ? <pre className="file-preview">{file.text}</pre> : file.base64 && /^image\/(png|jpeg|gif|webp)$/.test(file.mimeType) ? <img className="file-image" src={`data:${file.mimeType};base64,${file.base64}`} alt={file.name} /> : <p className="quiet">Preview is not available for this file type.</p>}
     </>}
@@ -91,7 +107,7 @@ export function Dictation({ disabled, onText }: { disabled: boolean; onText: (te
     setError("");
     try { current.start(); setListening(true); } catch { setError("Dictation could not start."); }
   }
-  return <><button type="button" disabled={disabled} onClick={toggle} aria-pressed={listening} title="Browser speech service. Review the draft before sending.">{listening ? "Stop dictation" : "Dictate"}</button>{listening && <span role="status">Listening · review before Send</span>}{error && <span role="status">{error}</span>}</>;
+  return <><button type="button" disabled={disabled} onClick={toggle} aria-pressed={listening} title="Browser speech service. Review the draft before sending.">{listening ? "Stop dictation" : "Dictate"}</button><span className="dictation-status" role="status">{listening ? "Listening · review before Send" : error}</span></>;
 }
 
 type Answer = { requestId: string; promptId: number; option?: number; text?: string };
@@ -135,7 +151,7 @@ export function PromptDecision({ sessionId, backend, prompt, canAnswer, controlI
       {backend === "cmux" && prompt.acceptsText && !textReply && <p className="quiet">To reply with text, answer in native cmux on the machine.</p>}
     </div>}
     {!canAnswer && <p className="quiet">Connect with a controller or owner key and take control to answer.</p>}
-    {message && <p role="status">{message}</p>}
+    <p className="prompt-feedback" role="status">{!busy && message}</p>
     {pending.current && !busy && <button disabled={!canAnswer} onClick={() => void deliver()}>Retry same answer</button>}
   </section>;
 }
@@ -177,5 +193,5 @@ export function SessionLifecycle({ session, role, online, controlId, refresh }: 
   if (role !== "owner") return null;
   const action = pending?.action ?? (running ? "stop" : "resume");
   if (!running && !session.resumable && !pending && !lifecycle.result && !lifecycle.message) return null;
-  return <span className="lifecycle-control">{lifecycle.result ? <a className="text-button" href={`#${machine === "direct" ? "" : `/machines/${machine}`}/sessions/${lifecycle.result.id}/chat`}>Open resumed session</a> : (running || session.resumable || pending) && <button className="text-button" disabled={!online || busy || (action === "stop" && session.capabilities?.inputControl === 1 && !controlId)} onClick={() => void act(action)}>{busy ? "Waiting…" : pending ? `Retry ${action === "stop" ? "end" : "resume"}` : running ? "End session" : "Resume session"}</button>}{lifecycle.message && <span className="error" role="status">{lifecycle.message}</span>}</span>;
+  return <span className="lifecycle-control">{lifecycle.result ? <a className="text-button" href={`#${machine === "direct" ? "" : `/machines/${machine}`}/sessions/${lifecycle.result.id}/chat`}>Open resumed session</a> : (running || session.resumable || pending) && <button className="text-button stable-action" aria-busy={busy} disabled={!online || busy || (action === "stop" && session.capabilities?.inputControl === 1 && !controlId)} onClick={() => void act(action)}>{busy ? "Waiting…" : pending ? `Retry ${action === "stop" ? "end" : "resume"}` : running ? "End session" : "Resume session"}</button>}{lifecycle.message && !busy && <span className="error" role="status">{lifecycle.message}</span>}</span>;
 }

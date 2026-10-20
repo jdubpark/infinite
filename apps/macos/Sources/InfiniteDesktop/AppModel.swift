@@ -17,6 +17,9 @@ struct AgentSession: Identifiable, Equatable {
     var managedBy: SessionManagement? { try? value["managedBy"].decoded() }
     /// Run by a mission coordinator: the owner sees it read-only and answers only its provider prompts.
     var managed: Bool { managedBy != nil }
+    /// The owner may use this session's terminal fallback (attach, take control, keys, typed input). Always for a
+    /// session the owner runs; for a mission-managed one only while its provider prompt waits for the owner.
+    var terminalOpen: Bool { !managed || needsYou }
     /// The host reports these attention states once a session can no longer be reached, whatever its stored status says.
     private static let ended: Set<String> = ["exited", "unavailable", "recording-error"]
     var running: Bool { (status == "running" || status == "starting") && !Self.ended.contains(attention) }
@@ -495,9 +498,11 @@ struct TeamResumeFailure: Equatable {
     var ready: Bool { attached && session.running }
     var screenReady: Bool { ready && snapshotReady && !rendererUnavailable }
     var canSend: Bool { ready && !busy && draft.pendingID == nil && !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    /// A mission-managed session refuses the input lease and native attach, so its provider prompts need only the running session.
+    /// A provider prompt is answered without the input lease or an attached terminal. A mission-managed session needs only that it is running.
     var canAnswerPrompt: Bool { role != "viewer" && !answering && (managed ? session.running : ready) }
     var managed: Bool { session.managed }
+    /// Whether the terminal fallback is open to the owner; see `AgentSession.terminalOpen`.
+    var terminalOpen: Bool { session.terminalOpen }
     /// The open dialog, when the host reports one.
     var prompt: JSON? { let value = session.value["attention"]["prompt"]; return value == .null ? nil : value }
     /// Another device currently holds the input lease.
@@ -605,6 +610,7 @@ struct TeamResumeFailure: Equatable {
     func attach() async {
         observing = true
         if chatTask == nil { startChat() }
+        // A mission-managed session's terminal stays readable; only its input waits for an open prompt.
         guard streamID == nil, !busy else { return }
         guard supportsStream && session.backend != "cmux" else { notice = "This host does not provide a live byte stream for this session. Update the host or use the cmux connection."; return }
         attachGeneration = UUID(); let current = attachGeneration
@@ -651,13 +657,13 @@ struct TeamResumeFailure: Equatable {
         if next != session { session = next }
         let control = value["control"]
         if control["label"].string != holder { holder = control["label"].string }
-        if !lease["id"].string.isEmpty && (control["id"] != lease["id"] || session.status != "running" || session.managed) {
+        if !lease["id"].string.isEmpty && (control["id"] != lease["id"] || session.status != "running" || !session.terminalOpen) {
             controlGeneration = UUID(); lease = .null; directInput = false; queuedRaw = Data(); sendingRaw = false; renewal?.cancel()
         }
     }
     func claim(takeover: Bool = false) async {
-        // The host refuses input-control claims for a mission-managed session; the owner never holds its input.
-        guard attached, !managed else { return }
+        // A mission-managed session accepts a control claim only while its provider prompt waits for the owner.
+        guard attached, terminalOpen else { return }
         let attachment = attachGeneration
         controlGeneration = UUID(); let operation = controlGeneration
         queuedRaw = Data(); sendingRaw = false
@@ -699,7 +705,7 @@ struct TeamResumeFailure: Equatable {
     /// Sending claims the input lease itself; a lease held elsewhere is taken over.
     func ensureControl() async -> Bool {
         if hasControl { return true }
-        guard ready, !managed else { return false }
+        guard ready, terminalOpen else { return false }
         await claim(takeover: !holder.isEmpty)
         return hasControl
     }

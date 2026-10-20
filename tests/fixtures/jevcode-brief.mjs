@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 const receiptPath = process.argv[2];
 // Optional mode after the receipt path: fail (exit 1), skip (an unrefreshed brief), empty (no brief yet)
 // or disabled (the repository is not opted in).
-const mode = ["fail", "skip", "empty", "disabled", "provenance"].includes(process.argv[3]) ? process.argv[3] : null;
+const mode = ["fail", "skip", "empty", "disabled"].includes(process.argv[3]) ? process.argv[3] : null;
 const fail = mode === "fail";
 const args = process.argv.slice(mode ? 4 : 3);
 const repo = args[args.indexOf("--repo") + 1];
@@ -38,13 +38,12 @@ process.stdout.write(JSON.stringify({
   decision: mode === "skip"
     ? { action: "skip", reason: "jev judged a refresh not worthwhile (0.20 < 0.5)", judge: "jev", worthwhile: 0.2, scope: "skip" }
     : { action: "run", reason: "full brief written by muse", judge: "heuristic", worthwhile: 1, scope: "full" },
-  repo: mode === "provenance" ? `${root}/wrong` : root,
+  repo: execFileSync("git", ["-C", repo, "rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim(),
   head,
   base,
   generatedAt: new Date().toISOString(),
   fingerprint: "a".repeat(40),
   brief: { summary: marker < 0 ? "Fixture repository brief." : `Fixture repository brief includes ${activity[marker].text}.`, architecture: [], review: [], changes: [], checks: [], guidance: [], unknowns: [], diagrams: [] },
   evidence,
-  coverage: ["fixture repository"],
-  ...(mode === "provenance" ? { usage: { providerId: "deepseek", modelId: "deepseek-flash", tokens: { input: 100, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 } } } : {})
+  coverage: ["fixture repository"]
 }));

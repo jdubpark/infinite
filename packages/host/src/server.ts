@@ -31,6 +31,8 @@ import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
 import { GoalService } from "./goals.js";
+import { MissionService, missionBoard } from "./missions.js";
+import { createMissionSchema, missionActionSchema, missionTextSchema } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { LinearService } from "./linear.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema } from "./goal-types.js";
@@ -138,6 +140,8 @@ export function createApp(config: Config, key: Buffer) {
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
   const projectGroups = new ProjectGroupService(config, key);
+  const missions = new MissionService(config, key, manager, teams, projectGroups);
+  missions.useUsage(usage);
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
   const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
@@ -343,6 +347,7 @@ export function createApp(config: Config, key: Buffer) {
       ),
       teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
+      missions: { enabled: missions.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
       providerLimits: teams.providerLimits(),
       projects: config.projects.map(({ id, name, path, team, linear }) => ({ id, name, path, ...(team ? { team } : {}), ...(linear ? { linear: { enabled: true } } : {}) })),
@@ -376,6 +381,19 @@ export function createApp(config: Config, key: Buffer) {
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
+  app.get("/api/missions", (_req, res) => res.json({ missions: missions.list() }));
+  app.get("/api/missions/:id", (req, res) => res.json(missions.get(id.parse(req.params.id))));
+  app.post("/api/missions", requireRole(["owner"]), async (req, res) => {
+    const body = createMissionSchema.parse(req.body);
+    for (const repo of projectGroups.get(body.groupId).repos) assertNoHandoff(repo.projectId);
+    return res.json(await missions.create(body));
+  });
+  app.post("/api/missions/:id/steer", requireRole(["owner", "controller"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
+  app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner", "controller"]), async (req, res) =>
+    res.json(await missions.answer(id.parse(req.params.id), id.parse(req.params.decisionId), missionTextSchema.parse(req.body))));
+  for (const action of ["pause", "resume", "cancel"] as const)
+    app.post(`/api/missions/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await missions[action](id.parse(req.params.id), missionActionSchema.parse(req.body))));
+  app.get("/api/board", (_req, res) => res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects)));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
   app.post("/api/teams/:id/permissions/revoke", requireRole(["owner"]), async (req, res) => res.json(await teams.revokePermissions(id.parse(req.params.id), teamActionSchema.parse(req.body))));
   app.get("/api/teams/:id/bundle", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
@@ -419,12 +437,14 @@ export function createApp(config: Config, key: Buffer) {
   const standaloneTeam = (value: unknown) => {
     const teamId = id.parse(value);
     if (teams.get(teamId).goal) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal. Team decisions can still be answered here.");
+    if (teams.get(teamId).missionId) throw new TeamError(409, "mission-owned-team", "Control this subteam from its mission.");
     return teamId;
   };
   app.post("/api/teams/:id/steer", requireRole(["owner", "controller"]), async (req, res) =>
     res.json(await teams.steer(standaloneTeam(req.params.id), teamMutationSchema.parse(req.body))));
   app.post("/api/teams/:id/decisions/:decisionId/answer", requireRole(["owner", "controller"]), async (req, res) => {
     const teamId = id.parse(req.params.id), decisionId = id.parse(req.params.decisionId), body = teamMutationSchema.parse(req.body);
+    if (teams.get(teamId).missionId) throw new TeamError(409, "mission-owned-team", "The mission coordinator answers this subteam's decisions and escalates owner questions to the mission.");
     res.json(await (teams.get(teamId).goal ? goals.answer(teamId, decisionId, body) : teams.answer(teamId, decisionId, body)));
   });
   for (const action of ["pause", "resume", "cancel"] as const) {
@@ -1023,17 +1043,19 @@ export function createApp(config: Config, key: Buffer) {
   server.once("listening", () => linear.start());
   server.once("listening", () => teams.start());
   server.once("listening", () => goals.start());
+  server.once("listening", () => missions.start());
   server.once("listening", () => handoffs.start());
   if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });
   server.once("close", () => teams.close());
   server.once("close", () => usage.close());
   server.once("close", () => goals.close());
+  server.once("close", () => missions.close());
   server.once("close", () => repositoryBriefings?.close());
   server.once("close", () => linear.close());
   server.once("close", () => handoffs.close());
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { handoffs.close(); missions.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

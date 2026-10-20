@@ -151,6 +151,41 @@ export function permissionCoordinatorLaunch(provider: Provider, profile: AgentPr
   return { ...profile, args: merged };
 }
 
+/** Keep a mission coordinator read-only while retaining only its structured report channel. */
+export function missionCoordinatorLaunch(provider: Provider, profile: AgentProfile): AgentProfile {
+  if (provider === "claude") {
+    const restricted = permissionCoordinatorLaunch("claude", profile);
+    const args: string[] = [];
+    for (let index = 0; index < restricted.args.length; index++) {
+      const arg = restricted.args[index];
+      if (["--permission-mode", "--tools"].includes(arg)) { index++; continue; }
+      if (arg === "--allowedTools") {
+        while (index + 1 < restricted.args.length && !restricted.args[index + 1].startsWith("-")) index++;
+        continue;
+      }
+      args.push(arg);
+    }
+    args.push("--permission-mode", "plan", "--tools", "Read,Glob,Grep,LS", "--allowedTools", "mcp__infinite_team__mission_report");
+    return { ...restricted, args };
+  }
+  if (provider !== "codex") throw new Error("Mission coordinator requires Claude Code or Codex.");
+  const args: string[] = [];
+  const configured = [...profile.args];
+  for (let index = 0; index < configured.length; index++) {
+    const arg = configured[index];
+    if (["--sandbox", "--ask-for-approval"].includes(arg)) { index++; continue; }
+    if (/^--(?:sandbox|ask-for-approval)=/.test(arg)) continue;
+    if (["--yolo", "--full-auto", "--dangerously-bypass-approvals-and-sandbox"].includes(arg))
+      throw new Error(`Mission coordinator profile cannot configure ${arg}.`);
+    const config = arg === "-c" || arg === "--config" ? configured[index + 1]
+      : arg.startsWith("--config=") ? arg.slice(9) : arg.startsWith("-c") ? arg.slice(2) : undefined;
+    if (config && /^\s*["']?sandbox_mode["']?\s*=/.test(config))
+      throw new Error("Mission coordinator profile cannot configure sandbox_mode.");
+    args.push(arg);
+  }
+  return { ...profile, args: [...args, "-c", "mcp_servers={}", "--sandbox", "read-only", "--ask-for-approval", "never"] };
+}
+
 const CLAUDE_EVENTS = [
   "UserPromptSubmit",
   "PreToolUse",

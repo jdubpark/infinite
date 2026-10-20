@@ -310,6 +310,40 @@ test("team objectives with bare URLs sync on create and lost-response reconcilia
   } finally { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
+test("mission child questions and blockers stay with the coordinator; coordinator answers retain provenance", { timeout: 45000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-mission-"));
+  const config = { stateDir: join(root, "state"), linear: { apiKeyFile: join(root, "linear-key"), endpoint: linear.endpoint },
+    projects: [{ id: "mission", name: "Mission", path: root, linear: { teamId: linear.teamId } }] } as unknown as Config;
+  writeFileSync(config.linear!.apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const service = new LinearService(config, randomBytes(32));
+  const child = { id: randomUUID(), projectId: "mission", missionId: randomUUID(), title: "Child", objective: "Implement a bounded task", status: "implementing",
+    revision: 1, members: [], checks: [], steering: [], decisions: [{ id: "decision", revision: 1, question: "Which path?", options: [], memberId: "member", createdAt: new Date().toISOString(), answer: "Use the existing path", answeredBy: "coordinator" }] } as unknown as TeamRun;
+  try {
+    service.start();
+    service.updateTeam(child, true);
+    await waitFor(async () => service.getTeam(child.id)?.status, status => status === "synced", 15000);
+    const childIssue = service.getTeam(child.id)!.issue!.id;
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal([...linear.comments.values()].some(comment => comment.issue.id === childIssue), false);
+    child.status = "blocked"; child.reason = "Waiting for the mission coordinator.";
+    service.updateTeam(child, true, false);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal([...linear.comments.values()].some(comment => comment.issue.id === childIssue), false);
+    assert.equal(linear.issueLabels.has(childIssue), false);
+
+    const ordinary = { ...child, id: randomUUID(), missionId: undefined, status: "implementing", reason: undefined } as unknown as TeamRun;
+    service.updateTeam(ordinary, true);
+    await waitFor(async () => service.getTeam(ordinary.id)?.status, status => status === "synced", 15000);
+    ordinary.decisions = child.decisions;
+    service.updateTeam(ordinary, true);
+    const answer = await waitFor(async () => [...linear.comments.values()].find(comment => comment.issue.id === service.getTeam(ordinary.id)!.issue!.id && comment.body.includes("Coordinator answer")), Boolean, 15000);
+    assert.match(answer!.body, /Coordinator answer for feature revision 1/);
+    assert.doesNotMatch(answer!.body, /User answer/);
+    assert.deepEqual(linear.violations, []);
+  } finally { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test("a blocked run's issue gets its reason, next step and a Blocked label until the run moves again", { timeout: 60000 }, async () => {
   const linear = await startLinearServer();
   const root = mkdtempSync(join(tmpdir(), "inf-linear-flag-"));

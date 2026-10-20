@@ -397,6 +397,7 @@ test("mixed teams pin real worker launches across configuration changes, restart
     const answer = { requestId: randomUUID(), revision: waiting.revision, text: "Compact" };
     assert.equal((await f.host.fetchApi(answerPath, "controller", answer)).status, 200);
     assert.equal((await f.host.fetchApi(answerPath, "controller", answer)).status, 200);
+    assert.equal((await f.get(waiting.id)).decisions.find(item => item.id === decision.id)?.answeredBy, "owner");
     const finished = await f.settled(waiting.id);
     assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
     assert.deepEqual(finished.lineup, mixedLineup);

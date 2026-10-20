@@ -27,7 +27,7 @@ import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { teamModelProfileSchema, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
-import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
+import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type {
   Config,
   Provider,
@@ -461,6 +461,7 @@ export class Manager {
     if (!configuredProfile) throw new Error("Provider is not configured on this host");
     let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
     if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
+    if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(request.provider, profile);
     const context = new ProjectContexts(this.config, this.key).snapshot(request.projectId);
     const session: Session = {
       id,

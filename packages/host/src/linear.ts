@@ -163,9 +163,9 @@ export class LinearService {
       if (parentKey) { const parent = this.records.get(parentKey); if (parent) this.force(parent); }
     }
     for (const direction of run.steering) this.comment(stored, `direction:${direction.revision}`, `User direction for feature revision ${direction.revision}:\n\n${direction.text}\n\nThe approved scope and execution limits remain in force.`);
-    for (const decision of run.decisions) {
+    if (!run.missionId) for (const decision of run.decisions) {
       this.comment(stored, `question:${decision.id}`, `Agent question for feature revision ${decision.revision}:\n\n${decision.question}`);
-      if (decision.answer) this.comment(stored, `answer:${decision.id}`, `User answer for feature revision ${decision.revision}:\n\n${decision.answer}`);
+      if (decision.answer) this.comment(stored, `answer:${decision.id}`, `${decision.answeredBy === "coordinator" ? "Coordinator" : "User"} answer for feature revision ${decision.revision}:\n\n${decision.answer}`);
     }
     if (run.brief) this.comment(stored, `brief:${run.revision}`, [`Proposed feature: ${run.brief.title}`, run.brief.problem,
       `Acceptance criteria:\n${run.brief.acceptance.join("\n")}`, `Expected outcome:\n${run.brief.expectedOutcome}`].join("\n\n"));
@@ -178,7 +178,7 @@ export class LinearService {
       this.comment(stored, `permission:${decision.id}:${decision.status}`,
         `Delegated permission decision ${decision.id}\n\nStatus: ${decision.status}\nRun revision: ${decision.revision}\nTarget member: ${decision.targetMemberId}\nTarget session: ${decision.targetSessionId}\nPrompt: ${decision.promptId}\nCoordinator member: ${decision.coordinatorMemberId ?? "not assigned"}\nAnswer request: ${decision.answerRequestId}\nDelivery: ${decision.receipt ? `${decision.receipt.state}; ${decision.receipt.result ?? "unconfirmed"}; journal sequence ${decision.receipt.seq}` : decision.status === "uncertain" ? "dispatch or result unconfirmed" : "no recorded dispatch"}\n\nThe owner delegated one-shot tool decisions under this run's pinned repository policy. Approval is separate from successful tool execution. This comment omits prompt content and the coordinator's summary.`);
     }
-    if (evidenceStatuses.has(run.status) && (run.status !== "blocked" || resumable !== undefined)) {
+    if (evidenceStatuses.has(run.status) && (run.status !== "blocked" || resumable !== undefined && !run.missionId)) {
       const checks = run.checks.filter(check => check.revision === run.revision);
       // A goal's runs are resumed from the goal; the team resume route refuses them.
       const flag = run.status === "blocked" ? `Reason: ${sharedText(run.reason ?? "not recorded")}\nNext step: ${run.goal ? "inspect the goal that owns this run, then approve new work for it if it should continue."
@@ -186,8 +186,8 @@ export class LinearService {
       this.comment(stored, `status:${run.revision}:${run.status}`, `Infinite feature execution\n\nStatus: ${run.status}\n${flag}Agent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`);
     }
     // Flag a blocked run on its issue; the label follows the host's status, never the reverse.
-    if (run.status === "blocked" && stored.label !== "added" && stored.label !== "add") { stored.label = "add"; stored.labelFailures = 0; stored.labelRetryAt = 0; }
-    else if (run.status !== "blocked" && (stored.label === "added" || stored.label === "add")) { stored.label = "remove"; stored.labelFailures = 0; stored.labelRetryAt = 0; }
+    if (!run.missionId && run.status === "blocked" && stored.label !== "added" && stored.label !== "add") { stored.label = "add"; stored.labelFailures = 0; stored.labelRetryAt = 0; }
+    else if ((run.missionId || run.status !== "blocked") && (stored.label === "added" || stored.label === "add")) { stored.label = "remove"; stored.labelFailures = 0; stored.labelRetryAt = 0; }
     this.save(stored); return this.view(stored);
   }
   getGoal(id: string) { return this.get("goal", id); }

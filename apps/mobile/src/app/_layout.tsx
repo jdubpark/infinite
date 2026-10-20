@@ -21,6 +21,7 @@ export default function Layout() {
         }}
       >
         <Stack.Screen name="index" />
+        <Stack.Screen name="pair" />
         <Stack.Screen name="(tabs)" />
         <Stack.Screen name="mission/[id]" />
       </Stack>

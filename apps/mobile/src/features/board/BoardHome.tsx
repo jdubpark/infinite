@@ -28,7 +28,7 @@ export function BoardHome() {
     let live = true;
     loadConnections().then(current => {
       if (!live) return;
-      if (!current.profiles.length) router.replace("/");
+      if (!current.profiles.length) router.replace("/pair");
     }).finally(() => { if (live) setLoaded(true); });
     return () => { live = false; };
   }, [machine, router]);
@@ -54,12 +54,12 @@ export function BoardHome() {
     await unregisterPush(connection);
     closeConnection(connection);
     await removal;
-    if (profiles.length === 1) router.replace("/");
+    if (profiles.length === 1) router.replace("/pair");
   }
   if (!loaded || !connection) return <SafeAreaView style={s.safe}><ActivityIndicator style={s.loading} color={theme.colors.forest} /></SafeAreaView>;
   return <SafeAreaView style={s.safe}>
     <Board key={active} connection={connection} machines={profiles} onSelectMachine={id => void select(id)}
-      onAddMachine={() => router.push({ pathname: "/", params: { pair: "true" } })} onDisconnect={() => void disconnect()}
+      onAddMachine={() => router.push({ pathname: "/pair", params: { pair: "true" } })} onDisconnect={() => void disconnect()}
       pushNote={push[active] ? PUSH_NOTES[push[active]] : undefined} />
   </SafeAreaView>;
 }

@@ -21,7 +21,7 @@ export default function Sessions() {
     let live = true;
     loadConnections().then(current => {
       if (!live) return;
-      if (!current.profiles.length) router.replace("/");
+      if (!current.profiles.length) router.replace("/pair");
     }).finally(() => { if (live) setLoaded(true); });
     return () => { live = false; };
   }, [machine, router]);
@@ -35,13 +35,13 @@ export default function Sessions() {
     await unregisterPush(connection);
     closeConnection(connection);
     await removal;
-    if (profiles.length === 1) router.replace("/");
+    if (profiles.length === 1) router.replace("/pair");
   }
   if (!loaded || !connection) return <SafeAreaView style={s.safe}><ActivityIndicator style={s.loading} color={theme.colors.forest} /></SafeAreaView>;
   return <SafeAreaView style={s.safe}>
     <View style={s.fill}>
       <Inbox key={active} connection={connection} machines={profiles} onSelectMachine={key => void select(key)}
-        onAddMachine={() => router.push({ pathname: "/", params: { pair: "true" } })} onDisconnect={() => void disconnect()} />
+        onAddMachine={() => router.push({ pathname: "/pair", params: { pair: "true" } })} onDisconnect={() => void disconnect()} />
     </View>
   </SafeAreaView>;
 }

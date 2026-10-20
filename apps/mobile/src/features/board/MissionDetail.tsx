@@ -25,6 +25,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   }, 2500, [connection, id]);
   const [recorded, setRecorded] = useState<Mission | null>(null);
   const [direction, setDirection] = useState("");
+  const [dockHeight, setDockHeight] = useState(0);
   const mission = poll.data ? newer(recorded, poll.data.mission) : recorded;
   const request = useRunRequest<Mission>(connection, `${machine}/mission/${id}`, {
     accepted: result => { setRecorded(previous => newer(previous, result)); poll.refresh(); },
@@ -90,7 +91,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       {mission.dispatchSummary ? <Section title="Coordinator update"><Text style={t.body}>{mission.dispatchSummary}</Text></Section> : null}
       {mission.result ? <Section title="Reported result"><Card><Text style={t.body}>{mission.result.summary}</Text><Text style={t.note}>Coordinator report · not an independent review</Text></Card></Section> : null}
 
-      {me?.role === "owner" ? <Section title="Mission controls">
+      {me?.role === "owner" && (controls.pause || controls.resume || controls.cancel) ? <Section title="Mission controls">
         <View style={s.controls}>
           {controls.resume ? <Button compact title="Resume" glyph="play" disabled={locked} onPress={() => send("resume", "Resume")} />
             : controls.pause ? <Button compact secondary title="Pause" glyph="pause" disabled={locked} onPress={() => send("pause", "Pause")} /> : null}
@@ -111,13 +112,13 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       </Section>
       <View style={s.endNote}><Text style={t.note}>Ready for review records the coordinator’s report. It does not confirm acceptance or delivery.</Text></View>
     </ScrollView>
-    {me?.role === "owner" ? <View style={s.dock}>
-      <RequestStatus request={request} canRetry={fresh && me.role === "owner"} />
+    {me?.role === "owner" ? <View style={s.dock} onLayout={event => setDockHeight(event.nativeEvent.layout.height)}>
       <SteerBox value={direction} onChange={setDirection} placeholder="Steer the coordinator…"
         enabled={controls.steer && !locked} busy={request.busy}
         note={me.role !== "owner" ? "View only." : mission.status === "paused" ? "Resume to steer." : !controls.steer ? "This mission cannot be steered in its current state." : undefined}
         onSend={() => { const text = direction.trim(); if (text) { send("steer", "Direction", { text }); setDirection(""); } }} />
     </View> : null}
+    {me?.role === "owner" ? <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh} /> : null}
     <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : null} />
   </KeyboardAvoidingView>;
 }

@@ -413,6 +413,25 @@ test("ordinary interrupted answer retries return the refused receipt without typ
   } finally { await worker.stop(); }
 });
 
+test("a host-authorized mission answer does not require an input-control lease", { timeout: 20_000 }, async () => {
+  const team: TeamAssignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "mission-coordinator" };
+  const worker = await fixture("demo", "", team);
+  try {
+    await worker.command("permission");
+    const open = await waitFor(() => worker.call({ op: "state" }), state => state.attention.state === "needs-you" && Boolean(state.attention.prompt?.hash));
+    const prompt = open.attention.prompt!;
+    await worker.call({ op: "control", action: "claim", actor: { id: "stale-owner", label: "Owner" } });
+    await assert.rejects(worker.call({ op: "answer", requestId: randomUUID(), promptId: prompt.id, option: 1 }), { code: "control-busy" });
+
+    const answered = await worker.call<Receipt & { result?: string }>({
+      op: "answer", requestId: randomUUID(), promptId: prompt.id, option: 1, missionManaged: true,
+    });
+    assert.equal(answered.state, "delivered");
+    assert.equal(answered.result, "closed");
+    assert.match(worker.output(), /APPROVED/);
+  } finally { await worker.stop(); }
+});
+
 test("native conversation identity comes only from authenticated matching provider hooks", { timeout: 15_000 }, async () => {
   const worker = await fixture("claude");
   try {

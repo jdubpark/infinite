@@ -6,8 +6,10 @@ import { workerCall } from "./ipc.js";
 import type { Manager } from "./manager.js";
 import { nativeCatalogSender, NATIVE_COMPRESSION, NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 
+export type MissionManagedSessionGuard = (sessionId: string) => boolean | Promise<boolean>;
+
 /** Native protocols grant owner capabilities. Browser cookies and narrower device roles cannot attach. */
-export function connectNativeFrontends(server: Server, manager: Manager, authenticate: (token: string) => PairedDevice | undefined) {
+export function connectNativeFrontends(server: Server, manager: Manager, authenticate: (token: string) => PairedDevice | undefined, missionManaged?: MissionManagedSessionGuard) {
   const sockets = new WebSocketServer({ noServer: true, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: NATIVE_COMPRESSION });
   const upstreams = new Set<WebSocket>();
   const origin = new URL(manager.config.origin);
@@ -23,12 +25,20 @@ export function connectNativeFrontends(server: Server, manager: Manager, authent
     const device = token ? authenticate(token) : undefined;
     const clientId = url.searchParams.get("client"), leaseId = url.searchParams.get("lease");
     const deny = () => socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    const denyMissionManaged = () => {
+      const body = JSON.stringify({ error: "This session is run by its mission coordinator. Talk to the coordinator from the mission.", code: "mission-managed" });
+      socket.end(`HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+    };
     if (!match || !z.uuid().safeParse(match[1]).success ||
-        (executor ? typeof executorToken !== "string" || !/^[a-f0-9]{64}$/.test(executorToken) : !z.uuid().safeParse(clientId).success || !z.uuid().safeParse(leaseId).success) ||
-        !device || device.role !== "owner" || req.headers.origin || sockets.clients.size >= 16 ||
+        (executor ? typeof executorToken !== "string" || !/^[a-f0-9]{64}$/.test(executorToken) : !z.uuid().safeParse(clientId).success || !z.uuid().safeParse(leaseId).success)) { deny(); return; }
+    if (req.headers.origin || sockets.clients.size >= 16 ||
         ![origin.host, `127.0.0.1:${manager.config.port}`, `localhost:${manager.config.port}`].includes(req.headers.host ?? "")) { deny(); return; }
     void (async () => {
       try {
+        // Mission-owned sessions reject human native attachment before the
+        // owner-role check. Executor tunnel upgrades retain their own authority.
+        if (!executor && device && missionManaged && await missionManaged(match[1])) { denyMissionManaged(); return; }
+        if (!device || device.role !== "owner") { deny(); return; }
         manager.meta(match[1]);
         const backend = await workerCall<{ url: string; token: string }>(manager.config.runDir, match[1], executor ? {
           op: "executor-connect", token: executorToken as string,

@@ -240,3 +240,12 @@ public struct Mission: Identifiable, Equatable, Sendable {
     /// Which subtask raised an escalated decision, when one did.
     public func origin(of decision: MissionDecision) -> MissionSubtask? { decision.subtaskID.isEmpty ? nil : subtask(decision.subtaskID) }
 }
+
+/// A session the host reports as run by a mission's coordinator. The host refuses owner input, keys,
+/// stop, resume, control, and native attach for it; provider prompt answers stay allowed. Sessions the
+/// owner runs omit the field, and an absent `managedBy` decodes to nil.
+public struct SessionManagement: Codable, Equatable, Sendable {
+    public let kind: String
+    public let missionId: String
+    public let teamId: String?
+}

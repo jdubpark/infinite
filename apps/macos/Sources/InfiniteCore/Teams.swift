@@ -11,6 +11,10 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
     public var status: String { value["status"].string }
     public var revision: Int { value["revision"].int }
     public var projectID: String { value["projectId"].string }
+    /// The mission whose coordinator runs this team; empty for a team an owner started directly.
+    public var missionID: String { value["missionId"].string }
+    /// A mission's subteam is run by its coordinator and is read-only to people: no steering, decisions, owner actions, or ratings.
+    public var managedByMission: Bool { !missionID.isEmpty }
     public var provider: String { value["provider"].string }
     public var objective: String { value["objective"].string }
     public var parallelism: Int { value["parallelism"].int }
@@ -73,9 +77,9 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
     /// The Linear issue the host syncs this run to, when it tracks one.
     public var linearIssue: String { value["linear"]["issue"]["identifier"].string }
     /// A blocked run the owner can resume from a list without the team page: the host marked it resumable,
-    /// and it has no goal or delivery receipt that a resume would have to preserve.
+    /// it has no goal or delivery receipt that a resume would have to preserve, and no mission coordinator runs it.
     public var offersResume: Bool {
-        status == "blocked" && value["resumable"].bool && Self.absent(value["goal"]) && Self.absent(value["deliveryReceipt"])
+        status == "blocked" && value["resumable"].bool && Self.absent(value["goal"]) && Self.absent(value["deliveryReceipt"]) && !managedByMission
     }
     /// Blocked runs first. A stable partition: the incoming order holds within the blocked and the other runs.
     public static func blockedFirst(_ runs: [TeamRun]) -> [TeamRun] {

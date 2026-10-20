@@ -415,7 +415,9 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     assert.deepEqual(await client.request(`/missions/${missionId}`), { count: 7, method: "GET", path: `/api/missions/${missionId}` });
     assert.deepEqual(await client.request(`/missions/${missionId}/answer/${decisionId}`, { body: {} }), { count: 8, method: "POST", path: `/api/missions/${missionId}/answer/${decisionId}` });
     assert.deepEqual(await client.request("/project-groups/shop", { method: "DELETE", body: {} }), { count: 9, method: "DELETE", path: "/api/project-groups/shop" });
-    for (const [method, path] of [["POST", `/missions/${missionId}/answer/not-a-uuid`], ["GET", `/missions/${missionId}/steer`], ["GET", "/project-groups/shop"], ["PUT", "/project-groups/Shop"]] as const)
+    // The phone dictates over this channel; transcript cleanup is a POST only.
+    assert.deepEqual(await client.request("/dictation/cleanup", { body: { text: "um add retries" } }), { count: 10, method: "POST", path: "/api/dictation/cleanup" });
+    for (const [method, path] of [["POST", `/missions/${missionId}/answer/not-a-uuid`], ["GET", `/missions/${missionId}/steer`], ["GET", "/project-groups/shop"], ["PUT", "/project-groups/Shop"], ["GET", "/dictation/cleanup"]] as const)
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
     runner.oversized();
     await assert.rejects(client.request("/me"), (error: RemoteError) => error.status === 413 && error.code === "response-too-large");

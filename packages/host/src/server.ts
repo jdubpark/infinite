@@ -21,6 +21,7 @@ import { CmuxError } from "./cmux/client.js";
 import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
 import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
+import { ProjectSourceError, ProjectSourceService } from "./project-source.js";
 import { MirroredProjects } from "./mirrored-projects.js";
 import { RepoEnrollmentService, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
 import { HandoffService } from "./handoffs.js";
@@ -127,13 +128,18 @@ export function createApp(config: Config, key: Buffer) {
   const startsInFlight = new Map<string, number>();
   const projectFileChanges = new Set<string>();
   const projectConfigChanges = new Set<string>();
+  const projectSourceConfiguredAtStartup = config.projects.some(project => project.source?.mode === "github");
+  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix });
   /**
-   * A sync commit or apply evaluates projectRunning only after `applying()` turns true.
-   * A start either sees that flag and is refused, or is counted before the check runs.
+   * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
+   * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
+   * tools run elsewhere, and an exited session never counts. A session list that cannot be read counts as running.
    */
   const startInProject = async <T>(projectId: string, start: () => Promise<T>): Promise<T> => {
     if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
     if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
+    if (projectSource.isGithub(projectId) && projectSource.refreshing(projectId))
+      throw new ProjectSourceError("A refresh from GitHub is updating this project. Start the session after it finishes.", "source-refreshing");
     if (projectSync.applying(projectId))
       throw new ProjectSyncError("A workspace sync is being applied to this project. Start the session after it finishes.", "sync-applying");
     startsInFlight.set(projectId, (startsInFlight.get(projectId) ?? 0) + 1);
@@ -145,7 +151,10 @@ export function createApp(config: Config, key: Buffer) {
   const linear = new LinearService(config, key);
   const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
   const readings = new Readings(config, key, manager, summarizer);
-  const teams = new TeamService(config, key, manager, startInProject, linear, readings);
+  const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
+    source: projectSource,
+    onMerged: id => void projectSource.refresh(id).catch(() => {}),
+  });
   const usage = new UsageService(config, key, manager);
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
@@ -228,10 +237,18 @@ export function createApp(config: Config, key: Buffer) {
     session: sessionDetail,
     events: (sessionId, after) => sessionEvents(sessionId, after),
   });
+  /** A source refresh waits only for cloud sessions using the project tree; a failed session listing fails closed. */
+  async function sessionRunningInProject(projectId: string) {
+    if (startsInFlight.has(projectId)) return true;
+    let sessions: Awaited<ReturnType<typeof listSessions>>;
+    try { sessions = await listSessions(); } catch { return true; }
+    return sessions.some(s => s.projectId === projectId && s.executionLocation !== "laptop" &&
+      (["running", "starting"].includes(s.status) ||
+        (["unavailable", "recording-error"].includes(s.status) && (alive(s.pid) || alive((s as { workerPid?: unknown }).workerPid)))));
+  }
   /**
-   * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
-   * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
-   * tools run elsewhere, and an exited session never counts. A session list that cannot be read counts as running.
+   * A sync commit or apply evaluates projectRunning only after `applying()` turns true.
+   * A start either sees that flag and is refused, or is counted before the check runs.
    */
   const projectRunning = async (projectId: string, ignoreConfigChange = false) => {
     if (!ignoreConfigChange && projectConfigChanges.has(projectId)) return true;
@@ -465,7 +482,7 @@ export function createApp(config: Config, key: Buffer) {
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
-      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
       missions: { enabled: missions.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
@@ -1153,13 +1170,25 @@ export function createApp(config: Config, key: Buffer) {
     const projectId = projectSchema.parse(req.params.id);
     const project = config.projects.find(p => p.id === projectId);
     if (!project) return void res.status(404).json({ error: "Unknown project" });
-    res.json({ id: project.id, name: project.name, path: project.path, sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
+    res.json({ id: project.id, name: project.name, path: project.path, source: projectSource.status(projectId), sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
+  });
+  app.post("/api/projects/:id/source/refresh", requireRole(["owner"]), async (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!projectSource.isGithub(projectId)) throw new ProjectSourceError("This project follows the laptop, not GitHub.", "not-github");
+    res.json(await projectSource.refresh(projectId));
   });
   // Sync moves whole checkouts, ignored files and credentials included, so it shares laptop execution's single-tenant gate.
   app.use("/api/projects/:id/sync", (_req, res, next) => runtimeSecurity(config.deployment).tenancy === "single-tenant" ? next()
     : void res.status(403).json({ error: "Workspace sync requires a single-tenant host" }));
+  const refuseGithubSync = (projectId: string, res: express.Response) => {
+    if (!projectSource.isGithub(projectId)) return false;
+    res.status(409).json({ error: "This project follows GitHub; laptop sync is off. Re-enroll with --source laptop to upload from this computer.", code: "source-github" });
+    return true;
+  };
   app.post("/api/projects/:id/sync/begin", requireRole(["owner"]), requireOwnerCli, (req, res) => {
-    res.json(projectSync.begin(projectSchema.parse(req.params.id)));
+    const projectId = projectSchema.parse(req.params.id);
+    if (refuseGithubSync(projectId, res)) return;
+    res.json(projectSync.begin(projectId));
   });
   app.post("/api/projects/:id/sync/has", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     const body = z.object({ hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(512) }).strict().parse(req.body);
@@ -1179,11 +1208,13 @@ export function createApp(config: Config, key: Buffer) {
   // The body wraps a manifest of up to the manifest bound with its generation; the store checks the manifest itself.
   app.post("/api/projects/:id/sync/commit", requireRole(["owner"]), requireOwnerCli, express.json({ limit: WORKSPACE_LIMITS.manifestBytes + 64 * 1024 }), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
+    if (refuseGithubSync(projectId, res)) return;
     const body = z.object({ generation: z.uuid(), manifest: z.unknown() }).strict().parse(req.body);
     res.json(await projectSync.commit(projectId, body.generation, body.manifest, () => projectRunning(projectId)));
   });
   app.post("/api/projects/:id/sync/apply", requireRole(["owner"]), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
+    if (refuseGithubSync(projectId, res)) return;
     const body = z.object({ force: z.boolean().optional() }).strict().parse(req.body ?? {});
     res.json(await projectSync.apply(projectId, { force: body.force, running: () => projectRunning(projectId) }));
   });
@@ -1242,6 +1273,7 @@ export function createApp(config: Config, key: Buffer) {
       if (error instanceof TeamError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof ProjectSyncError)
         return res.status(error.status).json({ code: error.code, error: error.message, ...(error.category ? { category: error.category, message: error.message } : {}) });
+      if (error instanceof ProjectSourceError) return res.status(error.status).json({ error: error.message, code: error.code });
       if (error instanceof ContentError) return res.status(error.status).json({ error: error.message });
       if (error instanceof DesktopError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof z.ZodError)
@@ -1294,6 +1326,8 @@ export function createApp(config: Config, key: Buffer) {
   server.once("listening", () => missions.start());
   server.once("listening", () => handoffs.start());
   server.once("listening", () => readings.start());
+  // Start the source timer only when a GitHub project exists at server startup.
+  if (projectSourceConfiguredAtStartup) server.once("listening", () => projectSource.start());
   if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });
   server.once("listening", () => balances.start());
   server.once("close", () => teams.close());
@@ -1304,6 +1338,7 @@ export function createApp(config: Config, key: Buffer) {
   server.once("close", () => linear.close());
   server.once("close", () => handoffs.close());
   server.once("close", () => readings.stop());
+  if (projectSourceConfiguredAtStartup) server.once("close", () => projectSource.stop());
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);

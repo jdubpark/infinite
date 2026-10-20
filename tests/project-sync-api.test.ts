@@ -394,3 +394,25 @@ test("a failed apply answers a sync-specific refusal and keeps the generation pe
     assert.equal(readFileSync(join(host.config.projects[0].path, "notes.md"), "utf8"), "v2\n");
   } finally { chmodSync(host.root, 0o700); await host.stop(); rmSync(root, { recursive: true, force: true }); }
 });
+
+test("GitHub project status is exposed and laptop sync is refused", async () => {
+  const host = await inProcessHost();
+  try {
+    host.config.projects[0].source = { mode: "github", repository: "example/product", baseBranch: "main" };
+
+    const project = await host.fetchApi("/projects/rehearsal");
+    assert.equal(project.body.source.mode, "github");
+
+    const apply = await host.fetchApi("/projects/rehearsal/sync/apply", "owner", { force: true });
+    assert.deepEqual([apply.status, apply.body.code], [409, "source-github"]);
+    const begin = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {});
+    assert.deepEqual([begin.status, begin.body.code], [409, "source-github"]);
+    const commit = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", {});
+    assert.deepEqual([commit.status, commit.body.code], [409, "source-github"]);
+
+    delete host.config.projects[0].source;
+    const refresh = await host.fetchApi("/projects/rehearsal/source/refresh", "owner", {});
+    assert.deepEqual([refresh.status, refresh.body.code], [409, "not-github"]);
+    assert.equal((await host.fetchApi("/me")).body.teams.projectSource, 1);
+  } finally { await host.stop(); }
+});

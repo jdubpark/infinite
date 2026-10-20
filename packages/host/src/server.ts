@@ -8,7 +8,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { Manager, publicAttention } from "./manager.js";
 import { hashToken, validateLinearConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
@@ -119,7 +119,7 @@ export function createApp(config: Config, key: Buffer) {
   const app = express();
   const mirroredProjects = runtimeSecurity(config.deployment).tenancy === "single-tenant" ? new MirroredProjects(config, key) : undefined;
   const enrollment = new RepoEnrollmentService(config, key, { isBusy: async projectId =>
-    projectSync.applying(projectId) || await projectRunning(projectId, true) });
+    projectSync.applying(projectId) || projectSource.refreshing(projectId) || await projectRunning(projectId, true) });
   validateLinearConfig(config);
   const manager = new Manager(config, key);
   const projectSync = new ProjectSync(config, key);
@@ -236,12 +236,25 @@ export function createApp(config: Config, key: Buffer) {
     session: sessionDetail,
     events: (sessionId, after) => sessionEvents(sessionId, after),
   });
-  /** A source refresh waits only for cloud sessions using the project tree; a failed session listing fails closed. */
+  /**
+   * A source refresh waits only for work that uses the project tree itself: a cloud session whose working directory
+   * lies inside it (team members run in their own clones and do not count), an admitted session start, and a file or
+   * repository-setup change in flight. A failed session listing, or a session without a recorded directory, fails closed.
+   */
   async function sessionRunningInProject(projectId: string) {
-    if (startsInFlight.has(projectId)) return true;
+    if (startsInFlight.has(projectId) || projectFileChanges.has(projectId) || projectConfigChanges.has(projectId)) return true;
+    const project = config.projects.find(p => p.id === projectId);
+    if (!project) return true;
+    const canonical = (value: string) => { try { return realpathSync(value); } catch { return resolve(value); } };
+    const tree = canonical(project.path);
+    const insideTree = (cwd: unknown) => {
+      if (typeof cwd !== "string" || !cwd) return true;
+      const target = canonical(cwd);
+      return target === tree || target.startsWith(tree.endsWith(sep) ? tree : `${tree}${sep}`);
+    };
     let sessions: Awaited<ReturnType<typeof listSessions>>;
     try { sessions = await listSessions(); } catch { return true; }
-    return sessions.some(s => s.projectId === projectId && s.executionLocation !== "laptop" &&
+    return sessions.some(s => s.projectId === projectId && s.executionLocation !== "laptop" && insideTree((s as { cwd?: unknown }).cwd) &&
       (["running", "starting"].includes(s.status) ||
         (["unavailable", "recording-error"].includes(s.status) && (alive(s.pid) || alive((s as { workerPid?: unknown }).workerPid)))));
   }
@@ -266,6 +279,7 @@ export function createApp(config: Config, key: Buffer) {
     try {
       if (await projectRunning(projectId)) throw new DesktopError("session-running", "Stop this project's running sessions before replacing files");
       if (projectSync.applying(projectId)) throw new DesktopError("sync-applying", "A workspace sync is being applied. Retry after it finishes.");
+      if (projectSource.refreshing(projectId)) throw new DesktopError("source-refreshing", "A refresh from GitHub is updating this project. Retry after it finishes.");
       // Fence sync after checking existing sessions, while new session admission is already closed.
       startsInFlight.set(projectId, (startsInFlight.get(projectId) ?? 0) + 1); held = true;
       return await action();

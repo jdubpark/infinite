@@ -134,6 +134,7 @@ export type MissionMessage =
   | { type: "subtask-finished"; subtaskId: string; teamId?: string; status: "done" | "blocked" | "cancelled"; teamStatus?: string; reason?: string }
   | { type: "owner-answer"; decisionId: string; question: string; answer: string; forwardedTo?: { subtaskId: string; childDecisionId: string } }
   | { type: "owner-direction"; text: string }
+  | { type: "repository-held"; subtaskId: string; repoProjectId: string; teamId: string; teamStatus: string; reason?: string }
   | { type: "resumed" }
   | { type: "refused"; kind: string; reason: string };
 export type MissionPromptRepo = { projectId: string; name: string; path: string; teamReady: boolean };
@@ -196,7 +197,9 @@ export function missionPromptWithMessageCount(mission: Mission, repos: MissionPr
 - {"kind":"cancel-subtask","subtaskId":"...","reason":"..."} cancels a subtask and its subteam.
 - {"kind":"result","summary":"..."} is accepted only when every subtask is done or cancelled and no owner decision is open. Cancel a blocked or stranded subtask explicitly with cancel-subtask first. Summarize what each subteam delivered and what still needs owner review.
 - {"kind":"blocked","summary":"..."} stops the mission when it cannot proceed safely.
-After the report, stop. The host starts a new attempt when a subteam opens a decision, becomes blocked, or finishes, or when the owner answers or gives direction.`,
+- {"kind":"wait","summary":"..."} ends this attempt without a decision when nothing needs one, for example after a resume with no new messages. Do not ask the owner a question only to file a report. Waiting is refused while a subteam decision in openChildDecisions has neither an ownerDecisionId nor answerPendingBy; answer it, ask the owner, or cancel the subtask first. Otherwise it is accepted only while a subteam is working, a queued subtask can start without anyone acting, or an owner decision is open.
+A repository-held message means a ready subtask cannot start because only paused or blocked runs outside this mission hold its repository; cancel the subtask, ask the owner, or report blocked.
+After the report, stop. The host starts a new attempt when a subteam opens a decision, becomes blocked, or finishes, when a ready subtask's repository is held only by paused or blocked runs, or when the owner answers or gives direction.`,
     `Mission state (JSON): ${JSON.stringify(state)}`,
     `Messages since your last attempt (JSON): ${JSON.stringify(recent.slice(0, included))}`,
     context.waiting + messages.length - included ? `${context.waiting + messages.length - included} more message${context.waiting + messages.length - included === 1 ? " is" : "s are"} waiting; the host delivers ${context.waiting + messages.length - included === 1 ? "it" : "them"} in your next attempt. Open subteam decisions are always listed in the mission state as openChildDecisions.` : "",

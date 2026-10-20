@@ -204,7 +204,7 @@ struct BoardRow: View {
         }
     }
     private var caption: String {
-        [item.kind == .team ? "Team run" : item.kind == .goal ? "Goal" : nil, item.projectName, item.subtaskLabel, item.detail.isEmpty ? nil : item.detail]
+        [item.kind == .team ? "Team run" : item.kind == .goal ? "Goal" : nil, item.projectName, item.subtaskLabel, item.detailBesideProgress]
             .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
     }
     private var opens: Bool { item.kind == .mission || item.kind == .team }

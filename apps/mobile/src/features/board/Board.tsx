@@ -38,7 +38,11 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
     else if (item.kind === "team") router.push({ pathname: "/team/[id]", params: { id: item.id, machine } });
     else router.push({ pathname: "/goal/[id]", params: { id: item.id, machine } });
   };
-  const titleOfStatus = (item: BoardItem) => item.kind === "mission" ? missionStatusLabel(item.status as Parameters<typeof missionStatusLabel>[0]) : item.status.replace(/-/g, " ");
+  const titleOfStatus = (item: BoardItem) => {
+    if (item.kind === "mission") return missionStatusLabel(item.status as Parameters<typeof missionStatusLabel>[0]);
+    const words = item.status.replace(/-/g, " ");
+    return words.charAt(0).toUpperCase() + words.slice(1);
+  };
   const kindOf = (item: BoardItem): StatusKind => {
     if (item.status === "needs-input") return "attention";
     if (item.status === "blocked") return "blocked";
@@ -61,8 +65,8 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <Text style={s.title} accessibilityRole="header">Board</Text>
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filters}>
-        <Chip label="All" accessibilityLabel="All projects" onPress={() => setProjectId("")} />
-        {groups.map(group => <Chip key={group.id} label={group.name} onPress={() => setProjectId(group.id)} accessibilityLabel={`Filter by ${group.name}`} />)}
+        <Chip label="All" accessibilityLabel="All projects" selected={!projectId} onPress={() => setProjectId("")} />
+        {groups.map(group => <Chip key={group.id} label={group.name} selected={projectId === group.id} onPress={() => setProjectId(group.id)} accessibilityLabel={`Filter by ${group.name}`} />)}
       </ScrollView>
       {!groups.length && poll.online ? <Text style={s.note}>No projects are available on this machine.</Text> : null}
       {sections.map(section => {
@@ -85,7 +89,7 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
               <View style={s.rowMeta}>
                 <Chip label={item.projectName} accessibilityLabel={`Project: ${item.projectName}`} />
                 <Text style={[s.status, (item.column === "needs-input" || item.status === "paused") && s.attention]} numberOfLines={1}>{titleOfStatus(item)}</Text>
-                {item.subtasks ? <Text style={s.progress}>{item.subtasks.done}/{item.subtasks.total}</Text> : null}
+                {item.subtasks?.total ? <Text style={s.progress}>{item.subtasks.done}/{item.subtasks.total}</Text> : null}
               </View>
               <Text style={s.detail} numberOfLines={1}>{item.detail}</Text>
             </View>
@@ -138,7 +142,7 @@ const s = StyleSheet.create({
   rowTitle: { flex: 1, fontSize: 15, fontWeight: "600", color: theme.colors.ink },
   age: { fontSize: 11, color: theme.colors.mutedInk, fontVariant: ["tabular-nums"] },
   rowMeta: { flexDirection: "row", alignItems: "center", gap: 7 },
-  status: { flexShrink: 1, fontSize: 12, color: theme.colors.mutedInk, textTransform: "capitalize" },
+  status: { flexShrink: 1, fontSize: 12, color: theme.colors.mutedInk },
   attention: { color: theme.colors.warningInk, fontWeight: "600" },
   progress: { fontSize: 12, color: theme.colors.mutedInk, fontVariant: ["tabular-nums"] },
   detail: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },

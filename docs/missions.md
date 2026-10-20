@@ -57,25 +57,52 @@ The coordinator reports through its mission report tool:
 
 | Report | Effect |
 |---|---|
-| `dispatch` | Adds subtasks (up to `maxSubtasks` in total). A later dispatch may add more. |
+| `dispatch` | Adds subtasks (up to `maxSubtasks` in total). Later dispatches may add more. The host adds same-repository dependency edges, shown in mission events and later coordinator mission state. |
 | `answer-child` | Answers an open subteam decision within the mission's objective and steering. Recorded as answered by the coordinator, in the mission and in the subteam. |
 | `question` | Opens a mission decision for the owner. With `subtaskId` and `childDecisionId`, the owner's answer is forwarded to that subteam decision. |
 | `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. |
 | `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, and no owner decision is open. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
 | `blocked` | Moves the mission to `blocked` with the summary as its reason. |
+| `wait` | Ends the attempt without a decision. Refused while a subteam decision is open that the coordinator has neither answered nor escalated. Otherwise accepted only while something else will start a later attempt: an open owner decision, a subteam that is not paused, or a queued subtask that can start without anyone acting. A queued subtask whose repository any paused or blocked run holds does not count, since that run keeps the repository reserved after the others finish. |
+
+Each attempt must end with one report. An attempt whose session ends its turn
+without a report, or shows no activity for the team stall window while not
+waiting on a provider prompt, is stopped. A turn counts as ended only when the
+latest turn signal in the session's journal is a turn-end that has stood for
+five seconds; a quiet screen alone is not evidence, because the attention state
+keeps an earlier turn-end while a later turn continues. A report the session
+files before it confirms its exit, including across a host restart, is applied
+as usual and is not counted as missing. The next attempt starts with a
+refusal that says so, together with every message that arrived meanwhile.
+Three missed or refused reports in a row block the mission.
 
 Size rules: a `solo` subtask starts a subteam with parallelism 1, and a `team`
 subtask uses its `parallelism` (1–4). The coordinator chooses the size; a simple
 mission may dispatch exactly one solo subtask.
 
-Scheduling: a subtask starts when every dependency is `done`. At most one team
-run per repository is active at a time across every mission and every run
-started outside a mission; others stay `queued`. A `blocked` run keeps its
-repository reserved until it is cancelled. A subtask that depends, directly or
-through other subtasks, on a finished subtask in its own repository starts from
-that run's workspace head rather than from the repository; with several such
-predecessors it uses the latest one in dependency order. A subtask is
-`done` when its subteam reaches `ready-for-review`, `merged`, or `no-change`;
+Scheduling: a subtask starts when every dependency is `done`. The host adds a
+dependency from each later subtask to the latest earlier, non-cancelled subtask
+in the same repository, including when the subtasks arrive in separate
+dispatches. The coordinator can also declare dependencies explicitly. Generated
+edges are recorded on the affected subtasks, named in mission events, and shown
+in the `dependsOn` fields of subsequent coordinator mission state.
+
+Mission subteams reserve only their own repository while a launch is pending or
+their run is active; a mission does not reserve every repository in its group
+for its whole lifetime. An active subteam or pending mission launch prevents a
+standalone team from starting in that repository. Once the subteam finishes,
+standalone runs can start there even if the mission continues elsewhere.
+Multiple standalone runs may coexist in one repository. A mission subtask waits
+while its repository is already in use and rechecks at launch; if a standalone
+run starts in the gap, the mission records that launch failure as a blocked
+subtask with the reason. A blocked subteam run keeps its repository reserved
+until cancelled.
+
+A subtask that depends, directly or through other subtasks, on finished work in
+its own repository starts from that run's workspace head rather than from the
+repository. With several same-repository predecessors, it uses the latest run
+in the dependency chain, so its base includes earlier work. A subtask is `done`
+when its subteam reaches `ready-for-review`, `merged`, or `no-change`;
 `blocked` when its subteam is blocked; `cancelled` when its subteam is cancelled.
 
 Escalation: when a subteam opens a decision or becomes blocked, the host sends
@@ -85,6 +112,13 @@ for the next attempt. Every open subteam decision is also listed in each
 attempt's mission state, read from the subteams, so none depends on a message. Only the coordinator's `question` report reaches the owner. Provider
 permission prompts are unaffected and keep their existing owner or delegated
 coordinator path per repository.
+
+A run outside the mission that holds a repository changes state without
+reaching the mission. When a ready subtask's repository is held only by paused
+or blocked runs outside this mission and no coordinator attempt is running, the
+host sends the coordinator a `repository-held` message naming each holder run
+and its status, once per subtask, holder, and status. The coordinator can then
+cancel the subtask, ask the owner, or report blocked.
 
 Owner controls: answer, steer (forwarded to the coordinator), pause, resume, and
 cancel. All five are owner-only; a controller cannot answer or steer a mission. A

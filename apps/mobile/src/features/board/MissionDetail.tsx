@@ -25,6 +25,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   }, 2500, [connection, id]);
   const [recorded, setRecorded] = useState<Mission | null>(null);
   const [direction, setDirection] = useState("");
+  const [dockHeight, setDockHeight] = useState(0);
   const mission = poll.data ? newer(recorded, poll.data.mission) : recorded;
   const request = useRunRequest<Mission>(connection, `${machine}/mission/${id}`, {
     accepted: result => { setRecorded(previous => newer(previous, result)); poll.refresh(); },
@@ -40,6 +41,8 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   const controls = missionControls(mission, me?.role, fresh, now);
   const locked = request.busy || Boolean(request.pending);
   const decisions = openMissionDecisions(mission);
+  const answered = mission.decisions.filter(decision => decision.answer != null);
+  const titleOf = (subtaskId: string) => mission.subtasks.find(subtask => subtask.id === subtaskId)?.title ?? subtaskId;
   const group = poll.data?.projects.groups.find(value => value.id === mission.groupId);
   const projectName = group?.name ?? mission.groupName;
   const repoName = (projectId: string) => me?.projects?.find(project => project.id === projectId)?.name
@@ -80,7 +83,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
             <View style={s.subtaskIcon}><StatusIcon kind={subtask.status === "done" ? "done" : subtask.status === "running" ? "progress" : subtask.status === "blocked" ? "blocked" : subtask.status === "cancelled" ? "cancelled" : "todo"} size={15} /></View>
             <View style={s.subtaskMain}>
               <Text style={s.subtaskTitle} numberOfLines={1}>{subtask.title}</Text>
-              <Text style={t.note} numberOfLines={1}>{repoName(subtask.repoProjectId)} · {subtask.size} · {label}{subtask.size === "team" ? ` · ${subtask.parallelism} parallel` : ""}</Text>
+              <Text style={t.note} numberOfLines={2}>{repoName(subtask.repoProjectId)} · {subtask.size} · {label}{subtask.size === "team" ? ` · ${subtask.parallelism} parallel` : ""}{subtask.dependsOn.length ? ` · after ${subtask.dependsOn.map(titleOf).join(", ")}` : ""}</Text>
             </View>
             {subtask.teamId ? <Glyph name="forward" size={12} color={theme.colors.mutedInk} /> : null}
           </Pressable>;
@@ -90,7 +93,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       {mission.dispatchSummary ? <Section title="Coordinator update"><Text style={t.body}>{mission.dispatchSummary}</Text></Section> : null}
       {mission.result ? <Section title="Reported result"><Card><Text style={t.body}>{mission.result.summary}</Text><Text style={t.note}>Coordinator report · not an independent review</Text></Card></Section> : null}
 
-      {me?.role === "owner" ? <Section title="Mission controls">
+      {me?.role === "owner" && (controls.pause || controls.resume || controls.cancel) ? <Section title="Mission controls">
         <View style={s.controls}>
           {controls.resume ? <Button compact title="Resume" glyph="play" disabled={locked} onPress={() => send("resume", "Resume")} />
             : controls.pause ? <Button compact secondary title="Pause" glyph="pause" disabled={locked} onPress={() => send("pause", "Pause")} /> : null}
@@ -100,8 +103,13 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
         </View>
       </Section> : null}
 
-      {mission.steering.length ? <Section title="Your directions" count={mission.steering.length}>
-          {[...mission.steering].reverse().map((entry, index) => <Card key={`${entry.at}/${index}`}><Text style={t.note}>Revision {entry.revision} · {age(entry.at, now)}</Text><Text style={t.body}>{entry.text}</Text></Card>)}
+      {mission.steering.length || answered.length ? <Section title="Your directions and decisions" count={mission.steering.length + answered.length}>
+          {[...mission.steering].reverse().map((entry, index) => <Card key={`${entry.at}/${index}`}><Text style={t.note}>Direction · revision {entry.revision} · {age(entry.at, now)}</Text><Text style={t.body}>{entry.text}</Text></Card>)}
+          {[...answered].reverse().map(decision => <Card key={decision.id}>
+            <Text style={t.note}>Decision · answered by {decision.answeredBy === "coordinator" ? "the coordinator" : "you"}{decision.answeredAt ? ` · ${age(decision.answeredAt, now)}` : ""}</Text>
+            <Text style={t.body}>{decision.question}</Text>
+            <Text style={t.strong}>Answer: {decision.answer}</Text>
+          </Card>)}
       </Section> : null}
 
       <Section title="Events" count={mission.events.length}>
@@ -111,13 +119,13 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       </Section>
       <View style={s.endNote}><Text style={t.note}>Ready for review records the coordinator’s report. It does not confirm acceptance or delivery.</Text></View>
     </ScrollView>
-    {me?.role === "owner" ? <View style={s.dock}>
-      <RequestStatus request={request} canRetry={fresh && me.role === "owner"} />
+    {me?.role === "owner" ? <View style={s.dock} onLayout={event => setDockHeight(event.nativeEvent.layout.height)}>
       <SteerBox value={direction} onChange={setDirection} placeholder="Steer the coordinator…"
         enabled={controls.steer && !locked} busy={request.busy}
         note={me.role !== "owner" ? "View only." : mission.status === "paused" ? "Resume to steer." : !controls.steer ? "This mission cannot be steered in its current state." : undefined}
         onSend={() => { const text = direction.trim(); if (text) { send("steer", "Direction", { text }); setDirection(""); } }} />
     </View> : null}
+    {me?.role === "owner" ? <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh} /> : null}
     <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : null} />
   </KeyboardAvoidingView>;
 }

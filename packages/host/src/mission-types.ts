@@ -40,6 +40,8 @@ export const missionReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("question"), question: z.string().trim().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), subtaskId: subtaskId.optional(), childDecisionId: z.uuid().optional() }).strict(),
   z.object({ kind: z.literal("result"), summary: z.string().trim().min(1).max(8000) }).strict(),
   z.object({ kind: z.literal("blocked"), summary: z.string().trim().min(1).max(4000) }).strict(),
+  /** Ends the attempt without a decision; the next subteam event or owner input starts another. */
+  z.object({ kind: z.literal("wait"), summary: z.string().trim().min(1).max(2000) }).strict(),
 ]);
 export type MissionReport = z.infer<typeof missionReportSchema>;
 export const missionReportEnvelopeSchema = z.object({ requestId: z.uuid(), missionId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: missionReportSchema }).strict();

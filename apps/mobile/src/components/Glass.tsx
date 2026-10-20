@@ -42,16 +42,16 @@ export function LiveStatus({ online, loading, seen, stale }: { online: boolean; 
 }
 
 /** A Linear-style property: an icon or status and a few words. */
-export function Chip({ kind, fraction, icon, label, tone, onPress, accessibilityLabel }: {
-  kind?: StatusKind; fraction?: number; icon?: ReactNode; label: string; tone?: "attention" | "error"; onPress?: () => void; accessibilityLabel?: string;
+export function Chip({ kind, fraction, icon, label, tone, selected, onPress, accessibilityLabel }: {
+  kind?: StatusKind; fraction?: number; icon?: ReactNode; label: string; tone?: "attention" | "error"; selected?: boolean; onPress?: () => void; accessibilityLabel?: string;
 }) {
   const body = <>
     {kind ? <StatusIcon kind={kind} fraction={fraction} size={13} /> : icon}
-    <Text style={[s.chipText, tone === "attention" && s.chipTextAttention, tone === "error" && s.chipTextError]} numberOfLines={1}>{label}</Text>
+    <Text style={[s.chipText, tone === "attention" && s.chipTextAttention, tone === "error" && s.chipTextError, selected && s.chipTextSelected]} numberOfLines={1}>{label}</Text>
   </>;
-  const style = [s.chip, tone === "attention" && s.chipAttention, tone === "error" && s.chipError];
+  const style = [s.chip, tone === "attention" && s.chipAttention, tone === "error" && s.chipError, selected && s.chipSelected];
   return onPress
-    ? <Pressable accessibilityRole="button" accessibilityLabel={accessibilityLabel ?? label} onPress={onPress} hitSlop={SLOP} style={({ pressed }) => [...style, pressed && s.dim]}>{body}</Pressable>
+    ? <Pressable accessibilityRole="button" accessibilityState={selected === undefined ? undefined : { selected }} accessibilityLabel={accessibilityLabel ?? label} onPress={onPress} hitSlop={SLOP} style={({ pressed }) => [...style, pressed && s.dim]}>{body}</Pressable>
     : <View accessible accessibilityLabel={accessibilityLabel ?? label} style={style}>{body}</View>;
 }
 
@@ -161,6 +161,8 @@ const s = StyleSheet.create({
   chipText: { fontSize: 12, fontWeight: "500", color: theme.colors.ink, flexShrink: 1 },
   chipTextAttention: { color: theme.colors.warningInk, fontWeight: "600" },
   chipTextError: { color: theme.colors.error },
+  chipSelected: { backgroundColor: theme.colors.forest, borderColor: theme.colors.forest },
+  chipTextSelected: { color: theme.colors.white, fontWeight: "600" },
   track: { flexDirection: "row", padding: 3, gap: 2, borderRadius: theme.radius.capsule, backgroundColor: theme.colors.secondarySurface },
   segment: { flex: 1, minHeight: 36, flexDirection: "row", gap: 5, alignItems: "center", justifyContent: "center", paddingHorizontal: 6, borderRadius: theme.radius.capsule },
   segmentOn: { backgroundColor: theme.colors.white, ...theme.lift },

@@ -94,6 +94,14 @@ public struct BoardItem: Identifiable, Equatable, Sendable {
         guard let counts = subtasks, counts.total > 0 else { return nil }
         return "\(counts.done)/\(counts.total) subtask\(counts.total == 1 ? "" : "s")"
     }
+    /// The host's detail without its closing "N of M subtasks done" when `subtaskLabel` already shows those
+    /// counts, so a running row reads "1/3 subtasks · Running: …" once. The host may write "subtasks" for one.
+    public var detailBesideProgress: String {
+        guard let counts = subtasks, subtaskLabel != nil,
+              let match = detail.firstMatch(of: #/(?:^|\.\s+)(\d+) of (\d+) subtasks? done$/#),
+              Int(match.1) == counts.done, Int(match.2) == counts.total else { return detail }
+        return String(detail[..<match.range.lowerBound])
+    }
     /// How full a working row's ring draws: finished subtasks, never below a started quarter.
     public var progressFraction: Double {
         guard let counts = subtasks, counts.total > 0 else { return 0.25 }
@@ -226,6 +234,8 @@ public struct Mission: Identifiable, Equatable, Sendable {
     public var canPause: Bool { ["planning", "working", "needs-input"].contains(status) }
     public var canResume: Bool { status == "paused" }
     public var canCancel: Bool { status != "cancelled" }
+    /// The host accepts an answer only while the mission runs; a paused or blocked mission keeps its question for later.
+    public var canAnswer: Bool { ["planning", "working", "needs-input"].contains(status) }
     public func subtask(_ id: String) -> MissionSubtask? { subtasks.first { $0.id == id } }
     /// Which subtask raised an escalated decision, when one did.
     public func origin(of decision: MissionDecision) -> MissionSubtask? { decision.subtaskID.isEmpty ? nil : subtask(decision.subtaskID) }

@@ -987,14 +987,19 @@ GitHub-tracked sources add these operations. The host runs each through
 - in a host mirror: `init --bare` when the mirror is created, `fetch --no-tags` of
   the base branch from the GitHub URL into `refs/heads/BASE`, and `rev-parse` of
   that ref;
-- in a project source directory: `fetch --no-tags` of the base branch from the
-  mirror path into `refs/remotes/origin/BASE`, `rev-parse HEAD`,
-  `merge-base --is-ancestor`, `status --porcelain --untracked-files=no`,
-  `checkout --detach` to the new head, and, to save tracked edits,
-  `checkout -b infinite/saved-*`, `add -u`, and `commit -m` with the fixed message;
+- in a project source directory: `rev-parse --show-toplevel` (the refresh
+  refuses a directory that is not the repository root), `fetch --no-tags` of the
+  base branch from the mirror path into `refs/remotes/origin/BASE`,
+  `rev-parse HEAD`, `merge-base --is-ancestor`,
+  `status --porcelain --untracked-files=no`, `checkout --detach` to the new head,
+  and, to save tracked edits, `checkout -b infinite/saved-*`,
+  `diff --cached --quiet`, `add -u`, and `commit -m` with one of two fixed
+  messages (staged edits are committed first, then remaining working-tree edits);
 - in a team run: `clone --no-local --no-hardlinks --no-checkout -- MIRROR_PATH`
-  into the run directory in place of a project-directory clone, and `cat-file -t`
-  on the base commit.
+  into the run directory in place of a project-directory clone, `cat-file -t`
+  on the base commit, and, for a continuation, `fetch --no-tags -- MIRROR_PATH SHA`
+  of the current mirror head into the parent run's integration checkout so the
+  host can tell whether that run is behind the base.
 
 Nothing new is needed for `--delivery pr`. The delivery member pushes from its
 member clone with its own tools, as it does for `merge`.

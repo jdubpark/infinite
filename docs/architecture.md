@@ -101,12 +101,14 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 Mission-managed sessions refuse direct human input, stop/resume, native attach,
 and OpenCode access. While the worker reports an open provider prompt
 (`attention.state === "needs-you"`), owner/controller input and key requests,
-owner raw input, and lease claims are allowed through the worker's normal lease
-fencing. The host checks that state for each HTTP request and terminal write
-frame; once the prompt closes, those actions return `409 mission-managed`
-again. Stop, resume, and native/OpenCode attachment remain refused throughout.
-Renew and release remain available for an existing lease; `/answer` and
-`/resize` retain their existing role rules.
+owner raw input, and lease claims and renewals are allowed through the worker's
+normal lease fencing. The host checks that state for each HTTP request and
+terminal write frame; once the prompt closes, those actions return
+`409 mission-managed` again, so a fallback lease lapses within its 30-second
+TTL. Release stays available. Stop, resume, and native/OpenCode attachment
+remain refused throughout; `/answer` and `/resize` retain their existing role
+rules. The window is a convenience boundary for people, not a sandbox: input
+sent while the prompt is open is not limited to the prompt itself.
 
 **Owner CLI** routes accept only a paired owner bearer key; a browser session is refused. While a sync commit or apply holds a project, Infinite-managed session creation and resume in that project answer `409` with code `sync-applying`; this includes cmux sessions. [Workspace sync](workspace-sync.md) defines the transfer limits, apply rules, and pending reasons.
 

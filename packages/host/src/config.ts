@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { Config } from "./types.js";
 import { assertRunnerDeployment, parseDeployment } from "./deployment.js";
 import { machineIdentity } from "./machine.js";
-import { teamProjectSchema, teamCommandSchema, teamLineupSchema } from "./team-types.js";
+import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamLineupSchema } from "./team-types.js";
 
 /**
  * Provider hooks injected at launch when the config does not say. Codex hooks stay off until
@@ -86,6 +86,7 @@ const schema = z
           path: z.string(),
           team: teamProjectSchema.optional(),
           linear: z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict().optional(),
+          source: projectSourceSchema.optional(),
         }),
       )
       .min(1),

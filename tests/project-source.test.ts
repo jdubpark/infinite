@@ -103,7 +103,7 @@ test("first refresh creates the mirror and fast-forwards the detached checkout t
     assert.equal(service.status("example").appliedHead, commitB);
 
     const commands = readFileSync(join(f.prefixReceipts, "commands.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    assert.equal(commands.length, 8, "each host Git operation, including init and fetch, crosses the prefix");
+    assert.equal(commands.length, 9, "each host Git operation, including init, fetch, and root validation, crosses the prefix");
     assert.ok(commands.every(command => command.command === "git"));
     assert.ok(commands.some(command => command.args.includes("fetch")));
   } finally { f.close(); }
@@ -128,7 +128,49 @@ test("a running session defers the working-tree step and a later refresh applies
   } finally { f.close(); }
 });
 
-test("tracked edits are saved on a dated branch while untracked files stay in the checkout", async () => {
+test("partially staged tracked edits preserve both versions on one saved branch", async () => {
+  const f = fixture();
+  try {
+    const commitB = f.push("Remote B\n", "Commit B");
+    writeFileSync(join(f.projectPath, "tracked.txt"), "staged B\n");
+    git(f.projectPath, "add", "tracked.txt");
+    writeFileSync(join(f.projectPath, "tracked.txt"), "worktree C\n");
+
+    const status = await f.service().refresh("example");
+    const saved = status.savedBranches?.[0];
+    assert.match(saved ?? "", /^infinite\/saved-\d{8}-[0-9a-f]{8}$/);
+    assert.equal(git(f.projectPath, "rev-list", "--count", `${f.commitA}..${saved}`), "2");
+    assert.deepEqual(
+      git(f.projectPath, "log", "--reverse", "--format=%s", `${f.commitA}..${saved}`).split("\n"),
+      ["Staged edits left in the host checkout before a refresh from GitHub", "Edits left in the host checkout before a refresh from GitHub"],
+    );
+    assert.equal(git(f.projectPath, "show", `${saved}~1:tracked.txt`), "staged B");
+    assert.equal(git(f.projectPath, "show", `${saved}:tracked.txt`), "worktree C");
+    assert.equal(git(f.projectPath, "rev-parse", "HEAD"), commitB);
+    assert.equal(git(f.projectPath, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD");
+    assert.equal(status.appliedHead, commitB);
+    assert.equal(git(f.projectPath, "status", "--porcelain", "--untracked-files=no"), "");
+  } finally { f.close(); }
+});
+
+test("staged-only tracked edits create one saved commit", async () => {
+  const f = fixture();
+  try {
+    const commitB = f.push("Remote B\n", "Commit B");
+    writeFileSync(join(f.projectPath, "tracked.txt"), "staged edit\n");
+    git(f.projectPath, "add", "tracked.txt");
+
+    const status = await f.service().refresh("example");
+    const saved = status.savedBranches?.[0];
+    assert.ok(saved);
+    assert.equal(git(f.projectPath, "rev-list", "--count", `${f.commitA}..${saved}`), "1");
+    assert.equal(git(f.projectPath, "log", "-1", "--format=%s", saved), "Staged edits left in the host checkout before a refresh from GitHub");
+    assert.equal(git(f.projectPath, "show", `${saved}:tracked.txt`), "staged edit");
+    assert.equal(status.appliedHead, commitB);
+  } finally { f.close(); }
+});
+
+test("worktree-only tracked edits create one saved commit while untracked files stay in the checkout", async () => {
   const f = fixture();
   try {
     const commitB = f.push("B\n", "Commit B");
@@ -138,12 +180,86 @@ test("tracked edits are saved on a dated branch while untracked files stay in th
     const status = await f.service().refresh("example");
     const saved = status.savedBranches?.[0];
     assert.match(saved ?? "", /^infinite\/saved-\d{8}-[0-9a-f]{8}$/);
+    assert.equal(git(f.projectPath, "rev-list", "--count", `${f.commitA}..${saved}`), "1");
     assert.equal(git(f.projectPath, "log", "-1", "--format=%s", saved ?? ""), "Edits left in the host checkout before a refresh from GitHub");
+    assert.equal(git(f.projectPath, "show", `${saved}:tracked.txt`), "session edit");
     assert.equal(status.appliedHead, commitB);
     assert.equal(git(f.projectPath, "rev-parse", "HEAD"), commitB);
     assert.equal(existsSync(join(f.projectPath, "left-untracked.txt")), true);
     assert.equal(git(f.projectPath, "status", "--porcelain", "--untracked-files=no"), "");
     assert.match(git(f.projectPath, "status", "--short"), /\?\? left-untracked\.txt/);
+  } finally { f.close(); }
+});
+
+test("a project path nested inside another Git repository is refused without changing its parent", async () => {
+  const f = fixture();
+  try {
+    const nested = join(f.projectPath, "nested-project");
+    mkdirSync(nested);
+    writeFileSync(join(f.projectPath, "parent-staged.txt"), "staged parent content\n");
+    git(f.projectPath, "add", "parent-staged.txt");
+    const beforeHead = git(f.projectPath, "rev-parse", "HEAD");
+    const beforeIndex = git(f.projectPath, "diff", "--cached", "--binary");
+    f.config.projects[0]!.path = nested;
+
+    const status = await f.service().refresh("example");
+    assert.equal(status.pending?.reason, "apply-failed");
+    assert.equal(status.pending?.category, "other");
+    assert.equal(status.pending?.message, "the host checkout is not a Git repository root");
+    assert.equal(git(f.projectPath, "rev-parse", "HEAD"), beforeHead);
+    assert.equal(git(f.projectPath, "diff", "--cached", "--binary"), beforeIndex);
+  } finally { f.close(); }
+});
+
+test("changing the GitHub source drops old cached heads after a failed fetch and loads the new mirror head", async () => {
+  const f = fixture();
+  try {
+    const service = f.service();
+    writeFileSync(join(f.projectPath, "tracked.txt"), "saved before source change\n");
+    const first = await service.refresh("example");
+    assert.equal(first.mirrorHead, f.commitA);
+    assert.equal(first.savedBranches?.length, 1);
+
+    f.config.projects[0]!.source!.repository = "example/other";
+    f.config.source!.remoteOverrides!.example = join(f.root, "missing.git");
+    const changed = service.status("example");
+    assert.equal(changed.repository, "example/other");
+    assert.equal(changed.baseBranch, "main");
+    assert.equal("mirrorHead" in changed, false);
+    assert.equal("appliedHead" in changed, false);
+    assert.deepEqual(changed.savedBranches, first.savedBranches);
+
+    const failed = await service.refresh("example");
+    assert.equal(failed.pending?.reason, "fetch-failed");
+    assert.equal("mirrorHead" in failed, false);
+
+    const originB = join(f.root, "repository-b.git");
+    const seedB = join(f.root, "seed-b");
+    git(f.root, "init", "--bare", "--initial-branch=main", originB);
+    git(f.root, "init", "--initial-branch=main", seedB);
+    writeFileSync(join(seedB, "tracked.txt"), "Repository B\n");
+    git(seedB, "add", "tracked.txt");
+    git(seedB, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Repository B base");
+    git(seedB, "remote", "add", "origin", originB);
+    git(seedB, "push", "origin", "main");
+    const headB = git(seedB, "rev-parse", "HEAD");
+    f.config.source!.remoteOverrides!.example = originB;
+
+    const refreshed = await service.refresh("example");
+    assert.equal(refreshed.mirrorHead, headB);
+    assert.notEqual(refreshed.mirrorHead, first.mirrorHead);
+  } finally { f.close(); }
+});
+
+test("a missing project directory reports the fixed missing-path apply failure", async () => {
+  const f = fixture();
+  try {
+    f.config.projects[0]!.path = join(f.root, "missing-project");
+
+    const status = await f.service().refresh("example");
+    assert.equal(status.pending?.reason, "apply-failed");
+    assert.equal(status.pending?.category, "missing-path");
+    assert.equal(status.pending?.message, "The cloud project directory is missing.");
   } finally { f.close(); }
 });
 

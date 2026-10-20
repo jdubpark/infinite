@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Config } from "./types.js";
 import type { TeamCommand } from "./team-types.js";
@@ -8,7 +8,9 @@ import { TeamError, teamCommand, teamGitArgs } from "./team-workspace.js";
 
 const FETCH_TIMEOUT_MS = 120_000;
 const COMMAND_TIMEOUT_MS = 30_000;
+const STAGED_EDITS_MESSAGE = "Staged edits left in the host checkout before a refresh from GitHub";
 const SAVED_CHANGES_MESSAGE = "Edits left in the host checkout before a refresh from GitHub";
+const NOT_GIT_ROOT_MESSAGE = "the host checkout is not a Git repository root";
 const FETCH_MESSAGES: Record<Exclude<SourceFetchCategory, "auth">, string> = {
   network: "the host could not reach GitHub",
   "not-found": "GitHub reports no such repository or branch for the configured source",
@@ -100,13 +102,23 @@ export class ProjectSourceService {
     if (project.source?.mode !== "github") return { mode: "laptop" };
     const file = this.statusFile(projectId);
     const saved = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) as Partial<ProjectSourceStatus> : {};
+    if (saved.repository !== project.source.repository || saved.baseBranch !== project.source.baseBranch) {
+      return {
+        mode: "github",
+        repository: project.source.repository,
+        baseBranch: project.source.baseBranch,
+        ...(saved.savedBranches ? { savedBranches: saved.savedBranches } : {}),
+      };
+    }
     return { ...saved, mode: "github", repository: project.source.repository, baseBranch: project.source.baseBranch };
   }
   private writeStatus(projectId: string, status: ProjectSourceStatus) {
+    const project = this.project(projectId);
+    const source = project.source?.mode === "github" ? project.source : undefined;
     const file = this.statusFile(projectId);
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
     const temporary = `${file}.${randomUUID()}.tmp`;
-    writeFileSync(temporary, JSON.stringify(status), { mode: 0o600, flag: "wx" });
+    writeFileSync(temporary, JSON.stringify(source ? { ...status, mode: "github", repository: source.repository, baseBranch: source.baseBranch } : status), { mode: 0o600, flag: "wx" });
     renameSync(temporary, file);
   }
   private savePending(projectId: string, status: ProjectSourceStatus, pending: Omit<NonNullable<ProjectSourceStatus["pending"]>, "since">) {
@@ -139,12 +151,34 @@ export class ProjectSourceService {
     await this.git(parent, ["init", "--bare", mirror], signal);
     return mirror;
   }
-  private fetchFailure(projectId: string, status: ProjectSourceStatus, category: SourceFetchCategory) {
-    const project = this.project(projectId);
+  private fetchFailure(projectId: string, status: ProjectSourceStatus, repository: string, category: SourceFetchCategory) {
     const message = category === "auth"
-      ? `grant the GitHub App access to ${project.source?.mode === "github" ? project.source.repository : "the configured repository"}`
+      ? `grant the GitHub App access to ${repository}`
       : FETCH_MESSAGES[category];
     return this.savePending(projectId, status, { reason: "fetch-failed", category, message });
+  }
+  private sourceMatches(projectId: string, source: { repository: string; baseBranch: string }) {
+    const current = this.config.projects.find(project => project.id === projectId)?.source;
+    return current?.mode === "github" && current.repository === source.repository && current.baseBranch === source.baseBranch;
+  }
+  private async checkoutRootFailure(projectPath: string, signal?: AbortSignal): Promise<{ category: SyncFailureCategory; message: string } | undefined> {
+    let projectRealPath: string;
+    try {
+      projectRealPath = realpathSync(projectPath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (["ENOENT", "ENOTDIR"].includes(code ?? "") && !existsSync(projectPath)) return syncFailure(error, projectPath);
+      return { category: "other", message: NOT_GIT_ROOT_MESSAGE };
+    }
+    try {
+      const result = await this.command(projectPath, ["rev-parse", "--show-toplevel"], signal);
+      if (!commandSucceeded(result)) return { category: "other", message: NOT_GIT_ROOT_MESSAGE };
+      if (realpathSync(result.stdout.trim()) !== projectRealPath) return { category: "other", message: NOT_GIT_ROOT_MESSAGE };
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return { category: "other", message: NOT_GIT_ROOT_MESSAGE };
+    }
+    return undefined;
   }
   private async isRunning(projectId: string) {
     try { return await this.options.running(projectId); }
@@ -153,26 +187,30 @@ export class ProjectSourceService {
   private async refreshOne(projectId: string, options?: { maxAgeMs?: number; signal?: AbortSignal }): Promise<ProjectSourceStatus> {
     const project = this.project(projectId);
     if (project.source?.mode !== "github") throw new ProjectSourceError("This project is not tracked on GitHub", "not-github");
+    const source = { repository: project.source.repository, baseBranch: project.source.baseBranch };
     let status = this.status(projectId);
     if (options?.maxAgeMs !== undefined && status.fetchedAt && Date.now() - Date.parse(status.fetchedAt) < options.maxAgeMs) return status;
 
-    const remote = mirrorRemoteUrl(project.source, this.config.source?.remoteOverrides?.[projectId]);
+    const remote = mirrorRemoteUrl(source, this.config.source?.remoteOverrides?.[projectId]);
     const mirror = this.mirrorPath(projectId);
     let fetchedHead: string;
     try {
       await this.ensureMirror(projectId, options?.signal);
-      const fetched = await this.command(mirror, ["fetch", "--no-tags", remote, `+refs/heads/${project.source.baseBranch}:refs/heads/${project.source.baseBranch}`], options?.signal, FETCH_TIMEOUT_MS);
+      const fetched = await this.command(mirror, ["fetch", "--no-tags", remote, `+refs/heads/${source.baseBranch}:refs/heads/${source.baseBranch}`], options?.signal, FETCH_TIMEOUT_MS);
       if (options?.signal?.aborted) throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+      if (!this.sourceMatches(projectId, source)) return this.status(projectId);
       if (!commandSucceeded(fetched)) {
         const output = `${fetched.output}${fetched.interrupted ? " timed out" : ""}`;
-        return this.fetchFailure(projectId, status, fetchCategory(output));
+        return this.fetchFailure(projectId, status, source.repository, fetchCategory(output));
       }
-      fetchedHead = await this.git(mirror, ["rev-parse", `refs/heads/${project.source.baseBranch}`], options?.signal);
+      fetchedHead = await this.git(mirror, ["rev-parse", `refs/heads/${source.baseBranch}`], options?.signal);
     } catch (error) {
       if (options?.signal?.aborted) throw error;
-      return this.fetchFailure(projectId, status, error instanceof TeamError ? fetchCategory(error.message) : "other");
+      if (!this.sourceMatches(projectId, source)) return this.status(projectId);
+      return this.fetchFailure(projectId, status, source.repository, error instanceof TeamError ? fetchCategory(error.message) : "other");
     }
 
+    if (!this.sourceMatches(projectId, source)) return this.status(projectId);
     const fetchedStatus = status.pending?.reason === "fetch-failed" ? withoutPending(status) : status;
     status = {
       ...fetchedStatus,
@@ -182,6 +220,9 @@ export class ProjectSourceService {
     this.writeStatus(projectId, status);
 
     if (status.mirrorHead === status.appliedHead) {
+      const rootFailure = await this.checkoutRootFailure(project.path, options?.signal);
+      if (!this.sourceMatches(projectId, source)) return this.status(projectId);
+      if (rootFailure) return this.savePending(projectId, status, { reason: "apply-failed", ...rootFailure });
       try {
         if (await this.git(project.path, ["rev-parse", "HEAD"], options?.signal) === status.mirrorHead) return status;
       } catch (error) {
@@ -194,14 +235,18 @@ export class ProjectSourceService {
     this.changing.add(projectId);
     try {
       if (await this.isRunning(projectId)) return this.savePending(projectId, status, { reason: "session-running" });
+      if (!this.sourceMatches(projectId, source)) return this.status(projectId);
+      const rootFailure = await this.checkoutRootFailure(project.path, options?.signal);
+      if (!this.sourceMatches(projectId, source)) return this.status(projectId);
+      if (rootFailure) return this.savePending(projectId, status, { reason: "apply-failed", ...rootFailure });
       const treeHead = await this.git(project.path, ["rev-parse", "HEAD"], options?.signal);
       // Make the fetched base objects visible to merge-base in this detached checkout.
-      await this.git(project.path, ["fetch", "--no-tags", mirror, `+refs/heads/${project.source.baseBranch}:refs/remotes/origin/${project.source.baseBranch}`], options?.signal);
+      await this.git(project.path, ["fetch", "--no-tags", mirror, `+refs/heads/${source.baseBranch}:refs/remotes/origin/${source.baseBranch}`], options?.signal);
       const ancestry = await this.command(project.path, ["merge-base", "--is-ancestor", treeHead, fetchedHead], options?.signal);
       if (!commandSucceeded(ancestry)) {
         const pending = this.savePending(projectId, status, {
           reason: "diverged",
-          message: `the host checkout has commits that are not on ${project.source.baseBranch}`,
+          message: `the host checkout has commits that are not on ${source.baseBranch}`,
         });
         return pending;
       }
@@ -212,12 +257,20 @@ export class ProjectSourceService {
         const date = new Date().toISOString().slice(0, 10).replaceAll("-", "");
         const branch = `infinite/saved-${date}-${suffix}`;
         await this.git(project.path, ["checkout", "-b", branch], options?.signal);
+        const staged = await this.command(project.path, ["diff", "--cached", "--quiet"], options?.signal);
+        if (staged.interrupted || staged.truncated || ![0, 1].includes(staged.exitCode ?? -1))
+          throw new TeamError(409, "workspace-operation-failed", "A team Git operation failed. The isolated workspace was preserved for inspection.");
+        if (staged.exitCode === 1) await this.git(project.path, ["commit", "-m", STAGED_EDITS_MESSAGE], options?.signal);
         await this.git(project.path, ["add", "-u"], options?.signal);
-        await this.git(project.path, ["commit", "-m", SAVED_CHANGES_MESSAGE], options?.signal);
+        const worktree = await this.command(project.path, ["diff", "--cached", "--quiet"], options?.signal);
+        if (worktree.interrupted || worktree.truncated || ![0, 1].includes(worktree.exitCode ?? -1))
+          throw new TeamError(409, "workspace-operation-failed", "A team Git operation failed. The isolated workspace was preserved for inspection.");
+        if (worktree.exitCode === 1) await this.git(project.path, ["commit", "-m", SAVED_CHANGES_MESSAGE], options?.signal);
         status = { ...status, savedBranches: [...(status.savedBranches ?? []), branch] };
         this.writeStatus(projectId, status);
       }
 
+      if (!this.sourceMatches(projectId, source)) return this.status(projectId);
       await this.git(project.path, ["checkout", "--detach", fetchedHead], options?.signal);
       const applied: ProjectSourceStatus = { ...withoutPending(status), appliedHead: fetchedHead, appliedAt: new Date().toISOString() };
       this.writeStatus(projectId, applied);

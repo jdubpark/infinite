@@ -15,6 +15,9 @@ import InfiniteCore
     let role: String
     private let client: RemoteClient
     private var pollTask: Task<Void, Never>?
+    private var pageShown = false
+    private var displayVisible = false
+    private var pollGeneration = UUID()
     init(mission: Mission, client: RemoteClient, role: String) { self.mission = mission; self.client = client; self.role = role }
     var id: String { mission.id }
     /// Newer revisions always win; within a revision the later update does.
@@ -23,18 +26,49 @@ import InfiniteCore
         if next != mission { mission = next }
     }
     func startPolling() {
+        pageShown = true
+        updatePolling()
+    }
+    func stopPolling() {
+        pageShown = false
+        updatePolling()
+    }
+    func setDisplayVisible(_ visible: Bool) {
+        guard displayVisible != visible else { return }
+        displayVisible = visible
+        if !visible { fresh = false }
+        updatePolling()
+    }
+    private func updatePolling() {
+        guard pageShown && displayVisible else {
+            pollGeneration = UUID(); pollTask?.cancel(); pollTask = nil
+            return
+        }
         guard pollTask == nil else { return }
+        let generation = UUID(); pollGeneration = generation
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.poll()
+                guard let self, self.pollGeneration == generation, self.pageShown, self.displayVisible else { break }
+                await self.poll(generation)
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
+            guard let self, self.pollGeneration == generation else { return }
+            self.pollTask = nil
         }
     }
-    func stopPolling() { pollTask?.cancel(); pollTask = nil }
     func poll() async {
-        do { let value = try await client.request("/missions/\(mission.id)"); observe(Mission(value)); if !fresh { fresh = true } }
-        catch { if fresh { fresh = false } }
+        await poll(pollGeneration)
+    }
+    private func poll(_ generation: UUID) async {
+        guard displayVisible else { return }
+        do {
+            let value = try await client.request("/missions/\(mission.id)")
+            guard displayVisible, generation == pollGeneration else { return }
+            observe(Mission(value)); if !fresh { fresh = true }
+        } catch {
+            guard displayVisible, generation == pollGeneration else { return }
+            if fresh { fresh = false }
+        }
     }
     /// The spec gives answering, steering, and lifecycle controls to the owner only.
     var canAct: Bool { fresh && role == "owner" && !busy && pending == nil }

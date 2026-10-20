@@ -94,17 +94,17 @@ export class LinearService {
       const recordKey = file.slice(0, -7).replace("-", ":");
       const stored = unseal<Stored>(key, `linear:${recordKey}`, readFileSync(join(this.directory, file), "utf8"));
       if (keyOf(stored.kind, stored.id) !== recordKey) throw new Error("A Linear tracking record cannot be authenticated.");
-      this.records.set(recordKey, stored); this.saved.set(recordKey, JSON.stringify(stored));
+      this.records.set(recordKey, stored); this.saved.set(recordKey, hash(stored));
       this.fresh.set(recordKey, { requested: 1, verified: 0, queued: new Set(), readRequested: false });
     }
   }
 
   private save(stored: Stored) {
     if (this.closed) return;
-    const recordKey = keyOf(stored.kind, stored.id), serialized = JSON.stringify(stored);
-    if (this.saved.get(recordKey) === serialized) return;
+    const recordKey = keyOf(stored.kind, stored.id), fingerprint = hash(stored);
+    if (this.saved.get(recordKey) === fingerprint) return;
     writeSealed(join(this.directory, `${stored.kind}-${stored.id}.sealed`), this.key, `linear:${recordKey}`, stored);
-    this.saved.set(recordKey, serialized);
+    this.saved.set(recordKey, fingerprint);
   }
   private clock(stored: Stored) { return this.fresh.get(keyOf(stored.kind, stored.id))!; }
   private force(stored: Stored) { this.clock(stored).requested++; }

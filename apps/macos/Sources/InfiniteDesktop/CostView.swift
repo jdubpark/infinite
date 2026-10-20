@@ -21,44 +21,82 @@ import InfiniteCore
     @Published private(set) var loadedAt: Date?
     let client: RemoteClient
     let owner: Bool
+    private var displayVisible = false
+    private var displayGeneration = UUID()
+    private var reloadWhenIdle = false
     /// Days are bucketed in this Mac's timezone, so the bars match the owner's calendar.
     let tz = TimeZone.current.identifier
     init(client: RemoteClient, owner: Bool) { self.client = client; self.owner = owner }
 
+    func setDisplayVisible(_ visible: Bool) {
+        guard displayVisible != visible else { return }
+        displayVisible = visible
+        displayGeneration = UUID()
+        if !visible { reloadWhenIdle = false }
+    }
+
     /// One pass over every route; a single failing route leaves the others' data in place.
     func load() async {
-        guard !loading else { return }
-        loading = true; defer { loading = false }
+        guard displayVisible else { return }
+        guard !loading else { reloadWhenIdle = true; return }
+        loading = true
+        let generation = displayGeneration
+        defer {
+            loading = false
+            let reload = reloadWhenIdle && displayVisible
+            reloadWhenIdle = false
+            if reload { Task { await self.load() } }
+        }
         async let overview = client.usageOverview()
         async let daily = client.usageDaily(days: 30, tz: tz)
         async let projects = client.usageProjects(tz: tz)
         async let models = client.usageModels(role: role)
         var failures: [String] = []
-        do { self.overview = try await overview } catch { failures.append(error.localizedDescription) }
-        do { self.daily = try await daily } catch { failures.append(error.localizedDescription) }
-        do { self.projects = try await projects.projects.sorted { $0.total.usd > $1.total.usd } } catch { failures.append(error.localizedDescription) }
-        do { self.scorecard = try await models } catch { failures.append(error.localizedDescription) }
-        if let id = projectID { await loadProject(id) }
+        do {
+            let value = try await overview
+            guard isCurrent(generation) else { return }
+            self.overview = value
+        } catch { guard isCurrent(generation) else { return }; failures.append(error.localizedDescription) }
+        do {
+            let value = try await daily
+            guard isCurrent(generation) else { return }
+            self.daily = value
+        } catch { guard isCurrent(generation) else { return }; failures.append(error.localizedDescription) }
+        do {
+            let value = try await projects
+            guard isCurrent(generation) else { return }
+            self.projects = value.projects.sorted { $0.total.usd > $1.total.usd }
+        } catch { guard isCurrent(generation) else { return }; failures.append(error.localizedDescription) }
+        do {
+            let value = try await models
+            guard isCurrent(generation) else { return }
+            self.scorecard = value
+        } catch { guard isCurrent(generation) else { return }; failures.append(error.localizedDescription) }
+        if let id = projectID { await loadProject(id, generation: generation) }
+        guard isCurrent(generation) else { return }
         self.error = failures.first ?? ""
         if failures.isEmpty { loadedAt = Date() }
     }
+    private func isCurrent(_ generation: UUID) -> Bool { displayVisible && generation == displayGeneration }
     func loadModels() async {
+        guard displayVisible else { return }
         do { scorecard = try await client.usageModels(role: role); error = "" } catch { self.error = error.localizedDescription }
     }
     func open(project id: String) async {
         projectID = id; tab = .projects
         if project?.id != id { project = nil; projectDaily = nil }
-        await loadProject(id)
+        await loadProject(id, generation: displayGeneration)
     }
     func closeProject() { projectID = nil; project = nil; projectDaily = nil }
-    private func loadProject(_ id: String) async {
+    private func loadProject(_ id: String, generation: UUID) async {
         async let detail = client.usageProject(id, tz: tz)
         async let days = client.usageDaily(days: 30, tz: tz, project: id)
-        do { let value = try await detail; if projectID == id { project = value } } catch { self.error = error.localizedDescription }
-        do { let value = try await days; if projectID == id { projectDaily = value } } catch { self.error = error.localizedDescription }
+        do { let value = try await detail; if isCurrent(generation), projectID == id { project = value } } catch { if isCurrent(generation) { self.error = error.localizedDescription } }
+        do { let value = try await days; if isCurrent(generation), projectID == id { projectDaily = value } } catch { if isCurrent(generation) { self.error = error.localizedDescription } }
     }
     /// Owner only: asks the provider for a fresh balance, then reloads everything.
     func refresh() async {
+        guard displayVisible else { return }
         if owner { do { _ = try await client.refreshBalances() } catch { self.error = error.localizedDescription } }
         await load()
     }
@@ -122,10 +160,11 @@ struct CostView: View {
             }
         }
         .background(Palette.background)
-        .task(id: app.activeID) {
-            // Refresh while shown; the task ends with the view.
+        .task(id: "\(app.activeID):\(app.displayVisible)") {
+            guard app.displayVisible else { return }
             while !Task.isCancelled {
                 await model.load()
+                guard !Task.isCancelled else { return }
                 try? await Task.sleep(nanoseconds: 60_000_000_000)
             }
         }

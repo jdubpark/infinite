@@ -34,7 +34,7 @@ export const switchesMember = (data: Record<string, unknown>): data is LimitObse
 export class ProviderLimits {
   private state: State = { limits: {}, cleared: {} };
   /** Per-session journal position, latest limit observation, and latest successful turn end. */
-  private readonly sessions = new Map<string, { cursor: number; limitAt?: number; turnAt?: string }>();
+  private readonly sessions = new Map<string, { provider: Provider; cursor: number; limitAt?: number; turnAt?: string }>();
   constructor(private readonly file: string, private readonly key: Buffer) {
     // The memory is advisory and every entry expires, so an unreadable file starts it empty rather than blocking startup.
     if (existsSync(file)) try {
@@ -79,7 +79,7 @@ export class ProviderLimits {
         this.observe({ provider: session.provider, detectedAt: shown.since, ...(shown.resetsAt ? { resetsAt: shown.resetsAt } : {}), sessionId: session.id, ...(session.team ? { runId: session.team.runId } : {}), confidence: "corroborated" });
       const entry = this.active(now).find(limit => limit.provider === session.provider);
       if (!entry) continue;
-      const seen = this.sessions.get(session.id) ?? { cursor: 0 };
+      const seen = this.sessions.get(session.id) ?? { provider: session.provider, cursor: 0 };
       let page: ReturnType<LimitSessions["events"]>;
       // One unreadable journal must not keep other sessions from clearing the entry.
       try { page = sessions.events(session.id, seen.cursor, 200, new Set(["signal"])); } catch { continue; }
@@ -95,6 +95,9 @@ export class ProviderLimits {
       const turnAt = time(seen.turnAt);
       if (turnAt !== undefined && turnAt > Date.parse(entry.detectedAt) && (seen.limitAt === undefined || turnAt > seen.limitAt)) this.clear(session.provider, seen.turnAt);
     }
+    // A cursor lasts while its session is listed and its provider is limited; keeping it means a drained journal is not read again.
+    const listed = new Set(rows.map(row => row.id)), limited = this.limited(now);
+    for (const [sessionId, seen] of this.sessions) if (!listed.has(sessionId) || !limited.has(seen.provider)) this.sessions.delete(sessionId);
   }
   private save() { writeSealed(this.file, this.key, SCOPE, this.state); }
 }

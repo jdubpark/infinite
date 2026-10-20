@@ -455,7 +455,9 @@ export class RepositoryBriefings {
         if (this.closed) { for (const waiter of ready.waiters) waiter.reject(new Error("Repository brief service closed")); break; }
         this.setStatus(ready.session.id, { state: "running", ...(this.latest.get(ready.session.id)?.summary ? { summary: this.latest.get(ready.session.id)!.summary } : {}) });
         this.inFlight.set(ready.key, ready);
+        this.lastAttempt.delete(ready.session.id);
         this.lastAttempt.set(ready.session.id, Date.now());
+        while (this.lastAttempt.size > MAX_TRACKED) this.lastAttempt.delete(this.lastAttempt.keys().next().value!);
           const summary = await this.run(ready);
           this.inFlight.delete(ready.key);
           this.reports.set(ready.key, summary);

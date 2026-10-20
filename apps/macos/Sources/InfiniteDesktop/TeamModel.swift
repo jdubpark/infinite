@@ -24,6 +24,9 @@ struct TeamMutation: Equatable {
     let role: String
     private let client: RemoteClient
     private var pollTask: Task<Void, Never>?
+    private var pageShown = false
+    private var displayVisible = false
+    private var pollGeneration = UUID()
     private lazy var freshness = DisplayFreshness { [weak self] in self?.displayStale = $0 }
     init(run: TeamRun, client: RemoteClient, role: String) { self.run = run; self.client = client; self.role = role }
     var id: String { run.id }
@@ -33,18 +36,49 @@ struct TeamMutation: Equatable {
         if next != run { run = next }
     }
     func startPolling() {
+        pageShown = true
+        updatePolling()
+    }
+    func stopPolling() {
+        pageShown = false
+        updatePolling()
+    }
+    func setDisplayVisible(_ visible: Bool) {
+        guard displayVisible != visible else { return }
+        displayVisible = visible
+        if !visible { fresh = false }
+        updatePolling()
+    }
+    private func updatePolling() {
+        guard pageShown && displayVisible else {
+            pollGeneration = UUID(); pollTask?.cancel(); pollTask = nil
+            return
+        }
         guard pollTask == nil else { return }
+        let generation = UUID(); pollGeneration = generation
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.poll()
+                guard let self, self.pollGeneration == generation, self.pageShown, self.displayVisible else { break }
+                await self.poll(generation)
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
+            guard let self, self.pollGeneration == generation else { return }
+            self.pollTask = nil
         }
     }
-    func stopPolling() { pollTask?.cancel(); pollTask = nil }
     func poll() async {
-        do { let value = try await client.request("/teams/\(run.id)"); observe(TeamRun(value)); if !fresh { fresh = true }; freshness.recovered() }
-        catch { if fresh { fresh = false }; freshness.failed() }
+        await poll(pollGeneration)
+    }
+    private func poll(_ generation: UUID) async {
+        guard displayVisible else { return }
+        do {
+            let value = try await client.request("/teams/\(run.id)")
+            guard displayVisible, generation == pollGeneration else { return }
+            observe(TeamRun(value)); if !fresh { fresh = true }; freshness.recovered()
+        } catch {
+            guard displayVisible, generation == pollGeneration else { return }
+            if fresh { fresh = false }; freshness.failed()
+        }
     }
     /// A mission's subteam is run by its coordinator: the owner reads it, and talks to the coordinator from the mission.
     var managed: Bool { run.managedByMission }

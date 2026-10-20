@@ -124,6 +124,15 @@ never blocks another device. Session polling only redraws the window when the
 session list actually changes, and resource samples are requested only while a
 Resources window is open.
 
+Periodic desktop reads pause while Infinite is hidden, every Infinite window is
+minimized or fully occluded, or the display or system is asleep. A visible window
+refreshes immediately on return and resumes the existing cadence. This pauses
+the session list, chat, team, mission, cmux catalog, cost, and resource polls.
+Attached terminal streams stay open, and a held input lease continues its small
+renewal request; returning to the app never claims control again.
+Terminal output keeps its scrollback current, while xterm cursor blinking pauses
+when its page or session pane is not visible.
+
 ## Editing and terminal behavior
 
 Prompt composition happens in a native Mac text editor. Editing, selection, and

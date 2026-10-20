@@ -4,6 +4,10 @@ const terminal = new Terminal({
   cursorBlink: true, scrollback: 10000, allowProposedApi: false, disableStdin: true,
   theme: { background: '#0D1017', foreground: '#BFBDB6', cursor: '#E6B450', selectionBackground: '#273747' }
 });
+let rendererVisible = false;
+const updateCursorBlink = () => { terminal.options.cursorBlink = rendererVisible && document.visibilityState === 'visible'; };
+document.addEventListener('visibilitychange', updateCursorBlink);
+updateCursorBlink();
 const fit = new FitAddon.FitAddon();
 terminal.loadAddon(fit); terminal.open(document.getElementById('terminal'));
 // GPU rendering keeps full-screen TUI redraws smooth; the DOM renderer remains the fallback.
@@ -35,6 +39,7 @@ window.infiniteTerminal = {
     return new Promise(resolve => terminal.write(bytes, () => { if (reset) fitViewport(); resolve(); }));
   },
   control(enabled) { terminal.options.disableStdin = !enabled; },
+  render(enabled) { rendererVisible = enabled; updateCursorBlink(); },
   follow(enabled) { follows = enabled; if (enabled) fitViewport(); },
   focus() { terminal.focus(); },
   selection() { return terminal.getSelection(); },

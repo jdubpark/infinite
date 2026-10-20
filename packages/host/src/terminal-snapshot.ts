@@ -120,7 +120,7 @@ export class TerminalSnapshots {
           if (enabled) this.unsupported.add("synchronized-output");
           else this.unsupported.delete("synchronized-output");
         } else if (![1, 6, 7, 9, 45, 66, 1000, 1002, 1003, 1004, 1049, 2004].includes(mode)) {
-          this.unsupported.add(`mode-${mode}`);
+          this.unsupported.add("unknown-private-mode");
         }
       }
     } else if ((final === "h" || final === "l") && params !== "4") {

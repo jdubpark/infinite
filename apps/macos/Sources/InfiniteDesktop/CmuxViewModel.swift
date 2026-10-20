@@ -30,6 +30,7 @@ private struct CmuxPendingCreation: Codable {
     @Published var activeID = ""
     @Published var connected = false
     @Published var connecting = false
+    @Published private(set) var displayVisible = false
     @Published private(set) var disconnecting = false
     @Published var attached = false
     @Published var busy = false
@@ -53,6 +54,8 @@ private struct CmuxPendingCreation: Codable {
     private let backend = CmuxBackend()
     private let drafts = DraftStore()
     private var poll: Task<Void, Never>?
+    private var displayGeneration = UUID()
+    private var pollGeneration = UUID()
     private var saveTask: Task<Void, Never>?
     private var connectionGeneration = UUID()
     private var attachmentGeneration = UUID()
@@ -68,12 +71,53 @@ private struct CmuxPendingCreation: Codable {
     private var attachedProfileID = ""
     var active: CmuxHostProfile? { profiles.first { $0.id == activeID } }
     var selected: CmuxTerminalRow? { terminals.first { $0.id == selectedID } }
+    var rendererVisible: Bool { displayVisible && attached }
     var canSend: Bool { connected && attached && snapshotReady && inputEnabled && !directInput && !busy && draft.pendingID == nil && !draft.text.isEmpty }
     private var draftIdentity: String? { selectedID.map { "cmux:\(attachedProfileID):\($0)" } }
 
     init() {
         if let data = UserDefaults.standard.data(forKey: "cmuxProfiles"), let saved = try? JSONDecoder().decode([CmuxHostProfile].self, from: data) { profiles = saved }
         activeID = UserDefaults.standard.string(forKey: "activeCmuxProfile") ?? profiles.first?.id ?? ""
+    }
+
+    func setDisplayVisible(_ visible: Bool) {
+        guard displayVisible != visible else { return }
+        displayVisible = visible
+        displayGeneration = UUID()
+        // A failed catalog read clears `connected`; the established backend still resumes polling, whose next read recovers it.
+        if visible, hasConnected {
+            let generation = displayGeneration
+            Task {
+                await refresh()
+                guard self.displayVisible, self.displayGeneration == generation, self.hasConnected, !self.disconnecting else { return }
+                if selectedID == nil, let id = terminals.first?.id { await select(id) }
+                startPolling()
+            }
+        } else {
+            stopPolling()
+        }
+    }
+
+    private func startPolling() {
+        guard poll == nil, hasConnected, !disconnecting, displayVisible else { return }
+        let generation = connectionGeneration, visibility = displayGeneration
+        let run = UUID(); pollGeneration = run
+        poll = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self, !Task.isCancelled, self.pollGeneration == run,
+                      self.connectionGeneration == generation, self.hasConnected, !self.disconnecting, self.displayVisible,
+                      self.displayGeneration == visibility else { break }
+                await self.refresh()
+            }
+            guard let self, self.pollGeneration == run else { return }
+            self.poll = nil
+        }
+    }
+
+    private func stopPolling() {
+        pollGeneration = UUID()
+        poll?.cancel(); poll = nil
     }
 
     func addProfile(label: String, route: String, invitation: String) async {
@@ -111,13 +155,7 @@ private struct CmuxPendingCreation: Codable {
             guard generation == connectionGeneration else { return }
             if let id = terminals.first?.id { await select(id) }
             guard generation == connectionGeneration else { return }
-            poll = Task { [weak self] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
-                    guard let self, !Task.isCancelled, self.connectionGeneration == generation else { return }
-                    await self.refresh()
-                }
-            }
+            startPolling()
         } catch {
             guard generation == connectionGeneration else { return }
             connecting = false; connected = false; connectionStatus = "Disconnected"
@@ -126,11 +164,11 @@ private struct CmuxPendingCreation: Codable {
     }
 
     func refresh() async {
-        guard !disconnecting else { return }
-        let generation = connectionGeneration
+        guard displayVisible, !disconnecting else { return }
+        let generation = connectionGeneration, visibility = displayGeneration
         do {
             let snapshot = try await backend.snapshot()
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             let tabs = snapshot["tabs"].array, panes = snapshot["panes"].array, screens = snapshot["screens"].array, workspaces = snapshot["workspaces"].array
             terminals = snapshot["terminals"].array.map { terminal in
                 let tab = tabs.first { $0["id"] == terminal["tab_id"] }
@@ -144,7 +182,7 @@ private struct CmuxPendingCreation: Codable {
             catalogFreshness.recovered()
             if let selectedID, !terminals.contains(where: { $0.id == selectedID && $0.running }) { inputEnabled = false; directInput = false }
         } catch {
-            guard generation == connectionGeneration else { return }
+            guard generation == connectionGeneration, visibility == displayGeneration, displayVisible else { return }
             connected = false; inputEnabled = false; directInput = false
             catalogFreshness.failed()
         }
@@ -371,7 +409,7 @@ private struct CmuxPendingCreation: Codable {
         guard !disconnecting else { return }
         disconnecting = true
         defer { disconnecting = false }
-        try persistDraft(); saveTask?.cancel(); poll?.cancel(); poll = nil
+        try persistDraft(); saveTask?.cancel(); stopPolling()
         connectionGeneration = UUID(); attachmentGeneration = UUID()
         connected = false; connecting = false; attaching = false; sendingRaw = false; busyAttachment = nil
         inputEnabled = false; directInput = false; attached = false; snapshotReady = false; snapshotReceived = false; queuedInput.removeAll()

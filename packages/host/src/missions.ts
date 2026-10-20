@@ -89,7 +89,7 @@ export class MissionService {
       const stored = unseal<Stored>(key, `mission:${id}`, readFileSync(join(this.directory, file), "utf8"));
       if (stored.mission.id !== id) throw new TeamError(409, "invalid-mission-record", "A mission record cannot be authenticated.");
       this.records.set(id, stored);
-      this.saved.set(id, JSON.stringify(stored));
+      this.saved.set(id, digest(stored));
     }
     this.teams.useMissionReservations((projectId, exceptMissionId) => {
       for (const [missionId, stored] of this.records) {
@@ -119,10 +119,10 @@ export class MissionService {
     const attempt = stored.attempts.at(-1), mission = stored.mission;
     mission.coordinator = attempt && { memberId: attempt.memberId, sessionId: attempt.sessionId,
       status: attempt.status !== "stopped" ? "running" : live.has(mission.status) ? "waiting" : "stopped" };
-    if (this.saved.get(mission.id) === JSON.stringify(stored)) return;
+    if (this.saved.get(mission.id) === digest(stored)) return;
     mission.updatedAt = now();
     writeSealed(join(this.directory, `${mission.id}.sealed`), this.key, `mission:${mission.id}`, stored);
-    this.saved.set(mission.id, JSON.stringify(stored));
+    this.saved.set(mission.id, digest(stored));
   }
   private event(stored: Stored, text: string) {
     stored.mission.events.push({ at: now(), text });

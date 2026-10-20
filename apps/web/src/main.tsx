@@ -527,11 +527,26 @@ function Create({
     setSyncError(null);
     setSyncNotice("");
     if (!projectId || !syncs) return;
-    let active = true;
-    const load = () => api<ProjectDetail>(`/projects/${projectId}`).then(detail => { if (active) setProject(detail); }).catch(() => { if (active) setProject(null); });
-    void load();
-    const timer = setInterval(load, 5000);
-    return () => { active = false; clearInterval(timer); };
+    // Hiding the tab stops the 5-second read and starts a new generation, so an earlier reply cannot replace a later one.
+    let active = true, generation = 0;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const load = () => {
+      const started = generation;
+      const current = () => active && started === generation;
+      // An unchanged detail keeps its object, so the panel does not re-render.
+      api<ProjectDetail>(`/projects/${projectId}`).then(detail => { if (current()) setProject(previous => JSON.stringify(previous) === JSON.stringify(detail) ? previous : detail); }).catch(() => { if (current()) setProject(null); });
+    };
+    const schedule = () => {
+      generation++;
+      clearInterval(timer);
+      timer = undefined;
+      if (document.visibilityState === "hidden") return;
+      load();
+      timer = setInterval(load, 5000);
+    };
+    document.addEventListener("visibilitychange", schedule);
+    schedule();
+    return () => { active = false; clearInterval(timer); document.removeEventListener("visibilitychange", schedule); };
   }, [api, projectId, syncs]);
   async function applyPending(force: boolean) {
     const id = projectId;
@@ -678,32 +693,55 @@ function TerminalView({ id, readOnly }: { id: string; readOnly: boolean }) {
     const observer = new ResizeObserver(() => fit.fit());
     observer.observe(element.current!);
     let active = true,
-      cursor = 0;
+      cursor = 0,
+      retry = 1800,
+      // Hiding the tab starts a new generation: output from an earlier read is dropped, and returning reads again at once.
+      generation = 0,
+      inFlight: number | undefined;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
+      clearTimeout(timer);
+      if (!active || inFlight === generation || document.visibilityState === "hidden") return;
+      const started = generation;
+      const current = () => active && started === generation;
+      inFlight = started;
       try {
         const page = await api<{
           events: LogEvent[];
           cursor: number;
           more: boolean;
         }>(`/sessions/${id}/events?after=${cursor}`);
-        if (!active) return;
+        if (!current()) return;
         for (const event of page.events)
           if (event.type === "output") terminal.write(String(event.data.text));
         cursor = page.cursor;
         setError("");
+        retry = 1800;
         timer = setTimeout(poll, page.more ? 0 : 800);
       } catch {
-        if (active) {
+        if (current()) {
           setError("Waiting for the host. Recorded output will resume here.");
-          timer = setTimeout(poll, 1800);
+          // Retries back off while the host is unreachable, so an offline tab does not poll every 1.8 seconds.
+          timer = setTimeout(poll, retry);
+          retry = Math.min(retry * 2, 15000);
         }
+      } finally {
+        if (inFlight === started) inFlight = undefined;
       }
     };
+    const resume = () => { generation++; void poll(); };
+    // Coming back online or to the window retries at once instead of waiting out the backoff.
+    const retryNow = () => { if (inFlight === undefined) void poll(); };
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("online", retryNow);
+    window.addEventListener("focus", retryNow);
     void poll();
     return () => {
       active = false;
       clearTimeout(timer);
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("online", retryNow);
+      window.removeEventListener("focus", retryNow);
       observer.disconnect();
       terminal.dispose();
     };

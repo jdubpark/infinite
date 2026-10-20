@@ -5,6 +5,7 @@ import InfiniteCore
 
 @main struct InfiniteDesktopApp: App {
     @StateObject private var model = AppModel()
+    @StateObject private var visibility = DisplayVisibilityMonitor()
     @NSApplicationDelegateAdaptor(DesktopDelegate.self) private var delegate
     init() {
         // A locked Keychain or changed signing identity must produce a usable
@@ -14,18 +15,36 @@ import InfiniteCore
     var body: some Scene {
         Window("Infinite", id: "main") {
             DesktopView(app: model)
+                .modifier(DisplayVisibilityUpdates(app: model, visibility: visibility))
                 .frame(minWidth: 880, minHeight: 560)
-                .onAppear { delegate.model = model; model.start() }
+                .onAppear {
+                    delegate.model = model
+                    model.start()
+                }
         }
         .defaultSize(width: 1240, height: 820)
         .commands { WorkspaceCommands(app: model) }
-        Window("Resources", id: "resources") { ResourceView(app: model).frame(minWidth: 640, minHeight: 480) }
+        Window("Resources", id: "resources") { ResourceView(app: model).modifier(DisplayVisibilityUpdates(app: model, visibility: visibility)).frame(minWidth: 640, minHeight: 480) }
             .defaultSize(width: 840, height: 640)
-        Window("Files & Sync", id: "files") { FilesView(app: model).frame(minWidth: 780, minHeight: 540) }
+        Window("Files & Sync", id: "files") { FilesView(app: model).modifier(DisplayVisibilityUpdates(app: model, visibility: visibility)).frame(minWidth: 780, minHeight: 540) }
             .defaultSize(width: 1040, height: 720)
-        Window("cmux Workspaces", id: "cmux") { CmuxWorkspaceView(model: model.cmux).frame(minWidth: 780, minHeight: 540) }
+        Window("cmux Workspaces", id: "cmux") { CmuxWorkspaceView(model: model.cmux).modifier(DisplayVisibilityUpdates(app: model, visibility: visibility)).frame(minWidth: 780, minHeight: 540) }
             .defaultSize(width: 1120, height: 760)
-        Settings { ConnectionsView(app: model).frame(width: 600) }
+        Settings { ConnectionsView(app: model).modifier(DisplayVisibilityUpdates(app: model, visibility: visibility)).frame(width: 600) }
+    }
+}
+
+private struct DisplayVisibilityUpdates: ViewModifier {
+    @ObservedObject var app: AppModel
+    @ObservedObject var visibility: DisplayVisibilityMonitor
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                visibility.refresh()
+                app.setDisplayVisible(visibility.state.isVisible)
+            }
+            .onChange(of: visibility.state) { _, state in app.setDisplayVisible(state.isVisible) }
     }
 }
 
@@ -299,12 +318,14 @@ struct DesktopView: View {
     private var panes: some View {
         GeometryReader { area in
             let visible = app.visibleIDs
+            let rendererVisible = app.displayVisible && !app.showingHome && !app.showingCost && missionModel == nil && teamModel == nil
             let width = max(1, (area.size.width - CGFloat(visible.count - 1)) / CGFloat(max(1, visible.count)))
             ZStack(alignment: .topLeading) {
                 ForEach(app.mounted, id: \.self) { id in
                     if let model = app.model(for: id) {
                         let slot = visible.firstIndex(of: id)
-                        SessionPane(model: model, closeView: visible.count > 1 && id == app.secondaryID ? { app.secondaryID = nil } : nil, openMission: { app.selectedMissionID = $0 })
+                        SessionPane(model: model, closeView: visible.count > 1 && id == app.secondaryID ? { app.secondaryID = nil } : nil,
+                                    openMission: { app.selectedMissionID = $0 }, rendererVisible: rendererVisible && slot != nil)
                             .frame(width: slot == nil ? area.size.width : width, height: area.size.height)
                             .offset(x: slot.map { CGFloat($0) * (width + 1) } ?? 0)
                             .opacity(slot == nil ? 0 : 1)
@@ -348,6 +369,7 @@ struct SessionPane: View {
     var closeView: (() -> Void)?
     /// Opens the mission that runs this session, when it has one; its line then leads there.
     var openMission: ((String) -> Void)? = nil
+    var rendererVisible = true
     @State private var confirmEnd = false
     @State private var confirmClear = false
     private var session: AgentSession { model.session }
@@ -361,7 +383,9 @@ struct SessionPane: View {
                 if model.screenShown {
                     GeometryReader { area in
                         let generation = model.rendererGeneration
-                        TerminalSurface(pipe: model.pipe, acceptsInput: model.directInput && model.canUseTerminal, followsViewport: model.hasControl, onInput: model.raw, onResize: { cols, rows in Task { await model.resize(cols, rows) } }, onFailure: { message in
+                        TerminalSurface(pipe: model.pipe, acceptsInput: model.directInput && model.canUseTerminal,
+                                        followsViewport: model.hasControl, isVisible: rendererVisible && model.view == .screen,
+                                        onInput: model.raw, onResize: { cols, rows in Task { await model.resize(cols, rows) } }, onFailure: { message in
                             if generation == model.rendererGeneration { model.rendererFailed(message) }
                         }, onReady: { model.rendererRestored(generation) })
                             .id(generation).frame(width: area.size.width, height: area.size.height)

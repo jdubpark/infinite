@@ -55,12 +55,14 @@ class SessionControl {
   constructor(
     private readonly connection: Connection,
     private readonly id: string,
+    private readonly onUnused: () => void,
   ) {}
 
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
+      this.collect();
     };
   };
   snapshot = () => this.state;
@@ -85,6 +87,11 @@ class SessionControl {
       return;
     this.state = next;
     for (const listener of this.listeners) listener();
+  }
+
+  private collect() {
+    if (!this.listeners.size && this.focused === 0 && !this.state.lease && !this.claiming && !this.renewing)
+      this.onUnused();
   }
 
   private active() {
@@ -115,11 +122,15 @@ class SessionControl {
     this.revision++;
     const previous = this.state.lease;
     this.hold(null);
-    if (!previous) return;
+    if (!previous) {
+      this.collect();
+      return;
+    }
     this.set({
       message: "Monitoring. Take control again when you are ready to send input.",
     });
     if (release) this.release(previous);
+    this.collect();
   };
 
   /** The host refused input for control: this phone no longer holds a lease there. */
@@ -172,6 +183,7 @@ class SessionControl {
     } finally {
       this.claiming = false;
       this.set({ busy: false });
+      this.collect();
     }
   };
 
@@ -210,6 +222,7 @@ class SessionControl {
         this.renewOnForeground = false;
         if (!renewed && this.state.lease && this.active()) void this.renew();
       }
+      this.collect();
     }
   }
 
@@ -247,7 +260,9 @@ function controlFor(connection: Connection, id: string) {
   const key = `${connection.url}\n${connection.token}\n${id}`;
   let control = controls.get(key);
   if (!control) {
-    control = new SessionControl(connection, id);
+    control = new SessionControl(connection, id, () => {
+      if (controls.get(key) === control) controls.delete(key);
+    });
     controls.set(key, control);
   }
   return control;

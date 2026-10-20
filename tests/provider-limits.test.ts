@@ -127,6 +127,27 @@ test("a clear waits until the session's journal has been read to its end", async
   } finally { s.close(); }
 });
 
+test("a drained journal is not read again while its limit lasts, and its cursor goes once the limit expires or the session is gone", async () => {
+  const s = store();
+  try {
+    const limits = s.open();
+    limits.observe({ provider: "claude", detectedAt: at("10:00"), sessionId: "s1", confidence: "corroborated" });
+    const reads: number[] = [];
+    const journal = sessions({ old: [{ at: at("09:00"), data: claudeLimit }, { at: at("09:30"), data: claudeLimit }] });
+    const manager: LimitSessions = { events: (id, after, limit, types) => { reads.push(after); return journal.events(id, after, limit, types); } };
+    const rows: LimitRow[] = [{ id: "old", provider: "claude", attention: {} }];
+    for (const minute of ["10:01", "10:02", "10:03"]) await limits.reconcile(manager, rows, new Date(at(minute)));
+    assert.deepEqual(reads, [0, 2, 2], "each pass resumes after the events it already read");
+
+    const cursors = (limits as unknown as { sessions: Map<string, unknown> }).sessions;
+    await limits.reconcile(manager, [], new Date(at("10:04")));
+    assert.equal(cursors.size, 0, "a session no longer listed needs no cursor");
+    await limits.reconcile(manager, rows, new Date(at("10:05")));
+    await limits.reconcile(manager, rows, new Date(at("10:16")));
+    assert.equal(cursors.size, 0, "an expired provider limit needs no per-session cursors");
+  } finally { s.close(); }
+});
+
 test("a Codex terminal turn end does not clear an entry; a native turn end does", async () => {
   const s = store();
   try {

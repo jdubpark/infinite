@@ -56,7 +56,7 @@ export class GoalService {
         }
       }
       this.records.set(id, stored);
-      this.saved.set(id, JSON.stringify(stored));
+      this.saved.set(id, digest(stored));
     }
   }
   enabled() {
@@ -72,10 +72,10 @@ export class GoalService {
     return stored;
   }
   private save(stored: Stored) {
-    if (this.saved.get(stored.goal.id) === JSON.stringify(stored)) return;
+    if (this.saved.get(stored.goal.id) === digest(stored)) return;
     stored.goal.updatedAt = now();
     writeSealed(join(this.directory, `${stored.goal.id}.sealed`), this.key, `goal:${stored.goal.id}`, stored);
-    this.saved.set(stored.goal.id, JSON.stringify(stored));
+    this.saved.set(stored.goal.id, digest(stored));
   }
   private event(stored: Stored, text: string) {
     stored.goal.events.push({ at: now(), text });

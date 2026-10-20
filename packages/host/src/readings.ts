@@ -16,6 +16,8 @@ export type SessionReading = {
   title?: { text: string; source: "first-line" | "jev-first-line" | "writer"; model?: string };
 };
 export type ReadingRow = { id: string; title: string; provider: Provider; attention: Attention; reading?: SessionReading; backend?: string };
+type LatestRow = { backend?: string; state: Attention["state"]; lastMessageHash: string; lastMessageLength: number };
+type LatestSession = { defaultTitle: boolean; promptLine: string; promptLineLength: number; promptHash?: string };
 type Key = "now" | "title";
 type StoredEntry = { key: string; value?: SessionReading; failedUntil?: number };
 type Evaluation = { hash: string; outcome: { kind: "result"; value: SessionReading } | { kind: "failure"; failedUntil: number } };
@@ -97,8 +99,8 @@ export class Readings {
   private readonly evaluations = new Map<string, Partial<Record<Key, Evaluation>>>();
   private readonly queue = new Map<string, PendingJob>();
   private readonly active = new Map<string, string>();
-  private readonly latestRows = new Map<string, ReadingRow>();
-  private readonly latestSessions = new Map<string, Session>();
+  private readonly latestRows = new Map<string, LatestRow>();
+  private readonly latestSessions = new Map<string, LatestSession>();
   private observationRevision = 0;
   private timer?: ReturnType<typeof setInterval>;
   private readonly apiKey?: string;
@@ -129,7 +131,7 @@ export class Readings {
   /** Synchronous cache merge; stale message hashes and owner titles are omitted. */
   merge<T extends ReadingRow>(rows: T[]): T[] {
     const completeSnapshot = rows.length === 0 || rows.every(row => row.backend !== undefined);
-    this.observeRows(rows, completeSnapshot ? "snapshot" : "partial");
+    this.observeRows(rows, completeSnapshot ? "snapshot" : "partial", (row, session) => this.queueTitleReading(row, session));
     const merged = rows.map(row => {
       const reading: SessionReading = {};
       const message = row.attention.lastMessage ?? "";
@@ -143,17 +145,10 @@ export class Readings {
       }
       try {
         const session = this.latestSessions.get(row.id);
-        const prompt = session?.initialPrompt;
-        if (row.backend !== "cmux" && session && defaultTitle(session.title, session.provider, session.generatedTitle) && prompt !== undefined) {
-          const line = firstLine(prompt);
-          if (line) {
-            const fallback = { text: line.length <= 60 ? line : clipTitle(line), source: "first-line" as const };
-            const value = this.cached(row.id, "title", messageHash(prompt));
-            reading.title = value?.title ?? fallback;
-            if (this.config.jev && this.writer && line.length > 60) {
-              this.enqueue(row.id, "title", messageHash(prompt), stillCurrent => this.readTitle(row, prompt, line, messageHash(prompt), stillCurrent));
-            }
-          }
+        if (row.backend !== "cmux" && session?.defaultTitle && session.promptLine && session.promptHash) {
+          const fallback = { text: session.promptLine, source: "first-line" as const };
+          const value = this.cached(row.id, "title", session.promptHash);
+          reading.title = value?.title ?? fallback;
         }
       } catch { /* Native cmux rows have no Infinite metadata. */ }
       if (this.config.jev) this.queueTurnReading(row);
@@ -170,21 +165,14 @@ export class Readings {
     let rows: ReadingRow[];
     try { rows = await this.manager.list({ includeFullMessage: true }) as ReadingRow[]; } catch { return; }
     if (this.observationRevision !== revision) return;
-    this.observeRows(rows, "tick");
+    this.observeRows(rows, "tick", (row, session) => this.queueTitleReading(row, session));
     for (const row of rows) {
       this.queueTurnReading(row);
-      const session = this.latestSessions.get(row.id);
-      if (!session) continue;
-      const prompt = session.initialPrompt ?? "";
-      if (!defaultTitle(session.title, session.provider, session.generatedTitle) || !prompt) continue;
-      const line = firstLine(prompt);
-      const hash = messageHash(prompt);
-      if (line.length > 60 && this.writer) this.enqueue(row.id, "title", hash, stillCurrent => this.readTitle(row, prompt, line, hash, stillCurrent));
     }
     this.drain();
   }
 
-  private observeRows(rows: ReadingRow[], source: "partial" | "snapshot" | "tick") {
+  private observeRows(rows: ReadingRow[], source: "partial" | "snapshot" | "tick", onSession?: (row: ReadingRow, session: Session) => void) {
     this.observationRevision++;
     const incoming = new Set(rows.map(row => row.id));
     if (source === "snapshot" || source === "tick") {
@@ -196,9 +184,19 @@ export class Readings {
       for (const [id, row] of retainedExternal) this.latestRows.set(id, row);
     }
     for (const row of rows) {
-      this.latestRows.set(row.id, row);
-      try { this.latestSessions.set(row.id, this.manager.meta(row.id).session); }
-      catch { this.latestSessions.delete(row.id); }
+      const lastMessage = row.attention.lastMessage ?? "";
+      this.latestRows.set(row.id, { backend: row.backend, state: row.attention.state,
+        lastMessageHash: "", lastMessageLength: lastMessage.length });
+      let session: Session;
+      try { session = this.manager.meta(row.id).session; }
+      catch { this.latestSessions.delete(row.id); continue; }
+      const prompt = session.initialPrompt ?? "";
+      const titleIsDefault = defaultTitle(session.title, session.provider, session.generatedTitle);
+      const line = titleIsDefault && prompt ? firstLine(prompt) : "";
+      this.latestSessions.set(row.id, { defaultTitle: titleIsDefault,
+        promptLine: line.length <= 60 ? line : clipTitle(line), promptLineLength: line.length,
+        ...(titleIsDefault && prompt ? { promptHash: messageHash(prompt) } : {}) });
+      onSession?.(row, session);
     }
     if (source === "partial") return;
     const live = new Set(this.latestRows.keys());
@@ -212,7 +210,19 @@ export class Readings {
     const text = row.attention.lastMessage ?? "";
     if (row.attention.state !== "turn-finished" || text.length <= 200 || candidateSentences(text).length < 2 || !isWeakRuleLine(text)) return;
     const hash = messageHash(text);
+    const latest = this.latestRows.get(row.id);
+    if (latest) this.latestRows.set(row.id, { ...latest, lastMessageHash: hash });
     this.enqueue(row.id, "now", hash, stillCurrent => this.readNow(row, text, hash, stillCurrent));
+  }
+
+  private queueTitleReading(row: ReadingRow, session: Session) {
+    if (!this.config.jev || !this.writer || !defaultTitle(session.title, session.provider, session.generatedTitle)) return;
+    const prompt = session.initialPrompt ?? "";
+    if (!prompt) return;
+    const line = firstLine(prompt);
+    if (line.length <= 60) return;
+    const hash = messageHash(prompt);
+    this.enqueue(row.id, "title", hash, stillCurrent => this.readTitle(row, prompt, line, hash, stillCurrent));
   }
 
   private enqueue(sessionId: string, type: Key, hash: string, work: PendingJob["work"]) {
@@ -256,12 +266,11 @@ export class Readings {
     const row = this.latestRows.get(job.sessionId);
     if (!row) return false;
     if (job.type === "now") {
-      const message = row.attention.lastMessage ?? "";
-      return messageHash(message) === job.hash && row.attention.state === "turn-finished" && message.length > 200 && candidateSentences(message).length >= 2 && isWeakRuleLine(message);
+      return row.lastMessageHash === job.hash && row.state === "turn-finished" && row.lastMessageLength > 200;
     }
     const session = this.latestSessions.get(job.sessionId);
-    const prompt = session?.initialPrompt ?? "";
-    return Boolean(this.writer && this.config.jev && session && row.backend !== "cmux" && defaultTitle(session.title, session.provider, session.generatedTitle) && firstLine(prompt).length > 60 && messageHash(prompt) === job.hash);
+    return Boolean(this.writer && this.config.jev && session?.defaultTitle && row.backend !== "cmux" &&
+      session.promptLineLength > 60 && session.promptHash === job.hash);
   }
 
   private async readNow(row: ReadingRow, message: string, hash: string, stillCurrent: () => boolean) {

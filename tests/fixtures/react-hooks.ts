@@ -1,5 +1,5 @@
 /**
- * Stands in for React's hook runtime, and for expo-router's `useFocusEffect`, so one custom
+ * Stands in for React's hook runtime, and for expo-router's `useFocusEffect` and `useIsFocused`, so one custom
  * hook can run under Node. It keeps React's contract for these hooks: state, refs and
  * callbacks persist across renders, and an effect reruns (after its cleanup) only when a
  * dependency changes.
@@ -51,6 +51,8 @@ export function useSyncExternalStore<T>(_subscribe: (listener: () => void) => ()
 
 /** A mounted test screen stays focused: its focus effect runs on mount and cleans up on unmount. */
 export const useFocusEffect = (effect: () => void | (() => void)) => useEffect(effect, [effect]);
+/** A hook rendered here is always on a focused screen. */
+export const useIsFocused = () => true;
 
 /** Mounts `hook`. `read()` renders again with the latest state; `unmount()` runs effect cleanups. */
 export function renderHook<T>(hook: () => T) {

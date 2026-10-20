@@ -5,28 +5,33 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 
-// Runs the web client's conversation panel in Chromium and toggles page visibility to check its polling.
+// Runs the web client's conversation panel and control lease in Chromium and toggles page visibility to check their requests.
 // PLAYWRIGHT_CHROMIUM_PATH selects a Chromium build other than the one `npx playwright install chromium` provides.
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
 const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/web-polling-harness.tsx", import.meta.url));
+const controlHarness = fileURLToPath(new URL("./fixtures/web-control-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1/polling";
 
 describe("web conversation polling", { skip }, () => {
   let browser: Browser;
-  let script: string;
+  let script: string, controlScript: string;
+  const bundle = async (entry: string) => (await build({ entryPoints: [entry], bundle: true, write: false, format: "iife", jsx: "automatic", logLevel: "silent", define: { "process.env.NODE_ENV": '"production"' } })).outputFiles[0].text;
   before(async () => {
-    const bundle = await build({ entryPoints: [harness], bundle: true, write: false, format: "iife", jsx: "automatic", logLevel: "silent", define: { "process.env.NODE_ENV": '"production"' } });
-    script = bundle.outputFiles[0].text;
+    [script, controlScript] = await Promise.all([bundle(harness), bundle(controlHarness)]);
     browser = await chromium.launch({ executablePath });
   });
   after(() => browser?.close());
 
-  async function open(): Promise<Page> {
+  async function load(content: string): Promise<Page> {
     const page = await browser.newPage();
     await page.route(ORIGIN, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div>' }));
     await page.goto(ORIGIN);
-    await page.addScriptTag({ content: script });
+    await page.addScriptTag({ content });
+    return page;
+  }
+  async function open(): Promise<Page> {
+    const page = await load(script);
     await page.waitForFunction(() => (window as unknown as { polling: { requests: number } }).polling.requests >= 1);
     return page;
   }
@@ -97,6 +102,23 @@ describe("web conversation polling", { skip }, () => {
       assert.equal(await warning.count(), 0);
       // The read started on return is still unanswered, so the warning comes back after the grace period.
       await warning.waitFor({ timeout: 3000 });
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("a held control lease renews as soon as a hidden tab returns", async () => {
+    type Control = { renewals: number; held: { id: string } | null; claim: () => void };
+    const page = await load(controlScript);
+    try {
+      await page.waitForFunction(() => { (window as unknown as { control: Control }).control.claim(); return true; });
+      await page.waitForFunction(() => (window as unknown as { control: Control }).control.held?.id === "lease-1", undefined, { timeout: 2000 });
+      await setVisibility(page, "hidden");
+      await page.waitForTimeout(300);
+      assert.equal(await page.evaluate(() => (window as unknown as { control: Control }).control.renewals), 0);
+      await setVisibility(page, "visible");
+      // The periodic renewal is every 10 seconds, so a renewal within half a second comes from the return itself.
+      await page.waitForFunction(() => (window as unknown as { control: Control }).control.renewals === 1, undefined, { timeout: 500 });
     } finally {
       await page.close();
     }

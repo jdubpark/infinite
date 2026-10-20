@@ -37,6 +37,7 @@ import "@fontsource/instrument-sans/500.css";
 import "@fontsource/instrument-sans/600.css";
 import "@xterm/xterm/css/xterm.css";
 import { foreground, useLiveRefresh } from "./live-refresh";
+import { useSessionControl } from "./session-control";
 import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamView } from "./teams";
 import { GoalCreate, GoalDetail, GoalList, GoalPicker, clearGoalRequests, type ProductGoal } from "./goals";
 import { CostPage, CostPicker } from "./cost";
@@ -49,116 +50,6 @@ const time = (value: string) =>
   });
 // Switching sessions paints the last view immediately, but never restores authority.
 const sessionViews = new Map<string, { session: Session; events: LogEvent[]; cursor: number; seen: string }>();
-
-function useSessionControl(id: string) {
-  const api = useApi();
-  const [lease, setLease] = useState<ControlLease | null>(null);
-  const [holder, setHolder] = useState<ControlLease | null>(null);
-  const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState(false);
-  const owned = useRef<ControlLease | null>(null);
-  const claiming = useRef(false);
-  const generation = useRef(0);
-  const mounted = useRef(true);
-  const releaseRequest = (control: ControlLease) => api(`/sessions/${id}/control`, {
-    action: "release", leaseId: control.id,
-  }).catch(() => {});
-  const forget = (release = false) => {
-    generation.current++;
-    const previous = owned.current;
-    owned.current = null;
-    setLease(null);
-    if (previous) {
-      setHolder(current => current?.id === previous.id ? null : current);
-      setMessage("");
-      if (release) void releaseRequest(previous);
-    }
-  };
-  const observe = (session: Session, revision: number) => {
-    if (claiming.current || revision !== generation.current) return;
-    setHolder(session.control ?? null);
-    const previous = owned.current;
-    if (previous && (session.control?.id !== previous.id ||
-      session.control.expiresAt <= Date.now() || session.status !== "running")) forget();
-  };
-  const claim = async (takeover = false) => {
-    if (claiming.current) return;
-    claiming.current = true;
-    const revision = ++generation.current;
-    setBusy(true); setMessage("");
-    try {
-      const result = await api<{ control: ControlLease | null }>(`/sessions/${id}/control`, { action: "claim", takeover });
-      if (!mounted.current || !foreground() || revision !== generation.current) {
-        if (result.control) void releaseRequest(result.control);
-        return;
-      }
-      // A poll started while claim was pending still carries the old holder.
-      // Fence that response as well as polls begun before the request.
-      generation.current++;
-      owned.current = result.control;
-      setLease(result.control); setHolder(result.control);
-      setMessage(result.control ? "" : "Control was not granted. Refresh and try again.");
-    } catch (error) {
-      if (mounted.current && revision === generation.current) {
-        forget();
-        if (isControlRefusal(error) && error.control !== undefined) setHolder(error.control);
-        setMessage((error as Error).message);
-      }
-    } finally { claiming.current = false; if (mounted.current) setBusy(false); }
-  };
-  const release = async () => {
-    const previous = owned.current;
-    if (!previous || claiming.current) return;
-    forget();
-    const revision = generation.current;
-    claiming.current = true;
-    setBusy(true);
-    try {
-      await api(`/sessions/${id}/control`, { action: "release", leaseId: previous.id });
-    } catch {
-      if (mounted.current && revision === generation.current)
-        setMessage("Control release was not confirmed. This device stopped sending; the host lease will expire.");
-    } finally {
-      // Discard polls begun before the host acknowledged the release.
-      if (revision === generation.current) generation.current++;
-      claiming.current = false;
-      if (mounted.current) setBusy(false);
-    }
-  };
-  useEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-      generation.current++;
-      const previous = owned.current;
-      owned.current = null;
-      if (previous) void api(`/sessions/${id}/control`, { action: "release", leaseId: previous.id }).catch(() => {});
-    };
-  }, [id]);
-  useEffect(() => {
-    if (!lease) return;
-    let renewing = false;
-    const expire = setTimeout(() => forget(), Math.max(0, lease.expiresAt - Date.now()));
-    const renew = setInterval(async () => {
-      if (renewing || !foreground() || owned.current?.id !== lease.id) return;
-      renewing = true;
-      const revision = generation.current;
-      try {
-        const result = await api<{ control: ControlLease | null }>(`/sessions/${id}/control`, { action: "renew", leaseId: lease.id });
-        if (mounted.current && revision === generation.current && owned.current?.id === lease.id) {
-          if (result.control?.id === lease.id && foreground()) {
-            generation.current++;
-            owned.current = result.control; setLease(result.control); setHolder(result.control);
-          } else forget();
-        }
-      } catch {
-        if (mounted.current && revision === generation.current) forget();
-      } finally { renewing = false; }
-    }, 10000);
-    return () => { clearTimeout(expire); clearInterval(renew); };
-  }, [id, lease]);
-  return { lease, holder, message, busy, claim, release, forget, observe, generation, owned };
-}
 
 function Mark() {
   return (

@@ -200,7 +200,7 @@ export async function createHybridWorkspace(options: {
   return {
     control(method: string, params: any): Promise<any> {
       return enqueue(async () => {
-        if (method === "sync/status") { publish(); return { ...state, revision, epoch }; }
+        if (method === "sync/status") { publish(); return { ...state, revision, epoch, acknowledged }; }
         if (method === "sync/problem") {
           if (typeof params?.reason !== "string" || !params.reason.trim())
             throw new Error("A workspace preparation problem requires a reason.");

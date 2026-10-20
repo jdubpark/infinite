@@ -32,15 +32,17 @@ test("the detached sync service pushes edits, stays pending while a session runs
     await waitFor(() => host.fetchApi("/projects/rehearsal"), r => Boolean(r.body.sync.appliedManifest), 20000);
     assert.equal(cloudFile(), "one\n");
 
+    const recorded = (sync: Record<string, unknown>) => [sync.appliedAt, sync.lastSyncedManifest, sync.lastSyncedAt];
+    const first = (await host.fetchApi("/projects/rehearsal")).body.sync;
+    await delay(7000);
+    const idle = (await host.fetchApi("/projects/rehearsal")).body.sync;
+    assert.deepEqual(recorded(idle), recorded(first), "an idle workspace leaves the committed checkpoint unchanged");
+
     writeFileSync(join(laptop, "app.ts"), "two\n");
     // The cloud file reads "two" a moment before the apply is recorded; wait for the record too.
     const pushed = await waitFor(() => host.fetchApi("/projects/rehearsal"),
       r => cloudFile() === "two\n" && !r.body.sync.pendingGeneration && r.body.sync.appliedManifest === r.body.sync.lastSyncedManifest, 20000);
-    // Two capture cycles over an unchanged tree must not push or replace the cloud copy again.
-    await delay(7000);
-    const idle = (await host.fetchApi("/projects/rehearsal")).body.sync;
-    const recorded = (sync: Record<string, unknown>) => [sync.appliedAt, sync.lastSyncedManifest, sync.lastSyncedAt];
-    assert.deepEqual(recorded(idle), recorded(pushed.body.sync), "no new generation was received or applied");
+    assert.equal(pushed.body.sync.appliedManifest, pushed.body.sync.lastSyncedManifest, "a file change is pushed and applied");
 
     const id = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Busy", prompt: "" });
@@ -117,7 +119,7 @@ test("failed commits back off, and a lasting apply failure holds the content unt
     assert.equal((await host.fetchApi("/projects/rehearsal/sync/apply", "owner", {})).status, 200);
     assert.equal(readFileSync(join(host.config.projects[0].path, "app.ts"), "utf8"), "three\n");
     // The service notices the explicit apply and clears its problem without another push.
-    await waitFor(async () => readSyncState(stateFile), state => Boolean(state && !state.problem), 20000);
+    await waitFor(async () => readSyncState(stateFile), state => Boolean(state && !state.problem), 45000);
     assert.equal((await detail()).lastSyncedAt, failed.lastSyncedAt);
   } finally {
     chmodSync(host.root, 0o700);

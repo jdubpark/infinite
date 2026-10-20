@@ -7,6 +7,7 @@ type TeamRow = { id: string; title: string; status: string; reason?: string; res
 type GoalRow = { id: string; title: string; status: string; reason?: string };
 type Lifecycle = { id: string; title: string; status: string; reason?: string; resumable?: boolean; kind: "goal" | "team"; event: string; titleText: string; body: string; priority: "default" | "high" };
 const PUSH_STATES = new Set(["needs-you", "turn-finished", "exited", "recording-error"]);
+const REMOVED_LIMIT = 1024;
 const GOAL_EVENTS: Record<string, { event: string; title: string; body: string; priority: "default" | "high" }> = {
   achieved: { event: "goal-finished", title: "Goal finished", body: "finished", priority: "default" },
   "ready-for-review": { event: "goal-finished", title: "Goal finished", body: "finished", priority: "default" },
@@ -29,6 +30,7 @@ export class Notifier {
   private seen = new Map<string, string>();
   private teamStatus = new Map<string, string>();
   private goalStatus = new Map<string, string>();
+  private recentlyRemoved = new Map<string, string>();
   private primed = false;
   private teamsPrimed = false;
   private goalsPrimed = false;
@@ -50,10 +52,11 @@ export class Notifier {
       const rows = (await this.manager.list()) as unknown as Row[];
       for (const row of rows) {
         const key = `${row.attention.state}:${row.attention.prompt?.id ?? ""}`;
-        const previous = this.seen.get(row.id);
+        const previous = this.previous("session", row.id, this.seen);
         this.seen.set(row.id, key);
         if (this.primed && previous !== key && PUSH_STATES.has(row.attention.state) && this.options.events.includes(row.attention.state)) due.push(row);
       }
+      this.prune("session", this.seen, new Set(rows.map(row => row.id)));
       this.primed = true;
     } catch {}
     const lifecycle = [...this.teamEvents(), ...this.goalEvents()];
@@ -83,9 +86,7 @@ export class Notifier {
     if (!this.teams) return [];
     let teams: TeamRow[];
     try { teams = this.teams.statuses(); } catch { return []; }
-    const due = this.lifecycle("team", teams.filter(team => !team.goal && !team.mission), this.teamStatus, this.teamsPrimed, TEAM_EVENTS, "Team started");
-    // Goal-owned runs still record their status so they never announce as new later.
-    for (const team of teams) if (team.goal || team.mission) this.teamStatus.set(team.id, team.status);
+    const due = this.lifecycle("team", teams, this.teamStatus, this.teamsPrimed, TEAM_EVENTS, "Team started");
     this.teamsPrimed = true;
     return due;
   }
@@ -101,16 +102,39 @@ export class Notifier {
   private lifecycle(kind: "goal" | "team", rows: TeamRow[], statuses: Map<string, string>, primed: boolean, map: typeof TEAM_EVENTS, startedTitle: string) {
     const due: Lifecycle[] = [];
     for (const row of rows) {
-      const previous = statuses.get(row.id);
+      const previous = this.previous(kind, row.id, statuses);
       statuses.set(row.id, row.status);
-      if (!primed || previous === row.status) continue;
+      if (!primed || previous === row.status || (kind === "team" && (row.goal || row.mission))) continue;
       const base = { id: row.id, title: row.title, status: row.status, reason: row.reason, resumable: row.resumable, kind };
       if (previous === undefined && this.enabled(`${kind}-started`))
         due.push({ ...base, event: `${kind}-started`, titleText: startedTitle, body: "started", priority: "default" });
       const category = map[row.status];
       if (category && this.enabled(category.event)) due.push({ ...base, event: category.event, titleText: category.title, body: category.body, priority: category.priority });
     }
+    this.prune(kind, statuses, new Set(rows.map(row => row.id)));
     return due;
+  }
+  private previous(kind: "session" | "goal" | "team", id: string, statuses: Map<string, string>) {
+    const previous = statuses.get(id);
+    if (previous !== undefined) return previous;
+    const key = `${kind}:${id}`;
+    const removed = this.recentlyRemoved.get(key);
+    this.recentlyRemoved.delete(key);
+    return removed;
+  }
+  private prune(kind: "session" | "goal" | "team", statuses: Map<string, string>, listed: Set<string>) {
+    for (const [id, status] of statuses) {
+      if (listed.has(id)) continue;
+      statuses.delete(id);
+      const key = `${kind}:${id}`;
+      this.recentlyRemoved.delete(key);
+      this.recentlyRemoved.set(key, status);
+    }
+    while (this.recentlyRemoved.size > REMOVED_LIMIT) {
+      const oldest = this.recentlyRemoved.keys().next().value;
+      if (oldest === undefined) break;
+      this.recentlyRemoved.delete(oldest);
+    }
   }
   private enabled(event: string) { return this.options.events.includes(event) || (event === "team-stuck" && this.options.events.includes("team-blocked")); }
   private lifecycleMessage(item: Lifecycle, to: string) {

@@ -60,6 +60,68 @@ test("notifier sends once per transition, minimal body, prunes unregistered toke
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("notifier prunes absent listings and does not reannounce returning ids", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "ios");
+  const sent: unknown[][] = [];
+  const sender = async (messages: unknown[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const session = { id: "s1", title: "Retry logic", provider: "claude", status: "running", attention: att("working") };
+  const sessions = [session];
+  const teams = [{ id: "t1", title: "Build", status: "planning" }];
+  const goals = [{ id: "g1", title: "Ship", status: "running" }];
+  let listFails = false;
+  const notifier = new Notifier(
+    { list: async () => { if (listFails) throw new Error("listing unavailable"); return sessions; } } as never,
+    store, sender, { detail: "minimal", events: ["needs-you", "team-stuck", "goal-stuck"], intervalMs: 100000 },
+    { statuses: () => teams }, { statuses: () => goals },
+  );
+  const maps = notifier as unknown as { seen: Map<string, string>; teamStatus: Map<string, string>; goalStatus: Map<string, string> };
+  try {
+    await notifier.tick();
+    session.attention = att("needs-you", 1);
+    teams[0].status = "blocked";
+    goals[0].status = "blocked";
+    await notifier.tick();
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].length, 3);
+
+    listFails = true;
+    sessions.length = 0;
+    await notifier.tick();
+    assert.equal(maps.seen.size, 1, "a failed session listing keeps its previous baseline");
+    listFails = false;
+    sessions.push(session);
+    await notifier.tick();
+    assert.equal(sent.length, 1, "a failed listing does not make the same attention state look new");
+
+    sessions.length = 0;
+    teams.length = 0;
+    goals.length = 0;
+    await notifier.tick();
+    assert.deepEqual([maps.seen.size, maps.teamStatus.size, maps.goalStatus.size], [0, 0, 0]);
+
+    sessions.push(session);
+    teams.push({ id: "t1", title: "Build", status: "blocked" });
+    goals.push({ id: "g1", title: "Ship", status: "blocked" });
+    await notifier.tick();
+    assert.equal(sent.length, 1, "returning ids keep their last state and do not repeat the same push");
+
+    session.attention = att("working");
+    teams[0].status = "planning";
+    goals[0].status = "running";
+    await notifier.tick();
+    session.attention = att("needs-you", 2);
+    teams[0].status = "blocked";
+    goals[0].status = "blocked";
+    await notifier.tick();
+    assert.equal(sent.length, 2, "new transitions after a return still send");
+    assert.equal(sent[1].length, 3);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("full-detail turn-finished push prefers the cached phone reading", async () => {
   const dir = mkdtempSync("/tmp/inf-push-");
   const store = new PushStore(dir, randomBytes(32));

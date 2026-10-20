@@ -63,7 +63,7 @@ The coordinator reports through its mission report tool:
 | `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. |
 | `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, and no owner decision is open. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
 | `blocked` | Moves the mission to `blocked` with the summary as its reason. |
-| `wait` | Ends the attempt without a decision. Refused while a subteam decision is open that the coordinator has neither answered nor escalated. Otherwise accepted only while something else will start a later attempt: an open owner decision, a subteam that is not paused, or a queued subtask that can start without anyone acting. A repository held only by paused or blocked runs does not count. |
+| `wait` | Ends the attempt without a decision. Refused while a subteam decision is open that the coordinator has neither answered nor escalated. Otherwise accepted only while something else will start a later attempt: an open owner decision, a subteam that is not paused, or a queued subtask that can start without anyone acting. A queued subtask whose repository any paused or blocked run holds does not count, since that run keeps the repository reserved after the others finish. |
 
 Each attempt must end with one report. An attempt whose session ends its turn
 without a report, or shows no activity for the team stall window while not
@@ -112,6 +112,13 @@ for the next attempt. Every open subteam decision is also listed in each
 attempt's mission state, read from the subteams, so none depends on a message. Only the coordinator's `question` report reaches the owner. Provider
 permission prompts are unaffected and keep their existing owner or delegated
 coordinator path per repository.
+
+A run outside the mission that holds a repository changes state without
+reaching the mission. When a ready subtask's repository is held only by paused
+or blocked runs outside this mission and no coordinator attempt is running, the
+host sends the coordinator a `repository-held` message naming each holder run
+and its status, once per subtask, holder, and status. The coordinator can then
+cancel the subtask, ask the owner, or report blocked.
 
 Owner controls: answer, steer (forwarded to the coordinator), pause, resume, and
 cancel. All five are owner-only; a controller cannot answer or steer a mission. A

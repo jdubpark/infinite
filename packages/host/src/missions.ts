@@ -393,10 +393,10 @@ export class MissionService {
     for (const other of this.records.values())
       for (const item of other.mission.subtasks) if (item.status === "running" || other.launches[item.id]) busy.add(item.repoProjectId);
     for (const subtask of mission.subtasks) {
-      if (subtask.status !== "queued" || stored.launches[subtask.id] || busy.has(subtask.repoProjectId)) continue;
+      if (subtask.status !== "queued" || stored.launches[subtask.id]) continue;
       if (!subtask.dependsOn.every(id => mission.subtasks.find(item => item.id === id)?.status === "done")) continue;
       // A blocked or unfinished run in the repository, inside or outside a mission, keeps it reserved.
-      if (this.teams.activeForProject(subtask.repoProjectId)) { busy.add(subtask.repoProjectId); continue; }
+      if (busy.has(subtask.repoProjectId) || this.teams.activeForProject(subtask.repoProjectId)) { busy.add(subtask.repoProjectId); this.reportHeld(stored, subtask); continue; }
       const base = this.baseSubtask(mission, subtask);
       const objective = [
         `Mission: ${mission.title}`,
@@ -412,6 +412,20 @@ export class MissionService {
       busy.add(subtask.repoProjectId);
       this.save(stored);
     }
+  }
+  /**
+   * Tells a stopped coordinator when only paused or blocked runs outside this mission hold a ready subtask's
+   * repository. Those runs change state without reaching the mission, so nothing else would wake it.
+   */
+  private reportHeld(stored: Stored, subtask: Mission["subtasks"][number]) {
+    if ((stored.attempts.at(-1)?.status ?? "stopped") !== "stopped") return;
+    // This mission's own subteam in the repository reaches the coordinator itself; skip listing every run.
+    if (stored.mission.subtasks.some(item => item.repoProjectId === subtask.repoProjectId && (item.status === "running" || stored.launches[item.id]))) return;
+    const holders = holdersOf(this.teams.list(), subtask.repoProjectId);
+    if (!holders.length || holders.some(run => run.missionId === stored.mission.id || !waitsOnPerson(run.status))) return;
+    for (const run of holders)
+      this.message(stored, `${subtask.id}:held:${run.id}:${run.status}`, { type: "repository-held", subtaskId: subtask.id, repoProjectId: subtask.repoProjectId,
+        teamId: run.id, teamStatus: run.status, ...(run.reason ? { reason: run.reason } : {}) });
   }
   /**
    * A subtask that depends, directly or through other subtasks, on finished work in its own repository
@@ -630,11 +644,9 @@ export class MissionService {
       item.dependsOn.every(id => mission.subtasks.find(other => other.id === id)?.status === "done"));
     if (ready.some(item => stored.launches[item.id])) return true;
     if (!ready.length) return false;
+    // Every holder must finish on its own: one paused or blocked holder keeps the repository reserved after the others end.
     const runs = this.teams.list();
-    return ready.some(item => {
-      const holders = runs.filter(run => run.projectId === item.repoProjectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status));
-      return !holders.length || holders.some(run => !["paused", "blocked"].includes(run.status));
-    });
+    return ready.some(item => holdersOf(runs, item.repoProjectId).every(run => !waitsOnPerson(run.status)));
   }
   private refuse(stored: Stored, kind: string, reason: string, wake = true) {
     stored.refusals++;
@@ -785,6 +797,11 @@ export class MissionService {
     this.settle(stored);
   }
 }
+
+/** Unfinished team runs in a repository, which keep it reserved. */
+const holdersOf = (runs: TeamView[], projectId: string) => runs.filter(run => run.projectId === projectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status));
+/** A paused or blocked run continues only when a person acts. */
+const waitsOnPerson = (status: TeamView["status"]) => status === "paused" || status === "blocked";
 
 /** Queued subtasks that can never start, because a dependency ended blocked or cancelled, directly or transitively. */
 function stalledSubtasks(mission: Mission) {

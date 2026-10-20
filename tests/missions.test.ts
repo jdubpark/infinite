@@ -686,7 +686,7 @@ test("a coordinator cannot wait past a subteam decision it has not handled, or b
   try {
     h.runs.set("paused-web", { id: "paused-web", projectId: "web", missionId: "", status: "paused", revision: 1, decisions: [], updatedAt: new Date().toISOString() });
     const { id } = await h.create();
-    await h.report(1, { kind: "dispatch", summary: "One change per repository", subtasks: [plan("a", "api"), plan("b", "web")] });
+    await h.report(1, { kind: "dispatch", summary: "The API, then the web client", subtasks: [plan("a", "api"), plan("b", "web", ["a"])] });
     const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
     const decisionId = randomUUID();
     h.set(teamId, { status: "needs-input", decisions: [{ id: decisionId, memberId: randomUUID(), revision: 1, question: "Which format?", options: [], createdAt: new Date().toISOString() }] });
@@ -701,7 +701,9 @@ test("a coordinator cannot wait past a subteam decision it has not handled, or b
 
     // Only a paused run outside the mission holds the web repository, so subtask b will not start by itself.
     h.set(teamId, { status: "ready-for-review" });
-    assert.ok((await h.messages(4)).some((message: { type: string; subtaskId?: string }) => message.type === "subtask-finished" && message.subtaskId === "a"));
+    const fourth = await h.messages(4);
+    assert.ok(fourth.some((message: { type: string; subtaskId?: string }) => message.type === "subtask-finished" && message.subtaskId === "a"));
+    assert.ok(fourth.some((message: { type: string; teamId?: string }) => message.type === "repository-held" && message.teamId === "paused-web"));
     assert.equal(h.get(id).subtasks[1].status, "queued");
     await h.report(4, { kind: "wait", summary: "Subtask b is queued" });
     const held = (await h.messages(5)).find((message: { type: string }) => message.type === "refused");
@@ -762,6 +764,49 @@ test("a wait filed on the tick that resumes a paused subteam is accepted", { tim
     await h.releaseStopAndResume(2);
     const waiting = await until(() => h.get(id), mission => mission.events.some(event => /waiting for subteam progress|wait report was refused/.test(event.text)), 20000);
     assert.ok(!waiting.events.some(event => /wait report was refused/.test(event.text)), "The resumed subteam is working, so the wait is accepted");
+  } finally { h.close(); }
+});
+
+test("a coordinator cannot wait behind a repository that a paused run holds alongside a working one", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const at = new Date().toISOString();
+    h.runs.set("paused-web", { id: "paused-web", projectId: "web", missionId: "", status: "paused", revision: 1, decisions: [], updatedAt: at });
+    h.runs.set("busy-web", { id: "busy-web", projectId: "web", missionId: "", status: "implementing", revision: 1, decisions: [], updatedAt: at });
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One web change", subtasks: [plan("b", "web")] });
+    await until(() => h.get(id), mission => mission.subtasks.length === 1);
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep it small" });
+    // The working run will finish, but the paused one keeps the repository reserved after it.
+    await h.report(2, { kind: "wait", summary: "Subtask b waits for the web repository" });
+    const refusal = (await h.messages(3)).find((message: { type: string }) => message.type === "refused");
+    assert.equal(refusal.kind, "wait");
+    assert.match(refusal.reason, /no later attempt would start/);
+  } finally { h.close(); }
+});
+
+test("a stopped coordinator is told once when only a paused run outside the mission holds a ready subtask's repository", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const at = new Date().toISOString();
+    h.runs.set("paused-web", { id: "paused-web", projectId: "web", missionId: "", status: "paused", revision: 1, decisions: [], updatedAt: at });
+    h.runs.set("busy-web", { id: "busy-web", projectId: "web", missionId: "", status: "implementing", revision: 1, decisions: [], updatedAt: at });
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One web change", subtasks: [plan("b", "web")] });
+    await until(() => h.get(id), mission => mission.subtasks.length === 1);
+    await new Promise(done => setTimeout(done, 1500));
+    assert.equal(h.attempts(), 1, "A working holder will free the repository, so the coordinator is not woken");
+    h.set("busy-web", { status: "ready-for-review" });
+    const held = (await h.messages(2)).filter((message: { type: string }) => message.type === "repository-held");
+    assert.deepEqual(held, [{ type: "repository-held", subtaskId: "b", repoProjectId: "web", teamId: "paused-web", teamStatus: "paused" }]);
+    assert.equal(h.get(id).subtasks[0].status, "queued");
+    await h.report(2, { kind: "question", question: "A paused run holds the web repository. Cancel it or resume it?", options: ["Cancel it", "Resume it"] });
+    await until(() => h.get(id), mission => mission.status === "needs-input");
+    await new Promise(done => setTimeout(done, 1500));
+    assert.equal(h.attempts(), 2, "The same holder and status are reported once");
+    // A new holder status is news.
+    h.set("paused-web", { status: "blocked" });
+    assert.ok((await h.messages(3)).some((message: { type: string; teamStatus?: string }) => message.type === "repository-held" && message.teamStatus === "blocked"));
   } finally { h.close(); }
 });
 

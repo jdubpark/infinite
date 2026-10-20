@@ -23,6 +23,10 @@ export interface Prompt {
   tool?: { name: string; input: Record<string, unknown>; inputComplete?: boolean };
   source: PromptSource;
   hash?: string;
+  /** A screen block followed only by blank lines and key hints, as a provider's own dialog is. */
+  pinned?: boolean;
+  /** Set only on host list rows: the prompt has the complete evidence a delegated coordinator review needs. */
+  delegable?: boolean;
 }
 
 export type PromptClosedReason = "answered-here" | "resolved" | "vanished" | "superseded";

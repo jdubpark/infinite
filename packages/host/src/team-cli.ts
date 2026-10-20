@@ -587,7 +587,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       throw new Error("This host does not support delegated permissions. Upgrade it or use --permissions off before running repo init.");
     const permissions = permissionMode === "off" ? undefined : configureCoordinatorPermissions ? teamPermissionsSchema.parse({
       mode: "coordinator",
-      scope: String(options["--permission-scope"] ?? "Approve one-time repository read, edit, build and test operations required by the accepted task within its assigned workspace. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, permission bypasses and unclear effects."),
+      scope: String(options["--permission-scope"] ?? "Approve one-time repository read, edit, build and test operations required by the accepted task within its assigned workspace, including a one-time run of the task's tests or accepted checks outside the provider sandbox. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, persistent approvals, other permission bypasses and unclear effects."),
       maxDecisions: Number(options["--permission-limit"] ?? 10),
     }) : target.team?.permissions;
 

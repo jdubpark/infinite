@@ -1018,6 +1018,42 @@ test("a usage limit with no configured fallback blocks the run with its reason a
   } finally { await run.close(); }
 });
 
+test("permission coordinator prompt reviews Codex command dialogs against changed-path and accepted-check evidence", () => {
+  const run = { provider: "codex", revision: 1, objective: "Run the task checks", projectId: "project", permissions: { mode: "coordinator", scope: "Pinned one-time task scope" }, steering: [], tasks: [], checks: [] } as unknown as TeamRun;
+  const evidence = JSON.stringify({
+    targetChangedPaths: ["src/task.ts"],
+    targetChangedPathCount: 1,
+    acceptedChecks: [{ command: "npm", args: ["test"] }],
+  });
+  const prompt = teamPrompt(run, "permission-coordinator", undefined, evidence, "claude", limitLineup.coordinator);
+  assert.match(prompt, /Would you like to run the following command\?/);
+  assert.match(prompt, /feedback\.targetChangedPaths, feedback\.targetChangedPathCount, and feedback\.acceptedChecks/);
+  assert.match(prompt, /targetChangedPathCount exceeds the number of listed targetChangedPaths/);
+  assert.match(prompt, /package manifests or scripts, lockfiles, Makefiles, test\/build\/tsconfig configuration, or files under scripts directories/);
+  assert.match(prompt, /exact command only runs the assigned task's tests or exactly matches an accepted check in the target workspace/);
+  assert.match(prompt, /no install, download, publish, deploy, credential, or global-setting effect/);
+  assert.match(prompt, /Owner-authorized permission scope \(pinned for this run\):\nPinned one-time task scope/);
+  assert.match(prompt, /host rechecks the exact prompt and all current authority and alone applies any answer/);
+  assert.ok(prompt.includes(evidence));
+});
+
+test("Codex sandbox guidance covers members but excludes the permission coordinator", () => {
+  const run = { provider: "codex", revision: 1, objective: "Run task checks", projectId: "project", permissions: { mode: "coordinator", scope: "Pinned scope" }, steering: [], tasks: [], checks: [] } as unknown as TeamRun;
+  const member = teamPrompt(run, "implementer", undefined, undefined, "codex", limitLineup.implementers[1]);
+  assert.match(member, /no network access and cannot start local listeners or IPC sockets/);
+  assert.match(member, /typecheck, lint, and unit tests that need no server/);
+  assert.match(member, /one-time run of this task's tests or an accepted check that cannot run in the sandbox/);
+  assert.match(member, /Never request persistent approval/);
+  assert.match(member, /Report skipped checks and why; the host runs accepted checks after integration/);
+  const coordinator = teamPrompt(run, "permission-coordinator", undefined, "evidence", "codex", limitLineup.coordinator);
+  assert.doesNotMatch(coordinator, /Codex sandbox guidance:/);
+  const switchedCoordinator = retargetPrompt(
+    teamPrompt(run, "permission-coordinator", undefined, "evidence", "claude", limitLineup.coordinator),
+    { provider: "codex", profile: limitLineup.coordinator },
+  );
+  assert.doesNotMatch(switchedCoordinator!, /Codex sandbox guidance:/);
+});
+
 test("retargeting a member prompt keeps its answers, swaps reporting and profile, and refuses an unrecognized prompt", () => {
   const run = { provider: "codex", revision: 1, objective: "Create a.txt", baseCommit: "base", headCommit: "head", steering: [], tasks: [], checks: [], lineup: limitLineup } as unknown as TeamRun;
   const [haiku, astra] = limitLineup.implementers, deepseek = limitLineup.fallbacks![0];
@@ -1028,12 +1064,17 @@ test("retargeting a member prompt keeps its answers, swaps reporting and profile
   assert.match(refreshed, /report tool of the infinite_team MCP server/);
   assert.doesNotMatch(refreshed, /Pipe a JSON object matching the above schema to this command:/);
   assert.equal(retargetPrompt(oldHelper, { provider: "codex", profile: astra }), teamPrompt(run, "implementer", undefined, undefined, "codex", astra));
+  assert.match(retargetPrompt(oldHelper, { provider: "codex", profile: astra })!, /Codex sandbox guidance:/);
   // A Codex prompt written by an earlier release names its helper, at another release's path.
   const older = oldHelper.replace(/to this command: [^\n]+?\. The helper/, "to this command: 'node' 'dist/team-report.js'. The helper");
   assert.notEqual(older, oldHelper);
   assert.equal(refreshReportingInstructions(`${older}\n\nUser answered: Compact`, "codex"), `${refreshed}\n\nUser answered: Compact`);
   assert.equal(retargetPrompt(answered("claude", haiku), { provider: "codex", profile: astra }), answered("codex", astra));
-  assert.equal(retargetPrompt(answered("codex", astra), { provider: "opencode", profile: deepseek }), answered("opencode", deepseek));
+  const oldCodex = teamPrompt(run, "implementer", undefined, undefined, "codex", astra).replace(/Codex sandbox guidance:[^\n]+\n\n/, "");
+  assert.match(retargetPrompt(oldCodex, { provider: "codex", profile: astra })!, /Codex sandbox guidance:/, "an older accumulated Codex prompt gains the current paragraph");
+  const switchedAway = retargetPrompt(answered("codex", astra), { provider: "opencode", profile: deepseek });
+  assert.equal(switchedAway, answered("opencode", deepseek));
+  assert.doesNotMatch(switchedAway!, /Codex sandbox guidance:/);
   assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek }), undefined);
 });
 
@@ -1198,6 +1239,25 @@ test(`a ${refusal} pre-delivery refusal with ${protection} ${earlierStop ? "reta
       assert.equal(f.state.status, "running");
       assert.equal(teams.get(f.run.id).members.length, 1);
     }
+  } finally { f.close(); }
+});
+
+test("a member back from an outage into a delegable prompt runs again and gets a permission decision", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.members[0].status = "unavailable";
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+    f.state.attention.state = "needs-you";
+    f.state.attention.prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" }] };
+    f.writeTeam();
+    const teams = f.openTeam(); teams.start();
+    const result = await waitFor(async () => teams.get(f.run.id), run => (run.permissionDecisions?.length ?? 0) > 0);
+    assert.equal(result.members[0].status, "running");
+    assert.equal(result.permissionDecisions?.[0].status, "escalated");
+    assert.match(result.permissionDecisions?.[0].reason ?? "", /coordinator provider is not configured/);
   } finally { f.close(); }
 });
 

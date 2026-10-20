@@ -81,6 +81,8 @@ export function publicAttention(att: Attention): Attention {
     prompt: {
       ...prompt,
       ...(tool ? { tool: { name: tool.name, input: {} } } : {}),
+      // Decided on the full prompt, since the row drops the tool input the check reads.
+      ...(oneShotPermissionOption(att.prompt) !== undefined ? { delegable: true } : {}),
     },
     lastMessage,
   };

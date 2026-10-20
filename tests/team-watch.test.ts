@@ -101,6 +101,10 @@ test("the summary card reads the coordinator brief and the log card returns to i
   const screen = "\u001b[32mplanning the stop\u001b[0m\nnext step";
   assert.match(visibleScreen(screen), /planning the stop\nnext step/);
   assert.equal(plainScreen(screen), "planning the stop\nnext step");
+  // Blank rows under the composer do not count, so the last lines (dialog and prompt) survive the window.
+  assert.equal(plainScreen("Run it?\nyes\n\n   \n", 1), "yes");
+  const rows = Array.from({ length: 20 }, (_, index) => `row ${index + 1}`);
+  assert.equal(plainScreen([...rows, "", " "].join("\n"), 14), rows.slice(-14).join("\n"));
   assert.doesNotMatch(visibleScreen(screen), /32m/);
   assert.deepEqual(visibleScreen("top line\nsecond line\n\n", 4).split("\n"), ["top line", "second line", "", ""]);
   assert.equal(visibleScreen("", 4), "No screen is recorded for this agent.");

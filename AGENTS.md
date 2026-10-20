@@ -46,6 +46,7 @@ If you find existing private information while working, remove or replace it and
   and preserve its request identity rather than inventing a completed update.
 
 - Requirements: Node.js 22.14+ and npm. `npm ci` builds the shared `@infinite/attention` package during install.
+- In a network-off provider sandbox, the `tsx` CLI cannot open its IPC socket and tests that start a host cannot listen; run focused tests that start no server with `node --import tsx --test FILE`, and leave the rest to the host-run checks.
 - Run `npm run check` (typecheck, tests, builds) before declaring host or shared-package work complete.
 - For the phone app, also run `npm run lint -w @infinite/mobile` and `npx tsc --noEmit` in `apps/mobile`.
 - Product, design, and protocol context: `PRODUCT.md`, `DESIGN.md`, `docs/architecture.md`, `docs/security.md`.

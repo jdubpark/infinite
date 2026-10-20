@@ -197,14 +197,19 @@ export async function assertMemberReadOnly(cwd: string, base: string, prefix?: T
     throw new TeamError(409, "read-only-role-changed-files", "A read-only agent changed its working copy. Its report cannot advance the team.");
 }
 export function teamPathAllowed(path: string, allowed: string[]) { return allowed.some(prefix => prefix === "." || path === prefix || path.startsWith(`${prefix}/`)); }
-/** A continuation may retain partial edits only after their ownership is checked. */
-export async function assertMemberScope(cwd: string, base: string, paths?: string[], prefix?: TeamCommand, signal?: AbortSignal) {
-  await git(cwd, ["merge-base", "--is-ancestor", base, "HEAD"], prefix, 30000, signal);
+/** List all tracked, staged, and untracked paths changed from a member's base commit. */
+export async function memberChangedPaths(cwd: string, base: string, prefix?: TeamCommand, signal?: AbortSignal) {
   const changed = [
     ...lines(await git(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", base, "--"], prefix, 30000, signal)),
     ...lines(await git(cwd, ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", base, "--"], prefix, 30000, signal)),
     ...lines(await git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"], prefix, 30000, signal)),
   ];
+  return [...new Set(changed)].sort();
+}
+/** A continuation may retain partial edits only after their ownership is checked. */
+export async function assertMemberScope(cwd: string, base: string, paths?: string[], prefix?: TeamCommand, signal?: AbortSignal) {
+  await git(cwd, ["merge-base", "--is-ancestor", base, "HEAD"], prefix, 30000, signal);
+  const changed = await memberChangedPaths(cwd, base, prefix, signal);
   if (paths && changed.some(path => !teamPathAllowed(path, paths)))
     throw new TeamError(409, "task-scope-violation", "An agent changed files outside its assigned paths. Its changes were retained in its isolated workspace.");
 }

@@ -9,3 +9,4 @@ export * from "./codex.js";
 export * from "./moments.js";
 export * from "./inbox.js";
 export * from "./limits.js";
+export * from "./delegation.js";

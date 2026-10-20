@@ -7,7 +7,7 @@ import type { StatusKind } from "../../status";
 import type { OwnerRating, Rubric, TaskUsage } from "../cost/model";
 
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
-export type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
+export type TeamRole = "project-manager" | "permission-coordinator" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
 export type TeamCommand = { command: string; args: string[] };
 export type ModelProfile = { id: string; label: string; provider: string; model: string; effort?: string; variant?: string; tier?: "light" | "strong"; dataUse?: "standard" | "contributor" };
 export type TeamLineup = { coordinator: ModelProfile; integrator: ModelProfile; reviewer: ModelProfile; implementers: ModelProfile[]; escalations?: ModelProfile[]; fallbacks?: ModelProfile[] };
@@ -82,7 +82,7 @@ export const GOAL_LABELS: Record<GoalStatus, string> = {
   cancelled: "Cancelled", achieved: "Outcome recorded: achieved",
 };
 export const OUTCOME_LABELS: Record<GoalResult, string> = { achieved: "Achieved", "not-achieved": "Not achieved", inconclusive: "Inconclusive" };
-export const ROLE_NAMES: Record<TeamRole, string> = { "project-manager": "Coordinator", scout: "Scout", implementer: "Implementer", integrator: "Integrator", reviewer: "Reviewer", delivery: "Delivery" };
+export const ROLE_NAMES: Record<TeamRole, string> = { "project-manager": "Coordinator", "permission-coordinator": "Permission coordinator", scout: "Scout", implementer: "Implementer", integrator: "Integrator", reviewer: "Reviewer", delivery: "Delivery" };
 
 /** RunPill tones: amber waits on a person, forest is working or ready, error is stuck. */
 export type Tone = "amber" | "forest" | "muted" | "error";
@@ -198,20 +198,22 @@ export function memberKind(status: string): StatusKind {
   }
 }
 
-/** The parts of a member session's open prompt that decide who answers it. */
-export type WaitingSession = { id: string; attention: { state: string; prompt?: { id: number; kind: string; destructive?: unknown; multiSelect?: boolean } } };
+/** The parts of a member session's open prompt that decide who answers it. `delegable` is set on list rows only when the host has the evidence for a coordinator review. */
+export type WaitingSession = { id: string; attention: { state: string; prompt?: { id: number; kind: string; destructive?: unknown; multiSelect?: boolean; delegable?: boolean } } };
 
 /**
  * Who answers a member's open provider prompt. The coordinator owns it while its recorded decision
- * is in flight, and owns a fresh one-shot permission when the run delegated permissions and has
- * decisions left. Everything else waits on a person: escalations, stale or uncertain decisions,
- * questions, destructive or multi-select prompts, and runs without delegation.
+ * is in flight, and owns a fresh one-shot permission when the run delegated permissions, has
+ * decisions left, runs a strong lineup coordinator, and the host can hand over the prompt whole.
+ * Everything else waits on a person: escalations, stale or uncertain decisions, questions,
+ * destructive or multi-select prompts, prompts without the host's review evidence, weaker
+ * coordinators, and runs without delegation.
  */
 export function approvalOwner(team: TeamView, sessionId: string, prompt?: WaitingSession["attention"]["prompt"]): "coordinator" | "person" {
   const decision = [...(team.permissionDecisions ?? [])].reverse().find(item => item.targetSessionId === sessionId && item.promptId === prompt?.id);
   if (decision) return ["pending", "reviewing", "approved", "answering"].includes(decision.status) ? "coordinator" : "person";
   const delegated = Boolean(team.permissions) && !team.permissionsRevokedAt && (team.permissionDecisions?.length ?? 0) < (team.permissions?.maxDecisions ?? 0);
-  return delegated && prompt?.kind === "permission" && !prompt.destructive && !prompt.multiSelect ? "coordinator" : "person";
+  return delegated && team.lineup?.coordinator.tier === "strong" && prompt?.delegable === true && prompt.kind === "permission" && !prompt.destructive && !prompt.multiSelect ? "coordinator" : "person";
 }
 
 /** Live members of the current revision whose open prompt waits on a person rather than the coordinator. */

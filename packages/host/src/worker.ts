@@ -853,10 +853,15 @@ async function answer(
   const current = screenPrompt();
   if (!current || hashOf(current.fingerprint) !== prompt.hash)
     throw new Refusal("prompt-changed");
+  // The hash ignores spacing inside lines, so a team answer also needs the reviewed text exactly,
+  // and screen-only evidence needs the dialog still pinned to the bottom of the screen. Each
+  // delegated key write checks this again, since the dialog can redraw between keys.
+  const showsReviewed = (now: ReturnType<typeof screenPrompt>) => Boolean(teamRequest && now &&
+    hashOf(now.fingerprint) === prompt.hash && now.title === prompt.title && now.detail === prompt.detail &&
+    (prompt.tool || now.pinned) && now.options.some(option => option.index === teamRequest.option && option.role === "accept"));
   if (teamRequest && (teamRequest.promptId !== prompt.id || teamRequest.promptHash !== prompt.hash ||
       teamRequest.evidenceHash !== permissionEvidenceHash(prompt) ||
-      oneShotPermissionOption(prompt) !== teamRequest.option ||
-      !current.options.some(option => option.index === teamRequest.option && option.role === "accept")))
+      oneShotPermissionOption(prompt) !== teamRequest.option || !showsReviewed(current)))
     throw new Refusal("prompt-changed");
   if (prompt.multiSelect || current.multiSelect)
     throw new Refusal("unsupported");
@@ -865,6 +870,9 @@ async function answer(
     throw new Refusal("invalid-option");
   // Delivery follows the dialog on screen, not the hook's kind for it.
   const yesNo = current.kind === "yes-no";
+  // A typed `y` changes the yes-no line before its Enter, so that Enter could not be checked
+  // against the reviewed screen. A delegated answer goes only to a menu.
+  if (teamRequest && yesNo) throw new Refusal("unsupported");
   const feedback = current.options.find(
     (o) => o.role === "reject-with-feedback",
   );
@@ -934,6 +942,7 @@ async function answer(
         session.team.memberId !== teamRequest.assignment.memberId || session.team.revision !== teamRequest.assignment.revision ||
         session.team.role !== teamRequest.assignment.role || session.team.taskId !== teamRequest.assignment.taskId))
       throw new Refusal("unsupported");
+    if (teamRequest && !showsReviewed(screenPrompt())) throw new Refusal("prompt-changed");
   };
   answering = prompt.id;
   try {

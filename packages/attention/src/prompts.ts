@@ -9,6 +9,8 @@ export interface DetectedPrompt {
   highlighted?: number;
   acceptsText: boolean;
   multiSelect: boolean;
+  /** Only blank lines and key hints follow the options: the block is the screen's bottom-most UI, not transcript text. */
+  pinned: boolean;
   fingerprint: string;
   blockStart: number;
   blockEnd: number;
@@ -21,6 +23,7 @@ const PERMISSION = /do you want to (proceed|make this edit|create|run)|would you
 const QUESTION_OPTION = /^(chat about this|other|skip|type something)/i;
 const MULTI = /a to select all|n to select none/i;
 const YES_NO = /(\[(y\/N|Y\/n|y\/n)\]|\((y\/n|yes\/no)\))\s*:?\s*$/i;
+const KEY_HINT = /^(Enter to|Esc to|Press )/i;
 
 /** The non-empty lines of `text`, each with its whitespace runs collapsed to one space. */
 export function normalisedLines(text?: string): string[] {
@@ -50,12 +53,13 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
     const detail = detailLines.length ? detailLines.join("\n").slice(0, 2000) : undefined;
     const footer = clean.slice(end + 1, end + 3).join(" ");
     const multiSelect = MULTI.test(footer);
+    const pinned = clean.slice(end + 1).every((l) => l === "" || RULE.test(l) || KEY_HINT.test(l));
     let kind: PromptKind = "menu";
     if (PERMISSION.test(title)) kind = "permission";
     else if (options.some((o) => QUESTION_OPTION.test(o.label))) kind = "question";
     const acceptsText = options.some((o) => o.role === "reject-with-feedback");
     return {
-      kind, title, detail, options, highlighted, acceptsText, multiSelect,
+      kind, title, detail, options, highlighted, acceptsText, multiSelect, pinned,
       // The detail (the command, path or question body) is part of the dialog's identity.
       fingerprint: [title, ...normalisedLines(detail), ...options.map((o) => o.label)].join("\n"),
       blockStart: start, blockEnd: end,
@@ -71,7 +75,7 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
         { index: 0, label: "Yes", role: "accept" },
         { index: 1, label: "No", role: "reject" },
       ],
-      acceptsText: true, multiSelect: false, fingerprint: title,
+      acceptsText: true, multiSelect: false, pinned: true, fingerprint: title,
       blockStart: lastIndex, blockEnd: lastIndex,
     };
   }
@@ -87,7 +91,6 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
 function lastOptionBlock(clean: string[], raw: string[]) {
   const firstTextCol = (line: string) => line.search(/[^\s│┃]/);
   const numberCol = (line: string) => line.search(/\d{1,2}\.\s/);
-  const KEY_HINT = /^(Enter to|Esc to|Press )/i;
   let best: { start: number; end: number; options: PromptOption[]; highlighted?: number } | null = null;
   let i = 0;
   while (i < clean.length) {
@@ -159,6 +162,7 @@ function detectWorkspaceTrust(clean: string[]): DetectedPrompt | null {
     highlighted: marked,
     acceptsText: false,
     multiSelect: false,
+    pinned: clean.slice(end + 1).every((line) => line === "" || RULE.test(line) || KEY_HINT.test(line)),
     fingerprint: [title, ...normalisedLines(detail), ...options.map((option) => option.label)].join("\n"),
     blockStart: start,
     blockEnd: end,

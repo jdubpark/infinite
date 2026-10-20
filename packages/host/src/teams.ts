@@ -763,10 +763,14 @@ export class TeamService {
         if (!member.report) {
           if (member.role === "permission-coordinator" && member.startedAt && Date.now() - Date.parse(member.startedAt) > 5 * 60 * 1000) {
             const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
-            if (decision && decision.status === "reviewing") { decision.status = "escalated"; decision.reason = "The five-minute review window expired without a decision."; }
+            const decisionChanged = decision?.status === "reviewing", before = member.status;
+            if (decision && decisionChanged) { decision.status = "escalated"; decision.reason = "The five-minute review window expired without a decision."; }
             try { if (!await this.stopped(member)) member.status = "unavailable"; }
             catch { member.status = "unavailable"; }
-            this.event(stored, "The permission coordinator exceeded its review window; the request remains with the user."); this.save(stored); continue;
+            // A coordinator that will not exit is retried each pass; report the expiry once.
+            if (decisionChanged || before !== "unavailable") this.event(stored, "The permission coordinator exceeded its review window; the request remains with the user.");
+            if (decisionChanged || member.status !== before) this.save(stored);
+            continue;
           }
           const { page, limit } = this.readMemberJournal(run, member);
           if (!member.report && limit) {
@@ -803,7 +807,10 @@ export class TeamService {
             // A prompt that waits on a person outranks one the coordinator is still reviewing.
             else if (state.attention.state === "needs-you")
               run.reason = underReview(run, member.sessionId, state.attention.prompt?.id) && run.reason !== providerInputReason ? permissionReviewReason : providerInputReason;
-            else member.status = "running";
+            // A coordinator back from an outage runs again only while its review is current; an obsolete or
+            // expired one (its decision already moved on) stays unavailable until its exit is confirmed.
+            else if (member.status !== "unavailable" || member.role !== "permission-coordinator" ||
+              run.permissionDecisions?.some(item => item.coordinatorMemberId === member.memberId && item.status === "reviewing")) member.status = "running";
             this.save(stored);
             if (state.status === "running" && journalDrained && member.role !== "permission-coordinator" &&
                 (member.stalledAt || state.attention.state !== "needs-you" && !member.pendingLimit && quietFor(member) > this.stallWindow())) {

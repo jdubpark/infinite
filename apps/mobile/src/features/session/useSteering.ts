@@ -20,14 +20,16 @@ export type SteeringKey = (typeof KEYS)[number];
  * Terminal does: there the person sees the dialog the text lands in.
  * Every send carries this phone's control lease, and nothing is sent without
  * one when the session `requiresControl`. The unsent text and an unconfirmed
- * request stay in memory under `draftKey` across navigation.
+ * request stay in memory under `draftKey` across navigation. A `managed`
+ * session (run by a mission coordinator) takes no text or keys from this phone,
+ * so nothing is sent.
  */
 export function useSteering(
   connection: Connection,
   id: string,
   onDelivered: () => void,
   control: Pick<SessionControlHandle, "leaseId" | "refused">,
-  options: { force?: boolean; draftKey: string; requiresControl: boolean },
+  options: { force?: boolean; draftKey: string; requiresControl: boolean; managed?: boolean },
 ) {
   const { draftKey } = options;
   const [busy, setBusy] = useState(false);
@@ -44,7 +46,7 @@ export function useSteering(
 
   /** Resolves true once the host confirms delivery to the terminal. */
   async function send(): Promise<boolean> {
-    if (inFlight.current) return false;
+    if (inFlight.current || options.managed) return false;
     inFlight.current = true;
     setBusy(true);
     setError("");
@@ -91,6 +93,11 @@ export function useSteering(
         settleDraft(draftKey, request.requestId, false);
         setError("A prompt is open. Answer it above, or reply instead.");
         onDelivered();
+      } else if (e instanceof ApiError && e.code === "mission-managed") {
+        // The session became mission-managed while the text was in flight. The host refused before typing, so nothing is retried.
+        settleDraft(draftKey, request.requestId, false);
+        setError(e.message);
+        onDelivered();
       } else setError((e as Error).message);
       return false;
     } finally {
@@ -100,7 +107,7 @@ export function useSteering(
   }
 
   async function sendKey(key: SteeringKey) {
-    if (inFlight.current) return;
+    if (inFlight.current || options.managed) return;
     inFlight.current = true;
     setBusy(true);
     setError("");

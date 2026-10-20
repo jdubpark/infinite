@@ -29,7 +29,8 @@ export function AgentApproval({ connection, member, agent, provider, decision, m
   }, 2000, [connection, id]);
   useControlSync(control, poll.data, poll.stale);
   const session = poll.data?.session ?? null;
-  const requiresControl = session?.capabilities?.inputControl === 1;
+  // A mission-managed member has no lease to claim (the host refuses the claim), so its prompt is answered without one.
+  const requiresControl = session?.capabilities?.inputControl === 1 && !session?.managedBy;
   const prompt = session?.attention.state === "needs-you" ? session.attention.prompt : undefined;
   const answering = useAnswer(connection, id, prompt, poll.refresh, control, requiresControl);
   const permitted = me !== null && me.role !== "viewer" && me.capabilities?.answer !== false && !answering.forbidden;

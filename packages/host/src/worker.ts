@@ -837,7 +837,7 @@ async function answer(
         !Number.isFinite(Date.parse(teamRequest.expiresAt)) || Date.parse(teamRequest.expiresAt) <= Date.now())
       throw new Refusal("prompt-changed");
     checkControl(teamRequest);
-  } else checkControl(request);
+  } else if (request.op === "answer" && !request.missionManaged) checkControl(request);
   const acceptedControlGeneration = controlChangeGeneration;
   const pty = child;
   if (state.status !== "running" || !pty)

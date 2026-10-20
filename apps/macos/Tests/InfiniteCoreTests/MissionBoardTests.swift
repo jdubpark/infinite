@@ -191,4 +191,15 @@ final class MissionBoardTests: XCTestCase {
         for status in ["planning", "working", "needs-input"] { XCTAssertTrue(Mission(.object(["status": .string(status)])).canAnswer, status) }
         for status in ["paused", "blocked", "ready-for-review", "cancelled"] { XCTAssertFalse(Mission(.object(["status": .string(status)])).canAnswer, status) }
     }
+
+    func testManagedSessionsDecodeTheirMissionAndOwnerSessionsCarryNone() throws {
+        let managed = try parse(#"{"id":"s-1","status":"running","managedBy":{"kind":"mission","missionId":"m-1","teamId":"t-1"}}"#)
+        XCTAssertEqual(try managed["managedBy"].decoded(SessionManagement.self), SessionManagement(kind: "mission", missionId: "m-1", teamId: "t-1"))
+        // A coordinator's own session names no team.
+        let coordinator = try parse(#"{"id":"s-2","managedBy":{"kind":"mission","missionId":"m-1"}}"#)
+        XCTAssertNil(try coordinator["managedBy"].decoded(SessionManagement.self).teamId)
+        // Older hosts and owner-run sessions send no managedBy, which decodes to nil.
+        let owned = try parse(#"{"id":"s-3","status":"running"}"#)
+        XCTAssertNil(try? owned["managedBy"].decoded(SessionManagement.self))
+    }
 }

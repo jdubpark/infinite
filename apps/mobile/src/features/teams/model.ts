@@ -133,7 +133,8 @@ export function teamKind(team: TeamView, approvals = 0): { kind: StatusKind; fra
   if (team.status === "no-change") return { kind: "stopped", fraction: 0 };
   if (team.status === "paused") return { kind: "paused", fraction: 0 };
   if (team.status === "blocked") return { kind: "blocked", fraction: 0 };
-  if (team.status === "needs-input" || openDecisions(team).length || approvals) return { kind: "attention", fraction: 0 };
+  // A mission subteam's decisions go to its coordinator; only provider prompts need the owner there.
+  if ((!team.missionId && (team.status === "needs-input" || openDecisions(team).length)) || approvals) return { kind: "attention", fraction: 0 };
   if (team.status === "ready-for-review" || team.status === "merged") return { kind: "review", fraction: 1 };
   const { done, total } = teamProgress(team);
   return { kind: "progress", fraction: Math.max(PHASE_FLOOR[team.status] ?? 0.25, total ? done / total : 0) };
@@ -270,17 +271,19 @@ export function profileSetting(profile: ModelProfile) {
 
 /**
  * Which team controls to offer. Steering and lifecycle belong to standalone teams; a goal-owned
- * team is controlled from its goal, though its decisions stay answerable here. Pause, resume and
+ * team is controlled from its goal, though its decisions stay answerable here. A mission's subteam is
+ * run by its mission coordinator, so people get no run controls there. Pause, resume and
  * cancel are owner actions. Every control waits for a fresh poll.
  */
 export function teamControls(team: TeamView, role: DeviceRole | undefined, fresh: boolean) {
   const acts = fresh && role !== undefined && role !== "viewer";
-  const owns = fresh && role === "owner" && !team.goal && team.status !== "cancelled";
+  const managed = Boolean(team.missionId);
+  const owns = fresh && role === "owner" && !team.goal && !managed && team.status !== "cancelled";
   const deliveryStarted = team.status === "delivering" || team.status === "merged" || Boolean(team.deliveryReceipt);
   const deliveryReported = team.status === "merged" || Boolean(team.deliveryReceipt);
   return {
-    answer: acts && !["paused", "cancelled"].includes(team.status),
-    steer: acts && !team.goal && team.status !== "cancelled" && !deliveryStarted,
+    answer: acts && !managed && !["paused", "cancelled"].includes(team.status),
+    steer: acts && !managed && !team.goal && team.status !== "cancelled" && !deliveryStarted,
     pause: owns && !deliveryReported && !["paused", "blocked", "ready-for-review", "no-change", "merged"].includes(team.status),
     resume: owns && (team.status === "paused" || team.resumable === true) && !deliveryReported,
     cancel: owns,

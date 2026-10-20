@@ -304,7 +304,7 @@ struct DesktopView: View {
                 ForEach(app.mounted, id: \.self) { id in
                     if let model = app.model(for: id) {
                         let slot = visible.firstIndex(of: id)
-                        SessionPane(model: model, closeView: visible.count > 1 && id == app.secondaryID ? { app.secondaryID = nil } : nil)
+                        SessionPane(model: model, closeView: visible.count > 1 && id == app.secondaryID ? { app.secondaryID = nil } : nil, openMission: { app.selectedMissionID = $0 })
                             .frame(width: slot == nil ? area.size.width : width, height: area.size.height)
                             .offset(x: slot.map { CGFloat($0) * (width + 1) } ?? 0)
                             .opacity(slot == nil ? 0 : 1)
@@ -346,6 +346,8 @@ func statusColor(_ session: AgentSession) -> Color {
 struct SessionPane: View {
     @ObservedObject var model: SessionModel
     var closeView: (() -> Void)?
+    /// Opens the mission that runs this session, when it has one; its line then leads there.
+    var openMission: ((String) -> Void)? = nil
     @State private var confirmEnd = false
     @State private var confirmClear = false
     private var session: AgentSession { model.session }
@@ -370,7 +372,7 @@ struct SessionPane: View {
             Divider()
             VStack(spacing: 10) {
                 if let prompt = model.prompt, model.session.needsYou { PromptCard(model: model, prompt: prompt).id(prompt["id"].int) }
-                composer
+                if let management = session.managedBy { managedFooter(management) } else { composer }
             }.padding(12).fixedSize(horizontal: false, vertical: true).layoutPriority(1)
         }.background(Palette.background)
         .task { await model.attach() }
@@ -398,12 +400,12 @@ struct SessionPane: View {
             Picker("View", selection: Binding(get: { model.view }, set: { if $0 == .screen { model.showScreen() } else { model.view = .chat } })) {
                 Text("Chat").tag(SessionViewMode.chat); Text("Screen").tag(SessionViewMode.screen)
             }.pickerStyle(.segmented).labelsHidden().fixedSize()
-            if !session.running && session.value["resumable"].bool == true {
+            if !session.running && session.value["resumable"].bool == true && !model.managed {
                 Button("Resume") { Task { await model.resume() } }.disabled(model.role != "owner")
             } else {
                 Menu {
                     Button("Reconnect terminal") { Task { await model.detach(); await model.attach() } }
-                    if model.role == "owner" { Button("End session…", role: .destructive) { confirmEnd = true } }
+                    if model.role == "owner" && !model.managed { Button("End session…", role: .destructive) { confirmEnd = true } }
                 } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton).fixedSize().help("Session actions")
             }
             if let closeView { Button(action: closeView) { Image(systemName: "xmark") }.buttonStyle(.plain).help("Close this view; the agent keeps running") }
@@ -430,7 +432,7 @@ struct SessionPane: View {
             HStack(spacing: 12) {
                 Text(footer.text).font(.system(size: 11)).foregroundStyle(footer.color).lineLimit(2).help(footer.text).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).frame(height: 28, alignment: .leading)
-                if model.role == "owner" {
+                if model.role == "owner" && !model.managed {
                     Toggle("Type in terminal", isOn: Binding(get: { model.directInput }, set: model.setDirectInput))
                         .toggleStyle(.switch).controlSize(.mini).font(.caption).disabled(!model.screenReady || model.view != .screen)
                 }
@@ -446,6 +448,15 @@ struct SessionPane: View {
                     .disabled(!model.canSend || model.role == "viewer" || promptBlocks)
             }
         }
+    }
+    /// Stands in for the composer on a mission-managed session. Its notice still shows, so a provider prompt answer is confirmed here.
+    private func managedFooter(_ management: SessionManagement) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            MissionManagedNote(missionID: management.missionId, openMission: openMission)
+            if !model.notice.isEmpty {
+                Text(model.notice).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading).frame(minHeight: 28, alignment: .topLeading)
     }
 }
 

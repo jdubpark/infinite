@@ -25,7 +25,7 @@ import {
   Users,
   WifiOff,
 } from "lucide-react";
-import { useApi, ago, ApiError, isControlRefusal, names, pendingLabel, type ControlLease, type Me, type ProjectDetail, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
+import { useApi, ago, ApiError, isControlRefusal, isMissionManaged, missionManagedLine, names, pendingLabel, type ControlLease, type Me, type ProjectDetail, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
 import { clearDrafts, readDraft, settleDraft, useSessionDraft, writeDraft, type PendingInput } from "./drafts";
 import { creations, lifecycles } from "./requests";
 import { MachinePicker, MachineProvider, useMachines } from "./machines";
@@ -654,7 +654,7 @@ function Create({
     </div>
   );
 }
-function TerminalView({ id }: { id: string }) {
+function TerminalView({ id, managed }: { id: string; managed: boolean }) {
   const api = useApi();
   const element = useRef<HTMLDivElement>(null);
   const [error, setError] = useState("");
@@ -711,7 +711,7 @@ function TerminalView({ id }: { id: string }) {
   return (
     <div className="terminal-shell">
       <div className="terminal-caption">
-        Recorded terminal · use the composer to send input
+        {managed ? "Recorded terminal · read-only" : "Recorded terminal · use the composer to send input"}
       </div>
       <div className="terminal" ref={element} />
       {error && (
@@ -813,8 +813,13 @@ function SessionView({
     composer.current.style.height = `${Math.min(170, composer.current.scrollHeight)}px`;
   }, [text, tab, session !== null]);
   const requiresControl = session?.capabilities?.inputControl === 1;
-  const canSteer = connected && view.fresh && session?.status === "running" &&
-    me.role !== "viewer" && (!requiresControl || Boolean(control.lease));
+  // A mission coordinator runs managed sessions; the host refuses people's input, keys, stop, resume and control claims.
+  const managed = Boolean(session?.managedBy);
+  const answerable = connected && view.fresh && session?.status === "running" && me.role !== "viewer";
+  const controlled = !requiresControl || Boolean(control.lease);
+  const canSteer = answerable && !managed && controlled;
+  // Provider prompts stay with the owner. Their answers need no control lease, because a managed session cannot be claimed.
+  const canAnswer = answerable && (managed || controlled) && me.capabilities?.answer !== false;
   async function takeControl(takeover = false) {
     if (!view.fresh || session?.status !== "running") return;
     await control.claim(takeover);
@@ -858,7 +863,12 @@ function SessionView({
         "Delivered to the terminal. Agent execution is not yet confirmed.",
       );
     } catch (e) {
-      if (handleInputError(e)) {
+      if (isMissionManaged(e)) {
+        // Refused, not delivered: keep the draft in the tab and drop the pending request.
+        settleDraft(cacheKey, request.requestId, false);
+        setError(e.message);
+        view.refresh();
+      } else if (handleInputError(e)) {
         if (!retrying) {
           settleDraft(cacheKey, request.requestId, false);
         }
@@ -885,7 +895,8 @@ function SessionView({
       if (receipt.state !== "delivered") throw new Error("Key delivery is uncertain.");
       setNotice(`${key} sent to the terminal.`);
     } catch (e) {
-      setError(handleInputError(e) ? `${(e as Error).message} The key was not sent.` :
+      if (isMissionManaged(e)) { setError(e.message); view.refresh(); }
+      else setError(handleInputError(e) ? `${(e as Error).message} The key was not sent.` :
         `${(e as Error).message} Check the recording before sending another key.`);
     } finally {
       setBusy(false);
@@ -994,7 +1005,7 @@ function SessionView({
           setFollowing(false);
       }}>
         {tab === "chat" ? <Conversation id={id} /> : tab === "files" ? <ProjectFiles id={id} online={connected && view.fresh} /> : tab === "terminal" ? (
-          <TerminalView id={id} />
+          <TerminalView id={id} managed={managed} />
         ) : tab === "context" ? (
           <Context session={session} me={me} connected={connected && view.fresh} />
         ) : (
@@ -1051,16 +1062,16 @@ function SessionView({
         )}
       </div>
       <div className="composer-area">
-        {session.attention?.prompt && <PromptDecision key={session.attention.prompt.id} sessionId={id} backend={session.backend} prompt={session.attention.prompt} canAnswer={Boolean(canSteer && me.capabilities?.answer !== false)} controlId={control.lease?.id} refresh={view.refresh} onRefused={() => control.forget()} openTerminal={() => setTab("terminal")} />}
+        {session.attention?.prompt && <PromptDecision key={session.attention.prompt.id} sessionId={id} backend={session.backend} prompt={session.attention.prompt} canAnswer={canAnswer} controlId={control.lease?.id} refresh={view.refresh} onRefused={() => control.forget()} openTerminal={() => setTab("terminal")} />}
         <div className="control-bar">
-          <div>
+          {managed ? <p className="quiet control-managed">{missionManagedLine}</p> : <div>
             <strong>{requiresControl ? control.lease ? "You have control" : "Monitoring" : me.role === "viewer" ? "View only" : "Shared controls"}</strong>
             <span className="control-state" title={!view.fresh || !connected ? "Refreshing before input…" : session.status !== "running" ? "Process is not running" : requiresControl && !control.lease ? control.holder ? `${control.holder.label} has control` : "Draft now, take control to send" : "Ready for input"}>{!view.fresh || !connected ? "Refreshing before input…" : session.status !== "running" ? "Process is not running" : requiresControl && !control.lease ? control.holder ? `${control.holder.label} has control` : "Draft now, take control to send" : "Ready for input"}</span>
-          </div>
+          </div>}
           <div className="control-actions">
-            <SessionLifecycle session={session} role={me.role} online={connected && view.fresh} controlId={control.lease?.id} refresh={view.refresh} />
+            {!managed && <SessionLifecycle session={session} role={me.role} online={connected && view.fresh} controlId={control.lease?.id} refresh={view.refresh} />}
             <button className="text-button" onClick={view.refresh} disabled={view.refreshing} aria-label="Refresh this session" aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={16} /></button>
-            {requiresControl && me.role !== "viewer" && session.status === "running" && (
+            {!managed && requiresControl && me.role !== "viewer" && session.status === "running" && (
               control.lease ? <button className="text-button" onClick={async () => { await control.release(); view.refresh(); }}>Stop controlling</button> :
                 <button className="primary stable-action" aria-busy={control.busy} disabled={!connected || !view.fresh || control.busy} onClick={() => takeControl(Boolean(control.holder))}>
                   {control.busy ? "Updating…" : control.holder ? "Take over" : "Take control"}
@@ -1076,7 +1087,7 @@ function SessionView({
         </div>
         {me.role === "viewer" ? (
           <p className="quiet">This device has view-only access.</p>
-        ) : (
+        ) : managed ? null : (
           <>
             <form className="composer" onSubmit={send}>
               <label className="sr-only" htmlFor="message">

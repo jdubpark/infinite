@@ -342,6 +342,8 @@ async function main() {
         tokens: { input, output, reasoning: 0, cache: { read: 1, write: 1 } } });
       process.stdout.write([
         line("text", { type: "text", id: `prt_${assignment.taskId}_0`, messageID: `msg_${assignment.taskId}`, sessionID: "ses_fixture", text: "Working." }),
+        line("tool_use", { type: "tool", id: `prt_${assignment.taskId}_t`, messageID: `msg_${assignment.taskId}`, sessionID: "ses_fixture", tool: "bash",
+          callID: `call_${assignment.taskId}`, state: { status: "completed", input: { command: "ls" }, output: "a.txt" } }),
         step(1, 0.1, 400, 100),
         step(2, 0.4, 600, 400),
         "Implementation notes follow.",

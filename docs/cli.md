@@ -111,10 +111,10 @@ full key list.
 | `--delivery merge` | None | The delivery member merges the reviewed commit on GitHub. The host refreshes after the merge report. |
 | `--delivery pr` | None | The delivery member pushes the reviewed branch and opens a pull request. The owner merges on GitHub. |
 | `--repository OWNER/REPO` | Read from `origin` | Delivery target for `merge` and `pr`. |
-| `--base-branch BRANCH` | `origin/HEAD`, else local `main` or `master` | Delivery base for `merge` and `pr`. |
+| `--base-branch BRANCH` | `origin/HEAD`, else local `main` or `master` | The branch a GitHub source follows, and the delivery base for `merge` and `pr`. |
 | `--merge-method` | None | Squash, merge, or rebase, for `--delivery merge` only. |
 
-`--repository` and `--base-branch` require `--delivery merge` or `pr`. When
+`--repository` requires `--delivery merge` or `pr`; `--base-branch` also works alone to name the followed branch. When
 `--delivery` is omitted, an existing enrollment keeps its delivery policy.
 Running `repo init` in an enrolled GitHub checkout switches it to `github` mode.
 

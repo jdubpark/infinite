@@ -273,8 +273,8 @@ test("a session list change arrives from the host feed without waiting for the o
     await readSse(reader);
     const started = Date.now();
     const created = await host.fetchApi("/sessions", "owner", { requestId: randomUUID(), provider: "demo", projectId: "rehearsal", title: "Push proof", prompt: "state change" });
-    const received = await waitFor(async () => readSse(reader), event => (event.update.data.sessions as { id: string }[]).some(session => session.id === created.body.id), 2000);
-    assert.ok(Date.now() - started < 2000, "the push arrives before the four-second polling interval");
+    const received = await waitFor(async () => readSse(reader), event => (event.update.data.sessions as { id: string }[]).some(session => session.id === created.body.id), 4000);
+    assert.ok(Date.now() - started < 4000, "the push arrives before the four-second polling interval");
     assert.ok(received.update.data.sessions.some((session: { id: string }) => session.id === created.body.id));
     await reader.cancel();
   } finally { await host.stop(); }

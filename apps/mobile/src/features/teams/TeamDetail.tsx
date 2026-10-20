@@ -1,10 +1,11 @@
 import { useState, type ReactNode } from "react";
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me, type SessionRow } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
+import { useKeyboardPadding } from "../../components/keyboard";
 import { Button } from "../../components/Button";
 import { Card, Chip, GlassButton, GroupHeader, LiveStatus, ProgressBar, Segmented, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
@@ -39,6 +40,7 @@ const live = (member: TeamMember) => member.status === "running" || member.statu
  */
 export function TeamDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
+  const keyboardPadding = useKeyboardPadding();
   const machine = connectionKey(connection);
   const poll = useLive<TeamView>(connection, {
     topics: ["teams"], intervalMs: 2000, deps: [id],
@@ -155,7 +157,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     </View>;
   };
 
-  return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
+  return <View style={[s.fill, s.overlayRoot, { paddingBottom: keyboardPadding }]}>
     {top}
     <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : agentStale ? "Agent screen may be stale." : null} />
     <DictationNotice dictation={dictation} position="top" offset={110} />
@@ -354,7 +356,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
         onSend={() => { const text = direction.trim(); if (text) send("/steer", "Direction", { text }); }} />}
     </View>
     <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|answer)$/.test(request.pending?.path ?? ""))} />
-  </KeyboardAvoidingView>;
+  </View>;
 }
 
 /** An icon and a number, with the full meaning for screen readers; tapping opens its tab. */

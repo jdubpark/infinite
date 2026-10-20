@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me, type Mission, type ProjectGroupList } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { FloatingNotice } from "../../components/FloatingNotice";
+import { useKeyboardPadding } from "../../components/keyboard";
 import { Button } from "../../components/Button";
 import { Card, Chip, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
@@ -16,6 +17,7 @@ import { missionControls, missionStatusLabel, missionSubtaskLabel, openMissionDe
 
 export function MissionDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
+  const keyboardPadding = useKeyboardPadding();
   const machine = connectionKey(connection);
   const poll = usePoll(async () => {
     const [mission, me, projects] = await Promise.all([
@@ -56,7 +58,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
     : mission.status === "paused" ? "paused" : mission.status === "ready-for-review" ? "review"
       : mission.status === "cancelled" ? "cancelled" : "progress";
 
-  return <KeyboardAvoidingView style={s.fill} behavior="padding">
+  return <View style={[s.fill, { paddingBottom: keyboardPadding }]}>
     {top}
     <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
@@ -127,7 +129,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
     </View> : null}
     {me?.role === "owner" ? <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh} /> : null}
     <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : null} />
-  </KeyboardAvoidingView>;
+  </View>;
 }
 
 function Decision({ question, options, enabled, onAnswer }: { question: string; options: string[]; enabled: boolean; onAnswer: (text: string) => void }) {

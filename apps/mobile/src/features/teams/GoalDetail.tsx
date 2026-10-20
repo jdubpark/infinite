@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
+import { useKeyboardPadding } from "../../components/keyboard";
 import { Card, Chip, LiveStatus, ProgressBar, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
@@ -21,6 +22,7 @@ import { CostLine, MoneyText } from "../cost/parts";
 /** One product goal: its outcome, limits, active cycle, earlier cycles, and the person's assessment. */
 export function GoalDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
+  const keyboardPadding = useKeyboardPadding();
   const machine = connectionKey(connection);
   const poll = usePoll(async () => ({ goal: await api<ProductGoal>(connection, `/goals/${id}`), receivedAt: Date.now() }), 2000, [connection, id]);
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
@@ -63,7 +65,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   const project = me?.projects?.find(value => value.id === goal.projectId)?.name ?? goal.projectId;
   const send = (action: string, label: string, fields?: Record<string, string | number>) => request.send(`/goals/${id}/${action}`, label, goal.revision, fields);
 
-  return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
+  return <View style={[s.fill, s.overlayRoot, { paddingBottom: keyboardPadding }]}>
     {header}
     <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : active.stale ? activeTeam ? "Active cycle may be out of date." : "Can't load the active cycle." : null} />
     <DictationNotice dictation={dictation} position="top" offset={110} />
@@ -188,7 +190,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
         onSend={() => { const text = direction.trim(); if (text) send("steer", "Direction", { text }); }} />
     </View>
     <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|outcome)$/.test(request.pending?.path ?? ""))} />
-  </KeyboardAvoidingView>;
+  </View>;
 }
 
 /** The person's judgment of the product outcome. It does not publish the changes. */

@@ -353,7 +353,7 @@ function scripted() {
     projects: [{ id: "api", name: "API", path: repo("api"), team: { checks } }, { id: "web", name: "Web", path: repo("web"), team: { checks } }],
     teams: { workspaceDir: join(root, "teams"), lineup } };
   const attempts: { sessionId: string; assignment: TeamAssignment; prompt: string }[] = [];
-  const reports = new Map<string, MissionReport>();
+  const reports = new Map<string, MissionReport>(), turnEnded = new Set<string>();
   const manager = {
     async createTeamSession(request: { requestId: string; prompt: string }, assignment: TeamAssignment) {
       if (!attempts.some(item => item.sessionId === request.requestId)) attempts.push({ sessionId: request.requestId, assignment, prompt: request.prompt });
@@ -366,7 +366,9 @@ function scripted() {
       return { events: [{ data: { requestId: randomUUID(), missionId: runId, memberId, revision, report } }], cursor: 1, more: false };
     },
     meta() { return {}; },
-    async state() { return { status: "running" }; },
+    async state(sessionId: string) {
+      return { status: "running", attention: { state: turnEnded.has(sessionId) ? "turn-finished" : "working", lastActivityAt: new Date().toISOString() } };
+    },
     async stopTeamSession() { return { status: "exited" }; },
   };
   const runs = new Map<string, FakeRun>(), standalone = new Set<string>(), failing = new Set<string>();
@@ -422,6 +424,8 @@ function scripted() {
     messages: async (n: number) => parse((await attempt(n)).prompt, "Messages since your last attempt (JSON): "),
     state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),
     report: async (n: number, report: MissionReport) => { reports.set((await attempt(n)).sessionId, report); },
+    /** The coordinator's turn ends without a report; its session stays alive at the prompt. */
+    endTurn: async (n: number) => { turnEnded.add((await attempt(n)).sessionId); },
     create: (objective = "Change the API and the web client") => missions.create({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 }),
     get: (id: string) => missions.get(id),
     close: () => { missions.close(); rmSync(root, { recursive: true, force: true }); },
@@ -531,6 +535,30 @@ test("a coordinator with nothing to decide waits without opening an owner questi
     assert.equal(refusal.kind, "wait");
     assert.match(refusal.reason, /no later attempt would start/);
     await h.report(4, { kind: "result", summary: "The API change is ready" });
+    await until(() => h.get(id), mission => mission.status === "ready-for-review", 20000);
+  } finally { h.close(); }
+});
+
+test("a coordinator that ends its turn without a report is replaced, so the last subtask's finish still reaches a new attempt", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One change per repository", subtasks: [plan("a", "api"), plan("b", "web")] });
+    const started = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a") && teamOf(mission, "b")));
+    // A waiting coordinator is woken by owner input.
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep both changes small" });
+    await h.report(2, { kind: "wait", summary: "Both subteams are working" });
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Mention the endpoint in the summary" });
+    assert.ok((await h.messages(3)).some((message: { type: string }) => message.type === "owner-direction"));
+    // The woken attempt ends its turn without reporting, while the last subtasks finish.
+    h.set(teamOf(started, "a")!, { status: "ready-for-review" });
+    h.set(teamOf(started, "b")!, { status: "ready-for-review" });
+    await h.endTurn(3);
+    const fourth = await h.messages(4);
+    assert.ok(fourth.some((message: { type: string; kind?: string }) => message.type === "refused" && message.kind === "missing"), "The next attempt is told the previous one filed no report");
+    assert.deepEqual(fourth.filter((message: { type: string }) => message.type === "subtask-finished").map((message: { subtaskId: string }) => message.subtaskId).sort(), ["a", "b"]);
+    assert.ok(h.get(id).events.some(event => /missing report was refused: Your previous attempt ended without a mission report/.test(event.text)));
+    await h.report(4, { kind: "result", summary: "Both repositories are ready; the endpoint is GET /health" });
     await until(() => h.get(id), mission => mission.status === "ready-for-review", 20000);
   } finally { h.close(); }
 });

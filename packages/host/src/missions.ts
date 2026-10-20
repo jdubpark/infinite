@@ -22,7 +22,9 @@ type Action = { requestId: string; revision: number };
 /** One coordinator session. Like a team member, it ends with one report; the host starts the next attempt when needed. */
 type Attempt = { memberId: string; sessionId: string; revision: number; prompt: string; cursor: number; stopRequestId: string; status: "queued" | "running" | "reported" | "stopped"; report?: MissionReport; startedAt?: string;
   /** The owner input count when this attempt's prompt was built; a result from an attempt that missed later input is not applied. */
-  ownerInputs?: number };
+  ownerInputs?: number;
+  /** The session ended its turn or went quiet without a report; it is stopped and the next attempt is told why. */
+  missedReport?: boolean };
 /** A subteam action recorded before it is sent, so a restart replays it under the same request ID. */
 type ChildOp = { kind: "answer" | "pause" | "resume" | "cancel"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; by?: "owner" | "coordinator" };
 type Stored = {
@@ -515,17 +517,22 @@ export class MissionService {
       if (!this.launched(attempt)) { attempt.status = "stopped"; this.save(stored); return; }
       attempt.status = "running";
     }
-    if (attempt.status === "running") {
+    if (attempt.status === "running" && !attempt.missedReport) {
       this.readReport(stored, attempt);
       if (attempt.status === "running" && live.has(mission.status)) {
         const state = await this.manager.state(attempt.sessionId);
-        if (state.status !== "exited") { this.save(stored); return; }
+        // A coordinator that ends its turn without a report, or goes quiet, would otherwise hold the attempt open
+        // while subteam and owner messages wait behind it. A provider prompt waiting on the owner is not quiet.
+        const quiet = state.attention.state !== "needs-you" &&
+          Date.now() - Date.parse(state.attention.lastActivityAt ?? attempt.startedAt ?? now()) > (this.config.teams?.stallMinutes ?? 30) * 60000;
+        if (state.status !== "exited" && state.attention.state !== "turn-finished" && !quiet) { this.save(stored); return; }
         this.readReport(stored, attempt);
-        if (attempt.status === "running") {
+        if (attempt.status === "running" && state.status === "exited") {
           attempt.status = "stopped";
           this.stop(stored, "blocked", "The mission coordinator exited without a valid structured report. Subteam workspaces remain available.");
           this.event(stored, stored.mission.reason!); this.save(stored); return;
         }
+        if (attempt.status === "running") { attempt.missedReport = true; this.save(stored); }
       }
     }
     // A reported attempt, or one the mission no longer wants, is stopped before anything acts on its report.
@@ -537,7 +544,8 @@ export class MissionService {
     if (attempt.report) {
       if (live.has(mission.status)) this.consume(stored, attempt.report, attempt);
       else this.event(stored, "A coordinator report arrived after the mission stopped; it was not applied.");
-    }
+    } else if (attempt.missedReport && live.has(mission.status))
+      this.refuse(stored, "missing", "Your previous attempt ended without a mission report. File exactly one report in every attempt; report wait when nothing needs a decision.");
     this.save(stored);
   }
   /** Starts the next coordinator attempt once the previous one stopped and a message needs it. */

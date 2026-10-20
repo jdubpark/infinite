@@ -65,6 +65,12 @@ The coordinator reports through its mission report tool:
 | `blocked` | Moves the mission to `blocked` with the summary as its reason. |
 | `wait` | Ends the attempt without a decision. Accepted only while a subtask is running or can still start, or an owner decision is open, so a later attempt is certain. |
 
+Each attempt must end with one report. An attempt whose session ends its turn
+without a report, or shows no activity for the team stall window while not
+waiting on a provider prompt, is stopped. The next attempt starts with a
+refusal that says so, together with every message that arrived meanwhile.
+Three missed or refused reports in a row block the mission.
+
 Size rules: a `solo` subtask starts a subteam with parallelism 1, and a `team`
 subtask uses its `parallelism` (1–4). The coordinator chooses the size; a simple
 mission may dispatch exactly one solo subtask.

@@ -155,9 +155,14 @@ test("permission coordinator rejects conflicting Claude permission and tool sett
 
 test("mission coordinators can only read repositories and report, for Claude and Codex", () => {
   const claude = missionCoordinatorLaunch("claude", { command: "claude", args: ["--model", "opus"] });
-  assert.ok(claude.args.includes("--permission-mode") && claude.args[claude.args.indexOf("--permission-mode") + 1] === "plan");
-  assert.ok(claude.args.includes("--tools") && claude.args[claude.args.indexOf("--tools") + 1] === "Read,Glob,Grep,LS");
-  assert.deepEqual(claude.args.slice(claude.args.indexOf("--allowedTools") + 1), ["mcp__infinite_team__mission_report"]);
+  assert.ok(claude.args.includes("--permission-mode") && claude.args[claude.args.indexOf("--permission-mode") + 1] === "dontAsk");
+  assert.ok(claude.args.includes("--tools") && claude.args[claude.args.indexOf("--tools") + 1] === "Read,Glob,Grep");
+  const allowed = claude.args.indexOf("--allowedTools");
+  assert.deepEqual(claude.args.slice(allowed + 1, allowed + 5), ["Read", "Glob", "Grep", "mcp__infinite_team__mission_report"]);
+  assert.ok(claude.args.includes("--strict-mcp-config"));
+  const wrapped = missionCoordinatorLaunch("claude", { command: "/usr/bin/sudo", args: ["-n", "-u", "agent", "--", "/usr/local/libexec/infinite/claude", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Edit"] });
+  assert.ok(!wrapped.args.includes("acceptEdits") && !wrapped.args.includes("Bash") && !wrapped.args.includes("Edit"));
+  assert.throws(() => missionCoordinatorLaunch("claude", { command: "claude", args: ["--dangerously-skip-permissions"] }), /cannot configure/);
   assert.ok(!claude.args.some(arg => /dangerously-skip|permission-mode.*acceptEdits|mcp__infinite_team__report/.test(arg)));
 
   const codex = missionCoordinatorLaunch("codex", { command: "codex", args: ["--sandbox", "workspace-write", "--ask-for-approval", "on-request", "-c", "sandbox_workspace_write.network_access=false"] });

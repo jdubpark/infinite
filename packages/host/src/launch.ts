@@ -154,19 +154,25 @@ export function permissionCoordinatorLaunch(provider: Provider, profile: AgentPr
 /** Keep a mission coordinator read-only while retaining only its structured report channel. */
 export function missionCoordinatorLaunch(provider: Provider, profile: AgentProfile): AgentProfile {
   if (provider === "claude") {
-    const restricted = permissionCoordinatorLaunch("claude", profile);
+    // Like the permission coordinator: dontAsk denies anything not listed, so the coordinator can read and report only.
     const args: string[] = [];
-    for (let index = 0; index < restricted.args.length; index++) {
-      const arg = restricted.args[index];
-      if (["--permission-mode", "--tools"].includes(arg)) { index++; continue; }
-      if (arg === "--allowedTools") {
-        while (index + 1 < restricted.args.length && !restricted.args[index + 1].startsWith("-")) index++;
+    const valueFlags = new Set(["--permission-mode", "--tools", "--mcp-config", "--settings", "--agents", "--plugin-dir", "--permission-prompt-tool"]);
+    const listFlags = new Set(["--allowedTools", "--allowed-tools"]);
+    for (let index = 0; index < profile.args.length; index++) {
+      const arg = profile.args[index], flag = arg.split("=")[0];
+      if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"].includes(flag))
+        throw new Error(`Mission coordinator profile cannot configure ${flag}.`);
+      if (valueFlags.has(flag)) { if (!arg.includes("=")) index++; continue; }
+      if (listFlags.has(flag)) {
+        if (!arg.includes("=")) while (index + 1 < profile.args.length && !profile.args[index + 1].startsWith("-")) index++;
         continue;
       }
       args.push(arg);
     }
-    args.push("--permission-mode", "plan", "--tools", "Read,Glob,Grep,LS", "--allowedTools", "mcp__infinite_team__mission_report");
-    return { ...restricted, args };
+    // A flag follows the variadic tool list so it cannot absorb a later positional prompt.
+    args.push("--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
+      "--allowedTools", "Read", "Glob", "Grep", "mcp__infinite_team__mission_report", "--strict-mcp-config", "--disable-slash-commands");
+    return { ...profile, args };
   }
   if (provider !== "codex") throw new Error("Mission coordinator requires Claude Code or Codex.");
   const args: string[] = [];

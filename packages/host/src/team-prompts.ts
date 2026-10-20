@@ -156,7 +156,7 @@ export function missionPrompt(mission: Mission, repos: MissionPromptRepo[], mess
   };
   const recent = messages.map(message => "question" in message ? { ...message, question: clip(message.question, 2000) } : message);
   const prompt = [
-    `You are the main coordinator of a mission for the project "${mission.groupName}". This is coordinator attempt ${attempt}. Your working folder is the mission folder, outside every repository. You may keep short notes there; later attempts start in the same folder.`,
+    `You are the main coordinator of a mission for the project "${mission.groupName}". This is coordinator attempt ${attempt}. Your working folder is the mission folder, outside every repository. You can read files and report; you cannot edit files or run commands, and the host carries mission state between attempts.`,
     profileInstructions(modelProfile),
     `Repositories in this project (inspect read-only at these host paths):\n${repos.map(repo => `- ${repo.projectId} (${repo.name}): ${repo.path}${repo.teamReady ? "" : " — not configured for subteams; do not dispatch to it"}`).join("\n")}\nDo not edit, commit, push, or run commands that change any repository. Every change goes through a subteam: an ordinary team run in one repository that keeps that repository's own checks, independent review, delivery policy, and permission rules.`,
     `Mission objective:\n${mission.objective}`,

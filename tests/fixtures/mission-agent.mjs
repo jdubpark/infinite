@@ -68,13 +68,13 @@ async function subteam() {
   if (assignment.role === "project-manager") {
     if (prompt.includes("HOLD-SUBTEAM")) return hold();
     if (!api) await until(() => existsSync(join(receipts, "release-web-question")));
-    if (!prompt.includes("User answered:")) {
+    if (!/(?:User|Mission coordinator) answered:/.test(prompt)) {
       await report({ kind: "question", question: api ? "Which response format should the endpoint use?" : "Should the button be primary?", options: api ? ["JSON", "Text"] : ["Primary", "Secondary"] });
       return;
     }
     await report({ kind: "plan", summary: `Write ${file}`, tasks: [{ id: "write", title: `Write ${file}`, instructions: `Create ${file}`, agentProfileId: "light", paths: [file], dependsOn: [] }] });
   } else if (assignment.role === "implementer") {
-    writeFileSync(file, `${prompt.match(/User answered: (.*)/)?.[1] ?? "ready"}\n`);
+    writeFileSync(file, `${prompt.match(/(?:User|Mission coordinator) answered: (.*)/)?.[1] ?? "ready"}\n`);
     await report({ kind: "result", summary: `Wrote ${file}` });
   } else if (assignment.role === "reviewer") {
     await report({ kind: "review", verdict: "approved", summary: `Inspected ${file} and the passing check` });

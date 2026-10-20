@@ -385,6 +385,7 @@ function scripted() {
     async stopTeamSession(sessionId: string) { stops.push(sessionId); return { status: held.has(sessionId) ? "running" : "exited" }; },
   };
   const runs = new Map<string, FakeRun>(), standalone = new Set<string>(), failing = new Set<string>();
+  let resumeBusy = false;
   const created: { request: CreateTeam; options?: { baseRunId?: string } }[] = [];
   const answers: { teamId: string; decisionId: string; text: string; by?: string }[] = [];
   const view = (run: FakeRun) => ({ ...structuredClone(run), title: run.id, tasks: [], usage: emptyRollup() }) as unknown as TeamView;
@@ -413,7 +414,10 @@ function scripted() {
       return view(target);
     },
     async pause(id: string) { return view(set(id, { status: "paused" })); },
-    async resume(id: string) { return view(set(id, { status: "implementing" })); },
+    async resume(id: string) {
+      if (resumeBusy) throw new TeamError(409, "team-operation-running", "Another team operation is running.");
+      return view(set(id, { status: "implementing" }));
+    },
     async cancel(id: string) { return view(set(id, { status: "cancelled" })); },
     activeForProject: (projectId: string) => standalone.has(projectId) ||
       [...runs.values()].some(item => item.projectId === projectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(item.status)),
@@ -455,6 +459,10 @@ function scripted() {
     },
     holdStop: async (n: number) => { held.add((await attempt(n)).sessionId); },
     releaseStop: async (n: number) => { held.delete((await attempt(n)).sessionId); },
+    /** Subteam resumes are refused as busy and retried until released. */
+    holdResume: () => { resumeBusy = true; },
+    /** Releases the held stop and resume together, so one tick applies the resume and then consumes the report. */
+    releaseStopAndResume: async (n: number) => { const sessionId = (await attempt(n)).sessionId; held.delete(sessionId); resumeBusy = false; },
     stops: async (n: number) => { const sessionId = (await attempt(n)).sessionId; return stops.filter(item => item === sessionId).length; },
     create: (objective = "Change the API and the web client") => missions.create({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 }),
     get: (id: string) => missions.get(id),
@@ -733,6 +741,27 @@ test("a report filed while a missed-report stop is still pending is applied, not
     assert.ok(!started.events.some(event => /missing report was refused/.test(event.text)));
     await new Promise(done => setTimeout(done, 1000));
     assert.equal(h.attempts(), 1, "The applied report leaves nothing to wake a new attempt");
+  } finally { h.close(); }
+});
+
+test("a wait filed on the tick that resumes a paused subteam is accepted", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    await h.missions.pause(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    await until(() => h.get(id), mission => mission.subtasks[0].teamStatus === "paused");
+    h.holdResume();
+    await h.missions.resume(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    assert.ok((await h.messages(2)).some((message: { type: string }) => message.type === "resumed"));
+    await h.holdStop(2);
+    await h.report(2, { kind: "wait", summary: "The API subteam resumes" });
+    await new Promise(done => setTimeout(done, 1000));
+    assert.equal(h.runs.get(teamId)!.status, "paused", "The resume has not reached the subteam yet");
+    await h.releaseStopAndResume(2);
+    const waiting = await until(() => h.get(id), mission => mission.events.some(event => /waiting for subteam progress|wait report was refused/.test(event.text)), 20000);
+    assert.ok(!waiting.events.some(event => /wait report was refused/.test(event.text)), "The resumed subteam is working, so the wait is accepted");
   } finally { h.close(); }
 });
 

@@ -619,8 +619,12 @@ export class MissionService {
   private willWake(stored: Stored) {
     const mission = stored.mission;
     if (mission.decisions.some(item => !item.answer)) return true;
-    const resuming = (teamId: string) => stored.ops.some(op => op.kind === "resume" && op.teamId === teamId);
-    if (mission.subtasks.some(item => item.status === "running" && (item.teamStatus !== "paused" || resuming(item.teamId!)))) return true;
+    // The subteam's live status, since a resume applied on this tick is not yet mirrored into the subtask.
+    const working = (teamId: string) => {
+      if (stored.ops.some(op => op.kind === "resume" && op.teamId === teamId)) return true;
+      try { return this.teams.get(teamId).status !== "paused"; } catch (error) { if (notFound(error)) return false; throw error; }
+    };
+    if (mission.subtasks.some(item => item.status === "running" && working(item.teamId!))) return true;
     const stalled = stalledSubtasks(mission);
     const ready = mission.subtasks.filter(item => item.status === "queued" && !stalled.has(item.id) &&
       item.dependsOn.every(id => mission.subtasks.find(other => other.id === id)?.status === "done"));

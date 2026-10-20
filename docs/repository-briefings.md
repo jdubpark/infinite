@@ -116,15 +116,14 @@ sudo install -o root -g root -m 0440 \
 sudo visudo -cf /etc/sudoers.d/infinite
 ```
 
-Jevcode briefs only repositories the owner opted in, and the host trigger is
-no exception: a session in any other repository reports the briefing as
-unavailable. Opt a repository in as the agent account; the rule covers every
-clone and worktree of that repository, including team worktrees:
+Jevcode briefs every repository; there is no per-repository opt-in. A
+session reports the briefing as unavailable only when Jevcode's automatic
+briefs are turned off globally.
 
-```sh
-sudo -n -H -u infinite-agent -- /usr/local/libexec/infinite/jevcode \
-  optin --repo /srv/infinite-data/workspaces/PROJECT
-```
+To count briefing spend in the cost view, add `--report-usage` to
+`repositoryBriefings.args` after the wrapper path. Jevcode then reports the
+writer's token usage for each brief it writes, and only when every billed
+writer call used one model; anything else stays unmeasured.
 
 To let Jev gate refreshes and check claims, store a TypeSafe key readable only
 by the agent account; the wrapper exports it when present:

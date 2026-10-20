@@ -59,7 +59,7 @@ Use it to compress agent activity into meaningful changes, explain system respon
 
 Configure `JEVCODE_ROOT` outside the repository to a built Jevcode installation on the execution host. Muse Spark 1.3 Contributor writes briefs through OpenCode, with DeepSeek V4.1 Flash as the fallback. Jev (TypeSafe System One) decides when a refresh is worth its cost, which sections are stale, and whether each claim's citations support it.
 
-Briefs refresh automatically. Where the execution host installs Jevcode's Stop hooks and this repository is opted in (`jevcode optin`, which covers every clone and worktree), every Claude Code and Codex turn ends with a detached `jevcode auto` check that costs no model tokens when nothing changed. Do not run briefs routinely. At a handoff, or before writing a human-facing summary, request a refresh with your own session transcript and read the result:
+Briefs refresh automatically. Where the execution host installs Jevcode's Stop hooks, every Claude Code and Codex turn ends with a detached `jevcode auto` check that costs no model tokens when nothing changed. Do not run briefs routinely. At a handoff, or before writing a human-facing summary, request a refresh with your own session transcript and read the result:
 
 ```sh
 node "$JEVCODE_ROOT/scripts/jevcode.mjs" auto --repo "$PWD" --log "$SESSION_TRANSCRIPT"

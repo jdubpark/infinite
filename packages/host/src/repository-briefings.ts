@@ -97,7 +97,7 @@ const DEBOUNCE_MS = 350;
 const MAX_GIT_MS = 2000;
 const FAILED_MESSAGE = "Repository brief could not be generated. Check the configured briefing wrapper.";
 const NOT_READY_MESSAGE = "No repository brief exists yet; one is generated after the next change.";
-const NOT_OPTED_IN_MESSAGE = "This repository is not opted in to repository briefings.";
+const NOT_OPTED_IN_MESSAGE = "Repository briefings are turned off on this host.";
 const WRITER_LABEL = { muse: "meta/muse-spark-1.3-contributor", deepseek: "deepseek/deepseek-flash", codex: "codex" } as const;
 class NotReady extends Error {}
 class NotOptedIn extends Error {}
@@ -499,7 +499,7 @@ export class RepositoryBriefings {
       });
       const value: unknown = JSON.parse(raw);
       const empty = emptySchema.safeParse(value);
-      // Jevcode honors the owner's per-repository opt-in; a repository outside it is unavailable, not failed.
+      // Jevcode reports `disabled` only when automatic briefs are off globally: unavailable, not failed.
       if (empty.success) throw empty.data.decision.action === "disabled" ? new NotOptedIn() : new NotReady();
       const parsed = envelopeSchema.parse(value);
       if (resolve(parsed.repo) !== job.location.root || (job.location.baseline !== null && parsed.base !== job.location.baseline))

@@ -12,7 +12,7 @@
     "postinstall": "node scripts/prepare-pty.mjs && npm run build -w @infinite/attention && npm run build -w @infinite/remote",
     "build": "npm run build -w @infinite/attention && npm run build -w @infinite/remote && npm run build -w @infinite/host && npm run build -w @infinite/web",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run build -w @infinite/attention && npm run build -w @infinite/remote && tsx --test --test-concurrency=1 tests/*.test.ts",
+    "test": "npm run build -w @infinite/attention && npm run build -w @infinite/remote && node scripts/run-tests.mjs",
     "dev": "tsx packages/host/src/cli.ts dev",
     "host": "node packages/host/dist/cli.js",
     "web": "npm run dev -w @infinite/web",

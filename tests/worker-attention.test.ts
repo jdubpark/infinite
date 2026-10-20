@@ -439,62 +439,41 @@ const startLimitSession = (host: Host, provider: string, prompt: string) => {
 };
 const sleepMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-test("a Claude rate-limit hook is single-source until the screen notice corroborates it", { timeout: 60000 }, async () => {
+test("Claude rate-limit evidence is source-order independent and successful turns do not reopen the episode", { timeout: 60000 }, async () => {
   const host = await limitHost("hook-agent.mjs", "claude");
   try {
-    const id = await startLimitSession(host, "claude", "rate-limit");
-    const rows = await waitFor(() => limitsOf(host, id), (r) => r.some((e) => e.data.confidence === "corroborated"), 20000);
-    assert.equal(rows[0].data.confidence, "single-source");
-    assert.equal(rows[0].data.source, "hook");
-    assert.equal(rows[1].data.confidence, "corroborated");
-    assert.equal(rows[1].data.source, "screen");
-    assert.equal(rows.length, 2);
-    const detail = await host.fetchApi(`/sessions/${id}`);
-    assert.equal(detail.body.attention.limit.confidence, "corroborated");
-  } finally {
-    await host.stop();
-  }
-});
+    const hookFirstId = await startLimitSession(host, "claude", "rate-limit");
+    const hookFirstRows = await waitFor(() => limitsOf(host, hookFirstId), (r) => r.some((e) => e.data.confidence === "corroborated"), 20000);
+    assert.equal(hookFirstRows[0].data.confidence, "single-source");
+    assert.equal(hookFirstRows[0].data.source, "hook");
+    assert.equal(hookFirstRows[1].data.confidence, "corroborated");
+    assert.equal(hookFirstRows[1].data.source, "screen");
+    assert.equal(hookFirstRows.length, 2);
+    const hookFirstDetail = await host.fetchApi(`/sessions/${hookFirstId}`);
+    assert.equal(hookFirstDetail.body.attention.limit.confidence, "corroborated");
 
-test("a Claude rate-limit hook with no screen notice stays single-source", { timeout: 60000 }, async () => {
-  const host = await limitHost("hook-agent.mjs", "claude");
-  try {
-    const id = await startLimitSession(host, "claude", "rate-limit-blip");
-    await waitFor(() => limitsOf(host, id), (r) => r.length >= 1, 15000);
+    const hookOnlyId = await startLimitSession(host, "claude", "rate-limit-blip");
+    await waitFor(() => limitsOf(host, hookOnlyId), (r) => r.length >= 1, 15000);
     await sleepMs(5000);
-    const rows = await limitsOf(host, id);
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].data.confidence, "single-source");
-  } finally {
-    await host.stop();
-  }
-});
+    const hookOnlyRows = await limitsOf(host, hookOnlyId);
+    assert.equal(hookOnlyRows.length, 1);
+    assert.equal(hookOnlyRows[0].data.confidence, "single-source");
 
-test("a screen notice that came first is corroborated by the hook, and a repeated hook adds nothing", { timeout: 60000 }, async () => {
-  const host = await limitHost("hook-agent.mjs", "claude");
-  try {
-    const id = await startLimitSession(host, "claude", "rate-limit-notice-first");
-    const rows = await waitFor(() => limitsOf(host, id), (r) => r.some((e) => e.data.confidence === "corroborated"), 20000);
+    const screenFirstId = await startLimitSession(host, "claude", "rate-limit-notice-first");
+    const screenFirstRows = await waitFor(() => limitsOf(host, screenFirstId), (r) => r.some((e) => e.data.confidence === "corroborated"), 20000);
     await sleepMs(4000);
-    const after = await limitsOf(host, id);
-    assert.deepEqual(after.map((e) => [e.data.confidence, e.data.source]), [["single-source", "screen"], ["corroborated", "hook"]]);
-    assert.equal(rows.length, 2);
-    assert.equal(after[1].data.resetsAt?.slice(11, 16), "15:45", "The corroborating hook keeps the reset time the notice stated");
-    assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.limit.resetsAt?.slice(11, 16), "15:45");
-  } finally {
-    await host.stop();
-  }
-});
+    const screenFirstAfter = await limitsOf(host, screenFirstId);
+    assert.deepEqual(screenFirstAfter.map((e) => [e.data.confidence, e.data.source]), [["single-source", "screen"], ["corroborated", "hook"]]);
+    assert.equal(screenFirstRows.length, 2);
+    assert.equal(screenFirstAfter[1].data.resetsAt?.slice(11, 16), "15:45", "The corroborating hook keeps the reset time the notice stated");
+    assert.equal((await host.fetchApi(`/sessions/${screenFirstId}`)).body.attention.limit.resetsAt?.slice(11, 16), "15:45");
 
-test("a notice still on screen after a successful turn does not start a new limit episode", { timeout: 60000 }, async () => {
-  const host = await limitHost("hook-agent.mjs", "claude");
-  try {
-    const id = await startLimitSession(host, "claude", "rate-limit-then-stop");
-    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention.state === "turn-finished" && r.body.attention.limit === undefined, 20000);
+    const successfulTurnId = await startLimitSession(host, "claude", "rate-limit-then-stop");
+    await waitFor(() => host.fetchApi(`/sessions/${successfulTurnId}`), (r) => r.body.attention.state === "turn-finished" && r.body.attention.limit === undefined, 20000);
     await sleepMs(5000);
-    const rows = await limitsOf(host, id);
-    assert.deepEqual(rows.map((e) => e.data.confidence), ["single-source", "corroborated"]);
-    assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.limit, undefined);
+    const successfulTurnRows = await limitsOf(host, successfulTurnId);
+    assert.deepEqual(successfulTurnRows.map((e) => e.data.confidence), ["single-source", "corroborated"]);
+    assert.equal((await host.fetchApi(`/sessions/${successfulTurnId}`)).body.attention.limit, undefined);
   } finally {
     await host.stop();
   }

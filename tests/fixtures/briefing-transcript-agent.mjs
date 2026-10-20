@@ -38,7 +38,8 @@ function assistantRecord(index, text = `Historical result ${index}`) {
 }
 
 const history = [];
-for (let index = 0; index < 1050; index++) history.push(userRecord(index), assistantRecord(index));
+// Keep enough history to cross the 200-message activity window without adding needless fixture load.
+for (let index = 0; index < 110; index++) history.push(userRecord(index), assistantRecord(index));
 writeFileSync(transcriptPath, `${history.join("\n")}\n`);
 
 const base = { session_id: sessionId, transcript_path: transcriptPath };

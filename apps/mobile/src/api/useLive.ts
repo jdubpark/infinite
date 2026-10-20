@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AppState } from "react-native";
 import { openEvents, type Connection } from "./client";
-import { canUseLiveFallback, isLiveOnline, LIVE_STALE_DELAY_MS, shouldMarkLiveStale, shouldRetryEmptyLiveLoad } from "./liveStatus";
+import { canUseLiveFallback, invalidatesLiveLoad, isLiveOnline, LIVE_STALE_DELAY_MS, shouldMarkLiveStale, shouldRetryEmptyLiveLoad } from "./liveStatus";
 
 type Consumer = { after: () => number; onEvent(event: { topic: string; data: unknown }): void; onClose(): void };
 type SharedStream = { consumers: Set<Consumer>; stream?: { close(): void }; opening?: Promise<void> };
@@ -137,7 +137,7 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
             const refreshOnEvent = typeof current.current.refreshOnEvent === "function"
               ? current.current.refreshOnEvent(event.topic, event.data)
               : current.current.refreshOnEvent;
-            if (next === undefined || next !== value.current || refreshOnEvent) revision++;
+            if (invalidatesLiveLoad(next, value.current)) revision++;
             if (next !== undefined) { value.current = next; setData(next); setLoading(false); }
             setSeen(stamp());
             if (next === undefined || refreshOnEvent) void load();

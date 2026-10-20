@@ -6,7 +6,7 @@ import {
   mergeSignalEvents,
   shouldRefreshConversation,
 } from "../apps/mobile/src/features/session/liveState.js";
-import { canUseLiveFallback, isLiveOnline, LIVE_STALE_DELAY_MS, shouldMarkLiveStale, shouldRetryEmptyLiveLoad } from "../apps/mobile/src/api/liveStatus.js";
+import { canUseLiveFallback, invalidatesLiveLoad, isLiveOnline, LIVE_STALE_DELAY_MS, shouldMarkLiveStale, shouldRetryEmptyLiveLoad } from "../apps/mobile/src/api/liveStatus.js";
 
 test("signal delta loads preserve, deduplicate, and cap the existing timeline", () => {
   const existing = [{ seq: 1, value: "first" }, { seq: 2, value: "old" }];
@@ -56,4 +56,11 @@ test("a discarded initial load retries only while it left live data unset", () =
   assert.equal(shouldRetryEmptyLiveLoad(true, null), true);
   assert.equal(shouldRetryEmptyLiveLoad(true, { sessions: [] }), false);
   assert.equal(shouldRetryEmptyLiveLoad(false, null), false);
+});
+
+test("a refetch notice leaves an in-flight load valid; only a replacing snapshot fences it off", () => {
+  const data = { sessions: [] };
+  assert.equal(invalidatesLiveLoad(undefined, data), false, "a refetch the screen cannot apply only requests a coalesced reload");
+  assert.equal(invalidatesLiveLoad(data, data), false);
+  assert.equal(invalidatesLiveLoad({ sessions: [] }, data), true);
 });

@@ -8,6 +8,11 @@ export function canUseLiveFallback<T>(data: T | null, continuePolling?: (data: T
   return continuePolling ? continuePolling(data) : true;
 }
 
+/** Only a stream snapshot that replaces the data fences off an in-flight load; reload requests coalesce instead. */
+export function invalidatesLiveLoad<T>(next: T | undefined, current: T | null): boolean {
+  return next !== undefined && next !== current;
+}
+
 export function shouldRetryEmptyLiveLoad(discarded: boolean, data: unknown): boolean {
   return discarded && data === null;
 }

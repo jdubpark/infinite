@@ -40,28 +40,28 @@ const PERMISSION_COPY = "Allow microphone and speech recognition access in Setti
 const LOCKED = "Dictation stopped because the field was locked. Nothing was added.";
 const LEFT = "Dictation stopped because you left this screen. Nothing was added.";
 const BUSY = "Dictation is already running in another field. Stop it there first.";
-/** How long an aborted capture may take to deliver its native `end` before the recognizer is free again. */
-const DRAIN_MS = 3000;
+const STOPPING = "Dictation is still stopping. Try again in a moment.";
 
 /**
  * The native recognizer is one per app, and every mounted field hears its events; a screen left in the
  * stack stays mounted. One field owns it from start until its capture's native `end`. An abandoned
  * capture keeps it reserved until its late `end` arrives, so that event cannot finish a newer capture.
+ * An abort always ends with that event, so the reservation waits for it rather than for a timer: native
+ * events carry no capture identity, and a timer that ran out first would hand the stale `end` to the next owner.
  */
-const recognizer: { owner: object | null; drain?: { subscription: { remove(): void }; timer: ReturnType<typeof setTimeout> } } = { owner: null };
+const recognizer: { owner: object | null; drain?: { remove(): void } } = { owner: null };
 
 function release(owner: object) {
   if (recognizer.owner !== owner) return;
   recognizer.owner = null;
-  recognizer.drain?.subscription.remove();
-  clearTimeout(recognizer.drain?.timer);
+  recognizer.drain?.remove();
   recognizer.drain = undefined;
 }
 
 /** Keeps the recognizer reserved after an abort until its `end`, without depending on the owner staying mounted. */
 function drain(owner: object) {
   if (!speech || recognizer.owner !== owner || recognizer.drain) return;
-  recognizer.drain = { subscription: speech.addListener("end", () => release(owner)), timer: setTimeout(() => release(owner), DRAIN_MS) };
+  recognizer.drain = speech.addListener("end", () => release(owner));
 }
 /** Ends inside the encrypted remote channel's 30-second request timeout; the host bounds its model call at 25 seconds. */
 const CLEANUP_TIMEOUT_MS = 28000;
@@ -187,8 +187,7 @@ export function useDictation({ connection, value, onChange, maxLength, disabled 
   const start = useCallback(async () => {
     if (!speech || session.current) return;
     if (recognizer.owner) {
-      // This field's own abandoned capture is still draining; the mic is usable again in a moment.
-      if (recognizer.owner !== self) setNotice({ message: BUSY, kind: "warning" });
+      setNotice({ message: recognizer.drain || recognizer.owner === self ? STOPPING : BUSY, kind: "warning" });
       return;
     }
     recognizer.owner = self;

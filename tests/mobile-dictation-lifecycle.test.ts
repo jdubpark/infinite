@@ -109,11 +109,13 @@ describe("phone dictation lifecycle", { skip }, () => {
     await brief.button("Stop dictation").waitFor();
     await brief.button("Lock field").click();
     await brief.button("Unlock field").click();
-    // The aborted capture has not ended yet, so neither screen may start over it.
+    // The aborted capture has not ended yet, however long that takes, so neither screen may start over it.
+    await page.waitForTimeout(3200);
     await brief.button("Dictate").click();
     await terminal.button("Dictate").click();
     await settle(page);
     assert.equal(await speech.starts(), 1);
+    assert.match(await terminal.notice(), /still stopping/);
     await speech.releaseEnds();
     await terminal.button("Dictate").click();
     await terminal.button("Stop dictation").waitFor();

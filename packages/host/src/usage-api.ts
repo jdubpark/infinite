@@ -1,8 +1,16 @@
+import { z } from "zod";
 import type { UsageTokens } from "./usage.js";
 
 export type Money = { usd: number; unpriced: number };
 export type Balance = { amount: number; currency: string; asOf: string; stale: boolean } | null;
-export type AccountView = { id: string; kind: "metered" | "subscription"; month?: Money; planUsd?: number; balance: Balance };
+export type PlanSource = "owner" | "config";
+export type AccountView = { id: string; kind: "metered" | "subscription"; month?: Money; planUsd?: number; planSource?: PlanSource; balance: Balance };
+const planUsdSchema = z.number().finite().min(0).max(100_000).refine(value => {
+  const [mantissa, exponent = "0"] = value.toString().toLowerCase().split("e");
+  return Math.max(0, (mantissa.split(".")[1]?.length ?? 0) - Number(exponent)) <= 2;
+}, "Plan fees may have at most two decimal places");
+export const usagePlanSchema = z.object({ planUsd: planUsdSchema.nullable() }).strict();
+export type UsagePlanRequest = z.infer<typeof usagePlanSchema>;
 export type TaskUsage = { usd: number; unpriced: number; tokens: number; attempts: number; profiles: string[] };
 export type BriefingUsage = { providerId: string; modelId: string; tokens: UsageTokens; reportedCost?: number };
 export type UsageResolvers = {

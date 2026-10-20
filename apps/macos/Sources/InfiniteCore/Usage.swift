@@ -44,11 +44,40 @@ public struct AccountView: Codable, Equatable, Sendable, Identifiable {
     public var kind: String
     public var month: Money?
     public var planUsd: Double?
+    /// Where a subscription's fee comes from: "config" for the host's default, "owner" once the owner set it.
+    public var planSource: String?
     public var balance: Balance?
-    public init(id: String, kind: String, month: Money? = nil, planUsd: Double? = nil, balance: Balance? = nil) {
-        self.id = id; self.kind = kind; self.month = month; self.planUsd = planUsd; self.balance = balance
+    public init(id: String, kind: String, month: Money? = nil, planUsd: Double? = nil, planSource: String? = nil, balance: Balance? = nil) {
+        self.id = id; self.kind = kind; self.month = month; self.planUsd = planUsd; self.planSource = planSource; self.balance = balance
     }
     public var metered: Bool { kind == "metered" }
+    /// True when the owner overrode the config default; "Reset to default" only makes sense then.
+    public var planSetByOwner: Bool { planSource == "owner" }
+}
+
+/// The owner's typed monthly fee, checked the way `PUT /api/usage/accounts/:id/plan` checks it:
+/// 0–100000 dollars with at most two decimals. A leading "$" and one decimal comma are tolerated.
+public enum PlanFee {
+    public static let maxUsd: Double = 100_000
+    public static func parse(_ text: String) throws -> Double {
+        var cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.hasPrefix("$") { cleaned.removeFirst() }
+        // One comma is a decimal separator, as some keyboards type it; thousands grouping is refused rather than guessed.
+        if cleaned.filter({ $0 == "," }).count > 1 || (cleaned.contains(",") && cleaned.contains(".")) {
+            throw DesktopError("Use one comma or dot for cents, without thousands separators.")
+        }
+        cleaned = cleaned.replacingOccurrences(of: ",", with: ".")
+        guard !cleaned.isEmpty else { throw DesktopError("Enter a monthly fee in dollars.") }
+        let parts = cleaned.split(separator: ".", omittingEmptySubsequences: false)
+        // Digits only, with the point optional; ".5" is fine, "1." and "1.2.3" are not.
+        guard parts.count <= 2, parts.allSatisfy({ $0.allSatisfy(\.isNumber) }), parts.count == 1 ? !parts[0].isEmpty : !parts[1].isEmpty else {
+            throw DesktopError("Enter a plain dollar amount such as 200 or 19.99.")
+        }
+        if parts.count == 2, parts[1].count > 2 { throw DesktopError("Use at most two decimals.") }
+        guard let value = Double(cleaned), value.isFinite, value >= 0 else { throw DesktopError("Enter a plain dollar amount such as 200 or 19.99.") }
+        guard value <= maxUsd else { throw DesktopError("The fee must be at most " + UsageFormat.usd(maxUsd) + " a month.") }
+        return value
+    }
 }
 
 /// `GET /api/usage`: the month headline and the accounts. The older per-provider fields pass through untouched.
@@ -343,6 +372,15 @@ extension RemoteClient {
     public func refreshBalances() async throws -> [AccountView] {
         struct Reply: Decodable { var accounts: [AccountView] }
         return try await request("/usage/balances/refresh", body: .object([:])).decoded(Reply.self).accounts
+    }
+    /// Owner only: sets a subscription's monthly fee, or `nil` to return to the config default.
+    /// Returns every account as the host now sees it; a refused value arrives as the host's error text.
+    public func setPlan(account: String, planUsd: Double?) async throws -> [AccountView] {
+        struct Reply: Decodable { var accounts: [AccountView] }
+        // The remote channel refuses percent-encoded paths, so keep the ASCII characters account IDs use.
+        let id = account.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")) ?? account
+        let body: JSON = .object(["planUsd": planUsd.map { .number($0) } ?? .null])
+        return try await request("/usage/accounts/" + id + "/plan", body: body, method: "PUT").decoded(Reply.self).accounts
     }
     /// Owner only, idempotent per `requestID`. Returns the host's updated team view.
     public func rateTask(team: String, task: String, score: Int, note: String? = nil, requestID: String) async throws -> JSON {

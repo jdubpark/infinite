@@ -54,6 +54,57 @@ test("an unreadable or misshapen ledger is discarded with a warning and the serv
   } finally { console.warn = warn; rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("owner subscription plans persist sealed and override config only until reset", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-usage-plans-")), key = randomBytes(32);
+  const config = { stateDir: dir, usage: { accounts: {
+    claude: { kind: "subscription", match: ["anthropic/*"], planUsd: 200 },
+    codex: { kind: "subscription", match: ["openai/*"], planUsd: 30 },
+    deepseek: { kind: "metered", match: ["deepseek/*"] },
+  }, prices: {}, budgets: {} } } as Config;
+  try {
+    const usage = new UsageService(config, key, {} as Manager);
+    const initial = usage.summary(new Date("2026-10-19T12:00:00Z"));
+    assert.equal(initial.month.plansUsd, 230);
+    assert.equal(initial.accounts.find(account => account.id === "claude")?.planSource, "config");
+    assert.equal(usage.setPlan("deepseek", 5), "metered");
+    assert.equal(usage.setPlan("missing", 5), "missing");
+    assert.equal(usage.setPlan("claude", 12.34), "updated");
+    assert.equal(config.usage!.accounts.claude.planUsd, 200, "the owner override does not mutate config");
+    assert.equal(usage.summary().month.plansUsd, 42.34);
+    assert.equal(usage.summary().accounts.find(account => account.id === "claude")?.planSource, "owner");
+    const file = join(dir, "usage-plans.sealed"), raw = readFileSync(file, "utf8");
+    assert.equal(raw.includes("12.34"), false, "the owner-entered amount is sealed at rest");
+    assert.deepEqual(unseal(key, "usage-plans", raw), { claude: 12.34 });
+
+    const restored = new UsageService(config, key, {} as Manager);
+    assert.equal(restored.summary().month.plansUsd, 42.34, "the override survives an API restart");
+    assert.equal(restored.setPlan("claude", null), "updated");
+    assert.equal(restored.summary().month.plansUsd, 230, "null resets to the current configured default");
+    assert.equal(restored.summary().accounts.find(account => account.id === "claude")?.planSource, "config");
+    assert.deepEqual(unseal(key, "usage-plans", readFileSync(file, "utf8")), {});
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("an unreadable owner plan file warns and falls back to configured plans", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-usage-plans-")), key = randomBytes(32), file = join(dir, "usage-plans.sealed");
+  const warn = console.warn, warnings: string[] = [];
+  console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+  try {
+    const config = { stateDir: dir, usage: { accounts: { claude: { kind: "subscription", match: [], planUsd: 200 } }, prices: {}, budgets: {} } } as Config;
+    writeFileSync(file, "not a sealed plan file");
+    let usage = new UsageService(config, key, {} as Manager);
+    assert.equal(usage.summary().month.plansUsd, 200);
+    assert.equal(usage.summary().accounts[0].planSource, "config");
+    writeSealed(file, key, "usage-plans", { claude: null });
+    usage = new UsageService(config, key, {} as Manager);
+    assert.equal(usage.summary().month.plansUsd, 200);
+    assert.equal(usage.summary().accounts[0].planSource, "config");
+    assert.equal(warnings.length, 2);
+    assert.match(warnings[0], /Owner usage plans cannot be read/);
+    assert.match(warnings[1], /Owner usage plans cannot be read/);
+  } finally { console.warn = warn; rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("the API starts and serves with unreadable usage and limit files", { timeout: 60000 }, async () => {
   const host = await startHost();
   try {

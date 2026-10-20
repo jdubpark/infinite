@@ -15,7 +15,7 @@ final class UsageTests: XCTestCase {
          "accounts":[
            {"id":"deepseek","kind":"metered","month":{"usd":8.12,"unpriced":0},"balance":{"amount":12.5,"currency":"USD","asOf":"2026-10-19T08:00:00.000Z","stale":false}},
            {"id":"meta","kind":"metered","month":{"usd":4.72,"unpriced":0},"balance":null},
-           {"id":"claude","kind":"subscription","planUsd":200,"balance":null},
+           {"id":"claude","kind":"subscription","planUsd":200,"planSource":"owner","balance":null},
            {"id":"codex","kind":"subscription","balance":null}]}
         """)
         XCTAssertEqual(overview.month.spent, Money(usd: 12.84, unpriced: 0))
@@ -28,6 +28,27 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(overview.accounts[2].planUsd, 200)
         XCTAssertNil(overview.accounts[3].planUsd)
         XCTAssertFalse(overview.accounts[2].metered)
+        XCTAssertEqual(overview.accounts[2].planSource, "owner")
+        XCTAssertTrue(overview.accounts[2].planSetByOwner)
+        XCTAssertNil(overview.accounts[3].planSource)
+        XCTAssertFalse(overview.accounts[3].planSetByOwner)
+        let config = try decode(AccountView.self, #"{"id":"claude","kind":"subscription","planUsd":200,"planSource":"config"}"#)
+        XCTAssertFalse(config.planSetByOwner)
+    }
+
+    /// The fee editor refuses what `PUT /api/usage/accounts/:id/plan` refuses, before the request leaves the Mac.
+    func testPlanFeeParsesTheHostsRange() throws {
+        XCTAssertEqual(try PlanFee.parse("200"), 200)
+        XCTAssertEqual(try PlanFee.parse(" $19.99 "), 19.99)
+        XCTAssertEqual(try PlanFee.parse("19,99"), 19.99, "one comma is the decimal separator, never thousands grouping")
+        XCTAssertEqual(try PlanFee.parse("0"), 0)
+        XCTAssertEqual(try PlanFee.parse(".5"), 0.5)
+        XCTAssertEqual(try PlanFee.parse("100000"), 100_000)
+        for bad in ["", "abc", "-1", "19.999", "100000.01", "1e3", "1.", "12.3.4", "$", "1,200.5", "1,999", "1,000,000"] {
+            XCTAssertThrowsError(try PlanFee.parse(bad), bad)
+        }
+        XCTAssertThrowsError(try PlanFee.parse("19.999")) { XCTAssertEqual(($0 as? DesktopError)?.message, "Use at most two decimals.") }
+        XCTAssertThrowsError(try PlanFee.parse("100001")) { XCTAssertEqual(($0 as? DesktopError)?.message, "The fee must be at most $100K a month.") }
     }
 
     /// The desktop client receives `JSON` values; the typed contract comes from re-encoding them.

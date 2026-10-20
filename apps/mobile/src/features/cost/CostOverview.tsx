@@ -43,6 +43,12 @@ export function CostOverview({ connection }: { connection: Connection }) {
     try { await api(connection, "/usage/balances/refresh", { method: "POST" }); overview.refresh(); setBalances("idle"); }
     catch { setBalances("failed"); }
   }
+  /** The owner's plan fee for a subscription account; `null` restores the config default. The host's refusal text reaches the card. */
+  async function savePlan(id: string, planUsd: number | null) {
+    await api(connection, `/usage/accounts/${encodeURIComponent(id)}/plan`, { method: "PUT", body: { planUsd } });
+    overview.refresh();
+  }
+  const owner = me.data?.role === "owner";
   const top = <TopBar backLabel="Home" onBack={back} right={<LiveStatus online={overview.online} loading={overview.loading} seen={overview.seen} />} />;
   if (!overview.data) return <View style={s.fill}>{top}<View style={s.empty}>
     {overview.loading ? <ActivityIndicator color={theme.colors.forest} /> : <Text style={t.note}>{overview.online ? "This host reports no usage." : "Could not load usage."}</Text>}
@@ -67,9 +73,10 @@ export function CostOverview({ connection }: { connection: Connection }) {
         </View>
         {accounts.length ? <View style={s.accounts}>
           {accounts.map(account => <AccountCard key={account.id} account={account} color={colors[account.id]}
-            spark={account.kind === "metered" ? days.map(day => day.byAccount[account.id] ?? 0) : undefined} />)}
+            spark={account.kind === "metered" ? days.map(day => day.byAccount[account.id] ?? 0) : undefined}
+            plan={owner && account.kind === "subscription" ? { onSave: planUsd => savePlan(account.id, planUsd) } : undefined} />)}
         </View> : null}
-        {me.data?.role === "owner" && accounts.some(account => account.kind === "metered") ? <View style={s.actions}>
+        {owner && accounts.some(account => account.kind === "metered") ? <View style={s.actions}>
           <Button compact secondary title={balances === "busy" ? "Refreshing…" : "Refresh balances"} disabled={balances === "busy" || !overview.online} onPress={() => void refreshBalances()} />
           {balances === "failed" ? <Text accessibilityRole="alert" style={t.error}>Refresh failed</Text> : null}
         </View> : null}

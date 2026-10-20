@@ -1,6 +1,8 @@
-import { Pressable, StyleSheet, Text, View, type StyleProp, type TextStyle } from "react-native";
+import { useState } from "react";
+import { Pressable, StyleSheet, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
 import { ago } from "../../api/client";
 import { Avatar } from "../../components/Avatar";
+import { Button } from "../../components/Button";
 import { Card, Chip } from "../../components/Glass";
 import { Glyph } from "../../components/Icon";
 import { theme } from "../../theme";
@@ -8,7 +10,7 @@ import { shortDate } from "../teams/model";
 import { t } from "../teams/parts";
 import { IntervalBar, Sparkline } from "./charts";
 import {
-  accountName, compactTokens, monthName, money, rubricMean, shortDay, usd,
+  accountName, compactTokens, monthName, money, parsePlanUsd, rubricMean, shortDay, usd,
   type AccountView, type DailyPoint, type ModelRow, type Money, type OwnerRating, type ProjectCostRow, type Rubric, type Suggestion, type TaskUsage,
 } from "./model";
 
@@ -58,21 +60,60 @@ export function DayCaption({ day, days, accounts, colors }: { day?: DailyPoint; 
   </View>;
 }
 
-/** One connected account: its balance or plan fee, this month's metered spend, and a 30-day trend. */
-export function AccountCard({ account, color, spark }: { account: AccountView; color?: string; spark?: number[] }) {
+/** The owner's hand on a subscription fee: `null` asks the host for its config default. The host's error text is shown as thrown. */
+export type PlanControl = { onSave: (planUsd: number | null) => Promise<void> };
+
+/**
+ * One connected account: its balance or plan fee, this month's metered spend, and a 30-day trend.
+ * With `plan`, the owner taps a subscription fee to edit it in place; the card refuses an amount
+ * outside the host's rule before sending and otherwise shows what the host answered.
+ */
+export function AccountCard({ account, color, spark, plan }: { account: AccountView; color?: string; spark?: number[]; plan?: PlanControl }) {
   const balance = account.balance;
   const name = accountName(account.id);
   const value = balance ? `${usd(balance.amount)}${balance.currency.toUpperCase() !== "USD" ? ` ${balance.currency.toUpperCase()}` : ""}` : account.kind === "subscription" ? usd(account.planUsd ?? 0) : "—";
   const meta = account.kind === "subscription" ? "per month · plan" : balance ? `balance · ${ago(balance.asOf)}` : "no balance";
   const label = `${name}: ${account.kind === "subscription" ? `${value} per month plan` : balance ? `balance ${value} as of ${ago(balance.asOf)}${balance.stale ? ", stale" : ""}` : "no balance"}${account.month ? `, ${money(account.month).atLeast ? "at least " : ""}${usd(account.month.usd)} this month` : ""}`;
+  const editable = Boolean(plan) && account.kind === "subscription";
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  function open() { setDraft(String(account.planUsd ?? 0)); setError(""); setEditing(true); }
+  async function submit(planUsd: number | null) {
+    if (!plan || busy) return;
+    setBusy(true); setError("");
+    try { await plan.onSave(planUsd); setEditing(false); }
+    catch (cause) { setError(cause instanceof Error && cause.message ? cause.message : "Save failed"); }
+    finally { setBusy(false); }
+  }
+  function save() {
+    const parsed = parsePlanUsd(draft);
+    if (!parsed.ok) { setError(parsed.error); return; }
+    void submit(parsed.value);
+  }
   return <Card style={s.account}>
-    <View accessible accessibilityLabel={label} style={s.accountBody}>
+    <View accessible={!editing} accessibilityLabel={label} style={s.accountBody}>
       <View style={s.accountHead}>{color ? <View style={[s.dot, { backgroundColor: color }]} /> : null}<Text style={s.accountName} numberOfLines={1}>{name}</Text>{balance?.stale ? <Chip label="stale" tone="attention" /> : null}</View>
-      <View style={s.accountLine}>
-        <Text style={[s.accountValue, !balance && account.kind === "metered" && s.accountNone]}>{value}</Text>
+      {editing ? <View style={s.planField}>
+        <Text style={s.planPrefix}>$</Text>
+        <TextInput accessibilityLabel={`${name} plan fee per month`} value={draft} onChangeText={setDraft} editable={!busy} autoFocus selectTextOnFocus
+          keyboardType="decimal-pad" returnKeyType="done" maxLength={9} onSubmitEditing={save} placeholder="0" placeholderTextColor={theme.colors.placeholder} style={s.planInput} />
+      </View> : <View style={s.accountLine}>
+        {editable ? <Pressable accessibilityRole="button" accessibilityLabel={`Edit ${name} plan fee, ${value} per month`} onPress={open} hitSlop={6} style={({ pressed }) => pressed && s.pressed}>
+          <Text style={[s.accountValue, s.editableValue]}>{value}</Text>
+        </Pressable> : <Text style={[s.accountValue, !balance && account.kind === "metered" && s.accountNone]}>{value}</Text>}
         {color && spark?.some(value => value > 0) ? <Sparkline values={spark} color={color} width={56} height={20} /> : null}
-      </View>
+      </View>}
       <Text style={s.muted} numberOfLines={1}>{meta}</Text>
+      {editing ? <View style={s.planActions}>
+        <Button compact title="Save" busy={busy} disabled={busy} onPress={save} />
+        <Button compact secondary title="Cancel" disabled={busy} onPress={() => setEditing(false)} />
+      </View> : null}
+      {editing && account.planSource === "owner" ? <Pressable accessibilityRole="button" disabled={busy} onPress={() => void submit(null)} hitSlop={6} style={({ pressed }) => pressed && s.pressed}>
+        <Text style={s.planLink}>Reset to default</Text>
+      </Pressable> : null}
+      {editing && error ? <Text accessibilityRole="alert" style={t.error}>{error}</Text> : null}
       {account.month ? <Text style={s.accountMonth} numberOfLines={1}><MoneyText value={account.month} /> this month</Text> : null}
     </View>
   </Card>;
@@ -168,6 +209,12 @@ const s = StyleSheet.create({
   accountLine: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6 },
   accountValue: { flexShrink: 1, fontSize: 24, lineHeight: 30, fontWeight: "600", letterSpacing: -0.5, color: theme.colors.ink },
   accountNone: { color: theme.colors.placeholder, fontWeight: "400" },
+  editableValue: { color: theme.colors.forest, textDecorationLine: "underline", textDecorationStyle: "dotted", textDecorationColor: theme.colors.focus },
+  planField: { flexDirection: "row", alignItems: "center", gap: 2, borderBottomWidth: 1, borderBottomColor: theme.colors.fieldRule, paddingBottom: 2 },
+  planPrefix: { fontSize: 20, fontWeight: "600", color: theme.colors.mutedInk },
+  planInput: { flex: 1, fontSize: 24, lineHeight: 30, fontWeight: "600", letterSpacing: -0.5, color: theme.colors.ink, paddingVertical: 0, fontVariant: ["tabular-nums"] },
+  planActions: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 6 },
+  planLink: { fontSize: 12, lineHeight: 17, fontWeight: "600", color: theme.colors.secondaryInk, marginTop: 4 },
   accountMonth: { fontSize: 12, lineHeight: 17, color: theme.colors.ink, marginTop: 2 },
   row: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },
   rowMain: { flex: 1, gap: 2 },

@@ -40,7 +40,7 @@ export function scorecard(runs: ScorecardRun[], usage: TaskUsage, options: { rol
     const measured = profile.provider === "opencode" ? integrated.map(({ member }) => usage(member.sessionId)) : [];
     const costs = measured.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry) && entry!.unpriced === 0).map(entry => entry!.cost);
     const tokens = measured.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry) && entry!.unpriced === 0).map(entry => entry!.tokens);
-    const minutes = integrated.flatMap(({ member }) => member.startedAt ? [Math.max(0, (Date.parse(member.reportedAt ?? new Date().toISOString()) - Date.parse(member.startedAt)) / 60000)] : []);
+    const minutes = integrated.flatMap(({ member }) => member.startedAt && member.reportedAt ? [Math.max(0, (Date.parse(member.reportedAt) - Date.parse(member.startedAt)) / 60000)] : []);
     const tasks = integrated.map(({ task }) => task!);
     const rubricTasks = tasks.filter(task => task.rubric?.version === 1).map(task => task.rubric!);
     const ownerRatings = tasks.flatMap(task => task.ownerRating ? [task.ownerRating.score] : []);

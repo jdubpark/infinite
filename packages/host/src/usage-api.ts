@@ -14,9 +14,9 @@ export type UsageResolvers = {
 export type UsageMonth = { start: string; end: string; spent: Money; previous: Money; plansUsd: number; unmeasuredSessions: number };
 export type UsageApiSummary = import("./usage-service.js").UsageSummary;
 export type DailyUsage = { tz: string; accounts: string[]; days: { date: string; usd: number; byAccount: Record<string, number> }[] };
-export type ProjectUsage = { id: string; name: string; total: Money; month: Money; spark: number[] };
+export type ProjectUsage = { id: string; name: string; total: Money; month: Money & { unmeasured: number }; unmeasured: number; spark: number[] };
 export type ProjectUsageDetail = {
-  id: string; name: string; total: Money;
+  id: string; name: string; total: Money; unmeasured: number;
   byKind: { goals: number; teams: number; sessions: number; briefings: number };
   goals: { id: string; title: string; total: Money; tasks: number }[];
   teams: { id: string; title: string; goalId?: string; total: Money }[];

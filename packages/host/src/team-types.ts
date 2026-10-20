@@ -243,6 +243,8 @@ export interface TeamMember extends TeamAssignment {
   usage?: UsageTotals;
 }
 export interface TeamTask extends TeamTaskPlan {
+  /** Run revision whose plan created this task. */
+  revision: number;
   status: "pending" | "running" | "waiting" | "integrated" | "blocked";
   memberId?: string;
   commit?: string;

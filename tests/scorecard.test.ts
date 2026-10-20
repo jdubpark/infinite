@@ -34,3 +34,20 @@ test("enough metered profiles with overlapping intervals produce an advisory", (
   assert.equal(result.suggestions.length, 1);
   assert.match(result.suggestions[0].text, /cheap integrated 10\/10 implementer tasks/);
 });
+
+test("review rounds include first-pass approvals and exclude missing historical values", () => {
+  const run = fixture("rounds", "claude", 10, 10);
+  run.tasks.forEach((task, index) => { task.reviewRounds = index === 9 ? 1 : 0; });
+  assert.equal(scorecard([run], () => undefined).rows[0].meanReviewRounds, 0.1);
+  run.tasks[0].reviewRounds = undefined;
+  assert.equal(scorecard([run], () => undefined).rows[0].meanReviewRounds, 1 / 9, "Unknown review history is omitted from the mean");
+});
+
+test("completed attempts without reportedAt do not invent a duration", () => {
+  const run = fixture("duration", "claude", 2, 2);
+  run.members[0].startedAt = "2025-01-01T00:00:00.000Z";
+  run.members[0].reportedAt = "2025-01-01T00:02:00.000Z";
+  run.members[1].startedAt = "2025-01-01T00:00:00.000Z";
+  run.members[1].reportedAt = undefined;
+  assert.equal(scorecard([run], () => undefined).rows[0].medianMinutes, 2);
+});

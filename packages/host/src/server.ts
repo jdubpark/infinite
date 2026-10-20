@@ -371,7 +371,7 @@ export function createApp(config: Config, key: Buffer) {
     const query = z.object({ role: z.string().trim().min(1).max(40).optional() }).strict().parse(req.query);
     return res.json(scorecard(teams.list(), sessionId => {
       const found = usage.session(sessionId);
-      return found.measured ? { cost: found.cost, tokens: found.tokens.input + found.tokens.output, unpriced: found.pricing.unknown } : undefined;
+      return found.measured ? { cost: found.cost, tokens: found.tokens.input + found.tokens.output + found.tokens.reasoning + found.tokens.cacheRead + found.tokens.cacheWrite, unpriced: found.pricing.unknown } : undefined;
     }, { role: query.role }));
   });
   app.get("/api/usage/daily", (req, res, next) => {

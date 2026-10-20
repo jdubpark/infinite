@@ -185,8 +185,12 @@ export class TeamService {
       ...(run.permissionDecisions ? { permissionDecisions: run.permissionDecisions.map(({ prompt: _prompt, ...decision }) => decision) } : {}),
     };
     const withUsage = teamUsage(members.map(({ prompt: _prompt, ...member }) => member), run.provider, this.usage);
-    const byTask = new Map<string, typeof withUsage.members>(); for (const member of withUsage.members) if (member.taskId) byTask.set(member.taskId, [...(byTask.get(member.taskId) ?? []), member]);
-    return { ...safeRun, tasks: safeRun.tasks.map(task => { const attempts = byTask.get(task.id) ?? []; const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []); return { ...task, ...(usage.length ? { usage: { usd: Math.round(usage.reduce((n, row) => n + row.cost, 0) * 1_000_000) / 1_000_000, unpriced: usage.reduce((n, row) => n + row.pricing.unknown, 0), tokens: usage.reduce((n, row) => n + Object.values(row.tokens).reduce((a, b) => a + b, 0), 0), attempts: attempts.length, profiles: [...new Set(attempts.map(member => member.modelProfile?.id).filter((id): id is string => Boolean(id)))].sort() } } : {}) }; }), members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active() };
+    return { ...safeRun, tasks: safeRun.tasks.map(task => { // Older records predate task.revision; steering clears the task list, so the retained run revision identifies their plan.
+      const revision = task.revision ?? safeRun.revision;
+      const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
+      const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
+      return { ...task, revision, ...(usage.length ? { usage: { usd: Math.round(usage.reduce((n, row) => n + row.cost, 0) * 1_000_000) / 1_000_000, unpriced: usage.reduce((n, row) => n + row.pricing.unknown, 0), tokens: usage.reduce((n, row) => n + Object.values(row.tokens).reduce((a, b) => a + b, 0), 0), attempts: attempts.length, profiles: [...new Set(attempts.map(member => member.modelProfile?.id).filter((id): id is string => Boolean(id)))].sort() } } : {}) };
+    }), members: withUsage.members, usage: withUsage.rollup, providerLimits: this.limits.active() };
   }
   private save(stored: Stored) {
     stored.run.updatedAt = timestamp();
@@ -1256,7 +1260,7 @@ export class TeamService {
         run.tasks = [];
         while (remaining.length) {
           const index = remaining.findIndex(task => task.dependsOn.every(id => run.tasks.some(done => done.id === id)));
-          run.tasks.push({ ...remaining.splice(index, 1)[0], status: "pending" });
+          run.tasks.push({ ...remaining.splice(index, 1)[0], revision: member.revision, reviewRounds: 0, status: "pending" });
         }
         run.brief = report.brief;
         if (report.verification && !run.verification) {

@@ -1,12 +1,14 @@
+import { MAX_EVENTS_EVENT_BYTES } from "@infinite/remote/protocol";
+
 export type LiveTopic = "sessions" | "teams" | `session/${string}`;
-export type LiveUpdate = { topic: LiveTopic; data: unknown };
+export type LiveUpdate = { topic: LiveTopic | "refetch"; data: unknown };
 export interface LiveSource {
   sessions(): Promise<unknown>;
   teams(): unknown;
   session(id: string): Promise<unknown>;
   events(id: string, after: number): Promise<{ events: unknown[]; cursor: number; more: boolean }>;
 }
-type Listener = { topics: Set<LiveTopic>; cursors: Map<string, number>; values: Map<string, string>; emit(update: LiveUpdate): void };
+type Listener = { topics: Set<LiveTopic>; cursors: Map<string, number>; values: Map<string, string>; refetch: Map<LiveTopic, number>; emit(update: LiveUpdate): void };
 
 /** Shared change snapshots for HTTP and encrypted remote event subscribers. */
 export class LiveFeed {
@@ -19,7 +21,7 @@ export class LiveFeed {
   }
 
   subscribe(topics: LiveTopic[], after: number, emit: (update: LiveUpdate) => void): () => void {
-    const listener: Listener = { topics: new Set(topics), cursors: new Map(), values: new Map(), emit };
+    const listener: Listener = { topics: new Set(topics), cursors: new Map(), values: new Map(), refetch: new Map(), emit };
     for (const topic of topics) if (topic.startsWith("session/")) listener.cursors.set(topic, after);
     this.listeners.add(listener);
     if (!this.timer) this.timer = setInterval(() => { void this.tick(); }, this.intervalMs);
@@ -69,9 +71,17 @@ export class LiveFeed {
           listener.cursors.set(topic, Math.max(after, page.cursor));
         }
         const serialized = JSON.stringify(data);
-        if (listener.values.get(topic) === serialized) continue;
+        const lastRefetch = listener.refetch.get(topic);
+        if (listener.values.get(topic) === serialized && (lastRefetch === undefined || Date.now() - lastRefetch < 15000)) continue;
         listener.values.set(topic, serialized);
-        try { listener.emit({ topic, data }); } catch { /* A disconnected consumer is removed by its owner. */ }
+        const update = { topic, data };
+        const eventBytes = Buffer.byteLength(JSON.stringify(update));
+        if (eventBytes > MAX_EVENTS_EVENT_BYTES || lastRefetch !== undefined) listener.refetch.set(topic, Date.now());
+        // Keep the latch after the first refetch: a later inline event could move
+        // the phone's journal cursor past data it has not fetched yet. Repeat
+        // unchanged refetches periodically so a failed REST load can recover.
+        const outgoing = listener.refetch.has(topic) ? { topic: "refetch" as const, data: { topic } } : update;
+        try { listener.emit(outgoing); } catch { /* A disconnected consumer is removed by its owner. */ }
       }
     } finally { this.ticking = false; }
   }

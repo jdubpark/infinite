@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import { createRemoteClient, RemoteError, type RemoteClient } from "@infinite/remote";
-import { MAX_FRAME_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_EVENTS_BUFFERED_BYTES } from "@infinite/remote/protocol";
+import { MAX_FRAME_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_EVENT_BYTES } from "@infinite/remote/protocol";
 import { connectRemoteAccess } from "../packages/host/src/remote-access.js";
 import { createRelayServer } from "../packages/host/src/relay.js";
 import { hashToken } from "../packages/host/src/config.js";
@@ -204,7 +204,7 @@ test("encrypted terminals carry real PTY output and receipts, enforce leases and
   } finally { owner.close(); viewer.close(); closeRemote(); proxy.close(); await host.stop(); }
 });
 
-test("remote event streams enforce caps, close cleanly, reject revoked keys, and stop at the buffer limit", { timeout: 30000 }, async () => {
+test("remote event streams replace oversized snapshots with refetch and keep delivering", { timeout: 30000 }, async () => {
   const host = await inProcessHost();
   host.config.remote = { enabled: true };
   const closeRemote = connectRemoteAccess(host.server, host.config);
@@ -219,17 +219,78 @@ test("remote event streams enforce caps, close cleanly, reject revoked keys, and
 
     const teams = host.teams as unknown as { list(): unknown };
     const originalList = teams.list;
-    teams.list = () => [{ title: "x".repeat(MAX_EVENTS_BUFFERED_BYTES + 1) }];
-    let closedCode: number | undefined;
-    await owner.openEvents({ topics: ["teams"], onEvent: () => {}, onClose: event => { closedCode = event.code; } });
-    await waitFor(async () => closedCode, code => code === 1013, 3000);
+    const manager = host.manager as unknown as { events(id: string, after: number, limit: number, types?: Set<string>): { events: unknown[]; cursor: number; more: boolean } };
+    const originalEvents = manager.events;
+    const session = await owner.request<{ id: string }>("/sessions", { body: {
+      requestId: randomUUID(), provider: "demo", projectId: "rehearsal", title: "Live cursor", prompt: "Cursor check",
+    } });
+    const journalEvent = { seq: 1, type: "signal", data: { text: "x".repeat(391203) } };
+    assert.equal(Buffer.byteLength(JSON.stringify(journalEvent)), 391247);
+    let journalCursor = 1;
+    manager.events = (_id, after) => ({
+      events: (journalCursor === 1 ? [journalEvent] : [{ seq: journalCursor, type: "signal", data: { text: `event-${journalCursor}` } }]).filter(event => event.seq > after),
+      cursor: journalCursor, more: false,
+    });
+    const oversized = [{ title: "💥".repeat(Math.ceil(MAX_EVENTS_EVENT_BYTES / 4)) }];
+    teams.list = () => oversized;
+    const sessionTopic = `session/${session.id}`;
+    const updates: { topic: string; data: any }[] = [], freshSessionUpdates: { topic: string; data: any }[] = [];
+    const stream = await owner.openEvents({ topics: ["teams", sessionTopic], onEvent: event => updates.push(event as { topic: string; data: any }), onClose: () => {} });
+    await waitFor(async () => updates, values => values.some(value => value.topic === "refetch" && value.data.topic === "teams") && values.some(value => value.topic === "refetch" && value.data.topic === sessionTopic), 4000);
+    assert.deepEqual(updates.find(value => value.topic === "refetch"), { topic: "refetch", data: { topic: "teams" } }, "UTF-8 serialized event size triggers a topic refetch");
+    const rest = await owner.request<{ teams: unknown[] }>("/teams");
+    assert.deepEqual(rest.teams, oversized, "the REST snapshot still returns the full source data");
+    const journal = await owner.request<{ events: unknown[]; cursor: number }>(`/sessions/${session.id}/events?after=0`);
+    assert.deepEqual(journal.events, [journalEvent], "REST retains the oversized journal event");
+    const before = updates.filter(value => value.topic === "refetch" && value.data.topic === sessionTopic).length;
+    teams.list = () => [{ title: "small snapshot" }];
+    journalCursor = 2;
+    const freshSession = await owner.openEvents({ topics: [sessionTopic], after: journal.cursor, onEvent: event => freshSessionUpdates.push(event as { topic: string; data: any }), onClose: () => {} });
+    await waitFor(async () => freshSessionUpdates, values => values.some(value => value.topic === sessionTopic && value.data.events.events.some((event: { seq: number }) => event.seq === 2)), 4000);
+    assert.equal(freshSessionUpdates.filter(value => value.topic === sessionTopic).length, 1, "a listener starting after the oversized journal event gets the next inline sequence once");
+    await waitFor(async () => updates.filter(value => value.topic === "refetch" && value.data.topic === sessionTopic).length, count => count > before, 4000);
+    assert.equal(updates.some(value => value.topic === sessionTopic), false, "the older listener never advances the phone's cursor through inline updates after refetch");
+    assert.equal(updates.filter(value => value.topic === "teams" || (value.topic === "refetch" && value.data.topic === "teams")).every(value => value.topic === "refetch"), true,
+      "once refetch is required, later team changes on this subscription never send an inline snapshot");
+    stream.close();
+    freshSession.close();
     teams.list = originalList;
+    manager.events = originalEvents;
 
     host.config.tokens = host.config.tokens.filter(device => device.role !== "owner");
     await assert.rejects(owner.openEvents({ topics: ["sessions"], onEvent: () => {}, onClose: () => {} }), (error: RemoteError) => error.code === "disconnected");
   } finally {
     for (const stream of streams) stream.close();
     owner.close(); closeRemote(); await host.stop();
+  }
+});
+
+test("remote event parsing accepts coalesced frames within the outstanding event budget", { timeout: 15000 }, async () => {
+  const token = randomBytes(32).toString("base64url"), machineId = randomUUID();
+  const payloads = Array.from({ length: 3 }, (_, index) => JSON.stringify({ topic: "sessions", data: { value: `${index}${"x".repeat(87334)}` } }));
+  const wireChunk = payloads.map(data => `event: update\ndata: ${data}\n\n`).join("");
+  assert.ok(payloads.every(data => Buffer.byteLength(data) <= MAX_EVENTS_EVENT_BYTES));
+  assert.ok(payloads.reduce((size, data) => size + Buffer.byteLength(data), 0) <= MAX_EVENTS_BUFFERED_BYTES);
+  assert.ok(Buffer.byteLength(wireChunk) > MAX_EVENTS_BUFFERED_BYTES, "SSE framing makes the coalesced chunk larger than the pending event budget");
+  const server = createServer((req, res) => {
+    if (req.url?.startsWith("/api/events")) {
+      res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      res.end(wireChunk);
+    } else { res.writeHead(404); res.end(); }
+  });
+  const config = {
+    origin: "http://127.0.0.1", port: 0, environment: "local", machine: { id: machineId, label: "Test runner" }, remote: { enabled: true },
+    tokens: [{ id: "test-owner", label: "Test owner", role: "owner", hash: hashToken(token) }],
+  } as Config;
+  const closeRemote = connectRemoteAccess(server, config), url = await listen(server);
+  const client = createRemoteClient({ url, token });
+  const events: unknown[] = [];
+  try {
+    await client.openEvents({ topics: ["sessions"], onEvent: event => events.push(event), onClose: () => {} });
+    await waitFor(async () => events, values => values.length === payloads.length, 3000);
+    assert.equal(events.length, payloads.length);
+  } finally {
+    client.close(); closeRemote(); server.closeAllConnections(); server.close();
   }
 });
 
@@ -334,7 +395,7 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     assert.equal(runner.requests.length, 0);
     const client = connect();
     await client.request("/me");
-    for (const path of ["/login", "/sessions/../me", "/sessions/%2e%2e/me", "/sessions/" + randomUUID() + "/raw"]) {
+    for (const path of ["/login", "/sessions/../me", "/sessions/%2e%2e/me", "/sessions/" + randomUUID() + "/raw", "/events?topics=sessions"]) {
       await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403);
     }
     // Workspace content moves only over a direct owner connection.

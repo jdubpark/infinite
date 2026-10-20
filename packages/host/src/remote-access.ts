@@ -8,6 +8,7 @@ import {
   createCipherChannel, createServerHello, equalBytes, HANDSHAKE_TIMEOUT_MS, keyFromHash,
   matchesClientHello, MAX_FRAME_BYTES, MAX_PENDING_REQUESTS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
   MAX_TERMINAL_STREAMS, MAX_TERMINAL_BUFFERED_BYTES, MAX_EVENTS_STREAMS, MAX_EVENTS_BUFFERED_BYTES,
+  MAX_EVENTS_EVENT_BYTES,
   object, parseClientHello, parseRelayEnvelope, remoteSocketUrl, tokenKey, UUID,
   type CipherChannel, type RelayEnvelope, type RemoteMethod, type RemoteRequest, type RemoteResponse,
   type RemoteTerminalCommand, type RemoteTerminalEvent, type RemoteEventsCommand, type RemoteEventsEvent,
@@ -27,7 +28,6 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   // Reject normalization tricks and encoded route delimiters. File names belong in the query.
   if (url.pathname !== path.split("?")[0] || /%/i.test(url.pathname)) return false;
   if (method === "GET" && url.pathname === "/api/me") return true;
-  if (method === "GET" && url.pathname === "/api/events") return true;
   if (method === "GET" && url.pathname === "/api/machine/resources") return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/sessions") return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/teams") return true;
@@ -153,11 +153,11 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
       try { if (!send(JSON.stringify(channel.seal(response)), onSent)) close(); }
       catch { close(); }
     }
-    function stopEvents(streamId: string, code: number, notify = true) {
+    function stopEvents(streamId: string, code: number, notify = true, reason?: string) {
       const stream = eventStreams.get(streamId);
       if (!stream) return;
       eventStreams.delete(streamId); stream.controller.abort();
-      if (notify) reply({ type: "events-closed", streamId, code });
+      if (notify) reply({ type: "events-closed", streamId, code, ...(reason ? { reason } : {}) });
     }
     async function events(command: RemoteEventsCommand) {
       if (command.type === "events-close") { stopEvents(command.streamId, 1000); return; }
@@ -185,18 +185,34 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
           const chunk = await reader.read();
           if (chunk.done) break;
           pendingText += decoder.decode(chunk.value, { stream: true });
-          if (Buffer.byteLength(pendingText) > MAX_EVENTS_BUFFERED_BYTES) throw new Error("Events frame exceeds the remote limit");
           let boundary: number;
           while ((boundary = pendingText.indexOf("\n\n")) >= 0) {
             const frame = pendingText.slice(0, boundary); pendingText = pendingText.slice(boundary + 2);
-            const data = frame.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
+            const lines = frame.split(/\r?\n/);
+            const event = lines.find(line => line.startsWith("event:"))?.slice(6).trim();
+            const data = lines.filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
             if (!data) continue;
+            if (event === "close") {
+              const close = object(JSON.parse(data));
+              const reason = typeof close.reason === "string" ? close.reason.slice(0, 160) : "Runner closed the live event stream";
+              stopEvents(command.id, 1013, true, reason); return;
+            }
+            const size = Buffer.byteLength(data);
+            if (size > MAX_EVENTS_EVENT_BYTES) {
+              stopEvents(command.id, 1013, true, "Live event exceeds the remote event limit"); return;
+            }
             const update = object(JSON.parse(data));
             if (typeof update.topic !== "string" || !("data" in update)) throw new Error("Invalid live event");
-            const size = Buffer.byteLength(data);
-            if (stream.buffered + size > MAX_EVENTS_BUFFERED_BYTES) { stopEvents(command.id, 1013); return; }
-            stream.buffered += size;
-            reply({ type: "events-event", streamId: command.id, topic: update.topic, data: update.data }, () => { stream.buffered = Math.max(0, stream.buffered - size); });
+            const eventBytes = Buffer.byteLength(JSON.stringify({ topic: update.topic, data: update.data }));
+            if (stream.buffered + eventBytes > MAX_EVENTS_BUFFERED_BYTES) {
+              stopEvents(command.id, 1013, true, "Remote event stream buffer limit exceeded"); return;
+            }
+            stream.buffered += eventBytes;
+            reply({ type: "events-event", streamId: command.id, topic: update.topic, data: update.data }, () => { stream.buffered = Math.max(0, stream.buffered - eventBytes); });
+          }
+          // Completed frames are checked independently above; only the unfinished tail is bounded here.
+          if (Buffer.byteLength(pendingText) > MAX_EVENTS_EVENT_BYTES + 128) {
+            stopEvents(command.id, 1013, true, "Unfinished live event exceeds the remote event limit"); return;
           }
         }
         stopEvents(command.id, 1000);

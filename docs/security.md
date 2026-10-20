@@ -200,6 +200,20 @@ Use encrypted off-host backups with restore testing. Keep the backup decryption 
 
 Before putting private production repositories here, verify the isolation and storage controls on the selected host and repeat a real provider session through an actual laptop-network outage. Local synthetic continuity tests establish neither cloud hardening nor provider acceptance.
 
+## GitHub-tracked source mirrors
+
+The host mirror of each GitHub-tracked project is writable by the agent identity,
+because the fetch that fills it must run as that identity. On the Ubuntu template,
+only that identity can reach the GitHub App token through its Git credential
+helper. Every network Git command against GitHub runs through `teams.commandPrefix`.
+The mirror grants agents no power over the base that they lack today, since the
+project directory they clone is already agent-writable. Its purpose is to keep team
+runs apart from the working tree that sessions edit. It does not protect the base
+from agents. Content fetched from GitHub is repository content, so it carries the
+same prompt-injection risk as any checked-out file. The GitHub App mints tokens for
+every repository it is installed on, not a hand-kept list, so a new installation
+widens token issuance. See [GitHub App setup](../deploy/ubuntu/github-app.md).
+
 ## Dependency audit
 
 The current lockfile's production host dependency audit reports zero known advisories. The full workspace audit reports 29 findings (19 high, 10 moderate), propagated from four transitive packages in the Expo 57 dependency tree: `braces`, `node-forge`, `uuid`, and `decode-uri-component`. Most are in build tooling; the Router URI decoder also requires review before native release. At the time of the check, the registry's latest `braces` and `node-forge` versions remained affected. A forced audit fix proposed incompatible SDK changes, so it was not applied. These findings remain open; the mobile debug build is not a security-reviewed release.

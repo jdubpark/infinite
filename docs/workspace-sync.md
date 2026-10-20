@@ -1,6 +1,14 @@
 # Workspace sync
 
-Workspace sync keeps a cloud project directory current with the owner's laptop checkout. It is one way, laptop to cloud. The cloud directory is the executing copy for every cloud session in that project. Changes made there travel back only through `infinite pull`, into a new directory. Command usage is in the [CLI guide](cli.md#workspace-sync-and-pull).
+Workspace sync keeps a cloud project directory current with the owner's laptop checkout. It is one way, laptop to cloud, and it applies only to projects in `laptop` source mode. A project in `github` mode is updated by the host from GitHub instead, as described in [Source modes](#source-modes). The cloud directory is the executing copy for every cloud session in that project. Changes made there travel back only through `infinite pull`, into a new directory. Command usage is in the [CLI guide](cli.md#workspace-sync-and-pull).
+
+## Source modes
+
+Each enrolled project has one source mode. In `laptop` mode, the project's code comes from the owner's laptop through workspace sync, which this page describes. In `github` mode, the host follows the project's base branch on GitHub. It fetches that branch and fast-forwards the project directory itself, with no laptop process running. The two modes never apply to one project at the same time, so a laptop upload cannot report `cloud-changed` against a tree the host moved.
+
+`infinite repo init` records `github` when `origin` is an HTTPS or SSH `github.com` URL without embedded credentials, and `laptop` otherwise. `--source laptop` keeps workspace sync for a GitHub checkout. `--source github` switches an enrolled project to GitHub mode, stops any laptop sync service recorded for it, and reads the followed branch from `origin/HEAD`, else local `main` or `master`. Projects enrolled before this mode existed stay in `laptop` mode until they are enrolled again.
+
+While a project is in `github` mode, every laptop sync route for it answers `409` with code `source-github`, and its message names `--source laptop`. `infinite sync` in such a checkout prints that the project follows GitHub and starts no service. The pending reasons on this page apply only to `laptop` mode. GitHub mode reports its own state, described in [GitHub-tracked sources](teams.md#github-tracked-sources).
 
 ## Folder mapping
 

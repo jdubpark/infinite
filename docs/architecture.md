@@ -38,6 +38,15 @@ flowchart LR
 
 The native process lives under its worker, not the HTTP server. An API crash leaves workers alive. Each worker owns its recording and input receipt map. The single HTTP listener binds only to `127.0.0.1`; Tailscale Serve can provide private HTTPS. A laptop can use ordinary SSH from a cmux pane to run `infinite attach SESSION_ID` on the host. Web and phone clients can also select independently paired machines. An optional outbound runner connection reaches an opaque relay, which forwards encrypted requests into the same authorized API. The optional cmux backend discovers existing Claude Code and Codex conversations and creates new cmux workspaces. Its process lifecycle and snapshot recording differ from detached Infinite workers. [Remote machines](remote-machines.md) defines those contracts and setup; neither backend changes execution ownership merely because a client switches machines.
 
+Workspace sync and GitHub-tracked sources are the two ways a cloud project
+directory gets its code. Sync uploads a laptop tree and applies it. A `github`
+project instead keeps a bare mirror of its base branch, outside every project
+directory. The host fast-forwards the project directory from that mirror when no
+session is using it, on a timer, before team runs, and after a merge report. Team
+runs clone the mirror, so they start from the current base. The two modes are
+exclusive per project. [Workspace sync](workspace-sync.md#source-modes) and
+[teams](teams.md#github-tracked-sources) define the contracts.
+
 ## State and failure behavior
 
 `starting → running → exited`. An unreachable worker is reported as `unavailable`, never “completed.” Recording failure sets `recording-error` and attempts to suspend the native process with SIGSTOP. This favors preserving the record over continuing silently without one. Operator intervention is required if storage fills.

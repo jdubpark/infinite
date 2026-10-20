@@ -512,6 +512,15 @@ a test, the agent must identify its observable contract, a credible regression,
 and the gap in existing coverage. Repository instructions still apply. Repair
 attempts are bounded; unresolved failures remain visible.
 
+Each configured check may run for `teams.checkMinutes` (default 60). A check that
+runs past the limit is stopped and blocks the team with a resumable reason. The
+timeout does not count as one of the team's two correction rounds, because it is
+host evidence about the check, not about the agents' work. When the command runs
+through a `teams.commandPrefix` launcher such as `sudo`, the host may be refused
+permission to signal it. The check output then says so, and the command is left
+to finish with its result discarded. Size the limit for the project's full check
+on the execution host.
+
 For a brief that changes the interface, an approving reviewer must include
 `uiEvidence` describing the runnable flow inspected, results, and limitations.
 This is an agent's recorded claim, separate from the host's command results. If

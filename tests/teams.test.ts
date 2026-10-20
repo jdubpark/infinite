@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
-import { memberStallReason } from "../packages/host/src/teams.js";
+import { checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
 import type { CreateTeam, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
@@ -627,6 +627,33 @@ test("review approval cannot make an integration checkout changed after verifica
     assert.equal(readFileSync(join(blocked.workspace, "a.txt"), "utf8"), "Changed after verification\n");
     assert.equal(git(f.source, "status", "--porcelain"), "");
   } finally { await f.close(); }
+});
+
+test("a check past teams.checkMinutes blocks a resumable run without spending a correction round", { timeout: 120000 }, async () => {
+  const f = await fixture("lifecycle", undefined, { teams: { checkMinutes: 0.05 } });
+  let checkPid: number | undefined;
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const id = created.body.id;
+    await waitFor(async () => existsSync(join(f.receipts, "check-ready.json")), Boolean, 30000);
+    checkPid = JSON.parse(readFileSync(join(f.receipts, "check-ready.json"), "utf8")).pid;
+    const checking = await f.get(id);
+    const blocked = await waitFor(() => f.get(id), run => run.status === "blocked", 30000);
+    assert.equal(blocked.reason, checkTimeoutReason, JSON.stringify(blocked));
+    assert.equal(blocked.round, 0, "A host timeout is not an agent correction round");
+    assert.equal(blocked.members.length, checking.members.length, "No repair member is started for a timeout");
+    assert.equal(blocked.checks.at(-1)?.status, "interrupted", JSON.stringify(blocked.checks.map(check => check.status)));
+    await waitFor(async () => { try { process.kill(checkPid!, 0); return false; } catch { return true; } }, exited => exited, 5000);
+    writeFileSync(join(f.receipts, "check-release"), "continue", { mode: 0o600 });
+    const resume = { requestId: randomUUID(), revision: blocked.revision };
+    const resumed = await waitFor(() => f.host.fetchApi(`/teams/${id}/resume`, "owner", resume), response => response.body?.code !== "members-stopping", 15000);
+    assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
+    assert.equal(resumed.body.revision, blocked.revision + 1);
+  } finally {
+    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { /* Already exited. */ } }
+    await f.close();
+  }
 });
 
 test("pausing a running check waits for its abort and resumes once without a late completion reopening the paused run", { timeout: 120000 }, async () => {

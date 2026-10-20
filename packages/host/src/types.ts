@@ -111,6 +111,8 @@ export interface Config {
     trustWorkspaces?: boolean;
     /** Minutes without attention activity before a member without a report is stopped and replaced. */
     stallMinutes?: number;
+    /** Minutes each configured verification command may run before the host stops it (default 60). */
+    checkMinutes?: number;
   };
   machine?: { id: string; label: string };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };

@@ -29,7 +29,11 @@ export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSig
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false;
     const stop = () => {
       interrupted = true;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* Already exited. */ }
+      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); }
+      catch (error) {
+        // A prefixed launcher such as sudo leads a group the host may not signal; say so rather than imply the command stopped.
+        if ((error as NodeJS.ErrnoException).code === "EPERM") capture(Buffer.from("\n[The host could not stop this command (EPERM); it was left to finish and its result is not used.]\n"));
+      }
     };
     const capture = (chunk: Buffer) => {
       const text = chunk.toString("utf8");

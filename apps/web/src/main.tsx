@@ -329,6 +329,7 @@ function App() {
                     <small>
                       {names[session.provider]} · started{" "}
                       {time(session.createdAt)}
+                      {session.archivedAt ? " · archived" : ""}
                     </small>
                   </span>
                   <span className="session-status">

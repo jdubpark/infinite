@@ -64,6 +64,8 @@ export interface Session {
   cwd: string;
   createdAt: string;
   status: Status;
+  /** Host-owned: set when the owner archived this exited session */
+  archivedAt?: string;
   pid?: number;
   exitCode?: number;
   /** Canonical source checkout at creation; never inferred from a Linear mapping. */

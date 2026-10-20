@@ -48,13 +48,13 @@ Terminal-native input can include arbitrary keyboard sequences over owner-only t
 
 ## Delivery contract
 
-Creation uses a client UUID as the logical session ID. The stored request fingerprint makes an identical retry return the existing session; a conflicting reuse fails. Creation does not automatically retry spawning after an ambiguous failure.
+Creation uses a client UUID as the logical session ID. The stored request fingerprint makes an identical retry return the existing session; a conflicting reuse fails. Deletion keeps a sealed ID receipt so a delayed retry cannot relaunch the deleted request or reuse its ID. Creation does not automatically retry spawning after an ambiguous failure.
 
 New session metadata also pins a separate runtime UUID, execution location, and transport. Records written before execution location was stored are reported as `laptop` when they carry a hybrid workspace and `cloud` otherwise. Detaching and reconnecting never change that runtime. Authenticated Claude/Codex hooks may identify the native conversation; absence means unknown. Native argument passthrough does not inject hooks, so such sessions may have no native conversation mapping. This is not a portable recovery checkpoint or a complete provider-account binding.
 
 Input carries a client-generated `requestId`. The worker durably appends intent, writes to the PTY, then durably appends the result. Concurrent identical retries return one receipt. If the write may have happened but the result was not recorded, that ID remains uncertain. It must not be silently reissued under another ID. Exactly-once execution of a provider's tool is not guaranteed by exactly-once terminal input.
 
-Each event has `seq`, `at`, `type`, and `data`. The encrypted journal uses 256-record segments. `GET /api/sessions/:id/events?after=N&limit=200` returns `{events,cursor,more}`. Clients advance only to a received cursor and page until `more=false`. Events are retained after native process exit. There is no automatic record deletion or retention quota yet.
+Each event has `seq`, `at`, `type`, and `data`. The encrypted journal uses 256-record segments. `GET /api/sessions/:id/events?after=N&limit=200` returns `{events,cursor,more}`. Clients advance only to a received cursor and page until `more=false`. Events are retained after native process exit. There is no automatic record deletion or retention quota; the owner can explicitly delete an exited session's record.
 
 `GET /api/events?topics=sessions,teams,session/<id>&after=<cursor>` provides the shared live feed as authenticated `text/event-stream`. One host loop runs every 750 ms only while it has subscribers. Each tick reads each requested list or session state once, reads a session's journal page from the lowest active subscriber cursor, and emits only when the serialized topic data changes. `sessions` matches `GET /api/sessions`, `teams` matches `GET /api/teams`, and `session/<id>` contains the `GET /api/sessions/:id` detail plus a journal page shaped like `GET /api/sessions/:id/events`. The stream sends a comment heartbeat every 15 seconds, disables proxy buffering, and stops work when its last subscriber closes. It uses the same paired-device authentication and read roles as those GET routes.
 
@@ -77,6 +77,8 @@ All API routes except login require a bearer key or same-origin HttpOnly cookie.
 | List / inspect sessions | `GET /api/sessions`, `GET /api/sessions/:id` | Any |
 | Subscribe to live state | `GET /api/events?topics=...&after=...` | Any |
 | Create session | `POST /api/sessions` | Owner |
+| Archive / unarchive an exited session | `POST /api/sessions/:id/archive` | Owner |
+| Delete an exited session record | `DELETE /api/sessions/:id` | Owner |
 | Read chat / preview a project file | `GET /api/sessions/:id/messages`, `/file?path=` | Any |
 | Read a model-written digest of the chat | `GET /api/sessions/:id/summary?after=` | Any, when `summaries` is configured |
 | Clean a dictated transcript | `POST /api/dictation/cleanup` | Owner, controller; when `dictation` is configured |

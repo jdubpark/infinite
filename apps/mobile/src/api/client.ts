@@ -162,6 +162,8 @@ export type SessionRow = {
   /** Set on a session a mission coordinator runs (its coordinator or a subteam member). The host refuses input, stop, resume and control for it. */
   managedBy?: { kind: "mission"; missionId: string; teamId?: string };
   resumable?: boolean;
+  /** Set once the owner archived this exited session; it leaves the live lists but keeps its record. */
+  archivedAt?: string;
   title: string;
   reading?: {
     now?: { text: string; source: "jev"; for: string; at: string };

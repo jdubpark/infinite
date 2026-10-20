@@ -14,6 +14,7 @@ export type Session = {
   projectId: string;
   status: string;
   createdAt: string;
+  archivedAt?: string;
   pid?: number;
   seq: number;
   screen?: string;

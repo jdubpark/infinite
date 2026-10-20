@@ -25,6 +25,16 @@ test("empty groups are omitted", () => {
   assert.deepEqual(groupSessions([]), []);
 });
 
+test("an archived row leaves its state group for Archived, which comes last", () => {
+  const groups = groupSessions([
+    { ...row("a", "exited"), archivedAt: "2026-10-05T00:00:00.000Z" },
+    row("e", "exited"),
+    { ...row("b", "turn-finished"), archivedAt: "2026-10-05T00:00:00.000Z" },
+  ]);
+  assert.deepEqual(groups.map((g) => g.title), ["Exited", "Archived"]);
+  assert.deepEqual(groups.map((g) => g.rows.map((r) => r.id).sort()), [["e"], ["a", "b"]]);
+});
+
 test("within a group the newer since comes first", () => {
   const [g] = groupSessions([
     row("old", "working", "2026-10-04T11:00:00.000Z"),

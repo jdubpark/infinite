@@ -63,7 +63,8 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   const match = /^\/api\/sessions\/([^/]+)(?:\/([^/]+))?$/.exec(url.pathname);
   if (!match || !UUID.test(match[1])) return false;
   return method === "GET" ? [undefined, "events", "messages", "summary", "file", "handoff"].includes(match[2])
-    : method === "POST" && ["control", "input", "answer", "key", "stop", "resize", "resume"].includes(match[2]);
+    : method === "DELETE" ? match[2] === undefined
+      : method === "POST" && ["control", "input", "answer", "key", "stop", "resize", "resume", "archive"].includes(match[2]);
 }
 
 function parseRequest(value: unknown): RemoteRequest {

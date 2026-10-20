@@ -422,6 +422,19 @@ export function createApp(config: Config, key: Buffer) {
       next(error);
     }
   };
+  const refuseTeamSessionDeletion: express.RequestHandler = (req, res, next) => {
+    const param = req.params.id;
+    const sessionId = Array.isArray(param) ? param[0] : param;
+    if (!sessionId || !id.safeParse(sessionId).success) return next();
+    try {
+      if (manager.meta(sessionId).session.team)
+        return void res.status(409).json({ code: "team-session", error: "Team sessions cannot be deleted individually" });
+      next();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return next();
+      next(error);
+    }
+  };
   const refuseManagedOutsideProviderPrompt: express.RequestHandler = (req, res, next) => {
     const param = req.params.id ?? req.params[0];
     const sessionId = Array.isArray(param) ? param[0] : param;
@@ -790,6 +803,15 @@ export function createApp(config: Config, key: Buffer) {
     const sessionId = id.parse(req.params.id);
     if (existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) return next();
     const action = req.path;
+    if ((req.method === "POST" && action === "/archive") || req.method === "DELETE") {
+      if (res.locals.role !== "owner") return void res.status(403).json({ error: "This device is not allowed to perform that action" });
+      try { await cmux.get(sessionId); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return next();
+        throw error;
+      }
+      return void res.status(409).json({ error: "This action is unavailable for cmux sessions", code: "unsupported" });
+    }
     if (req.method === "GET") {
       if (action === "/" || action === "") {
         const session = await cmux.get(sessionId);
@@ -889,6 +911,25 @@ export function createApp(config: Config, key: Buffer) {
     const session = manager.meta(sessionId).session;
     if (session.workspace) throw new ContentError("Hybrid files must be inspected on their executor or through an explicit recovery copy");
     res.json(await sessionFile(session, z.string().parse(req.query.path)));
+  });
+  app.post("/api/sessions/:id/archive", requireRole(["owner"]), refuseMissionManaged, async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    const body = z.object({ requestId: id, archived: z.boolean() }).strict().parse(req.body);
+    await manager.setArchived(sessionId, body.archived);
+    res.json(await sessionDetail(sessionId));
+  });
+  app.delete("/api/sessions/:id", requireRole(["owner"]), refuseTeamSessionDeletion, refuseMissionManaged, async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    try {
+      if (manager.meta(sessionId).session.team)
+        return void res.status(409).json({ code: "team-session", error: "Team sessions cannot be deleted individually" });
+      await manager.remove(sessionId);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT")
+        return void res.status(404).json({ code: "not-found", error: "Session not found" });
+      throw error;
+    }
+    res.json({ ok: true, id: sessionId });
   });
   app.post("/api/sessions/:id/resume", refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);

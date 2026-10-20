@@ -5,6 +5,7 @@ import * as Crypto from "expo-crypto";
 import { api, ApiError, connectionKey, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { TopBar } from "../../components/Glass";
 import { goalCreations } from "../../store/requests";
 import { theme } from "../../theme";
@@ -26,7 +27,7 @@ export function GoalCreate({ connection }: { connection: Connection }) {
   const machine = connectionKey(connection);
   const creation = goalCreations.use(machine);
   const pending = creation.pending;
-  const { data: me, online, refresh } = usePoll(() => api<Me>(connection, "/me"), 5000, [connection]);
+  const { data: me, online, stale, refresh } = usePoll(() => api<Me>(connection, "/me"), 5000, [connection]);
   const projects = me?.projects ?? [];
   const [project, setProject] = useState(pending?.projectId);
   const [linearIssueId, setLinearIssueId] = useState(pending?.linearIssueId ?? "");
@@ -38,6 +39,7 @@ export function GoalCreate({ connection }: { connection: Connection }) {
   const [evidence, setEvidence] = useState(pending?.evidence.join("\n") ?? "");
   const [limits, setLimits] = useState<Record<LimitKey, string>>(() => Object.fromEntries(LIMITS.map(limit => [limit.key, String(pending?.[limit.key] ?? limit.initial)])) as Record<LimitKey, string>);
   const [sending, setSending] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState("");
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
@@ -53,6 +55,7 @@ export function GoalCreate({ connection }: { connection: Connection }) {
     if (busy || !allowed) return;
     setError("");
     let request = pending;
+    setRetrying(Boolean(pending));
     // A retry resends the recorded request even if this host's settings have changed since.
     if (!request) {
       if (!projectId) return;
@@ -86,12 +89,12 @@ export function GoalCreate({ connection }: { connection: Connection }) {
       placeholder={options.placeholder} placeholderTextColor={theme.colors.placeholder} style={[t.input, options.multiline && t.multiline]} />
     {options.note ? <Text style={t.note}>{options.note}</Text> : null}
   </>;
-  return <KeyboardAvoidingView style={s.fill} behavior="padding">
+  return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     <TopBar backLabel="Goals" onBack={() => router.canGoBack() ? router.back() : router.replace({ pathname: "/", params: { machine, view: "goals" } })} right={<Text style={t.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
+    <FloatingNotice position="top" offset={58} message={stale ? me ? "Waiting for a fresh machine connection." : "Can't reach this machine." : null} actions={stale ? <Button compact title="Refresh" secondary onPress={refresh} /> : null} />
     <ScrollView contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>New goal</Text>
       <Text style={t.note}>Give the team an outcome and the evidence it should use. Agents choose scoped improvements and build reviewed cycles within these limits.</Text>
-      {!online ? <View style={s.section}><Text style={t.warning}>Waiting for a fresh machine connection.</Text><Button title="Refresh" secondary onPress={refresh} /></View> : null}
       {me && me.role !== "owner" ? <Text style={t.warning}>An owner key is required to start a goal.</Text> : null}
       {me && (!me.goals?.enabled || !me.teams?.lineup) ? <Text style={t.warning}>Goals need a configured team lineup with strong coordinator and reviewer profiles.</Text> : null}
       {creation.result ? <View style={s.section}><Text style={t.note}>Goal started.</Text><Button title="Open goal" onPress={() => router.replace({ pathname: "/goal/[id]", params: { id: creation.result!.id, machine } })} /></View> : null}
@@ -119,14 +122,15 @@ export function GoalCreate({ connection }: { connection: Connection }) {
         <LineupView lineup={me.teams.lineup} />
       </Disclosure> : null}
       <Text style={t.note}>Review the team’s results. Delivery follows each repository’s policy. Provider permissions remain in force.</Text>
-      {error || creation.message ? <Text style={t.warning} accessibilityRole="alert">{error || creation.message}</Text> : null}
-      <View style={s.section}><Button title={busy ? "Starting goal…" : pending ? "Retry same request" : "Start goal"} disabled={busy || !allowed} onPress={() => void submit()} /></View>
+      {error || creation.message ? <Text accessibilityRole="alert" style={t.warning}>{error || creation.message}</Text> : null}
+      <View style={s.section}><Button busy={busy} title={pending && (!busy || retrying) ? "Retry same request" : "Start goal"} disabled={busy || !allowed} onPress={() => void submit()} /></View>
     </ScrollView>
   </KeyboardAvoidingView>;
 }
 
 const s = StyleSheet.create({
   fill: { flex: 1 },
+  overlayRoot: { position: "relative" },
   body: { padding: 24, gap: 10, paddingBottom: 48 },
   title: { fontSize: 28, lineHeight: 34, color: theme.colors.ink, fontWeight: "700", letterSpacing: -0.6 },
   section: { marginVertical: 16, gap: 12 },

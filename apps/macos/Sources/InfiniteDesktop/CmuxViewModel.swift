@@ -33,6 +33,7 @@ private struct CmuxPendingCreation: Codable {
     @Published private(set) var disconnecting = false
     @Published var attached = false
     @Published var busy = false
+    @Published private(set) var sending = false
     @Published var inputEnabled = false
     @Published var directInput = false
     @Published var notice = "Connect an enrolled cmux server to open its real terminals."
@@ -44,6 +45,10 @@ private struct CmuxPendingCreation: Codable {
     @Published var creationPending = false
     @Published private(set) var rendererGeneration = UUID()
     @Published private(set) var snapshotReady = false
+    @Published private(set) var hasConnected = false
+    @Published private(set) var catalogDisplayStale = false
+    @Published private(set) var catalogLoaded = false
+    @Published private(set) var attaching = false
     let pipe = TerminalPipe()
     private let backend = CmuxBackend()
     private let drafts = DraftStore()
@@ -59,6 +64,7 @@ private struct CmuxPendingCreation: Codable {
     private var busyAttachment: UUID?
     private var snapshotReceived = false
     private var streamEnded = false
+    private lazy var catalogFreshness = DisplayFreshness { [weak self] in self?.catalogDisplayStale = $0 }
     private var attachedProfileID = ""
     var active: CmuxHostProfile? { profiles.first { $0.id == activeID } }
     var selected: CmuxTerminalRow? { terminals.first { $0.id == selectedID } }
@@ -99,6 +105,7 @@ private struct CmuxPendingCreation: Codable {
             }
             guard generation == connectionGeneration else { return }
             connected = true; connecting = false; connectionStatus = "Noise encrypted · enrolled device"
+            hasConnected = true
             persistProfiles(); loadPendingCreation()
             await refresh()
             guard generation == connectionGeneration else { return }
@@ -133,12 +140,13 @@ private struct CmuxPendingCreation: Codable {
                 let agent = snapshot["agents"].array.first { $0["terminal_id"] == terminal["id"] } ?? .null
                 return CmuxTerminalRow(value: terminal, workspace: workspace?["name"].string ?? "Workspace", agent: agent)
             }
-            connected = true; lastSeen = Date()
+            connected = true; lastSeen = Date(); hasConnected = true; catalogLoaded = true
+            catalogFreshness.recovered()
             if let selectedID, !terminals.contains(where: { $0.id == selectedID && $0.running }) { inputEnabled = false; directInput = false }
         } catch {
             guard generation == connectionGeneration else { return }
             connected = false; inputEnabled = false; directInput = false
-            notice = "Catalog is stale. \(error.localizedDescription)"
+            catalogFreshness.failed()
         }
     }
 
@@ -147,10 +155,11 @@ private struct CmuxPendingCreation: Codable {
         do { try persistDraft() } catch { notice = error.localizedDescription; return }
         let connection = connectionGeneration, profileID = activeID
         saveTask?.cancel(); inputEnabled = false; directInput = false; queuedInput.removeAll()
+        attaching = true
         attachmentGeneration = UUID(); let generation = attachmentGeneration
         rendererGeneration = UUID(); snapshotReady = false; snapshotReceived = false
         busy = true; busyAttachment = generation; sendingRaw = false
-        defer { if generation == attachmentGeneration && connection == connectionGeneration { busy = false; busyAttachment = nil } }
+        defer { if generation == attachmentGeneration && connection == connectionGeneration { busy = false; busyAttachment = nil; attaching = false } }
         outputBuffer?.cancel(); outputBuffer = nil
         await backend.detach()
         guard connection == connectionGeneration, generation == attachmentGeneration, profileID == activeID else { return }
@@ -188,6 +197,7 @@ private struct CmuxPendingCreation: Codable {
     func rendererFailed(_ message: String) {
         attachmentGeneration = UUID(); let generation = attachmentGeneration
         streamEnded = true; attached = false; snapshotReady = false; snapshotReceived = false; inputEnabled = false; directInput = false
+        attaching = false
         if busyAttachment != nil { busy = false; busyAttachment = nil }
         sendingRaw = false; queuedInput.removeAll()
         outputBuffer?.cancel(); outputBuffer = nil
@@ -225,6 +235,8 @@ private struct CmuxPendingCreation: Codable {
 
     func send() async {
         guard canSend, let identity = draftIdentity, let terminalID = selectedID else { return }
+        sending = true
+        defer { sending = false }
         let connection = connectionGeneration, attachment = attachmentGeneration, profileID = attachedProfileID
         let current = { self.connectionGeneration == connection && self.attachmentGeneration == attachment && self.attachedProfileID == profileID && self.selectedID == terminalID && self.draftIdentity == identity }
         guard draft.text.utf8.count <= 32 * 1024 else { notice = "Send at most 32 KiB in one prompt."; return }
@@ -361,11 +373,12 @@ private struct CmuxPendingCreation: Codable {
         defer { disconnecting = false }
         try persistDraft(); saveTask?.cancel(); poll?.cancel(); poll = nil
         connectionGeneration = UUID(); attachmentGeneration = UUID()
-        connected = false; connecting = false; sendingRaw = false; busyAttachment = nil
+        connected = false; connecting = false; attaching = false; sendingRaw = false; busyAttachment = nil
         inputEnabled = false; directInput = false; attached = false; snapshotReady = false; snapshotReceived = false; queuedInput.removeAll()
         outputBuffer?.cancel(); outputBuffer = nil
         try await backend.disconnect()
         connected = false; connecting = false; busy = false; connectionStatus = "Disconnected"
+        hasConnected = false; catalogLoaded = false; sending = false; catalogFreshness.recovered()
         notice = "Connect to inspect your server terminals."
         terminals = []; selectedID = nil; pipe.feed(Data(), reset: true)
         draft = DraftRecord(); pendingCreation = nil; creationPending = false

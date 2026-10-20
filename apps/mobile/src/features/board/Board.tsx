@@ -6,7 +6,7 @@ import { usePoll } from "../../api/usePoll";
 import { Avatar } from "../../components/Avatar";
 import { Chip, GroupHeader, LiveStatus, Sheet, SheetRow } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
-import { OfflineBanner } from "../../components/OfflineBanner";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { age, type StatusKind } from "../../status";
 import { theme } from "../../theme";
 import { Composer } from "./Composer";
@@ -55,9 +55,8 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
         <Text style={s.machineName} numberOfLines={1}>{machineName}</Text>
         <View style={s.toggle}><Glyph name="down" size={11} color={theme.colors.secondaryInk} /></View>
       </Pressable>
-      <LiveStatus online={poll.online} loading={poll.loading} seen={poll.seen} />
+      <LiveStatus online={poll.online} loading={poll.loading} seen={poll.seen} stale={poll.stale} />
     </View>
-    <OfflineBanner online={poll.online || poll.loading} message="Offline · showing the last received board." />
     <ScrollView style={s.list} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <Text style={s.title} accessibilityRole="header">Board</Text>
@@ -116,6 +115,7 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
         { text: "Keep", style: "cancel" }, { text: "Remove", style: "destructive", onPress: onDisconnect },
       ])} />
     </Sheet>
+    <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · showing the last received board." : null} />
   </View>;
 }
 

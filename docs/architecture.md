@@ -114,7 +114,7 @@ Claude Code and Codex hooks are command hooks that run Infinite's relay inside t
 
 `POST /api/sessions/:id/input` refuses text while the open prompt's dialog is on screen, with `409 { error: "prompt-open", attention }`, because text and Enter would select the dialog's highlighted option. Nothing is typed or journaled. A request with `force: true` is delivered anyway; only terminal surfaces, where the person sees the dialog, send it.
 
-The `Notifier` in the API process polls session attention and sends a push message through the Expo push service on a transition into a configured state. Push only happens while the API runs.
+The `Notifier` in the API process polls session attention plus goal and team lifecycle state, and sends configured priority push events through Expo on transitions. Goal-owned team runs use goal notifications. `turn-finished` and `exited` remain opt-in; items already present when the API starts are primed silently. Push only happens while the API runs.
 
 ## Provider boundary
 

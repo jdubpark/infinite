@@ -358,6 +358,8 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void
       return;
     }
     if (state.status !== "running") throw new HookPayloadError(409);
+    if (session.team.role === "project-manager" && report.report.kind === "plan" && report.report.verification && session.team.verificationRefused)
+      throw new HookPayloadError(409, "Plan rejected: this run uses the project's configured checks. Remove verification and submit a corrected plan. If the checks seem insufficient, explain that in the summary and assign tasks to run additional commands themselves and report results.");
     append("team-report", report);
     teamReportReceipt = { requestId: report.requestId, digest };
     return;
@@ -1264,7 +1266,9 @@ server.listen(socketPath(runDir, session.id), async () => {
     env.TERM = "xterm-256color";
     if (session.team) {
       if (!hookServer) throw new Error("Team report channel could not start");
-      env.INFINITE_TEAM_ASSIGNMENT = JSON.stringify(session.team);
+      // The verification flag is host policy; the agent's binding stays the stable assignment identity.
+      const { verificationRefused: _refused, ...binding } = session.team;
+      env.INFINITE_TEAM_ASSIGNMENT = JSON.stringify(binding);
       if (session.team.role === "mission-coordinator")
         env.INFINITE_MISSION_ASSIGNMENT = JSON.stringify({ missionId: session.team.runId, memberId: session.team.memberId, revision: session.team.revision });
       if (session.workspaceTrusted) {

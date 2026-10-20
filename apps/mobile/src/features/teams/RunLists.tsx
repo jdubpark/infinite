@@ -84,7 +84,7 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
   const canResume = canResumeBlockedTeam(team, role);
   const resume = () => request.send(`/teams/${team.id}/resume`, "Resume", team.revision);
   const { kind: rowKind } = canResume ? { kind: "blocked" as const } : { kind };
-  return <>
+  return <View style={s.runRowWrap}>
     <View style={s.listRow}>
       <Pressable accessibilityRole="button" accessibilityLabel={`Open team ${team.title}, ${TEAM_LABELS[team.status]}${total ? `, ${done} of ${total} tasks integrated` : ""}`}
         onPress={onOpen} style={({ pressed }) => [s.rowContent, pressed && s.pressed]}>
@@ -108,10 +108,10 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
               : <Text style={s.meta} numberOfLines={1}>{[project(team.projectId), team.linear?.issue?.identifier, team.goal ? `Goal cycle ${team.goal.cycle}` : ""].filter(Boolean).join(" · ")}</Text>}
         </View>
       </Pressable>
-      {canResume ? <Button compact secondary title={request.busy ? "Resuming…" : "Resume"} disabled={request.busy || Boolean(request.pending)} onPress={resume} /> : null}
+      {canResume ? <Button compact busy={request.busy} secondary title="Resume" disabled={request.busy || Boolean(request.pending)} onPress={resume} /> : null}
     </View>
-    {canResume || request.pending || request.message ? <RequestStatus request={request} canRetry={role === "owner"} subject="team" /> : null}
-  </>;
+    {canResume || request.pending || request.message ? <RequestStatus request={request} bottom={74} canRetry={role === "owner"} /> : null}
+  </View>;
 }
 
 /** The Goals tab: each goal's state, cycles used against its limit, and deadline. */
@@ -157,6 +157,7 @@ export function GoalList({ connection, me, goals, now }: { connection: Connectio
 }
 
 export const listStyles = StyleSheet.create({
+  runRowWrap: { position: "relative" },
   listRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 11, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },
   rowContent: { flex: 1, flexDirection: "row", gap: 12 },
   row: { flexDirection: "row", gap: 12, paddingVertical: 11, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },

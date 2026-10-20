@@ -14,13 +14,15 @@ export function usePoll<T>(
   fn: () => Promise<T>,
   intervalMs: number,
   deps: unknown[],
-): { data: T | null; online: boolean; loading: boolean; refreshing: boolean; seen: string; refresh: () => void } {
+): { data: T | null; online: boolean; stale: boolean; loading: boolean; refreshing: boolean; seen: string; refresh: () => void } {
   const [data, setData] = useState<T | null>(null);
   const [online, setOnline] = useState(false);
+  const [stale, setStale] = useState(false);
   const [seen, setSeen] = useState("");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const latest = useRef(fn);
+  const onlineNow = useRef(false);
   const pollNow = useRef<() => void>(() => {});
   useEffect(() => {
     latest.current = fn;
@@ -31,6 +33,14 @@ export function usePoll<T>(
       again = false,
       generation = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let staleTimer: ReturnType<typeof setTimeout> | undefined;
+    const delayStale = () => {
+      if (onlineNow.current || staleTimer !== undefined) return;
+      staleTimer = setTimeout(() => {
+        staleTimer = undefined;
+        if (active && !onlineNow.current) setStale(true);
+      }, 3000);
+    };
     const poll = async () => {
       if (!active || AppState.currentState !== "active") return;
       if (polling) {
@@ -44,12 +54,20 @@ export function usePoll<T>(
       try {
         const value = await latest.current();
         if (current()) {
+          onlineNow.current = true;
+          clearTimeout(staleTimer);
+          staleTimer = undefined;
+          setStale(false);
           setData(value);
           setOnline(true);
           setSeen(new Date().toLocaleTimeString());
         }
       } catch {
-        if (current()) setOnline(false);
+        if (current()) {
+          onlineNow.current = false;
+          setOnline(false);
+          delayStale();
+        }
       } finally {
         polling = false;
         if (current()) setLoading(false);
@@ -67,13 +85,16 @@ export function usePoll<T>(
     const listener = AppState.addEventListener("change", (state) => {
       generation++;
       clearTimeout(timer);
+      onlineNow.current = false;
       setOnline(false);
+      delayStale();
       if (state === "active") void poll();
     });
     void poll();
     return () => {
       active = false;
       clearTimeout(timer);
+      clearTimeout(staleTimer);
       listener.remove();
       pollNow.current = () => {};
     };
@@ -81,5 +102,5 @@ export function usePoll<T>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intervalMs, ...deps]);
   const refresh = useCallback(() => pollNow.current(), []);
-  return { data, online, loading, refreshing, seen, refresh };
+  return { data, online, stale: stale && !online, loading, refreshing, seen, refresh };
 }

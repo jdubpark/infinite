@@ -3,6 +3,7 @@ import { ActivityIndicator, Alert, KeyboardAvoidingView, Pressable, RefreshContr
 import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me, type Mission, type ProjectGroupList } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
+import { FloatingNotice } from "../../components/FloatingNotice";
 import { Button } from "../../components/Button";
 import { Card, Chip, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
@@ -54,7 +55,6 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
 
   return <KeyboardAvoidingView style={s.fill} behavior="padding">
     {top}
-    {!fresh ? <Text style={t.banner}>Offline · last received state. Controls paused.</Text> : null}
     <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View style={s.heading}>
@@ -112,12 +112,13 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       <View style={s.endNote}><Text style={t.note}>Ready for review records the coordinator’s report. It does not confirm acceptance or delivery.</Text></View>
     </ScrollView>
     {me?.role === "owner" ? <View style={s.dock}>
-      <RequestStatus request={request} canRetry={fresh && me.role === "owner"} subject="mission" />
+      <RequestStatus request={request} canRetry={fresh && me.role === "owner"} />
       <SteerBox value={direction} onChange={setDirection} placeholder="Steer the coordinator…"
         enabled={controls.steer && !locked} busy={request.busy}
         note={me.role !== "owner" ? "View only." : mission.status === "paused" ? "Resume to steer." : !controls.steer ? "This mission cannot be steered in its current state." : undefined}
         onSend={() => { const text = direction.trim(); if (text) { send("steer", "Direction", { text }); setDirection(""); } }} />
     </View> : null}
+    <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : null} />
   </KeyboardAvoidingView>;
 }
 

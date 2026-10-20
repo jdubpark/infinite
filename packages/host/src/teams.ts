@@ -79,7 +79,9 @@ export function blockedTeamCanResume(input: {
 }
 /** Milliseconds since the member last showed attention activity, or since it started before any was observed. */
 const quietFor = (member: TeamMember) => Date.now() - Date.parse(member.lastActivityAt ?? member.startedAt ?? timestamp());
-const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runId, memberId: member.memberId, revision: member.revision, role: member.role, ...(member.taskId ? { taskId: member.taskId } : {}) });
+// The flag is persisted on the member at creation, so a recovered or stopped session keeps the fingerprint it launched with.
+const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runId, memberId: member.memberId, revision: member.revision, role: member.role, ...(member.taskId ? { taskId: member.taskId } : {}),
+  ...(member.verificationRefused ? { verificationRefused: true } : {}) });
 
 /** Durable orchestration; reports describe agent claims, configured checks describe host evidence. */
 export class TeamService {
@@ -183,7 +185,7 @@ export class TeamService {
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
-  statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId })); }
+  statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal) })); }
   get(id: string): TeamView { return this.view(this.record(id)); }
   async bundle(id: string) {
     const stored = this.record(id), run = stored.run;
@@ -976,9 +978,10 @@ export class TeamService {
     }
     const modelProfile = selected ? structuredClone(selected) : undefined;
     const provider = modelProfile?.provider ?? run.provider;
-    const instructions = prompt === undefined ? teamPrompt(run, role, task, undefined, provider, modelProfile) : refreshReportingInstructions(prompt, provider);
+    const configuredProject = this.config.projects.find(project => project.id === run.projectId)?.team;
+    const instructions = prompt === undefined ? teamPrompt(run, role, task, undefined, provider, modelProfile, configuredProject) : refreshReportingInstructions(prompt, provider);
     if (Buffer.byteLength(instructions) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
-    return { runId: run.id, memberId, revision: run.revision, role, provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, cursor: 0, stopRequestId: randomUUID() };
+    return { runId: run.id, memberId, revision: run.revision, role, ...(role === "project-manager" && !run.establishChecks && !run.verification ? { verificationRefused: true as const } : {}), provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, cursor: 0, stopRequestId: randomUUID() };
   }
   /**
    * A limit acts only on the whole journal: a report or recovery in an unread tail wins.
@@ -1096,7 +1099,8 @@ export class TeamService {
     // Editing roles keep in-scope partial work; read-only roles must have left their copy unchanged.
     this.operation(stored, "result", signal => editing ? assertMemberScope(member.cwd, member.baseCommit, task ? task.paths : run.goal?.allowedPaths, prefix, signal) : assertMemberReadOnly(member.cwd, member.baseCommit, prefix, signal), () => {
       // The prompt keeps its feedback and user answers. An unrecognized prompt is rebuilt with its answers.
-      const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback),
+      const configuredProject = this.config.projects.find(project => project.id === run.projectId)?.team;
+      const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback, configuredProject),
         ...run.decisions.filter(decision => decision.answer && run.members.some(prior => prior.memberId === decision.memberId && prior.role === member.role && prior.taskId === member.taskId && prior.revision === member.revision)).map(decision => `User answered: ${decision.answer}`)].join("\n\n");
       const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, `${carried}\n\n${note}`, fallback);
       if (task) {
@@ -1114,7 +1118,7 @@ export class TeamService {
   }
   private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string) {
     const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id);
-    if (feedback) member.prompt = teamPrompt(run, role, task, feedback, member.provider ?? run.provider, member.modelProfile);
+    if (feedback) member.prompt = teamPrompt(run, role, task, feedback, member.provider ?? run.provider, member.modelProfile, this.config.projects.find(project => project.id === run.projectId)?.team);
     if (role !== "permission-coordinator") run.status = role === "project-manager" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
     this.operation(stored, "member", async signal => {
       this.assertRunPath(stored, run.workspace);
@@ -1221,8 +1225,21 @@ export class TeamService {
     if (report.kind === "plan") {
       validateTeamPlan(report.tasks);
       this.taskProfiles(run, report.tasks);
-      if (report.verification && !run.establishChecks)
-        throw new TeamError(409, "verification-not-authorized", "A plan cannot replace the project's configured checks.");
+      if (report.verification && !run.establishChecks && !run.verification) {
+        if (run.verificationCorrections?.includes(run.revision)) {
+          this.block(stored, new TeamError(409, "verification-not-authorized", "A plan cannot replace the project's configured checks."));
+          return;
+        }
+        run.verificationCorrections = [...(run.verificationCorrections ?? []), run.revision];
+        const message = "Plan rejected: this run uses the project's configured checks. Remove verification and submit a corrected plan. If the checks seem insufficient, explain that in the summary and assign tasks to run additional commands themselves and report results.";
+        this.event(stored, "The project manager's plan included unauthorized verification; requesting a corrected plan.");
+        this.save(stored);
+        // Carry the owner's answers to this revision's planning questions into the corrected plan.
+        const answers = run.decisions.filter(decision => decision.answer && decision.revision === run.revision && run.members.some(prior => prior.memberId === decision.memberId && prior.role === "project-manager"))
+          .map(decision => `Earlier planning question: ${decision.question}\nUser answered: ${decision.answer}`);
+        this.prepareMember(stored, "project-manager", undefined, [message, ...answers].join("\n\n"));
+        return;
+      }
       if (run.establishChecks && !run.verification && !report.verification)
         throw new TeamError(409, "verification-required", "The first plan must establish project verification commands before implementation.");
       if (run.verification && report.verification && digest(run.verification) !== digest(report.verification))

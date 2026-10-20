@@ -150,6 +150,13 @@ struct BoardList: View {
             } else {
                 ForEach(columns, id: \.column) { entry in section(entry.column, entry.items) }
             }
+        }.overlay(alignment: .top) {
+            if (app.teamsEnabled && app.teamsDisplayStale) || app.sessionsDisplayStale {
+                Label(app.teamsLoaded ? "Updates unavailable · last received projects remain visible" : "Can't reach the server · projects haven't loaded", systemImage: "wifi.exclamationmark")
+                    .font(.caption).foregroundStyle(Palette.attention).padding(8)
+                    .background(.regularMaterial, in: Capsule())
+                    .allowsHitTesting(false)
+            }
         }
     }
 
@@ -205,7 +212,12 @@ struct BoardRow: View {
         VStack(alignment: .leading, spacing: 4) {
             rowLine
             if let failure = app.teamResumeFailures[item.id] {
-                Text(failure.message).font(.caption).foregroundStyle(Palette.error).lineLimit(2).padding(.leading, 24)
+                HStack(spacing: 6) {
+                    Text(failure.message).font(.caption).foregroundStyle(Palette.error).lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button { app.clearTeamResumeFailure(item.id) } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.plain).help("Dismiss resume failure")
+                }.padding(.leading, 24)
             }
         }
         .padding(.horizontal, 10).padding(.vertical, 8)

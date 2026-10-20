@@ -80,9 +80,11 @@ test("a setgid parent or sync.sharedGroup makes the applied tree group-writable;
         chmodSync(f.root, 0o2700);
         assert.equal(mode(f.root) & 0o2000, 0o2000, "the fixture parent carries the setgid bit");
       }
-      mkdirSync(join(f.laptop, "src"), { mode: 0o755 });
-      writeFileSync(join(f.laptop, "src/index.ts"), "export {};\n", { mode: 0o644 });
-      writeFileSync(join(f.laptop, "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+      mkdirSync(join(f.laptop, "src"));
+      writeFileSync(join(f.laptop, "src/index.ts"), "export {};\n");
+      writeFileSync(join(f.laptop, "run.sh"), "#!/bin/sh\n");
+      // Set laptop modes explicitly so a restrictive umask (the server stage uses 077) cannot change the fixture.
+      chmodSync(join(f.laptop, "src"), 0o755); chmodSync(join(f.laptop, "src/index.ts"), 0o644); chmodSync(join(f.laptop, "run.sh"), 0o755);
       const first = await push(f);
       writeFileSync(join(f.laptop, "src/index.ts"), "export const a = 1;\n");
       // The second apply replaces a tree with shared directories.

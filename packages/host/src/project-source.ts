@@ -112,16 +112,21 @@ export class ProjectSourceService {
     }
     return { ...saved, mode: "github", repository: project.source.repository, baseBranch: project.source.baseBranch };
   }
-  private writeStatus(projectId: string, status: ProjectSourceStatus) {
+  /** Writes nothing, and returns false, when `expected` names a source the project no longer follows. */
+  private writeStatus(projectId: string, status: ProjectSourceStatus, expected?: { repository: string; baseBranch: string }) {
     const project = this.project(projectId);
     const source = project.source?.mode === "github" ? project.source : undefined;
+    if (expected && !this.sourceMatches(projectId, expected)) return false;
     const file = this.statusFile(projectId);
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
     const temporary = `${file}.${randomUUID()}.tmp`;
     writeFileSync(temporary, JSON.stringify(source ? { ...status, mode: "github", repository: source.repository, baseBranch: source.baseBranch } : status), { mode: 0o600, flag: "wx" });
     renameSync(temporary, file);
+    return true;
   }
-  private savePending(projectId: string, status: ProjectSourceStatus, pending: Omit<NonNullable<ProjectSourceStatus["pending"]>, "since">) {
+  /** Records a pending reason for the source captured at the start of a refresh; a changed source gets the current status instead. */
+  private savePending(projectId: string, status: ProjectSourceStatus, pending: Omit<NonNullable<ProjectSourceStatus["pending"]>, "since">, expected?: { repository: string; baseBranch: string }) {
+    if (expected && !this.sourceMatches(projectId, expected)) return this.status(projectId);
     const next: ProjectSourceStatus = {
       ...status,
       pending: {
@@ -151,11 +156,12 @@ export class ProjectSourceService {
     await this.git(parent, ["init", "--bare", mirror], signal);
     return mirror;
   }
-  private fetchFailure(projectId: string, status: ProjectSourceStatus, repository: string, category: SourceFetchCategory) {
+  private fetchFailure(projectId: string, status: ProjectSourceStatus, source: { repository: string; baseBranch: string }, category: SourceFetchCategory) {
+    const repository = source.repository;
     const message = category === "auth"
       ? `grant the GitHub App access to ${repository}`
       : FETCH_MESSAGES[category];
-    return this.savePending(projectId, status, { reason: "fetch-failed", category, message });
+    return this.savePending(projectId, status, { reason: "fetch-failed", category, message }, source);
   }
   private sourceMatches(projectId: string, source: { repository: string; baseBranch: string }) {
     const current = this.config.projects.find(project => project.id === projectId)?.source;
@@ -166,9 +172,9 @@ export class ProjectSourceService {
     try {
       projectRealPath = realpathSync(projectPath);
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException | undefined)?.code;
-      if (["ENOENT", "ENOTDIR"].includes(code ?? "") && !existsSync(projectPath)) return syncFailure(error, projectPath);
-      return { category: "other", message: NOT_GIT_ROOT_MESSAGE };
+      // Keep filesystem categories such as `permission` and `missing-path`; only an unclassified error means "not a root".
+      const failure = syncFailure(error, projectPath);
+      return failure.category === "other" ? { category: "other", message: NOT_GIT_ROOT_MESSAGE } : failure;
     }
     try {
       const result = await this.command(projectPath, ["rev-parse", "--show-toplevel"], signal);
@@ -201,13 +207,13 @@ export class ProjectSourceService {
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);
       if (!commandSucceeded(fetched)) {
         const output = `${fetched.output}${fetched.interrupted ? " timed out" : ""}`;
-        return this.fetchFailure(projectId, status, source.repository, fetchCategory(output));
+        return this.fetchFailure(projectId, status, source, fetchCategory(output));
       }
       fetchedHead = await this.git(mirror, ["rev-parse", `refs/heads/${source.baseBranch}`], options?.signal);
     } catch (error) {
       if (options?.signal?.aborted) throw error;
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);
-      return this.fetchFailure(projectId, status, source.repository, error instanceof TeamError ? fetchCategory(error.message) : "other");
+      return this.fetchFailure(projectId, status, source, error instanceof TeamError ? fetchCategory(error.message) : "other");
     }
 
     if (!this.sourceMatches(projectId, source)) return this.status(projectId);
@@ -217,12 +223,12 @@ export class ProjectSourceService {
       mirrorHead: fetchedHead,
       fetchedAt: new Date().toISOString(),
     };
-    this.writeStatus(projectId, status);
+    this.writeStatus(projectId, status, source);
 
     if (status.mirrorHead === status.appliedHead) {
       const rootFailure = await this.checkoutRootFailure(project.path, options?.signal);
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);
-      if (rootFailure) return this.savePending(projectId, status, { reason: "apply-failed", ...rootFailure });
+      if (rootFailure) return this.savePending(projectId, status, { reason: "apply-failed", ...rootFailure }, source);
       try {
         if (await this.git(project.path, ["rev-parse", "HEAD"], options?.signal) === status.mirrorHead) return status;
       } catch (error) {
@@ -230,15 +236,15 @@ export class ProjectSourceService {
         // A missing or unreadable working tree is reported through the apply-failed state below.
       }
     }
-    if (await this.isRunning(projectId)) return this.savePending(projectId, status, { reason: "session-running" });
+    if (await this.isRunning(projectId)) return this.savePending(projectId, status, { reason: "session-running" }, source);
 
     this.changing.add(projectId);
     try {
-      if (await this.isRunning(projectId)) return this.savePending(projectId, status, { reason: "session-running" });
+      if (await this.isRunning(projectId)) return this.savePending(projectId, status, { reason: "session-running" }, source);
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);
       const rootFailure = await this.checkoutRootFailure(project.path, options?.signal);
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);
-      if (rootFailure) return this.savePending(projectId, status, { reason: "apply-failed", ...rootFailure });
+      if (rootFailure) return this.savePending(projectId, status, { reason: "apply-failed", ...rootFailure }, source);
       const treeHead = await this.git(project.path, ["rev-parse", "HEAD"], options?.signal);
       // Make the fetched base objects visible to merge-base in this detached checkout.
       await this.git(project.path, ["fetch", "--no-tags", mirror, `+refs/heads/${source.baseBranch}:refs/remotes/origin/${source.baseBranch}`], options?.signal);
@@ -247,7 +253,7 @@ export class ProjectSourceService {
         const pending = this.savePending(projectId, status, {
           reason: "diverged",
           message: `the host checkout has commits that are not on ${source.baseBranch}`,
-        });
+        }, source);
         return pending;
       }
 
@@ -267,17 +273,17 @@ export class ProjectSourceService {
           throw new TeamError(409, "workspace-operation-failed", "A team Git operation failed. The isolated workspace was preserved for inspection.");
         if (worktree.exitCode === 1) await this.git(project.path, ["commit", "-m", SAVED_CHANGES_MESSAGE], options?.signal);
         status = { ...status, savedBranches: [...(status.savedBranches ?? []), branch] };
-        this.writeStatus(projectId, status);
+        this.writeStatus(projectId, status, source);
       }
 
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);
       await this.git(project.path, ["checkout", "--detach", fetchedHead], options?.signal);
       const applied: ProjectSourceStatus = { ...withoutPending(status), appliedHead: fetchedHead, appliedAt: new Date().toISOString() };
-      this.writeStatus(projectId, applied);
+      this.writeStatus(projectId, applied, source);
       return applied;
     } catch (error) {
       const failure = syncFailure(error, project.path);
-      return this.savePending(projectId, status, { reason: "apply-failed", ...failure });
+      return this.savePending(projectId, status, { reason: "apply-failed", ...failure }, source);
     } finally {
       this.changing.delete(projectId);
     }

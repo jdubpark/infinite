@@ -94,6 +94,8 @@ test("repo init takes --base-branch as the followed branch when origin/HEAD is m
     assert.deepEqual(inferProjectSource(root, "github", "trunk"), { mode: "github", repository: "example/product", baseBranch: "trunk" });
     assert.deepEqual(inferProjectSource(root, undefined, "trunk"), { mode: "github", repository: "example/product", baseBranch: "trunk" });
     assert.equal(requestedDelivery(root, { "--base-branch": "trunk" }, { revision: 0 }), undefined);
+    assert.throws(() => inferProjectSource(root, undefined, "bad..branch"), /safe Git branch name/);
+    assert.throws(() => inferProjectSource(root, "github", "-flag"), /safe Git branch name/);
     assert.throws(() => requestedDelivery(root, { "--repository": "example/product" }, { revision: 0 }), /--repository requires --delivery merge or pr/);
   } finally {
     rmSync(root, { recursive: true, force: true });

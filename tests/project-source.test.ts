@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ProjectSourceError, ProjectSourceService } from "../packages/host/src/project-source.js";
@@ -341,5 +341,46 @@ test("cloud configuration refuses test remote overrides with a plain error", () 
   const f = fixture({ environment: "cloud" });
   try {
     assert.throws(() => f.service(), error => error instanceof Error && !(error instanceof ProjectSourceError));
+  } finally { f.close(); }
+});
+
+test("a source change during the running check is not recorded under the new identity", async () => {
+  const f = fixture();
+  try {
+    const first = await f.service().refresh("example");
+    assert.equal(first.mirrorHead, f.commitA);
+    f.push("second.txt", "B");
+    // The running check switches the enrolled repository mid-refresh and then reports a session, as a slow listing could.
+    const service = f.service(async () => { f.config.projects[0]!.source = { mode: "github", repository: "example/other", baseBranch: "main" }; return true; });
+    const result = await service.refresh("example");
+    assert.equal(result.repository, "example/other");
+    assert.equal(result.mirrorHead, undefined);
+    assert.equal(result.pending, undefined);
+    // The fetch that ran while the project still followed example/product was recorded for it; the session-running
+    // marker observed after the switch was not written under either identity.
+    const saved = JSON.parse(readFileSync(join(f.config.stateDir, "projects", "example", "source", "status.json"), "utf8"));
+    assert.equal(saved.repository, "example/product");
+    assert.notEqual(saved.mirrorHead, undefined);
+    assert.equal(saved.pending, undefined);
+  } finally { f.close(); }
+});
+
+test("a checkout the host cannot read reports a permission failure, not a missing repository root", { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false }, async () => {
+  const f = fixture();
+  try {
+    const first = await f.service().refresh("example");
+    assert.equal(first.appliedHead, f.commitA);
+    f.push("second.txt", "B");
+    // A parent directory without search permission makes the host's own path check fail with EACCES.
+    const locked = join(f.root, "locked");
+    mkdirSync(locked);
+    renameSync(f.projectPath, join(locked, "project"));
+    f.config.projects[0]!.path = join(locked, "project");
+    chmodSync(locked, 0o000);
+    try {
+      const result = await f.service().refresh("example");
+      assert.equal(result.pending?.reason, "apply-failed");
+      assert.equal(result.pending?.category, "permission");
+    } finally { chmodSync(locked, 0o755); }
   } finally { f.close(); }
 });

@@ -95,7 +95,9 @@ function inferBaseBranch(root: string): string {
 /** `baseBranch` is an explicit `--base-branch`; without it the branch comes from `origin/HEAD` or a local main/master. */
 export function inferProjectSource(root: string, option: string | undefined, baseBranch?: string): ProjectSource {
   if (option === "laptop") return { mode: "laptop" };
-  const branch = () => baseBranch === undefined ? inferBaseBranch(root) : gitBranchSchema.parse(baseBranch);
+  // An explicit branch is validated before inference, so a bad value is an error rather than a silent fall back to laptop mode.
+  const explicit = baseBranch === undefined ? undefined : gitBranchSchema.parse(baseBranch);
+  const branch = () => explicit ?? inferBaseBranch(root);
   if (option === "github") return { mode: "github", repository: inferGitHubRepository(root), baseBranch: branch() };
   if (option !== undefined) throw new Error("--source must be github or laptop.");
   try {

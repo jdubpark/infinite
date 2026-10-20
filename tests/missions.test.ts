@@ -388,6 +388,9 @@ function scripted() {
   let resumeBusy = false;
   const created: { request: CreateTeam; options?: { baseRunId?: string } }[] = [];
   const answers: { teamId: string; decisionId: string; text: string; by?: string }[] = [];
+  const steers: { teamId: string; text: string }[] = [];
+  const steerReceipts = new Map<string, string>();
+  let steerLimit: boolean | Set<string> = false, steerBusy = false, loseSteerReply = false;
   const view = (run: FakeRun) => ({ ...structuredClone(run), title: run.id, tasks: [], usage: emptyRollup() }) as unknown as TeamView;
   const run = (id: string) => { const value = runs.get(id); if (!value) throw new TeamError(404, "team-not-found", "This team does not exist."); return value; };
   const set = (id: string, patch: Partial<FakeRun>) => Object.assign(run(id), patch, { updatedAt: new Date().toISOString() });
@@ -413,6 +416,22 @@ function scripted() {
       if (target.decisions.every(item => item.answer)) set(id, { status: "implementing" });
       return view(target);
     },
+    // Mirrors TeamService.steer: a known request replays, then busy, stale, and limit refusals, then a new revision.
+    async steer(id: string, body: { requestId: string; revision: number; text: string }) {
+      const fingerprint = JSON.stringify(body);
+      if (steerReceipts.has(body.requestId)) {
+        if (steerReceipts.get(body.requestId) !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
+        return view(run(id));
+      }
+      if (steerBusy) throw new TeamError(409, "team-operation-running", "A workspace operation is in progress. Retry steering after it settles.");
+      if (body.revision !== run(id).revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
+      if (steerLimit === true || (steerLimit && steerLimit.has(id))) throw new TeamError(409, "team-steering-limit", "This team reached its steering limit. Start a new team from the reviewed integration branch.");
+      steerReceipts.set(body.requestId, fingerprint);
+      steers.push({ teamId: id, text: body.text });
+      const steered = view(set(id, { status: "planning", revision: run(id).revision + 1 }));
+      if (loseSteerReply) { loseSteerReply = false; throw new TeamError(409, "team-operation-running", "The reply was lost after the steer was recorded."); }
+      return steered;
+    },
     async pause(id: string) { return view(set(id, { status: "paused" })); },
     async resume(id: string) {
       if (resumeBusy) throw new TeamError(409, "team-operation-running", "Another team operation is running.");
@@ -434,7 +453,13 @@ function scripted() {
   const attempt = async (n: number) => (await waitFor(async () => attempts[n - 1], value => Boolean(value), 20000))!;
   const parse = (prompt: string, label: string) => JSON.parse(prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
   return {
-    missions, runs, standalone, failing, created, answers, set,
+    missions, runs, standalone, failing, created, answers, steers, set,
+    /** Later steers of these subteams, or of every subteam, are refused at the steering limit. */
+    limitSteering: (teamIds?: string[]) => { steerLimit = teamIds ? new Set(teamIds) : true; },
+    /** Subteam steers are refused as busy until released. */
+    holdSteers: (held: boolean) => { steerBusy = held; },
+    /** The next steer is recorded by the subteam, but the mission sees a retryable error instead of its reply. */
+    loseNextSteerReply: () => { loseSteerReply = true; },
     remove: () => { removed = true; },
     attempts: () => attempts.length,
     attempt,
@@ -861,5 +886,110 @@ test("messages beyond one attempt's limit wait for the next, and open subteam de
     assert.equal(delivered.filter((message: { type: string }) => message.type === "owner-direction").length, 20);
     await waitFor(async () => h.answers.length, count => count === 2, 20000);
     assert.ok(h.answers.every(answer => answer.by === "coordinator"));
+  } finally { h.close(); }
+});
+
+test("a coordinator forwards owner direction to a running subteam, held while it is paused and refused for queued work", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "API first, then web", subtasks: [plan("a", "api"), plan("b", "web", ["a"])] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    h.set(teamId, { status: "paused" });
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Return JSON, not text" });
+    assert.ok((await h.messages(2)).some((message: { type: string }) => message.type === "owner-direction"));
+    await h.report(2, { kind: "steer-subtask", subtaskId: "a", text: "The owner wants JSON responses" });
+    await until(() => h.get(id), mission => mission.events.some(event => /sent direction to subtask a/.test(event.text)));
+    await new Promise(done => setTimeout(done, 1200));
+    assert.deepEqual(h.steers, [], "A paused subteam is not restarted by forwarded direction");
+    h.set(teamId, { status: "implementing" });
+    await until(() => h.steers, steers => steers.length === 1);
+    assert.deepEqual(h.steers, [{ teamId, text: "The owner wants JSON responses" }]);
+    await until(() => h.get(id), mission => mission.events.some(event => /Subtask a received the coordinator's direction/.test(event.text)));
+
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Label the web button Check health" });
+    await h.report(3, { kind: "steer-subtask", subtaskId: "b", text: "Label the button Check health" });
+    await until(() => h.get(id), mission => mission.events.some(event => /steer-subtask report was refused: Subtask b has no running or blocked subteam/.test(event.text)));
+
+    h.limitSteering();
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Also log each request" });
+    await h.report(4, { kind: "steer-subtask", subtaskId: "a", text: "Log each request" });
+    const refused = (await h.messages(5)).find((message: { type: string; kind?: string }) => message.type === "refused" && message.kind === "steer-subtask");
+    assert.match(refused.reason, /steering limit/, "A subteam's refusal wakes the coordinator with the reason");
+    assert.equal(h.steers.length, 1);
+  } finally { h.close(); }
+});
+
+test("a steer whose reply was lost replays its request instead of steering the subteam twice", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Return JSON" });
+    h.loseNextSteerReply();
+    await h.report(2, { kind: "steer-subtask", subtaskId: "a", text: "The owner wants JSON responses" });
+    await until(() => h.get(id), mission => mission.events.some(event => /Subtask a received the coordinator's direction/.test(event.text)));
+    await new Promise(done => setTimeout(done, 1200));
+    assert.equal(h.steers.length, 1, "The retry replays the recorded request rather than sending a second direction");
+    assert.equal(h.runs.get(teamId)!.revision, 2);
+  } finally { h.close(); }
+});
+
+test("direction for a blocked subteam waits while the mission is paused, and is delivered after it resumes", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    h.set(teamId, { status: "blocked" });
+    assert.ok((await h.messages(2)).some((message: { type: string; status?: string }) => message.type === "subtask-finished" && message.status === "blocked"));
+    h.holdSteers(true);
+    await h.report(2, { kind: "steer-subtask", subtaskId: "a", text: "Use the cached client; it is allowed" });
+    await until(() => h.get(id), mission => mission.events.some(event => /sent direction to subtask a/.test(event.text)));
+    await h.missions.pause(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    h.holdSteers(false);
+    await new Promise(done => setTimeout(done, 1500));
+    assert.deepEqual(h.steers, [], "A paused mission does not restart its blocked subteam");
+    assert.equal(h.runs.get(teamId)!.status, "blocked");
+    await h.missions.resume(id, { requestId: randomUUID(), revision: h.get(id).revision });
+    await until(() => h.steers, steers => steers.length === 1);
+    assert.equal(h.runs.get(teamId)!.status, "planning");
+  } finally { h.close(); }
+});
+
+test("three directions in a row that subteams refuse block the mission like other refused reports", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
+    h.limitSteering();
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Log each request" });
+    for (const n of [2, 3, 4]) await h.report(n, { kind: "steer-subtask", subtaskId: "a", text: "Log each request" });
+    const blocked = await until(() => h.get(id), mission => mission.status === "blocked", 20000);
+    assert.match(blocked.reason ?? "", /refused three times in a row.*steering limit/);
+  } finally { h.close(); }
+});
+
+test("a direction delivered between refused ones resets the refusal count in delivery order", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One change per repository", subtasks: [plan("a", "api"), plan("b", "web")] });
+    const started = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a") && teamOf(mission, "b")));
+    h.limitSteering([teamOf(started, "a")!]);
+    h.holdSteers(true);
+    // Four directions queue while subteams are busy; they are then delivered in one tick as refused, delivered, refused, refused.
+    for (const [n, subtaskId] of [[2, "a"], [3, "b"], [4, "a"], [5, "a"]] as const) {
+      await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: `Direction ${n}` });
+      await h.report(n, { kind: "steer-subtask", subtaskId, text: `Direction ${n}` });
+      await until(() => h.get(id), mission => mission.events.filter(event => /sent direction to subtask/.test(event.text)).length === n - 1);
+    }
+    h.holdSteers(false);
+    await until(() => h.steers, steers => steers.length === 1);
+    await new Promise(done => setTimeout(done, 1500));
+    assert.notEqual(h.get(id).status, "blocked", "Only two refusals follow the delivered direction");
+    assert.equal(h.get(id).events.filter(event => /steer-subtask report was refused/.test(event.text)).length, 3);
   } finally { h.close(); }
 });

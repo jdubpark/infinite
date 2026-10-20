@@ -60,6 +60,7 @@ The coordinator reports through its mission report tool:
 | `dispatch` | Adds subtasks (up to `maxSubtasks` in total). Later dispatches may add more. The host adds same-repository dependency edges, shown in mission events and later coordinator mission state. |
 | `answer-child` | Answers an open subteam decision within the mission's objective and steering. Recorded as answered by the coordinator, in the mission and in the subteam. |
 | `question` | Opens a mission decision for the owner. With `subtaskId` and `childDecisionId`, the owner's answer is forwarded to that subteam decision. |
+| `steer-subtask` | Sends direction to a running or blocked subteam, such as an owner answer or direction that changes work under way. The subteam stops its members and replans under a new revision. Held while the subteam is paused; refused, and the coordinator told, when the subtask has no running or blocked subteam or the subteam refuses the direction. |
 | `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. |
 | `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, and no owner decision is open. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
 | `blocked` | Moves the mission to `blocked` with the summary as its reason. |
@@ -121,7 +122,10 @@ and its status, once per subtask, holder, and status. The coordinator can then
 cancel the subtask, ask the owner, or report blocked.
 
 Owner controls: answer, steer (forwarded to the coordinator), pause, resume, and
-cancel. All five are owner-only; a controller cannot answer or steer a mission. A
+cancel. Owner direction and answers to mission-level questions reach the
+coordinator; subtasks started later include the direction, and the coordinator
+forwards it to a subteam already under way with `steer-subtask`. All five
+controls are owner-only; a controller cannot answer or steer a mission. A
 coordinator `result` from an attempt that started before the owner's latest
 direction or answer is not applied; the host starts a new attempt with that
 input instead. Pause, resume, and cancel apply to the coordinator and every active

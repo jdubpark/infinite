@@ -33,6 +33,8 @@ export type TeamView = {
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
   lineup?: TeamLineup; linear?: LinearTracking; brief?: TeamBrief;
   goal?: { id: string; revision: number; cycle: number };
+  /** A mission subteam is controlled from its mission. */
+  missionId?: string;
   noChange?: { summary: string; evidence: TeamEvidence[] };
   /** The host can start a fresh plan from the preserved integration commit, as after a member's runtime limit. */
   resumable?: boolean;

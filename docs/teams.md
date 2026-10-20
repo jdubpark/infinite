@@ -521,8 +521,10 @@ workers than the limit hold a slot.
 A worker holds its slot until it reports and the host confirms its process
 stopped. A finished implementer waiting for serialized integration and a member
 waiting for a user answer do not hold slots. Once the answer is recorded, the
-member's replacement starts without waiting for a free slot, so the running count
-can briefly exceed the limit.
+member's replacement waits for a free slot like any other start, keeping the
+answer and working copy. It takes the next free slot ahead of tasks that have
+not started. A stalled or time-limited worker's replacement continues in the
+slot its predecessor held.
 
 The owner can raise or lower the limit while a team or goal runs. Raising it
 starts more ready tasks on the next scheduling pass. Lowering it never stops a

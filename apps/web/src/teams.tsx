@@ -28,6 +28,8 @@ export type TeamView = {
   providerLimits?: ProviderLimit[];
   usage?: TeamUsage;
   linear?: LinearTrackingView;
+  /** A mission subteam is controlled from its mission. */
+  missionId?: string;
   goal?: { id: string; revision: number; cycle: number; successCriteria: string; nonGoals: string[]; allowedPaths: string[]; evidence: string[]; previousWork: string[]; deadlineAt: string; maxMembers: number; parentRunId?: string };
   brief?: TeamBrief;
   discovery?: { revision: number; summary: string; tasks: TeamScout[]; completedAt?: string };
@@ -419,7 +421,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   const attention = memberSessions.filter(session => session.attention?.state === "needs-you");
   const selectedMember = team.members.find(member => member.memberId === agentId);
   const workersText = workerStatus(team.parallelism, team.workers);
-  const limitEditable = me.role === "owner" && !team.goal && !["cancelled", "ready-for-review", "merged", "no-change"].includes(team.status);
+  const limitEditable = me.role === "owner" && !team.goal && !team.missionId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(team.status);
   return <div className="team-detail">
     <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span className="team-workers" title={workersText}>{workersText}</span><span className="team-freshness" role="status">{view.stale ? "Showing last received state; controls are disabled." : ""}</span></div></div><div className="team-heading-actions"><div className="team-view-switch" role="group" aria-label="Team view"><button type="button" aria-pressed={mode === "summary"} onClick={() => setMode("summary")}>Summary</button><button type="button" aria-pressed={mode === "logs"} onClick={() => setMode("logs")}>Review logs</button></div><button className="text-button team-refresh" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh team</button></div></header>
     <div className="team-detail-body">

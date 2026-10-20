@@ -1377,6 +1377,39 @@ test("a member back from an outage into a delegable prompt runs again and gets a
   } finally { f.close(); }
 });
 
+test("an answered implementer waits for a slot under a lowered worker limit, then continues", async () => {
+  const f = schedulerFixture();
+  try {
+    const original = f.run.members[0], at = new Date().toISOString();
+    const active = { ...original, role: "implementer" as const, taskId: "a", startedAt: at, lastActivityAt: at };
+    const waiting = { ...original, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer" as const, taskId: "b", status: "waiting" as const,
+      report: { kind: "question" as const, question: "Continue?", options: ["Yes"] } };
+    f.run.members = [active, waiting]; f.run.status = "implementing"; f.run.parallelism = 2;
+    f.run.tasks = ["a", "b"].map((id, index) => ({ id, title: id, instructions: "Write the assigned file", paths: [`${id}.txt`], dependsOn: [],
+      status: index ? "waiting" as const : "running" as const, memberId: index ? waiting.memberId : active.memberId }));
+    f.run.decisions = [{ id: randomUUID(), memberId: waiting.memberId, revision: 1, question: "Continue?", options: ["Yes"], createdAt: at }];
+    f.state.attention.lastActivityAt = at;
+    f.writeTeam();
+    const teams = f.openTeam();
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+    await teams.setParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 1 });
+    await teams.answer(f.run.id, f.run.decisions[0].id, { requestId: randomUUID(), revision: 1, text: "Yes" });
+    await scheduler.step(scheduler.record(f.run.id));
+    const held = teams.get(f.run.id);
+    assert.deepEqual([held.workers.limit, held.workers.running], [1, 1]);
+    assert.deepEqual(held.members.map(member => [member.taskId, member.status]), [["a", "running"], ["b", "waiting"]]);
+    assert.equal(held.decisions[0].answer, "Yes");
+
+    await teams.setParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 2 });
+    await scheduler.step(scheduler.record(f.run.id));
+    const resumed = teams.get(f.run.id);
+    assert.deepEqual(resumed.members.map(member => [member.taskId, member.status]), [["a", "running"], ["b", "stopped"], ["b", "queued"]]);
+    assert.match(f.readRecord<{ run: TeamRun }>("team", f.run.id).run.members[2].prompt, /User answered: Yes$/);
+    assert.equal(resumed.members[2].cwd, waiting.cwd);
+    assert.equal(resumed.tasks[1].memberId, resumed.members[2].memberId);
+  } finally { f.close(); }
+});
+
 test("an old member that still shows activity is not stalled after a restart", { timeout: 60000 }, async () => {
   const f = await fixture("mcp");
   try {

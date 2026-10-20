@@ -819,6 +819,8 @@ export class TeamService {
       for (const decision of run.decisions.filter(item => item.revision === run.revision && item.answer)) {
         const prior = run.members.find(member => member.memberId === decision.memberId)!;
         if (prior.status !== "waiting") continue;
+        // An answered scout or implementer keeps waiting, answer intact, until a worker slot frees under the current limit.
+        if ((prior.role === "scout" || prior.role === "implementer") && run.members.filter(member => holdsWorkerSlot(member, run.revision)).length >= run.parallelism) continue;
         const answeredBy = decision.answeredBy === "coordinator" ? "Mission coordinator" : "User";
         const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, `${prior.prompt}\n\n${answeredBy} answered: ${decision.answer}`, prior.modelProfile);
         // A limit substitution may have pinned a fallback profile on another provider.

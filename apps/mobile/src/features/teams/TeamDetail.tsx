@@ -157,7 +157,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           <LinearChip tracking={team.linear} fresh={fresh} />
         </View>
         <Text style={s.workerStatus} numberOfLines={2}>{workerStatus(team)}</Text>
-        {owns && !["cancelled", "ready-for-review", "merged", "no-change"].includes(team.status) ? <View style={s.workerControl}>
+        {owns && !team.missionId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(team.status) ? <View style={s.workerControl}>
           <Text style={t.label}>Worker limit</Text>
           <Choices values={Array.from({ length: team.workers?.max ?? 4 }, (_, index) => index + 1)} selected={team.workers?.limit ?? team.parallelism} disabled={locked || !fresh}
             label={String} onSelect={parallelism => { if (parallelism !== team.parallelism) send("/parallelism", "Worker limit", { parallelism }); }} />

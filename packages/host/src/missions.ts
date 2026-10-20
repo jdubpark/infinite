@@ -24,7 +24,9 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   /** The owner input count when this attempt's prompt was built; a result from an attempt that missed later input is not applied. */
   ownerInputs?: number;
   /** The session ended its turn or went quiet without a report; it is stopped and the next attempt is told why. */
-  missedReport?: boolean };
+  missedReport?: boolean;
+  /** The journal position read for turn signals, and the latest turn boundary seen there. */
+  signalCursor?: number; turnSignal?: { kind: string; at: string } };
 /** A subteam action recorded before it is sent, so a restart replays it under the same request ID. */
 type ChildOp = { kind: "answer" | "pause" | "resume" | "cancel"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; by?: "owner" | "coordinator" };
 type Stored = {
@@ -55,6 +57,10 @@ const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(va
 const live = new Set<Mission["status"]>(["planning", "working", "needs-input"]);
 const teamDone = new Set(["ready-for-review", "merged", "no-change"]);
 const maxAttempts = 60;
+/** How long a coordinator's turn-end must stand, with no newer turn activity, before the attempt counts as ending without a report. */
+const turnEndSettleMs = 5000;
+/** Journal signals that show the provider is in a turn; a turn-end closes it. */
+const turnActivity = new Set(["turn-start", "tool-start", "tool-end", "prompt-open", "prompt-closed", "answer"]);
 /** Messages delivered per coordinator attempt; the rest wait for the next attempt. */
 const messageLimit = 30;
 const timeLimitReason = "The approved time limit has expired. Active subteams were cancelled; their workspaces remain available.";
@@ -490,6 +496,22 @@ export class MissionService {
       }
     } while (page.more);
   }
+  /**
+   * Whether the session's latest turn boundary in its journal is a turn-end that has settled. The attention
+   * state alone is not enough: it keeps a past turn-end, so a continuing turn can read as finished on a quiet screen.
+   */
+  private turnEnded(attempt: Attempt) {
+    let page: ReturnType<Manager["events"]>;
+    do {
+      page = this.manager.events(attempt.sessionId, attempt.signalCursor ?? 0, 200, new Set(["signal"]));
+      attempt.signalCursor = page.cursor;
+      for (const event of page.events) {
+        const kind = String(event.data.kind);
+        if (kind === "turn-end" || turnActivity.has(kind)) attempt.turnSignal = { kind, at: event.at };
+      }
+    } while (page.more);
+    return attempt.turnSignal?.kind === "turn-end" && Date.now() - Date.parse(attempt.turnSignal.at) >= turnEndSettleMs;
+  }
   private launched(attempt: Attempt) {
     try { this.manager.meta(attempt.sessionId); return true; }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
@@ -525,7 +547,8 @@ export class MissionService {
         // while subteam and owner messages wait behind it. A provider prompt waiting on the owner is not quiet.
         const quiet = state.attention.state !== "needs-you" &&
           Date.now() - Date.parse(state.attention.lastActivityAt ?? attempt.startedAt ?? now()) > (this.config.teams?.stallMinutes ?? 30) * 60000;
-        if (state.status !== "exited" && state.attention.state !== "turn-finished" && !quiet) { this.save(stored); return; }
+        const ended = state.attention.state === "turn-finished" && this.turnEnded(attempt);
+        if (state.status !== "exited" && !ended && !quiet) { this.save(stored); return; }
         this.readReport(stored, attempt);
         if (attempt.status === "running" && state.status === "exited") {
           attempt.status = "stopped";

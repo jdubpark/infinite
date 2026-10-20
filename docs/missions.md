@@ -67,7 +67,10 @@ The coordinator reports through its mission report tool:
 
 Each attempt must end with one report. An attempt whose session ends its turn
 without a report, or shows no activity for the team stall window while not
-waiting on a provider prompt, is stopped. The next attempt starts with a
+waiting on a provider prompt, is stopped. A turn counts as ended only when the
+latest turn signal in the session's journal is a turn-end that has stood for
+five seconds; a quiet screen alone is not evidence, because the attention state
+keeps an earlier turn-end while a later turn continues. The next attempt starts with a
 refusal that says so, together with every message that arrived meanwhile.
 Three missed or refused reports in a row block the mission.
 

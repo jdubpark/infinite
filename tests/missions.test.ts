@@ -16,6 +16,7 @@ import type { Config } from "../packages/host/src/types.js";
 import type { CreateTeam, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { CreateMission, Mission, MissionReport } from "../packages/host/src/mission-types.js";
 import { emptyRollup } from "../packages/host/src/team-usage.js";
+import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const lineup: TeamLineup = {
@@ -353,23 +354,35 @@ function scripted() {
     projects: [{ id: "api", name: "API", path: repo("api"), team: { checks } }, { id: "web", name: "Web", path: repo("web"), team: { checks } }],
     teams: { workspaceDir: join(root, "teams"), lineup } };
   const attempts: { sessionId: string; assignment: TeamAssignment; prompt: string }[] = [];
-  const reports = new Map<string, MissionReport>(), turnEnded = new Set<string>();
+  const reports = new Map<string, MissionReport>();
+  // Each coordinator session's journaled signals and the attention the real reducer derives from them.
+  const signals = new Map<string, SignalEvent[]>(), attention = new Map<string, Attention>();
+  const held = new Set<string>(), stops: string[] = [];
+  const signal = (sessionId: string, data: Signal, at = new Date()) => {
+    const journal = signals.get(sessionId)!;
+    const event: SignalEvent = { seq: journal.length + 1, at: at.toISOString(), type: "signal", data: { ...data, source: "hook", provider: "claude" } };
+    journal.push(event);
+    attention.set(sessionId, applySignal(attention.get(sessionId)!, event));
+  };
   const manager = {
     async createTeamSession(request: { requestId: string; prompt: string }, assignment: TeamAssignment) {
-      if (!attempts.some(item => item.sessionId === request.requestId)) attempts.push({ sessionId: request.requestId, assignment, prompt: request.prompt });
+      if (!attempts.some(item => item.sessionId === request.requestId)) {
+        attempts.push({ sessionId: request.requestId, assignment, prompt: request.prompt });
+        signals.set(request.requestId, []); attention.set(request.requestId, initialAttention(new Date().toISOString(), true));
+        signal(request.requestId, { kind: "turn-start" });
+      }
       return { status: "running" };
     },
-    events(sessionId: string, cursor: number) {
+    events(sessionId: string, cursor: number, _limit: number, types: Set<string>) {
+      if (types.has("signal")) { const events = signals.get(sessionId)!.filter(event => event.seq > cursor); return { events, cursor: events.at(-1)?.seq ?? cursor, more: false }; }
       const report = reports.get(sessionId), attempt = attempts.find(item => item.sessionId === sessionId)!;
       if (!report || cursor > 0) return { events: [], cursor, more: false };
       const { runId, memberId, revision } = attempt.assignment;
       return { events: [{ data: { requestId: randomUUID(), missionId: runId, memberId, revision, report } }], cursor: 1, more: false };
     },
     meta() { return {}; },
-    async state(sessionId: string) {
-      return { status: "running", attention: { state: turnEnded.has(sessionId) ? "turn-finished" : "working", lastActivityAt: new Date().toISOString() } };
-    },
-    async stopTeamSession() { return { status: "exited" }; },
+    async state(sessionId: string) { return { status: "running", attention: attention.get(sessionId) }; },
+    async stopTeamSession(sessionId: string) { stops.push(sessionId); return { status: held.has(sessionId) ? "running" : "exited" }; },
   };
   const runs = new Map<string, FakeRun>(), standalone = new Set<string>(), failing = new Set<string>();
   const created: { request: CreateTeam; options?: { baseRunId?: string } }[] = [];
@@ -425,7 +438,24 @@ function scripted() {
     state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),
     report: async (n: number, report: MissionReport) => { reports.set((await attempt(n)).sessionId, report); },
     /** The coordinator's turn ends without a report; its session stays alive at the prompt. */
-    endTurn: async (n: number) => { turnEnded.add((await attempt(n)).sessionId); },
+    endTurn: async (n: number, at?: Date) => { signal((await attempt(n)).sessionId, { kind: "turn-end" }, at); },
+    signal: async (n: number, data: Signal) => signal((await attempt(n)).sessionId, data),
+    /** What the session worker publishes when the screen goes quiet without a dialog. */
+    quietScreen: async (n: number) => {
+      const sessionId = (await attempt(n)).sessionId, current = attention.get(sessionId)!;
+      const decision = screenDecision(current, null, true, false, new Date().toISOString());
+      if (decision.idle) attention.set(sessionId, { ...current, state: decision.idle, since: current.state === decision.idle ? current.since : new Date().toISOString(), source: "screen" });
+      return decision.idle;
+    },
+    /** Stop requests for that attempt's session report it still running until released. */
+    /** An earlier turn ended a minute ago and the provider continued in a new turn. */
+    continueAfterTurnEnd: async (n: number) => {
+      const sessionId = (await attempt(n)).sessionId;
+      signal(sessionId, { kind: "turn-end" }, new Date(Date.now() - 60000)); signal(sessionId, { kind: "turn-start" });
+    },
+    holdStop: async (n: number) => { held.add((await attempt(n)).sessionId); },
+    releaseStop: async (n: number) => { held.delete((await attempt(n)).sessionId); },
+    stops: async (n: number) => { const sessionId = (await attempt(n)).sessionId; return stops.filter(item => item === sessionId).length; },
     create: (objective = "Change the API and the web client") => missions.create({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 }),
     get: (id: string) => missions.get(id),
     close: () => { missions.close(); rmSync(root, { recursive: true, force: true }); },
@@ -669,6 +699,22 @@ test("a coordinator cannot wait past a subteam decision it has not handled, or b
     const held = (await h.messages(5)).find((message: { type: string }) => message.type === "refused");
     assert.equal(held.kind, "wait");
     assert.match(held.reason, /no later attempt would start/);
+  } finally { h.close(); }
+});
+
+test("a coordinator still working after an earlier turn-end is not stopped when its screen goes quiet", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.continueAfterTurnEnd(1);
+    // The real reducer keeps the earlier turn-end, so a quiet screen reads the continuing turn as finished.
+    assert.equal(await h.quietScreen(1), "turn-finished");
+    await new Promise(done => setTimeout(done, 1500));
+    assert.equal(await h.stops(1), 0, "The working coordinator is not stopped");
+    assert.equal(h.attempts(), 1);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const started = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
+    assert.ok(!started.events.some(event => /missing report was refused/.test(event.text)));
   } finally { h.close(); }
 });
 

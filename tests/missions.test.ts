@@ -79,6 +79,10 @@ function harness() {
 }
 
 const until = (read: () => Mission, accepts: (mission: Mission) => boolean, timeout = 60000) => waitFor(async () => read(), accepts, timeout);
+const standaloneRequest = (projectId: string): CreateTeam => ({
+  requestId: randomUUID(), projectId, provider: "claude", useConfiguredLineup: true,
+  title: "Standalone run", objective: "Make an independent repository change", parallelism: 1,
+});
 
 test("mission prompt keeps 21 open child questions under the byte limit without repeating their text", () => {
   const openChildDecisions: MissionOpenChildDecision[] = Array.from({ length: 21 }, (_, index) => ({
@@ -190,6 +194,88 @@ test("a mission dispatches dependent subteams across two repositories, routes th
   } finally { await h.close(); }
 });
 
+test("standalone team creation is reserved only while a mission subteam holds that repository", { timeout: 180000 }, async () => {
+  const h = harness();
+  try {
+    const { missions, teams } = h.open();
+    const mission = await missions.create(h.create());
+    await waitFor(async () => h.coordinatorReceipts().length, count => count === 1, 30000);
+    h.release("release-dispatch");
+    const waiting = await until(() => missions.get(mission.id), value => value.status === "needs-input", 120000);
+    const api = waiting.subtasks.find(subtask => subtask.id === "api-change")!;
+    assert.ok(api.teamId);
+
+    const rejected = standaloneRequest("api");
+    await assert.rejects(teams.create(rejected), (error: TeamError) =>
+      error.status === 409 && error.code === "mission-repository-reserved" && error.message.includes(mission.id));
+
+    const decision = waiting.decisions[0]!;
+    await missions.answer(mission.id, decision.id, {
+      requestId: randomUUID(), revision: waiting.revision, text: "JSON",
+    });
+    await waitFor(async () => teams.get(api.teamId!).status, status => status === "ready-for-review", 120000);
+
+    const started = await teams.create(rejected);
+    assert.equal(started.id, rejected.requestId);
+    assert.equal(started.missionId, undefined, "The new run is standalone after the mission subteam finishes");
+  } finally { await h.close(); }
+});
+
+test("standalone team creation is reserved while a mission launch is pending", { timeout: 120000 }, async () => {
+  const h = harness();
+  try {
+    const { missions, teams } = h.open();
+    const createForMission = teams.createForMission.bind(teams);
+    let launchRequested = false;
+    let releaseLaunch!: () => void;
+    const launchGate = new Promise<void>(resolve => { releaseLaunch = resolve; });
+    teams.createForMission = async (request, missionId, pinnedLineup, options) => {
+      launchRequested = true;
+      await launchGate;
+      return createForMission(request, missionId, pinnedLineup, options);
+    };
+
+    const mission = await missions.create(h.create());
+    await waitFor(async () => h.coordinatorReceipts().length, count => count === 1, 30000);
+    h.release("release-dispatch");
+    await waitFor(async () => launchRequested, value => value, 30000);
+
+    await assert.rejects(teams.create(standaloneRequest("api")), (error: TeamError) =>
+      error.status === 409 && error.code === "mission-repository-reserved" && error.message.includes(mission.id));
+
+    releaseLaunch();
+    const launched = await until(() => missions.get(mission.id), value => Boolean(value.subtasks.find(subtask => subtask.id === "api-change")?.teamId), 30000);
+    assert.ok(launched.subtasks.find(subtask => subtask.id === "api-change")?.teamId);
+  } finally { await h.close(); }
+});
+
+test("a mission launch rechecks an active standalone run and records the launch reason", { timeout: 180000 }, async () => {
+  const h = harness();
+  try {
+    const { missions, teams } = h.open();
+    const standalone = await teams.create({ ...standaloneRequest("api"), objective: "HOLD-SUBTEAM while the mission attempts to launch" });
+    await waitFor(async () => teams.get(standalone.id).members.some(member => member.status === "running"), value => value, 30000);
+
+    // Let MissionService's scheduling check see an available repository once. The real
+    // createForMission admission check must still observe the active standalone run.
+    const activeForProject = teams.activeForProject.bind(teams);
+    let skipSchedulerCheck = false;
+    teams.activeForProject = projectId => {
+      if (skipSchedulerCheck && projectId === "api") { skipSchedulerCheck = false; return false; }
+      return activeForProject(projectId);
+    };
+
+    const mission = await missions.create(h.create());
+    await waitFor(async () => h.coordinatorReceipts().length, count => count === 1, 30000);
+    skipSchedulerCheck = true;
+    h.release("release-dispatch");
+    const blocked = await until(() => missions.get(mission.id), value => value.subtasks.some(subtask => subtask.status === "blocked"), 120000);
+    const api = blocked.subtasks.find(subtask => subtask.id === "api-change")!;
+    assert.equal(api.teamId, undefined);
+    assert.ok(blocked.events.some(event => event.text.includes("Subtask api-change could not start:") && /active team run already holds repository api/.test(event.text)));
+  } finally { await h.close(); }
+});
+
 test("a mission refuses invalid dispatches, and pausing and cancelling reach its coordinator and active subteam", { timeout: 120000 }, async () => {
   const h = harness();
   try {
@@ -290,6 +376,11 @@ function scripted() {
   const run = (id: string) => { const value = runs.get(id); if (!value) throw new TeamError(404, "team-not-found", "This team does not exist."); return value; };
   const set = (id: string, patch: Partial<FakeRun>) => Object.assign(run(id), patch, { updatedAt: new Date().toISOString() });
   const teams = {
+    useMissionReservations(_lookup: (projectId: string, exceptMissionId?: string) => string | undefined) {},
+    isActiveRun(id: string) {
+      const current = runs.get(id);
+      return Boolean(current && !["cancelled", "ready-for-review", "merged", "no-change"].includes(current.status));
+    },
     async createForMission(request: CreateTeam, missionId: string, _lineup: TeamLineup, options?: { baseRunId?: string }) {
       if (runs.has(request.requestId)) return view(run(request.requestId));
       if (failing.has(request.projectId)) throw new TeamError(409, "team-start-failed", "The repository could not start a team run.");
@@ -406,13 +497,15 @@ test("a result waits until blocked and stranded subtasks are cancelled, and each
   } finally { h.close(); }
 });
 
-test("a subtask that depends on finished work in its own repository starts from the latest such run", { timeout: 60000 }, async () => {
+test("a subtask with two same-repository predecessors starts from the later run's head", { timeout: 60000 }, async () => {
   const h = scripted();
   try {
     const { id } = await h.create();
-    await h.report(1, { kind: "dispatch", summary: "Layered changes", subtasks: [plan("a", "api"), plan("a2", "api", ["a"]), plan("w", "web", ["a"]), plan("b", "api", ["w", "a2"])] });
+    await h.report(1, { kind: "dispatch", summary: "Layered changes", subtasks: [plan("a", "api"), plan("a2", "api"), plan("w", "web", ["a"]), plan("b", "api", ["w", "a", "a2"])] });
     const first = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
     assert.equal(h.created[0].options, undefined, "The first subtask starts from the repository");
+    assert.deepEqual(first.subtasks.find(subtask => subtask.id === "a2")?.dependsOn, ["a"]);
+    assert.ok(first.events.some(event => /added same-repository dependencies/i.test(event.text) && event.text.includes("a2 depends on a")));
     h.set(teamOf(first, "a")!, { status: "ready-for-review" });
     const second = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a2") && teamOf(mission, "w")));
     const options = (subtaskId: string) => h.created.find(item => item.request.requestId === teamOf(h.get(id), subtaskId))!.options;
@@ -423,6 +516,64 @@ test("a subtask that depends on finished work in its own repository starts from 
     await until(() => h.get(id), mission => Boolean(teamOf(mission, "b")));
     assert.deepEqual(options("b"), { baseRunId: teamOf(second, "a2") }, "b builds on a2, which already includes a");
     assert.match(h.created.at(-1)!.request.objective, /starts from the finished work of subtask a2/);
+  } finally { h.close(); }
+});
+
+test("a no-change predecessor keeps the latest reviewed same-repository run as the base", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "Review an API change, then continue", subtasks: [
+      plan("reviewed", "api"), plan("no-change", "api"), plan("after", "api"),
+    ] });
+    const first = await until(() => h.get(id), mission => Boolean(teamOf(mission, "reviewed")));
+    const reviewedTeamId = teamOf(first, "reviewed")!;
+    h.set(reviewedTeamId, { status: "ready-for-review" });
+
+    const second = await until(() => h.get(id), mission => Boolean(teamOf(mission, "no-change")));
+    const noChangeTeamId = teamOf(second, "no-change")!;
+    h.set(noChangeTeamId, { status: "no-change" });
+
+    const third = await until(() => h.get(id), mission => Boolean(teamOf(mission, "after")));
+    const afterTeamId = teamOf(third, "after")!;
+    assert.deepEqual(h.created.find(item => item.request.requestId === afterTeamId)?.options, { baseRunId: reviewedTeamId });
+  } finally { h.close(); }
+});
+
+test("same-repository subtasks dispatched later are chained and start from the earlier subtask's head", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "Start the API change", subtasks: [plan("first", "api")] });
+    const first = await until(() => h.get(id), mission => Boolean(teamOf(mission, "first")));
+    const firstTeamId = teamOf(first, "first")!;
+
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Add another API change after the first." });
+    await h.attempt(2);
+    await h.report(2, { kind: "dispatch", summary: "Follow up in the same repository", subtasks: [plan("second", "api"), plan("third", "api")] });
+    const chained = await until(() => h.get(id), mission => Boolean(mission.subtasks.find(subtask => subtask.id === "third")));
+    const second = chained.subtasks.find(subtask => subtask.id === "second")!;
+    const third = chained.subtasks.find(subtask => subtask.id === "third")!;
+    assert.deepEqual(second.dependsOn, ["first"]);
+    assert.equal(second.status, "queued");
+    assert.deepEqual(third.dependsOn, ["second"], "The second plan in this dispatch follows the first same-repository plan");
+    assert.equal(third.status, "queued");
+    assert.ok(chained.events.some(event => /added same-repository dependencies/i.test(event.text) &&
+      event.text.includes("second depends on first") && event.text.includes("third depends on second")));
+
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Continue with the accepted dependency chain." });
+    const state = await h.state(3);
+    assert.deepEqual(state.subtasks.find((subtask: { id: string }) => subtask.id === "second")?.dependsOn, ["first"]);
+    assert.deepEqual(state.subtasks.find((subtask: { id: string }) => subtask.id === "third")?.dependsOn, ["second"]);
+
+    h.set(firstTeamId, { status: "ready-for-review" });
+    const launched = await until(() => h.get(id), mission => Boolean(teamOf(mission, "second")));
+    const secondTeamId = teamOf(launched, "second")!;
+    assert.deepEqual(h.created.find(item => item.request.requestId === secondTeamId)?.options, { baseRunId: firstTeamId });
+    h.set(secondTeamId, { status: "ready-for-review" });
+    const thirdLaunched = await until(() => h.get(id), mission => Boolean(teamOf(mission, "third")));
+    const thirdTeamId = teamOf(thirdLaunched, "third")!;
+    assert.deepEqual(h.created.find(item => item.request.requestId === thirdTeamId)?.options, { baseRunId: secondTeamId });
   } finally { h.close(); }
 });
 

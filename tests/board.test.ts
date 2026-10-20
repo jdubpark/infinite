@@ -73,6 +73,32 @@ test("the board maps missions, standalone teams, and goals to columns and hides 
   assert.equal(find("Goal running").projectName, "Web");
 });
 
+test("a member stopped on a provider prompt moves its run, mission, or goal to needs-input, and an ended mission drops its open question", () => {
+  const waiting = "A provider needs user input. Open the member session to respond; the team will not approve it.";
+  const prompted = team("implementing", 1, { missionId: randomUUID(), reason: waiting });
+  const standalone = team("implementing", 2, { reason: waiting });
+  const goalRun = team("implementing", 3, { goal: { id: randomUUID() } as TeamView["goal"], reason: waiting });
+  const finished = team("ready-for-review", 4, { reason: waiting });
+  const open = [{ id: randomUUID(), question: "Ship on Friday?", options: [], createdAt: at(5) }];
+  const missions = [
+    mission("working", 5, { title: "Prompted", subtasks: [{ id: "a", repoProjectId: "api", title: "Endpoint", objective: "x", size: "solo", parallelism: 1, dependsOn: [], status: "running", teamId: prompted.id }] }),
+    mission("cancelled", 6, { title: "Ended", reason: "Cancelled by the owner.", decisions: open,
+      subtasks: [{ id: "b", repoProjectId: "web", title: "Client", objective: "x", size: "solo", parallelism: 1, dependsOn: [], status: "running", teamId: prompted.id }] }),
+  ] as Mission[];
+  const goals = [goal("running", 7, { title: "Prompted goal", activeTeamId: goalRun.id }), goal("cancelled", 8, { title: "Cancelled goal", activeTeamId: goalRun.id })];
+  const { items } = missionBoard(missions, [prompted, standalone, goalRun, finished], goals, projects);
+  const find = (title: string) => items.find(item => item.title === title)!;
+  assert.equal(find("Prompted").column, "needs-input");
+  assert.equal(find("Prompted").detail, `Subtask a: ${waiting}`);
+  assert.equal(find(standalone.title).column, "needs-input");
+  assert.equal(find(standalone.title).detail, waiting);
+  assert.equal(find("Prompted goal").column, "needs-input");
+  assert.equal(find(finished.title).column, "review", "A finished run no longer waits on a provider prompt");
+  assert.equal(find("Ended").column, "ended", "A cancelled mission stays ended while its subteam's cancel is still cascading");
+  assert.equal(find("Cancelled goal").column, "ended");
+  assert.equal(find("Ended").detail, "Cancelled by the owner.", "An ended mission takes no answers, so its question is not its caption");
+});
+
 test("the board and mission routes enforce roles and report an unconfigured host", { timeout: 30000 }, async () => {
   const host = await startHost();
   try {

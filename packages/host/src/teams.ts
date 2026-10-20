@@ -25,6 +25,7 @@ type Mutation = { requestId: string; revision: number; text: string };
 type Action = { requestId: string; revision: number };
 type LimitSwitch = LimitObservation & { at: string; seq: number };
 type StartInProject = <T>(projectId: string, start: () => Promise<T>) => Promise<T>;
+type MissionReservationLookup = (projectId: string, exceptMissionId?: string) => string | undefined;
 type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
   pending?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number };
@@ -42,7 +43,9 @@ const activeMember = (member: TeamMember) => ["queued", "running", "reported", "
 const holdsWorkerSlot = (member: TeamMember, revision: number) => member.revision === revision &&
   (member.role === "scout" || member.role === "implementer") &&
   (["queued", "running", "unavailable"].includes(member.status) || member.status === "reported" && !member.exitConfirmedAt);
-const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
+const inactiveTeamStatuses = new Set(["cancelled", "ready-for-review", "merged", "no-change"]);
+const activeTeamRun = (status: string) => !inactiveTeamStatuses.has(status);
+export const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
 const permissionReviewReason = "The permission coordinator is reviewing a provider request.";
 /** Whether a delegated permission decision still holds this member's open prompt. */
 const underReview = (run: TeamRun, sessionId: string, promptId?: number) => promptId !== undefined &&
@@ -124,6 +127,7 @@ export class TeamService {
   private readonly commands = new Map<string, AbortController>();
   private readonly directory: string;
   private usage?: UsageService;
+  private missionReservations?: MissionReservationLookup;
   private readonly limits: ProviderLimits;
   private reconciledAt = 0;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService, private readonly titler?: Pick<Readings, "requestTitle">) {
@@ -163,6 +167,8 @@ export class TeamService {
   }
   /** The usage ledger this service prices member usage from; its tick also drives the ledger's reads. */
   useUsage(service: UsageService) { this.usage = service; }
+  /** MissionService supplies active-subteam and pending-launch reservations without a reverse import. */
+  useMissionReservations(lookup: MissionReservationLookup) { this.missionReservations = lookup; }
   /** Active host-level provider limits; new members of a limited provider launch on their fallback. */
   providerLimits() { return this.limits.active(); }
   private enqueue<T>(task: () => T | Promise<T>): Promise<T> {
@@ -270,8 +276,9 @@ export class TeamService {
     return { workspace, branch, head: headCommit };
   }
   activeForProject(projectId: string) {
-    return [...this.records.values()].some(({ run }) => run.projectId === projectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status));
+    return [...this.records.values()].some(({ run }) => run.projectId === projectId && activeTeamRun(run.status));
   }
+  isActiveRun(id: string) { const stored = this.records.get(id); return Boolean(stored && activeTeamRun(stored.run.status)); }
   create(request: CreateTeam): Promise<TeamView> {
     const parsed = createTeamSchema.parse(request);
     return this.createRun(parsed);
@@ -314,6 +321,10 @@ export class TeamService {
       }
       const project = this.config.projects.find(item => item.id === parsed.projectId);
       if (!project) throw new TeamError(404, "unknown-project", "The selected project is not configured.");
+      const reservedBy = this.missionReservations?.(parsed.projectId, internal?.missionId);
+      if (reservedBy) throw new TeamError(409, "mission-repository-reserved", `Mission ${reservedBy} holds repository ${parsed.projectId} for an active subteam or pending launch.`);
+      if (internal?.missionId && this.activeForProject(parsed.projectId))
+        throw new TeamError(409, "project-team-active", `An active team run already holds repository ${parsed.projectId}; this mission subtask cannot start until it finishes or is cancelled.`);
       if (!this.config.teams || !project.team || (!project.team.checks.length && !project.team.establishChecks)) throw new TeamError(409, "teams-not-configured", "Configure a team workspace directory and required checks, or authorize the team to establish checks, before starting a team.");
       const goal = internal ? structuredClone(internal.goal) : undefined;
       const lineup = internal ? structuredClone(internal.lineup) : useConfiguredLineup ? structuredClone(this.config.teams.lineup) : undefined;

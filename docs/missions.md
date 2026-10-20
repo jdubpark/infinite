@@ -57,7 +57,7 @@ The coordinator reports through its mission report tool:
 
 | Report | Effect |
 |---|---|
-| `dispatch` | Adds subtasks (up to `maxSubtasks` in total). A later dispatch may add more. |
+| `dispatch` | Adds subtasks (up to `maxSubtasks` in total). Later dispatches may add more. The host adds same-repository dependency edges, shown in mission events and later coordinator mission state. |
 | `answer-child` | Answers an open subteam decision within the mission's objective and steering. Recorded as answered by the coordinator, in the mission and in the subteam. |
 | `question` | Opens a mission decision for the owner. With `subtaskId` and `childDecisionId`, the owner's answer is forwarded to that subteam decision. |
 | `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. |
@@ -68,14 +68,29 @@ Size rules: a `solo` subtask starts a subteam with parallelism 1, and a `team`
 subtask uses its `parallelism` (1–4). The coordinator chooses the size; a simple
 mission may dispatch exactly one solo subtask.
 
-Scheduling: a subtask starts when every dependency is `done`. At most one team
-run per repository is active at a time across every mission and every run
-started outside a mission; others stay `queued`. A `blocked` run keeps its
-repository reserved until it is cancelled. A subtask that depends, directly or
-through other subtasks, on a finished subtask in its own repository starts from
-that run's workspace head rather than from the repository; with several such
-predecessors it uses the latest one in dependency order. A subtask is
-`done` when its subteam reaches `ready-for-review`, `merged`, or `no-change`;
+Scheduling: a subtask starts when every dependency is `done`. The host adds a
+dependency from each later subtask to the latest earlier, non-cancelled subtask
+in the same repository, including when the subtasks arrive in separate
+dispatches. The coordinator can also declare dependencies explicitly. Generated
+edges are recorded on the affected subtasks, named in mission events, and shown
+in the `dependsOn` fields of subsequent coordinator mission state.
+
+Mission subteams reserve only their own repository while a launch is pending or
+their run is active; a mission does not reserve every repository in its group
+for its whole lifetime. An active subteam or pending mission launch prevents a
+standalone team from starting in that repository. Once the subteam finishes,
+standalone runs can start there even if the mission continues elsewhere.
+Multiple standalone runs may coexist in one repository. A mission subtask waits
+while its repository is already in use and rechecks at launch; if a standalone
+run starts in the gap, the mission records that launch failure as a blocked
+subtask with the reason. A blocked subteam run keeps its repository reserved
+until cancelled.
+
+A subtask that depends, directly or through other subtasks, on finished work in
+its own repository starts from that run's workspace head rather than from the
+repository. With several same-repository predecessors, it uses the latest run
+in the dependency chain, so its base includes earlier work. A subtask is `done`
+when its subteam reaches `ready-for-review`, `merged`, or `no-change`;
 `blocked` when its subteam is blocked; `cancelled` when its subteam is cancelled.
 
 Escalation: when a subteam opens a decision or becomes blocked, the host sends

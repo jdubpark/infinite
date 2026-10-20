@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { writeSealed, unseal } from "./vault.js";
-import { TeamService, TeamError } from "./teams.js";
+import { TeamService, TeamError, providerInputReason } from "./teams.js";
 import type { Manager } from "./manager.js";
 import type { Config } from "./types.js";
 import type { CreateTeam, TeamAssignment, TeamView } from "./team-types.js";
@@ -83,6 +83,15 @@ export class MissionService {
       this.records.set(id, stored);
       this.saved.set(id, JSON.stringify(stored));
     }
+    this.teams.useMissionReservations((projectId, exceptMissionId) => {
+      for (const [missionId, stored] of this.records) {
+        if (missionId === exceptMissionId) continue;
+        const pendingLaunch = Object.values(stored.launches).some(request => request.projectId === projectId);
+        const activeSubteam = stored.mission.subtasks.some(subtask => subtask.repoProjectId === projectId && subtask.teamId && this.teams.isActiveRun(subtask.teamId));
+        if (pendingLaunch || activeSubteam) return missionId;
+      }
+      return undefined;
+    });
   }
   /** The usage ledger that prices coordinator sessions; subteam usage comes from their runs. */
   useUsage(service: UsageService) { this.usage = service; }
@@ -369,10 +378,7 @@ export class MissionService {
       delete stored.launches[subtaskId]; delete stored.bases?.[subtaskId]; this.save(stored);
     }
   }
-  /**
-   * Starts queued subtasks whose dependencies are done, with one active team run per repository
-   * across every mission and every run started outside a mission.
-   */
+  /** Starts queued subtasks whose dependencies are done, after checking the repository is idle. */
   private schedule(stored: Stored) {
     const mission = stored.mission;
     const busy = new Set<string>();
@@ -591,6 +597,7 @@ export class MissionService {
       if (!repo.teamReady) return `Repository ${plan.repoProjectId} is not configured for subteams.`;
     }
     for (const plan of plans) if (plan.dependsOn.some(id => id === plan.id || !ids.has(id))) return `Subtask ${plan.id} depends on an unknown subtask or on itself.`;
+    for (const plan of plans) if (plan.dependsOn.length > 12) return `Subtask ${plan.id} exceeds the 12-dependency limit after repository ordering.`;
     // Earlier subtasks cannot depend on new ones, so a cycle can only form inside this batch.
     const placed = new Set(mission.subtasks.map(item => item.id)), pending = [...plans];
     while (pending.length) {
@@ -599,6 +606,34 @@ export class MissionService {
       placed.add(pending.splice(index, 1)[0].id);
     }
     return undefined;
+  }
+  private chainDispatch(stored: Stored, plans: MissionSubtaskPlan[]) {
+    const mission = stored.mission;
+    const normalized = plans.map(plan => ({ ...plan, parallelism: plan.size === "solo" ? 1 : plan.parallelism, dependsOn: [...plan.dependsOn] }));
+    const dependencies = new Map<string, string[]>();
+    for (const subtask of mission.subtasks) dependencies.set(subtask.id, subtask.dependsOn);
+    for (const plan of normalized) dependencies.set(plan.id, plan.dependsOn);
+    const history = mission.subtasks.map(subtask => ({ id: subtask.id, repoProjectId: subtask.repoProjectId, status: subtask.status }));
+    const generated: { subtaskId: string; predecessorId: string }[] = [];
+    const ancestorsOf = (id: string) => {
+      const found = new Set<string>(), pending = [...(dependencies.get(id) ?? [])];
+      while (pending.length) {
+        const next = pending.pop()!;
+        if (found.has(next)) continue;
+        found.add(next);
+        pending.push(...(dependencies.get(next) ?? []));
+      }
+      return found;
+    };
+    for (const plan of normalized) {
+      const predecessor = [...history].reverse().find(item => item.repoProjectId === plan.repoProjectId && item.status !== "cancelled");
+      if (predecessor && !ancestorsOf(plan.id).has(predecessor.id)) {
+        plan.dependsOn.push(predecessor.id);
+        generated.push({ subtaskId: plan.id, predecessorId: predecessor.id });
+      }
+      history.push({ id: plan.id, repoProjectId: plan.repoProjectId, status: "queued" });
+    }
+    return { plans: normalized, generated };
   }
   private consume(stored: Stored, report: MissionReport, attempt: Attempt) {
     const mission = stored.mission;
@@ -613,11 +648,13 @@ export class MissionService {
     };
     switch (report.kind) {
       case "dispatch": {
-        const error = this.dispatchError(stored, report.subtasks);
+        const { plans, generated } = this.chainDispatch(stored, report.subtasks);
+        const error = this.dispatchError(stored, plans);
         if (error) return this.refuse(stored, report.kind, error);
-        for (const plan of report.subtasks) mission.subtasks.push({ ...plan, parallelism: plan.size === "solo" ? 1 : plan.parallelism, status: "queued" });
+        for (const plan of plans) mission.subtasks.push({ ...plan, status: "queued" });
         mission.dispatchSummary = report.summary;
-        this.event(stored, `The coordinator dispatched ${report.subtasks.length} subtask${report.subtasks.length === 1 ? "" : "s"}.`);
+        const edges = generated.length ? ` The host added same-repository dependencies: ${generated.map(edge => `${edge.subtaskId} depends on ${edge.predecessorId}`).join("; ")}.` : "";
+        this.event(stored, `The coordinator dispatched ${plans.length} subtask${plans.length === 1 ? "" : "s"}.${edges}`);
         break;
       }
       case "answer-child": {
@@ -696,9 +733,12 @@ const teamStep: Record<string, string> = {
   "no-change": "No change needed", cancelled: "Cancelled",
 };
 const openTeamQuestion = (team: TeamView | undefined) => team?.decisions.find(decision => decision.revision === team.revision && !decision.answer)?.question;
+/** A member stopped on a provider prompt waits on the person; the team never approves it. */
+const waitsOnProvider = (team: TeamView | undefined) => Boolean(team && !["cancelled", "ready-for-review", "merged", "no-change"].includes(team.status) && team.reason === providerInputReason);
 function teamDetail(team: TeamView) {
   const question = openTeamQuestion(team);
   if (question) return question;
+  if (waitsOnProvider(team)) return providerInputReason;
   if (team.status === "blocked" || team.status === "cancelled") return team.reason ?? teamStep[team.status] ?? team.status;
   const integrated = team.tasks.filter(task => task.status === "integrated").length;
   return `${teamStep[team.status] ?? team.status}${team.tasks.length && team.status === "implementing" ? `: ${integrated} of ${team.tasks.length} tasks integrated` : ""}`;
@@ -706,9 +746,15 @@ function teamDetail(team: TeamView) {
 /** Cancelled subtasks are left out, so done/total counts only work the mission still owes. */
 const subtaskCounts = (mission: Mission) => ({ total: mission.subtasks.filter(item => item.status !== "cancelled").length,
   running: mission.subtasks.filter(item => item.status === "running").length, done: mission.subtasks.filter(item => item.status === "done").length });
-function missionDetail(mission: Mission) {
-  const question = mission.decisions.find(decision => !decision.answer)?.question;
+/** Only a mission still under way waits on a subteam's provider prompt; an ended one is past it even while its cancel cascades. */
+const promptedSubtask = (mission: Mission, teamById: Map<string, TeamView>) => ["planning", "working", "needs-input", "paused"].includes(mission.status)
+  ? mission.subtasks.find(item => item.teamId && waitsOnProvider(teamById.get(item.teamId))) : undefined;
+function missionDetail(mission: Mission, teamById: Map<string, TeamView>) {
+  // An ended mission no longer takes answers, so its open question is not its caption.
+  const question = ["cancelled", "ready-for-review"].includes(mission.status) ? undefined : mission.decisions.find(decision => !decision.answer)?.question;
   if (question) return question;
+  const prompted = promptedSubtask(mission, teamById);
+  if (prompted) return `Subtask ${prompted.id}: ${providerInputReason}`;
   if (mission.status === "blocked" || mission.status === "cancelled" || mission.status === "paused") return mission.reason ?? mission.status;
   if (mission.status === "ready-for-review") return mission.result?.summary ?? "Ready for review";
   if (!mission.subtasks.length) return "Planning subtasks";
@@ -722,18 +768,18 @@ export function missionBoard(missions: Mission[], teams: TeamView[], goals: Prod
   const teamById = new Map(teams.map(team => [team.id, team]));
   const items: BoardItem[] = [];
   for (const mission of missions) {
-    const column: BoardColumn = ["needs-input", "blocked"].includes(mission.status) ? "needs-input" : mission.status === "ready-for-review" ? "review" : mission.status === "cancelled" ? "ended" : "working";
+    const column: BoardColumn = ["needs-input", "blocked"].includes(mission.status) || promptedSubtask(mission, teamById) ? "needs-input" : mission.status === "ready-for-review" ? "review" : mission.status === "cancelled" ? "ended" : "working";
     items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: mission.groupId, projectName: mission.groupName, column, status: mission.status,
-      detail: oneLine(missionDetail(mission)), updatedAt: mission.updatedAt,
+      detail: oneLine(missionDetail(mission, teamById)), updatedAt: mission.updatedAt,
       subtasks: subtaskCounts(mission) });
   }
   for (const team of teams) {
     if (team.missionId || team.goal) continue;
-    const column: BoardColumn = ["needs-input", "blocked"].includes(team.status) ? "needs-input" : team.status === "ready-for-review" ? "review" : ["merged", "no-change", "cancelled"].includes(team.status) ? "ended" : "working";
+    const column: BoardColumn = ["needs-input", "blocked"].includes(team.status) || waitsOnProvider(team) ? "needs-input" : team.status === "ready-for-review" ? "review" : ["merged", "no-change", "cancelled"].includes(team.status) ? "ended" : "working";
     items.push({ kind: "team", id: team.id, title: team.title, projectName: projectName(team.projectId), column, status: team.status, detail: oneLine(teamDetail(team)), updatedAt: team.updatedAt });
   }
   for (const goal of goals) {
-    const column: BoardColumn = ["needs-input", "blocked"].includes(goal.status) ? "needs-input" : ["running", "paused"].includes(goal.status) ? "working" : goal.status === "ready-for-review" ? "review" : "ended";
+    const column: BoardColumn = ["needs-input", "blocked"].includes(goal.status) || (["running", "paused"].includes(goal.status) && goal.activeTeamId && waitsOnProvider(teamById.get(goal.activeTeamId))) ? "needs-input" : ["running", "paused"].includes(goal.status) ? "working" : goal.status === "ready-for-review" ? "review" : "ended";
     const active = goal.activeTeamId ? teamById.get(goal.activeTeamId) : undefined;
     const detail = openTeamQuestion(active) ?? (goal.status === "running" && active ? `Feature ${goal.cycles.length}: ${teamDetail(active)}` : goal.reason ?? goal.status);
     items.push({ kind: "goal", id: goal.id, title: goal.title, projectName: projectName(goal.projectId), column, status: goal.status, detail: oneLine(detail), updatedAt: goal.updatedAt });

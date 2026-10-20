@@ -47,7 +47,8 @@ const runEvent = (run: TeamRun, text: string) => {
 };
 function diffStat(output?: string) {
   if (output === undefined) return undefined;
-  const rows = output.split("\n").filter(Boolean).map(line => {
+  // `--numstat -z --no-renames` ends every file record with NUL: "added<TAB>removed<TAB>path".
+  const rows = output.split("\0").filter(Boolean).map(line => {
     const [added, removed, path] = line.split("\t");
     return { added: added === "-" ? 0 : Number(added), removed: removed === "-" ? 0 : Number(removed), path: path ?? "" };
   });
@@ -1354,7 +1355,7 @@ export class TeamService {
       const commit = await captureMemberResult(member.cwd, member.baseCommit, member.role === "implementer" ? task!.paths : run.goal?.allowedPaths, this.config.teams?.commandPrefix, signal);
       const head = commit ? await integrateMemberResult(run.workspace, member.cwd, commit, this.config.teams?.commandPrefix, signal) : run.headCommit!;
       // Diff stats are scorecard evidence only: a launcher that refuses the command must not block integration.
-      const diff = commit ? await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--numstat", `${member.baseCommit}..${commit}`]) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined) : undefined;
+      const diff = commit ? await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--no-renames", "-z", member.baseCommit, commit, "--"]) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined) : undefined;
       return { commit, head, diff: diff?.exitCode === 0 ? diff.stdout : undefined };
     }, ({ commit, head, diff }) => {
       run.headCommit = head; stored.checkHead = undefined; run.review = undefined;

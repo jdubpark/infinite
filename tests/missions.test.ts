@@ -422,7 +422,7 @@ function scripted() {
     messages: async (n: number) => parse((await attempt(n)).prompt, "Messages since your last attempt (JSON): "),
     state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),
     report: async (n: number, report: MissionReport) => { reports.set((await attempt(n)).sessionId, report); },
-    create: () => missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Change the API and the web client", maxSubtasks: 8, maxMinutes: 30 }),
+    create: (objective = "Change the API and the web client") => missions.create({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 }),
     get: (id: string) => missions.get(id),
     close: () => { missions.close(); rmSync(root, { recursive: true, force: true }); },
   };
@@ -494,6 +494,19 @@ test("a result waits until blocked and stranded subtasks are cancelled, and each
     await h.report(5, { kind: "result", summary: "The API change is ready; the web change was cancelled" });
     const ready = await until(() => h.get(id), mission => mission.status === "ready-for-review", 20000);
     assert.deepEqual(ready.subtasks.map(subtask => subtask.status), ["done", "cancelled", "cancelled"]);
+  } finally { h.close(); }
+});
+
+test("each subteam is titled by its subtask first, so a long mission title cannot make siblings identical", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const objective = "Add a /health endpoint to the api returning {ok:true} with a test, and make web call it and print the result";
+    const { id } = await h.create(objective);
+    await h.report(1, { kind: "dispatch", summary: "One change per repository", subtasks: [plan("api-health", "api"), plan("web-health", "web")] });
+    await until(() => h.get(id), mission => Boolean(teamOf(mission, "api-health") && teamOf(mission, "web-health")));
+    const titles = h.created.map(item => item.request.title).sort();
+    assert.deepEqual(titles.map(title => title.split(" · ")[0]), ["Subtask api-health", "Subtask web-health"]);
+    assert.ok(titles.every(title => title.length <= 100 && title.includes("Add a /health endpoint")));
   } finally { h.close(); }
 });
 

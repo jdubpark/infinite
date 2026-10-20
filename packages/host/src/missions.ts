@@ -399,7 +399,8 @@ export class MissionService {
       ].filter(Boolean).join("\n\n");
       if (base) (stored.bases ??= {})[subtask.id] = base.teamId!;
       stored.launches[subtask.id] = { requestId: randomUUID(), projectId: subtask.repoProjectId, provider: mission.lineup.coordinator.provider, useConfiguredLineup: true,
-        title: `${mission.title} · ${subtask.title}`.slice(0, 100), objective, parallelism: subtask.size === "solo" ? 1 : subtask.parallelism };
+        // The subtask title leads, so a long mission title cannot clip it and sibling subteams stay distinguishable.
+        title: `${subtask.title} · ${mission.title}`.slice(0, 100), objective, parallelism: subtask.size === "solo" ? 1 : subtask.parallelism };
       busy.add(subtask.repoProjectId);
       this.save(stored);
     }

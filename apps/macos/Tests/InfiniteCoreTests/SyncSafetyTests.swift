@@ -130,4 +130,18 @@ final class SyncSafetyTests: XCTestCase {
         let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).first)
         XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber)?.intValue, 0o600)
     }
+
+    /// The installed app keeps the draft key and folder it always used; every other build gets its own, so a
+    /// rehearsal copy or unbundled binary never reads, rotates, or writes beside the installed app's drafts.
+    func testDraftLocationIsTheInstalledAppsOnlyForItsBundleID() {
+        XCTAssertEqual(DraftLocation(bundleID: "dev.infinite.desktop").service, "dev.infinite.desktop.device")
+        XCTAssertEqual(DraftLocation(bundleID: "dev.infinite.desktop").directory, "Infinite/Drafts")
+        let rehearsal = DraftLocation(bundleID: "dev.infinite.rehearsal.e2e")
+        XCTAssertEqual(rehearsal.service, "dev.infinite.desktop.device.dev.infinite.rehearsal.e2e")
+        XCTAssertEqual(rehearsal.directory, "Infinite/Drafts-dev.infinite.rehearsal.e2e")
+        XCTAssertEqual(DraftLocation(bundleID: nil).directory, "Infinite/Drafts-unbundled")
+        XCTAssertEqual(DraftLocation(bundleID: "..").directory, "Infinite/Drafts-unbundled")
+        XCTAssertEqual(DraftLocation(bundleID: "a/../b").directory, "Infinite/Drafts-a-..-b")
+        XCTAssertNotEqual(DraftLocation(bundleID: "dev.infinite.desktop.beta"), DraftLocation(bundleID: "dev.infinite.desktop"))
+    }
 }

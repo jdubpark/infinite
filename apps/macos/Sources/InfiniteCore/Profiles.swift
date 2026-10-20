@@ -24,8 +24,8 @@ public struct HostProfile: Codable, Identifiable, Equatable, Sendable {
 }
 
 public enum DeviceKeychain {
-    private static let service = "dev.infinite.desktop.device"
-    public static func save(_ token: String, for id: String) throws {
+    public static let service = "dev.infinite.desktop.device"
+    public static func save(_ token: String, for id: String, service: String = service) throws {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: id]
         let update: [String: Any] = [kSecValueData as String: Data(token.utf8)]
         let result = SecItemUpdate(query as CFDictionary, update as CFDictionary)
@@ -34,7 +34,7 @@ public enum DeviceKeychain {
             guard SecItemAdd(added as CFDictionary, nil) == errSecSuccess else { throw DesktopError("The device key could not be saved in Keychain.") }
         } else if result != errSecSuccess { throw DesktopError("Keychain could not update the device key.") }
     }
-    public static func read(_ id: String) throws -> String {
+    public static func read(_ id: String, service: String = service) throws -> String {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: id, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let data = item as? Data, let token = String(data: data, encoding: .utf8) else { throw DesktopError("Unlock Keychain or pair this device again.") }

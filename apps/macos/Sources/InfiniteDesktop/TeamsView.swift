@@ -118,7 +118,7 @@ struct TeamDetailView: View {
                 Image(systemName: "checkmark.seal.fill").foregroundStyle(.blue)
                 Text("Ready for your review").font(.headline)
                 Spacer()
-                Text("Nothing merges until you do").font(.caption).foregroundStyle(.secondary)
+                Text("Team report").font(.caption).foregroundStyle(.secondary)
             }
             HStack(spacing: 10) {
                 SignalTile(value: "\(done)/\(total)", label: "tasks integrated", source: "host", color: total > 0 && done == total ? .green : .orange)

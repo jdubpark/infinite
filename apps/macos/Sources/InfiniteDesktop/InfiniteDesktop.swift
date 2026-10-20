@@ -168,8 +168,9 @@ struct DesktopView: View {
     /// provider permission prompt, so no prompt is only reachable through its team's page.
     private var sidebar: some View {
         let groups = filteredGroups
-        let waiting = app.board.count(.needsInput)
         let sessions = filteredSessions.filter { $0.value["team"] == .null || $0.needsYou || searching }
+        // Board rows waiting on the person, plus standalone sessions stopped on a provider prompt.
+        let waiting = app.board.count(.needsInput) + app.sessions.filter { $0.value["team"] == .null && $0.needsYou }.count
         let live = sessions.filter(\.running)
         let ended = sessions.filter { !$0.running }
         return List(selection: selection) {

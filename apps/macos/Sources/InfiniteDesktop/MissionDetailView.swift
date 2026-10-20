@@ -8,7 +8,6 @@ struct MissionDetailView: View {
     @ObservedObject var model: MissionModel
     @State private var confirmCancel = false
     @State private var confirmDiscard = false
-    @State private var fullRequest = false
     private var mission: Mission { model.mission }
     private func repoName(_ id: String) -> String { app.projectGroups.repoName(id) ?? app.projectName(id) }
 
@@ -84,14 +83,15 @@ struct MissionDetailView: View {
     }
 
     @ViewBuilder private var decisions: some View {
-        let open = mission.openDecisions
+        // A cancelled mission's unanswered question is no longer for the owner; its history keeps the record.
+        let open = mission.ended ? [] : mission.openDecisions
         if !open.isEmpty {
             section("Decisions for you", count: open.count) {
                 // Keyed by decision ID: when polling drops an answered question, a typed draft stays
                 // with its own question instead of moving to the next card.
                 let revision = mission.revision
                 ForEach(open) { decision in
-                    DecisionCard(decision: decision.value, caption: caption(decision), disabled: !model.canAct || mission.status == "paused") { text in
+                    DecisionCard(decision: decision.value, caption: caption(decision), disabled: !model.canAct || !mission.canAnswer) { text in
                         Task { await model.answer(decisionID: decision.id, revision: revision, text: text) }
                     }
                     .id(decision.id)
@@ -128,7 +128,8 @@ struct MissionDetailView: View {
         section("Subtasks", count: total) {
             if total > 0 { Text("\(done) of \(total) done").font(.caption).foregroundStyle(.secondary) }
             if !mission.dispatchSummary.isEmpty {
-                Text(mission.dispatchSummary).font(.callout).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                // The coordinator's latest plan can run long; it folds so the subtasks stay in view.
+                FoldingText(text: mission.dispatchSummary, lines: 4, secondary: true)
             }
             if mission.subtasks.isEmpty { Text("The coordinator has not dispatched any subtasks yet.").font(.callout).foregroundStyle(.secondary) }
             ForEach(mission.subtasks) { subtask in SubtaskRow(subtask: subtask, repo: repoName(subtask.repoProjectID), after: subtask.dependsOn.map { mission.subtask($0)?.title ?? $0 }) {
@@ -139,10 +140,7 @@ struct MissionDetailView: View {
 
     private var request: some View {
         section("Your request") {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(mission.objective).font(.callout).textSelection(.enabled).lineLimit(fullRequest ? nil : 3).fixedSize(horizontal: false, vertical: true)
-                Button(fullRequest ? "Show less" : "Show all") { fullRequest.toggle() }.buttonStyle(.link).font(.caption)
-            }
+            FoldingText(text: mission.objective, lines: 3)
         }
     }
 
@@ -256,5 +254,33 @@ struct SubtaskRow: View {
         .onHover { hovering = $0 }
         .help(subtask.teamID == nil ? "Its subteam has not started yet." : "Open this subtask's team")
         .accessibilityLabel("\(subtask.title), \(repo), \(subtask.sizeLabel), \(subtask.statusLabel)")
+    }
+}
+
+/// Text clipped to a few lines that offers "Show all" exactly when the clip hides something. A hidden copy
+/// laid out at the same width measures the full height, so wrapping, newlines, and window width all count.
+struct FoldingText: View {
+    let text: String
+    let lines: Int
+    var secondary = false
+    @State private var expanded = false
+    @State private var clipped = false
+    private struct Clipped: PreferenceKey {
+        static let defaultValue = false
+        static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(text).font(.callout).foregroundStyle(secondary ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary)).textSelection(.enabled)
+                .lineLimit(expanded ? nil : lines).fixedSize(horizontal: false, vertical: true)
+                .background(GeometryReader { shown in
+                    Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
+                        .frame(width: shown.size.width, alignment: .leading).hidden()
+                        .background(GeometryReader { full in Color.clear.preference(key: Clipped.self, value: full.size.height > shown.size.height + 1) })
+                })
+                .onPreferenceChange(Clipped.self) { clipped = $0 }
+            // Once expanded nothing is clipped, so "Show less" stays until the owner folds it again.
+            if clipped || expanded { Button(expanded ? "Show less" : "Show all") { expanded.toggle() }.buttonStyle(.link).font(.caption) }
+        }
     }
 }

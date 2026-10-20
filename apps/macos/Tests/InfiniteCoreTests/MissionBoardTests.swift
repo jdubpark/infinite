@@ -92,6 +92,24 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertEqual(BoardItem(try parse(#"{"id":"m","subtasks":{"total":4,"running":0,"done":3}}"#)).progressFraction, 0.75)
     }
 
+    /// The row already shows "1/3 subtasks", so the host's closing count is dropped; other detail stays whole.
+    func testCaptionDetailDropsOnlyTheProgressTheRowAlreadyShows() throws {
+        func item(_ detail: String, done: Int = 1, total: Int = 3) throws -> BoardItem {
+            BoardItem(try parse(#"{"id":"m","kind":"mission","detail":"\#(detail)","subtasks":{"total":\#(total),"running":1,"done":\#(done)}}"#))
+        }
+        XCTAssertEqual(try item("Running: Call api /health from web. 1 of 3 subtasks done").detailBesideProgress, "Running: Call api /health from web")
+        XCTAssertEqual(try item("1 of 3 subtasks done").detailBesideProgress, "")
+        XCTAssertEqual(try item("1 of 1 subtask done", total: 1).detailBesideProgress, "")
+        // The host's own wording for a single subtask.
+        XCTAssertEqual(try item("Running: X. 0 of 1 subtasks done", done: 0, total: 1).detailBesideProgress, "Running: X")
+        // A longer number that merely ends in the row's count is not the row's count.
+        XCTAssertEqual(try item("Running: X. 21 of 3 subtasks done").detailBesideProgress, "Running: X. 21 of 3 subtasks done")
+        // Counts that disagree with the row, a question, and a row without counts keep the host's words.
+        XCTAssertEqual(try item("2 of 3 subtasks done").detailBesideProgress, "2 of 3 subtasks done")
+        XCTAssertEqual(try item("Should web wait for the merge?").detailBesideProgress, "Should web wait for the merge?")
+        XCTAssertEqual(BoardItem(try parse(#"{"id":"m","detail":"0 of 0 subtasks done"}"#)).detailBesideProgress, "0 of 0 subtasks done")
+    }
+
     func testMissionDecodesDecisionsSubtasksAndOwnerControls() throws {
         let mission = Mission(try parse("""
         {"id":"8a1f0000-0000-4000-8000-000000000001","groupId":"storefront","groupName":"Storefront","repoProjectIds":["storefront-web","storefront-api"],
@@ -169,5 +187,8 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertFalse(cancelled.canCancel)
         XCTAssertTrue(cancelled.ended)
         XCTAssertFalse(Mission(.object(["status": .string("ready-for-review")])).canPause)
+        // Answers match the host's running statuses, so a paused, blocked, or cancelled mission offers none.
+        for status in ["planning", "working", "needs-input"] { XCTAssertTrue(Mission(.object(["status": .string(status)])).canAnswer, status) }
+        for status in ["paused", "blocked", "ready-for-review", "cancelled"] { XCTAssertFalse(Mission(.object(["status": .string(status)])).canAnswer, status) }
     }
 }

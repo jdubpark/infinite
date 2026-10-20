@@ -47,10 +47,42 @@ export type LinearTrackingView = {
 export type UsageTotals = { cost: number; tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }; messages: number; pricing: { configured: number; provider: number; unknown: number } };
 export type TeamUsage = { total: UsageTotals; byProfile: Record<string, UsageTotals>; byProvider: Partial<Record<string, UsageTotals>>; unmeasuredMembers: number };
 export type UsageBudget = { usd: number; period: "day" | "week" | "month" };
+/** A dollar figure plus the count of steps it could not price. A lower bound whenever `unpriced > 0`. */
+export type Money = { usd: number; unpriced: number };
+/** Only a provider's own API fills this in; it stays null otherwise and renders "—". */
+export type Balance = { amount: number; currency: string; asOf: string; stale: boolean } | null;
+export type AccountView = { id: string; kind: "metered" | "subscription"; month?: Money; planUsd?: number; balance: Balance };
 export type UsageSummary = {
   period: { start: string; end: string };
   providers: Record<string, { measured: boolean; period: { start: string; end: string }; spent?: UsageTotals; previous?: UsageTotals; budget?: UsageBudget; unmeasuredSessions: number }>;
+  month: { start: string; end: string; spent: Money; previous: Money; plansUsd: number; unmeasuredSessions: number };
+  accounts: AccountView[];
 };
+export type UsageDaily = { tz: string; accounts: string[]; days: { date: string; usd: number; byAccount: Record<string, number> }[] };
+/** `unmeasured` counts sessions and briefing runs that produced no usage data; older hosts omit it. */
+export type UsageProjectRow = { id: string; name: string; total: Money; month: Money; spark: number[]; unmeasured?: number };
+export type UsageProject = {
+  id: string; name: string; total: Money; unmeasured?: number;
+  byKind: { goals: number; teams: number; sessions: number; briefings: number };
+  goals: { id: string; title: string; total: Money; tasks: number }[];
+  teams: { id: string; title: string; goalId?: string; total: Money }[];
+  sessions: { id: string; title: string; total: Money }[];
+  briefings: { total: Money; runs: number; unmeasured: number };
+};
+export type TaskUsage = { usd: number; unpriced: number; tokens: number; attempts: number; profiles: string[] };
+export type OwnerRating = { score: 1 | 2 | 3 | 4 | 5; note?: string; at: string };
+export type RubricScore = { score: 1 | 2 | 3 | 4 | 5; why: string };
+export type Rubric = { version: 1; correctness: RubricScore; cleanliness: RubricScore; extensibility: RubricScore; docs: RubricScore; reviewerProfileId: string };
+export type ModelRow = {
+  profileId: string; label: string; provider: string; role: string; metered: boolean;
+  attempts: number; integrated: number; rate: number; rateInterval: [number, number] | null;
+  medianUsd: number | null; medianTokens: number | null; usdPerMTok: number | null;
+  medianMinutes: number | null; meanReviewRounds: number | null;
+  rubric: { correctness: number; cleanliness: number; extensibility: number; docs: number; n: number } | null;
+  owner: { mean: number; n: number } | null; enough: boolean;
+};
+export type Suggestion = { text: string; profileId: string; comparedTo: string; role: string; n: [number, number] };
+export type Scorecard = { rubricVersion: 1; minAttempts: number; rows: ModelRow[]; suggestions: Suggestion[] };
 /** A host-level record that a provider's account was seen at its limit. The reset time is the provider's own statement. */
 export type ProviderLimit = { provider: string; detectedAt: string; resetsAt?: string; expiresAt: string; sessionId: string; runId?: string; confidence: "corroborated" };
 export type LimitSwitch = { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string };

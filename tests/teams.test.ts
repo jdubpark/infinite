@@ -874,6 +874,12 @@ test("OpenCode team members journal each step with its tokens and cost", { timeo
       assert.equal(usage.reduce((sum, event) => sum + event.data.tokens.input, 0), 1000);
       assert.equal(usage.reduce((sum, event) => sum + event.data.tokens.output, 0), 500);
       assert.ok(Math.abs(usage.reduce((sum, event) => sum + event.data.reportedCost, 0) - 0.5) < 1e-9);
+      const signals = (await f.host.fetchApi(`/sessions/${member.sessionId}/events?types=signal&limit=200`)).body.events.map((event: any) => event.data);
+      const tools = signals.filter((data: any) => data.kind === "tool-start" || data.kind === "tool-end");
+      assert.deepEqual(tools.map((data: any) => [data.kind, data.tool, data.toolUseId, data.source]),
+        [["tool-start", "bash", `call_${member.taskId}`, "protocol"], ["tool-end", "bash", `call_${member.taskId}`, "protocol"]],
+        "A finished OpenCode tool call is journaled as activity so a long headless turn is not taken for a stall");
+      assert.deepEqual(tools[0].input, {}, "Activity signals do not copy tool input into the journal");
     }
   } finally { await f.close(); }
 });

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Alert, KeyboardAvoidingView, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Alert, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import * as Crypto from "expo-crypto";
 import { PROVIDER_NAMES } from "@infinite/attention";
@@ -7,6 +7,7 @@ import { ago, api, ApiError, connectionKey, pendingLabel, type Connection, type 
 import { creations } from "../../store/requests";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
+import { useKeyboardPadding } from "../../components/keyboard";
 import { TopBar } from "../../components/Glass";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
@@ -15,6 +16,7 @@ import { useDictation } from "../../dictation/useDictation";
 
 export function Create({ connection }: { connection: Connection }) {
   const router = useRouter();
+  const keyboardPadding = useKeyboardPadding();
   const machine = connectionKey(connection);
   const creation = creations.use(machine);
   const request = creation.pending;
@@ -73,7 +75,7 @@ export function Create({ connection }: { connection: Connection }) {
       creations.fail(machine, body.requestId, `${(error as Error).message}${rejected ? " Correct the session details and try again." : " The result may be uncertain. Check Sessions or retry the same request."}`, rejected);
     } finally { sending.current = false; if (mounted.current) setBusy(false); }
   }
-  return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
+  return <View style={[s.fill, s.overlayRoot, { paddingBottom: keyboardPadding }]}>
     <TopBar backLabel="Sessions" onBack={() => router.replace({ pathname: "/", params: { machine } })} right={<Text style={s.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
     <FloatingNotice position="top" offset={58} message={stale ? me ? "Waiting for a fresh machine connection." : "Can't reach this machine." : null} actions={stale ? <Button compact title="Refresh" secondary onPress={refresh} /> : null} />
     <DictationNotice dictation={dictation} position="top" offset={110} />
@@ -101,7 +103,7 @@ export function Create({ connection }: { connection: Connection }) {
       {creation.message ? <Text accessibilityRole="alert" style={s.warning}>{creation.message}</Text> : null}
       <View style={s.section}><Button busy={busy} title={request && (!busy || retrying) ? "Retry same request" : "Start session"} onPress={() => void submit()} disabled={busy || !online || me?.role !== "owner" || !selectedProvider || !selectedProject || !title.trim()} /></View>
     </ScrollView>
-  </KeyboardAvoidingView>;
+  </View>;
 }
 const s = StyleSheet.create({
   fill: { flex: 1 },

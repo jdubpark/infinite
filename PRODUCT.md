@@ -3,6 +3,8 @@
 <!-- impeccable:product-schema 1 -->
 
 ## Platform
+adaptive
+
 Web client, React Native phone client (Android first, iPhone build support), and
 a personal native macOS client in `apps/macos`. The Mac implementation includes
 streamed provider terminals, a local prompt composer, resource/agent monitoring,

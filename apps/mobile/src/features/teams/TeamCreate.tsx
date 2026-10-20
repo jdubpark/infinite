@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { KeyboardAvoidingView, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import * as Crypto from "expo-crypto";
 import { api, ApiError, connectionKey, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
+import { useKeyboardPadding } from "../../components/keyboard";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { TopBar } from "../../components/Glass";
 import { teamCreations } from "../../store/requests";
@@ -19,6 +20,7 @@ const inFlight = new Set<string>();
 /** Starts a team from a feature request or PRD. Creation is an owner action. */
 export function TeamCreate({ connection }: { connection: Connection }) {
   const router = useRouter();
+  const keyboardPadding = useKeyboardPadding();
   const machine = connectionKey(connection);
   const creation = teamCreations.use(machine);
   const pending = creation.pending;
@@ -69,7 +71,7 @@ export function TeamCreate({ connection }: { connection: Connection }) {
       teamCreations.fail(machine, request.requestId, `${(error as Error).message}${rejected ? " Correct the request and try again." : " Delivery is unconfirmed. Check Teams or retry the same request."}`, rejected);
     } finally { inFlight.delete(request.requestId); if (mounted.current) setSending(false); }
   }
-  return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
+  return <View style={[s.fill, s.overlayRoot, { paddingBottom: keyboardPadding }]}>
     <TopBar backLabel="Teams" onBack={() => router.canGoBack() ? router.back() : router.replace({ pathname: "/", params: { machine, view: "teams" } })} right={<Text style={t.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
     <FloatingNotice position="top" offset={58} message={stale ? me ? "Waiting for a fresh machine connection." : "Can't reach this machine." : null} actions={stale ? <Button compact title="Refresh" secondary onPress={refresh} /> : null} />
     <DictationNotice dictation={dictation} position="top" offset={110} />
@@ -114,7 +116,7 @@ export function TeamCreate({ connection }: { connection: Connection }) {
       {creation.message ? <Text accessibilityRole="alert" style={t.warning}>{creation.message}</Text> : null}
       <View style={s.section}><Button busy={busy} title={pending && (!busy || retrying) ? "Retry same request" : "Start team"} disabled={busy || !allowed} onPress={() => void submit()} /></View>
     </ScrollView>
-  </KeyboardAvoidingView>;
+  </View>;
 }
 
 const s = StyleSheet.create({

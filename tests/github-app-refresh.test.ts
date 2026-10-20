@@ -220,7 +220,14 @@ test("discovers installed repositories, refreshes scoped tokens, and removes onl
     const discoveryToken = calls.find(call => call.url.endsWith("/access_tokens") && call.body && !call.body.repository_ids);
     assert.ok(discoveryToken);
     assert.equal(Object.hasOwn(discoveryToken.body, "repository_ids"), false);
+    assert.deepEqual(discoveryToken.body, { permissions: { metadata: "read" } });
     assert.ok(calls.some(call => call.url.endsWith("/installation/repositories?per_page=100&page=1") && call.method === "GET"));
+    const temporaryToken = "installation_test_token_value_101";
+    assert.doesNotMatch(result.stdout + result.stderr, new RegExp(temporaryToken));
+    assert.doesNotMatch(readFileSync(f.requestLog, "utf8"), new RegExp(temporaryToken));
+    for (const repository of ["example/first", "example/second"]) {
+      assert.doesNotMatch(readFileSync(f.tokenFile(repository), "utf8"), new RegExp(temporaryToken));
+    }
   } finally { f.close(); }
 });
 

@@ -330,7 +330,7 @@ async function requestUnrestrictedInstallationToken(installationId, jwt) {
         "content-type": "application/json",
         "x-github-api-version": "2022-11-28",
       },
-      body: JSON.stringify({ permissions: EXPECTED_PERMISSIONS }),
+      body: JSON.stringify({ permissions: { metadata: "read" } }),
     });
   } catch { fail("discovery-failed"); }
   if (!response.ok) {

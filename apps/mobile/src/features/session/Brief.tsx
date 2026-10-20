@@ -76,7 +76,7 @@ export function Brief({
       : undefined,
   });
   const session = poll?.session ?? null;
-  useControlSync(control, poll, online);
+  useControlSync(control, poll, stale);
   // `/me` is read once; a failed read is retried after the next good poll.
   const [me, setMe] = useState<Me | null>(null);
   const needMe = me === null && online;

@@ -1,12 +1,15 @@
 import type { Attention, Provider } from "@infinite/attention";
-import { createRemoteClient, RemoteError, type RemoteAccessToken, type RemoteEvents } from "@infinite/remote";
+import { createRemoteClient, RemoteError, type RemoteAccessToken, type RemoteEvents, type RemoteRequestOptions } from "@infinite/remote";
 import * as Crypto from "expo-crypto";
 import { loadClientId } from "../store/connection";
 import type { TeamLineup, TeamProject, TeamRole, TeamStatus } from "../features/teams/model";
+import { APP_BACKGROUND_GRACE_MS, inForeground, onForegroundChange } from "./foreground";
 
 export type Connection = { id?: string; machineId?: string; label?: string; url: string; token: string; relay?: { machineId: string }; access?: RemoteAccessToken };
 export const connectionKey = (connection: Connection) => connection.id ?? `${connection.url}/${connection.relay?.machineId ?? "direct"}`;
-const remotes = new Map<string, { secrets: string; client: ReturnType<typeof createRemoteClient> }>();
+/** `calls` counts api() requests in flight on this channel. */
+type Remote = { secrets: string; client: ReturnType<typeof createRemoteClient>; calls: number };
+const remotes = new Map<string, Remote>();
 const remoteKey = (connection: Connection) => `${connectionKey(connection)}/${connection.url}/${connection.relay?.machineId ?? "direct"}`;
 export function closeConnection(connection: Connection) {
   remotes.get(remoteKey(connection))?.client.close();
@@ -18,10 +21,40 @@ function remote(connection: Connection) {
   const secrets = JSON.stringify([connection.token, connection.access?.clientId, connection.access?.clientSecret]);
   if (!saved || saved.secrets !== secrets) {
     saved?.client.close();
-    saved = { secrets, client: createRemoteClient(connection, { randomBytes: Crypto.getRandomBytes }) };
+    saved = { secrets, client: createRemoteClient(connection, { randomBytes: Crypto.getRandomBytes }), calls: 0 };
     remotes.set(key, saved);
   }
-  return saved.client;
+  return saved;
+}
+function drop(key: string, entry: Remote) {
+  if (remotes.get(key) === entry) remotes.delete(key);
+  entry.client.close();
+}
+/** Replace idle channels after the same grace used by the live stream. */
+let backgroundedAt = 0;
+let backgroundResetTimer: ReturnType<typeof setTimeout> | undefined;
+onForegroundChange((foreground) => {
+  if (!foreground) {
+    backgroundedAt = Date.now();
+    clearTimeout(backgroundResetTimer);
+    backgroundResetTimer = setTimeout(() => {
+      backgroundResetTimer = undefined;
+      if (!inForeground())
+        for (const [key, entry] of remotes) if (entry.calls === 0) drop(key, entry);
+    }, APP_BACKGROUND_GRACE_MS);
+    return;
+  }
+  clearTimeout(backgroundResetTimer); backgroundResetTimer = undefined;
+  if (Date.now() - backgroundedAt < APP_BACKGROUND_GRACE_MS) return;
+  for (const [key, entry] of remotes) if (entry.calls === 0) drop(key, entry);
+});
+async function call<T>(entry: Remote, path: string, options: RemoteRequestOptions): Promise<T> {
+  entry.calls++;
+  try {
+    return await entry.client.request<T>(path, options);
+  } finally {
+    entry.calls--;
+  }
 }
 
 export class ApiError extends Error {
@@ -64,15 +97,26 @@ export async function api<T>(
   const { timeoutMs = 12000, ...options } = init;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // Only reads (GET without a body) are retried or dropped on timeout; mutations never are.
+  const read = (init.method ?? "GET") === "GET" && init.body === undefined;
+  let saved: Remote | undefined;
   try {
     const headers = {
       "X-Infinite-Client": await loadClientId(),
       ...(init.control ? { "X-Infinite-Control": init.control } : {}),
     };
+    const request = { ...options, headers, signal: controller.signal };
     // Both direct and relayed connections use the authenticated encrypted
     // channel. An unavailable endpoint never falls back to plaintext API calls.
+    saved = remote(connection);
     try {
-      return await remote(connection).request<T>(path, { ...options, headers, signal: controller.signal });
+      try {
+        return await call<T>(saved, path, request);
+      } catch (error) {
+        // A backgrounded app does not reconnect; its return poll recovers instead.
+        if (!read || !(error instanceof RemoteError) || error.code !== "disconnected" || !inForeground()) throw error;
+        return await call<T>(saved, path, request);
+      }
     } catch (error) {
       if (error instanceof RemoteError) {
         const value = error.body as { error?: string; code?: string; attention?: Attention } | undefined;
@@ -83,6 +127,8 @@ export async function api<T>(
       throw error;
     }
   } catch (error) {
+    // A timed-out read may have left the channel unusable; don't drop it under another call.
+    if (read && controller.signal.aborted && saved && saved.calls === 0) drop(remoteKey(connection), saved);
     if ((error as Error).name === "AbortError")
       throw new ApiError(
         "The host did not respond. Input delivery may be uncertain.",
@@ -100,7 +146,7 @@ export function openEvents(connection: Connection, options: {
   onEvent(event: { topic: string; data: unknown }): void;
   onClose(event: { code: number; error?: RemoteError }): void;
 }): Promise<RemoteEvents> {
-  return remote(connection).openEvents(options);
+  return remote(connection).client.openEvents(options);
 }
 
 /** One device's input lease; the host refuses input from every other device while it lasts. */

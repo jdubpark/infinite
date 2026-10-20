@@ -195,7 +195,7 @@ export function Inbox({
         {machines.map(machine => {
           const key = connectionKey(machine);
           const current = key === connectionKey(connection);
-          return <SheetRow key={key} selected={current} label={machineName(machine)} detail={current ? (online ? "Connected" : "Offline") : undefined}
+          return <SheetRow key={key} selected={current} label={machineName(machine)} detail={current ? (online ? "Connected" : stale ? "Offline" : "Connecting") : undefined}
             icon={<Avatar label={machineName(machine)} size={26} />} onPress={() => { setMachineSheet(false); if (!current) onSelectMachine(key); }} />;
         })}
         <SheetRow glyph="plus" label="Add machine" onPress={() => { setMachineSheet(false); onAddMachine(); }} />

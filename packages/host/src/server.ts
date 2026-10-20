@@ -128,7 +128,6 @@ export function createApp(config: Config, key: Buffer) {
   const startsInFlight = new Map<string, number>();
   const projectFileChanges = new Set<string>();
   const projectConfigChanges = new Set<string>();
-  const projectSourceConfiguredAtStartup = config.projects.some(project => project.source?.mode === "github");
   const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix });
   /**
    * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
@@ -1326,8 +1325,8 @@ export function createApp(config: Config, key: Buffer) {
   server.once("listening", () => missions.start());
   server.once("listening", () => handoffs.start());
   server.once("listening", () => readings.start());
-  // Start the source timer only when a GitHub project exists at server startup.
-  if (projectSourceConfiguredAtStartup) server.once("listening", () => projectSource.start());
+  // The timer checks each tick which projects follow GitHub, so one enrolled while the server runs is picked up too.
+  server.once("listening", () => projectSource.start());
   if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });
   server.once("listening", () => balances.start());
   server.once("close", () => teams.close());
@@ -1338,7 +1337,7 @@ export function createApp(config: Config, key: Buffer) {
   server.once("close", () => linear.close());
   server.once("close", () => handoffs.close());
   server.once("close", () => readings.stop());
-  if (projectSourceConfiguredAtStartup) server.once("close", () => projectSource.stop());
+  server.once("close", () => projectSource.stop());
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);

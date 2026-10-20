@@ -1,16 +1,113 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFile, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer } from "node:net";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { demoProfile, startHost, waitFor } from "./helpers.js";
 import { readSyncState, stopSyncService } from "../packages/host/src/sync-service.js";
+import { compareLaptop, describeSource } from "../packages/host/src/client.js";
+import type { ProjectSourceStatus } from "../packages/host/src/project-source.js";
 
 const exec = promisify(execFile);
+
+const sourceStatus = (changes: Partial<ProjectSourceStatus> = {}): ProjectSourceStatus => ({
+  mode: "github", repository: "example/product", baseBranch: "main", ...changes,
+});
+
+test("describeSource renders GitHub source heads, pending states, and saved edits", () => {
+  const now = Date.parse("2026-01-01T12:00:00.000Z");
+  const appliedHead = "0123456789abcdef0123456789abcdef01234567";
+  const mirrorHead = "fedcba9876543210fedcba9876543210fedcba98";
+  const minute = (count: number) => new Date(now - count * 60_000).toISOString();
+
+  assert.equal(describeSource(sourceStatus({ appliedHead, mirrorHead: appliedHead, fetchedAt: minute(2), appliedAt: minute(3) }), now),
+    "follows github example/product@main · host 01234567 = origin/main · fetched 2m ago · applied 3m ago");
+  assert.equal(describeSource(sourceStatus({ appliedHead, mirrorHead, pending: { reason: "fetch-failed", category: "auth", since: minute(14) } }), now),
+    "follows github example/product@main · host 01234567, origin/main fedcba98 · fetch failed 14m ago: auth");
+  assert.equal(describeSource(sourceStatus({ appliedHead, mirrorHead, pending: { reason: "fetch-failed", category: "auth", message: "grant the GitHub App access", since: minute(14) }, savedBranches: ["infinite/saved-old", "infinite/saved-new"] }), now),
+    "follows github example/product@main · host 01234567, origin/main fedcba98 · fetch failed 14m ago: auth · grant the GitHub App access · saved local edits on infinite/saved-new");
+  assert.equal(describeSource(sourceStatus({ appliedHead, mirrorHead, pending: { reason: "session-running", since: minute(1) } }), now),
+    "follows github example/product@main · host 01234567, origin/main fedcba98 · waiting: session running");
+  assert.equal(describeSource(sourceStatus({ appliedHead, mirrorHead, pending: { reason: "diverged", since: minute(1) } }), now),
+    "follows github example/product@main · host diverged from origin/main");
+  assert.equal(describeSource(sourceStatus({ mirrorHead }), now),
+    "follows github example/product@main · host none, origin/main fedcba98");
+  assert.equal(describeSource(sourceStatus(), now),
+    "follows github example/product@main · host none, origin/main unknown");
+  assert.equal(describeSource({ mode: "laptop" }, now), "follows laptop");
+});
+
+test("compareLaptop uses the host mirror commit and exact local graph counts", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-source-compare-")));
+  const git = (...args: string[]) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  const commit = (file: string, contents: string) => {
+    writeFileSync(join(root, file), contents);
+    git("add", file);
+    git("-c", "commit.gpgsign=false", "commit", "-m", contents);
+    return git("rev-parse", "HEAD");
+  };
+  const now = Date.parse("2026-01-01T12:00:00.000Z");
+  try {
+    execFileSync("git", ["init", "--quiet", "-b", "main", root], { stdio: "ignore" });
+    git("config", "user.name", "Test User");
+    git("config", "user.email", "test@example.invalid");
+    const base = commit("base.txt", "base");
+    git("checkout", "--quiet", "-b", "laptop");
+    const laptop = commit("laptop.txt", "laptop");
+    git("checkout", "--quiet", "-b", "host", base);
+    const host = commit("host.txt", "host");
+    const withHead = (mirrorHead?: string) => sourceStatus({ mirrorHead, fetchedAt: new Date(now - 180_000).toISOString() });
+
+    assert.equal(compareLaptop(root, withHead(), now), "host has not fetched origin/main yet");
+    assert.equal(compareLaptop(root, withHead("0".repeat(40)), now), "host is ahead; fetch to compare");
+    assert.equal(compareLaptop(root, withHead(host), now), `laptop ${host.slice(0, 8)} = origin/main`);
+    assert.equal(compareLaptop(root, withHead(base), now), "laptop has 1 unpushed commits; the host runs origin/main");
+    git("checkout", "--quiet", base);
+    assert.equal(compareLaptop(root, withHead(host), now), "laptop is 1 commits behind origin/main (host fetched 3m ago)");
+    git("checkout", "--quiet", laptop);
+    assert.equal(compareLaptop(root, withHead(host), now), "laptop and origin/main have diverged (1 and 1 commits)");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sync refuses a GitHub source before starting the laptop service", { timeout: 60000 }, async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-source-sync-")));
+  const checkout = join(root, "checkout"), hostProject = join(root, "host-project");
+  const fallbackProject = join(root, "fallback-project");
+  mkdirSync(checkout); mkdirSync(hostProject); mkdirSync(fallbackProject);
+  execFileSync("git", ["init", "--quiet", "-b", "main", checkout], { stdio: "ignore" });
+  execFileSync("git", ["-C", checkout, "config", "user.name", "Test User"], { stdio: "ignore" });
+  execFileSync("git", ["-C", checkout, "config", "user.email", "test@example.invalid"], { stdio: "ignore" });
+  writeFileSync(join(checkout, "file.txt"), "enrolled checkout\n");
+  execFileSync("git", ["-C", checkout, "add", "file.txt"], { stdio: "ignore" });
+  execFileSync("git", ["-C", checkout, "-c", "commit.gpgsign=false", "commit", "-m", "Initial fixture"], { stdio: "ignore" });
+  const host = await startHost({ config: { projects: [
+    { id: "rehearsal", name: "Rehearsal", path: hostProject, source: { mode: "github", repository: "example/product", baseBranch: "main" } },
+    { id: "fallback", name: "Fallback", path: fallbackProject },
+  ] } });
+  const clientFile = join(root, "client.json"), stateFile = join(root, "sync", "rehearsal.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner, projectId: "fallback" }), { mode: 0o600 });
+  const identity = createHash("sha256").update(`${host.origin}\n${host.tokens.owner}`).digest("hex");
+  const mappingsPath = join(root, "team-cli", identity, "repo-mappings.json");
+  mkdirSync(join(root, "team-cli", identity), { recursive: true, mode: 0o700 });
+  writeFileSync(mappingsPath, JSON.stringify({ [`${host.origin}\n${checkout}`]: { projectId: "rehearsal", source: "test" } }), { mode: 0o600 });
+  const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/cli.ts"), "--client-config", clientFile];
+  try {
+    await assert.rejects(exec(process.execPath, [...cli, "sync"], { cwd: checkout }),
+      (error: { stderr: string }) => /This project follows GitHub; laptop sync is off\. Push to GitHub, or re-enroll with infinite repo init --source laptop\./.test(error.stderr));
+    assert.equal(existsSync(stateFile), false);
+    await assert.rejects(exec(process.execPath, [...cli, "sync", "--project", "rehearsal"], { cwd: checkout }),
+      (error: { stderr: string }) => /This project follows GitHub; laptop sync is off\. Push to GitHub, or re-enroll with infinite repo init --source laptop\./.test(error.stderr));
+    assert.equal(existsSync(stateFile), false);
+  } finally {
+    await host.stop(); rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("cloud launches mirror the local home layout, checkout contents, and nested cwd across API restarts", { timeout: 120000 }, async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-folders-")));

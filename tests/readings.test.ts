@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Attention } from "@infinite/attention";
 import type { Config, Provider, Session } from "../packages/host/src/types.js";
-import { Readings, candidateSentences, clipTitle, isWeakRuleLine, messageHash, type JevTransport, type ReadingRow } from "../packages/host/src/readings.js";
+import { Readings, candidateSentences, clipTitle, isWeakRuleLine, messageHash, titleInput, type JevTransport, type ReadingRow } from "../packages/host/src/readings.js";
 import { Summarizer } from "../packages/host/src/summary.js";
 
 const longLine = "Investigate the database read path and compare its consistency guarantees across the worker, API, and phone clients before changing any behavior.";
@@ -117,6 +117,38 @@ test("long generated titles ask Jev only with a writer and pass only the clipped
     assert.equal(title?.text, clipTitle(prompt.split("\n")[0]));
     assert.equal(title?.source, "jev-first-line");
   } finally { f.dispose(); }
+});
+
+test("team request titles keep short lines, keep clear clipped lines, and otherwise ask the writer with paths removed", async () => {
+  const inputs: string[] = [];
+  const writer = { titleFromPrompt: async (prompt: string) => { inputs.push(prompt); return { text: "Database read consistency", model: "writer-model" }; } };
+  const clear = responding({ clear: 0.9 }), unclear = responding({ clear: 0.1 });
+  const a = setup({ transport: clear.transport, writer }), b = setup({ transport: unclear.transport, writer });
+  const withoutJev = new Readings({ ...a.config, jev: undefined }, a.key, a.manager, writer);
+  const withoutWriter = new Readings(a.config, a.key, a.manager, undefined, clear.transport);
+  const prompt = `Start from /srv/private/notes.md and ${longLine.toLowerCase()}\nKeep the later line.`;
+  try {
+    assert.equal(await a.readings.requestTitle("Fix the retry race\nWith a long second line that is never used for the title"), undefined);
+    assert.equal(await withoutWriter.requestTitle(prompt), undefined);
+    assert.deepEqual(await a.readings.requestTitle(prompt), { text: clipTitle(titleInput(prompt).split("\n")[0]) });
+    assert.deepEqual(clear.calls.map(call => call.state), [{ clipped: clipTitle(titleInput(prompt).split("\n")[0]) }]);
+    assert.equal(inputs.length, 0);
+    assert.deepEqual(await b.readings.requestTitle(prompt), { text: "Database read consistency", model: "writer-model" });
+    assert.deepEqual(await withoutJev.requestTitle(prompt), { text: "Database read consistency", model: "writer-model" });
+    assert.deepEqual(inputs, [titleInput(prompt), titleInput(prompt)]);
+    assert.match(inputs[0]!, /Start from \[local path omitted\]/);
+    assert.doesNotMatch(JSON.stringify(clear.calls), /\/srv\/private/, "Jev sees the redacted line too");
+    assert.equal(unclear.calls.length, 1);
+  } finally { a.dispose(); b.dispose(); }
+});
+
+test("team title input removes absolute and quoted paths without dropping the request", () => {
+  for (const path of ["/srv/private/customer-contract.md", '"/home/dev/Client Alpha/contract.md"',
+    "'/opt/Client Beta/contract.md'", "`/mnt/Client Gamma/contract.md`", "/data/contracts/draft.md", "~/contracts/draft.md",
+    '"~/Client Alpha/contract.md"', "C:\\contracts\\draft.md", '"C:\\Client Alpha\\contract.md"', "D:/contracts/draft.md",
+    "file:///srv/private/client-contract.md", "/.env", "/secrets", "/home/dev/Client Alpha/contract.md"])
+    assert.equal(titleInput(`Review ${path} using docs/review.md and https://example.invalid/help/review`),
+      "Review [local path omitted] using docs/review.md and https://example.invalid/help/review", path);
 });
 
 test("no writer means a long default title uses a word-boundary clip without a Jev call", async () => {

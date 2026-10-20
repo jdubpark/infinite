@@ -140,7 +140,9 @@ export function createApp(config: Config, key: Buffer) {
     }
   };
   const linear = new LinearService(config, key);
-  const teams = new TeamService(config, key, manager, startInProject, linear);
+  const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
+  const readings = new Readings(config, key, manager, summarizer);
+  const teams = new TeamService(config, key, manager, startInProject, linear, readings);
   const usage = new UsageService(config, key, manager);
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
@@ -252,8 +254,6 @@ export function createApp(config: Config, key: Buffer) {
     }
   };
   const pushStore = new PushStore(config.stateDir, key);
-  const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
-  const readings = new Readings(config, key, manager, summarizer);
   const repositoryBriefings = config.repositoryBriefings
     ? new RepositoryBriefings(config.repositoryBriefings, manager, config.projects, config.teams?.workspaceDir)
     : undefined;

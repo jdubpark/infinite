@@ -33,6 +33,19 @@ establish product impact or human acceptance. The host does not push, open pull
 requests, merge into the original checkout, or deploy.
 The paired CLI can bring a team's integrated branch into an ordinary local branch with `infinite team pull TEAM_ID`.
 
+A run started without its own title is named by its request's first line, and the
+full request stays visible on the run as "Your request". A first line longer than
+60 characters gets a shorter title in the background. Local paths and file URLs
+are removed from the request first; quote a path that contains spaces so it is
+removed whole. With `jev` configured, Jev keeps the clipped line when it reads
+clearly; otherwise the `summaries` writer names the request. Once the coordinator's plan arrives,
+its brief title replaces either form; a title the owner wrote is never replaced.
+A Linear issue created for the run follows these renames, and any concurrent edit
+to its description, project, or parent still blocks the run. A title edit made on
+Linear also blocks it, with one exception: a rename request the host sent but
+never got an answer for may still commit, so a change to that exact title is
+treated as the late rename and renamed back to the run's newest title.
+
 ## Start from a terminal
 
 The paired laptop CLI can enroll a repository and control the same Teams shown

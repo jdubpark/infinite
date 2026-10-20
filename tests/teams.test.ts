@@ -6,12 +6,12 @@ import { createInterface } from "node:readline";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
-import { checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
-import type { CreateTeam, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
+import { applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
+import type { CreateTeam, TeamBrief, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
 
@@ -54,6 +54,66 @@ test("team runs use readable names and exact root permissions under a strict uma
     process.umask(previousUmask);
     try { await f?.close(); } finally { rmSync(root, { recursive: true, force: true }); }
   }
+});
+
+test("request titles are named asynchronously and briefs take over model-owned titles", { timeout: 120000 }, async () => {
+  const root = mkdtempSync("/tmp/inf-team-title-model-");
+  const keyFile = join(root, "model-key"), requests: Record<string, any>[] = [];
+  writeFileSync(keyFile, randomBytes(32).toString("hex"), { mode: 0o600 });
+  const model = createServer(async (request, response) => {
+    let body = ""; for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: "Review reporting flow" }] }] }));
+  });
+  await new Promise<void>((resolve, reject) => { model.once("error", reject); model.listen(0, "127.0.0.1", resolve); });
+  const address = model.address();
+  if (!address || typeof address === "string") throw new Error("Title fixture needs a TCP address");
+  let f: Awaited<ReturnType<typeof fixture>> | undefined;
+  try {
+    f = await fixture("success", undefined, { summaries: { model: "example-writer", apiKeyFile: keyFile, baseUrl: `http://127.0.0.1:${address.port}` } } as unknown as Partial<Config>);
+    const objective = "Improve how owners review generated reports before they reach /home/dev/example/private.txt\nKeep the existing export format.";
+    const fallback = f.create(); fallback.title = objective.trim().split("\n")[0]!.slice(0, 100).trim(); fallback.objective = objective;
+    const created = await f.host.fetchApi("/teams", "owner", fallback);
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const named = await waitFor(() => f!.get(created.body.id), run => run.titleSource === "model" && run.title === "Review reporting flow", 30000);
+    assert.equal(named.objective, objective, "The full request remains saved on the run");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]!.store, false);
+    assert.equal(requests[0]!.input, "Improve how owners review generated reports before they reach [local path omitted]\nKeep the existing export format.");
+
+    const run = structuredClone(named) as unknown as TeamRun;
+    const brief: TeamBrief = { title: "Evidence-backed report updates", problem: "Reports lack a clear review path.", evidence: [{ source: "Repository review", observation: "The report page has no review summary." }],
+      dataShape: "A report with a status and reviewer note.", acceptance: ["The review state is visible."], expectedOutcome: "Owners can assess reports quickly.", uiChanges: true };
+    applyTeamBriefTitle(run, brief);
+    assert.equal(run.title, brief.title);
+    assert.equal(run.titleSource, "brief");
+    assert.equal(run.objective, objective);
+
+    const ownerRequest = f.create(); ownerRequest.title = "Owner chosen title"; ownerRequest.objective = "Create two independent files and verify their integrated contents.";
+    const ownerCreated = await f.host.fetchApi("/teams", "owner", ownerRequest);
+    assert.ok([200, 201].includes(ownerCreated.status), JSON.stringify(ownerCreated.body));
+    const ownerRun = await f.get(ownerCreated.body.id);
+    assert.equal(ownerRun.title, "Owner chosen title");
+    assert.equal(ownerRun.titleSource, undefined);
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.equal(requests.length, 1, "Owner-written titles do not invoke the naming model");
+  } finally {
+    try { await f?.close(); } finally {
+      model.closeAllConnections(); await new Promise<void>(resolve => model.close(() => resolve()));
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+for (const completion of ["cancelled", "superseded"] as const)
+test(`a ${completion} plan completion preserves the team title and still records its brief`, () => {
+  const run = { title: "Model title", titleSource: "model", status: completion === "cancelled" ? "cancelled" : "planning", revision: 2 } as TeamRun;
+  const brief: TeamBrief = { title: "Brief title", problem: "Reports need review", evidence: [{ source: "Repository", observation: "Review is missing" }],
+    dataShape: "Report status", acceptance: ["Review is visible"], expectedOutcome: "Reports can be reviewed", uiChanges: true };
+  applyTeamBriefTitle(run, brief, completion === "superseded" ? 1 : 2);
+  assert.equal(run.title, "Model title");
+  assert.equal(run.titleSource, "model");
+  assert.deepEqual(run.brief, brief, "Recording the completed plan's brief keeps its existing semantics");
 });
 
 for (const unsafe of ["root", "parent"] as const)

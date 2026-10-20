@@ -13,6 +13,7 @@ import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
 import type { CreateTeam, TeamBrief, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
+import { permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
 
 // The shared fallback lineup used by delivery and permission tests; the limit tests below define their own.
@@ -1374,6 +1375,75 @@ test("a member back from an outage into a delegable prompt runs again and gets a
     assert.equal(result.members[0].status, "running");
     assert.equal(result.permissionDecisions?.[0].status, "escalated");
     assert.match(result.permissionDecisions?.[0].reason ?? "", /coordinator provider is not configured/);
+  } finally { f.close(); }
+});
+
+for (const [ending, minutes, event] of [
+  ["its request is obsolete", 0, /could not be confirmed stopped/],
+  ["its review window expires", 6, /exceeded its review window/],
+] as const) {
+  test(`a permission coordinator that does not exit after ${ending} stays unavailable and is reported once`, async () => {
+    const f = schedulerFixture();
+    try {
+      const at = new Date().toISOString(), manager = f.run.members[0];
+      manager.startedAt = at; f.state.attention.lastActivityAt = at;
+      const coordinator = { ...manager, memberId: randomUUID(), role: "permission-coordinator" as const, title: "Permission coordinator",
+        startedAt: new Date(Date.now() - minutes * 60000).toISOString() };
+      f.run.members.push(coordinator);
+      f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
+      // The decision's target member is gone, so the review is obsolete even inside its window.
+      f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: randomUUID(), targetSessionId: randomUUID(),
+        targetCwd: coordinator.cwd, promptId: 1, promptHash: "b".repeat(64), evidenceHash: "c".repeat(64), option: 0,
+        prompt: { id: 1, kind: "permission", source: "screen", hash: "b".repeat(64), pinned: true, acceptsText: false,
+          title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+          options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" }] },
+        expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: coordinator.memberId, answerRequestId: randomUUID(), status: "reviewing" }];
+      // Its process keeps running after the host asks it to stop.
+      f.manager.stopTeamSession = async () => f.manager.state();
+      f.writeTeam();
+      const teams = f.openTeam();
+      const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+      for (let pass = 0; pass < 3; pass++) await scheduler.step(scheduler.record(f.run.id));
+      const result = teams.get(f.run.id);
+      assert.equal(result.members[1].status, "unavailable");
+      assert.equal(result.permissionDecisions?.[0].status, "escalated");
+      const reported = result.events.filter(item => /permission coordinator/.test(item.text));
+      assert.equal(reported.length, 1, JSON.stringify(reported));
+      assert.match(reported[0].text, event);
+    } finally { f.close(); }
+  });
+}
+
+test("a permission coordinator back from an outage during a current review runs again", async () => {
+  const f = schedulerFixture();
+  try {
+    const at = new Date().toISOString(), target = f.run.members[0];
+    target.startedAt = at; f.state.attention.lastActivityAt = at;
+    const idle = structuredClone(f.state);
+    const prompt = { id: 1, kind: "permission" as const, source: "screen" as const, hash: "b".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" as const }, { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" as const }] };
+    f.state.attention.state = "needs-you"; f.state.attention.prompt = prompt;
+    const coordinator = { ...target, memberId: randomUUID(), sessionId: randomUUID(), role: "permission-coordinator" as const,
+      title: "Permission coordinator", status: "unavailable" as const };
+    f.run.members.push(coordinator);
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
+    f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: target.memberId, targetSessionId: target.sessionId,
+      targetCwd: target.cwd, promptId: prompt.id, promptHash: prompt.hash, evidenceHash: permissionEvidenceHash(prompt), prompt, option: 0,
+      expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: coordinator.memberId, answerRequestId: randomUUID(), status: "reviewing" }];
+    // The target still waits on the same prompt; the coordinator's own session is running again and has reported nothing yet.
+    const targetState = f.manager.state, targetEvents = f.manager.events;
+    f.manager.state = async (sessionId?: string) => sessionId === coordinator.sessionId ? structuredClone(idle) : targetState();
+    f.manager.events = (sessionId: string, after: number, limit: number, types?: Set<string>) =>
+      sessionId === coordinator.sessionId ? { events: [], cursor: after, more: false } : targetEvents(sessionId, after, limit, types);
+    f.writeTeam();
+    const teams = f.openTeam();
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+    await scheduler.step(scheduler.record(f.run.id));
+    const result = teams.get(f.run.id);
+    assert.equal(result.members[1].status, "running");
+    assert.equal(result.permissionDecisions?.[0].status, "reviewing");
+    assert.deepEqual(result.events.filter(item => /permission coordinator/.test(item.text)), []);
   } finally { f.close(); }
 });
 

@@ -7,6 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { captureWorkspace, type WorkspaceManifest } from "./workspace-checkpoint.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
+import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
 
 export interface SyncServiceOptions {
   origin: string; token: string; projectId: string; root: string; stateFile: string; storeDir: string;
@@ -188,6 +189,7 @@ async function pendingReason(options: SyncServiceOptions, signal: AbortSignal): 
 async function runSyncService(): Promise<void> {
   const abort = new AbortController();
   let released = false, reported = false, options: SyncServiceOptions | undefined, reason: string | undefined;
+  let changeDetector: ReturnType<typeof watchWorkspaceChanges>;
   const stop = () => abort.abort();
   const disconnected = () => { if (!released) stop(); };
   const detach = (value: unknown) => {
@@ -238,56 +240,68 @@ async function runSyncService(): Promise<void> {
     };
     // `held`: the host kept the last pushed content but cannot apply it for a lasting reason.
     let previous: WorkspaceManifest | undefined, committed: string | undefined, lastFull = 0, failures = 0, pushFailures = 0, held = false;
+    let firstIteration = true, previousIterationFailed = false, lastCaptureStartedAt = 0, lastPendingCheckAt = 0;
+    changeDetector = watchWorkspaceChanges([config.root]);
     while (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) {
       let content: string | undefined, pushing = false;
       try {
-        const forceFull = Date.now() - lastFull > 60000;
         progress();
-        const left: string[] = [];
-        const manifest = await captureWorkspace({ roots: [config.root], cwd: config.root, storeDir: config.storeDir, signal: abort.signal, previous, forceFull, onProgress: progress, onSkipped: path => left.push(path) });
-        previous = manifest;
-        if (left.length !== skipped.length) { if (left.length) state.skipped = left.length; else delete state.skipped; record(); }
-        skipped = left;
-        if (forceFull) lastFull = Date.now();
-        content = fingerprint(manifest);
-        if (content !== committed) {
-          pushing = true; held = false;
-          progress();
-          const { generation } = await api<{ generation: string }>(config, "begin", abort.signal, {});
-          // A batch request reports nothing until the host has stored it; a heartbeat keeps startup alive meanwhile.
-          const uploading = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
-          try {
-            await uploadMissingChunks({ storeDir: config.storeDir, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), signal: abort.signal, progress, transport: {
-              has: async (hashes, signal) => (await api<{ missing: unknown }>(config, "has", signal, { hashes })).missing,
-              putBatch: async (body, signal) => {
-                try { await api(config, "blobs", signal, undefined, body, BATCH_TIMEOUT); }
-                catch (error) { if (error instanceof MissingRouteError) return "unsupported"; throw error; }
-              },
-              put: async (hash, bytes, signal) => { await api(config, `blob/${hash}`, signal, undefined, bytes); },
-            } });
-          } finally { clearInterval(uploading); }
-          // The host applies inside this request and reports nothing until it finishes; a heartbeat keeps startup alive meanwhile.
-          const heartbeat = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
-          try { await api(config, "commit", abort.signal, { generation, manifest }, undefined, COMMIT_TIMEOUT); }
-          finally { clearInterval(heartbeat); }
-          committed = content; pushFailures = 0;
-          state.lastCommitAt = new Date().toISOString(); state.lastManifest = manifest.id; delete state.problem;
-          record();
-        } else if (held) {
-          // An explicit apply on the host, or a reset, replaces the failure marker; then normal pushing resumes.
+        const changed = changeDetector?.take() ?? true;
+        const capture = firstIteration || shouldCaptureWorkspace({ changed, previousFailed: previousIterationFailed, lastCaptureStartedAt, checkpointCurrent: true });
+        firstIteration = false;
+        if (capture) {
+          lastCaptureStartedAt = Date.now();
+          const forceFull = Date.now() - lastFull > 60000;
+          const left: string[] = [];
+          const manifest = await captureWorkspace({ roots: [config.root], cwd: config.root, storeDir: config.storeDir, signal: abort.signal, previous, forceFull, onProgress: progress, onSkipped: path => left.push(path) });
+          previous = manifest;
+          if (left.length !== skipped.length) { if (left.length) state.skipped = left.length; else delete state.skipped; record(); }
+          skipped = left;
+          if (forceFull) lastFull = Date.now();
+          content = fingerprint(manifest);
+          if (content !== committed) {
+            pushing = true; held = false;
+            progress();
+            const { generation } = await api<{ generation: string }>(config, "begin", abort.signal, {});
+            // A batch request reports nothing until the host has stored it; a heartbeat keeps startup alive meanwhile.
+            const uploading = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
+            try {
+              await uploadMissingChunks({ storeDir: config.storeDir, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), signal: abort.signal, progress, transport: {
+                has: async (hashes, signal) => (await api<{ missing: unknown }>(config, "has", signal, { hashes })).missing,
+                putBatch: async (body, signal) => {
+                  try { await api(config, "blobs", signal, undefined, body, BATCH_TIMEOUT); }
+                  catch (error) { if (error instanceof MissingRouteError) return "unsupported"; throw error; }
+                },
+                put: async (hash, bytes, signal) => { await api(config, `blob/${hash}`, signal, undefined, bytes); },
+              } });
+            } finally { clearInterval(uploading); }
+            // The host applies inside this request and reports nothing until it finishes; a heartbeat keeps startup alive meanwhile.
+            const heartbeat = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
+            try { await api(config, "commit", abort.signal, { generation, manifest }, undefined, COMMIT_TIMEOUT); }
+            finally { clearInterval(heartbeat); }
+            committed = content; pushFailures = 0;
+            state.lastCommitAt = new Date().toISOString(); state.lastManifest = manifest.id; delete state.problem;
+            record();
+          } else if (state.problem && !held) { delete state.problem; record(); }
+        }
+        if (held && Date.now() - lastPendingCheckAt >= 30000) {
+          // An explicit apply on the host, or a reset, replaces the failure marker; poll at a bounded rate.
+          lastPendingCheckAt = Date.now();
           if (await pendingReason(config, abort.signal) !== "apply-failed") { held = false; pushFailures = 0; delete state.problem; record(); }
-        } else if (state.problem) { delete state.problem; record(); }
+        } else if (capture && !held && state.problem) { delete state.problem; record(); }
         failures = 0;
         ready();
+        previousIterationFailed = false;
       } catch (error) {
         if (abort.signal.aborted) break;
         if (error instanceof FatalSyncError) { reason = error.message; break; }
+        previousIterationFailed = true;
         failures += 1;
         if (pushing) pushFailures += 1;
         // A held apply failure stays the reported problem until it is resolved or new content is pushed.
         if (!held || pushing) state.problem = (error instanceof Error ? error.message : "Workspace sync is retrying").slice(0, 200);
         // The host received this content and kept it pending; pushing the same content again would fail the same way.
-        if (pushing && error instanceof SyncRequestError && error.code === "apply-failed" && LASTING.has(error.category ?? "")) { committed = content; held = true; }
+        if (pushing && error instanceof SyncRequestError && error.code === "apply-failed" && LASTING.has(error.category ?? "")) { committed = content; held = true; pushFailures = 0; }
         record();
         if (held) ready();
         else if (!reported && failures > 5) { reason = state.problem; break; }
@@ -298,6 +312,7 @@ async function runSyncService(): Promise<void> {
     }
   } catch (error) { process.exitCode = 1; if (error instanceof Error && error.message !== STARTUP_ERROR) reason ??= error.message; }
   finally {
+    changeDetector?.close();
     stop(); clearTimeout(startup);
     process.off("disconnect", disconnected); process.off("message", detach);
     for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(name, stop);

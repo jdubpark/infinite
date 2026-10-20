@@ -230,7 +230,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   let duplex: ReturnType<typeof terminalConnection> | undefined;
   let interactive = !watch && me.role === "owner", online = false, cursor = 0, queued = "", sending = false, warned = false;
   let initialControl = interactive, leasesSupported = false, controlPending = false;
-  let handoffTimer: ReturnType<typeof setInterval> | undefined, handoffBusy = false, handoffNotice = "";
+  let handoffTimer: ReturnType<typeof setTimeout> | undefined, handoffBusy = false, handoffNotice = "";
   let renewal: ReturnType<typeof setInterval> | undefined;
   let lastStatus: Status = session.status;
   // A detached CLI has no background job to keep alive. Terminate this client
@@ -287,11 +287,18 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
     if (abort.signal.aborted || !interactive) return;
     loseControl(error instanceof TerminalControlError ? error.message : "Input delivery is uncertain. Nothing was retried. Inspect the terminal, then press Enter to enable input again.");
   };
+  const scheduleHandoff = (delayMs: number) => {
+    if (abort.signal.aborted) return;
+    handoffTimer = setTimeout(() => { void checkHandoff(); }, delayMs);
+    handoffTimer.unref();
+  };
   const checkHandoff = async () => {
     if (handoffBusy || abort.signal.aborted) return;
     handoffBusy = true;
+    let nextPollMs = 5000;
     try {
       const handoff = await api.json<{ status: string; reason?: string; teamId?: string }>(`/sessions/${session.id}/handoff`, undefined, AbortSignal.timeout(5000));
+      if (["requested", "waiting-for-control", "stopping", "creating", "blocked"].includes(handoff.status)) nextPollMs = 1000;
       if (handoff.status === "blocked") {
         const message = `Agent handoff is blocked${handoff.reason ? `: ${clean(handoff.reason)}` : ". Inspect the session before continuing."}`;
         if (handoffNotice !== message) notice(handoffNotice = message);
@@ -318,7 +325,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
         stop();
       }
     } catch { /* Older hosts return no handoff route; normal attachment continues. */ }
-    finally { handoffBusy = false; }
+    finally { handoffBusy = false; scheduleHandoff(nextPollMs); }
   };
   const send = async () => {
     if (sending) return;
@@ -382,8 +389,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   process.stdin.on("data", input); process.stdin.resume();
   process.stdout.on("resize", resize);
   process.on("SIGTERM", stop); process.on("SIGINT", stop); process.on("SIGHUP", stop);
-  handoffTimer = setInterval(() => { void checkHandoff(); }, 1000);
-  handoffTimer.unref();
+  scheduleHandoff(1000);
   try {
     while (!abort.signal.aborted) {
       const stalled = new AbortController();
@@ -453,7 +459,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
     }
   } finally { restoreTerminal(); }
   function restoreTerminal() {
-    progress.stop(); clearInterval(renewal); clearInterval(handoffTimer); abort.abort(); queued = ""; screen.dispose();
+    progress.stop(); clearInterval(renewal); clearTimeout(handoffTimer); abort.abort(); queued = ""; screen.dispose();
     process.stdin.off("data", input); process.stdin.pause();
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.stdout.off("resize", resize);

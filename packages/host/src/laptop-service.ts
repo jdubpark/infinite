@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { forwardExecutor, type ExecutorControl } from "./executor-tunnel.js";
 import { captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob, validateWorkspaceManifest, type WorkspaceManifest } from "./workspace-checkpoint.js";
+import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
 
 interface LaptopServiceOptions {
   origin: string;
@@ -23,60 +24,85 @@ interface LaptopServiceOptions {
 const STARTUP_TIMEOUT = 30000;
 const STARTUP_ERROR = "The laptop executor did not connect. Inspect the session before trying again; no command was replayed.";
 
+function entriesFingerprint(manifest: WorkspaceManifest): string {
+  return createHash("sha256").update(JSON.stringify({ cwd: manifest.cwd, roots: manifest.roots, entries: manifest.entries })).digest("hex");
+}
+
 /** One incremental transfer at a time, independent of the terminal and first tool. */
-async function synchronizeWorkspace(options: LaptopServiceOptions, control: ExecutorControl, signal: AbortSignal) {
+export async function synchronizeWorkspace(options: LaptopServiceOptions, control: ExecutorControl, signal: AbortSignal) {
   const inside = (root: string, path: string) => { const rel = relative(root, path); return !rel || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); };
   let directory = join(dirname(options.configFile), "workspaces", options.sessionId);
   if (options.roots.some(root => inside(root, directory))) directory = join(homedir(), ".infinite", "workspaces", options.sessionId);
   if (options.roots.some(root => inside(root, directory))) throw new Error("Workspace cache must be outside the selected project");
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const storeDir = join(directory, "objects");
+  const changeDetector = watchWorkspaceChanges(options.roots);
   let previous: WorkspaceManifest | undefined, recovered: string | undefined, lastFull = 0;
-  while (!signal.aborted) {
-    try {
-      const status = await control("sync/status");
-      if (status.location === "cloud") {
-        const exported = await control("sync/export");
-        const manifest = validateWorkspaceManifest(exported.manifest);
-        const fingerprint = createHash("sha256").update(JSON.stringify(manifest.entries)).digest("hex");
-        if (fingerprint !== recovered) {
-          const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
-          for (let offset = 0; offset < hashes.length; offset += 512) {
-            const missing = await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512));
-            for (const hash of missing) {
-              if (signal.aborted) return;
-              const { base64 } = await control("sync/blob", { hash });
-              await putWorkspaceBlob(storeDir, hash, base64);
+  let committed: { revision: number; epoch: number; id: string; entriesFingerprint: string } | undefined;
+  let previousIterationFailed = false, lastCaptureStartedAt = 0;
+  try {
+    while (!signal.aborted) {
+      try {
+        const status = await control("sync/status");
+        if (status.location === "cloud") {
+          const exported = await control("sync/export");
+          const manifest = validateWorkspaceManifest(exported.manifest);
+          const fingerprint = createHash("sha256").update(JSON.stringify(manifest.entries)).digest("hex");
+          if (fingerprint !== recovered) {
+            const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
+            for (let offset = 0; offset < hashes.length; offset += 512) {
+              const missing = await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512));
+              for (const hash of missing) {
+                if (signal.aborted) return;
+                const { base64 } = await control("sync/blob", { hash });
+                await putWorkspaceBlob(storeDir, hash, base64);
+              }
+            }
+            const destination = join(directory, "recovered", manifest.id);
+            await materializeWorkspace({ manifest, storeDir, destination });
+            await writeFile(join(directory, "recovery.json"), JSON.stringify({ checkpoint: status.checkpoint, cloudCheckpoint: manifest.id,
+              capturedAt: manifest.capturedAt, destination, originalRoots: options.roots }), { mode: 0o600 });
+            recovered = fingerprint;
+          }
+        } else {
+          const changed = changeDetector?.take() ?? true;
+          const checkpointCurrent = !!committed && status.acknowledged === true && status.revision === committed.revision && status.checkpoint?.id === committed.id;
+          const capture = shouldCaptureWorkspace({ changed, previousFailed: previousIterationFailed, lastCaptureStartedAt, checkpointCurrent });
+          if (capture) {
+            const begin = await control("sync/begin");
+            const forceFull = Date.now() - lastFull > 60000;
+            // Clear events received during sync/begin just before capture; later events schedule another capture.
+            changeDetector?.take();
+            lastCaptureStartedAt = Date.now();
+            const manifest = await captureWorkspace({ roots: options.roots, cwd: options.cwd, storeDir, signal, previous, forceFull });
+            if (forceFull) lastFull = Date.now();
+            const content = entriesFingerprint(manifest);
+            if (committed && content === committed.entriesFingerprint && begin.revision === committed.revision && status.checkpoint?.id === committed.id && status.acknowledged === true) {
+              previous = manifest;
+            } else {
+              const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
+              for (let offset = 0; offset < hashes.length; offset += 512) {
+                const { missing } = await control("sync/has", { hashes: hashes.slice(offset, offset + 512) });
+                if (!Array.isArray(missing) || missing.some(hash => !hashes.includes(hash))) throw new Error("Invalid workspace transfer reply");
+                for (const hash of missing) {
+                  if (signal.aborted) return;
+                  await control("sync/blob", { hash, base64: await readWorkspaceBlob(storeDir, hash) });
+                }
+              }
+              await control("sync/commit", { ...begin, manifest });
+              previous = manifest;
+              committed = { revision: begin.revision, epoch: begin.epoch, id: manifest.id, entriesFingerprint: content };
             }
           }
-          const destination = join(directory, "recovered", manifest.id);
-          await materializeWorkspace({ manifest, storeDir, destination });
-          await writeFile(join(directory, "recovery.json"), JSON.stringify({ checkpoint: status.checkpoint, cloudCheckpoint: manifest.id,
-            capturedAt: manifest.capturedAt, destination, originalRoots: options.roots }), { mode: 0o600 });
-          recovered = fingerprint;
         }
-      } else {
-        const begin = await control("sync/begin");
-        const forceFull = Date.now() - lastFull > 60000;
-        const manifest = await captureWorkspace({ roots: options.roots, cwd: options.cwd, storeDir, signal, previous, forceFull });
-        const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
-        for (let offset = 0; offset < hashes.length; offset += 512) {
-          const { missing } = await control("sync/has", { hashes: hashes.slice(offset, offset + 512) });
-          if (!Array.isArray(missing) || missing.some(hash => !hashes.includes(hash))) throw new Error("Invalid workspace transfer reply");
-          for (const hash of missing) {
-            if (signal.aborted) return;
-            await control("sync/blob", { hash, base64: await readWorkspaceBlob(storeDir, hash) });
-          }
-        }
-        await control("sync/commit", { ...begin, manifest });
-        previous = manifest;
-        if (forceFull) lastFull = Date.now();
+        previousIterationFailed = false;
+      } catch (error) {
+        previousIterationFailed = true;
+        if (!signal.aborted) await control("sync/problem", { reason: error instanceof Error ? error.message.slice(0, 200) : "Workspace preparation is retrying" }).catch(() => {});
       }
-    } catch (error) {
-      if (!signal.aborted) await control("sync/problem", { reason: error instanceof Error ? error.message.slice(0, 200) : "Workspace preparation is retrying" }).catch(() => {});
+      await delay(3000, undefined, { signal }).catch(() => {});
     }
-    await delay(3000, undefined, { signal }).catch(() => {});
-  }
+  } finally { changeDetector?.close(); }
 }
 
 /** Check the installed executable before creating a cloud session. */

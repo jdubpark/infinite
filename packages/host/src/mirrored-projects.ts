@@ -57,7 +57,7 @@ export class MirroredProjects {
 
   private destination(path: string): string {
     if (!homeRelativePath(path)) throw invalid();
-    const home = this.canonical(resolve(this.config.sync?.homeDir ?? homedir()));
+    const home = this.home();
     const destination = resolve(home, ...path.split("/"));
     if (!inside(home, destination) || destination === home) throw invalid();
     // Refuse symlink aliases: they could silently select another project or private host directory.
@@ -72,6 +72,8 @@ export class MirroredProjects {
     if (protectedPaths.some(value => inside(destination, this.canonical(resolve(value))) || inside(this.canonical(resolve(value)), destination))) throw invalid();
     return destination;
   }
+
+  private home() { return this.canonical(resolve(this.config.sync?.homeDir ?? homedir())); }
 
   private register(path: string, id?: string): Project {
     const destination = this.destination(path);
@@ -104,8 +106,23 @@ export class MirroredProjects {
     const project = this.register(path, entry?.id);
     try {
       // Intermediate folders remain host-controlled even when agents can edit each applied project.
-      mkdirSync(dirname(project.path), { recursive: true, mode: this.config.sync?.sharedGroup ? 0o2750 : 0o700 });
-      mkdirSync(project.path, { recursive: true, mode: this.config.sync?.sharedGroup ? 0o2770 : 0o700 });
+      const shared = this.config.sync?.sharedGroup, parent = dirname(project.path), home = this.home();
+      // A folder agents can write could swap a folder below it for a symlink before the chmods below follow it.
+      // Check every existing ancestor up to the home folder, or to the first existing folder above a missing home.
+      if (shared)
+        for (let dir = parent; ; dir = dirname(dir)) {
+          let exists = true;
+          try { if (lstatSync(dir).mode & 0o022) throw invalid(); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; exists = false; }
+          if ((exists && inside(dir, home)) || dirname(dir) === dir) break;
+        }
+      const firstParent = mkdirSync(parent, { recursive: true, mode: shared ? 0o2750 : 0o700 });
+      const created = mkdirSync(project.path, { recursive: true, mode: shared ? 0o2770 : 0o700 });
+      if (shared) {
+        // mkdir modes pass through the process umask (the service runs with 0077), so set them on the folders this call made.
+        if (firstParent) for (let dir = parent; ; dir = dirname(dir)) { chmodDirectoryNoFollow(dir, 0o2750); if (dir === firstParent || dirname(dir) === dir) break; }
+        if (created) chmodDirectoryNoFollow(project.path, 0o2770);
+      }
       const wasForgotten = entry?.forgotten;
       if (wasForgotten && this.config.sync?.sharedGroup) {
         const info = lstatSync(project.path);

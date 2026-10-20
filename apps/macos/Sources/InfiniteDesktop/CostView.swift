@@ -92,10 +92,7 @@ enum AccountPalette {
 }
 
 private let dayParser: DateFormatter = { let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"; return f }()
-private let monthName: DateFormatter = { let f = DateFormatter(); f.setLocalizedDateFormatFromTemplate("MMMM"); return f }()
 private let dayName: DateFormatter = { let f = DateFormatter(); f.setLocalizedDateFormatFromTemplate("EEE d MMM"); return f }()
-private let isoPlain: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f }()
-private func isoDate(_ value: String) -> Date? { ISO8601DateFormatter.flexible.date(from: value) ?? isoPlain.date(from: value) }
 
 struct CostView: View {
     @ObservedObject var app: AppModel
@@ -143,19 +140,33 @@ struct CostView: View {
 }
 
 /// A dollar figure with its source marker: "≥" and a dotted line when some steps carried no price.
+/// Unmeasured work counts the same way: a figure with gaps is a floor, and nothing measured is "—", never $0.
 struct MoneyText: View {
     let money: Money
-    init(_ money: Money) { self.money = money }
+    let unmeasured: Int
+    init(_ money: Money, unmeasured: Int = 0) { self.money = money; self.unmeasured = unmeasured }
+    private var display: Money.Display { money.display(unmeasured: unmeasured) }
+    private var gaps: String {
+        var parts: [String] = []
+        if money.unpriced > 0 { parts.append("\(money.unpriced) step\(money.unpriced == 1 ? "" : "s") had no price") }
+        if unmeasured > 0 { parts.append("\(unmeasured) session\(unmeasured == 1 ? "" : "s") unmeasured") }
+        return parts.joined(separator: " · ")
+    }
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 3) {
-            if money.isFloor { Text("≥").foregroundStyle(.secondary) }
-            Text(UsageFormat.usd(money.usd)).overlay(alignment: .bottom) {
-                // A hairline of dots under a floor, the same weight at every size.
-                if money.isFloor { Line().stroke(Palette.muted, style: StrokeStyle(lineWidth: 1, dash: [1, 2])).frame(height: 1).offset(y: 2) }
+            switch display {
+            case .absent: Text("—").foregroundStyle(.tertiary)
+            case .floor(let usd):
+                Text("≥").foregroundStyle(.secondary)
+                Text(UsageFormat.usd(usd)).overlay(alignment: .bottom) {
+                    // A hairline of dots under a floor, the same weight at every size.
+                    Line().stroke(Palette.muted, style: StrokeStyle(lineWidth: 1, dash: [1, 2])).frame(height: 1).offset(y: 2)
+                }
+            case .exact(let usd): Text(UsageFormat.usd(usd))
             }
         }
-        .help(money.isFloor ? "At least: \(money.unpriced) step\(money.unpriced == 1 ? "" : "s") had no price" : "")
-        .accessibilityLabel(money.isFloor ? "at least \(UsageFormat.usd(money.usd))" : UsageFormat.usd(money.usd))
+        .help(display == .exact(money.usd) ? "" : (display == .absent ? "Not measured: " : "At least: ") + gaps)
+        .accessibilityLabel(display == .absent ? "not measured" : display.label.replacingOccurrences(of: "≥ ", with: "at least "))
     }
     private struct Line: Shape {
         func path(in rect: CGRect) -> Path { var path = Path(); path.move(to: CGPoint(x: rect.minX, y: rect.midY)); path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY)); return path }
@@ -182,8 +193,9 @@ private struct OverviewSection: View {
         }
     }
     private func headline(_ overview: UsageOverview) -> some View {
-        let start = isoDate(overview.month.start)
-        let previous = start.flatMap { Calendar.current.date(byAdding: .day, value: -1, to: $0) }
+        // The host's month starts at 00:00 UTC; the name is read in UTC so it never slips a month west of it.
+        let month = UsageFormat.monthName(overview.month.start)
+        let previous = UsageFormat.previousMonthName(overview.month.start)
         let delta = UsageFormat.delta(overview.month.spent.usd, previous: overview.month.previous.usd)
         return VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 14) {
@@ -192,7 +204,7 @@ private struct OverviewSection: View {
                     HStack(spacing: 4) {
                         Image(systemName: delta.hasPrefix("+") ? "arrow.up.right" : delta.hasPrefix("−") ? "arrow.down.right" : "arrow.right").font(.system(size: 10, weight: .bold))
                         Text(delta).monospacedDigit()
-                        if let previous { Text("vs \(monthName.string(from: previous))").foregroundStyle(.secondary) }
+                        if let previous { Text("vs \(previous)").foregroundStyle(.secondary) }
                     }
                     .font(.caption.weight(.medium)).padding(.horizontal, 9).padding(.vertical, 4)
                     .background(Color.primary.opacity(0.06), in: Capsule())
@@ -202,7 +214,7 @@ private struct OverviewSection: View {
                 }
             }
             HStack(spacing: 6) {
-                Text(start.map { monthName.string(from: $0) } ?? "This month").foregroundStyle(.primary)
+                Text(month ?? "This month").foregroundStyle(.primary)
                 dot
                 HStack(spacing: 4) { Text("with plans"); Text(UsageFormat.usd(overview.withPlansUsd)).monospacedDigit().foregroundStyle(.primary) }
                 if overview.month.unmeasuredSessions > 0 { dot; Text("\(overview.month.unmeasuredSessions) unmeasured").monospacedDigit() }
@@ -369,7 +381,7 @@ private struct ProjectRowView: View {
                 Text(project.name).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                 Sparkline(values: project.spark).frame(width: 104, height: 24)
                 MoneyText(project.month).font(.callout).monospacedDigit().foregroundStyle(.secondary).frame(width: 84, alignment: .trailing)
-                MoneyText(project.total).font(.callout.weight(.medium)).monospacedDigit().frame(width: 96, alignment: .trailing)
+                MoneyText(project.total, unmeasured: project.unmeasured ?? 0).font(.callout.weight(.medium)).monospacedDigit().frame(width: 96, alignment: .trailing)
                 Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.tertiary)
             }
             .padding(.horizontal, 10).padding(.vertical, 9).contentShape(Rectangle())
@@ -417,11 +429,14 @@ private struct ProjectDetailSection: View {
                 HStack(alignment: .firstTextBaseline, spacing: 14) {
                     Text(project.name).font(.title2.weight(.semibold)).lineLimit(1)
                     Spacer(minLength: 12)
-                    MoneyText(project.total).font(.system(size: 28, weight: .semibold, design: .rounded))
+                    MoneyText(project.total, unmeasured: project.unmeasured ?? 0).font(.system(size: 28, weight: .semibold, design: .rounded))
                 }
                 if let daily = model.projectDaily { DailyChart(daily: daily, colors: colors) }
-                HStack(spacing: 18) {
-                    count(project.byKind.goals, "goal"); count(project.byKind.teams, "team run"); count(project.byKind.sessions, "session"); count(project.byKind.briefings, "briefing")
+                HStack(alignment: .top, spacing: 26) {
+                    kind(project.goals.count, "goal", usd: project.byKind.goals)
+                    kind(project.teams.count, "team run", usd: project.byKind.teams)
+                    kind(project.sessions.count, "session", usd: project.byKind.sessions)
+                    kind(project.briefings.runs, "briefing", usd: project.byKind.briefings)
                 }
                 if !project.goals.isEmpty {
                     group("Goals") {
@@ -440,9 +455,10 @@ private struct ProjectDetailSection: View {
                 if !project.sessions.isEmpty {
                     group("Sessions") { ForEach(project.sessions) { session in row(session.title, detail: nil, money: session.total) } }
                 }
-                if project.briefings.runs > 0 || project.byKind.briefings > 0 {
+                if project.briefings.runs > 0 || project.briefings.total.usd > 0 {
                     group("Briefings") {
-                        row("\(project.briefings.runs) run\(project.briefings.runs == 1 ? "" : "s")", detail: project.briefings.unmeasured > 0 ? "\(project.briefings.unmeasured) unmeasured" : nil, money: project.briefings.total)
+                        row("\(project.briefings.runs) run\(project.briefings.runs == 1 ? "" : "s")", detail: project.briefings.unmeasured > 0 ? "\(project.briefings.unmeasured) unmeasured" : nil,
+                            money: project.briefings.total, unmeasured: project.briefings.unmeasured)
                     }
                 }
                 CostLegend()
@@ -451,10 +467,14 @@ private struct ProjectDetailSection: View {
             }
         }
     }
-    private func count(_ n: Int, _ noun: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 4) {
-            Text("\(n)").font(.system(size: 17, weight: .semibold, design: .rounded)).monospacedDigit()
-            Text(n == 1 ? noun : noun + "s").font(.caption).foregroundStyle(.secondary)
+    /// How many of a kind, and the dollars they add up to.
+    private func kind(_ n: Int, _ noun: String, usd: Double) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text("\(n)").font(.system(size: 17, weight: .semibold, design: .rounded)).monospacedDigit()
+                Text(n == 1 ? noun : noun + "s").font(.caption).foregroundStyle(.secondary)
+            }
+            Text(n == 0 && usd <= 0 ? "—" : UsageFormat.usd(usd)).font(.callout).monospacedDigit().foregroundStyle(n == 0 && usd <= 0 ? .tertiary : .secondary)
         }
     }
     private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -463,12 +483,12 @@ private struct ProjectDetailSection: View {
             content()
         }
     }
-    private func row(_ title: String, detail: String?, money: Money) -> some View {
+    private func row(_ title: String, detail: String?, money: Money, unmeasured: Int = 0) -> some View {
         HStack(spacing: 12) {
             Text(title).lineLimit(1)
             if let detail { Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
             Spacer(minLength: 12)
-            MoneyText(money).font(.callout).monospacedDigit()
+            MoneyText(money, unmeasured: unmeasured).font(.callout).monospacedDigit()
         }
         .padding(.horizontal, 10).padding(.vertical, 7)
         .overlay(alignment: .bottom) { Rectangle().fill(Palette.line).frame(height: 1).padding(.horizontal, 10) }

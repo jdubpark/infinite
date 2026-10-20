@@ -9,9 +9,26 @@ public struct Money: Codable, Equatable, Sendable {
     public var unpriced: Int
     public init(usd: Double, unpriced: Int = 0) { self.usd = usd; self.unpriced = unpriced }
     public static let zero = Money(usd: 0)
-    /// "≥ $12.40" when some steps carried no price, otherwise "$12.40".
-    public var label: String { (unpriced > 0 ? "≥ " : "") + UsageFormat.usd(usd) }
+    /// "≥ $12.40" when some steps carried no price, "—" when nothing priced was measured, otherwise "$12.40".
+    public var label: String { display().label }
     public var isFloor: Bool { unpriced > 0 }
+    /// How a figure shows once the work the ledger could not price or see is counted in. A figure is
+    /// never $0 when something was spent that nobody measured; it is a floor when part was measured.
+    public enum Display: Equatable, Sendable {
+        case absent, floor(Double), exact(Double)
+        public var label: String {
+            switch self {
+            case .absent: return "—"
+            case .floor(let usd): return "≥ " + UsageFormat.usd(usd)
+            case .exact(let usd): return UsageFormat.usd(usd)
+            }
+        }
+    }
+    public func display(unmeasured: Int = 0) -> Display {
+        let gaps = unpriced > 0 || unmeasured > 0
+        if usd <= 0 && gaps { return .absent }
+        return gaps ? .floor(usd) : .exact(usd)
+    }
 }
 
 public struct Balance: Codable, Equatable, Sendable {
@@ -77,7 +94,9 @@ public struct ProjectUsageSummary: Codable, Equatable, Sendable, Identifiable {
     public var total: Money
     public var month: Money
     public var spark: [Double]
-    public init(id: String, name: String, total: Money, month: Money, spark: [Double]) { self.id = id; self.name = name; self.total = total; self.month = month; self.spark = spark }
+    /// Sessions and briefings the ledger could not measure; absent on hosts that do not count them yet.
+    public var unmeasured: Int?
+    public init(id: String, name: String, total: Money, month: Money, spark: [Double], unmeasured: Int? = nil) { self.id = id; self.name = name; self.total = total; self.month = month; self.spark = spark; self.unmeasured = unmeasured }
 }
 public struct UsageProjects: Codable, Equatable, Sendable {
     public var projects: [ProjectUsageSummary]
@@ -86,12 +105,13 @@ public struct UsageProjects: Codable, Equatable, Sendable {
 
 /// `GET /api/usage/projects/:id`: everything attributed to one project, split by kind.
 public struct ProjectUsage: Codable, Equatable, Sendable {
+    /// Dollars spent per kind of work. Counts come from the rows themselves and from `briefings.runs`.
     public struct Kinds: Codable, Equatable, Sendable {
-        public var goals: Int
-        public var teams: Int
-        public var sessions: Int
-        public var briefings: Int
-        public init(goals: Int, teams: Int, sessions: Int, briefings: Int) { self.goals = goals; self.teams = teams; self.sessions = sessions; self.briefings = briefings }
+        public var goals: Double
+        public var teams: Double
+        public var sessions: Double
+        public var briefings: Double
+        public init(goals: Double, teams: Double, sessions: Double, briefings: Double) { self.goals = goals; self.teams = teams; self.sessions = sessions; self.briefings = briefings }
     }
     public struct Goal: Codable, Equatable, Sendable, Identifiable {
         public var id: String
@@ -127,8 +147,10 @@ public struct ProjectUsage: Codable, Equatable, Sendable {
     public var teams: [Team]
     public var sessions: [Session]
     public var briefings: Briefings
-    public init(id: String, name: String, total: Money, byKind: Kinds, goals: [Goal], teams: [Team], sessions: [Session], briefings: Briefings) {
-        self.id = id; self.name = name; self.total = total; self.byKind = byKind; self.goals = goals; self.teams = teams; self.sessions = sessions; self.briefings = briefings
+    /// Sessions and briefings the ledger could not measure; absent on hosts that do not count them yet.
+    public var unmeasured: Int?
+    public init(id: String, name: String, total: Money, byKind: Kinds, goals: [Goal], teams: [Team], sessions: [Session], briefings: Briefings, unmeasured: Int? = nil) {
+        self.id = id; self.name = name; self.total = total; self.byKind = byKind; self.goals = goals; self.teams = teams; self.sessions = sessions; self.briefings = briefings; self.unmeasured = unmeasured
     }
 }
 
@@ -250,6 +272,24 @@ public enum UsageFormat {
         let rounded = Int(percent.rounded())
         if rounded == 0 { return "0%" }
         return (rounded > 0 ? "+" : "−") + String(abs(rounded)) + "%"
+    }
+    /// The month an ISO instant falls in, read in UTC because the host's month windows start at
+    /// 00:00 UTC; the local zone would name the previous month west of Greenwich.
+    public static func monthName(_ iso: String, locale: Locale = .current) -> String? {
+        guard let date = parseISO(iso) else { return nil }
+        return monthFormatter(locale).string(from: date)
+    }
+    /// The month before the one `iso` falls in, in the same UTC reading.
+    public static func previousMonthName(_ iso: String, locale: Locale = .current) -> String? {
+        guard let date = parseISO(iso), let previous = utcCalendar.date(byAdding: .month, value: -1, to: date) else { return nil }
+        return monthFormatter(locale).string(from: previous)
+    }
+    private static let utcCalendar: Calendar = { var c = Calendar(identifier: .gregorian); c.timeZone = TimeZone(identifier: "UTC")!; return c }()
+    private static let isoFractional: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
+    private static let isoPlain: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f }()
+    private static func parseISO(_ iso: String) -> Date? { isoFractional.date(from: iso) ?? isoPlain.date(from: iso) }
+    private static func monthFormatter(_ locale: Locale) -> DateFormatter {
+        let f = DateFormatter(); f.locale = locale; f.timeZone = TimeZone(identifier: "UTC"); f.setLocalizedDateFormatFromTemplate("MMMM"); return f
     }
     /// "0.91" style rate as a percent without decimals: "91%".
     public static func percent(_ rate: Double) -> String { String(Int((rate * 100).rounded())) + "%" }

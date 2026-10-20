@@ -3,11 +3,12 @@ import { randomBytes, randomUUID } from "node:crypto";
 
 export interface FixtureIssue {
   id: string; identifier: string; url: string; title: string; description: string;
-  updatedAt: string; archivedAt: string | null; team: { id: string }; parent: { id: string } | null;
+  updatedAt: string; archivedAt: string | null; team: { id: string }; project: { id: string } | null; parent: { id: string } | null;
   state: { id: string; name: string; type: string };
 }
 interface FixtureComment { id: string; body: string; issue: { id: string } }
-type WriteOperation = "InfiniteLinearIssueCreate" | "InfiniteLinearCommentCreate";
+type WriteOperation = "InfiniteLinearIssueCreate" | "InfiniteLinearIssueUpdate" | "InfiniteLinearCommentCreate";
+type IssueEdit = Partial<Pick<FixtureIssue, "id" | "title" | "description" | "team" | "project" | "parent" | "state" | "archivedAt">>;
 
 /** A GraphQL peer with committed writes that can lose their HTTP acknowledgement. */
 export async function startLinearServer() {
@@ -18,15 +19,16 @@ export async function startLinearServer() {
   const calls: { operation: string; variables: Record<string, any> }[] = [];
   const lostResponses: { operation: WriteOperation; id: string }[] = [];
   const violations: string[] = [];
-  let drop: { operation: WriteOperation; bodyIncludes?: string } | undefined, unavailable = false, clock = Date.now();
+  let drop: { operation: WriteOperation; bodyIncludes?: string } | undefined, titleUpdateEdit: IssueEdit | undefined, unavailable = false, clock = Date.now();
+  let holdTitle = false, rejectTitle = false; const heldTitles: { id: string; title: string }[] = [];
   const updatedAt = () => new Date(++clock).toISOString();
   const linearDescription = (value: string) => value.replace(/(?<![\[(<])https?:\/\/[^\s)>]+/g, url => `[${url}](<${url}>)`)
     .replace(/^([ \t]*)- /gm, "$1* ").trimEnd();
-  const seedIssue = (input: { id?: string; title: string; description: string; parentId?: string }) => {
+  const seedIssue = (input: { id?: string; title: string; description: string; parentId?: string; projectId?: string }) => {
     const identifier = `TEST-${issues.size + 1}`;
     const issue: FixtureIssue = { id: input.id ?? randomUUID(), identifier,
       url: `https://linear.app/example/issue/${identifier}`, title: input.title, description: input.description,
-      updatedAt: updatedAt(), archivedAt: null, team: { id: teamId }, parent: input.parentId ? { id: input.parentId } : null,
+      updatedAt: updatedAt(), archivedAt: null, team: { id: teamId }, project: input.projectId ? { id: input.projectId } : null, parent: input.parentId ? { id: input.parentId } : null,
       state: { id: randomUUID(), name: "Todo", type: "unstarted" } };
     issues.set(issue.id, issue); return issue;
   };
@@ -64,6 +66,16 @@ export async function startLinearServer() {
           if (issues.has(input.id)) { reply(200, { errors: [{ message: "Issue ID already exists" }] }); return; }
           const issue = seedIssue({ ...input, description: linearDescription(input.description) });
           writtenId = issue.id; data = { issueCreate: { success: true, issue } }; break;
+        }
+        case "InfiniteLinearIssueUpdate": {
+          const issue = issues.get(variables.id), input = variables.input;
+          if (!issue || typeof input?.title !== "string") throw new Error("Incomplete issue update");
+          // A held update fails before it commits; the test commits it later to model a delayed write.
+          if (holdTitle) { holdTitle = false; heldTitles.push({ id: issue.id, title: input.title }); response.destroy(); return; }
+          if (rejectTitle) { rejectTitle = false; data = { issueUpdate: { success: false, issue: null } }; break; }
+          Object.assign(issue, { title: input.title, ...titleUpdateEdit, updatedAt: updatedAt() });
+          titleUpdateEdit = undefined;
+          writtenId = issue.id; data = { issueUpdate: { success: true, issue } }; break;
         }
         case "InfiniteLinearComment": {
           const id = variables.filter?.id?.eq;
@@ -124,9 +136,16 @@ export async function startLinearServer() {
     rateLimitLabelChanges(value: boolean) { rateLimitLabelChanges = value; },
     dropNextResponse(operation: WriteOperation, bodyIncludes?: string) { drop = { operation, bodyIncludes }; },
     restore() { unavailable = false; },
-    editIssue(id: string, changes: Partial<Pick<FixtureIssue, "title" | "description" | "state" | "archivedAt">>) {
+    editIssue(id: string, changes: IssueEdit) {
       const issue = issues.get(id); if (!issue) throw new Error("Unknown fixture issue");
       Object.assign(issue, changes, { updatedAt: updatedAt() });
+    },
+    editOnNextTitleUpdate(changes: IssueEdit) { titleUpdateEdit = changes; },
+    holdNextTitleUpdate() { holdTitle = true; },
+    rejectNextTitleUpdate() { rejectTitle = true; },
+    commitHeldTitleUpdate() {
+      const held = heldTitles.shift(); if (!held) throw new Error("No held title update");
+      Object.assign(issues.get(held.id)!, { title: held.title, updatedAt: updatedAt() });
     },
     async close() { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); },
   };

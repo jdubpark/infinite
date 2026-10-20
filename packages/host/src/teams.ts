@@ -8,13 +8,14 @@ import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamPermissionDecision, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamPermissionDecision, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
 import { teamUsage } from "./team-usage.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
+import type { Readings } from "./readings.js";
 import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberWorkspace, prepareTeamWorkspace, teamCommand, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { oneShotPermissionOption, permissionEvidenceHash, refusedBeforeSend } from "./team-permissions.js";
@@ -67,6 +68,14 @@ export const memberTimeLimitReason = "An agent exceeded its one-hour runtime lim
 export const memberStallReason = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
 export const checkTimeoutReason = "A configured check ran past the team check time limit (teams.checkMinutes) and was stopped. No correction round was used; the integrated work was preserved.";
 
+export function applyTeamBriefTitle(run: TeamRun, brief: TeamBrief | undefined, revision = run.revision) {
+  run.brief = brief;
+  if (brief && run.status !== "cancelled" && revision === run.revision && (run.titleSource === "request" || run.titleSource === "model" || run.titleSource === "brief")) {
+    run.title = brief.title;
+    run.titleSource = "brief";
+  }
+}
+
 /**
  * The fallback for a member stopped at a provider limit. Its own provider counts as limited even when
  * only a single-source observation saw the limit, so a second hop never returns to that account.
@@ -114,7 +123,7 @@ export class TeamService {
   private usage?: UsageService;
   private readonly limits: ProviderLimits;
   private reconciledAt = 0;
-  constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService) {
+  constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService, private readonly titler?: Pick<Readings, "requestTitle">) {
     this.directory = join(config.stateDir, "teams");
     this.limits = new ProviderLimits(join(config.stateDir, "provider-limits.sealed"), key);
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
@@ -204,6 +213,19 @@ export class TeamService {
   private save(stored: Stored) {
     stored.run.updatedAt = timestamp();
     writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored);
+  }
+  private async nameRequest(id: string, objective: string) {
+    try {
+      const title = (await this.titler!.requestTitle(objective))?.text;
+      if (!title) return;
+      await this.enqueue(() => {
+        const stored = this.records.get(id), run = stored?.run;
+        if (this.closed || !stored || !run || run.titleSource !== "request" || !["planning", "discovering", "implementing", "integrating", "verifying", "reviewing", "delivering", "needs-input", "paused"].includes(run.status)) return;
+        run.title = title;
+        run.titleSource = "model";
+        this.save(stored);
+      });
+    } catch { /* Best-effort naming never affects team creation or execution. */ }
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
@@ -322,7 +344,9 @@ export class TeamService {
       // The `infinite/team-` prefix keeps constrained launchers that allow only team branches working.
       const branch = `infinite/team-${slug}-${suffix}`;
       const root = project.teamworkDir ?? this.config.teams.workspaceDir;
-      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: structuredClone(project.team.permissions), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      const fallbackTitle = parsed.objective.trim().split("\n")[0]!.slice(0, 100).trim();
+      const titleSource = !internal?.goal && !internal?.handoff && !internal?.missionId && parsed.title === fallbackTitle ? "request" as const : undefined;
+      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: structuredClone(project.team.permissions), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
           throw new TeamError(409, "delivery-lineup-required", "Automatic merge requires a configured strong coordinator and independent strong reviewer.");
@@ -340,6 +364,7 @@ export class TeamService {
       } else ensureDefaultTeamRoot(root, true);
       const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, root, ...(anchor ? { anchor } : {}), source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
       this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
+      if (run.titleSource === "request" && this.titler) void this.nameRequest(run.id, parsed.objective);
       this.operation(stored, "prepare", async signal => this.startInProject(run.projectId, async () => {
         const assertParent = () => {
           if (parent && (!["ready-for-review", "merged", "no-change"].includes(parent.status) || parent.revision !== parentRevision || parent.headCommit !== source.head))
@@ -1324,7 +1349,7 @@ export class TeamService {
           const index = remaining.findIndex(task => task.dependsOn.every(id => run.tasks.some(done => done.id === id)));
           run.tasks.push({ ...remaining.splice(index, 1)[0], revision: member.revision, reviewRounds: 0, status: "pending" });
         }
-        run.brief = report.brief;
+        applyTeamBriefTitle(run, report.brief, member.revision);
         if (report.verification && !run.verification) {
           run.verification = structuredClone(report.verification);
           this.event(stored, "The coordinator established verification commands under the owner's project opt-in.");

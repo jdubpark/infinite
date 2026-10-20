@@ -344,6 +344,248 @@ test("mission child questions and blockers stay with the coordinator; coordinato
   } finally { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
+test("created team issues follow guarded run title changes", { timeout: 45000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-retitle-"));
+  const config = { stateDir: join(root, "state"), linear: { apiKeyFile: join(root, "linear-key"), endpoint: linear.endpoint },
+    projects: [{ id: "retitle", name: "Retitle", path: root, linear: { teamId: linear.teamId } }] } as unknown as Config;
+  writeFileSync(config.linear!.apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const service = new LinearService(config, randomBytes(32));
+  const makeRun = (title: string) => ({ id: randomUUID(), projectId: "retitle", title, objective: "Review the requested change", status: "implementing",
+    revision: 1, members: [], checks: [], steering: [], decisions: [] } as unknown as TeamRun);
+  try {
+    const synced = makeRun("Request title");
+    service.updateTeam(synced, true);
+    service.start();
+    assert.equal(await waitFor(() => service.getTeam(synced.id)?.status, status => status === "synced" || status === "blocked", 15000), "synced");
+    const issueId = service.getTeam(synced.id)!.issue!.id;
+    service.updateTeam({ ...synced, title: "Model title" }, true);
+    const renamed = await waitFor(() => service.getTeam(synced.id), value => value?.status === "synced" && value.issue?.title === "Model title", 15000);
+    assert.equal(linear.issues.get(issueId)!.title, "Model title");
+    assert.ok(linear.calls.some(call => call.operation === "InfiniteLinearIssueUpdate" && call.variables.input.title === "Model title"));
+    assert.equal(renamed.status, "synced");
+
+    const conflicted = makeRun("Second request title");
+    service.updateTeam(conflicted, true);
+    assert.equal(await waitFor(() => service.getTeam(conflicted.id)?.status, status => status === "synced" || status === "blocked", 15000), "synced");
+    linear.editOnNextTitleUpdate({ description: "A concurrent edit changed the requirements" });
+    service.updateTeam({ ...conflicted, title: "Second model title" }, true);
+    const blocked = await waitFor(() => service.getTeam(conflicted.id), value => value?.status === "blocked", 15000);
+    assert.match(blocked.reason!, /requirements or parent changed/);
+
+    const beforeCreate = makeRun("Original request title");
+    service.updateTeam(beforeCreate, true);
+    service.updateTeam({ ...beforeCreate, title: "Named before issue creation" }, true);
+    assert.equal(await waitFor(() => service.getTeam(beforeCreate.id)?.status, status => status === "synced" || status === "blocked", 15000), "synced");
+    assert.equal(linear.issues.get(beforeCreate.id)!.title, "Named before issue creation");
+    assert.equal(linear.calls.some(call => call.operation === "InfiniteLinearIssueUpdate" && call.variables.id === beforeCreate.id), false,
+      "A title change before issueCreate must update its saved input, not issueUpdate later");
+    assert.deepEqual(linear.violations, []);
+  } finally { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a lost issue title acknowledgement is reconciled by the next read", { timeout: 45000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-retitle-lost-ack-"));
+  const config = { stateDir: join(root, "state"), linear: { apiKeyFile: join(root, "linear-key"), endpoint: linear.endpoint },
+    projects: [{ id: "retitle", name: "Retitle", path: root, linear: { teamId: linear.teamId } }] } as unknown as Config;
+  writeFileSync(config.linear!.apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const service = new LinearService(config, randomBytes(32));
+  const run = { id: randomUUID(), projectId: "retitle", title: "Request title", objective: "Review the requested change", status: "implementing",
+    revision: 1, members: [], checks: [], steering: [], decisions: [] } as unknown as TeamRun;
+  try {
+    service.updateTeam(run, true);
+    service.start();
+    assert.equal(await waitFor(() => service.getTeam(run.id)?.status, status => status === "synced" || status === "blocked", 15000), "synced");
+    linear.dropNextResponse("InfiniteLinearIssueUpdate");
+    service.updateTeam({ ...run, title: "Model title" }, true);
+    const issueId = run.id;
+    await waitFor(() => linear.lostResponses.length, count => count === 1, 15000);
+    assert.equal(linear.issues.get(issueId)?.title, "Model title", "Linear committed the title even though the acknowledgement was lost");
+    linear.restore();
+
+    // A queued member forces the next authoritative issue read after the lost acknowledgement.
+    service.updateTeam({ ...run, title: "Model title", members: [{ memberId: randomUUID(), status: "queued" }] } as unknown as TeamRun, true);
+    const reconciled = await waitFor(() => service.getTeam(run.id), value => value?.status === "synced" && value.issue?.title === "Model title", 15000);
+    assert.equal(reconciled.status, "synced");
+    assert.equal(linear.calls.filter(call => call.operation === "InfiniteLinearIssueUpdate").length, 1,
+      "the read that confirms the landed title must clear the pending retitle without another update");
+    assert.deepEqual(linear.violations, []);
+  } finally { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a rename that commits after a newer one is accepted and reverted; an owner edit back to an acknowledged title still blocks", { timeout: 60000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-retitle-late-"));
+  const config = { stateDir: join(root, "state"), linear: { apiKeyFile: join(root, "linear-key"), endpoint: linear.endpoint },
+    projects: [{ id: "retitle", name: "Retitle", path: root, linear: { teamId: linear.teamId } }] } as unknown as Config;
+  writeFileSync(config.linear!.apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const service = new LinearService(config, randomBytes(32));
+  const run = { id: randomUUID(), projectId: "retitle", title: "Request title", objective: "Review the requested change", status: "implementing",
+    revision: 1, members: [], checks: [], steering: [], decisions: [] } as unknown as TeamRun;
+  const refresh = (title: string) => service.updateTeam({ ...run, title, members: [{ memberId: randomUUID(), status: "queued" }] } as unknown as TeamRun, true);
+  const updates = () => linear.calls.filter(call => call.operation === "InfiniteLinearIssueUpdate").length;
+  try {
+    service.updateTeam(run, true);
+    service.start();
+    assert.equal(await waitFor(() => service.getTeam(run.id)?.status, status => status === "synced" || status === "blocked", 15000), "synced");
+
+    // The first rename fails before Linear commits it; while it backs off, a read of the unchanged issue must not retry it early.
+    linear.holdNextTitleUpdate();
+    service.updateTeam({ ...run, title: "Model title" }, true);
+    await waitFor(() => updates(), count => count === 1, 15000);
+    linear.restore();
+    refresh("Model title");
+    await waitFor(() => service.getTeam(run.id), value => value?.status === "synced" && value.issue?.title === "Request title", 15000);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(updates(), 1, "A routine read does not reset the rename backoff");
+
+    // A newer title is confirmed, then the held older request commits late.
+    service.updateTeam({ ...run, title: "Brief title" }, true);
+    await waitFor(() => service.getTeam(run.id), value => value?.status === "synced" && value.issue?.title === "Brief title", 15000);
+    linear.commitHeldTitleUpdate();
+    refresh("Brief title");
+    const restored = await waitFor(() => service.getTeam(run.id), value => value?.status === "blocked" || (value?.status === "synced" && linear.issues.get(run.id)?.title === "Brief title" && value.issue?.title === "Brief title"), 15000);
+    assert.equal(restored.status, "synced", restored.reason);
+
+    // Brief title's request was acknowledged, so an owner setting it again is an edit the host did not make.
+    service.updateTeam({ ...run, title: "Final title" }, true);
+    await waitFor(() => service.getTeam(run.id), value => value?.status === "synced" && value.issue?.title === "Final title", 15000);
+    linear.editIssue(run.id, { title: "Brief title" });
+    refresh("Final title");
+    const edited = await waitFor(() => service.getTeam(run.id), value => value?.status === "blocked", 15000);
+    assert.match(edited.reason!, /requirements or parent changed/);
+    assert.deepEqual(linear.violations, []);
+  } finally { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("an unanswered rename stays host-authored across a restart and a later acknowledged retry of the same title", { timeout: 90000 }, async () => {
+  const f = await retitleFixture();
+  const updates = () => f.linear.calls.filter(call => call.operation === "InfiniteLinearIssueUpdate").length;
+  try {
+    await f.start();
+    // B1 fails before committing; B2 (the same title) is acknowledged; then C is acknowledged.
+    f.linear.holdNextTitleUpdate();
+    f.service.updateTeam({ ...f.run, title: "Model title" }, true);
+    await waitFor(() => updates(), count => count === 1);
+    f.linear.restore();
+    f.service.close();
+    f.restart();
+    // The persisted rename backoff (30 s after one failure) survives the restart before B2 is sent.
+    await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "synced" && value.issue?.title === "Model title", 45000);
+    assert.equal(updates(), 2);
+    f.service.updateTeam({ ...f.run, title: "Brief title" }, true);
+    await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "synced" && value.issue?.title === "Brief title", 15000);
+    // B1 commits much later; it is still an unanswered host request, so the run continues and is renamed back.
+    f.linear.commitHeldTitleUpdate();
+    f.service.updateTeam({ ...f.run, title: "Brief title", members: [{ memberId: randomUUID(), status: "queued" }] } as unknown as TeamRun, true);
+    const result = await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "blocked"
+      || (value?.status === "synced" && f.linear.issues.get(f.run.id)?.title === "Brief title" && value.issue?.title === "Brief title" && updates() === 4), 15000);
+    assert.equal(result.status, "synced", result.reason);
+    assert.deepEqual(f.linear.violations, []);
+  } finally { await f.close(); }
+});
+
+test("a rename Linear answered with a refusal is not host evidence later", { timeout: 90000 }, async () => {
+  const f = await retitleFixture();
+  const updates = () => f.linear.calls.filter(call => call.operation === "InfiniteLinearIssueUpdate").length;
+  try {
+    await f.start();
+    f.linear.rejectNextTitleUpdate();
+    f.service.updateTeam({ ...f.run, title: "Model title" }, true);
+    await waitFor(() => updates(), count => count === 1);
+    f.service.updateTeam({ ...f.run, title: "Brief title" }, true);
+    await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "synced" && value.issue?.title === "Brief title", 45000);
+    f.linear.editIssue(f.run.id, { title: "Model title" });
+    f.service.updateTeam({ ...f.run, title: "Brief title", members: [{ memberId: randomUUID(), status: "queued" }] } as unknown as TeamRun, true);
+    const edited = await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "blocked", 15000);
+    assert.match(edited.reason!, /requirements or parent changed/);
+  } finally { await f.close(); }
+});
+
+async function retitleFixture(projectId?: string) {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-retitle-regression-")), key = randomBytes(32);
+  const config = { stateDir: join(root, "state"), linear: { apiKeyFile: join(root, "linear-key"), endpoint: linear.endpoint },
+    projects: [{ id: "retitle", name: "Retitle", path: root, linear: { teamId: linear.teamId, ...(projectId ? { projectId } : {}) } }] } as unknown as Config;
+  writeFileSync(config.linear!.apiKeyFile, linear.apiKey, { mode: 0o600 });
+  let service = new LinearService(config, key);
+  const run = { id: randomUUID(), projectId: "retitle", title: "Request title", objective: "Review the requested change", status: "implementing",
+    revision: 1, members: [], checks: [], steering: [], decisions: [] } as unknown as TeamRun;
+  return { linear, run, get service() { return service; },
+    async start() {
+      service.updateTeam(run, true); service.start();
+      assert.equal(await waitFor(() => service.getTeam(run.id)?.status, status => status === "synced" || status === "blocked", 15000), "synced");
+    },
+    restart() { service.close(); service = new LinearService(config, key); service.start(); },
+    async close() { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+for (const successor of ["Brief title", "Request title"])
+test(`a superseded title with a lost acknowledgement survives restart and sends ${successor}`, { timeout: 30000 }, async () => {
+  const f = await retitleFixture();
+  try {
+    await f.start();
+    f.linear.dropNextResponse("InfiniteLinearIssueUpdate");
+    f.service.updateTeam({ ...f.run, title: "Model title" }, true);
+    await waitFor(() => f.linear.lostResponses.length, count => count === 1);
+    assert.equal(f.linear.issues.get(f.run.id)?.title, "Model title");
+    assert.equal(f.service.getTeam(f.run.id)?.status, "synced", "A lost rename acknowledgement must not gate execution");
+    // The desired title changes while the cached issue still has the original title.
+    // Repeat the update as list/get polling does, including when reverting to that original.
+    for (let i = 0; i < 2; i++) f.service.updateTeam({ ...f.run, title: successor }, true);
+    f.service.close();
+    f.linear.restore();
+    f.restart();
+    const result = await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "blocked"
+      || value?.status === "synced" && value.issue?.title === successor, 15000);
+    assert.equal(result?.status, "synced", result?.reason);
+    assert.equal(f.linear.issues.get(f.run.id)?.title, successor);
+    assert.deepEqual(f.linear.calls.filter(call => call.operation === "InfiniteLinearIssueUpdate").map(call => call.variables.input.title),
+      ["Model title", successor], "Reconcile the durable attempt before sending its successor exactly once");
+    assert.deepEqual(f.linear.violations, []);
+  } finally { await f.close(); }
+});
+
+for (const gate of ["completed", "canceled", "unsupported", "archived", "id", "team", "parent", "project"] as const)
+test(`title update responses enforce the ${gate} gate`, { timeout: 30000 }, async () => {
+  const f = await retitleFixture(gate === "project" ? randomUUID() : undefined);
+  try {
+    await f.start();
+    const change = gate === "archived" ? { archivedAt: new Date().toISOString() }
+      : gate === "id" ? { id: randomUUID() }
+      : ["team", "parent", "project"].includes(gate) ? { [gate]: { id: randomUUID() } }
+      : { state: { id: randomUUID(), name: "Changed workflow", type: gate } };
+    f.linear.editOnNextTitleUpdate(change);
+    f.service.updateTeam({ ...f.run, title: "Model title" }, true);
+    const result = await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "blocked" || value?.issue?.title === "Model title", 15000);
+    assert.equal(result?.status, "blocked", `The ${gate} change must stop execution even in a successful rename response`);
+    assert.match(result.reason!, ["id", "team", "parent", "project"].includes(gate)
+      ? /different team, project, or parent|requirements or parent changed/ : /closed, archived, or uses an unsupported workflow state/);
+    assert.deepEqual(f.linear.violations, []);
+  } finally { await f.close(); }
+});
+
+for (const acknowledgement of ["received", "lost"] as const)
+test(`a title rename with a ${acknowledgement} acknowledgement rejects project moves without a configured project`, { timeout: 30000 }, async () => {
+  const f = await retitleFixture();
+  try {
+    await f.start();
+    f.linear.editOnNextTitleUpdate({ project: { id: randomUUID() } });
+    if (acknowledgement === "lost") f.linear.dropNextResponse("InfiniteLinearIssueUpdate");
+    f.service.updateTeam({ ...f.run, title: "Model title" }, true);
+    if (acknowledgement === "lost") {
+      await waitFor(() => f.linear.lostResponses.length, count => count === 1);
+      f.service.close(); f.linear.restore(); f.restart();
+    }
+    const result = await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "blocked" || value?.issue?.title === "Model title", 15000);
+    assert.equal(result?.status, "blocked", "A title-only exception must not accept a project move");
+    assert.match(result.reason!, /requirements or parent changed|project/);
+    assert.deepEqual(f.linear.violations, []);
+  } finally { await f.close(); }
+});
+
 test("a blocked run's issue gets its reason, next step and a Blocked label until the run moves again", { timeout: 60000 }, async () => {
   const linear = await startLinearServer();
   const root = mkdtempSync(join(tmpdir(), "inf-linear-flag-"));

@@ -300,6 +300,8 @@ export interface TeamRun {
   delivery?: TeamDelivery;
   /** Agent-reported delivery evidence; this is not independently verified by the host. */
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
+  /** Whether the current run title came from its request, a naming model, or the coordinator brief. */
+  titleSource?: "request" | "model" | "brief";
   linearTracking?: boolean;
   linear?: LinearTrackingView;
   id: string;

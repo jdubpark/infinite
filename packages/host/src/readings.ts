@@ -67,6 +67,15 @@ function keyOf(id: string, type: Key, hash: string) { return `${id}:${type}:${ha
 function pairOf(id: string, type: Key) { return `${id}:${type}`; }
 function firstLine(prompt: string) { return prompt.split(/\r?\n/, 1)[0]?.trim() ?? ""; }
 
+// Team requests can name private files; strip file URLs and absolute or quoted paths before any model sees them.
+// An unquoted path with spaces is cut at each space, so later fragments that still contain a separator are removed too.
+export function titleInput(value: string) {
+  const omitted = "[local path omitted]";
+  return value.replace(/(["'`])([^\r\n]*?)\1/g, (quoted, _quote, path: string) =>
+    /^(?:file:\/\/|\/[^/\s]|~\/|[A-Za-z]:[\\/])/i.test(path) ? omitted : quoted)
+    .replace(/(?<![\w./:\\~-])(?:file:\/\/[^\s<>"'`]*|\/[^\s<>"'`]+|~\/[^\s<>"'`]*|[A-Za-z]:[\\/][^\s<>"'`]*)(?:[ \t]+[^\s<>"'`]*[\\/][^\s<>"'`]*)*/gi, omitted);
+}
+
 /** True only when the rule-based turn line is likely to be unhelpful on the phone. */
 export function isWeakRuleLine(message: string): boolean {
   const firstRawLine = message.split(/\r?\n/).find(line => line.trim() !== "")?.trim() ?? "";
@@ -295,6 +304,26 @@ export class Readings {
     const title = await this.writer!.titleFromPrompt(prompt);
     if (!title?.text?.trim()) throw new Error("Title writer returned no text");
     if (stillCurrent()) this.recordResult(row.id, "title", hash, { title: { text: title.text.trim().slice(0, 100), source: "writer", model: title.model } });
+  }
+  /**
+   * A concise team run title, or undefined to keep the request's first line. A line of 60 characters or fewer is
+   * kept as is; Jev, when configured, keeps a clear clipped line; otherwise the writer names the path-redacted request.
+   */
+  async requestTitle(prompt: string): Promise<{ text: string; model?: string } | undefined> {
+    if (!this.writer || firstLine(prompt).length <= 60) return undefined;
+    const input = titleInput(prompt), clipped = clipTitle(firstLine(input));
+    if (this.config.jev) {
+      const result = await this.ask({
+        state: { clipped },
+        questions: { clear: noul("Is `clipped` a clear title for the requested work?", { true: "The clipped first line clearly identifies the requested work.", false: "The clipped first line is not a clear title." }) },
+      }, () => true);
+      const answer = result?.answers.clear;
+      if (answer?.type !== "noul") throw new Error("Invalid Jev title reading");
+      if (answer.noul >= 0.6) return { text: clipped };
+    }
+    const title = await this.writer.titleFromPrompt(input);
+    const text = title.text.trim().slice(0, 100);
+    return text ? { text, model: title.model } : undefined;
   }
   private async ask(request: Omit<SystemOneRequest<Questions>, "model">, stillCurrent: () => boolean) {
     const client = this.transport ?? await this.createTransport();

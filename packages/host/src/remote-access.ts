@@ -45,6 +45,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (team && UUID.test(team[1])) return method === "GET" ? !team[2]
     : method === "POST" && Boolean(team[2]) && (!team[3] || UUID.test(team[3]));
   if (["POST", "DELETE"].includes(method) && url.pathname === "/api/devices/push") return true;
+  if (method === "POST" && url.pathname === "/api/dictation/cleanup") return true;
   if (["GET", "PUT"].includes(method) && /^\/api\/projects\/[a-z0-9-]{1,80}\/context$/.test(url.pathname)) return true;
   if (method === "GET" && /^\/api\/projects\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
   if (method === "POST" && /^\/api\/projects\/[a-z0-9-]{1,80}\/sync\/apply$/.test(url.pathname)) return true;

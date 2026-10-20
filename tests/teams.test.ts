@@ -184,17 +184,64 @@ test("an opted-in blank project must receive checks before any implementer launc
   } finally { await f.close(); }
 });
 
-test("a coordinator cannot replace checks configured by the project owner", { timeout: 60000 }, async () => {
+test("a project manager corrects an unauthorized verification report and uses configured checks", { timeout: 120000 }, async () => {
   const f = await fixture("bootstrap-override");
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
-    const blocked = await f.settled(created.body.id);
-    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
-    assert.match(blocked.reason ?? "", /verification|check|configured/i);
-    assert.equal(blocked.tasks.length, 0);
-    assert.deepEqual(blocked.members.map(member => member.role), ["project-manager"]);
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.verification, undefined, "the project manager cannot replace or establish verification");
+    assert.ok(finished.tasks.every(task => task.status === "integrated"));
+    assert.equal(finished.checks.length, 1);
+    assert.equal(finished.checks[0].status, "passed");
+    assert.ok(finished.checks[0].command.args.includes("check.mjs"), "the configured project check ran after integration");
+    const manager = finished.members.find(member => member.role === "project-manager");
+    assert.ok(manager);
+    assert.match(readFileSync(join(f.receipts, `${manager.memberId}.rejection.txt`), "utf8"), /Plan rejected: .*configured checks\. Remove verification and submit a corrected plan/i);
   } finally { await f.close(); }
+});
+
+test("an unauthorized plan gets one correction per run revision before blocking", () => {
+  const f = schedulerFixture();
+  try {
+    f.writeTeam();
+    const service = f.openTeam() as unknown as {
+      records: Map<string, { run: TeamRun; [key: string]: unknown }>;
+      consume(stored: { run: TeamRun; [key: string]: unknown }, member: any): void;
+      prepareMember(stored: unknown, role: string, task: unknown, feedback: string): void;
+    };
+    const stored = service.records.get(f.run.id)!;
+    let corrections = 0;
+    service.prepareMember = (_stored, role, _task, feedback) => {
+      assert.equal(role, "project-manager");
+      assert.match(feedback, /Remove verification and submit a corrected plan/);
+      assert.match(feedback, /Earlier planning question: Which API\?\nUser answered: The public one/, "answered planning decisions reach the corrected plan");
+      assert.doesNotMatch(feedback, /Unanswered question/);
+      corrections++;
+    };
+    const managerId = stored.run.members[0].memberId;
+    stored.run.decisions = [
+      { id: randomUUID(), memberId: managerId, revision: f.run.revision, question: "Which API?", options: ["The public one", "The private one"], createdAt: new Date().toISOString(), answer: "The public one", answeredAt: new Date().toISOString() },
+      { id: randomUUID(), memberId: managerId, revision: f.run.revision, question: "Unanswered question", options: ["Yes", "No"], createdAt: new Date().toISOString() },
+    ];
+    const report = { kind: "plan", summary: "Plan with unauthorized verification", tasks: [
+      { id: "task-a", title: "Create the example file", instructions: "Create example.txt", paths: ["example.txt"], dependsOn: [] },
+    ], verification: { checks: [{ command: "npm", args: ["run", "check"] }] } };
+    const first = { ...stored.run.members[0], memberId: randomUUID(), report };
+    service.consume(stored, first);
+    assert.equal(corrections, 1);
+    const afterCorrection = f.readRecord<{ run: TeamRun }>("team", f.run.id);
+    assert.deepEqual((afterCorrection.run as any).verificationCorrections, [f.run.revision]);
+
+    const second = { ...first, memberId: randomUUID(), sessionId: randomUUID() };
+    service.consume(stored, second);
+    assert.equal(corrections, 1, "the same revision cannot request another project-manager correction");
+    const blocked = f.readRecord<{ run: TeamRun }>("team", f.run.id);
+    assert.equal(blocked.run.status, "blocked");
+    assert.equal(blocked.run.reason, "A plan cannot replace the project's configured checks.");
+    assert.deepEqual((blocked.run as any).verificationCorrections, [f.run.revision]);
+  } finally { f.close(); }
 });
 
 test("failed coordinator checks stay blocked after the bounded repair attempts", { timeout: 120000 }, async () => {
@@ -923,6 +970,40 @@ test("retargeting a member prompt keeps its answers, swaps reporting and profile
   assert.equal(retargetPrompt(answered("claude", haiku), { provider: "codex", profile: astra }), answered("codex", astra));
   assert.equal(retargetPrompt(answered("codex", astra), { provider: "opencode", profile: deepseek }), answered("opencode", deepseek));
   assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek }), undefined);
+});
+
+test("project-manager prompts list configured setup and checks and forbid unauthorized verification", () => {
+  const run = { provider: "demo", revision: 1, projectId: "example-project", objective: "Implement a small feature", baseCommit: "base", headCommit: "base", steering: [], tasks: [], checks: [] } as unknown as TeamRun;
+  const configuredProject = {
+    setup: { command: "npm", args: ["ci"] },
+    checks: [{ command: "npm", args: ["run", "check"] }],
+  };
+  const prompt = teamPrompt(run, "project-manager", undefined, undefined, "demo", undefined, configuredProject);
+  assert.ok(prompt.includes(JSON.stringify(configuredProject)));
+  assert.match(prompt, /checks run after integration and are fixed/);
+  assert.match(prompt, /plan MUST NOT include verification/);
+  assert.match(prompt, /say so in the summary and have tasks run additional commands \(such as a workspace's lint or typecheck\) themselves and report results/);
+});
+
+test("a rejected team report exposes the host's actionable 4xx response", async () => {
+  const message = "Plan rejected: remove verification and submit a corrected plan.";
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => response.writeHead(409, { "Content-Type": "text/plain; charset=utf-8" }).end(message));
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (server.address() as { port: number }).port;
+    const env = {
+      INFINITE_HOOK_URL: `http://127.0.0.1:${port}/hook`,
+      INFINITE_HOOK_TOKEN: "fixture-token",
+      INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId: randomUUID(), memberId: randomUUID(), revision: 1 }),
+    } as NodeJS.ProcessEnv;
+    await assert.rejects(submitTeamReport({ kind: "result", summary: "Fixture report" }, env), error => {
+      assert.equal(reportErrorMessage(error), message);
+      return true;
+    });
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 
 test("an unanswered report stays unconfirmed: a refused connection or a lost acknowledgement names the sandbox and requires inspection", async () => {

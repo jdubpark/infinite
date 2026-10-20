@@ -5,7 +5,7 @@ export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "t
 const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "team-handoff", "transcript"]);
 const MAX_BODY = 256 * 1024;
 export class HookPayloadError extends Error {
-  constructor(readonly status: number) { super("Hook payload was refused"); }
+  constructor(readonly status: number, message = "Hook payload was refused") { super(message); }
 }
 
 /**
@@ -73,7 +73,9 @@ export function startHookServer(opts: {
         reply = await opts.onPayload(route as HookRoute, parsed);
       } catch (error) {
         opts.onError();
-        res.writeHead(error instanceof HookPayloadError ? error.status : 500).end();
+        if (error instanceof HookPayloadError && error.message !== "Hook payload was refused")
+          res.writeHead(error.status, { "Content-Type": "text/plain; charset=utf-8" }).end(error.message);
+        else res.writeHead(error instanceof HookPayloadError ? error.status : 500).end();
         return;
       }
       if (reply && Object.keys(reply).length) res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(reply));

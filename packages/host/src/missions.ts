@@ -697,13 +697,7 @@ export class MissionService {
           return;
         }
         if (!mission.subtasks.some(item => item.status === "done")) return this.refuse(stored, report.kind, "No subtask has finished. Dispatch a subtask before reporting a result, or report blocked.");
-        // A queued subtask whose dependency ended blocked or cancelled never starts on its own.
-        const stalled = new Set<string>();
-        for (let grew = true; grew;) {
-          grew = false;
-          for (const item of mission.subtasks.filter(item => item.status === "queued" && !stalled.has(item.id)))
-            if (item.dependsOn.some(id => stalled.has(id) || ["blocked", "cancelled"].includes(mission.subtasks.find(other => other.id === id)?.status ?? "cancelled"))) { stalled.add(item.id); grew = true; }
-        }
+        const stalled = stalledSubtasks(mission);
         const pending = mission.subtasks.filter(item => item.status === "running" || (item.status === "queued" && !stalled.has(item.id))).length;
         if (pending) return this.refuse(stored, report.kind, `${pending} subtask${pending === 1 ? " is" : "s are"} still queued or running. Wait for them to finish or cancel them first.`, false);
         const unfinished = mission.subtasks.filter(item => item.status === "blocked" || stalled.has(item.id)).map(item => item.id);
@@ -714,6 +708,15 @@ export class MissionService {
         this.event(stored, "Every subtask finished and the coordinator reported a result. Ready for owner review; the mission itself published nothing.");
         break;
       }
+      case "wait": {
+        // Waiting is accepted only when a subteam or the owner will start a later attempt.
+        const stalled = stalledSubtasks(mission);
+        const upcoming = mission.subtasks.some(item => item.status === "running" || (item.status === "queued" && !stalled.has(item.id))) ||
+          mission.decisions.some(item => !item.answer);
+        if (!upcoming) return this.refuse(stored, report.kind, "Nothing is running or waiting for the owner, so no later attempt would start. Dispatch, cancel, report a result, or report blocked.");
+        this.event(stored, "The coordinator is waiting for subteam progress or owner input.");
+        break;
+      }
       case "blocked":
         this.stop(stored, "blocked", report.summary);
         this.event(stored, "The coordinator reported that the mission is blocked.");
@@ -722,6 +725,17 @@ export class MissionService {
     stored.refusals = 0;
     this.settle(stored);
   }
+}
+
+/** Queued subtasks that can never start, because a dependency ended blocked or cancelled, directly or transitively. */
+function stalledSubtasks(mission: Mission) {
+  const stalled = new Set<string>();
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const item of mission.subtasks.filter(item => item.status === "queued" && !stalled.has(item.id)))
+      if (item.dependsOn.some(id => stalled.has(id) || ["blocked", "cancelled"].includes(mission.subtasks.find(other => other.id === id)?.status ?? "cancelled"))) { stalled.add(item.id); grew = true; }
+  }
+  return stalled;
 }
 
 const oneLine = (text: string | undefined) => {

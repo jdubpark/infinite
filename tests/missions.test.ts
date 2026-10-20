@@ -510,6 +510,31 @@ test("each subteam is titled by its subtask first, so a long mission title canno
   } finally { h.close(); }
 });
 
+test("a coordinator with nothing to decide waits without opening an owner question, but cannot wait when nothing would wake it", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    // Owner direction wakes the coordinator while the subteam is still running; there is nothing to decide.
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Keep the change small" });
+    await h.report(2, { kind: "wait", summary: "The API subteam is still working; the direction is already in its objective" });
+    const waiting = await until(() => h.get(id), mission => mission.events.some(event => /waiting for subteam progress/.test(event.text)));
+    assert.deepEqual(waiting.decisions, [], "Waiting opens no owner decision");
+    assert.equal(waiting.status, "working");
+    await new Promise(done => setTimeout(done, 1500));
+    assert.equal(h.attempts(), 2, "A wait starts no new attempt by itself");
+
+    h.set(teamId, { status: "ready-for-review" });
+    await h.report(3, { kind: "wait", summary: "Nothing to do" });
+    const refusal = (await h.messages(4)).find((message: { type: string }) => message.type === "refused");
+    assert.equal(refusal.kind, "wait");
+    assert.match(refusal.reason, /no later attempt would start/);
+    await h.report(4, { kind: "result", summary: "The API change is ready" });
+    await until(() => h.get(id), mission => mission.status === "ready-for-review", 20000);
+  } finally { h.close(); }
+});
+
 test("a subtask with two same-repository predecessors starts from the later run's head", { timeout: 60000 }, async () => {
   const h = scripted();
   try {

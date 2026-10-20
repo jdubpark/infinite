@@ -254,7 +254,7 @@ export function describeNow(att: Attention, provider: Provider): string {
   return text.length > 140 ? text.slice(0, 139) + "…" : text;
 }
 
-function firstSentence(text?: string) {
+export function firstSentence(text?: string) {
   if (!text) return "";
   const line = text.trim().split("\n").find((l) => l.trim() !== "") ?? "";
   const m = /^(.+?[.!?])(\s|$)/.exec(line);

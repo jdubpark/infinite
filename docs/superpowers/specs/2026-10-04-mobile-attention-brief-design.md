@@ -22,7 +22,7 @@ The host makes this possible by gathering **signals**: structured facts about wh
 
 - No automatic approval. A signal never answers a permission prompt. Only a person's tap or a laptop keystroke does.
 - No task-completion inference. `turn-finished` means the agent said it finished a turn; it is shown with the agent's words, never as "done".
-- No model calls on the host. All classification is rule-based.
+- Jev may run on the host only to choose a turn-finished line or gate a generated session title under the gates in `packages/host/src/readings.ts`. Attention state, prompts, and destructive commands remain rule-based.
 - No change to the web client beyond keeping it working. No change to session creation (owner, laptop).
 - No notification action buttons that answer from the lock screen. Approving a command without seeing it contradicts `PRODUCT.md`.
 - No provider-native structured sessions (Codex app-server, Claude Agent SDK). Recorded as future work in §13.

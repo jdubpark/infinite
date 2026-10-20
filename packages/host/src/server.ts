@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { Manager } from "./manager.js";
+import { Manager, publicAttention } from "./manager.js";
 import { hashToken, validateLinearConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
 import { workerCall, type WorkerError } from "./ipc.js";
@@ -39,6 +39,7 @@ import { Summarizer, SummaryError } from "./summary.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
 import { LiveFeed, type LiveTopic } from "./live.js";
 import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/protocol";
+import { Readings } from "./readings.js";
 
 const id = z.uuid();
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
@@ -53,6 +54,7 @@ const createSchema = z
     provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]),
     projectId: z.string().max(80),
     title: z.string().trim().min(1).max(100),
+    generatedTitle: z.literal(true).optional(),
     prompt: z.string().max(24000).default(""),
     nativeArgs: z.array(z.string().max(8192).refine((s) => !s.includes("\0")))
       .max(256).refine((args) => args.join("").length <= 32000).optional(),
@@ -165,7 +167,7 @@ export function createApp(config: Config, key: Buffer) {
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
-    const native = (await manager.list()).map(session => {
+    const native = (await manager.list({ includeFullMessage: Boolean(config.jev) })).map(session => {
       const handoff = handoffs.view(session.id);
       return { ...session, handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
         resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
@@ -175,7 +177,8 @@ export function createApp(config: Config, key: Buffer) {
     const known = new Set(native.filter(s => s.status === "running" && s.nativeSession && s.pid)
       .map(s => `${s.provider}:${s.nativeSession!.id}:${s.pid}`));
     const external = cmux ? (await cmux.list()).filter(s => s.status !== "running" || !s.nativeSession || !s.pid || !known.has(`${s.provider}:${s.nativeSession.id}:${s.pid}`)) : [];
-    return [...native, ...external.map(s => ({ ...s, backend: "cmux" as const, machineId: config.machine!.id, resumable: resumable(s) }))];
+    const merged = readings.merge([...native, ...external.map(s => ({ ...s, backend: "cmux" as const, machineId: config.machine!.id, resumable: resumable(s) }))]);
+    return merged.map(session => ({ ...session, attention: publicAttention(session.attention) }));
   };
   const sessionDetail = async (sessionId: string) => {
     if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
@@ -184,7 +187,8 @@ export function createApp(config: Config, key: Buffer) {
     }
     const session = { ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) };
     const handoff = handoffs.view(sessionId);
-    return { ...session, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
+    const { generatedTitle: _generatedTitle, ...publicSession } = readings.merge([session])[0];
+    return { ...publicSession, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
       resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
   };
   const sessionEvents = async (sessionId: string, after: number, limit = 200) => {
@@ -232,6 +236,7 @@ export function createApp(config: Config, key: Buffer) {
   };
   const pushStore = new PushStore(config.stateDir, key);
   const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
+  const readings = new Readings(config, key, manager, summarizer);
   const repositoryBriefings = config.repositoryBriefings
     ? new RepositoryBriefings(config.repositoryBriefings, manager, config.projects, config.teams?.workspaceDir)
     : undefined;
@@ -1102,6 +1107,7 @@ export function createApp(config: Config, key: Buffer) {
   server.once("listening", () => teams.start());
   server.once("listening", () => goals.start());
   server.once("listening", () => handoffs.start());
+  server.once("listening", () => readings.start());
   if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });
   server.once("close", () => teams.close());
   server.once("close", () => usage.close());
@@ -1109,9 +1115,10 @@ export function createApp(config: Config, key: Buffer) {
   server.once("close", () => repositoryBriefings?.close());
   server.once("close", () => linear.close());
   server.once("close", () => handoffs.close());
+  server.once("close", () => readings.stop());
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { live.close(); handoffs.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
+  const closeConnections = () => { live.close(); handoffs.close(); readings.stop(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  return { app, manager, projectSync, teams, goals, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

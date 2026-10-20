@@ -184,7 +184,7 @@ export function Brief({
         <>
           <View style={s.head}>
             <Text style={s.title} numberOfLines={2}>
-              {session.title}
+              {session.reading?.title?.text ?? session.title}
             </Text>
             <View style={s.chips}>
               <StatePill state={session.attention.state} />
@@ -249,6 +249,7 @@ export function Brief({
                 key={session.attention.since}
                 attention={session.attention}
                 provider={session.provider}
+                pickedLine={session.reading?.now?.text}
                 exitCode={session.exitCode}
                 onOpenTerminal={openTerminal}
               />

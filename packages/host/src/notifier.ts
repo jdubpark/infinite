@@ -2,7 +2,7 @@ import { PROVIDER_NAMES, type Attention, type Provider } from "@infinite/attenti
 import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 
-type Row = { id: string; title: string; provider: Provider; attention: Attention };
+type Row = { id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } } };
 type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean };
 type GoalRow = { id: string; title: string; status: string; reason?: string };
 type Lifecycle = { id: string; title: string; status: string; reason?: string; resumable?: boolean; kind: "goal" | "team"; event: string; titleText: string; body: string; priority: "default" | "high" };
@@ -130,7 +130,7 @@ export class Notifier {
         : row.attention.state === "exited" ? ["Session exited", `${row.title} exited`]
         : ["Recording stopped", `${row.title} stopped recording`];
     return {
-      to, title, body: this.options.detail === "full" ? row.attention.now || minimal : minimal,
+      to, title, body: this.options.detail === "full" ? (row.attention.state === "turn-finished" ? row.reading?.now?.text : undefined) || row.attention.now || minimal : minimal,
       data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
       priority: row.attention.state === "needs-you" ? ("high" as const) : ("default" as const), collapseId: row.id,
     };

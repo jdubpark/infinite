@@ -60,6 +60,22 @@ test("notifier sends once per transition, minimal body, prunes unregistered toke
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("full-detail turn-finished push prefers the cached phone reading", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: { body: string }[][] = [];
+  const sessions = [{ id: "s1", title: "Retry logic", provider: "claude", status: "running", attention: att("working"), reading: { now: { text: "The retry path now preserves worker state.", source: "jev" as const, for: "hash", at: "t" } } }];
+  const notifier = new Notifier({ list: async () => sessions } as never, store,
+    async (messages: { body: string }[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); },
+    { detail: "full", events: ["turn-finished"], intervalMs: 100000 });
+  await notifier.tick();
+  sessions[0].attention = att("turn-finished");
+  await notifier.tick();
+  assert.equal(sent[0][0].body, "The retry path now preserves worker state.");
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("expo sender posts the Expo push payload with a bearer token", async () => {
   let seen: { auth?: string; body: unknown } | undefined;
   const server = createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { seen = { auth: req.headers.authorization, body: JSON.parse(b) }; res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify({ data: [{ status: "ok", id: "t1" }] })); }); });

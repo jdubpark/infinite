@@ -40,10 +40,10 @@ type AccountView = { id: string; kind: "metered" | "subscription"; month?: Money
 { tz: string; accounts: string[]; days: { date: "YYYY-MM-DD"; usd: number; byAccount: Record<string, number> }[] }
 
 // GET /api/usage/projects?tz=…
-{ projects: { id: string; name: string; total: Money; month: Money; spark: number[] /* 30 daily usd, oldest first */ }[] }
+{ projects: { id: string; name: string; total: Money; unmeasured: number; month: Money & { unmeasured: number }; spark: number[] /* 30 daily usd, oldest first */ }[] }
 
 // GET /api/usage/projects/:id?tz=…
-{ id: string; name: string; total: Money;
+{ id: string; name: string; total: Money; unmeasured: number;
   byKind: { goals: number; teams: number; sessions: number; briefings: number };
   goals: { id: string; title: string; total: Money; tasks: number }[];
   teams: { id: string; title: string; goalId?: string; total: Money }[];          // runs not under a goal, plus goal runs
@@ -133,14 +133,14 @@ Sources: `https://api-docs.deepseek.com/quick_start/pricing` and `https://dev.me
   - `daily({ days, tz, projectId?, now? })`.
   - `projects({ tz, now? })`.
   - `project(id, { tz, now? })`.
-  - `taskUsage(runId, taskId): TaskUsage | undefined`.
+  - `taskUsage(runId, taskId, revision): TaskUsage | undefined`; task attribution matches both the task ID and the revision that created the task.
   - `recordBriefing(projectId: string, sessionId: string, at: string, usage: BriefingUsage | null)`.
 - Produces `BriefingUsage = { providerId: string; modelId: string; tokens: UsageTokens; reportedCost?: number }`.
 - The ledger gains `briefings: Record<key, { projectId; at; record?: UsageRecord }>`. A missing `record` counts as unmeasured.
 - Goal and team resolution: `UsageService.useResolvers({ goalOfRun(runId): { id; title } | undefined; runTitle(runId): string | undefined; projectName(id): string | undefined; sessionTitle(id): string | undefined })`, wired in `server.ts`.
 
 Day bucketing uses `Intl.DateTimeFormat(…, { timeZone })`. An invalid tz throws `RangeError`, which the route maps to 400. Attribution:
-- task = ledger `team.runId` + `team.taskId`
+- task = ledger `team.runId` + `team.taskId` + the task-creating revision
 - goal = `goalOfRun(runId)`
 - project = ledger `projectId`
 - kind = briefing row, else team-with-goal, else team, else session

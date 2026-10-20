@@ -328,7 +328,7 @@ async function main() {
       const line = (type, part) => JSON.stringify({ type, timestamp: Date.now(), sessionID: "ses_fixture", part });
       const step = (n, cost, input, output) => line("step_finish", { type: "step-finish", id: `prt_${assignment.taskId}_${n}`,
         messageID: `msg_${assignment.taskId}`, sessionID: "ses_fixture", reason: "tool-calls", cost,
-        tokens: { input, output, reasoning: 0, cache: { read: 0, write: 0 } } });
+        tokens: { input, output, reasoning: 0, cache: { read: 1, write: 1 } } });
       process.stdout.write([
         line("text", { type: "text", id: `prt_${assignment.taskId}_0`, messageID: `msg_${assignment.taskId}`, sessionID: "ses_fixture", text: "Working." }),
         step(1, 0.1, 400, 100),

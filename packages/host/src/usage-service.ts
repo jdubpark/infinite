@@ -156,7 +156,12 @@ export class UsageService {
   projects({ tz = "UTC", now = new Date() }: { tz?: string; now?: Date }) {
     this.dateKey(now.toISOString(), tz);
     const ids = new Set([...Object.values(this.ledger.sessions).map(s => s.projectId), ...Object.values(this.ledger.briefings).map(b => b.projectId)]);
-    return { projects: [...ids].map(id => { const rows = this.projectRows(id), recent = this.daily({ days: 30, tz, projectId: id, now }); return { id, name: this.resolvers.projectName(id) ?? id, total: this.money(rows), month: this.money(rows.filter(row => { const at = Date.parse(row.at); return at >= periodStart("month", now).getTime() && at <= now.getTime(); })), spark: recent.days.map(day => day.usd) }; }).sort((a, b) => b.total.usd - a.total.usd) };
+    return { projects: [...ids].map(id => { const rows = this.projectRows(id), recent = this.daily({ days: 30, tz, projectId: id, now }), monthStart = periodStart("month", now); return { id, name: this.resolvers.projectName(id) ?? id, total: this.money(rows), month: { ...this.money(rows.filter(row => { const at = Date.parse(row.at); return at >= monthStart.getTime() && at <= now.getTime(); })), unmeasured: this.projectUnmeasured(id, monthStart, now) }, unmeasured: this.projectUnmeasured(id), spark: recent.days.map(day => day.usd) }; }).sort((a, b) => b.total.usd - a.total.usd) };
+  }
+  private projectUnmeasured(id: string, from?: Date, to?: Date) {
+    const inRange = (at: string) => { const time = Date.parse(at); return (!from || time >= from.getTime()) && (!to || time <= to.getTime()); };
+    return Object.values(this.ledger.sessions).filter(session => session.projectId === id && !session.measured && inRange(session.lastActiveAt ?? session.createdAt)).length
+      + Object.values(this.ledger.briefings).filter(row => row.projectId === id && !row.record && inRange(row.at)).length;
   }
   private projectRows(id: string) {
     const rows = this.allMeasuredRecords().filter(row => row.projectId === id).map(row => ({ ...row, at: row.record.completedAt }));
@@ -166,7 +171,7 @@ export class UsageService {
     this.dateKey(now.toISOString(), tz);
     const sessions = Object.entries(this.ledger.sessions).filter(([, session]) => session.projectId === id), briefings = Object.values(this.ledger.briefings).filter(row => row.projectId === id);
     if (!sessions.length && !briefings.length) return undefined;
-    const total = this.money(this.projectRows(id)), grouped = { goals: [] as any[], teams: [] as any[], sessions: [] as any[], briefings: [] as any[] };
+    const total = this.money(this.projectRows(id)), unmeasured = this.projectUnmeasured(id), grouped = { goals: [] as any[], teams: [] as any[], sessions: [] as any[], briefings: [] as any[] };
     for (const [sessionId, session] of sessions) {
       const records = this.priced(this.rowsBySession().get(sessionId) ?? []), sum = this.money(records);
       if (!session.measured) continue;
@@ -186,10 +191,10 @@ export class UsageService {
     }
     for (const [goalId, row] of goals) row.tasks = goalTasks.get(goalId)?.size ?? 0;
     const briefingMoney = this.money(grouped.briefings.flatMap(({ cost }) => cost ? [cost] : []));
-    return { id, name: this.resolvers.projectName(id) ?? id, total, byKind: { goals: [...goals.values()].reduce((n, g) => n + g.total.usd, 0), teams: grouped.teams.filter(row => !row.goalId).reduce((n, x) => n + x.total.usd, 0), sessions: grouped.sessions.reduce((n, x) => n + x.total.usd, 0), briefings: briefingMoney.usd }, goals: [...goals.values()], teams: grouped.teams, sessions: grouped.sessions, briefings: { total: briefingMoney, runs: briefings.length, unmeasured: briefings.filter(row => !row.record).length } };
+    return { id, name: this.resolvers.projectName(id) ?? id, total, unmeasured, byKind: { goals: [...goals.values()].reduce((n, g) => n + g.total.usd, 0), teams: grouped.teams.filter(row => !row.goalId).reduce((n, x) => n + x.total.usd, 0), sessions: grouped.sessions.reduce((n, x) => n + x.total.usd, 0), briefings: briefingMoney.usd }, goals: [...goals.values()], teams: grouped.teams, sessions: grouped.sessions, briefings: { total: briefingMoney, runs: briefings.length, unmeasured: briefings.filter(row => !row.record).length } };
   }
-  taskUsage(runId: string, taskId: string): TaskUsage | undefined {
-    const sessions = Object.entries(this.ledger.sessions).filter(([, session]) => session.team?.runId === runId && session.team.taskId === taskId);
+  taskUsage(runId: string, taskId: string, revision: number): TaskUsage | undefined {
+    const sessions = Object.entries(this.ledger.sessions).filter(([, session]) => session.team?.runId === runId && session.team.taskId === taskId && session.team.revision === revision);
     if (!sessions.length) return undefined;
     const rows = sessions.flatMap(([id]) => this.rowsBySession().get(id) ?? []), totals = this.priced(rows), sum = sumUsage(totals);
     if (!rows.length) return undefined;

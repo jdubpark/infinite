@@ -16,7 +16,7 @@ let sequence = 0;
 
 function quote(value: string) { return `'${value.replaceAll("'", "'\\''")}'`; }
 
-function fixture(repositories = ["acme/widget"]) {
+function fixture(repositories: string[] | null = ["acme/widget"]) {
   const directory = join(root, `fixture-${++sequence}`);
   const tokens = join(directory, "tokens");
   mkdirSync(tokens, { recursive: true, mode: 0o700 });
@@ -49,7 +49,7 @@ if (process.argv.at(-1) === "get") {
   process.stdout.write("username=fallback-user\\npassword=fallback-secret\\n\\n");
 }
 `);
-  writeFileSync(config, JSON.stringify({ tokenDirectory: tokens, githubCli: gh, repositories }), { mode: 0o600 });
+  writeFileSync(config, JSON.stringify({ tokenDirectory: tokens, githubCli: gh, ...(repositories === null ? {} : { repositories }) }), { mode: 0o600 });
   chmodSync(config, 0o600);
   return { directory, tokens, home, xdgConfig, xdgCache, ghConfig, emptyGlobalConfig, emptySystemConfig, capture, config, gh, fallback, fallbackMarker, repositories };
 }
@@ -356,4 +356,31 @@ test("status reports only cache state and protected files reject symlink or writ
   const linkedCache = invoke(f, ["status", "acme/widget"]);
   assert.equal(linkedCache.status, 0);
   assert.equal(JSON.parse(linkedCache.stdout).cache, "invalid");
+});
+
+test("omitted repositories derive configured status and credentials from present token files", () => {
+  const f = fixture(null);
+  const cacheValue = writeCache(f);
+  writeFileSync(join(f.tokens, "metadata.json"), "not a token cache", { mode: 0o600 });
+  const status = invoke(f, ["status"]);
+  assert.equal(status.status, 0, status.stderr);
+  assert.deepEqual(JSON.parse(status.stdout), {
+    repositories: [{ repository: "acme/widget", configured: true, cache: "ready", expiresAt: cacheValue.expiresAt }],
+  });
+  assert.equal(status.stdout.includes(appToken), false, "status must not expose the cached credential");
+
+  const credential = invoke(f, ["credential", "get"], { input: "protocol=https\nhost=github.com\npath=acme/widget\n\n" });
+  assert.equal(credential.status, 0, credential.stderr);
+  assert.equal(credential.stdout, `username=x-access-token\npassword=${appToken}\n\n`);
+
+  rmSync(cacheFile(f.tokens, "acme/widget"));
+  const absentStatus = invoke(f, ["status", "acme/widget"]);
+  assert.equal(absentStatus.status, 0, absentStatus.stderr);
+  assert.deepEqual(JSON.parse(absentStatus.stdout), { repository: "acme/widget", configured: false, cache: "not-applicable" });
+  const absentCredential = invoke(f, ["credential", "get"], { input: "protocol=https\nhost=github.com\npath=acme/widget\n\n" });
+  assert.equal(absentCredential.status, 0, absentCredential.stderr);
+  assert.equal(absentCredential.stdout, "", "an absent token file must not provide a credential");
+  const emptyStatus = invoke(f, ["status"]);
+  assert.equal(emptyStatus.status, 0, emptyStatus.stderr);
+  assert.deepEqual(JSON.parse(emptyStatus.stdout), { repositories: [] });
 });

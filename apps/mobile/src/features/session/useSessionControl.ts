@@ -65,7 +65,14 @@ class SessionControl {
   };
   snapshot = () => this.state;
   generation = () => this.revision;
-  leaseId = () => this.state.lease?.id;
+  leaseId = () => {
+    const lease = this.state.lease;
+    if (lease && lease.expiresAt <= Date.now()) {
+      this.forget();
+      return undefined;
+    }
+    return lease?.id;
+  };
 
   private set(patch: Partial<ControlState>) {
     const next = { ...this.state, ...patch };
@@ -170,6 +177,10 @@ class SessionControl {
 
   private async renew() {
     const held = this.state.lease;
+    if (held && held.expiresAt <= Date.now()) {
+      this.forget();
+      return;
+    }
     if (this.renewing) {
       if (this.active()) this.renewOnForeground = true;
       return;
@@ -221,7 +232,13 @@ class SessionControl {
       this.renewTimer = undefined;
       return;
     }
-    if (this.state.lease) void this.renew();
+    const lease = this.state.lease;
+    if (!lease) return;
+    if (lease.expiresAt <= Date.now()) {
+      this.forget();
+      return;
+    }
+    void this.renew();
   };
 }
 

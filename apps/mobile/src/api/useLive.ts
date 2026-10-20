@@ -88,7 +88,7 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
     let offlineSince: number | null = null;
     const stamp = () => new Date().toLocaleTimeString();
     const clearTimers = () => { clearTimeout(fallback); clearTimeout(retry); fallback = retry = undefined; };
-    const onlineNow = () => isLiveOnline(streamUp, lastLoadOk);
+    const onlineNow = () => isLiveOnline(streamUp && (!resumeCatchup || resumeEventSeen), lastLoadOk);
     const detach = () => {
       const close = unsubscribe; unsubscribe = undefined; restartShared = undefined; close?.();
     };
@@ -168,7 +168,7 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
           after: () => current.current.after?.() ?? 0,
           onEvent(event) {
             if (!active || !appActive) return;
-            if (resumeCatchup) { resumeEventSeen = true; return; }
+            if (resumeCatchup) { resumeEventSeen = true; markOnline(); return; }
             const next = current.current.select(event.topic, event.data, value.current);
             const refreshOnEvent = typeof current.current.refreshOnEvent === "function"
               ? current.current.refreshOnEvent(event.topic, event.data)
@@ -214,8 +214,8 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
     const recoverAfterResumeFailure = () => {
       resumeCatchup = false; resumeEventSeen = false;
       streamUp = false; lastLoadOk = false;
-      clearTimers(); clearTimeout(staleTimer); staleTimer = undefined;
-      setOnline(false); offlineSince = Date.now(); delayStale();
+      clearTimers();
+      setOnline(false); delayStale();
       if (restartShared) void restartShared().catch(() => {});
       else { detach(); void connect(); }
     };
@@ -244,8 +244,9 @@ export function useLive<T>(connection: Connection, options: LiveOptions<T>): {
       backgroundedAt = null;
       clearTimeout(backgroundGrace); backgroundGrace = undefined;
       if (streamUp && awayFor < APP_BACKGROUND_GRACE_MS) {
-        markOnline();
         resumeCatchup = true; resumeEventSeen = false;
+        lastLoadOk = false;
+        setStale(false); setOnline(false); offlineSince = Date.now(); delayStale();
         void load();
       } else {
         const restart = streamUp && awayFor >= APP_BACKGROUND_GRACE_MS ? restartShared : undefined;

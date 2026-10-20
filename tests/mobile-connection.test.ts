@@ -121,6 +121,73 @@ test("useLive keeps its established stream and refreshes once after a brief back
   }
 });
 
+test("useLive stays offline and starts stale grace while a brief-return catch-up is pending", { skip }, async t => {
+  const { resetEventStreams, setAppState } = phone!;
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
+  resetEventStreams();
+  setAppState("active");
+  let loads = 0, resolveCatchup!: (value: string) => void;
+  const view = mountLive(async () => {
+    if (++loads === 1) return "snapshot";
+    return new Promise<string>(resolve => { resolveCatchup = resolve; });
+  });
+  const status = () => { const { online, stale } = view.read(); return { online, stale }; };
+  try {
+    await flush();
+    assert.deepEqual(status(), { online: true, stale: false });
+
+    setAppState("background");
+    setAppState("active");
+    await flush();
+    assert.equal(loads, 2, "return starts one catch-up read");
+    assert.deepEqual(status(), { online: false, stale: false }, "the retained socket is unverified until fresh evidence arrives");
+
+    t.mock.timers.tick(LIVE_STALE_DELAY_MS);
+    await flush();
+    assert.deepEqual(status(), { online: false, stale: true }, "stale grace starts when the app returns, even while the read is pending");
+
+    resolveCatchup("fresh snapshot");
+    await flush();
+    assert.deepEqual(status(), { online: true, stale: false }, "a successful catch-up read verifies the retained connection");
+  } finally {
+    resolveCatchup?.("fresh snapshot");
+    view.unmount();
+    t.mock.timers.reset();
+    setAppState("active");
+    resetEventStreams();
+  }
+});
+
+test("useLive accepts a post-return event as fresh evidence while catch-up is pending", { skip }, async t => {
+  const { emitEvent, resetEventStreams, setAppState } = phone!;
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
+  resetEventStreams();
+  setAppState("active");
+  let loads = 0, resolveCatchup!: (value: string) => void;
+  const view = mountLive(async () => {
+    if (++loads === 1) return "snapshot";
+    return new Promise<string>(resolve => { resolveCatchup = resolve; });
+  });
+  const status = () => { const { online, stale } = view.read(); return { online, stale }; };
+  try {
+    await flush();
+    setAppState("background");
+    setAppState("active");
+    await flush();
+    assert.deepEqual(status(), { online: false, stale: false }, "the retained socket is initially unverified");
+
+    emitEvent(0, { topic: "sessions", data: { status: "changed" } });
+    assert.deepEqual(status(), { online: true, stale: false }, "an event delivered after return verifies the retained stream");
+  } finally {
+    resolveCatchup?.("fresh snapshot");
+    await flush();
+    view.unmount();
+    t.mock.timers.reset();
+    setAppState("active");
+    resetEventStreams();
+  }
+});
+
 test("useLive reconnects from the last applied cursor if the return catch-up read fails", { skip }, async t => {
   const { emitEvent, getEventOpenAfter, getEventOpenAttempts, resetEventStreams, setAppState } = phone!;
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
@@ -745,8 +812,10 @@ test("a held phone lease survives app switches, renews only in the foreground, a
     t.mock.timers.tick(31_000);
     assert.equal(sent("renew"), 2, "nothing renews in the background");
     setAppState("active");
-    await until(() => sent("renew") === 3 && held() === null, "returning asks the host before keeping the lease");
-    assert.equal(channels(), opened + 1, "a long absence replaces the idle channel");
+    assert.equal(sent("renew"), 2, "an expired lease is discarded without a renewal");
+    assert.equal(held(), null, "foreground return drops the expired lease synchronously");
+    await api(connection, "/me");
+    assert.equal(channels(), opened + 1, "a read after a long absence replaces the idle channel");
 
     setAppState("background");
     setAppState("active");
@@ -758,6 +827,80 @@ test("a held phone lease survives app switches, renews only in the foreground, a
     view.unmount();
     t.mock.timers.reset();
     setAppState("active"); closeConnection(connection); proxy.close(); runner.close();
+  }
+});
+
+test("a phone discards a lease that expires while background timers are suspended", { skip, timeout: 20000 }, async t => {
+  const { api, closeConnection, renderHook, setAppState, useSessionControl } = phone!;
+  let lease: ControlLease | null = null;
+  const runner = await httpRunner(({ path, body }) => {
+    if (!path.endsWith("/control")) return undefined;
+    const { action, leaseId } = body as { action: string; leaseId?: string };
+    if (action === "claim") lease = { id: randomUUID(), label: "Phone", expiresAt: Date.now() + 30_000 };
+    else if (action === "renew") lease = lease?.id === leaseId && lease.expiresAt > Date.now() ? { ...lease, expiresAt: Date.now() + 30_000 } : null;
+    return { control: lease };
+  });
+  const connection = { url: runner.url, token: runner.token };
+  const sent = (action: string) => runner.requests.filter(request => (request.body as { action?: string } | null)?.action === action).length;
+  setAppState("active");
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const session = randomUUID();
+  const view = renderHook(() => useSessionControl(connection, session));
+  try {
+    await api(connection, "/me");
+    await view.read().claim();
+    const expiresAt = lease!.expiresAt;
+    assert.notEqual(view.read().leaseId(), undefined);
+
+    setAppState("background");
+    t.mock.timers.setTime(expiresAt + 1);
+    setAppState("active");
+    const leaseIdAfterReturn = view.read().leaseId();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.deepEqual(
+      { renewals: sent("renew"), leaseId: leaseIdAfterReturn },
+      { renewals: 0, leaseId: undefined },
+      "foreground return discards an expired lease without sending or exposing its id",
+    );
+  } finally {
+    view.unmount();
+    t.mock.timers.reset();
+    setAppState("active");
+    closeConnection(connection);
+    runner.close();
+  }
+});
+
+test("a send-time lease lookup refuses a lease that expired while timers were suspended", { skip, timeout: 20000 }, async t => {
+  const { api, closeConnection, renderHook, setAppState, useSessionControl } = phone!;
+  let lease: ControlLease | null = null;
+  const runner = await httpRunner(({ path, body }) => {
+    if (!path.endsWith("/control")) return undefined;
+    const { action, leaseId } = body as { action: string; leaseId?: string };
+    if (action === "claim") lease = { id: randomUUID(), label: "Phone", expiresAt: Date.now() + 30_000 };
+    else if (action === "renew") lease = lease?.id === leaseId && lease.expiresAt > Date.now() ? { ...lease, expiresAt: Date.now() + 30_000 } : null;
+    return { control: lease };
+  });
+  const connection = { url: runner.url, token: runner.token };
+  const session = randomUUID();
+  setAppState("active");
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const view = renderHook(() => useSessionControl(connection, session));
+  try {
+    await api(connection, "/me");
+    await view.read().claim();
+    const expiresAt = lease!.expiresAt;
+
+    setAppState("background");
+    t.mock.timers.setTime(expiresAt + 1);
+    assert.equal(view.read().leaseId(), undefined, "a send-time lookup drops an expired lease synchronously");
+    assert.equal(view.read().lease, null);
+  } finally {
+    view.unmount();
+    t.mock.timers.reset();
+    setAppState("active");
+    closeConnection(connection);
+    runner.close();
   }
 });
 

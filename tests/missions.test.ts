@@ -7,7 +7,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { stopSessionWorkers, waitFor } from "./helpers.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
-import { MissionService, type ProjectGroupLookup } from "../packages/host/src/missions.js";
+import { MissionService, missionBoard, type ProjectGroupLookup } from "../packages/host/src/missions.js";
 import { createMissionReportEnvelope } from "../packages/host/src/team-report-client.js";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -181,6 +181,7 @@ test("a mission refuses invalid dispatches, and pausing and cancelling reach its
     await waitFor(async () => teams.get(teamId).status, status => status === "cancelled", 30000);
     const ended = await until(() => missions.get(created.id), mission => mission.coordinator?.status === "stopped" && mission.subtasks[0].status === "cancelled");
     assert.equal(ended.subtasks[0].teamStatus, "cancelled");
+    assert.deepEqual(missionBoard([ended], [], [], []).items[0].subtasks, { total: 0, running: 0, done: 0 }, "Cancelled subtasks do not count toward the board's done/total");
     await assert.rejects(missions.steer(created.id, { requestId: randomUUID(), revision: ended.revision, text: "More" }), (error: TeamError) => error.code === "mission-not-running");
   } finally { await h.close(); }
 });

@@ -189,7 +189,7 @@ test("Codex team launch configures its authenticated MCP report tool and require
         settings.set(override.slice(0, equals), JSON.parse(override.slice(equals + 1)));
       }
     }
-    assert.equal(settings.size, 4);
+    assert.equal(settings.size, 5);
     assert.equal(settings.get("command"), process.execPath);
     const serverArgs = settings.get("args") as string[];
     assert.equal(serverArgs.at(-1), relayPath.replace("hook-relay", "team-mcp"));
@@ -197,8 +197,10 @@ test("Codex team launch configures its authenticated MCP report tool and require
       assert.equal(serverArgs[0], "--import");
       assert.match(serverArgs[1], /^file:\/\/\/.+\/tsx\//);
     }
-    assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT"]);
+    // A mission coordinator's assignment reaches the host-side MCP server, which reports over loopback for the sandboxed agent.
+    assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT"]);
     assert.equal(settings.get("tools.report.approval_mode"), "approve");
+    assert.equal(settings.get("tools.mission_report.approval_mode"), "approve");
     assert.ok(launch.args.includes("--sandbox") && launch.args.includes("workspace-write"));
     assert.ok(launch.args.includes("sandbox_workspace_write.network_access=false"));
     assert.ok(launch.args.includes("on-request"));

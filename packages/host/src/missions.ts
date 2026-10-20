@@ -612,14 +612,17 @@ function teamDetail(team: TeamView) {
   const integrated = team.tasks.filter(task => task.status === "integrated").length;
   return `${teamStep[team.status] ?? team.status}${team.tasks.length && team.status === "implementing" ? `: ${integrated} of ${team.tasks.length} tasks integrated` : ""}`;
 }
+/** Cancelled subtasks are left out, so done/total counts only work the mission still owes. */
+const subtaskCounts = (mission: Mission) => ({ total: mission.subtasks.filter(item => item.status !== "cancelled").length,
+  running: mission.subtasks.filter(item => item.status === "running").length, done: mission.subtasks.filter(item => item.status === "done").length });
 function missionDetail(mission: Mission) {
   const question = mission.decisions.find(decision => !decision.answer)?.question;
   if (question) return question;
   if (mission.status === "blocked" || mission.status === "cancelled" || mission.status === "paused") return mission.reason ?? mission.status;
   if (mission.status === "ready-for-review") return mission.result?.summary ?? "Ready for review";
   if (!mission.subtasks.length) return "Planning subtasks";
-  const done = mission.subtasks.filter(item => item.status === "done").length, running = mission.subtasks.filter(item => item.status === "running");
-  return `${running.length ? `Running: ${running.map(item => item.title).join(", ")}. ` : ""}${done} of ${mission.subtasks.length} subtasks done`;
+  const counts = subtaskCounts(mission), running = mission.subtasks.filter(item => item.status === "running");
+  return `${running.length ? `Running: ${running.map(item => item.title).join(", ")}. ` : ""}${counts.done} of ${counts.total} subtasks done`;
 }
 
 /** The owner's board: missions, plus team runs and goals that no mission started. Goal cycles appear through their goal. */
@@ -631,7 +634,7 @@ export function missionBoard(missions: Mission[], teams: TeamView[], goals: Prod
     const column: BoardColumn = ["needs-input", "blocked"].includes(mission.status) ? "needs-input" : mission.status === "ready-for-review" ? "review" : mission.status === "cancelled" ? "ended" : "working";
     items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: mission.groupId, projectName: mission.groupName, column, status: mission.status,
       detail: oneLine(missionDetail(mission)), updatedAt: mission.updatedAt,
-      subtasks: { total: mission.subtasks.length, running: mission.subtasks.filter(item => item.status === "running").length, done: mission.subtasks.filter(item => item.status === "done").length } });
+      subtasks: subtaskCounts(mission) });
   }
   for (const team of teams) {
     if (team.missionId || team.goal) continue;

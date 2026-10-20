@@ -29,6 +29,7 @@ test("the board maps missions, standalone teams, and goals to columns and hides 
     mission("planning", 1), mission("working", 2, { subtasks: [
       { id: "a", repoProjectId: "api", title: "Endpoint", objective: "x", size: "solo", parallelism: 1, dependsOn: [], status: "running" },
       { id: "b", repoProjectId: "web", title: "Client", objective: "x", size: "solo", parallelism: 1, dependsOn: ["a"], status: "done" },
+      { id: "c", repoProjectId: "web", title: "Dropped", objective: "x", size: "solo", parallelism: 1, dependsOn: [], status: "cancelled" },
     ] }),
     mission("paused", 3, { reason: "Paused by the owner." }), mission("needs-input", 4, { decisions: [{ id: randomUUID(), question: "Ship on Friday?", options: [], createdAt: at(4) }] }),
     mission("blocked", 5, { reason: "The coordinator reported a blocker." }), mission("ready-for-review", 6, { result: { summary: "Both repositories are ready.", revision: 2, at: at(6) } }),

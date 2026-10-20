@@ -9,6 +9,7 @@ import {
   Check,
   ChevronRight,
   Cloud,
+  Coins,
   Download,
   Infinity as InfinityIcon,
   KeyRound,
@@ -37,6 +38,7 @@ import "@xterm/xterm/css/xterm.css";
 import { foreground, useLiveRefresh } from "./live-refresh";
 import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamView } from "./teams";
 import { GoalCreate, GoalDetail, GoalList, GoalPicker, clearGoalRequests, type ProductGoal } from "./goals";
+import { CostPage, CostPicker } from "./cost";
 import "./style.css";
 
 const time = (value: string) =>
@@ -279,7 +281,7 @@ function App() {
     );
   const active = sessions.filter((s) => s.status === "running").length;
   return (
-    <div className={`app ${selected || creating || route.teams || route.goals ? "has-detail" : ""}`}>
+    <div className={`app ${selected || creating || route.teams || route.goals || route.cost ? "has-detail" : ""}`}>
       <aside className="sidebar">
         <Mark />
         <MachinePicker />
@@ -288,15 +290,16 @@ function App() {
           <ShieldCheck size={15} />
         </div>
         <nav className="workspace-navigation" aria-label="Workspace views">
-          <button aria-current={!route.teams && !route.goals ? "page" : undefined} onClick={() => route.navigate(null)}><TerminalSquare size={16} />Sessions</button>
+          <button aria-current={!route.teams && !route.goals && !route.cost ? "page" : undefined} onClick={() => route.navigate(null)}><TerminalSquare size={16} />Sessions</button>
           <button aria-current={route.teams ? "page" : undefined} onClick={() => route.navigateTeam(null)}><Users size={16} />Teams</button>
           <button aria-current={route.goals ? "page" : undefined} onClick={() => route.navigateGoal(null)}><Target size={16} />Goals</button>
+          {me.usage?.enabled && <button aria-current={route.cost ? "page" : undefined} onClick={() => route.navigateCost()}><Coins size={16} />Cost</button>}
         </nav>
         <div className="rail-heading">
           <h2>
-            {route.goals ? "Goals" : route.teams ? "Teams" : "Sessions"} <span>{route.goals ? goals.length : route.teams ? teams.length : sessions.length}</span>
+            {route.cost ? "Projects by cost" : <>{route.goals ? "Goals" : route.teams ? "Teams" : "Sessions"} <span>{route.goals ? goals.length : route.teams ? teams.length : sessions.length}</span></>}
           </h2>
-          {me.role === "owner" && (
+          {me.role === "owner" && !route.cost && (
             <button
               className="icon-button"
               aria-label={route.goals ? "New goal" : route.teams ? "New team" : "New session"}
@@ -306,7 +309,7 @@ function App() {
             </button>
           )}
         </div>
-        {route.goals ? <GoalPicker goals={goals} selected={route.goalId} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} onSelect={route.navigateGoal} /> : route.teams ? <TeamPicker teams={teams} selected={route.teamId} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} onSelect={route.navigateTeam} /> : <SessionPicker sessions={sessions} showUsage={me.usage?.enabled === true} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />}
+        {route.cost ? <CostPicker selected={route.costProjectId} onSelect={id => route.navigateCost("projects", id)} /> : route.goals ? <GoalPicker goals={goals} selected={route.goalId} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} onSelect={route.navigateGoal} /> : route.teams ? <TeamPicker teams={teams} selected={route.teamId} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} onSelect={route.navigateTeam} /> : <SessionPicker sessions={sessions} showUsage={me.usage?.enabled === true} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />}
         <div className="host-status">
           <div>
             {me.environment === "cloud" ? (
@@ -358,15 +361,15 @@ function App() {
           <div className="breadcrumb">
             <button
               className="back icon-button"
-              onClick={() => route.goalId || route.creatingGoal ? route.navigateGoal(null) : route.teamId || route.creatingTeam ? route.navigateTeam(null) : route.navigate(null)}
-              aria-label={route.goalId || route.creatingGoal ? "Back to goals" : route.teamId || route.creatingTeam ? "Back to teams" : "Back to sessions"}
+              onClick={() => route.costProjectId ? route.navigateCost("projects") : route.goalId || route.creatingGoal ? route.navigateGoal(null) : route.teamId || route.creatingTeam ? route.navigateTeam(null) : route.navigate(null)}
+              aria-label={route.costProjectId ? "Back to projects" : route.goalId || route.creatingGoal ? "Back to goals" : route.teamId || route.creatingTeam ? "Back to teams" : "Back to sessions"}
             >
               <ArrowLeft size={20} />
             </button>
             <span>Workspace</span>
             <ChevronRight size={13} />
             <strong>
-              {route.creatingGoal ? "New goal" : route.goalId ? "Goal" : route.goals ? "Goals" : route.creatingTeam ? "New team" : route.teamId ? "Team" : route.teams ? "Teams" : creating ? "New session" : selected ? "Session" : "Overview"}
+              {route.cost ? (route.costProjectId ? "Project cost" : route.costView === "models" ? "Models" : "Cost") : route.creatingGoal ? "New goal" : route.goalId ? "Goal" : route.goals ? "Goals" : route.creatingTeam ? "New team" : route.teamId ? "Team" : route.teams ? "Teams" : creating ? "New session" : selected ? "Session" : "Overview"}
             </strong>
           </div>
           <div className="refresh-status">
@@ -384,7 +387,7 @@ function App() {
             {host.seen ? "This device is offline or the host is unreachable. Showing the last received state. Work may still be running; controls are disabled until a fresh connection arrives." : "Can’t reach the host. Sessions haven’t loaded; controls are disabled until a fresh connection arrives."}
           </div>
         )}
-        {route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} /> : creating ? (
+        {route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
           <Create
             me={me}
             done={route.navigate}

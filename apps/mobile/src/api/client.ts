@@ -1,5 +1,5 @@
 import type { Attention, Provider } from "@infinite/attention";
-import { createRemoteClient, RemoteError, type RemoteAccessToken } from "@infinite/remote";
+import { createRemoteClient, RemoteError, type RemoteAccessToken, type RemoteEvents } from "@infinite/remote";
 import * as Crypto from "expo-crypto";
 import { loadClientId } from "../store/connection";
 import type { TeamLineup, TeamProject, TeamRole, TeamStatus } from "../features/teams/model";
@@ -91,6 +91,15 @@ export async function api<T>(
   }
 }
 
+export function openEvents(connection: Connection, options: {
+  topics: string[];
+  after?: number;
+  onEvent(event: { topic: string; data: unknown }): void;
+  onClose(event: { code: number; error?: RemoteError }): void;
+}): Promise<RemoteEvents> {
+  return remote(connection).openEvents(options);
+}
+
 /** One device's input lease; the host refuses input from every other device while it lasts. */
 export type ControlLease = { id: string; label: string; expiresAt: number };
 export type SessionRow = {
@@ -103,6 +112,11 @@ export type SessionRow = {
   team?: { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string };
   resumable?: boolean;
   title: string;
+  reading?: {
+    now?: { text: string; source: "jev"; for: string; at: string };
+    waitingOnYou?: boolean;
+    title?: { text: string; source: "first-line" | "jev-first-line" | "writer"; model?: string };
+  };
   provider: Provider;
   status: string;
   createdAt: string;
@@ -139,6 +153,7 @@ export type Me = {
   capabilities?: { signals: boolean; answer: boolean; push: boolean };
   teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
   goals?: { enabled: boolean };
+  usage?: { enabled: boolean; budgets?: Record<string, unknown> };
 };
 
 /** Project group contract mirrored from the host for the mobile project picker. */

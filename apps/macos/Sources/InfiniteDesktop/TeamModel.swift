@@ -69,6 +69,16 @@ struct TeamMutation: Equatable {
         await send(TeamMutation(requestID: requestID, path: path, body: .object(fields), label: label))
     }
     func retry() async { guard let pending else { return }; await send(pending) }
+    /// The owner's 1–5 rating of a task. Idempotent per request id; the run is re-read afterwards.
+    func rate(task: String, score: Int) async {
+        guard canOwn, (1...5).contains(score) else { return }
+        busy = true; defer { busy = false }
+        do {
+            _ = try await client.rateTask(team: run.id, task: task, score: score, requestID: UUID().uuidString.lowercased())
+            notice = "Rating recorded."; noticeIsError = false
+        } catch { notice = error.localizedDescription; noticeIsError = true }
+        await poll()
+    }
     /// Only after the person has checked the team: the host may already have applied the request.
     func discardPending() { pending = nil; notice = "Unconfirmed request cleared after your review."; noticeIsError = false }
     private func send(_ mutation: TeamMutation) async {

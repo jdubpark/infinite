@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { JsonLineAssembler, usageFromRunLine, usageFromStepFinish } from "../packages/host/src/opencode-usage.js";
+import { JsonLineAssembler, toolFromRunLine, usageFromRunLine, usageFromStepFinish } from "../packages/host/src/opencode-usage.js";
 
 const context = { completedAt: "2026-10-17T12:00:00.000Z", providerId: "deepseek", modelId: "deepseek-flash", modelSource: "requested" as const };
 const step = { type: "step-finish", id: "prt_1", messageID: "msg_1", sessionID: "ses_1", reason: "stop", cost: 0.0123,
@@ -46,4 +46,13 @@ test("the assembler accepts CRLF endings and drops an oversize partial line", ()
   assert.deepEqual(assembler.push('{"a":1}\r\n'), [{ a: 1 }]);
   assert.deepEqual(assembler.push("x".repeat(1024 * 1024 + 1)), []);
   assert.deepEqual(assembler.push('tail\n{"b":2}\n'), [{ b: 2 }]);
+});
+
+test("a finished OpenCode tool part is activity without its input", () => {
+  const line = (status: string) => ({ type: "tool_use", timestamp: 5, sessionID: "s", part: { type: "tool", tool: "bash", callID: "call_1", state: { status, input: { command: "npm test" } } } });
+  assert.deepEqual(toolFromRunLine(line("completed")), { tool: "bash", toolUseId: "call_1", ok: true });
+  assert.deepEqual(toolFromRunLine(line("error")), { tool: "bash", toolUseId: "call_1", ok: false });
+  assert.equal(toolFromRunLine({ type: "tool_use", part: { tool: "" } }), undefined);
+  assert.equal(toolFromRunLine({ type: "step_finish", part: { type: "step-finish" } }), undefined);
+  assert.equal(toolFromRunLine(null), undefined);
 });

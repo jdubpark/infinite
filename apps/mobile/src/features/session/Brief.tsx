@@ -18,7 +18,7 @@ import {
   type Me,
   type SessionDetail,
 } from "../../api/client";
-import { usePoll } from "../../api/usePoll";
+import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
 import { Composer } from "../../components/Composer";
@@ -59,16 +59,20 @@ export function Brief({
     stale,
     seen,
     refresh,
-  } = usePoll(
-    async () => {
+  } = useLive(connection, {
+    topics: [`session/${id}`],
+    intervalMs: 1500,
+    deps: [id],
+    load: async () => {
       // A poll that started before a local control change must not undo it.
       const revision = control.generation();
       const session = await api<SessionDetail>(connection, `/sessions/${id}`);
       return { session, revision, receivedAt: Date.now() };
     },
-    1500,
-    [connection, id],
-  );
+    select: (topic, payload) => topic === `session/${id}`
+      ? { session: (payload as { state: SessionDetail }).state, revision: control.generation(), receivedAt: Date.now() }
+      : undefined,
+  });
   const session = poll?.session ?? null;
   useControlSync(control, poll, online);
   // `/me` is read once; a failed read is retried after the next good poll.
@@ -180,7 +184,7 @@ export function Brief({
         <>
           <View style={s.head}>
             <Text style={s.title} numberOfLines={2}>
-              {session.title}
+              {session.reading?.title?.text ?? session.title}
             </Text>
             <View style={s.chips}>
               <StatePill state={session.attention.state} />
@@ -245,6 +249,7 @@ export function Brief({
                 key={session.attention.since}
                 attention={session.attention}
                 provider={session.provider}
+                pickedLine={session.reading?.now?.text}
                 exitCode={session.exitCode}
                 onOpenTerminal={openTerminal}
               />

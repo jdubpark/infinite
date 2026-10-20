@@ -40,6 +40,7 @@ struct WorkspaceCommands: Commands {
         }
         CommandMenu("Server") {
             Button("Home") { app.showHome() }.keyboardShortcut("1").disabled(app.active == nil)
+            Button("Cost") { app.showCost() }.keyboardShortcut("5").disabled(app.active == nil || !app.usageEnabled)
             Button("Refresh") { Task { if app.connected { await app.refresh() } else { await app.connect() } } }.keyboardShortcut("r")
             Divider()
             Button("Resources") { openWindow(id: "resources") }.keyboardShortcut("2")
@@ -102,25 +103,28 @@ struct DesktopView: View {
     private var filteredGroups: [ProjectGroup] {
         app.projectGroups.groups.filter { search.isEmpty || ([$0.name] + $0.repos.map(\.name)).joined(separator: " ").localizedCaseInsensitiveContains(search) }
     }
-    /// One list selects Home, a project, or a session; prefixes keep the three from colliding.
+    /// One list selects Home, Cost, a project, or a session; prefixes keep the three from colliding.
     /// While a mission or team is open nothing is selected, so any row leads back.
     private var selection: Binding<String?> {
         Binding(get: {
             if app.showingHome { return app.projectFilter.map { "project:" + $0 } ?? "home" }
+            if app.showingCost { return "cost" }
             if app.selectedTeamID == nil && app.selectedMissionID == nil, let id = app.selectedID { return "session:" + id }
             return nil
         }, set: { value in
             guard let value else { return }
-            let leavingSession = !app.showingHome && app.selectedTeamID == nil && app.selectedMissionID == nil
+            let leavingSession = !app.showingHome && !app.showingCost && app.selectedTeamID == nil && app.selectedMissionID == nil
             if leavingSession, let current = app.selectedID, value != "session:" + current { app.terminals[current]?.markRead() }
-            if value.hasPrefix("session:") { app.openSession(String(value.dropFirst(8))) }
+            if value == "cost" { app.showCost() }
+            else if value.hasPrefix("session:") { app.openSession(String(value.dropFirst(8))) }
             else { app.showHome(project: value.hasPrefix("project:") ? String(value.dropFirst(8)) : nil) }
         })
     }
-    private var missionModel: MissionModel? { app.showingHome ? nil : app.selectedMissionID.flatMap(app.missionModel(for:)) }
-    private var teamModel: TeamModel? { app.showingHome || missionModel != nil ? nil : app.selectedTeamID.flatMap(app.teamModel(for:)) }
+    private var missionModel: MissionModel? { app.showingHome || app.showingCost ? nil : app.selectedMissionID.flatMap(app.missionModel(for:)) }
+    private var teamModel: TeamModel? { app.showingHome || app.showingCost || missionModel != nil ? nil : app.selectedTeamID.flatMap(app.teamModel(for:)) }
     private var pageTitle: String {
         if app.showingHome { return app.projectFilter.flatMap(app.projectGroups.group)?.name ?? "Home" }
+        if app.showingCost { return "Cost" }
         if let missionModel { return missionModel.mission.title }
         if let teamModel { return teamModel.run.title }
         return app.sessions.first { $0.id == app.selectedID }?.title ?? "Infinite"
@@ -171,6 +175,7 @@ struct DesktopView: View {
         return List(selection: selection) {
             if app.active != nil && !searching {
                 Label("Home", systemImage: "square.grid.2x2").tag("home").badge(waiting)
+                if app.usageEnabled { Label("Cost", systemImage: "chart.bar.xaxis").tag("cost") }
             }
             if !groups.isEmpty {
                 Section("Projects") { ForEach(groups) { group in ProjectSidebarRow(group: group, waiting: app.board.count(.needsInput, in: group)).tag("project:" + group.id) } }
@@ -254,8 +259,8 @@ struct DesktopView: View {
 
     @ViewBuilder private var detail: some View {
         VStack(spacing: 0) {
-            // Session panes stay mounted underneath Home, missions, and team dashboards, so switching back is instant.
-            let covered = app.active == nil || app.showingHome || missionModel != nil || teamModel != nil
+            // Session panes stay mounted underneath Home, Cost, missions, and team dashboards, so switching back is instant.
+            let covered = app.active == nil || app.showingHome || app.showingCost || missionModel != nil || teamModel != nil
             ZStack {
                 Group {
                     if app.mounted.isEmpty {
@@ -274,6 +279,7 @@ struct DesktopView: View {
                 }.opacity(covered ? 0 : 1).allowsHitTesting(!covered).accessibilityHidden(covered)
                 if app.active == nil { welcome }
                 else if app.showingHome { HomeView(app: app) }
+                else if app.showingCost, let cost = app.costModel() { CostView(app: app, model: cost) }
                 else if let missionModel { MissionDetailView(app: app, model: missionModel).id(missionModel.id) }
                 else if let teamModel { TeamDetailView(app: app, model: teamModel).id(teamModel.id) }
             }

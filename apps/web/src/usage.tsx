@@ -1,5 +1,4 @@
-import { useEffect, useState } from "react";
-import { useApi, type Me, type UsageSummary, type UsageTotals, type TeamUsage } from "./api";
+import { type Me, type UsageTotals, type TeamUsage } from "./api";
 
 const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
 /** Mirrors formatUsd in the host: four decimals below one cent, "0.00" only for a true zero. */
@@ -7,7 +6,6 @@ const amount = (usd: number) => usd === 0 ? "0.00" : usd >= 0.01 ? usd.toFixed(2
 /** Fully unpriced totals carry no figure; partly unpriced ones are a lower bound. */
 export const cost = (totals: UsageTotals) => totals.messages > 0 && totals.pricing.unknown === totals.messages ? "No price available"
   : (totals.pricing.unknown > 0 ? "At least " : "") + amount(totals.cost) + " USD";
-const day = (value: string) => new Date(value).toLocaleDateString([], { month: "short", day: "numeric", timeZone: "UTC" });
 
 /** Where each figure comes from: a configured price, the cost OpenCode reported, or no price at all. */
 export function usageProvenance(totals: UsageTotals): string {
@@ -39,30 +37,3 @@ export function UsageRollup({ me, usage, heading }: { me: Me; usage?: TeamUsage;
 }
 const names = (value: string) => value === "opencode" ? "OpenCode" : value;
 function FragmentRow({ label, usage }: { label: string; usage: UsageTotals }) { return <><dt>{label}</dt><dd><UsageFigure usage={usage} /></dd></>; }
-
-/** One row per provider. Each row is labelled from that provider's own window and budget period. */
-export function SpendBlock({ me }: { me: Me }) {
-  const api = useApi();
-  const [summary, setSummary] = useState<UsageSummary | null>(null);
-  const [failed, setFailed] = useState(false);
-  const enabled = usageEnabled(me);
-  useEffect(() => {
-    if (!enabled) return;
-    let live = true;
-    api<UsageSummary>("/usage").then(value => { if (live) { setSummary(value); setFailed(false); } }, () => { if (live) setFailed(true); });
-    return () => { live = false; };
-  }, [api, enabled]);
-  if (!enabled) return null;
-  return <section className="team-section"><div className="team-section-heading"><h2>Spend</h2><span className="quiet">Informational. Budgets never stop or hide work.</span></div>
-    {failed && <p className="quiet" role="status">Usage could not be loaded.</p>}
-    {!summary && !failed && <p className="quiet">Loading usage…</p>}
-    {summary && <dl className="team-output">{Object.entries(summary.providers).map(([name, entry]) => {
-      const period = entry.budget?.period, over = entry.spent && entry.budget && entry.spent.cost > entry.budget.usd;
-      return <FragmentProvider key={name} name={names(name)}>
-        {!entry.measured || !entry.spent ? <span className="quiet">Unmeasured{entry.unmeasuredSessions ? ` · ${plural(entry.unmeasuredSessions, "session")}` : ""}</span>
-          : <span>{entry.spent.messages > 0 && entry.spent.pricing.unknown === entry.spent.messages ? "No price available" : (entry.spent.pricing.unknown > 0 ? "At least " : "") + amount(entry.spent.cost)}{entry.budget ? ` / ${amount(entry.budget.usd)}` : ""} USD{over && <strong> · over budget</strong>} <span className="quiet">· {period ? `${period} budget, ` : ""}{day(entry.period.start)} to {day(new Date(Date.parse(entry.period.end) - 1).toISOString())} UTC · {usageProvenance(entry.spent)}{entry.unmeasuredSessions ? ` · ${plural(entry.unmeasuredSessions, "session")} unmeasured` : ""}</span></span>}
-      </FragmentProvider>;
-    })}</dl>}
-  </section>;
-}
-function FragmentProvider({ name, children }: { name: string; children: React.ReactNode }) { return <><dt>{name}</dt><dd>{children}</dd></>; }

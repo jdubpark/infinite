@@ -55,6 +55,24 @@ export class Summarizer {
   }
   get model() { return this.config.model; }
 
+  /** A short title derived only from a generated session's original prompt. */
+  async titleFromPrompt(prompt: string): Promise<{ text: string; model: string }> {
+    let response: Response;
+    try {
+      response = await this.fetcher(`${this.config.baseUrl.replace(/\/$/, "")}/v1/responses`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.key}` },
+        body: JSON.stringify({ model: this.config.model, instructions: "Write a clear session title using only the supplied prompt. Use eight words or fewer, plain text, with no quotes, heading, or ending punctuation. Never add details the prompt does not contain.", input: prompt.slice(0, 24_000), max_output_tokens: 32, store: false }),
+        signal: AbortSignal.timeout(4_000),
+      });
+    } catch (error) { throw new SummaryError(`The title writer could not be reached: ${(error as Error).message}`); }
+    const body: unknown = await response.json().catch(() => null);
+    if (!response.ok) throw new SummaryError(`The title writer refused the request (${response.status})`);
+    const text = responseText(body).replace(/^['"“”]+|['"“”]+$/g, "").trim().split(/\s+/).slice(0, 8).join(" ");
+    if (!text) throw new SummaryError("The title writer returned no title");
+    return { text, model: this.config.model };
+  }
+
   /** One request per distinct message range; concurrent callers share it. */
   summarize(sessionId: string, messages: ChatMessage[], from: string, to: string): Promise<Summary> {
     const key = `${sessionId}:${from}:${to}`;

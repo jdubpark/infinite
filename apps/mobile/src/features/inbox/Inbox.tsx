@@ -10,6 +10,7 @@ import {
   type SessionRow,
 } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
+import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
 import { GlassButton, GroupHeader, LiveStatus, Segmented, Sheet, SheetRow } from "../../components/Glass";
@@ -51,8 +52,11 @@ export function Inbox({
   const [view, setView] = useState<InboxView>(initialView);
   const [machineSheet, setMachineSheet] = useState(false);
   const [exitedOpen, setExitedOpen] = useState(false);
-  const { data, online, stale, loading, refreshing, seen, refresh } = usePoll(
-    async () => {
+  const { data, online, stale, loading, refreshing, seen, refresh } = useLive(connection, {
+    topics: ["sessions"],
+    intervalMs: 2500,
+    deps: [],
+    load: async () => {
       const [list, me] = await Promise.all([
         api<{ sessions: SessionRow[] }>(connection, "/sessions"),
         api<Me>(connection, "/me"),
@@ -66,15 +70,22 @@ export function Inbox({
         at: Date.now(),
       };
     },
-    2500,
-    [connection],
-  );
+    select: (topic, payload, previous) => {
+      if (topic !== "sessions" || !previous) return;
+      const list = payload as { sessions: SessionRow[] };
+      return { ...previous, sessions: [...list.sessions].sort((a, b) => b.createdAt.localeCompare(a.createdAt)), at: Date.now() };
+    },
+  });
   // Hosts that predate teams advertise no `teams` field and have no team routes to poll.
   const hasTeams = Boolean(data?.me.teams), hasGoals = Boolean(data?.me.goals);
   // Full run records are large, so only the visible tab polls quickly; the others refresh their counts slowly.
   const focused = useIsFocused();
   const pace = (tab: InboxView) => focused && view === tab ? 4000 : 20000;
-  const teamsPoll = usePoll(() => hasTeams ? api<{ teams: TeamView[] }>(connection, "/teams").then(value => value.teams) : Promise.resolve(null), pace("teams"), [connection, hasTeams]);
+  const teamsPoll = useLive<TeamView[] | null>(connection, {
+    topics: ["teams"], intervalMs: pace("teams"), deps: [hasTeams],
+    load: () => hasTeams ? api<{ teams: TeamView[] }>(connection, "/teams").then(value => value.teams) : Promise.resolve(null),
+    select: (topic, payload) => topic === "teams" && Array.isArray((payload as { teams?: unknown }).teams) ? (payload as { teams: TeamView[] }).teams : undefined,
+  });
   const goalsPoll = usePoll(() => hasGoals ? api<{ goals: ProductGoal[] }>(connection, "/goals").then(value => value.goals) : Promise.resolve(null), pace("goals"), [connection, hasGoals]);
   const teams = teamsPoll.data ?? [];
   const goals = goalsPoll.data ?? [];
@@ -105,7 +116,10 @@ export function Inbox({
           <Text style={s.machineName} numberOfLines={1}>{machineName(connection)}</Text>
           <View style={s.toggle}><Glyph name={machineSheet ? "up" : "down"} size={11} color={theme.colors.secondaryInk} /></View>
         </Pressable>
-        <LiveStatus online={online} loading={loading} seen={seen} stale={stale} />
+        <View style={s.headerRight}>
+          {data?.me.usage?.enabled ? <GlassButton glyph="chart" label="Cost" size={36} onPress={() => router.push({ pathname: "/cost", params: { machine: connectionKey(connection) } })} /> : null}
+          <LiveStatus online={online} loading={loading} seen={seen} stale={stale} />
+        </View>
       </View>
       <FloatingNotice position="top" offset={54}
         message={stale && !data ? "Can't reach this machine." : shown !== "sessions" && runs.stale ? runs.data ? "Teams offline · last received state." : "Can't load teams." : stale ? "Offline · showing the last received view. Agents may still be running." : null}
@@ -132,7 +146,7 @@ export function Inbox({
                 {folded ? null : group.rows.map((row) => (
                   <Pressable
                     accessibilityRole="button"
-                    accessibilityLabel={`Open ${row.title}, ${SESSION_LABELS[row.attention.state]}`}
+                    accessibilityLabel={`Open ${row.reading?.title?.text ?? row.title}, ${SESSION_LABELS[row.attention.state]}`}
                     key={row.id}
                     onPress={() => router.push({ pathname: "/session/[id]", params: { id: row.id, machine: connectionKey(connection) } })}
                     style={({ pressed }) => [listStyles.row, pressed && listStyles.pressed]}
@@ -140,7 +154,7 @@ export function Inbox({
                     <View style={listStyles.icon}><StatusIcon kind={SESSION_KIND[row.attention.state]} size={18} /></View>
                     <View style={listStyles.main}>
                       <View style={listStyles.line}>
-                        <Text style={listStyles.title} numberOfLines={1}>{row.title}</Text>
+                        <Text style={listStyles.title} numberOfLines={1}>{row.reading?.title?.text ?? row.title}</Text>
                         <Text style={listStyles.age}>{age(row.attention.since, now)}</Text>
                       </View>
                       <View style={listStyles.line}>
@@ -148,8 +162,9 @@ export function Inbox({
                         <Text style={[s.now, row.attention.state === "needs-you" && listStyles.attentionText]} numberOfLines={1}>
                           {row.attention.prompt?.destructive ? <Text style={s.destructive}>Destructive · </Text> : null}
                           {row.team ? <Text style={s.role}>{ROLE_NAMES[row.team.role]}{teamTitles.has(row.team.runId) && !row.title.includes(teamTitles.get(row.team.runId)!) ? ` · ${teamTitles.get(row.team.runId)}` : ""} · </Text> : null}
-                          {row.attention.now || SESSION_LABELS[row.attention.state]}
+                          {row.attention.state === "turn-finished" ? (row.reading?.now?.text ?? row.attention.now) || SESSION_LABELS[row.attention.state] : row.attention.now || SESSION_LABELS[row.attention.state]}
                         </Text>
+                        {row.attention.state === "turn-finished" && row.reading?.waitingOnYou ? <Text style={listStyles.meta}>Asks you</Text> : null}
                       </View>
                     </View>
                   </Pressable>
@@ -198,6 +213,7 @@ export function Inbox({
 const s = StyleSheet.create({
   fill: { flex: 1, position: "relative" },
   header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 16, paddingTop: 6, paddingBottom: 4, minHeight: 48 },
+  headerRight: { flexDirection: "row", alignItems: "center", gap: 8 },
   machine: { flexDirection: "row", alignItems: "center", gap: 7, flexShrink: 1, minHeight: 40 },
   machineName: { fontSize: 15, fontWeight: "600", color: theme.colors.ink, flexShrink: 1 },
   toggle: { width: 24, height: 24, borderRadius: 12, alignItems: "center", justifyContent: "center", backgroundColor: theme.colors.secondarySurface },

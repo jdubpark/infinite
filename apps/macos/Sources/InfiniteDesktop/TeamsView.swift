@@ -193,7 +193,8 @@ struct TeamDetailView: View {
             if team.tasks.isEmpty { Text("The coordinator has not reported a work plan yet.").font(.callout).foregroundStyle(.secondary) }
             ForEach(Array(team.tasks.enumerated()), id: \.offset) { _, task in
                 let id = task["id"].string
-                TaskCard(task: task, team: team, expanded: Binding(get: { expandedTasks.contains(id) }, set: { if $0 { expandedTasks.insert(id) } else { expandedTasks.remove(id) } })).id(id)
+                TaskCard(task: task, team: team, expanded: Binding(get: { expandedTasks.contains(id) }, set: { if $0 { expandedTasks.insert(id) } else { expandedTasks.remove(id) } }),
+                         rate: model.role == "owner" ? { score in Task { await model.rate(task: id, score: score) } } : nil, canRate: model.canOwn).id(id)
             }
         }
     }
@@ -371,11 +372,16 @@ struct DecisionCard: View {
 }
 
 /// One line per task; expanding shows the agent's own report and the brief it worked from.
+/// A metered task carries what it cost; the owner can rate any task from here.
 struct TaskCard: View {
     let task: JSON
     let team: TeamRun
     @Binding var expanded: Bool
+    var rate: ((Int) -> Void)? = nil
+    var canRate = false
     private var status: String { task["status"].string }
+    private var usage: TaskUsage? { task["usage"] == .null ? nil : try? task["usage"].decoded() }
+    private var rating: OwnerRating? { task["ownerRating"] == .null ? nil : try? task["ownerRating"].decoded() }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Button { withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() } } label: {
@@ -384,6 +390,7 @@ struct TaskCard: View {
                     Text(task["title"].string).font(.callout.weight(.medium)).lineLimit(1)
                     Text(agentLabel(task, team)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     Spacer()
+                    if let usage { MoneyText(usage.money).font(.caption).monospacedDigit().foregroundStyle(.secondary) }
                     Text("\(task["paths"].array.count) file\(task["paths"].array.count == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
                     Text(status).font(.caption).foregroundStyle(.secondary)
                     Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary).rotationEffect(.degrees(expanded ? 90 : 0))
@@ -393,6 +400,13 @@ struct TaskCard: View {
                 let depends = task["dependsOn"].array.map { id in team.task(id.string)?["title"].string ?? id.string }
                 if !depends.isEmpty { Text("After: \(depends.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary) }
                 assigned
+                if let usage { spend(usage) }
+                if rate != nil || rating != nil {
+                    HStack(spacing: 6) {
+                        Text("Your rating").font(.caption).foregroundStyle(.secondary)
+                        RatingControl(score: rating?.score, at: rating?.at, enabled: rate != nil && canRate) { score in rate?(score) }
+                    }
+                }
                 HStack(spacing: 6) {
                     Text("Owns").font(.caption).foregroundStyle(.secondary)
                     ForEach(Array(task["paths"].array.enumerated()), id: \.offset) { _, path in Text(path.string).font(.system(size: 11, design: .monospaced)).lineLimit(1) }
@@ -407,6 +421,15 @@ struct TaskCard: View {
                 }.font(.caption)
             }
         }.padding(10).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+    }
+    /// What the task cost across every attempt, from the host's ledger.
+    private func spend(_ usage: TaskUsage) -> some View {
+        HStack(spacing: 6) {
+            Text("Spent").font(.caption).foregroundStyle(.secondary)
+            MoneyText(usage.money).font(.caption.weight(.medium)).monospacedDigit()
+            Text("· \(UsageFormat.tokens(usage.tokens)) tokens · \(usage.attempts) attempt\(usage.attempts == 1 ? "" : "s")" + (usage.profiles.isEmpty ? "" : " · " + usage.profiles.joined(separator: ", ")))
+                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        }
     }
     @ViewBuilder private var assigned: some View {
         HStack(spacing: 6) {

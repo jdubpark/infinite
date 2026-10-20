@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { Manager } from "./manager.js";
+import { Manager, publicAttention } from "./manager.js";
 import { hashToken, validateLinearConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
 import { workerCall, type WorkerError } from "./ipc.js";
@@ -29,7 +29,8 @@ import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
-import { createTeamSchema, teamMutationSchema, teamActionSchema } from "./team-types.js";
+import { createTeamSchema, teamMutationSchema, teamActionSchema, teamTaskRatingSchema } from "./team-types.js";
+import { scorecard } from "./scorecard.js";
 import { GoalService } from "./goals.js";
 import { MissionService, missionBoard } from "./missions.js";
 import { createMissionSchema, missionActionSchema, missionTextSchema } from "./mission-types.js";
@@ -41,6 +42,10 @@ import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./
 import type { Config, Role, Receipt } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
+import { BalanceService } from "./balances.js";
+import { LiveFeed, type LiveTopic } from "./live.js";
+import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/protocol";
+import { Readings } from "./readings.js";
 
 const id = z.uuid();
 /** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
@@ -55,6 +60,7 @@ const createSchema = z
     provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]),
     projectId: z.string().max(80),
     title: z.string().trim().min(1).max(100),
+    generatedTitle: z.literal(true).optional(),
     prompt: z.string().max(24000).default(""),
     nativeArgs: z.array(z.string().max(8192).refine((s) => !s.includes("\0")))
       .max(256).refine((args) => args.join("").length <= 32000).optional(),
@@ -136,12 +142,20 @@ export function createApp(config: Config, key: Buffer) {
   const linear = new LinearService(config, key);
   const teams = new TeamService(config, key, manager, startInProject, linear);
   const usage = new UsageService(config, key, manager);
+  const balances = new BalanceService(config.usage?.accounts ?? {});
+  usage.useBalances(balances);
   // TeamService ticks on every host and drives the ledger from its own session listing.
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
   const projectGroups = new ProjectGroupService(config, key);
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   missions.useUsage(usage);
+  usage.useResolvers({
+    goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },
+    runTitle: runId => { try { return teams.get(runId).title; } catch { return undefined; } },
+    projectName: projectId => config.projects.find(project => project.id === projectId)?.name,
+    sessionTitle: sessionId => { try { return manager.meta(sessionId).session.title; } catch { return undefined; } },
+  });
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
   const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
   const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
@@ -170,7 +184,7 @@ export function createApp(config: Config, key: Buffer) {
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async () => {
-    const native = (await manager.list()).map(session => {
+    const native = (await manager.list({ includeFullMessage: Boolean(config.jev) })).map(session => {
       const handoff = handoffs.view(session.id);
       return { ...session, handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
         resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
@@ -180,8 +194,33 @@ export function createApp(config: Config, key: Buffer) {
     const known = new Set(native.filter(s => s.status === "running" && s.nativeSession && s.pid)
       .map(s => `${s.provider}:${s.nativeSession!.id}:${s.pid}`));
     const external = cmux ? (await cmux.list()).filter(s => s.status !== "running" || !s.nativeSession || !s.pid || !known.has(`${s.provider}:${s.nativeSession.id}:${s.pid}`)) : [];
-    return [...native, ...external.map(s => ({ ...s, backend: "cmux" as const, machineId: config.machine!.id, resumable: resumable(s) }))];
+    const merged = readings.merge([...native, ...external.map(s => ({ ...s, backend: "cmux" as const, machineId: config.machine!.id, resumable: resumable(s) }))]);
+    return merged.map(session => ({ ...session, attention: publicAttention(session.attention) }));
   };
+  const sessionDetail = async (sessionId: string) => {
+    if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
+      const session = await cmux.get(sessionId);
+      return { ...session, machineId: config.machine!.id, resumable: resumable(session) };
+    }
+    const session = { ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) };
+    const handoff = handoffs.view(sessionId);
+    const { generatedTitle: _generatedTitle, ...publicSession } = readings.merge([session])[0];
+    return { ...publicSession, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
+      resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
+  };
+  const sessionEvents = async (sessionId: string, after: number, limit = 200) => {
+    if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
+      await cmux.get(sessionId);
+      return cmux.events(sessionId, after, limit);
+    }
+    return manager.events(sessionId, after, limit);
+  };
+  const live = new LiveFeed({
+    sessions: async () => ({ sessions: await listSessions() }),
+    teams: () => ({ teams: teams.list() }),
+    session: sessionDetail,
+    events: (sessionId, after) => sessionEvents(sessionId, after),
+  });
   /**
    * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
    * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
@@ -214,9 +253,11 @@ export function createApp(config: Config, key: Buffer) {
   };
   const pushStore = new PushStore(config.stateDir, key);
   const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
+  const readings = new Readings(config, key, manager, summarizer);
   const repositoryBriefings = config.repositoryBriefings
     ? new RepositoryBriefings(config.repositoryBriefings, manager, config.projects, config.teams?.workspaceDir)
     : undefined;
+  repositoryBriefings?.useUsage(usage);
   async function inputAuthority(sessionId: string, res: express.Response) {
     // Retained workers from earlier releases hash the entire request. Adding
     // optional fields would make a pre-upgrade receipt impossible to retry.
@@ -224,6 +265,7 @@ export function createApp(config: Config, key: Buffer) {
       ? { actor: res.locals.actor, leaseId: res.locals.leaseId } : {};
   }
   const cookies = new Map<string, { device: PairedDevice; expires: number }>();
+  const eventStreamCounts = new Map<string, number>();
   const attempts = new Map<string, { start: number; count: number }>();
   const origin = new URL(config.origin);
   app.disable("x-powered-by");
@@ -256,6 +298,22 @@ export function createApp(config: Config, key: Buffer) {
     return config.tokens.find((t) =>
       timingSafeEqual(digest, Buffer.from(t.hash, "hex")),
     );
+  }
+  function authenticateRequest(req: express.Request) {
+    const bearer = req.headers.authorization?.match(/^Bearer (.{32,200})$/)?.[1];
+    if (bearer) {
+      const device = authenticate(bearer);
+      return device ? { device, credentialHash: device.hash, instance: "legacy", bearer: true } : undefined;
+    }
+    const value = req.headers.cookie
+      ?.split(";")
+      .map((v) => v.trim())
+      .find((v) => v.startsWith("infinite="))
+      ?.slice(9);
+    const session = value ? cookies.get(hashToken(value)) : undefined;
+    if (!session || session.expires <= Date.now()) return undefined;
+    const device = config.tokens.find(token => token.hash === session.device.hash);
+    return device ? { device, credentialHash: device.hash, instance: hashToken(value!), bearer: false } : undefined;
   }
   app.post("/api/login", (req, res) => {
     const ip = req.socket.remoteAddress ?? "unknown";
@@ -291,33 +349,23 @@ export function createApp(config: Config, key: Buffer) {
     return res.json({ role: device.role });
   });
   app.use("/api", (req, res, next) => {
-    const bearer =
-      req.headers.authorization?.match(/^Bearer (.{32,200})$/)?.[1];
-    let device = bearer ? authenticate(bearer) : undefined;
-    let instance = "legacy";
-    if (!bearer) {
-      const value = req.headers.cookie
-        ?.split(";")
-        .map((v) => v.trim())
-        .find((v) => v.startsWith("infinite="))
-        ?.slice(9);
-      const session = value ? cookies.get(hashToken(value)) : undefined;
-      if (session && session.expires > Date.now()) {
-        device = session.device;
-        instance = hashToken(value!);
-      }
+    const auth = authenticateRequest(req);
+    const device = auth?.device;
+    const hasBearer = Boolean(req.headers.authorization?.match(/^Bearer (.{32,200})$/)?.[1]);
+    if (!hasBearer) {
       if (req.method !== "GET" && req.headers.origin !== origin.origin)
         return res
           .status(403)
           .json({ error: "Origin is required for browser changes" });
     }
-    if (!device)
+    if (!auth || !device)
       return res.status(401).json({ error: "Connect with a device key" });
     res.locals.role = device.role;
     res.locals.deviceId = device.id;
-    res.locals.bearer = Boolean(bearer);
+    res.locals.bearer = auth.bearer;
+    res.locals.authCredentialHash = auth.credentialHash;
     const clientId = req.get("X-Infinite-Client");
-    res.locals.actor = controlActor(device, clientId ? id.parse(clientId) : instance);
+    res.locals.actor = controlActor(device, clientId ? id.parse(clientId) : auth.instance);
     res.locals.leaseId = id.optional().parse(req.get("X-Infinite-Control"));
     next();
   });
@@ -364,6 +412,19 @@ export function createApp(config: Config, key: Buffer) {
     }),
   );
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
+  app.get("/api/usage/models", (req, res) => {
+    const query = z.object({ role: z.string().trim().min(1).max(40).optional() }).strict().parse(req.query);
+    return res.json(scorecard(teams.list(), sessionId => {
+      const found = usage.session(sessionId);
+      return found.measured ? { cost: found.cost, tokens: found.tokens.input + found.tokens.output + found.tokens.reasoning + found.tokens.cacheRead + found.tokens.cacheWrite, unpriced: found.pricing.unknown } : undefined;
+    }, { role: query.role }));
+  });
+  app.get("/api/usage/daily", (req, res, next) => {
+    try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); }
+  });
+  app.get("/api/usage/projects", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query); return void res.json(usage.projects({ tz: query.tz })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
+  app.get("/api/usage/projects/:id", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query), result = usage.project(String(req.params.id), { tz: query.tz }); if (!result) return void res.status(404).json({ error: "Project usage not found" }); return void res.json(result); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
+  app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
   app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
@@ -399,6 +460,8 @@ export function createApp(config: Config, key: Buffer) {
     app.post(`/api/missions/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await missions[action](id.parse(req.params.id), missionActionSchema.parse(req.body))));
   app.get("/api/board", (_req, res) => res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects)));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  app.post("/api/teams/:id/tasks/:taskId/rating", requireRole(["owner"]), (req, res) =>
+    res.json(teams.rateTask(id.parse(req.params.id), z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).parse(req.params.taskId), teamTaskRatingSchema.parse(req.body))));
   app.post("/api/teams/:id/permissions/revoke", requireRole(["owner"]), async (req, res) => res.json(await teams.revokePermissions(id.parse(req.params.id), teamActionSchema.parse(req.body))));
   app.get("/api/teams/:id/bundle", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;
@@ -564,6 +627,64 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/sessions", async (_req, res) =>
     res.json({ sessions: await listSessions() }),
   );
+  app.get("/api/events", (req, res) => {
+    const topicValues = z.array(z.union([z.literal("sessions"), z.literal("teams"), z.string().regex(/^session\/[0-9a-f-]{36}$/i)])).min(1).max(16)
+      .parse(z.string().min(1).max(4096).parse(req.query.topics).split(","));
+    const topics = topicValues.map(value => value === "sessions" || value === "teams" ? value : `session/${id.parse(value.slice(8))}`) as LiveTopic[];
+    if (new Set(topics).size !== topics.length) return void res.status(400).json({ error: "Duplicate live topic" });
+    const after = z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0).parse(req.query.after);
+    const credentialHash = res.locals.authCredentialHash as string;
+    const initial = authenticateRequest(req);
+    if (!initial || initial.credentialHash !== credentialHash) return void res.status(401).json({ error: "Connect with a device key" });
+    const streamCounts = eventStreamCounts;
+    const active = streamCounts.get(credentialHash) ?? 0;
+    if (active >= MAX_EVENTS_STREAMS) return void res.status(429).json({ code: "busy", error: "Too many live event streams for this device" });
+    streamCounts.set(credentialHash, active + 1);
+    res.status(200).set({ "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", Connection: "keep-alive" });
+    let stop = () => {};
+    let closed = false;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      if (heartbeat) clearInterval(heartbeat);
+      stop();
+      const count = (streamCounts.get(credentialHash) ?? 1) - 1;
+      if (count > 0) streamCounts.set(credentialHash, count); else streamCounts.delete(credentialHash);
+    };
+    const stillAuthenticated = () => {
+      const current = authenticateRequest(req);
+      return Boolean(current && current.credentialHash === credentialHash && current.device.id === initial.device.id && current.device.role === initial.device.role);
+    };
+    const terminate = (reason: "auth-revoked" | "buffer-limit") => {
+      close();
+      if (reason === "buffer-limit") {
+        const frame = `event: close\ndata: {"reason":"buffer-limit"}\n\n`;
+        if (res.writableLength + Buffer.byteLength(frame) <= MAX_EVENTS_BUFFERED_BYTES) return void res.end(frame);
+        res.once("error", () => {});
+        return void res.destroy(new Error("HTTP events buffer limit exceeded"));
+      }
+      res.end();
+    };
+    const writeFrame = (frame: string) => {
+      if (closed || res.destroyed || res.writableEnded) return false;
+      if (!stillAuthenticated()) { terminate("auth-revoked"); return false; }
+      if (res.writableLength + Buffer.byteLength(frame) > MAX_EVENTS_BUFFERED_BYTES) { terminate("buffer-limit"); return false; }
+      res.write(frame);
+      return true;
+    };
+    res.on("close", close);
+    res.flushHeaders();
+    if (!writeFrame(": connected\n\n")) return;
+    const unsubscribe = live.subscribe(topics, after, update => {
+      writeFrame(`event: update\ndata: ${JSON.stringify(update)}\n\n`);
+    });
+    if (closed) unsubscribe(); else stop = unsubscribe;
+    if (!closed) {
+      heartbeat = setInterval(() => { writeFrame(": heartbeat\n\n"); }, 15000);
+      heartbeat.unref();
+    }
+  });
   app.post("/api/sessions", requireRole(["owner"]), async (req, res) => {
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) return void res.status(400).json({ code: "invalid-create", error: "Invalid session details", details: parsed.error.issues.map(issue => ({ path: issue.path.join("."), message: issue.message })) });
@@ -634,14 +755,7 @@ export function createApp(config: Config, key: Buffer) {
     }
   });
   app.get("/api/sessions/:id", async (req, res) => {
-    const sessionId = id.parse(req.params.id);
-    const session = {
-      ...manager.meta(sessionId).session,
-      ...(await manager.state(sessionId, true)),
-    };
-    const handoff = handoffs.view(sessionId);
-    res.json({ ...session, handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
-      resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) });
+    res.json(await sessionDetail(id.parse(req.params.id)));
   });
   app.get("/api/sessions/:id/handoff", (req, res) => res.json(handoffs.view(id.parse(req.params.id))));
   app.get("/api/sessions/:id/messages", async (req, res) => {
@@ -722,7 +836,7 @@ export function createApp(config: Config, key: Buffer) {
     const query = new URL(req.originalUrl, origin).search;
     proxyNativeHttp(req, res, new URL(backend.url + path + query), { Authorization: backend.token }, req.body === undefined ? undefined : Buffer.from(JSON.stringify(req.body)));
   });
-  app.get("/api/sessions/:id/events", (req, res) => {
+  app.get("/api/sessions/:id/events", async (req, res) => {
     const after = z.coerce
       .number()
       .int()
@@ -737,7 +851,7 @@ export function createApp(config: Config, key: Buffer) {
       .max(200)
       .default(200)
       .parse(req.query.limit);
-    const types =
+    const types: Set<string> | undefined =
       typeof req.query.types === "string"
         ? new Set(
             z
@@ -757,7 +871,9 @@ export function createApp(config: Config, key: Buffer) {
               .parse(req.query.types.split(",")),
           )
         : undefined;
-    res.json(manager.events(id.parse(req.params.id), after, limit, types));
+    const sessionId = id.parse(req.params.id);
+    const page = await sessionEvents(sessionId, after, limit);
+    res.json({ ...page, events: types ? page.events.filter(event => types.has(event.type)) : page.events });
   });
   app.post("/api/sessions/:id/control", requireRole(["owner", "controller"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);
@@ -1049,17 +1165,20 @@ export function createApp(config: Config, key: Buffer) {
   server.once("listening", () => goals.start());
   server.once("listening", () => missions.start());
   server.once("listening", () => handoffs.start());
+  server.once("listening", () => readings.start());
   if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });
+  server.once("listening", () => balances.start());
   server.once("close", () => teams.close());
-  server.once("close", () => usage.close());
+  server.once("close", () => { usage.close(); balances.close(); });
   server.once("close", () => goals.close());
   server.once("close", () => missions.close());
   server.once("close", () => repositoryBriefings?.close());
   server.once("close", () => linear.close());
   server.once("close", () => handoffs.close());
+  server.once("close", () => readings.stop());
   const closeTerminals = connectTerminals(server, manager, authenticate);
   const closeNative = connectNativeFrontends(server, manager, authenticate);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { handoffs.close(); missions.close(); goals.close(); teams.close(); usage.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, sessions: { list: listSessions }, pushStore, server, closeConnections };
+  const closeConnections = () => { live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  return { app, manager, projectSync, teams, goals, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

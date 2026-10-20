@@ -40,6 +40,19 @@ export function usageFromRunLine(line: unknown, model: string, now = new Date())
 }
 
 /**
+ * The finished tool call in one line of `opencode run --format json` output, or undefined. A
+ * headless turn reports progress only through these parts, so each one is evidence of activity.
+ */
+export function toolFromRunLine(line: unknown): { tool: string; toolUseId?: string; ok: boolean } | undefined {
+  const event = line as { type?: unknown; part?: { tool?: unknown; callID?: unknown; state?: { status?: unknown } } } | null;
+  if (event?.type !== "tool_use") return undefined;
+  const tool = text(event.part?.tool)?.slice(0, 100);
+  if (!tool) return undefined;
+  const toolUseId = text(event.part?.callID)?.slice(0, 200);
+  return { tool, ...(toolUseId ? { toolUseId } : {}), ok: event.part?.state?.status !== "error" };
+}
+
+/**
  * Reassembles newline-delimited JSON from raw terminal chunks. Lines that are not JSON objects
  * (spinners, plain text) are dropped, and a partial line over 1 MiB is discarded.
  */

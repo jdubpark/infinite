@@ -363,13 +363,19 @@ into tracked configuration examples, screenshots, or repository reports.
 
 ## Usage and budgets
 
-The host records OpenCode token usage and prices it. Usage is off until the host config has a `usage` block. The web client and `infinite usage` read the same ledger.
+The sealed host ledger records measured OpenCode token usage. Configure a `usage` block to expose the Cost view, account mapping, and budgets. The dated built-in catalog prices DeepSeek and Meta models; custom prices can override it. Claude and Codex remain unmeasured per use and appear only as fixed plan fees. The web client, API, and CLI read the same ledger.
 
 ```json
 {
   "usage": {
     "prices": {
       "PROVIDER_ID/MODEL_ID": { "input": 0.5, "output": 2, "cacheRead": 0.1, "cacheWrite": 0.6 }
+    },
+    "accounts": {
+      "deepseek": { "kind": "metered", "match": ["deepseek/*"], "balance": { "source": "deepseek", "apiKeyFile": "/ABSOLUTE/PATH/TO/DEEPSEEK_KEY" } },
+      "meta": { "kind": "metered", "match": ["meta/*"] },
+      "claude": { "kind": "subscription", "match": ["claude/*"], "planUsd": 200 },
+      "codex": { "kind": "subscription", "match": ["codex/*"], "planUsd": 200 }
     },
     "budgets": {
       "opencode": { "usd": 50, "period": "month" }
@@ -379,9 +385,11 @@ The host records OpenCode token usage and prices it. Usage is off until the host
 ```
 
 - **Prices** are USD per million tokens, keyed `provider/model`. `cacheRead` and `cacheWrite` default to the `input` price. Reasoning tokens bill at the `output` price.
+- **Catalog** prices are dated 2026-10-19 and include DeepSeek Flash/V4 Pro and Meta Muse Spark/Contributor/Wonder. DeepSeek weekday UTC peak windows are priced at twice the off-peak rate; Chinese public holidays are not modelled. Configured prices take precedence over the catalog, then OpenCode-reported cost is used. Each catalog entry records its source URL and date.
+- **Accounts** map provider/model globs to a metered or subscription account. `planUsd` is a fixed monthly line. The DeepSeek balance key is read once from an absolute `apiKeyFile`; it is never logged or returned to clients. The host refreshes at most every 15 minutes and preserves the last good balance as stale after a failure. Meta has no balance in this view; other balances show `—` unless supplied by an official provider API.
 - **Budgets** are per provider, in USD, with a `day`, `week`, or `month` period. Periods are UTC, weeks start on Monday, and the period defaults to `month`.
 
-A configured price wins over the cost OpenCode reports. Every figure names its source: `configured price`, `reported by OpenCode`, or unpriced when neither exists. A total that includes unpriced steps says how many, so it is never presented as complete.
+Every total carries an unpriced count. Clients mark incomplete priced totals with `≥` and do not turn missing usage or price into a zero-cost claim.
 
 Budgets are informational. The host shows spent against budget and marks `over budget`, but it never pauses, refuses, or hides a team, goal, or session because of spend.
 
@@ -389,7 +397,7 @@ Only some work is measured. OpenCode team members and OpenCode sessions started 
 
 Headless team members record the model that was requested for them. If the provider substitutes another model, the ledger still prices the requested one.
 
-Each provider row is labelled with that provider's own budget period and window. The web client shows these in the Spend block on the team list, as a cost line on each member, and as agent spend on each team run and goal. `infinite usage` prints one line per provider, and `infinite usage --json` prints the raw summary from `GET /api/usage`.
+`GET /api/usage` returns the month and account summary. `GET /api/usage/daily` accepts `days` (1–366), an IANA `tz` (default UTC), and optional `project`. `GET /api/usage/projects` and `/api/usage/projects/:id` provide project roll-ups. Owners can request a DeepSeek refresh with `POST /api/usage/balances/refresh`. The CLI provides `infinite usage`, `usage projects`, `usage project PROJECT_ID`, `usage goal GOAL_ID`, and `usage models [--role ROLE]`; each accepts `--json`.
 
 ## Provider usage limits and fallbacks
 
@@ -931,6 +939,16 @@ extend the goal first if it has.
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
+| `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
+
+## Model scorecard
+
+`GET /api/usage/models?role=implementer` returns per-profile task outcomes,
+metered usage, version 1 reviewer rubric means, separate owner ratings, Wilson
+95% integration intervals, and advisory comparisons once both profiles have
+at least ten attempts. Limit-switched attempts are excluded. The host never
+changes the configured model lineup; ratings and rubrics are not sent to
+implementers. The owner rating request is idempotent for a given `requestId`.
 
 Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route

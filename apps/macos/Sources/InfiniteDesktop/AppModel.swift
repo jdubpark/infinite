@@ -83,13 +83,16 @@ struct TeamResumeFailure: Equatable {
     /// Team runs the host reports, ordered with the ones waiting on a person first.
     @Published var teams: [TeamRun] = []
     /// A selected team shows its dashboard in place of the session panes, which stay mounted.
-    @Published var selectedTeamID: String? { didSet { if selectedTeamID != nil { showingHome = false; selectedMissionID = nil } } }
+    @Published var selectedTeamID: String? { didSet { if selectedTeamID != nil { showingHome = false; showingCost = false; selectedMissionID = nil } } }
     /// A selected mission shows its detail the same way; a mission and a team are never both open.
-    @Published var selectedMissionID: String? { didSet { if selectedMissionID != nil { showingHome = false; selectedTeamID = nil; teamOpenedFrom = nil } } }
+    @Published var selectedMissionID: String? { didSet { if selectedMissionID != nil { showingHome = false; showingCost = false; selectedTeamID = nil; teamOpenedFrom = nil } } }
     /// The mission whose subtask opened the current team page, so that page can lead back to it.
     @Published var teamOpenedFrom: String?
     /// Home, the project board, covers the session panes the same way; it is the first page after connecting.
-    @Published var showingHome = true
+    @Published var showingHome = true { didSet { if showingHome { showingCost = false } } }
+    /// The cost view covers the panes like Home; one of Home, Cost, a mission, or a team shows at a time.
+    @Published var showingCost = false { didSet { if showingCost { showingHome = false; selectedTeamID = nil; selectedMissionID = nil } } }
+    private(set) var cost: CostModel?
     /// The project Home's board is narrowed to; nil shows every project.
     @Published var projectFilter: String?
     @Published private(set) var projectGroups = ProjectGroupList.empty
@@ -126,6 +129,14 @@ struct TeamResumeFailure: Equatable {
     /// The host's configured digest model, when any.
     var summaryModel: String? { let model = me["capabilities"]["summaries"]["model"].string; return model.isEmpty ? nil : model }
     var teamsEnabled: Bool { me["teams"]["enabled"].bool }
+    /// The host keeps a usage ledger, so the cost view has figures to show.
+    var usageEnabled: Bool { me["usage"]["enabled"].bool }
+    func costModel() -> CostModel? {
+        if let cost { return cost }
+        guard let client else { return nil }
+        let model = CostModel(client: client, owner: isOwner); cost = model; return model
+    }
+    func showCost() { showingCost = true }
     var teamLineup: JSON { me["teams"]["lineup"] }
     var teamParallelismLimit: Int { let value = me["teams"]["maxParallelism"].int; return max(1, min(4, value == 0 ? 4 : value)) }
     func projectName(_ id: String) -> String { projects.first { $0["id"].string == id }?["name"].string ?? id }
@@ -177,7 +188,7 @@ struct TeamResumeFailure: Equatable {
         let previousClient = client; client = nil
         connected = false; connecting = true; sessions = []; resources = .null; me = .null
         teams = []; selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil; projectFilter = nil; showingHome = true; teamModels.removeAll(); teamsFresh = false
-        projectGroups = .empty; board = .empty; boardFresh = false; boardError = ""; missionModels.removeAll()
+        projectGroups = .empty; board = .empty; boardFresh = false; boardError = ""; missionModels.removeAll(); cost = nil
         sessionsLoaded = false; teamsLoaded = false
         sessionFreshness.recovered(); teamFreshness.recovered()
         for terminal in previousTerminals { await terminal.detach() }
@@ -353,7 +364,7 @@ struct TeamResumeFailure: Equatable {
         teamModels[id] = model; return model
     }
     /// Leaving a team for one of its member sessions.
-    func openSession(_ id: String) { selectedTeamID = nil; selectedMissionID = nil; showingHome = false; selectedID = id }
+    func openSession(_ id: String) { selectedTeamID = nil; selectedMissionID = nil; showingHome = false; showingCost = false; selectedID = id }
     func createTeam(projectID: String, provider: String, useLineup: Bool, title: String, objective: String, parallelism: Int) async throws {
         guard let client else { throw DesktopError("Connect to a server first.") }
         let profileID = activeID
@@ -392,7 +403,9 @@ struct TeamResumeFailure: Equatable {
         let profileID = activeID
         if pendingCreation.pendingID == nil {
             let requestID = UUID().uuidString.lowercased()
-            let body: JSON = .object(["requestId": .string(requestID), "provider": .string(provider), "projectId": .string(project), "title": .string(title.isEmpty ? "\(provider.capitalized) session" : title), "prompt": .string("")])
+            var fields: [String: JSON] = ["requestId": .string(requestID), "provider": .string(provider), "projectId": .string(project), "title": .string(title.isEmpty ? "\(provider.capitalized) session" : title), "prompt": .string("")]
+            if title.isEmpty { fields["generatedTitle"] = .bool(true) }
+            let body: JSON = .object(fields)
             var record = DraftRecord(); record.pendingID = requestID
             record.pendingText = String(decoding: try body.data(), as: UTF8.self)
             try drafts.save(record, identity: "\(profileID):create"); pendingCreation = record

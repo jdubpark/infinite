@@ -48,7 +48,7 @@ import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
-import { JsonLineAssembler, usageFromRunLine } from "./opencode-usage.js";
+import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
 import type {
   Bootstrap,
@@ -1396,6 +1396,12 @@ server.listen(socketPath(runDir, session.id), async () => {
         if (usageLines) for (const event of usageLines.push(data)) {
           const usage = session.teamModelProfile ? usageFromRunLine(event, session.teamModelProfile.model) : undefined;
           if (usage) append("usage", { ...usage });
+          // A finished tool call is the activity a long headless turn shows; it carries no input.
+          const tool = toolFromRunLine(event);
+          if (tool) {
+            record({ kind: "tool-start", tool: tool.tool, ...(tool.toolUseId ? { toolUseId: tool.toolUseId } : {}), input: {}, quiet: true }, "protocol");
+            record({ kind: "tool-end", ...tool }, "protocol");
+          }
         }
         snapshots.observe(data);
         terminal.write(data);

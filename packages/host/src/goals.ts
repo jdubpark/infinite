@@ -88,9 +88,11 @@ export class GoalService {
     const goal = structuredClone(this.record(id).goal);
     const tracking = this.linear?.updateGoal(goal, goal.linearTracking === true);
     goal.linear = this.linear?.getGoal(id) ?? tracking ?? goal.linear;
+    const tasks: { teamId: string; taskId: string; title: string; usage?: import("./usage-api.js").TaskUsage }[] = [];
     const rollups = goal.cycles.map(cycle => {
       try {
-        const { usage } = this.teams.get(cycle.teamId);
+        const team = this.teams.get(cycle.teamId), { usage } = team;
+        for (const task of team.tasks) tasks.push({ teamId: cycle.teamId, taskId: task.id, title: task.title, ...((task as typeof task & { usage?: import("./usage-api.js").TaskUsage }).usage ? { usage: (task as typeof task & { usage?: import("./usage-api.js").TaskUsage }).usage } : {}) });
         // A cycle whose members are all unmeasured has no figure; a zero total would read as measured and free.
         if (usage.total.messages > 0 || usage.unmeasuredMembers === 0) cycle.usage = usage.total;
         else delete cycle.usage;
@@ -98,7 +100,7 @@ export class GoalService {
       } catch (error) { if (error instanceof TeamError && error.code === "team-not-found") { delete cycle.usage; return emptyRollup(cycle.memberCount); } throw error; }
     });
     goal.usage = addRollups(rollups);
-    return goal;
+    return { ...goal, tasks };
   }
   answer(teamId: string, decisionId: string, body: Action & { text: string }) {
     return this.enqueue(async () => {

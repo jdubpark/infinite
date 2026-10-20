@@ -1,11 +1,11 @@
 import { useState } from "react";
-import { ActivityIndicator, Alert, KeyboardAvoidingView, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, KeyboardAvoidingView, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import { api, connectionKey, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { Card, Chip, LiveStatus, ProgressBar, TopBar } from "../../components/Glass";
-import { StatusIcon } from "../../components/Icon";
+import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
 import {
@@ -14,6 +14,7 @@ import {
 } from "./model";
 import { Choices, Clamp, Disclosure, LinearChip, LineupView, RequestStatus, RunPill, Section, SteerBox, t } from "./parts";
 import { useRunRequest } from "./useRunRequest";
+import { CostLine, MoneyText } from "../cost/parts";
 
 /** One product goal: its outcome, limits, active cycle, earlier cycles, and the person's assessment. */
 export function GoalDetail({ connection, id }: { connection: Connection; id: string }) {
@@ -119,6 +120,18 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
         </View>) : <Text style={t.note}>No earlier cycles recorded.</Text>}
       </Section>
 
+      {goal.tasks?.length ? <Section title="Tasks" count={goal.tasks.length}>
+        {/* Unmeasured tasks (Claude, Codex) never read as $0: the total is "—" without a measured task, a lower bound beside one. */}
+        <Text style={t.strong}>Total <MoneyText value={goal.tasks.reduce((total, task) => ({
+          usd: total.usd + (task.usage?.usd ?? 0), unpriced: total.unpriced + (task.usage?.unpriced ?? 0), unmeasured: total.unmeasured + (task.usage ? 0 : 1),
+        }), { usd: 0, unpriced: 0, unmeasured: 0 })} />{goal.tasks.some(task => !task.usage) ? <Text style={t.note}>  {goal.tasks.filter(task => !task.usage).length} unmeasured</Text> : null}</Text>
+        {goal.tasks.map(task => <Pressable key={`${task.teamId}/${task.taskId}`} accessibilityRole="button" accessibilityLabel={`Open ${task.title}`} onPress={() => openTeam(task.teamId)} hitSlop={5}
+          style={({ pressed }) => [s.taskRow, pressed && s.taskPressed]}>
+          <View style={s.taskMain}><Text style={s.taskTitle} numberOfLines={2}>{task.title}</Text><CostLine usage={task.usage} /></View>
+          <Glyph name="forward" size={12} color={theme.colors.mutedInk} />
+        </Pressable>)}
+      </Section> : null}
+
       <Section title="Scope and evidence">
         <Text style={t.label}>Allowed files and folders</Text>
         {goal.allowedPaths.map(path => <Text key={path} style={t.mono}>{path === "." ? ". (entire project)" : path}</Text>)}
@@ -187,4 +200,8 @@ const s = StyleSheet.create({
   body: { paddingHorizontal: 16, paddingTop: 2, gap: 10, paddingBottom: 24 },
   record: { gap: 4, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },
   dock: { gap: 6, paddingHorizontal: 12, paddingTop: 6, paddingBottom: 10 },
+  taskRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },
+  taskMain: { flex: 1, gap: 2 },
+  taskTitle: { fontSize: 14, lineHeight: 19, fontWeight: "600", color: theme.colors.ink },
+  taskPressed: { opacity: 0.55 },
 });

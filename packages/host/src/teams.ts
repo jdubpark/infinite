@@ -437,8 +437,9 @@ export class TeamService {
           if (workspaceSource.head && !fromMirror) await assertMemberReadOnly(workspaceSource.path, workspaceSource.head, this.config.teams?.commandPrefix, signal);
           return workspace;
         };
-        // GitHub runs and parent continuations never read the project tree, so they do not hold its session/refresh gate.
-        return githubProject ? prepareWorkspace() : this.startInProject(run.projectId, prepareWorkspace);
+        // The refresh above has released its working-tree hold by now, so the ordinary project gate still applies:
+        // it keeps a run from preparing while repository setup changes and lets a sync apply see the start.
+        return this.startInProject(run.projectId, prepareWorkspace);
       }, workspace => { Object.assign(run, workspace); run.headCommit = workspace.baseCommit; stored.prepared = true; this.event(stored, "Isolated project ready. Starting the project manager."); });
       return this.view(stored);
     });

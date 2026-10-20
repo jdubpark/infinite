@@ -397,7 +397,7 @@ export class TeamService {
         this.assertRunPath(stored, teamWorkspacePath(root, directoryName), true);
         let workspaceSource = source;
         let fromMirror = false;
-        if (githubProject && !parent) {
+        if (githubProject && !parent && !internal?.handoff) {
           const projectSource = this.options?.source;
           if (!projectSource) throw new TeamError(409, "source-unavailable", "The host has no copy of this repository from GitHub yet; check the project's source status.");
           const status = await projectSource.refresh(project.id);
@@ -415,8 +415,11 @@ export class TeamService {
           try {
             const mirrorHead = this.options.source.status(project.id).mirrorHead;
             if (mirrorHead && mirrorHead !== parent.headCommit) {
-              const ancestry = await teamCommand({ command: "git", args: teamGitArgs(source.path, ["merge-base", "--is-ancestor", parent.headCommit!, mirrorHead]) }, source.path, signal, 30000, this.config.teams?.commandPrefix);
-              if (ancestry.exitCode === 0 && !ancestry.interrupted && !ancestry.truncated) run.baseBehind = { mirrorHead };
+              const fetched = await teamCommand({ command: "git", args: teamGitArgs(source.path, ["fetch", "--no-tags", "--", this.options.source.mirrorPath(project.id), mirrorHead]) }, source.path, signal, 30000, this.config.teams?.commandPrefix);
+              if (fetched.exitCode === 0 && !fetched.interrupted && !fetched.truncated) {
+                const ancestry = await teamCommand({ command: "git", args: teamGitArgs(source.path, ["merge-base", "--is-ancestor", parent.headCommit!, mirrorHead]) }, source.path, signal, 30000, this.config.teams?.commandPrefix);
+                if (ancestry.exitCode === 0 && !ancestry.interrupted && !ancestry.truncated) run.baseBehind = { mirrorHead };
+              }
             }
           } catch { /* Refresh and ancestry checks do not move a continuation off its parent workspace. */ }
         }

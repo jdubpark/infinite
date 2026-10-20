@@ -13,6 +13,7 @@ import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
 import type { CreateTeam, TeamBrief, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
+import type { HandoffPolicy, TeamHandoffContext } from "../packages/host/src/handoff-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
@@ -87,15 +88,65 @@ test("a failed GitHub fetch records a stale base and event while using the last 
   } finally { await f.close(); }
 });
 
-test("a GitHub mission continuation keeps its parent head and records an ancestor mirror head", { timeout: 30000 }, async () => {
+test("a GitHub handoff clones its checkpoint from the project tree when the checkpoint is absent from the mirror", { timeout: 90000 }, async () => {
   const f = await fixture("success", fallbackLineup, {}, { noServer: true });
   try {
+    const mirror = join(f.host.root, "source-mirror.git");
+    git(f.source, "clone", "--bare", f.source, mirror);
+    writeFileSync(join(f.source, "handoff-checkpoint.txt"), "The committed handoff checkpoint must be preserved.\n");
+    git(f.source, "add", "handoff-checkpoint.txt");
+    git(f.source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Commit handoff checkpoint");
+    const checkpointHead = git(f.source, "rev-parse", "HEAD");
+    assert.throws(() => git(mirror, "cat-file", "-e", `${checkpointHead}^{commit}`), "The checkpoint is intentionally absent from the GitHub mirror");
+
+    const project = f.host.config.projects.find(candidate => candidate.id === "rehearsal")!;
+    project.team = { ...project.team!, handoff: "auto" };
+    const projectTeam = structuredClone(project.team);
+    const sourceSessionId = randomUUID();
+    const handoff: TeamHandoffContext = {
+      sourceSessionId, checkpointHead, deadlineAt: new Date(Date.now() + 60_000).toISOString(), maxMembers: 16, project: projectTeam,
+    };
+    const policy: HandoffPolicy = {
+      sourceSessionId, projectId: project.id, path: realpathSync(project.path), userRequest: "Keep the committed handoff checkpoint.",
+      lineup: fallbackLineup, project: projectTeam, workspaceDir: f.host.config.teams!.workspaceDir,
+      commandPrefix: f.host.config.teams?.commandPrefix, maxMinutes: 60, maxMembers: 16, parallelism: 2,
+    };
+    let refreshCalls = 0;
+    const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: f.base };
+    const source: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> = {
+      refresh: async () => { refreshCalls++; return status; },
+      mirrorPath: () => mirror,
+      isGithub: () => true,
+      status: () => status,
+    };
+    const teams = await f.openTeamService({ source });
+    const created = await teams.createForHandoff(f.create(), handoff, policy);
+    const run = await waitFor(() => Promise.resolve(teams.get(created.id)), current => Boolean(current.baseCommit) || current.status === "blocked", 30000);
+    assert.equal(run.baseCommit, checkpointHead);
+    assert.equal(git(run.workspace, "show", `HEAD:handoff-checkpoint.txt`), "The committed handoff checkpoint must be preserved.");
+    assert.equal(refreshCalls, 0, "A handoff uses its checkpoint instead of refreshing or cloning the GitHub mirror");
+  } finally { await f.close(); }
+});
+
+test("a GitHub mission continuation fetches a new ancestor mirror head without moving the parent checkout", { timeout: 30000 }, async () => {
+  const f = await fixture("success", fallbackLineup, {}, { noServer: true });
+  try {
+    const mirror = join(f.host.root, "source-mirror.git");
+    git(f.source, "clone", "--bare", f.source, mirror);
+    const parentId = randomUUID(), branch = "infinite/team-parent-test";
+    const parentWorkspace = join(f.host.config.teams!.workspaceDir, parentId, "integration");
+    mkdirSync(join(f.host.config.teams!.workspaceDir, parentId), { recursive: true });
+    git(f.source, "clone", "--no-local", "--no-hardlinks", "--", mirror, parentWorkspace);
+    git(parentWorkspace, "remote", "remove", "origin");
+    git(parentWorkspace, "checkout", "-b", branch, f.base);
+    const parentHeadBefore = git(parentWorkspace, "rev-parse", "HEAD");
+    const parentBranchBefore = git(parentWorkspace, "symbolic-ref", "--short", "HEAD");
+    const parentRefsBefore = git(parentWorkspace, "for-each-ref", "--format=%(refname) %(objectname)", "refs");
     writeFileSync(join(f.source, "mirror-update.txt"), "The base advanced after the parent run started.\n");
     git(f.source, "add", "mirror-update.txt");
     git(f.source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Advance mirror base");
     const mirrorHead = git(f.source, "rev-parse", "HEAD");
-    const mirror = join(f.host.root, "source-mirror.git");
-    git(f.source, "clone", "--bare", f.source, mirror);
+    git(mirror, "fetch", "--no-tags", "--", f.source, "+refs/heads/main:refs/heads/main");
     const refreshOptions: unknown[] = [];
     const status: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead };
     const source: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> = {
@@ -105,12 +156,6 @@ test("a GitHub mission continuation keeps its parent head and records an ancesto
       status: () => status,
     };
     const teams = await f.openTeamService({ source });
-    const parentId = randomUUID(), branch = "infinite/team-parent-test";
-    const parentWorkspace = join(f.host.config.teams!.workspaceDir, parentId, "integration");
-    mkdirSync(join(f.host.config.teams!.workspaceDir, parentId), { recursive: true });
-    git(f.source, "clone", "--no-local", "--no-hardlinks", "--", mirror, parentWorkspace);
-    git(parentWorkspace, "remote", "remove", "origin");
-    git(parentWorkspace, "checkout", "-b", branch, f.base);
     const at = new Date().toISOString();
     const parent: TeamRun = { id: parentId, projectId: "rehearsal", provider: "codex", missionId: "mission-test", title: "Parent run", objective: "Keep the parent base.",
       parallelism: 1, revision: 1, status: "ready-for-review", createdAt: at, updatedAt: at, workspace: parentWorkspace, branch, baseCommit: f.base, headCommit: f.base,
@@ -123,6 +168,10 @@ test("a GitHub mission continuation keeps its parent head and records an ancesto
     assert.equal(continuation.baseCommit, f.base);
     assert.deepEqual(continuation.baseBehind, { mirrorHead });
     assert.deepEqual(refreshOptions, [{ maxAgeMs: 60_000 }]);
+    assert.equal(git(parentWorkspace, "cat-file", "-t", mirrorHead), "commit");
+    assert.equal(git(parentWorkspace, "rev-parse", "HEAD"), parentHeadBefore);
+    assert.equal(git(parentWorkspace, "symbolic-ref", "--short", "HEAD"), parentBranchBefore);
+    assert.equal(git(parentWorkspace, "for-each-ref", "--format=%(refname) %(objectname)", "refs"), parentRefsBefore);
   } finally { await f.close(); }
 });
 

@@ -9,6 +9,8 @@ import { FloatingNotice } from "../../components/FloatingNotice";
 import { TopBar } from "../../components/Glass";
 import { teamCreations } from "../../store/requests";
 import { theme } from "../../theme";
+import { DictationNotice, MicButton } from "../../dictation/DictationControls";
+import { useDictation } from "../../dictation/useDictation";
 import { teamReady, type TeamView } from "./model";
 import { Choices, Disclosure, LineupView, providerName, t } from "./parts";
 
@@ -46,6 +48,7 @@ export function TeamCreate({ connection }: { connection: Connection }) {
   const locked = busy || Boolean(pending) || me?.role !== "owner";
   const ready = Boolean(me?.teams?.enabled && teamReady(selectedProject) && selectedProvider);
   const allowed = online && me?.role === "owner" && (Boolean(pending) || (ready && Boolean(objective.trim())));
+  const dictation = useDictation({ connection, value: objective, onChange: setObjective, maxLength: 24000, disabled: locked });
   async function submit() {
     if (busy || !allowed) return;
     // A retry resends the recorded request even if this host's settings have changed since.
@@ -69,13 +72,17 @@ export function TeamCreate({ connection }: { connection: Connection }) {
   return <KeyboardAvoidingView style={[s.fill, s.overlayRoot]} behavior="padding">
     <TopBar backLabel="Teams" onBack={() => router.canGoBack() ? router.back() : router.replace({ pathname: "/", params: { machine, view: "teams" } })} right={<Text style={t.note} numberOfLines={1}>{connection.label || "Selected machine"}</Text>} />
     <FloatingNotice position="top" offset={58} message={stale ? me ? "Waiting for a fresh machine connection." : "Can't reach this machine." : null} actions={stale ? <Button compact title="Refresh" secondary onPress={refresh} /> : null} />
+    <DictationNotice dictation={dictation} position="top" offset={110} />
     <ScrollView contentContainerStyle={s.body} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>New team</Text>
       <Text style={t.note}>A coordinator plans the work, implementers build it in isolated copies, and a reviewer checks the result. The team asks when it needs a decision.</Text>
       {me && me.role !== "owner" ? <Text style={t.warning}>An owner key is required to start a team.</Text> : null}
       {me && !me.teams?.enabled ? <Text style={t.warning}>Teams need host setup: enable teams and give a workspace its required checks.</Text> : null}
       {creation.result ? <View style={s.section}><Text style={t.note}>Team started.</Text><Button title="Open team" onPress={() => router.replace({ pathname: "/team/[id]", params: { id: creation.result!.id, machine } })} /></View> : null}
-      <Text style={t.label}>Feature request or PRD</Text>
+      <View style={s.labelRow}>
+        <Text style={[t.label, s.labelText]}>Feature request or PRD</Text>
+        <MicButton dictation={dictation} size={36} disabled={locked} />
+      </View>
       <TextInput accessibilityLabel="Feature request or PRD" value={objective} onChangeText={setObjective} editable={!locked} multiline maxLength={24000}
         placeholder="Describe the outcome, who it is for, and what should happen…" placeholderTextColor={theme.colors.placeholder} style={[t.input, s.objective]} />
       <Text style={t.label}>Team name (optional)</Text>
@@ -117,4 +124,6 @@ const s = StyleSheet.create({
   title: { fontSize: 28, lineHeight: 34, color: theme.colors.ink, fontWeight: "700", letterSpacing: -0.6 },
   section: { marginVertical: 16, gap: 12 },
   objective: { minHeight: 160, textAlignVertical: "top" },
+  labelRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 12 },
+  labelText: { marginTop: 0 },
 });

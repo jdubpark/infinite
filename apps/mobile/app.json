@@ -28,6 +28,13 @@
       "expo-secure-store",
       "expo-router",
       [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Infinite uses the microphone so you can dictate text into a field.",
+          "speechRecognitionPermission": "Infinite uses speech recognition to turn your dictation into text."
+        }
+      ],
+      [
         "expo-notifications",
         {
           "icon": "./assets/notification-icon.png",

@@ -120,6 +120,8 @@ The Codex profile sets `workspaceDir` to the prepared hybrid directory and enabl
 
 To let clients ask for a model-written digest of a session's chat, add a `summaries` block: `{"model": "gpt-6-luna", "apiKeyFile": "/etc/infinite/openai.key"}`, with the key in a root-owned 0640 file readable by the control user and, optionally, `baseUrl` for another OpenAI-compatible Responses endpoint. The host sends recorded chat messages to that service with `store: false`; leave the block out to send nothing.
 
+To clean up dictated text, add a `dictation` block such as `{"apiKeyFile": "/etc/infinite/openai.key"}`; `model` defaults to `gpt-6-luna`, and `baseUrl` can point to another OpenAI-compatible Responses endpoint.
+
 Validate and install `infinite.sudoers` using `visudo -cf`; then install `infinite.service`, reload systemd, and start it. Check that the API binds only to 127.0.0.1. The service does not mount the system read-only. Tool prefixes are writable by `infinite-agent`. The vault key, `/etc/infinite/config.json`, and the control directory stay owner-readable only.
 
 Expose it privately:

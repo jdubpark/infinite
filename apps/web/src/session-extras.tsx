@@ -82,34 +82,6 @@ export function ProjectFiles({ id, online }: { id: string; online: boolean }) {
   </div>;
 }
 
-type Recognition = { lang: string; interimResults: boolean; continuous: boolean; start(): void; stop(): void; abort(): void; onresult: ((event: { resultIndex: number; results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }> }) => void) | null; onerror: ((event: { error: string }) => void) | null; onend: (() => void) | null };
-type SpeechWindow = Window & { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition };
-export function Dictation({ disabled, onText }: { disabled: boolean; onText: (text: string) => void }) {
-  const Constructor = (window as SpeechWindow).SpeechRecognition ?? (window as SpeechWindow).webkitSpeechRecognition;
-  const recognition = useRef<Recognition | null>(null);
-  const [listening, setListening] = useState(false);
-  const [error, setError] = useState("");
-  useEffect(() => () => { recognition.current?.abort(); }, []);
-  useEffect(() => { if (disabled) recognition.current?.stop(); }, [disabled]);
-  if (!Constructor) return null;
-  function toggle() {
-    if (listening) { recognition.current?.stop(); return; }
-    if (disabled || !Constructor) return;
-    const current = new Constructor(); recognition.current = current;
-    current.lang = navigator.language; current.interimResults = false; current.continuous = false;
-    current.onresult = event => {
-      const text: string[] = [];
-      for (let index = event.resultIndex; index < event.results.length; index++) if (event.results[index].isFinal) text.push(event.results[index][0].transcript);
-      if (text.length) onText(text.join(" "));
-    };
-    current.onerror = event => { setError(`Dictation unavailable: ${event.error}.`); setListening(false); };
-    current.onend = () => setListening(false);
-    setError("");
-    try { current.start(); setListening(true); } catch { setError("Dictation could not start."); }
-  }
-  return <><button type="button" disabled={disabled} onClick={toggle} aria-pressed={listening} title="Browser speech service. Review the draft before sending.">{listening ? "Stop dictation" : "Dictate"}</button><span className="dictation-status" role="status">{listening ? "Listening · review before Send" : error}</span></>;
-}
-
 type Answer = { requestId: string; promptId: number; option?: number; text?: string };
 const answers = new Map<string, Answer>();
 export function PromptDecision({ sessionId, backend, prompt, canAnswer, controlId, refresh, onRefused, openTerminal }: {

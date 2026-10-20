@@ -1,6 +1,8 @@
 import type { ReactNode } from "react";
 import { ActivityIndicator, StyleSheet, Text, TextInput, View, type LayoutChangeEvent } from "react-native";
 import { theme } from "../theme";
+import { MicButton } from "../dictation/DictationControls";
+import type { Dictation } from "../dictation/useDictation";
 import { Button } from "./Button";
 import { GlassButton } from "./Glass";
 
@@ -10,8 +12,9 @@ import { GlassButton } from "./Glass";
  * and the button reads "Retry", which resends the same request. `blocked`
  * disables text and Send (not Interrupt) and says why, with
  * `blockedPlaceholder` in the empty field; `idleHint` replaces the
- * placeholder while steering is unavailable. `children` render under the
- * input row (the Terminal's key row).
+ * placeholder while steering is unavailable. `dictation` adds a mic beside
+ * the send control, off whenever the text is read-only. `children` render
+ * under the input row (the Terminal's key row).
  */
 export function Composer({
   canSteer,
@@ -29,6 +32,7 @@ export function Composer({
   controlLabel = "Take control",
   children,
   onLayout,
+  dictation,
 }: {
   canSteer: boolean;
   busy: boolean;
@@ -45,8 +49,11 @@ export function Composer({
   controlLabel?: string;
   children?: ReactNode;
   onLayout?: (event: LayoutChangeEvent) => void;
+  dictation?: Dictation;
 }) {
   const canType = canSteer && !blocked;
+  // Drafts stay editable without control, so dictation does too; only a blocked, busy, or pending field locks.
+  const editable = !blocked && !busy && !pending;
   return (
     <View style={s.area} onLayout={onLayout}>
       {blocked ? <Text style={s.hint}>{blocked}</Text> : null}
@@ -56,7 +63,7 @@ export function Composer({
           multiline
           value={text}
           onChangeText={onChangeText}
-          editable={!blocked && !busy && !pending}
+          editable={editable}
           placeholder={
             !canSteer
               ? (idleHint ?? "Draft here while reconnecting…")
@@ -68,6 +75,7 @@ export function Composer({
           style={s.message}
           maxLength={32000}
         />
+        {dictation ? <MicButton dictation={dictation} size={40} disabled={!editable} /> : null}
         {onTakeControl ? <Button
           compact
           busy={controlBusy}

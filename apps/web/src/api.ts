@@ -94,7 +94,7 @@ export type Me = {
   machine?: { id: string; label: string; environment: string };
   backends?: ("infinite" | "cmux")[];
   backendProviders?: { infinite: string[]; cmux?: string[] };
-  capabilities?: { signals: boolean; answer: boolean; push: boolean };
+  capabilities?: { signals: boolean; answer: boolean; push: boolean; dictation?: { model: string } };
   providers: string[];
   projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { establishChecks?: true; checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
   teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };

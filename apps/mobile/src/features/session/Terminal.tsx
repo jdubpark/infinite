@@ -24,6 +24,8 @@ import { ControlBar } from "../../components/ControlBar";
 import { LiveStatus, TopBar } from "../../components/Glass";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { theme } from "../../theme";
+import { DictationNotice } from "../../dictation/DictationControls";
+import { useDictation } from "../../dictation/useDictation";
 import { useControlSync, useSessionControl } from "./useSessionControl";
 import { KEYS, useSteering } from "./useSteering";
 
@@ -70,6 +72,14 @@ export function Terminal({
   const canSteer =
     online && running && role !== undefined && role !== "viewer" && controlled;
   const canSend = canSteer && !steering.busy && Boolean(steering.text.trim());
+  // Drafts work without control, so dictation does too; it stops only where the text itself is locked.
+  const dictation = useDictation({
+    connection,
+    value: steering.text,
+    onChange: steering.setText,
+    maxLength: 32000,
+    disabled: steering.busy || steering.pending,
+  });
   function send() {
     if (!canSend) return;
     void steering.send();
@@ -152,6 +162,7 @@ export function Terminal({
               onChangeText={steering.setText}
               onSend={send}
               onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
+              dictation={dictation}
             >
               {KEYS.map((key) => (
                 <Button
@@ -167,6 +178,7 @@ export function Terminal({
           )}
         </>
       )}
+      <DictationNotice dictation={dictation} position="top" offset={110} />
       <FloatingNotice position="bottom" offset={composerHeight + 10}
         message={steering.error || (steering.pending && !steering.busy ? "Delivery is unconfirmed. Retry sends the same request ID." : steering.receipt)}
         kind={steering.error ? "error" : steering.receipt ? "success" : "warning"}

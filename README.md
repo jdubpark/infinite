@@ -105,6 +105,8 @@ npm run android -w @infinite/mobile
 npm run ios -w @infinite/mobile
 ```
 
+Dictation uses a native speech module, so it needs a rebuilt development or release app; Expo Go and older builds hide the mic.
+
 On hosts whose workers enforce input control, the phone sends nothing until you tap **Take control** (or **Take over** when another device holds the session). The lease lasts 30 seconds, renews while the session is on screen, and is released when you leave the session or background the app. Viewers stay read-only.
 
 The **Teams** and **Goals** tabs appear on hosts that support teams; a host without teams configured shows setup guidance there. They list each run with what it waits on, open its decisions, plan, members, checks, and review, and let an owner or controller answer and steer. Starting, pausing, resuming, and cancelling a run are owner actions. See [Goals and agent teams](docs/teams.md).

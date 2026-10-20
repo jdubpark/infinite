@@ -57,10 +57,13 @@ export async function api<T>(
     body?: unknown;
     /** The lease id this phone holds; the host refuses input without it. */
     control?: string;
+    /** Abort after this many milliseconds. Defaults to 12 seconds. */
+    timeoutMs?: number;
   } = {},
 ): Promise<T> {
+  const { timeoutMs = 12000, ...options } = init;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const headers = {
       "X-Infinite-Client": await loadClientId(),
@@ -69,7 +72,7 @@ export async function api<T>(
     // Both direct and relayed connections use the authenticated encrypted
     // channel. An unavailable endpoint never falls back to plaintext API calls.
     try {
-      return await remote(connection).request<T>(path, { ...init, headers, signal: controller.signal });
+      return await remote(connection).request<T>(path, { ...options, headers, signal: controller.signal });
     } catch (error) {
       if (error instanceof RemoteError) {
         const value = error.body as { error?: string; code?: string; attention?: Attention } | undefined;
@@ -150,7 +153,7 @@ export type Me = {
   providers?: Provider[];
   backendProviders?: { infinite: Provider[]; cmux?: Provider[] };
   projects?: TeamProject[];
-  capabilities?: { signals: boolean; answer: boolean; push: boolean };
+  capabilities?: { signals: boolean; answer: boolean; push: boolean; dictation?: { model: string } };
   teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
   goals?: { enabled: boolean };
   usage?: { enabled: boolean; budgets?: Record<string, unknown> };

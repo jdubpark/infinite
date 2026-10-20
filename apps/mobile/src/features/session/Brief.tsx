@@ -31,6 +31,8 @@ import { Chip, GlassButton, LiveStatus, Segmented, TopBar } from "../../componen
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { StatePill } from "../../components/StatePill";
 import { theme } from "../../theme";
+import { DictationNotice } from "../../dictation/DictationControls";
+import { useDictation } from "../../dictation/useDictation";
 import { ROLE_NAMES } from "../teams/model";
 import { Conversation } from "./Conversation";
 import { Files } from "./Files";
@@ -132,6 +134,14 @@ export function Brief({
       ? "This session predates the Brief. Use the terminal to type."
       : undefined;
   const canSend = canSteer && !session?.team && !blocked && !steering.busy && Boolean(steering.text.trim());
+  // Drafts work without control, so dictation does too; it stops only where the text itself is locked.
+  const dictation = useDictation({
+    connection,
+    value: steering.text,
+    onChange: steering.setText,
+    maxLength: 32000,
+    disabled: Boolean(blocked) || steering.busy || steering.pending,
+  });
   function send() {
     if (!canSend) return;
     void steering.send();
@@ -310,10 +320,12 @@ export function Brief({
               onSend={send}
               onInterrupt={() => void steering.sendKey("interrupt")}
               onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
+              dictation={dictation}
             />
           ) : null}
         </>
       )}
+      <DictationNotice dictation={dictation} position="top" offset={110} />
       <FloatingNotice position="bottom" offset={composerHeight + 10}
         message={answering.notice || (steering.error ? steering.error : steering.pending && !steering.busy ? "Delivery is unconfirmed. Retry sends the same request ID." : steering.receipt)}
         kind={steering.error ? "error" : steering.receipt && !answering.notice ? "success" : "warning"}

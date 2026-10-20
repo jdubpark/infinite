@@ -43,6 +43,12 @@ const schema = z
       model: z.string().min(1).max(100).default("jev-latest"),
       baseUrl: z.url().default("https://api.typesafe.ai"),
     }).strict().optional(),
+    // Optional cleanup for platform-generated speech transcripts. The key is read once at startup.
+    dictation: z.object({
+      model: z.string().min(1).max(100).default("gpt-6-luna"),
+      apiKeyFile: z.string().refine(isAbsolute, "Dictation key file must be absolute"),
+      baseUrl: z.url().default("https://api.openai.com"),
+    }).strict().optional(),
     repositoryBriefings: z.object({
       command: z.string().refine(isAbsolute, "Repository briefing command must be absolute"),
       args: z.array(z.string().max(4096)).default([]),

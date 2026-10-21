@@ -209,16 +209,18 @@ export type Me = {
   usage?: { enabled: boolean; budgets?: Record<string, unknown> };
 };
 
-/** Project group contract mirrored from the host for the mobile project picker. */
-export type ProjectGroupRepo = { projectId: string; name: string; path: string };
+/** Project contract mirrored from the host (`project-group-types.ts`): a project holds repositories, each made of checkouts. */
+export type ProjectGroupKind = "owner" | "repository" | "implicit";
+export type ProjectGroupCheckout = { projectId: string; name: string; path: string; primary: boolean; teamReady: boolean; identityFrom?: "source" | "host-scan" };
+/** `projectId`, `name`, and `path` describe the primary checkout. */
+export type ProjectGroupRepo = { projectId: string; name: string; path: string; key?: string; checkouts: ProjectGroupCheckout[] };
 export type ProjectGroup = {
-  id: string; name: string; repos: ProjectGroupRepo[]; implicit: boolean; revision: number;
+  id: string; name: string; kind: ProjectGroupKind; hidden: boolean; repos: ProjectGroupRepo[]; implicit: boolean; revision: number;
   createdAt: string; updatedAt: string;
 };
-export type ProjectGroupList = {
-  groups: ProjectGroup[];
-  suggestions: { name: string; repos: string[]; reason: "shared-parent" | "shared-linear-project" }[];
-};
+export type ProjectGroupSuggestion = { name: string; repos: string[]; groupIds: string[]; reason: "shared-parent" | "shared-linear-project" };
+export type ProjectGroupList = { groups: ProjectGroup[]; suggestions: ProjectGroupSuggestion[] };
+export type ProjectGroupUpdateRequest = { requestId: string; revision: number; name?: string; repos?: string[]; hidden?: boolean; primary?: string[] };
 export type MissionStatus = "planning" | "working" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "cancelled";
 export type CreateMissionRequest = {
   requestId: string; groupId: string; title?: string; objective: string; maxSubtasks?: number; maxMinutes?: number;

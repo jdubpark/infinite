@@ -13,6 +13,8 @@ export const createMissionSchema = z.object({
   objective: z.string().trim().min(1).max(24000),
   maxSubtasks: z.number().int().min(1).max(12).default(8),
   maxMinutes: z.number().int().min(5).max(1440).default(240),
+  /** Host project ids that override the primary checkout of their repository for this mission. */
+  checkouts: z.array(z.string().regex(/^[a-z0-9-]{1,80}$/)).max(64).optional(),
 }).strict();
 export type CreateMission = z.infer<typeof createMissionSchema>;
 export const missionActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();

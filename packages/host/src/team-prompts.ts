@@ -203,7 +203,10 @@ function refreshCodexSandboxInstructions(prompt: string, provider: Provider) {
   const permissionCoordinator = /^You are the team's permission-coordinator\./m.test(prompt);
   if (provider !== "codex" || permissionCoordinator) return withoutPreviousGuidance;
   const report = reportingInstructions(provider);
-  return withoutPreviousGuidance.replace(report, `${codexSandboxInstructions}\n\n${report}`);
+  const contextInstructions = contextAccessInstructions();
+  return withoutPreviousGuidance.includes(contextInstructions)
+    ? withoutPreviousGuidance.replace(contextInstructions, `${codexSandboxInstructions}\n\n${contextInstructions}`)
+    : withoutPreviousGuidance.replace(report, `${codexSandboxInstructions}\n\n${report}`);
 }
 /**
  * Points a member's accumulated prompt, feedback and answers included, at another provider and

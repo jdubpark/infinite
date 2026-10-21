@@ -122,7 +122,7 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
     role === "reviewer" && run.brief?.uiChanges
       ? `This brief changes the UI. Inspect the runnable interface with the available browser or UI tools and verify the affected user flow. An approving review MUST include uiEvidence: "What you inspected, the result, and limitations". This is your evidence claim, not independent host proof. If UI inspection is unavailable, explicitly describe that inability and request changes or report blocked; do not claim approval from source code alone.`
       : "",
-    feedback ? `Feedback and answers:\n${feedback.slice(-16000)}` : "",
+    feedback && role !== "permission-coordinator" ? `Feedback and answers:\n${feedback.slice(-16000)}` : "",
     role === "permission-coordinator"
       ? `Use only the assigned report tool. Do not inspect or modify the repository, publish, merge, deploy, control another session, answer its prompt, or approve any permission yourself. Your only authority is to submit the exact recorded permission-decision report. An approve-once report can authorize only the host to consider the specific one-shot option in the assigned decision. If the report tool is unavailable or permission is denied, stop and request user attention.`
       : role === "delivery"

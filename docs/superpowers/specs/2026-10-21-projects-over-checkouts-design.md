@@ -103,7 +103,9 @@ it sealed beside the groups the first time it sees the checkout:
    `feat/github-source-tracking`, INF-97): `remote:github.com/OWNER/REPO`.
 2. `remote.origin.url` of the checkout on the host, normalized: scheme, user
    info, and a trailing `.git` dropped, host lowercased, `ssh` and `https`
-   forms of the same repository equal. Key `remote:HOST/PATH`.
+   forms of the same repository equal. A port stays in the key, since it names
+   a different server, and the path keeps its case except on `github.com`.
+   Key `remote:HOST[:PORT]/PATH`.
 3. The repository's earliest root commit, `git rev-list --max-parents=0 HEAD`,
    lowest hash when there are several. Key `root:HASH`.
 4. None. The checkout is not a Git repository or Git failed; it stays a

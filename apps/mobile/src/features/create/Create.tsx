@@ -38,7 +38,7 @@ export function Create({ connection }: { connection: Connection }) {
   // Older hosts lack /project-groups; the poll then stays null and the host project buttons remain.
   const { data: groupList } = usePoll(() => api<ProjectGroupList>(connection, "/project-groups"), 4000, [connection]);
   const groups = groupList ? visibleGroups(groupList.groups) : null;
-  const selectedGroup = groupList && project ? groupContaining(groupList.groups, project) : undefined;
+  const selectedGroup = groups && project ? groupContaining(request ? groupList!.groups : groups, project) : undefined;
   const selectedProject = project && (selectedGroup || projects.some(item => item.id === project)) ? project : groups ? (groups[0] ? preferredCheckout(groups[0])?.projectId : undefined) : projects[0]?.id;
   const workspaceGroup = groups ? groupContaining(groups, selectedProject ?? "") : undefined;
   const checkouts = workspaceGroup ? checkoutsOf(workspaceGroup) : [];

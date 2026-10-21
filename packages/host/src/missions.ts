@@ -917,7 +917,9 @@ export function missionBoard(
   const items: BoardItem[] = [];
   for (const mission of missions) {
     const column: BoardColumn = ["needs-input", "blocked"].includes(mission.status) || promptedSubtask(mission, teamById) ? "needs-input" : mission.status === "ready-for-review" ? "review" : mission.status === "cancelled" ? "ended" : "working";
-    items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: mission.groupId, projectName: mission.groupName, column, status: mission.status,
+    // A mission started before its checkout folded keeps its pinned record; the row follows the project that holds that checkout now.
+    const owner = mission.repoProjectIds.map(id => containing(id)).find(Boolean);
+    items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: owner?.id ?? mission.groupId, projectName: owner?.name ?? mission.groupName, column, status: mission.status,
       detail: oneLine(missionDetail(mission, teamById)), updatedAt: mission.updatedAt,
       subtasks: subtaskCounts(mission) });
   }

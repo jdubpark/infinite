@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
@@ -31,7 +31,7 @@ export function Composer({ connection, groups, items, suggestions, owner, onCrea
   useEffect(() => { latest.current = onCreated; });
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const busy = sending || Boolean(pending && inFlight.has(`${machine}/${pending.requestId}`));
-  const visible = visibleGroups(groups);
+  const visible = useMemo(() => visibleGroups(groups), [groups]);
   const selected = visible.find(group => group.id === groupId) ?? visible[0];
 
   useEffect(() => {
@@ -41,7 +41,7 @@ export function Composer({ connection, groups, items, suggestions, owner, onCrea
       else if (live && visible.length) setGroupId(visible[0]!.id);
     }).catch(() => { if (live && visible.length) setGroupId(visible[0]!.id); });
     return () => { live = false; };
-  }, [groups]);
+  }, [visible]);
 
   function choose(group: ProjectGroup) {
     setGroupId(group.id);
@@ -78,9 +78,9 @@ export function Composer({ connection, groups, items, suggestions, owner, onCrea
 
   return <View style={s.dock}>
     <View style={s.composer}>
-      <SheetRow glyph="target" label={selected?.name ?? (visible.length ? "Choose a project" : "No projects available")}
+      <SheetRow glyph="target" label={selected?.name ?? (visible.length ? "Choose a project" : groups.length ? "No visible projects" : "No projects available")}
         detail={selected ? groupActivity(items, selected.id) : undefined}
-        onPress={() => setPickerOpen(true)} disabled={!visible.length || busy || Boolean(pending)} />
+        onPress={() => setPickerOpen(true)} disabled={!groups.length || busy || Boolean(pending)} />
       <TextInput accessibilityLabel="Mission objective" value={objective} onChangeText={setObjective}
         placeholder="What should we work on?" placeholderTextColor={theme.colors.placeholder}
         multiline maxLength={24000} editable={!busy && !pending} style={s.input} textAlignVertical="top" />

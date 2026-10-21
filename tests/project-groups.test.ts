@@ -375,9 +375,10 @@ test("rematerializing an implicit project after deletion allocates a fresh ID", 
     assert.equal(rematerialized.id, "home-one-2");
     assert.equal(rematerialized.hidden, true);
     assert.equal(service.get("home-one").id, "home-one-2");
+    // The retired id no longer aliases the group that holds the checkout, whatever revision the stale edit carries.
     assert.throws(
-      () => service.update("home-one", { requestId: randomUUID(), revision: 1, name: "Stale edit" }),
-      failWith(409, "stale-project-group-revision"),
+      () => service.update("home-one", { requestId: randomUUID(), revision: rematerialized.revision, name: "Stale edit" }),
+      failWith(404, "project-group-not-found"),
     );
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
@@ -521,6 +522,28 @@ test("project group API exposes reads to paired roles and restricts all mutation
     assert.equal((await host.fetchApi(`/project-groups/${created.body.id}`, "owner", remove, {}, "DELETE")).status, 200);
   } finally {
     if (host) await host.stop();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("a retired group id never aliases its replacement, and a prototype-named checkout lists safely", () => {
+  const f = fixture();
+  try {
+    // "beta" is a host project id; editing it materializes a stored group with that id.
+    const service = f.service();
+    const beta = service.get("beta");
+    const renamed = service.update(beta.id, { requestId: randomUUID(), revision: beta.revision, name: "Beta product" });
+    service.remove(renamed.id, { requestId: randomUUID(), revision: renamed.revision });
+    // The checkout folds again under a fresh id; a stale update to the retired id is refused rather than redirected.
+    const replacement = service.get("beta");
+    assert.notEqual(replacement.id, renamed.id);
+    assert.throws(() => service.update(renamed.id, { requestId: randomUUID(), revision: replacement.revision, name: "Hijacked" }), failWith(404, "project-group-not-found"));
+    assert.equal(service.get("beta").name, replacement.name);
+
+    f.config.projects.push({ id: "constructor", name: "Constructor", path: join(f.root, "apps", "constructor") });
+    const list = f.service().list();
+    assert.ok(list.groups.some(group => group.id === "constructor" && group.kind === "implicit"), "a checkout named like a prototype member stays an implicit project");
+  } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
 });

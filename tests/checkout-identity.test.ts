@@ -8,10 +8,12 @@ test("normalizeRemote folds https, ssh, scp, credentials, and .git into one lowe
     ["git@github.com:example/sample.git", "sample"],
     ["ssh://git@GitHub.com/example/sample", "sample"],
     ["https://user:token@github.com/example/sample", "sample"],
-    ["ssh://git@github.com:22/example/sample/", "sample"],
     ["github.com/example/sample", "sample"],
   ];
   for (const [url, repoName] of cases) assert.deepEqual(normalizeRemote(url), { key: "remote:github.com/example/sample", repoName }, url);
+  assert.equal(normalizeRemote("ssh://git@github.com:22/example/sample/")?.key, "remote:github.com:22/example/sample", "a port names a different server");
+  assert.notEqual(normalizeRemote("ssh://git@git.example.net:2222/team/app")?.key, normalizeRemote("ssh://git@git.example.net:2223/team/app")?.key);
+  assert.equal(normalizeRemote("https://git.example.net/Team/App.git")?.key, "remote:git.example.net/Team/App", "path case is kept off GitHub");
   assert.equal(normalizeRemote(""), undefined);
   assert.equal(normalizeRemote("not a url"), undefined);
   assert.equal(normalizeRemote("https://github.com/"), undefined);

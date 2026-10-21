@@ -49,6 +49,8 @@ type ProjectGroupServiceOptions = {
   now?: () => number;
 };
 
+/** A keyed read that ignores inherited properties, so a checkout id such as `constructor` cannot alias a prototype member. */
+const own = <T>(map: Record<string, T>, key: string): T | undefined => Object.hasOwn(map, key) ? map[key] : undefined;
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const notFound = () => new TeamError(404, "project-group-not-found", "This project group does not exist.");
 const repoConflict = (projectId: string) => new TeamError(409, "project-group-repo-conflict", `Repository ${projectId} already belongs to an owner-created group.`);
@@ -198,11 +200,11 @@ export class ProjectGroupService {
   }
 
   private identityKey(projectId: string) {
-    return this.identities[projectId]?.key ?? `project:${projectId}`;
+    return own(this.identities, projectId)?.key ?? `project:${projectId}`;
   }
 
   private checkoutCount(group: StoredGroup, key: string, identities: Record<string, CheckoutIdentity>) {
-    return group.members.filter(id => identities[id]?.key === key).length;
+    return group.members.filter(id => own(identities, id)?.key === key).length;
   }
 
   /** Capture missing identities, then place every identified checkout in exactly one stored group. */
@@ -212,7 +214,7 @@ export class ProjectGroupService {
     const identities = { ...this.identities };
     const time = this.clock();
     for (const project of this.config.projects) {
-      if (identities[project.id]) continue;
+      if (own(identities, project.id)) continue;
       const attemptedAt = this.failedCaptureAt.get(project.id);
       if (attemptedAt !== undefined && time - attemptedAt < 60_000) continue;
       const captured = this.sourceIdentity(project) ?? captureIdentity(project, this.git, this.timestamp());
@@ -229,7 +231,7 @@ export class ProjectGroupService {
     const candidate = structuredClone(this.state);
     let changed = this.needsMigration;
     for (const project of this.config.projects) {
-      const identity = this.identities[project.id];
+      const identity = own(this.identities, project.id);
       if (!identity || Object.values(candidate.groups).some(group => group.members.includes(project.id))) continue;
 
       const possible = Object.values(candidate.groups)
@@ -287,11 +289,11 @@ export class ProjectGroupService {
 
     const repos: ProjectGroupRepo[] = [];
     for (const [key, projects] of byKey) {
-      const preferred = group.primary[key];
+      const preferred = own(group.primary, key);
       const primary = projects.find(project => project.id === preferred) ?? [...projects].sort((a, b) => this.comparePrimary(a, b))[0]!;
       const ordered = [primary, ...projects.filter(project => project.id !== primary.id).sort((a, b) => a.id.localeCompare(b.id))];
       const checkouts: ProjectGroupCheckout[] = ordered.map(project => {
-        const identity = this.identities[project.id];
+        const identity = own(this.identities, project.id);
         return {
           projectId: project.id,
           name: project.name,
@@ -301,7 +303,7 @@ export class ProjectGroupService {
           ...(identity ? { identityFrom: identity.from } : {}),
         };
       });
-      const identity = this.identities[primary.id] ?? projects.map(project => this.identities[project.id]).find(Boolean);
+      const identity = own(this.identities, primary.id) ?? projects.map(project => own(this.identities, project.id)).find(Boolean);
       repos.push({
         projectId: primary.id,
         name: identity?.repoName ?? primary.name,
@@ -324,8 +326,8 @@ export class ProjectGroupService {
   }
 
   private comparePrimary(a: Project, b: Project) {
-    const identityA = this.identities[a.id];
-    const identityB = this.identities[b.id];
+    const identityA = own(this.identities, a.id);
+    const identityB = own(this.identities, b.id);
     if (identityA?.from !== identityB?.from) {
       if (identityA?.from === "source") return -1;
       if (identityB?.from === "source") return 1;
@@ -358,13 +360,13 @@ export class ProjectGroupService {
       path: project.path,
       primary: true,
       teamReady: this.teamReady(project),
-      ...(this.identities[project.id] ? { identityFrom: this.identities[project.id]!.from } : {}),
+      ...(own(this.identities, project.id) ? { identityFrom: own(this.identities, project.id)!.from } : {}),
     };
     const repo: ProjectGroupRepo = {
       projectId: project.id,
-      name: this.identities[project.id]?.repoName ?? project.name,
+      name: own(this.identities, project.id)?.repoName ?? project.name,
       path: project.path,
-      ...(this.identities[project.id] ? { key: this.identities[project.id]!.key } : {}),
+      ...(own(this.identities, project.id) ? { key: own(this.identities, project.id)!.key } : {}),
       checkouts: [checkout],
     };
     const timestamp = this.timestamp();
@@ -376,7 +378,7 @@ export class ProjectGroupService {
   }
 
   private group(id: string) {
-    const group = this.state.groups[id];
+    const group = own(this.state.groups, id);
     if (!group) throw notFound();
     return group;
   }
@@ -429,7 +431,7 @@ export class ProjectGroupService {
     const groups = Object.values(this.state.groups).map(group => this.storedGroup(group));
     const grouped = new Set(Object.values(this.state.groups).flatMap(group => group.members));
     for (const project of this.config.projects)
-      if (!grouped.has(project.id) && !this.identities[project.id]) groups.push(this.implicit(project));
+      if (!grouped.has(project.id) && !own(this.identities, project.id)) groups.push(this.implicit(project));
     groups.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
     return { groups, suggestions: this.suggestions(groups) };
   }
@@ -438,7 +440,7 @@ export class ProjectGroupService {
   get(idOrProjectId: string): ProjectGroup {
     this.reconcile();
     projectGroupIdSchema.parse(idOrProjectId);
-    const group = this.state.groups[idOrProjectId];
+    const group = own(this.state.groups, idOrProjectId);
     if (group) return this.storedGroup(group);
     const project = this.config.projects.find(value => value.id === idOrProjectId);
     if (!project) throw notFound();
@@ -492,11 +494,13 @@ export class ProjectGroupService {
     if (replay) return replay;
 
     const candidate = structuredClone(this.state);
-    let current: StoredGroup | undefined = candidate.groups[id];
+    let current: StoredGroup | undefined = own(candidate.groups, id);
     if (!current) {
       const project = this.config.projects.find(value => value.id === id);
       if (!project) throw notFound();
       current = this.findContaining(candidate, id);
+      // A retired group id never aliases the group that now holds its checkout: a stale update is refused, not redirected.
+      if (current && candidate.tombstones.includes(id)) throw notFound();
       if (!current) {
         const groupId = candidate.tombstones.includes(id) ? this.slug(project.name, candidate) : id;
         current = {

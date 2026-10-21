@@ -43,6 +43,11 @@ test("the board maps missions, standalone teams, and goals to columns and hides 
   const goals = [goal("running", 15), goal("paused", 16), goal("needs-input", 17), goal("blocked", 18), goal("ready-for-review", 19),
     goal("no-opportunity", 20), goal("limit-reached", 21), goal("achieved", 22), goal("cancelled", 23)];
   const containing = (projectId: string) => ["api", "web"].includes(projectId) ? { id: "shop", name: "Shop" } : undefined;
+  // A mission that pinned "api" before folding follows the project that holds "api" now.
+  const legacy = mission("working", 30, { groupId: "api", groupName: "API", repoProjectIds: ["api"], title: "Legacy mission" });
+  const legacyRow = missionBoard([legacy], [], [], projects, containing).items[0]!;
+  assert.equal(legacyRow.groupId, "shop");
+  assert.equal(legacyRow.projectName, "Shop");
   const { items } = missionBoard(missions, teams, goals, projects, containing);
   const column = (kind: string, status: string) => items.filter(item => item.kind === kind && item.status === status).map(item => item.column);
 

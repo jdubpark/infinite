@@ -27,9 +27,10 @@ keeps its own. Context relationships from `infinite repo link` are unchanged.
 sealed the first time it sees the checkout. The first rule that applies wins:
 
 1. The GitHub source record, `remote:github.com/OWNER/REPO`, when one exists.
-2. The checkout's `remote.origin.url`, normalized to `remote:HOST/PATH`. The
-   scheme, user info, and a trailing `.git` are dropped, and the host is
-   lowercased. `ssh` and `https` forms of one remote are equal.
+2. The checkout's `remote.origin.url`, normalized to `remote:HOST[:PORT]/PATH`.
+   The scheme, user info, and a trailing `.git` are dropped, and the host is
+   lowercased; a port stays, and the path keeps its case except on
+   `github.com`. `ssh` and `https` forms of one remote are equal.
 3. The earliest root commit, `root:HASH`, when there is no remote.
 4. None, when the folder is not a Git repository or Git fails. Such a checkout
    stays a project of its own.

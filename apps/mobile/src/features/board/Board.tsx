@@ -103,6 +103,7 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
       })}
       {!poll.loading && sections.every(section => !section.items.length) ? <Text style={s.empty}>No work on this board yet.</Text> : null}
       {poll.data?.me.role !== "owner" ? <Text style={s.note}>This device can view the board but cannot start a mission.</Text> : null}
+      {poll.data && !owner ? <Pressable accessibilityRole="button" onPress={() => router.push({ pathname: "/projects", params: { machine } })} style={s.link}><Text style={s.linkText}>Projects</Text><Glyph name="forward" size={12} color={theme.colors.secondaryInk} /></Pressable> : null}
     </ScrollView>
     {owner ? <Composer connection={connection} groups={groups} items={poll.data?.board.items ?? []} suggestions={suggestions} owner={owner}
       onCreated={mission => {
@@ -155,4 +156,6 @@ const s = StyleSheet.create({
   detail: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
   empty: { paddingVertical: 24, fontSize: 14, color: theme.colors.mutedInk, textAlign: "center" },
   note: { marginHorizontal: 10, marginVertical: 8, fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
+  link: { flexDirection: "row", alignItems: "center", gap: 6, marginHorizontal: 10, minHeight: 40 },
+  linkText: { fontSize: 14, fontWeight: "600", color: theme.colors.secondaryInk },
 });

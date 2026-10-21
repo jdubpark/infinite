@@ -78,7 +78,7 @@ export function ProjectDetail({ connection, id }: { connection: Connection; id: 
   function moveOrPrimary(current: ProjectGroup, checkout: ProjectGroupCheckout) {
     if (!owner || busy) return;
     Alert.alert(checkout.name, undefined, [
-      { text: "Make primary", onPress: () => void change({ primary: [checkout.projectId] }) },
+      ...(checkout.primary ? [] : [{ text: "Make primary", onPress: () => void change({ primary: [checkout.projectId] }) }]),
       {
         text: "Move to its own project",
         onPress: () => void change({
@@ -113,7 +113,7 @@ export function ProjectDetail({ connection, id }: { connection: Connection; id: 
 
       {group.repos.map(repo => <Section key={repo.projectId} title={group.repos.length > 1 || repo.name !== group.name ? repo.name : "Checkouts"}>
         {[...repo.checkouts].sort((a, b) => Number(b.primary) - Number(a.primary)).map(checkout => {
-          const movable = owner && !checkout.primary;
+          const movable = owner && (!checkout.primary || group.repos.reduce((count, item) => count + item.checkouts.length, 0) > 1);
           const body = <>
             <View style={s.checkoutHead}>
               <Text style={s.checkoutName} numberOfLines={1}>{checkout.name}</Text>

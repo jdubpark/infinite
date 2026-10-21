@@ -29,8 +29,9 @@ export const readGit: GitReader = (cwd, args) => {
 const GENERIC_FOLDERS = new Set(["codebase", "code", "src", "repo", "app", "main", "worktree"]);
 
 /**
- * One key for every spelling of a remote: scheme, user info, port, a trailing `.git`, and case in the
- * host and path are dropped. `repoName` keeps the last path segment's spelling.
+ * One key for every spelling of a remote: scheme, user info, and a trailing `.git` are dropped and the
+ * host is lowercased. A port stays, since it names a different server, and the path keeps its case except
+ * on github.com. `repoName` keeps the last path segment's spelling.
  */
 export function normalizeRemote(url: string): { key: string; repoName: string } | undefined {
   const raw = url.trim();
@@ -47,13 +48,17 @@ export function normalizeRemote(url: string): { key: string; repoName: string } 
   const withoutUser = hostAndPath.replace(/^[^/@]*@/, "");
   const slash = withoutUser.indexOf("/");
   if (slash <= 0) return undefined;
-  const host = withoutUser.slice(0, slash).replace(/:\d+$/, "");
+  const host = withoutUser.slice(0, slash).toLowerCase();
+  if (!/^[a-z0-9.-]+(:\d+)?$/.test(host)) return undefined;
   const path = withoutUser.slice(slash + 1).replace(/\/+$/, "").replace(/\.git$/i, "").replace(/\/+$/, "");
-  if (!host || !path) return undefined;
+  if (!path) return undefined;
   const segments = path.split("/").filter(Boolean);
   const repoName = segments.at(-1);
   if (!repoName) return undefined;
-  return { key: `remote:${host.toLowerCase()}/${segments.join("/").toLowerCase()}`, repoName };
+  // GitHub names are case-insensitive; other hosts may distinguish case, and a port names a different server.
+  const joined = segments.join("/");
+  const hostName = host.replace(/:\d+$/, "");
+  return { key: `remote:${host}/${hostName === "github.com" ? joined.toLowerCase() : joined}`, repoName };
 }
 
 /** The checkout folder's name, or its parent's when the folder name is generic (`codebase`, `src`, ...). */

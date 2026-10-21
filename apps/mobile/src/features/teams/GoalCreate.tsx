@@ -53,7 +53,7 @@ export function GoalCreate({ connection }: { connection: Connection }) {
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   // A send started before this screen remounted is still in flight; its result re-renders through the store.
   const busy = sending || Boolean(pending && inFlight.has(pending.requestId));
-  const selectedGroup = groupList && project ? groupContaining(groupList.groups, project) : undefined;
+  const selectedGroup = groups && project ? groupContaining(pending ? groupList!.groups : groups, project) : undefined;
   const firstGroup = groups?.find(group => preferredCheckout(group)?.teamReady) ?? groups?.[0];
   const projectId = project && (selectedGroup || projects.some(value => value.id === project)) ? project : groups ? (firstGroup ? preferredCheckout(firstGroup)?.projectId : undefined) : (projects.find(teamReady) ?? projects[0])?.id;
   const selectedProject = projects.find(value => value.id === projectId);

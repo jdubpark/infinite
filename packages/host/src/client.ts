@@ -20,7 +20,7 @@ import { readSyncState, startSyncService, stopSyncService, syncServiceRunning } 
 import { localProjectPath } from "./mirrored-projects.js";
 import type { ProjectSourceStatus } from "./project-source.js";
 import { boundTeamProject, forgetBoundTeamProject, handleTeamClientCommand } from "./team-cli.js";
-import { handleBoardClientCommand } from "./board-cli.js";
+import { handleBoardClientCommand, projectsLines } from "./board-cli.js";
 import type { ProjectGroupList } from "./project-group-types.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
@@ -633,27 +633,18 @@ async function listLegacyProjects(projects: Me["projects"], api: { json<T>(path:
     console.log(`${project.id}  ${clean(project.name)}${detail ? `  · ${describeProjectStatus(detail)}` : ""}`);
   }
 }
-function shellQuote(value: string) { return `'${value.replaceAll("'", "'\\''")}'`; }
 async function listProjects(groups: ProjectGroupList, api: { json<T>(path: string): Promise<T> }, json: boolean) {
   if (json) {
     console.log(JSON.stringify(groups, null, 2));
     return;
   }
-  for (const group of groups.groups) {
-    console.log(`${group.id}  ${clean(group.name)}${group.implicit ? "  (single-repo)" : ""}`);
-    for (const repo of group.repos) {
-      const detail = await api.json<ProjectDetail>(`/projects/${repo.projectId}`).catch(() => undefined);
-      console.log(`  ${repo.projectId}  ${clean(repo.name)}${detail ? `  · ${describeProjectStatus(detail)}` : ""}`);
-    }
+  const syncs = new Map<string, string>();
+  const checkoutIds = new Set(groups.groups.flatMap(group => group.repos.flatMap(repo => [repo.projectId, ...repo.checkouts.map(checkout => checkout.projectId)])));
+  for (const projectId of checkoutIds) {
+    const detail = await api.json<ProjectDetail>(`/projects/${projectId}`).catch(() => undefined);
+    if (detail) syncs.set(projectId, describeProjectStatus(detail));
   }
-  if (groups.suggestions.length) {
-    console.log("\nSuggested groups (accept with the command shown):");
-    for (const suggestion of groups.suggestions) {
-      const command = ["infinite projects group", shellQuote(suggestion.name), ...suggestion.repos.map(shellQuote)].join(" ");
-      console.log(`${suggestion.name}  (${suggestion.reason})\n  ${command}`);
-    }
-  }
-  if (!groups.groups.length && !groups.suggestions.length) console.log("No projects are enrolled.");
+  for (const line of projectsLines(groups, projectId => syncs.get(projectId))) console.log(line);
 }
 async function showProjects(me: Me, api: { json<T>(path: string): Promise<T> }, json: boolean) {
   let groups: ProjectGroupList;

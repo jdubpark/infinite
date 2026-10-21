@@ -152,22 +152,71 @@ export function appendBoardComposer(composer: string, text: string): string {
   return composer + text;
 }
 
+/** A group holds a host project when the project is a repository's primary or any of its checkouts. */
+function groupHoldsCheckout(group: ProjectGroup, projectId: string): boolean {
+  return group.repos.some(repo => repo.projectId === projectId || repo.checkouts.some(checkout => checkout.projectId === projectId));
+}
+
+export type MissionProjectTarget = { group: ProjectGroup; checkout?: string };
+
 export function resolveMissionProject(
   groups: ProjectGroupList,
   explicitId: string | undefined,
   currentDirectory: string,
   binding: (directory: string) => string | undefined,
-): ProjectGroup {
+): MissionProjectTarget {
   if (explicitId) {
-    const selected = groups.groups.find(group => group.id === explicitId);
-    if (!selected) throw new Error(`Unknown project ID: ${explicitId}`);
-    return selected;
+    const group = groups.groups.find(item => item.id === explicitId);
+    if (group) return { group };
+    const holder = groups.groups.find(item => groupHoldsCheckout(item, explicitId));
+    if (!holder) throw new Error(`Unknown project ID: ${explicitId}`);
+    return { group: holder, checkout: explicitId };
   }
   const projectId = binding(currentDirectory);
   if (!projectId) throw new Error("No repository project is bound to this directory. Run infinite repo init or use --project ID.");
-  const selected = groups.groups.find(group => group.id === projectId || group.repos.some(repo => repo.projectId === projectId));
-  if (!selected) throw new Error("The current repository is not in an available project. Run infinite projects and select a project with --project ID.");
-  return selected;
+  const holder = groups.groups.find(item => item.id === projectId || groupHoldsCheckout(item, projectId));
+  if (!holder) throw new Error("The current repository is not in an available project. Run infinite projects and select a project with --project ID.");
+  return groupHoldsCheckout(holder, projectId) ? { group: holder, checkout: projectId } : { group: holder };
+}
+
+const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+
+/** Lines for `infinite projects`: groups, their repositories and checkouts, hidden groups, then suggestions. */
+export function projectsLines(list: ProjectGroupList, syncOf: (projectId: string) => string | undefined = () => undefined): string[] {
+  const lines: string[] = [];
+  const suffix = (projectId: string) => {
+    const sync = syncOf(projectId);
+    return sync ? `  · ${sync}` : "";
+  };
+  const renderGroup = (group: ProjectGroup) => {
+    lines.push(`${group.id}  ${safe(group.name)}${group.kind === "implicit" ? "  (single-repo)" : ""}`);
+    for (const repo of group.repos) {
+      if (repo.checkouts.length <= 1) {
+        lines.push(`  ${repo.projectId}  ${safe(repo.name)}${suffix(repo.projectId)}`);
+        continue;
+      }
+      lines.push(`  ${safe(repo.name)}  (${repo.checkouts.length} checkouts)`);
+      for (const checkout of repo.checkouts) {
+        lines.push(`    ${checkout.projectId}  ${safe(checkout.name)}${checkout.primary ? "  · primary" : ""}${suffix(checkout.projectId)}`);
+      }
+    }
+  };
+  const visible = list.groups.filter(group => !group.hidden);
+  const hidden = list.groups.filter(group => group.hidden);
+  visible.forEach(renderGroup);
+  if (hidden.length) {
+    lines.push("", "Hidden");
+    hidden.forEach(renderGroup);
+  }
+  if (list.suggestions.length) {
+    lines.push("", "Suggested groups (accept with the command shown):");
+    for (const suggestion of list.suggestions) {
+      const command = ["infinite projects group", shellQuote(suggestion.name), ...suggestion.repos.map(shellQuote)].join(" ");
+      lines.push(`${safe(suggestion.name)}  (${suggestion.reason})`, `  ${command}`);
+    }
+  }
+  if (!list.groups.length && !list.suggestions.length) lines.push("No projects are enrolled.");
+  return lines;
 }
 
 export function boardLines(
@@ -287,21 +336,36 @@ export async function handleBoardClientCommand(
   positional: string[], options: Options, config: ClientConfig, api: Api, configPath: string,
 ): Promise<boolean> {
   if (command === "projects") {
-    const action = positional[0];
-    if (action !== "group" || positional.length < 3) throw new Error("Usage: infinite projects group NAME REPO_ID...");
-    const body = { requestId: randomUUID(), name: positional[1], repos: positional.slice(2) };
-    const group = await api.json<ProjectGroup>("/project-groups", body);
-    console.log(`${group.name}  ${group.id}`);
-    return true;
+    const [action, ...args] = positional;
+    const usage = "Usage: infinite projects [group NAME REPO_ID... | rename ID NAME | hide ID | show ID | primary ID CHECKOUT_ID]";
+    const print = (group: ProjectGroup) => console.log(`${group.name}  ${group.id}`);
+    const edit = async (id: string, change: Record<string, unknown>) => {
+      const current = await api.json<ProjectGroup>(`/project-groups/${encodeURIComponent(id)}`);
+      const body = { requestId: randomUUID(), revision: current.revision, ...change };
+      const updated = await api.json<ProjectGroup>(`/project-groups/${encodeURIComponent(current.id)}`, body, undefined, undefined, "PUT");
+      print(updated);
+      return true;
+    };
+    if (action === "group" && args.length >= 2) {
+      const group = await api.json<ProjectGroup>("/project-groups", { requestId: randomUUID(), name: args[0], repos: args.slice(1) });
+      print(group);
+      return true;
+    }
+    if (action === "rename" && args.length === 2) return edit(args[0]!, { name: args[1] });
+    if (action === "hide" && args.length === 1) return edit(args[0]!, { hidden: true });
+    if (action === "show" && args.length === 1) return edit(args[0]!, { hidden: false });
+    if (action === "primary" && args.length === 2) return edit(args[0]!, { primary: [args[1]] });
+    throw new Error(usage);
   }
   if (command === "start") {
     const projectFlag = options["--project"] === undefined ? undefined : String(options["--project"]);
     const objective = positional.join(" ").trim();
     if (!objective) throw new Error('Usage: infinite start [--project ID] "task"');
     const groups = await api.json<ProjectGroupList>("/project-groups");
-    const project = resolveMissionProject(groups, projectFlag, process.cwd(), directory => boundTeamProject(config, configPath, directory));
-    const mission = await api.json<Mission>("/missions", { requestId: randomUUID(), groupId: project.id, objective });
-    console.log(`Started mission ${mission.id} in ${project.name}.\nFollow it with infinite board.`);
+    const target = resolveMissionProject(groups, projectFlag, process.cwd(), directory => boundTeamProject(config, configPath, directory));
+    const body = { requestId: randomUUID(), groupId: target.group.id, objective, ...(target.checkout ? { checkouts: [target.checkout] } : {}) };
+    const mission = await api.json<Mission>("/missions", body);
+    console.log(`Started mission ${mission.id} in ${target.group.name}.\nFollow it with infinite board.`);
     return true;
   }
   if (command === "mission") {
@@ -359,7 +423,7 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
   const projects = initial.groups;
   if (!projects.length) throw new Error("No projects are available. Enroll a repository with infinite repo init first.");
   const requested = options["--project"] === undefined ? undefined : String(options["--project"]);
-  projectIndex = requested ? projects.findIndex(project => project.id === requested) : 0;
+  projectIndex = requested ? projects.findIndex(project => project.id === requested || groupHoldsCheckout(project, requested)) : 0;
   if (requested && projectIndex < 0) throw new Error(`Unknown project ID: ${requested}`);
   const target = () => projects[projectIndex]!.id;
   const visibleBoard = () => options["--project"]

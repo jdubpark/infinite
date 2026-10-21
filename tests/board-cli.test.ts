@@ -1,18 +1,36 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  appendBoardComposer, answerPinnedMissionDecision, boardItemIdentity, boardLines,
+  appendBoardComposer, answerPinnedMissionDecision, boardItemIdentity, boardLines, handleBoardClientCommand,
   createBoardInputParser, MissionSubmitter, orderedBoardItems, parseBoardInputChunk, pinOpenMissionDecision,
-  reconcileBoardCursor, resolveMissionProject,
+  projectsLines, reconcileBoardCursor, resolveMissionProject,
 } from "../packages/host/src/board-cli.js";
 import type { Board, Mission } from "../packages/host/src/mission-types.js";
-import type { ProjectGroup, ProjectGroupList } from "../packages/host/src/project-group-types.js";
+import type { ProjectGroup, ProjectGroupCheckout, ProjectGroupList, ProjectGroupRepo } from "../packages/host/src/project-group-types.js";
 
-const project = (id: string, name: string, implicit = false): ProjectGroup => ({
-  id, name, repos: [{ projectId: implicit ? id : `${id}-repo`, name: `${name} repo`, path: "repo" }],
-  implicit, revision: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+const checkout = (projectId: string, name: string, primary = true): ProjectGroupCheckout => ({
+  projectId, name, path: `/home/dev/projects/${projectId}`, primary, teamReady: primary,
 });
-const projects: ProjectGroupList = { groups: [project("product", "Product"), project("docs", "Docs", true)], suggestions: [] };
+const repository = (name: string, checkouts: ProjectGroupCheckout[]): ProjectGroupRepo => {
+  const primary = checkouts.find(item => item.primary) ?? checkouts[0]!;
+  return { projectId: primary.projectId, name, path: primary.path, checkouts };
+};
+const group = (
+  id: string, name: string, repos: ProjectGroupRepo[], options: { kind?: ProjectGroup["kind"]; hidden?: boolean; revision?: number } = {},
+): ProjectGroup => {
+  const kind = options.kind ?? "owner";
+  return {
+    id, name, kind, hidden: options.hidden ?? false, repos, implicit: kind === "implicit", revision: options.revision ?? 1,
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+};
+const project = (id: string, name: string, implicit = false): ProjectGroup => group(
+  id, name, [repository(`${name} repo`, [checkout(implicit ? id : `${id}-repo`, `${name} repo`)])], { kind: implicit ? "implicit" : "owner" },
+);
+const product = group("product", "Product", [repository("Product repo", [
+  checkout("product-repo", "Product repo"), checkout("product-codex", "Product codex", false),
+])]);
+const projects: ProjectGroupList = { groups: [product, project("docs", "Docs", true)], suggestions: [] };
 const board: Board = { items: [
   { kind: "mission", id: "m1", title: "A long mission title that should be shortened", groupId: "product", projectName: "Product", column: "needs-input", status: "needs-input", detail: "Waiting for a decision", updatedAt: "2026-10-19T00:00:00.000Z", subtasks: { total: 3, running: 1, done: 1 } },
   { kind: "team", id: "t1", title: "Implement feature", projectName: "Docs", column: "working", status: "working", detail: "Writing code", updatedAt: "2026-10-19T00:00:00.000Z" },
@@ -69,9 +87,124 @@ test("mission project resolves through the current Git-root binding", () => {
     return "product-repo";
   });
   assert.equal(boundDirectory, "/checkout/repo");
-  assert.equal(selected.id, "product");
-  assert.equal(resolveMissionProject(projects, "docs", "/unused", () => undefined).implicit, true);
+  assert.equal(selected.group.id, "product");
+  assert.equal(selected.checkout, "product-repo");
+  assert.equal(resolveMissionProject(projects, "docs", "/unused", () => undefined).group.implicit, true);
   assert.throws(() => resolveMissionProject(projects, undefined, "/checkout/unbound", () => undefined), /No repository project is bound/);
+});
+
+test("mission project resolves a non-primary checkout to its group and that checkout", () => {
+  assert.deepEqual(resolveMissionProject(projects, "product", "/unused", () => undefined), { group: product });
+  assert.deepEqual(resolveMissionProject(projects, "product-codex", "/unused", () => undefined), { group: product, checkout: "product-codex" });
+  const bound = resolveMissionProject(projects, undefined, "/checkout/codex", () => "product-codex");
+  assert.deepEqual(bound, { group: product, checkout: "product-codex" });
+  assert.throws(() => resolveMissionProject(projects, "missing-checkout", "/unused", () => undefined), /Unknown project ID: missing-checkout/);
+});
+
+const quietly = async <T>(run: () => Promise<T>): Promise<T> => {
+  const log = console.log;
+  console.log = () => {};
+  try { return await run(); } finally { console.log = log; }
+};
+const config = { origin: "https://host.example.test", token: "test-token" };
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+test("start posts the group alone for a group id and the checkout for a checkout id", async () => {
+  for (const [flag, expected] of [
+    ["product", { groupId: "product", objective: "ship it" }],
+    ["product-codex", { groupId: "product", objective: "ship it", checkouts: ["product-codex"] }],
+  ] as const) {
+    const calls: { path: string; body?: unknown }[] = [];
+    const api = {
+      json: async (path: string, body?: unknown) => {
+        calls.push({ path, body });
+        return path === "/project-groups" ? projects : { id: "mission-9", title: "Mission", groupName: "Product" };
+      },
+    };
+    await quietly(() => handleBoardClientCommand("start", ["ship", "it"], { "--project": flag }, config, api as never, "/unused/config.json"));
+    const posted = calls.find(call => call.path === "/missions")!.body as { requestId: string };
+    assert.match(posted.requestId, uuid);
+    const { requestId: _requestId, ...rest } = posted;
+    assert.deepEqual(rest, expected);
+  }
+});
+
+test("projects lists checkouts, primary marks, sync summaries, hidden groups, and suggestions", () => {
+  const sample = group("sample", "sample", [repository("sample", [
+    checkout("sample-main", "Infinite main"), checkout("sample-codex", "Infinite codex", false),
+  ])]);
+  const archive = group("archive", "Archive", [repository("Archive repo", [checkout("archive-repo", "Archive repo")])], { hidden: true });
+  const list: ProjectGroupList = {
+    groups: [sample, project("docs", "Docs", true), archive],
+    suggestions: [{ name: "sample suite", repos: ["sample-main", "docs"], groupIds: ["sample", "docs"], reason: "shared-parent" }],
+  };
+  const lines = projectsLines(list, id => id === "sample-main" ? "synced now" : undefined);
+  assert.deepEqual(lines, [
+    "sample  sample",
+    "  sample  (2 checkouts)",
+    "    sample-main  Infinite main  · primary  · synced now",
+    "    sample-codex  Infinite codex",
+    "docs  Docs  (single-repo)",
+    "  docs  Docs repo",
+    "",
+    "Hidden",
+    "archive  Archive",
+    "  archive-repo  Archive repo",
+    "",
+    "Suggested groups (accept with the command shown):",
+    "sample suite  (shared-parent)",
+    "  infinite projects group 'sample suite' 'sample-main' 'docs'",
+  ]);
+  assert.deepEqual(projectsLines({ groups: [], suggestions: [] }), ["No projects are enrolled."]);
+});
+
+test("projects subcommands read the revision and send one PUT with the requested change", async () => {
+  const sample = group("sample", "Sample", [repository("sample", [
+    checkout("sample-main", "Infinite main"), checkout("sample-codex", "Infinite codex", false),
+  ])], { revision: 3 });
+  const runVerb = async (positional: string[]) => {
+    const calls: { path: string; body?: unknown; method?: string }[] = [];
+    const api = {
+      json: async (path: string, body?: unknown, _signal?: unknown, _headers?: unknown, method?: string) => {
+        calls.push({ path, body, method });
+        return sample;
+      },
+    };
+    await quietly(() => handleBoardClientCommand("projects", positional, {}, config, api as never, "/unused/config.json"));
+    return calls;
+  };
+  const expectPut = (calls: { path: string; body?: unknown; method?: string }[], change: Record<string, unknown>) => {
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0], { path: "/project-groups/sample", body: undefined, method: undefined });
+    assert.equal(calls[1]!.path, "/project-groups/sample");
+    assert.equal(calls[1]!.method, "PUT");
+    const { requestId, ...rest } = calls[1]!.body as { requestId: string };
+    assert.match(requestId, uuid);
+    assert.deepEqual(rest, { revision: 3, ...change });
+  };
+  expectPut(await runVerb(["rename", "sample", "Sample product"]), { name: "Sample product" });
+  expectPut(await runVerb(["hide", "sample"]), { hidden: true });
+  expectPut(await runVerb(["show", "sample"]), { hidden: false });
+  expectPut(await runVerb(["primary", "sample", "sample-codex"]), { primary: ["sample-codex"] });
+
+  const groupCalls: { path: string; body?: unknown; method?: string }[] = [];
+  await quietly(() => handleBoardClientCommand("projects", ["group", "Sample", "sample-main", "sample-codex"], {}, config, {
+    json: async (path: string, body?: unknown, _signal?: unknown, _headers?: unknown, method?: string) => {
+      groupCalls.push({ path, body, method });
+      return sample;
+    },
+  } as never, "/unused/config.json"));
+  assert.equal(groupCalls[0]!.path, "/project-groups");
+  assert.equal(groupCalls[0]!.method, undefined);
+  const { requestId: groupRequestId, ...groupBody } = groupCalls[0]!.body as { requestId: string };
+  assert.match(groupRequestId, uuid);
+  assert.deepEqual(groupBody, { name: "Sample", repos: ["sample-main", "sample-codex"] });
+
+  const usage = "Usage: infinite projects [group NAME REPO_ID... | rename ID NAME | hide ID | show ID | primary ID CHECKOUT_ID]";
+  const failing = { json: async () => { throw new Error("should not be called"); } } as never;
+  for (const positional of [["rename", "sample"], ["hide"], ["show", "sample", "extra"], ["primary", "sample"], ["group", "Only"], ["unknown"]]) {
+    await assert.rejects(handleBoardClientCommand("projects", positional, {}, config, failing, "/unused/config.json"), { message: usage });
+  }
 });
 
 test("mission submission retries the same request after an uncertain response and ignores a double submit", async () => {

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
-import { api, connectionKey, type Board as BoardData, type BoardItem, type Connection, type Me, type ProjectGroup, type ProjectGroupList } from "../../api/client";
+import { api, connectionKey, type Board as BoardData, type BoardItem, type Connection, type Me, type ProjectGroup, type ProjectGroupList, type ProjectGroupSuggestion } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Avatar } from "../../components/Avatar";
 import { Chip, GroupHeader, LiveStatus, Sheet, SheetRow } from "../../components/Glass";
@@ -9,6 +9,7 @@ import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { age, type StatusKind } from "../../status";
 import { theme } from "../../theme";
+import { visibleGroups } from "../projects/model";
 import { Composer } from "./Composer";
 import { groupBoard, missionStatusLabel } from "./model";
 
@@ -27,10 +28,13 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
       api<ProjectGroupList>(connection, "/project-groups"),
       api<Me>(connection, "/me"),
     ]);
-    return { board, groups: groups.groups, me, at: Date.now() };
+    return { board, groups: groups.groups, suggestions: groups.suggestions, me, at: Date.now() };
   }, 4000, [connection]);
   const groups: ProjectGroup[] = poll.data?.groups ?? [];
+  const suggestions: ProjectGroupSuggestion[] = poll.data?.suggestions ?? [];
+  const chips = visibleGroups(groups);
   const owner = poll.data?.me.role === "owner";
+  if (projectId && !chips.some(group => group.id === projectId)) setProjectId("");
   const sections = groupBoard(poll.data?.board.items ?? [], projectId || undefined);
   const machineName = connection.label || (() => { try { return new URL(connection.url).host; } catch { return "Machine"; } })();
   const open = (item: BoardItem) => {
@@ -66,9 +70,9 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
       <Text style={s.title} accessibilityRole="header">Board</Text>
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filters}>
         <Chip label="All" accessibilityLabel="All projects" selected={!projectId} onPress={() => setProjectId("")} />
-        {groups.map(group => <Chip key={group.id} label={group.name} selected={projectId === group.id} onPress={() => setProjectId(group.id)} accessibilityLabel={`Filter by ${group.name}`} />)}
+        {chips.map(group => <Chip key={group.id} label={group.name} selected={projectId === group.id} onPress={() => setProjectId(group.id)} accessibilityLabel={`Filter by ${group.name}`} />)}
       </ScrollView>
-      {!groups.length && poll.online ? <Text style={s.note}>No projects are available on this machine.</Text> : null}
+      {!chips.length && poll.online ? <Text style={s.note}>No projects are available on this machine.</Text> : null}
       {sections.map(section => {
         const folded = section.id === "ended" && !endedOpen;
         return <View key={section.id}>
@@ -100,10 +104,13 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
       {!poll.loading && sections.every(section => !section.items.length) ? <Text style={s.empty}>No work on this board yet.</Text> : null}
       {poll.data?.me.role !== "owner" ? <Text style={s.note}>This device can view the board but cannot start a mission.</Text> : null}
     </ScrollView>
-    {owner ? <Composer connection={connection} groups={groups} onCreated={mission => {
-      poll.refresh();
-      router.push({ pathname: "/mission/[id]", params: { id: mission.id, machine } });
-    }} /> : null}
+    {owner ? <Composer connection={connection} groups={groups} items={poll.data?.board.items ?? []} suggestions={suggestions} owner={owner}
+      onCreated={mission => {
+        poll.refresh();
+        router.push({ pathname: "/mission/[id]", params: { id: mission.id, machine } });
+      }}
+      onManage={() => router.push({ pathname: "/projects", params: { machine } })}
+      onChanged={() => poll.refresh()} /> : null}
     <Sheet visible={machineSheet} onClose={() => setMachineSheet(false)} title="Machines">
       {machines.map(profile => {
         const key = connectionKey(profile);

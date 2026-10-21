@@ -413,7 +413,8 @@ test("--laptop Codex uses the laptop project, hands off a verified checkpoint, a
     const uncertain = await connect(nativeUrl(host, uncertainSession.id, uncertainControl), { Authorization: `Bearer ${host.tokens.owner}` }); clients.push(uncertain.ws);
     const previous = (await uncertain.rpc("thread/read", { threadId: uncertainInfo.sessionId })).result.thread.environments;
     await uncertain.rpc("turn/start", { threadId: uncertainInfo.sessionId, input: [{ type: "text", text: "uncertain edit" }] });
-    await waitFor(async () => existsSync(uncertainCwd + "/uncertain-effect.txt"), Boolean);
+    await waitFor(async () => existsSync(uncertainCwd + "/uncertain-effect.txt")
+      ? readFileSync(uncertainCwd + "/uncertain-effect.txt", "utf8") : "", value => value === "performed\n");
     process.kill(uncertainPid, "SIGTERM");
     const paused = await waitFor(async () => (await host.fetchApi(uncertainPath)).body.execution, value => value?.state === "paused");
     assert.equal(paused.location, "laptop");

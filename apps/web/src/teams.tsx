@@ -25,6 +25,7 @@ export type TeamView = {
   steering: { text: string; revision: number; at: string }[]; events: { at: string; text: string }[];
   reason?: string; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string }; round: number;
   deliveryReceipt?: { pullRequestUrl: string; headCommit: string; mergeCommit: string; summary: string };
+  pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string };
   lineup?: TeamLineup;
   providerLimits?: ProviderLimit[];
   usage?: TeamUsage;
@@ -434,6 +435,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       <LinearTracking tracking={team.linear} stale={view.stale} />
       {team.deliveryReceipt && <p className="team-notice team-ready"><Check size={18} /><span>The delivery agent reports that <a href={team.deliveryReceipt.pullRequestUrl} target="_blank" rel="noreferrer">the pull request merged</a>. The host records this report; it does not independently verify GitHub or product impact.</span></p>}
       {team.status === "ready-for-review" && <p className="team-notice team-ready"><Check size={18} />The team reports that this run is ready for your review. Inspect the changes and evidence below before merging or publishing.</p>}
+      {team.pullRequest && <p className="team-notice team-ready"><Check size={18} /><span>The delivery agent reports an open pull request for the reviewed commit. The host records this report; it does not independently verify GitHub. {/^https:\/\//.test(team.pullRequest.pullRequestUrl) ? <a href={team.pullRequest.pullRequestUrl} target="_blank" rel="noreferrer">Open the pull request</a> : null}</span></p>}
       {team.goal && <p className="goal-team-origin"><a href={goalHref}>Open goal</a> · cycle {team.goal.cycle} · goal revision {team.goal.revision}</p>}
       {team.noChange && <section className="team-section"><h2>No change proposed</h2><p className="team-prose">{team.noChange.summary}</p><EvidenceList evidence={team.noChange.evidence} /></section>}
       {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>{missionManaged ? "Open decisions" : "Decisions for you"} <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} member={team.members.find(member => member.memberId === decision.memberId)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} readOnly={missionManaged} />)}</section>}

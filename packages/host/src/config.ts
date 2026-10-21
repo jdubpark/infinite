@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { Config } from "./types.js";
 import { assertRunnerDeployment, parseDeployment } from "./deployment.js";
 import { machineIdentity } from "./machine.js";
-import { teamProjectSchema, teamCommandSchema, teamLineupSchema } from "./team-types.js";
+import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamLineupSchema } from "./team-types.js";
 
 /**
  * Provider hooks injected at launch when the config does not say. Codex hooks stay off until
@@ -32,6 +32,7 @@ const schema = z
     deployment: z.unknown().optional(),
     usage: usageConfigSchema.optional(),
     sync: z.object({ sharedGroup: z.boolean().optional(), homeDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
+    source: z.object({ mirrorDir: z.string().refine(isAbsolute).optional(), refreshMinutes: z.number().int().min(1).max(1440).optional(), remoteOverrides: z.record(z.string(), z.string()).optional() }).strict().optional(),
     // Model-written chat digests. The key file is read once at startup and never logged.
     summaries: z.object({
       model: z.string().min(1).max(100),
@@ -85,6 +86,7 @@ const schema = z
           path: z.string(),
           team: teamProjectSchema.optional(),
           linear: z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict().optional(),
+          source: projectSourceSchema.optional(),
         }),
       )
       .min(1),

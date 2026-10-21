@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { constants as fsConstants } from "node:fs";
-import { lstat, mkdir, open, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, rename, unlink } from "node:fs/promises";
 import { createHash, createPrivateKey, sign, randomBytes } from "node:crypto";
 import { dirname, isAbsolute, resolve, basename, join } from "node:path";
 
 const API = "https://api.github.com";
 const MAX_CONFIG_BYTES = 128 * 1024;
 const MAX_RESPONSE_BYTES = 64 * 1024;
+const MAX_DISCOVERY_PAGE_BYTES = 1024 * 1024;
+const MAX_INSTALLATION_TOKEN_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_TOKEN_BYTES = 16 * 1024;
 const TOKEN_VALID_FOR_MS = 15 * 60 * 1000;
 const EXPECTED_PERMISSIONS = Object.freeze({
@@ -86,7 +88,7 @@ async function assertNoSymlinkParent(path, label) {
 
 function validateRepositoryName(value) {
   if (typeof value !== "string" || value !== value.toLowerCase()) fail("repository-name");
-  const match = /^([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\/([a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)$/.exec(value);
+  const match = /^([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\/(\.github|[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)$/.exec(value);
   if (!match || match[1].length > 39 || match[2].length > 100 || match[2].endsWith(".git")) fail("repository-name");
   return value;
 }
@@ -97,15 +99,20 @@ function positiveId(value, code) {
 }
 
 function validateConfig(input) {
-  exactKeys(input, ["appId", "privateKeyFile", "tokenDirectory", "tokenGroupId", "repositories"], "config-shape");
+  if (!input || typeof input !== "object" || Array.isArray(input)) fail("config-shape");
+  const allowed = ["appId", "privateKeyFile", "tokenDirectory", "tokenGroupId", "repositories", "installations"];
+  if (Object.keys(input).some((key) => !allowed.includes(key)) || ["appId", "privateKeyFile", "tokenDirectory", "tokenGroupId"].some((key) => !Object.hasOwn(input, key))) fail("config-shape");
   if (typeof input.appId !== "string" || !/^[0-9]{1,20}$/.test(input.appId)) fail("app-id");
   canonicalPath(input.privateKeyFile, "private-key-path");
   canonicalPath(input.tokenDirectory, "token-directory-path");
   if (!Number.isSafeInteger(input.tokenGroupId) || input.tokenGroupId < 0) fail("token-group-id");
-  if (!Array.isArray(input.repositories) || input.repositories.length < 1 || input.repositories.length > 500) fail("repositories");
+  if (!Array.isArray(input.repositories) && !Array.isArray(input.installations)) fail("config-shape");
+  if (input.repositories !== undefined && (!Array.isArray(input.repositories) || input.repositories.length > 500)) fail("repositories");
+  if (input.installations !== undefined && (!Array.isArray(input.installations) || input.installations.length < 1 || input.installations.length > 100)) fail("installations");
+  if ((!input.repositories || input.repositories.length === 0) && (!input.installations || input.installations.length === 0)) fail(input.installations ? "installations" : "repositories");
   const names = new Set();
   const ids = new Set();
-  const repositories = input.repositories.map((item) => {
+  const repositories = (input.repositories ?? []).map((item) => {
     exactKeys(item, ["repository", "repositoryId", "installationId"], "repository-shape");
     const repository = validateRepositoryName(item.repository);
     const repositoryId = positiveId(item.repositoryId, "repository-id");
@@ -115,7 +122,15 @@ function validateConfig(input) {
     ids.add(repositoryId);
     return { repository, repositoryId, installationId };
   });
-  return { ...input, repositories };
+  const installationIds = new Set();
+  const installations = (input.installations ?? []).map((item) => {
+    exactKeys(item, ["installationId"], "installations");
+    const installationId = positiveId(item.installationId, "installations");
+    if (installationIds.has(installationId)) fail("installations");
+    installationIds.add(installationId);
+    return { installationId };
+  });
+  return { ...input, repositories, installations };
 }
 
 function base64url(value) {
@@ -228,7 +243,7 @@ async function cachedToken(path, repository, groupId, nowMs = Date.now()) {
   return data;
 }
 
-async function boundedBody(response) {
+async function boundedBody(response, maxBytes = MAX_RESPONSE_BYTES) {
   if (!response.body) return "";
   const reader = response.body.getReader();
   const chunks = [];
@@ -238,7 +253,7 @@ async function boundedBody(response) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > MAX_RESPONSE_BYTES) {
+      if (size > maxBytes) {
         await reader.cancel().catch(() => {});
         fail("response-too-large");
       }
@@ -302,6 +317,119 @@ async function requestInstallationToken(repository, jwt) {
   };
 }
 
+async function requestUnrestrictedInstallationToken(installationId, jwt) {
+  let response;
+  try {
+    response = await fetch(`${API}/app/installations/${installationId}/access_tokens`, {
+      method: "POST",
+      redirect: "error",
+      signal: AbortSignal.timeout(15_000),
+      headers: {
+        accept: "application/vnd.github+json",
+        authorization: `Bearer ${jwt}`,
+        "content-type": "application/json",
+        "x-github-api-version": "2022-11-28",
+      },
+      body: JSON.stringify({ permissions: { metadata: "read" } }),
+    });
+  } catch { fail("discovery-failed"); }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    fail("discovery-failed");
+  }
+  let body;
+  try { body = JSON.parse(await boundedBody(response, MAX_INSTALLATION_TOKEN_RESPONSE_BYTES)); } catch { fail("discovery-failed"); }
+  if (!body || !validToken(body.token)) fail("discovery-failed");
+  return body.token;
+}
+
+async function discoverInstallationRepositories(installation, jwt, limit) {
+  const token = await requestUnrestrictedInstallationToken(installation.installationId, jwt);
+  const repositories = [];
+  let totalCount;
+  for (let page = 1; page <= Math.max(1, Math.ceil(limit / 100)); page += 1) {
+    let response;
+    try {
+      response = await fetch(`${API}/installation/repositories?per_page=100&page=${page}`, {
+        method: "GET",
+        redirect: "error",
+        signal: AbortSignal.timeout(15_000),
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${token}`,
+          "x-github-api-version": "2022-11-28",
+        },
+      });
+    } catch { fail("discovery-failed"); }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      fail("discovery-failed");
+    }
+    let body;
+    try { body = JSON.parse(await boundedBody(response, MAX_DISCOVERY_PAGE_BYTES)); } catch {
+      fail("discovery-failed");
+    }
+    if (!body || !Array.isArray(body.repositories) || body.repositories.length > 100) fail("discovery-failed");
+    if (!Number.isSafeInteger(body.total_count) || body.total_count < 0 || body.total_count > limit) fail("discovery-failed");
+    if (totalCount !== undefined && body.total_count !== totalCount) fail("discovery-failed");
+    totalCount = body.total_count;
+    const expectedPageSize = Math.min(100, totalCount - repositories.length);
+    if (expectedPageSize < 0 || body.repositories.length !== expectedPageSize) fail("discovery-failed");
+    for (const repository of body.repositories) {
+      if (!repository || !Number.isSafeInteger(repository.id) || repository.id <= 0) fail("discovery-failed");
+      let name;
+      try { name = validateRepositoryName(typeof repository.full_name === "string" ? repository.full_name.toLowerCase() : ""); } catch { fail("discovery-failed"); }
+      repositories.push({ repository: name, repositoryId: repository.id, installationId: installation.installationId });
+      if (repositories.length > limit) fail("discovery-failed");
+    }
+    if (repositories.length === totalCount) break;
+  }
+  if (repositories.length !== totalCount) fail("discovery-failed");
+  return repositories;
+}
+
+async function discoverRepositories(config, jwt) {
+  const explicit = new Map(config.repositories.map((repository) => [repository.repository, repository]));
+  const discovered = new Map();
+  const ids = new Set(config.repositories.map((repository) => repository.repositoryId));
+  let totalDiscovered = 0;
+  for (const installation of config.installations) {
+    const remaining = Math.max(0, 500 - totalDiscovered);
+    const repositories = await discoverInstallationRepositories(installation, jwt, remaining);
+    totalDiscovered += repositories.length;
+    for (const repository of repositories) {
+      if (explicit.has(repository.repository)) continue;
+      const previous = discovered.get(repository.repository);
+      if ((previous && (previous.repositoryId !== repository.repositoryId || previous.installationId !== repository.installationId)) || (ids.has(repository.repositoryId) && !previous)) fail("discovery-failed");
+      discovered.set(repository.repository, repository);
+      ids.add(repository.repositoryId);
+    }
+  }
+  const repositories = [...explicit.values(), ...discovered.values()];
+  if (repositories.length > 500) fail("discovery-failed");
+  return repositories;
+}
+
+async function removeStaleTokens(directory, repositories) {
+  const current = new Set(repositories.map((repository) => basename(tokenPath(directory, repository.repository))));
+  let entries;
+  try { entries = await readdir(directory, { withFileTypes: true }); } catch { fail("cache-unavailable"); }
+  for (const entry of entries) {
+    if (!/^[a-f0-9]{64}\.json$/.test(entry.name) || current.has(entry.name)) continue;
+    const path = join(directory, entry.name);
+    let info;
+    try { info = await lstat(path); } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      fail("cache-cleanup-failed");
+    }
+    if (info.isFile() && !info.isSymbolicLink()) {
+      try { await unlink(path); } catch (error) {
+        if (error?.code !== "ENOENT") fail("cache-cleanup-failed");
+      }
+    }
+  }
+}
+
 async function writeTokenAtomically(directory, filePath, value, groupId) {
   const owner = typeof process.getuid === "function" ? process.getuid() : 0;
   try {
@@ -350,13 +478,13 @@ async function run(configPath) {
   const config = validateConfig(parsed);
   await secureFile(config.privateKeyFile, "private-key", 1024 * 1024);
   await ensureTokenDirectory(config.tokenDirectory, config.tokenGroupId);
-  const currentTokens = await Promise.all(config.repositories.map(async (repository) => {
-    try { return { value: await cachedToken(tokenPath(config.tokenDirectory, repository.repository), repository, config.tokenGroupId) }; }
-    catch (error) { return { error: error instanceof RefreshError ? error.code : "cache-unavailable" }; }
+  const configuredTokens = await Promise.all(config.repositories.map(async (repository) => {
+    try { return await cachedToken(tokenPath(config.tokenDirectory, repository.repository), repository, config.tokenGroupId); }
+    catch { return undefined; }
   }));
-  const needsRefresh = currentTokens.some((cached) => !cached.error && !cached.value);
+  const needsJwt = config.installations.length > 0 || configuredTokens.some((token) => !token);
   let jwt;
-  if (needsRefresh) {
+  if (needsJwt) {
     let key;
     try { key = createPrivateKey((await secureFile(config.privateKeyFile, "private-key", 1024 * 1024)).toString("utf8")); } catch (error) {
       if (error instanceof RefreshError) throw error;
@@ -364,13 +492,28 @@ async function run(configPath) {
     }
     jwt = createAppJwt(config.appId, key);
   }
-  const results = new Array(config.repositories.length);
+  let repositories = config.repositories;
+  if (config.installations.length > 0) repositories = await discoverRepositories(config, jwt);
+  const currentTokens = await Promise.all(repositories.map(async (repository) => {
+    try { return { value: await cachedToken(tokenPath(config.tokenDirectory, repository.repository), repository, config.tokenGroupId) }; }
+    catch (error) { return { error: error instanceof RefreshError ? error.code : "cache-unavailable" }; }
+  }));
+  const needsRefresh = currentTokens.some((cached) => !cached.error && !cached.value);
+  if (needsRefresh && !jwt) {
+    let key;
+    try { key = createPrivateKey((await secureFile(config.privateKeyFile, "private-key", 1024 * 1024)).toString("utf8")); } catch (error) {
+      if (error instanceof RefreshError) throw error;
+      fail("private-key-invalid");
+    }
+    jwt = createAppJwt(config.appId, key);
+  }
+  const results = new Array(repositories.length);
   let nextIndex = 0;
-  const workers = Array.from({ length: Math.min(16, config.repositories.length) }, async () => {
+  const workers = Array.from({ length: Math.min(16, repositories.length) }, async () => {
     while (true) {
       const index = nextIndex++;
-      if (index >= config.repositories.length) return;
-      const repository = config.repositories[index];
+      if (index >= repositories.length) return;
+      const repository = repositories[index];
       const name = repository.repository;
       if (currentTokens[index].error) {
         console.error(`${name}: failed (${currentTokens[index].error})`);
@@ -394,6 +537,7 @@ async function run(configPath) {
     }
   });
   await Promise.all(workers);
+  if (config.installations.length > 0) await removeStaleTokens(config.tokenDirectory, repositories);
   if (results.some((result) => !result)) process.exitCode = 1;
 }
 

@@ -192,7 +192,23 @@ export function pendingLabel(pending: PendingGeneration) {
   if (pending.reason === "apply-failed") return `apply failed (${pending.category ?? "other"})${pending.message ? `: ${pending.message}` : ""}`;
   return "no session is running; ready to apply";
 }
-export type ProjectDetail = { id: string; name: string; sync: ProjectSyncStatus };
+export type SourcePendingStatus = { reason: "session-running" | "fetch-failed" | "diverged" | "apply-failed"; category?: string; message?: string; since: string };
+/** Where a workspace's files come from: the laptop, or a GitHub base branch the host mirrors. */
+export type ProjectSourceStatus = { mode: "github" | "laptop"; repository?: string; baseBranch?: string; mirrorHead?: string; appliedHead?: string; fetchedAt?: string; appliedAt?: string; pending?: SourcePendingStatus; savedBranches?: string[] };
+export type ProjectDetail = { id: string; name: string; sync: ProjectSyncStatus; source?: ProjectSourceStatus };
+/** One line for a GitHub-tracked workspace, worded like the CLI status line. */
+export function sourceLabel(source: ProjectSourceStatus, now = Date.now()) {
+  const head = source.appliedHead ? source.appliedHead.slice(0, 8) : "none";
+  const parts = [`Follows GitHub ${source.repository}@${source.baseBranch} · host ${head} · fetched ${ago(source.fetchedAt, now)}`];
+  const pending = source.pending;
+  if (pending?.reason === "session-running") parts.push("waiting: session running");
+  else if (pending?.reason === "fetch-failed") parts.push(`fetch failed: ${pending.category ?? "other"}${pending.message ? `: ${pending.message}` : ""}`);
+  else if (pending?.reason === "diverged") parts.push(`host diverged from origin/${source.baseBranch}`);
+  else if (pending?.reason === "apply-failed") parts.push(`apply failed (${pending.category ?? "other"})`);
+  const lastSaved = source.savedBranches?.[source.savedBranches.length - 1];
+  if (lastSaved) parts.push(`saved local edits on ${lastSaved}`);
+  return parts.join(" · ");
+}
 export function ago(iso?: string, now = Date.now()) {
   if (!iso) return "never";
   const s = Math.max(0, Math.floor((now - Date.parse(iso)) / 1000));

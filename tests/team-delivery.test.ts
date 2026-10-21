@@ -1,10 +1,41 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fixture, git, limitLineup } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
+import { TeamError } from "../packages/host/src/teams.js";
+import type { TeamMember, TeamReport, TeamRun } from "../packages/host/src/team-types.js";
+import { teamPrompt } from "../packages/host/src/team-prompts.js";
+
+async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: string) => void) {
+  const f = await fixture("delivery-fast", limitLineup, {}, { deliveryMode: mode, noServer: true });
+  const teams = await f.openTeamService({ onMerged, start: false });
+  const id = randomUUID(), memberId = randomUUID(), branch = "infinite/team-delivery-test";
+  git(f.source, "checkout", "-b", branch);
+  const root = join(f.host.config.teams!.workspaceDir, id);
+  const workspace = join(root, "integration"), members = join(root, "members"), cwd = join(members, memberId);
+  mkdirSync(members, { recursive: true });
+  git(f.source, "clone", "--no-hardlinks", f.source, workspace);
+  git(workspace, "remote", "remove", "origin");
+  const headCommit = git(workspace, "rev-parse", "HEAD");
+  git(workspace, "clone", "--no-hardlinks", workspace, cwd);
+  git(cwd, "remote", "remove", "origin");
+  const at = new Date().toISOString();
+  const policy = structuredClone(f.host.config.projects[0]!.team!.delivery!);
+  const member: TeamMember = { runId: id, memberId, revision: 1, role: "delivery", provider: "codex", sessionId: randomUUID(),
+    title: "delivery: Implement a small feature", status: "reported", cwd, baseCommit: headCommit, prompt: "", cursor: 0, stopRequestId: randomUUID(), startedAt: at };
+  const run: TeamRun = { id, projectId: "rehearsal", provider: "codex", title: "Implement a small feature", objective: "Record an owner-authorized delivery.",
+    parallelism: 2, revision: 1, status: "delivering", createdAt: at, updatedAt: at, workspace, branch, baseCommit: headCommit, headCommit,
+    tasks: [], members: [member], decisions: [], checks: [], steering: [], events: [], round: 0, delivery: policy,
+    review: { verdict: "approved", summary: "Reviewed the exact integration head.", revision: 1 } };
+  const stored = { run, fingerprint: "fixture", receipts: {}, prepared: true, root: f.host.config.teams!.workspaceDir,
+    checkHead: headCommit, deliveryAttempt: { memberId, revision: 1, headCommit } };
+  const internals = teams as unknown as { records: Map<string, typeof stored>; consume: (record: typeof stored, member: TeamMember) => void };
+  internals.records.set(id, stored);
+  return { f, teams, run, member, stored, headCommit, id, consume(report: TeamReport) { member.report = report; internals.consume(stored, member); } };
+}
 
 test("owner-authorized delivery waits for exact-head checks and review, survives API restart, and records one merge claim", { timeout: 90000 }, async () => {
   const f = await fixture("delivery-hold", limitLineup);
@@ -33,6 +64,59 @@ test("owner-authorized delivery waits for exact-head checks and review, survives
     assert.equal(steer.status, 409);
     assert.equal(steer.body.code, "delivery-reconciliation-required");
   } finally { await f.close(); }
+});
+
+test("pull-request delivery records the reviewed pull request and ends ready for review", { timeout: 30000 }, async () => {
+  const h = await deliveryRecord("pr");
+  try {
+    const prompt = teamPrompt(h.run, "delivery");
+    assert.match(prompt, /do not merge/i);
+    assert.match(prompt, /never force-push/i);
+    assert.match(prompt, /denied action must not be retried through another tool or credential/i);
+    assert.match(prompt, /missing required capabilities are a blocker/i);
+    h.consume({ kind: "pull-request", headCommit: h.headCommit, pullRequestUrl: "https://github.com/example/app/pull/1", summary: "Opened the reviewed head for owner review." });
+    const ready = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => ["ready-for-review", "blocked"].includes(run.status), 10000);
+    assert.equal(ready.status, "ready-for-review", JSON.stringify(ready));
+    assert.equal(ready.pullRequest?.headCommit, ready.headCommit);
+    assert.equal(ready.pullRequest?.pullRequestUrl, "https://github.com/example/app/pull/1");
+    assert.equal(ready.deliveryReceipt, undefined);
+    assert.ok(ready.events.some(event => event.text === "The delivery agent reported an open pull request for the reviewed commit. Review and merge it on GitHub; the host refreshes the project after the merge."));
+    assert.deepEqual(await h.teams.bundle(ready.id), { workspace: ready.workspace, branch: ready.branch, head: ready.headCommit });
+  } finally { await h.f.close(); }
+});
+
+test("delivery reports must match the pinned merge or pull-request mode", { timeout: 30000 }, async () => {
+  for (const [mode, kind] of [["pr", "delivery"], ["merge", "pull-request"]] as const) {
+    const h = await deliveryRecord(mode);
+    try {
+      const report: TeamReport = kind === "delivery"
+        ? { kind: "delivery", headCommit: h.headCommit, pullRequestUrl: "https://github.com/example/app/pull/1", mergeCommit: h.headCommit, summary: "Wrong report mode." }
+        : { kind: "pull-request", headCommit: h.headCommit, pullRequestUrl: "https://github.com/example/app/pull/1", summary: "Wrong report mode." };
+      assert.throws(() => h.consume(report), error => error instanceof TeamError && error.status === 409 && error.code === "delivery-mode-mismatch");
+      assert.equal(h.run.pullRequest, undefined);
+      assert.equal(h.run.deliveryReceipt, undefined);
+    } finally { await h.f.close(); }
+  }
+});
+
+test("a completed merge report invokes the source refresh callback once", { timeout: 30000 }, async () => {
+  const refreshed: string[] = [];
+  const callbackStatuses: string[] = [];
+  let h: Awaited<ReturnType<typeof deliveryRecord>> | undefined;
+  h = await deliveryRecord("merge", projectId => {
+    refreshed.push(projectId);
+    callbackStatuses.push(h?.teams.get(h.id).status ?? "missing");
+  });
+  try {
+    const tree = git(h.member.cwd, "rev-parse", `${h.headCommit}^{tree}`);
+    const mergeCommit = git(h.member.cwd, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", tree, "-p", h.headCommit, "-m", "Synthetic merge");
+    git(h.member.cwd, "update-ref", "refs/heads/synthetic-merge", mergeCommit);
+    h.consume({ kind: "delivery", headCommit: h.headCommit, pullRequestUrl: "https://github.com/example/app/pull/1", mergeCommit, summary: "Merged the reviewed head." });
+    const merged = await waitFor(() => Promise.resolve(h!.teams.get(h!.id)), run => ["merged", "blocked"].includes(run.status), 10000);
+    assert.equal(merged.status, "merged", JSON.stringify(merged));
+    assert.deepEqual(refreshed, ["rehearsal"]);
+    assert.deepEqual(callbackStatuses, ["merged"]);
+  } finally { await h.f.close(); }
 });
 
 test("delivery rejects foreign targets, stale heads, changed files, and invalid merged baselines", { timeout: 120000 }, async () => {

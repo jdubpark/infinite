@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { chmodSync, chownSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createHash, generateKeyPairSync } from "node:crypto";
 
@@ -24,7 +23,7 @@ if (process.env.TEST_SCENARIO === "write-mode-fails") {
 }
 globalThis.fetch = async (input, init = {}) => {
   const url = String(input);
-  const body = JSON.parse(init.body);
+  const body = init.body ? JSON.parse(init.body) : null;
   const auth = String(init.headers?.authorization ?? "");
   const jwt = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   const parts = jwt.split(".");
@@ -39,11 +38,35 @@ globalThis.fetch = async (input, init = {}) => {
   } catch {}
   const request = { url, method: init.method, redirect: init.redirect, body, jwtValid, claims };
   appendFileSync(process.env.TEST_REQUEST_LOG, JSON.stringify(request) + "\n", { mode: 0o600 });
+  const scenario = process.env.TEST_SCENARIO ?? "success";
+  const discovered = JSON.parse(process.env.TEST_DISCOVERED ?? "[]");
+  if (url.startsWith("https://api.github.com/installation/repositories")) {
+    const page = Number(new URL(url).searchParams.get("page"));
+    if (scenario === "discovery-failure" && page === 2) return new Response("sensitive-body-marker", { status: 503 });
+    const installationId = Number(/installation_test_token_value_(\d+)/.exec(auth)?.[1]);
+    const installationRepositories = discovered.filter(item => item.installationId === installationId);
+    const start = (page - 1) * 100;
+    return new Response(JSON.stringify({
+      total_count: scenario === "incomplete-discovery" ? 101 : installationRepositories.length,
+      repositories: installationRepositories.slice(start, start + 100).map(item => ({
+        id: item.repositoryId,
+        full_name: item.repository,
+        ...(scenario === "large-discovery-page" ? { description: "x".repeat(40 * 1024) } : {}),
+        ...(scenario === "oversized-discovery-page" ? { description: "x".repeat(600 * 1024) } : {}),
+      })),
+    }), { status: 200 });
+  }
   if (!url.startsWith(exactEndpoint)) throw new Error("unexpected endpoint");
   const installationId = Number(url.slice(exactEndpoint.length).split("/")[0]);
+  if (body && !body.repository_ids) {
+    const repositories = scenario === "large-installation-token-response"
+      ? Array.from({ length: 100 }, (_, index) => ({ id: index + 1, full_name: "example/repository-" + (index + 1), description: "x".repeat(1024) }))
+      : undefined;
+    return new Response(JSON.stringify({ token: "installation_test_token_value_" + installationId, ...(repositories ? { repositories } : {}) }), { status: 201 });
+  }
   const repositoryId = body.repository_ids[0];
-  const configured = JSON.parse(readFileSync(process.env.TEST_CONFIG, "utf8")).repositories.find(item => item.repositoryId === repositoryId);
-  const scenario = process.env.TEST_SCENARIO ?? "success";
+  const testConfig = JSON.parse(readFileSync(process.env.TEST_CONFIG, "utf8"));
+  const configured = [...(testConfig.repositories ?? []), ...discovered].find(item => item.repositoryId === repositoryId);
   if (scenario === "http-error" || (scenario === "one-installation-fails" && installationId === 101)) {
     return new Response("sensitive-body-marker", { status: 401 });
   }
@@ -59,8 +82,8 @@ globalThis.fetch = async (input, init = {}) => {
 };
 `;
 
-function fixture(repositories = [{ repository: "example/app", repositoryId: 17, installationId: 101 }]) {
-  const root = realpathSync(mkdtempSync(join(homedir(), ".github-app-refresh-")));
+function fixture(repositories = [{ repository: "example/app", repositoryId: 17, installationId: 101 }], installations?: Array<{ installationId: number }>, discovered: Array<{ repository: string; repositoryId: number; installationId: number }> = []) {
+  const root = realpathSync(mkdtempSync(join(process.cwd(), ".github-app-refresh-")));
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const privateKeyFile = join(root, "app-key.pem");
   const publicKeyFile = join(root, "app-public.pem");
@@ -71,18 +94,19 @@ function fixture(repositories = [{ repository: "example/app", repositoryId: 17, 
   writeFileSync(privateKeyFile, keys.privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
   writeFileSync(publicKeyFile, keys.publicKey.export({ type: "spki", format: "pem" }), { mode: 0o600 });
   writeFileSync(stubFile, stubSource, { mode: 0o600 });
-  const config = {
+  const config: Record<string, unknown> = {
     appId: "12345",
     privateKeyFile,
     tokenDirectory,
     tokenGroupId: typeof process.getgid === "function" ? process.getgid() : 0,
-    repositories,
   };
+  if (repositories !== undefined) config.repositories = repositories;
+  if (installations !== undefined) config.installations = installations;
   writeFileSync(configFile, JSON.stringify(config), { mode: 0o600 });
-  const run = (scenario = "success", configPath = configFile) => spawnSync(process.execPath, ["--import", stubFile, script, "--config", configPath], {
+  const run = (scenario = "success", configPath = configFile, timeout = 30_000) => spawnSync(process.execPath, ["--import", stubFile, script, "--config", configPath], {
     encoding: "utf8",
-    env: { ...process.env, TEST_CONFIG: configPath, TEST_PUBLIC_KEY: publicKeyFile, TEST_REQUEST_LOG: requestLog, TEST_SCENARIO: scenario },
-    timeout: 30_000,
+    env: { ...process.env, TEST_CONFIG: configPath, TEST_PUBLIC_KEY: publicKeyFile, TEST_REQUEST_LOG: requestLog, TEST_SCENARIO: scenario, TEST_DISCOVERED: JSON.stringify(discovered) },
+    timeout,
   });
   const tokenFile = (repository) => join(tokenDirectory, `${createDigest(repository)}.json`);
   const requests = () => exists(requestLog) ? readFileSync(requestLog, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : [];
@@ -172,6 +196,191 @@ test("continues other configured repositories after one installation fails", { t
     assert.equal(JSON.parse(readFileSync(f.tokenFile("example/second"), "utf8")).repositoryId, 23);
     assert.equal(f.requests().length, 2);
     assert.doesNotMatch(result.stdout + result.stderr, /sensitive-body-marker|opaque_test_token_value_42|Bearer /);
+  } finally { f.close(); }
+});
+
+test("discovers installed repositories, refreshes scoped tokens, and removes only stale token files", { timeout: 60_000 }, () => {
+  const discovered = [
+    { repository: "example/first", repositoryId: 31, installationId: 101 },
+    { repository: "example/second", repositoryId: 32, installationId: 101 },
+  ];
+  const f = fixture([], [{ installationId: 101 }], discovered);
+  try {
+    mkdirSync(f.tokenDirectory, { mode: 0o750 });
+    writeFileSync(f.tokenFile("example/stale"), "stale", { mode: 0o640 });
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /example\/first: refreshed/);
+    assert.match(result.stdout, /example\/second: refreshed/);
+    assert.equal(exists(f.tokenFile("example/stale")), false);
+    assert.equal(JSON.parse(readFileSync(f.tokenFile("example/first"), "utf8")).repositoryId, 31);
+    assert.equal(JSON.parse(readFileSync(f.tokenFile("example/second"), "utf8")).repositoryId, 32);
+    const calls = f.requests();
+    assert.equal(calls.filter(call => call.url.includes("/access_tokens")).length, 3);
+    const discoveryToken = calls.find(call => call.url.endsWith("/access_tokens") && call.body && !call.body.repository_ids);
+    assert.ok(discoveryToken);
+    assert.equal(Object.hasOwn(discoveryToken.body, "repository_ids"), false);
+    assert.deepEqual(discoveryToken.body, { permissions: { metadata: "read" } });
+    assert.ok(calls.some(call => call.url.endsWith("/installation/repositories?per_page=100&page=1") && call.method === "GET"));
+    const temporaryToken = "installation_test_token_value_101";
+    assert.doesNotMatch(result.stdout + result.stderr, new RegExp(temporaryToken));
+    assert.doesNotMatch(readFileSync(f.requestLog, "utf8"), new RegExp(temporaryToken));
+    for (const repository of ["example/first", "example/second"]) {
+      assert.doesNotMatch(readFileSync(f.tokenFile(repository), "utf8"), new RegExp(temporaryToken));
+    }
+  } finally { f.close(); }
+});
+
+test("installation discovery paginates with a hard 500 repository bound", { timeout: 120_000 }, () => {
+  const discovered = Array.from({ length: 101 }, (_, index) => ({ repository: `example/repo-${String(index + 1).padStart(3, "0")}`, repositoryId: index + 100, installationId: 101 }));
+  const f = fixture([], [{ installationId: 101 }], discovered);
+  try {
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(exists(f.tokenFile("example/repo-001")));
+    assert.ok(exists(f.tokenFile("example/repo-101")));
+    const pages = f.requests().filter(call => call.url.includes("/installation/repositories"));
+    assert.equal(pages.length, 2);
+    assert.match(pages[0].url, /per_page=100&page=1$/);
+    assert.match(pages[1].url, /per_page=100&page=2$/);
+  } finally { f.close(); }
+});
+
+test("refreshes exactly 500 repositories and still checks every configured installation", { timeout: 120_000 }, () => {
+  const discovered = Array.from({ length: 500 }, (_, index) => ({ repository: `example/repo-${String(index + 1).padStart(3, "0")}`, repositoryId: index + 100, installationId: 101 }));
+  const f = fixture([], [{ installationId: 101 }, { installationId: 202 }], discovered);
+  try {
+    const result = f.run("success", f.configFile, 120_000);
+    assert.equal(result.status, 0, result.stderr);
+    const pages = f.requests().filter(call => call.url.includes("/installation/repositories"));
+    assert.equal(pages.length, 6);
+    assert.equal(pages.filter(call => call.url.endsWith("page=1")).length, 2);
+    assert.equal(f.requests().filter(call => call.url.endsWith("/access_tokens") && call.body?.repository_ids).length, 500);
+  } finally { f.close(); }
+});
+
+test("accepts an unrestricted installation token response larger than a scoped-token response", { timeout: 30_000 }, () => {
+  const discovered = [{ repository: "example/app", repositoryId: 31, installationId: 101 }];
+  const f = fixture([], [{ installationId: 101 }], discovered);
+  try {
+    const result = f.run("large-installation-token-response");
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(exists(f.tokenFile("example/app")));
+  } finally { f.close(); }
+});
+
+test("accepts GitHub's special .github repository name during discovery", { timeout: 30_000 }, () => {
+  const discovered = [{ repository: "example/.github", repositoryId: 31, installationId: 101 }];
+  const f = fixture([], [{ installationId: 101 }], discovered);
+  try {
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(readFileSync(f.tokenFile("example/.github"), "utf8")).repository, "example/.github");
+  } finally { f.close(); }
+});
+
+test("accepts a discovery page larger than the token response limit", { timeout: 30_000 }, () => {
+  const discovered = [
+    { repository: "example/first", repositoryId: 31, installationId: 101 },
+    { repository: "example/second", repositoryId: 32, installationId: 101 },
+  ];
+  const f = fixture([], [{ installationId: 101 }], discovered);
+  try {
+    const result = f.run("large-discovery-page");
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(exists(f.tokenFile("example/first")));
+    assert.ok(exists(f.tokenFile("example/second")));
+  } finally { f.close(); }
+});
+
+test("maps an over-cap discovery page to discovery-failed", { timeout: 30_000 }, () => {
+  const discovered = [
+    { repository: "example/first", repositoryId: 31, installationId: 101 },
+    { repository: "example/second", repositoryId: 32, installationId: 101 },
+  ];
+  const f = fixture([], [{ installationId: 101 }], discovered);
+  try {
+    const result = f.run("oversized-discovery-page");
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /discovery-failed/);
+    assert.equal(f.requests().filter(call => call.url.endsWith("/access_tokens") && call.body?.repository_ids).length, 0);
+  } finally { f.close(); }
+});
+
+test("rejects installation discovery above the 500 repository cap before refreshing tokens", { timeout: 30_000 }, () => {
+  const discovered = Array.from({ length: 501 }, (_, index) => ({ repository: `example/repo-${String(index + 1).padStart(3, "0")}`, repositoryId: index + 100, installationId: 101 }));
+  const f = fixture([], [{ installationId: 101 }], discovered);
+  try {
+    const result = f.run();
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /discovery-failed/);
+    assert.equal(f.requests().filter(call => call.url.endsWith("/access_tokens") && call.body?.repository_ids).length, 0);
+    assert.equal(exists(f.tokenFile("example/repo-001")), false);
+  } finally { f.close(); }
+});
+
+test("rejects a merged explicit and discovered inventory over 500 before refreshing or cleanup", { timeout: 30_000 }, () => {
+  const explicit = Array.from({ length: 500 }, (_, index) => ({ repository: `example/configured-${String(index + 1).padStart(3, "0")}`, repositoryId: index + 1, installationId: 101 }));
+  const discovered = [{ repository: "example/discovered", repositoryId: 1001, installationId: 101 }];
+  const f = fixture(explicit, [{ installationId: 101 }], discovered);
+  try {
+    mkdirSync(f.tokenDirectory, { mode: 0o750 });
+    writeFileSync(f.tokenFile("example/stale"), "prior stale token", { mode: 0o640 });
+    const result = f.run();
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /discovery-failed/);
+    assert.equal(f.requests().filter(call => call.url.endsWith("/access_tokens") && call.body?.repository_ids).length, 0);
+    assert.equal(readFileSync(f.tokenFile("example/stale"), "utf8"), "prior stale token");
+  } finally { f.close(); }
+});
+
+test("explicit repository configuration wins a discovered duplicate slug", { timeout: 30_000 }, () => {
+  const discovered = [{ repository: "example/app", repositoryId: 99, installationId: 202 }];
+  const f = fixture([{ repository: "example/app", repositoryId: 17, installationId: 101 }], [{ installationId: 202 }], discovered);
+  try {
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(readFileSync(f.tokenFile("example/app"), "utf8")).repositoryId, 17);
+    assert.equal(f.requests().filter(call => call.url.endsWith("/access_tokens") && call.body?.repository_ids).length, 1);
+  } finally { f.close(); }
+});
+
+test("discovery failure preserves existing and stale token files", { timeout: 30_000 }, () => {
+  const discovered = Array.from({ length: 101 }, (_, index) => ({ repository: `example/repo-${String(index + 1).padStart(3, "0")}`, repositoryId: index + 100, installationId: 101 }));
+  const f = fixture([], [{ installationId: 101 }], discovered);
+  try {
+    mkdirSync(f.tokenDirectory, { mode: 0o750 });
+    writeFileSync(f.tokenFile("example/stale"), "prior stale token", { mode: 0o640 });
+    const previous = {
+      schemaVersion: 1,
+      repository: "example/repo-001",
+      repositoryId: 100,
+      installationId: 101,
+      token: "previous_test_token_value",
+      expiresAt: new Date(Date.now() + 45 * 60_000).toISOString(),
+      permissions: { contents: "write", pull_requests: "write", checks: "read", statuses: "read", actions: "read", metadata: "read" },
+    };
+    writeFileSync(f.tokenFile("example/repo-001"), JSON.stringify(previous), { mode: 0o640 });
+    const result = f.run("discovery-failure");
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /discovery-failed/);
+    assert.equal(readFileSync(f.tokenFile("example/stale"), "utf8"), "prior stale token");
+    assert.deepEqual(JSON.parse(readFileSync(f.tokenFile("example/repo-001"), "utf8")), previous);
+    assert.equal(f.requests().filter(call => call.url.endsWith("/access_tokens") && call.body?.repository_ids).length, 0);
+    assert.doesNotMatch(result.stdout + result.stderr, /sensitive-body-marker|installation_test_token_value_99/);
+  } finally { f.close(); }
+});
+
+test("incomplete discovery preserves prior token files and fails closed", { timeout: 30_000 }, () => {
+  const f = fixture([], [{ installationId: 101 }], []);
+  try {
+    mkdirSync(f.tokenDirectory, { mode: 0o750 });
+    writeFileSync(f.tokenFile("example/stale"), "prior stale token", { mode: 0o640 });
+    const result = f.run("incomplete-discovery");
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /discovery-failed/);
+    assert.equal(f.requests().filter(call => call.url.endsWith("/access_tokens") && call.body?.repository_ids).length, 0);
+    assert.equal(readFileSync(f.tokenFile("example/stale"), "utf8"), "prior stale token");
   } finally { f.close(); }
 });
 

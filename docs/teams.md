@@ -100,6 +100,14 @@ tool requests to the strong coordinator by default; `--permissions off` opts out
 The repository policy bounds that authority; see
 [Delegating permission decisions](#delegating-permission-decisions).
 
+`--source` picks where the host gets the repository. `infinite repo init` records
+`github` when `origin` is an HTTPS or SSH `github.com` URL without embedded
+credentials, and `laptop` otherwise. `--source laptop` keeps workspace sync for
+the checkout, and `--source github` switches an enrolled project to GitHub mode.
+Enrolling a `github` project still uploads a one-time snapshot so the project
+directory exists at once. The first refresh then fast-forwards it to the base
+branch. See [GitHub-tracked sources](#github-tracked-sources).
+
 A new empty repository can enroll immediately after `git init`. Its cloud source
 gets an empty baseline commit; local Git history and files stay unchanged. When
 no checks exist, enrollment records `checks: []` and `establishChecks: true`.
@@ -126,6 +134,132 @@ whether Linear has confirmed its issue and execution evidence. Historical runs
 remain unchanged. Run status, verification, and human acceptance retain the
 separate meanings described below.
 
+## GitHub-tracked sources
+
+A project in `github` source mode follows its base branch on GitHub. The host
+keeps that branch current without a laptop process, and team runs start from the
+current base. [Source modes](workspace-sync.md#source-modes) explains how a
+project gets this mode.
+
+### Host mirror
+
+The host keeps one bare Git mirror of the base branch for each `github` project,
+at `PROJECT_ID.git` under `source-mirrors`. That directory sits beside
+`teams.workspaceDir`, or under the host state directory when no team workspace
+directory is set. Set `source.mirrorDir` to an absolute path in host configuration
+to choose another parent. The mirror lives outside every project directory and
+every team workspace.
+
+```json
+{
+  "source": { "mirrorDir": "/srv/infinite-data/source-mirrors", "refreshMinutes": 5 }
+}
+```
+
+Agents can write the mirror. The API account creates it, but the fetch that
+fills it runs as the agent identity through `teams.commandPrefix`. On the Ubuntu
+template only that identity can reach the GitHub App token. A constrained
+launcher that clears global Git configuration must attach that credential helper
+to the mirror fetch itself, for example as `-c credential.https://github.com.helper=…`
+on that one operation; without it a private repository fails as `auth`. The mirror is
+group-writable with the setgid bit (`2770`) when `sync.sharedGroup` is set, and
+`0750` otherwise. This grants agents no power over the base that they lack today,
+because they already write the project directory that team runs clone. The mirror
+keeps team runs apart from the working tree that sessions edit. It does not
+protect the base from agents. The working tree stays a detached checkout with no
+GitHub remote, so only the mirror fetches from GitHub.
+
+### Refresh
+
+A refresh is one unit of work per project, and only one runs for a project at a
+time. It does these steps in order:
+
+1. Fetch the base branch from GitHub into the mirror, through the command prefix.
+   A failure records a category (`auth`, `network`, `not-found`, or `other`) and a
+   fixed message. The stored message never contains Git output, a URL, or a token.
+   After a failure the timer waits twice as long before each further attempt,
+   from the refresh interval up to one hour, until a fetch succeeds. An explicit
+   refresh and the refresh before a team run always attempt the fetch.
+2. If the mirror head moved and no cloud session is running or starting in the
+   project directory, fast-forward the working tree to the new head and record
+   `appliedAt`. Team runs, goals, and handoffs do not count as sessions here,
+   because they work in their own clones.
+3. If a session left tracked edits in the working tree, commit only those edits on
+   a local branch named `infinite/saved-YYYYMMDD-XXXXXXXX`, with a fixed message.
+   Then return the tree to a clean detached checkout. Untracked and ignored files
+   stay in place, so installed dependencies and generated reports survive. The
+   saved branch appears in the project's status.
+4. If the working tree's `HEAD` is not an ancestor of the new head, leave the tree
+   as it is and record `diverged`. This covers a session that committed on the
+   host, and a snapshot that had commits on a feature branch when the project
+   switched to GitHub mode. The owner or coordinator resolves it. A refresh never
+   resets the tree or discards tracked edits.
+
+While the fast-forward in step 2 runs, new sessions in the project wait with
+`409 source-refreshing`. The fetch in step 1 does not block sessions.
+
+### Triggers
+
+A refresh runs:
+
+- on a timer, using `source.refreshMinutes` (default 5, from 1 to 1440). The host
+  checks every minute and fetches a project whose last successful fetch is older
+  than the interval;
+- before a team run prepares its workspace, and before a goal or mission
+  continuation does (see [Team runs](#team-runs));
+- after the host records a `--delivery merge` merge report for the project;
+- at the end of `infinite repo init` for a `github` project;
+- on demand, through `infinite repo refresh`, the **Refresh from GitHub** button
+  in the web and phone apps, or `POST /api/projects/:id/source/refresh`.
+
+### Status
+
+`GET /api/projects/:id` returns `source` for every project. A laptop project
+returns `{ "mode": "laptop" }`. A `github` project also returns:
+
+- `repository` and `baseBranch`;
+- `mirrorHead` and `fetchedAt`, the base head the last successful fetch saw and when it ran;
+- `appliedHead` and `appliedAt`, the commit the working tree last reached;
+- `savedBranches`, the local branches that hold saved edits;
+- `pending`, with `reason`, `since`, and for some reasons `category` and `message`.
+
+| Reason | Meaning | Message |
+| --- | --- | --- |
+| `fetch-failed` | The last fetch failed | `auth` says `grant the GitHub App access to OWNER/REPO`. `network` says `the host could not reach GitHub`. `not-found` says `GitHub reports no such repository or branch for the configured source`. `other` says `the fetch from GitHub failed`. |
+| `session-running` | A session holds the working tree, so the fast-forward waits | None |
+| `diverged` | The working tree has commits that are not on the base branch | `the host checkout has commits that are not on BASE` |
+| `apply-failed` | The fast-forward or the save failed | A category from the [host-side table](workspace-sync.md#host-side) and a fixed message |
+
+The CLI prints one line for each state. These examples use placeholder
+repositories and heads:
+
+```text
+follows github example/product@main · host 0123abcd = origin/main · fetched 2m ago · applied 2m ago
+follows github example/product@main · host 0123abcd, origin/main 4567ef01 · fetch failed 14m ago: auth · grant the GitHub App access to example/product
+follows github example/product@main · host 0123abcd, origin/main 4567ef01 · waiting: session running
+follows github example/product@main · host 0123abcd = origin/main · saved local edits on infinite/saved-YYYYMMDD-XXXXXXXX
+follows github example/product@main · host diverged from origin/main
+```
+
+### Team runs
+
+A team run for a `github` project refreshes the source first. It then clones the
+mirror, not the project directory. The run's `baseCommit` is the mirror's
+base-branch head at that moment.
+
+- If the fetch failed but the mirror already has a head, the run starts from that
+  head. The run records `baseStale` with `reason: "fetch-failed"`, its category,
+  and the last `fetchedAt`. Its event log says GitHub could not be reached.
+- If the mirror has no head yet, the run is refused with `source-unavailable`
+  (409). The message points to the project's source status.
+
+Goal and mission continuations keep cloning the parent run's integration checkout,
+because they continue that run's branch. The host refreshes the mirror before they
+start, with a maximum age of one minute. When the mirror head descends from the
+parent's head and differs from it, the continuation records
+`baseBehind: { mirrorHead }`, so the coordinator can rebase early instead of at
+delivery.
+
 ## Optional provider-side delivery
 
 Repositories remain review-only until an owner configures delivery once during
@@ -134,10 +268,11 @@ enrollment:
 ```sh
 infinite repo init --delivery merge
 infinite repo init --delivery merge --repository OWNER/REPO --base-branch main --merge-method squash
+infinite repo init --delivery pr --repository OWNER/REPO --base-branch main
 infinite repo init --delivery review
 ```
 
-For `--delivery merge`, the CLI reads `origin` only when its URL is an HTTPS or
+For `--delivery merge` and `--delivery pr`, the CLI reads `origin` only when its URL is an HTTPS or
 SSH `github.com` repository without credentials. It reads the default branch
 from `origin/HEAD`; if that is missing, it uses the current local `main` or
 `master` branch. Otherwise, provide `--base-branch`. The CLI does not change
@@ -155,6 +290,21 @@ not independently verify the remote merge or grant GitHub tool permissions.
 Missing GitHub tools or authentication blocks delivery for review. It does not
 expand provider permissions, and a merge report does not establish human
 acceptance or product impact.
+
+After the host records a `merge` report, it refreshes the project, so the merged
+commit reaches the host before the owner reads the result.
+
+`--delivery pr` moves the review step to GitHub without granting merge authority.
+After the reviewer approves the implementation and its verification, the delivery
+member pushes the reviewed `infinite/team-*` branch at exactly the reviewed commit.
+It opens a pull request against the base branch, then stops. Its report names the
+head commit and the pull request URL. The host checks that the URL belongs to the
+configured repository, records it on the run as `pullRequest`, and sets the run to
+`ready-for-review`. The owner reviews and merges on GitHub. For a `github` project,
+the refresh timer then picks up the merge. `team pull` works on the run as usual.
+`pr` requires the same strong coordinator and independent strong reviewer as
+`merge`. `--merge-method` does not apply to it. A delivery report whose kind does
+not match the configured mode is refused with `delivery-mode-mismatch`.
 
 ## Project context and explicit relationships
 
@@ -836,6 +986,29 @@ can allow those read-only checks anywhere below the sync home and recognize a
 teamwork run by its directory: the API account creates each one, named
 `DATE-SLUG-REQUEST8`, before any Git command runs in it, and the provider
 account cannot create a directory with that owner.
+
+GitHub-tracked sources add these operations. The host runs each through
+`teams.commandPrefix`, and a launcher that refuses one fails that refresh step:
+
+- in a host mirror: `init --bare` when the mirror is created, `fetch --no-tags` of
+  the base branch from the GitHub URL into `refs/heads/BASE`, and `rev-parse` of
+  that ref;
+- in a project source directory: `rev-parse --show-toplevel` (the refresh
+  refuses a directory that is not the repository root), `fetch --no-tags` of the
+  base branch from the mirror path into `refs/remotes/origin/BASE`,
+  `rev-parse HEAD`, `merge-base --is-ancestor`,
+  `status --porcelain --untracked-files=no`, `checkout --detach` to the new head,
+  and, to save tracked edits, `checkout -b infinite/saved-*`,
+  `diff --cached --quiet`, `add -u`, and `commit -m` with one of two fixed
+  messages (staged edits are committed first, then remaining working-tree edits);
+- in a team run: `clone --no-local --no-hardlinks --no-checkout -- MIRROR_PATH`
+  into the run directory in place of a project-directory clone, `cat-file -t`
+  on the base commit, and, for a continuation, `fetch --no-tags -- MIRROR_PATH SHA`
+  of the current mirror head into the parent run's integration checkout so the
+  host can tell whether that run is behind the base.
+
+Nothing new is needed for `--delivery pr`. The delivery member pushes from its
+member clone with its own tools, as it does for `merge`.
 
 The Ubuntu launcher must preserve `INFINITE_HOOK_URL`, `INFINITE_HOOK_TOKEN`,
 `INFINITE_TEAM_ASSIGNMENT` and `INFINITE_TRUSTED_WORKSPACE`; the supplied sudoers

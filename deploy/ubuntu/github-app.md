@@ -1,9 +1,10 @@
 # Unattended GitHub access
 
 Use a private GitHub App for autonomous delivery. The server keeps its private
-key and renews installation tokens without a laptop connection. Each token is
-limited to one configured repository. A timer checks every five minutes and
-renews tokens with less than fifteen minutes remaining.
+key and renews installation tokens without a laptop connection. The refresh
+service mints a repository-scoped token for every repository the App
+installation can access. A timer checks every five minutes and renews tokens
+with less than fifteen minutes remaining.
 
 GitHub App private keys have no automatic expiration. Installation tokens expire
 after one hour; the renewal service handles that lifetime. This supports ongoing
@@ -30,9 +31,12 @@ repository settings, secrets, or branch protections.
 Generate one app private key and transfer it privately to the server's encrypted
 storage. Keep the key and issuer configuration owned by root with mode `0600`,
 inside a root-only directory. Do not put the key in a checkout, agent home,
-prompt, environment variable, or Git remote URL. Adding another repository needs
-an owner-approved installation change and a server configuration entry; it does
-not need another personal token or private key.
+prompt, environment variable, or Git remote URL. When installation discovery is
+configured, adding a repository needs only granting the App access in GitHub
+Settings > Installed GitHub Apps > repository access; no server configuration
+entry, personal token, or private key change is needed. The security consequence
+is that the refresh service mints tokens for every repository granted to the
+installation, so keep that grant limited to repositories approved for delivery.
 
 ## Server configuration
 
@@ -61,6 +65,23 @@ example IDs and group ID with the app, installation, repository, and agent group
 }
 ```
 
+Discover every repository granted to one or more installations by adding
+`installations`. `repositories` may be used by itself or together with
+`installations`; an explicit repository entry takes precedence over a discovered
+entry with the same slug.
+
+```json
+{
+  "appId": "12345",
+  "privateKeyFile": "/srv/infinite-data/github-app/private-key.pem",
+  "tokenDirectory": "/srv/infinite-data/github-app-tokens",
+  "tokenGroupId": 1001,
+  "installations": [
+    { "installationId": 34567 }
+  ]
+}
+```
+
 Create the non-secret `/etc/infinite-github/client.json`, owned by root with
 mode `0644`:
 
@@ -71,6 +92,9 @@ mode `0644`:
   "repositories": ["example/product"]
 }
 ```
+
+The client may omit `repositories`; it then treats repositories with a present
+token cache as configured and lists those repositories in `status` output.
 
 Install `infinite-github-refresh.service` and `infinite-github-refresh.timer` from
 this directory into `/etc/systemd/system`. Run the service once before enabling
@@ -131,7 +155,8 @@ equate merge with deployment or product-goal completion.
 
 To rotate the durable key, generate a replacement, install it privately, and
 verify a fresh token before revoking the old key. Removing repository access in
-GitHub and removing its server entries stops future renewal. Remove its cached
-token as part of that owner operation. Agent accounts sharing a Unix identity
-can read that identity's token files; this is repository-scoped GitHub authority,
-not filesystem isolation between agents or projects.
+GitHub stops discovery-based renewal. If the repository is also listed in
+`issuer.json` or `client.json`, remove that entry too. Remove its cached token as
+part of that owner operation. Agent accounts sharing a Unix identity can read
+that identity's token files; this is repository-scoped GitHub authority, not
+filesystem isolation between agents or projects.

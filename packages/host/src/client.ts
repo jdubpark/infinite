@@ -18,6 +18,7 @@ import { checkLaptopExecutor, startLaptopService } from "./laptop-service.js";
 import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWorkspaceManifest } from "./workspace-checkpoint.js";
 import { readSyncState, startSyncService, stopSyncService, syncServiceRunning } from "./sync-service.js";
 import { localProjectPath } from "./mirrored-projects.js";
+import type { ProjectSourceStatus } from "./project-source.js";
 import { boundTeamProject, forgetBoundTeamProject, handleTeamClientCommand } from "./team-cli.js";
 import { handleBoardClientCommand } from "./board-cli.js";
 import type { ProjectGroupList } from "./project-group-types.js";
@@ -476,7 +477,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
-  const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--relationship", "--delivery", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
+  const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
   const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
   const option = () => {
     const name = args.shift()!;
@@ -545,13 +546,72 @@ function localSyncProject(syncDir: string, origin: string): string | undefined {
   });
   return matches.length === 1 ? matches[0] : undefined;
 }
-function age(iso?: string) {
+function age(iso?: string, now = Date.now()) {
   if (!iso) return "never";
-  const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
+  const seconds = Math.max(0, Math.floor((now - Date.parse(iso)) / 1000));
   return seconds < 60 ? `${seconds}s ago` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : `${Math.floor(seconds / 3600)}h ago`;
 }
 type Pending = { reason: string; receivedAt: string; capturedAt?: string; category?: string; message?: string };
-type ProjectDetail = { id: string; name: string; sync: { lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: Pending; skipped?: number } };
+type ProjectDetail = { id: string; name: string; sync: { lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: Pending; skipped?: number }; source?: ProjectSourceStatus };
+const shortHead = (head?: string) => head ? clean(head.slice(0, 8)) : undefined;
+const sourceBranch = (source: ProjectSourceStatus) => clean(source.baseBranch ?? "unknown");
+const sourceOrigin = (source: ProjectSourceStatus) => `origin/${sourceBranch(source)}`;
+/** One-line source status for project listings and launch output. */
+export function describeSource(source: ProjectSourceStatus, now = Date.now()): string {
+  if (source.mode !== "github") return "follows laptop";
+
+  const repository = clean(source.repository ?? "unknown");
+  const branch = sourceOrigin(source);
+  const prefix = `follows github ${repository}@${sourceBranch(source)}`;
+  const host = shortHead(source.appliedHead) ?? "none";
+  const mirror = shortHead(source.mirrorHead) ?? "unknown";
+  const heads = `host ${host}, ${branch} ${mirror}`;
+  const pending = source.pending;
+  let state: string;
+
+  if (pending?.reason === "fetch-failed") {
+    state = `${heads} · fetch failed ${age(pending.since, now)}: ${clean(pending.category ?? "other")}${pending.message ? ` · ${clean(pending.message)}` : ""}`;
+  } else if (pending?.reason === "diverged") {
+    state = source.appliedHead ? `host diverged from ${branch}` : `host none, ${branch} ${mirror} · host diverged from ${branch}`;
+  } else if (pending?.reason === "session-running") {
+    state = `${heads} · waiting: session running`;
+  } else if (pending?.reason === "apply-failed") {
+    state = `${heads} · apply failed ${age(pending.since, now)}: ${clean(pending.category ?? "other")}${pending.message ? ` · ${clean(pending.message)}` : ""}`;
+  } else if (source.appliedHead && source.mirrorHead && source.appliedHead === source.mirrorHead) {
+    state = `host ${shortHead(source.appliedHead)} = ${branch} · fetched ${age(source.fetchedAt, now)} · applied ${age(source.appliedAt, now)}`;
+  } else {
+    state = heads;
+  }
+
+  const savedBranch = source.savedBranches?.at(-1);
+  return `${prefix} · ${state}${savedBranch ? ` · saved local edits on ${clean(savedBranch)}` : ""}`;
+}
+
+/** Compare the enrolled checkout with the host's last fetched commit without fetching. */
+export function compareLaptop(root: string, source: ProjectSourceStatus, now = Date.now()): string {
+  const branch = sourceOrigin(source);
+  const mirrorHead = source.mirrorHead;
+  if (!mirrorHead) return `host has not fetched ${branch} yet`;
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(mirrorHead)) return "host is ahead; fetch to compare";
+  // Comparison is strictly local, including for partial clones whose promisor remote
+  // could otherwise be contacted by Git when an object is missing.
+  const localGit = { cwd: root, env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } };
+
+  try {
+    execFileSync("git", ["cat-file", "-e", `${mirrorHead}^{commit}`], { ...localGit, stdio: "ignore" });
+  } catch {
+    return "host is ahead; fetch to compare";
+  }
+
+  const laptopHead = execFileSync("git", ["rev-parse", "HEAD"], { ...localGit, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  if (laptopHead === mirrorHead) return `laptop ${shortHead(laptopHead)} = ${branch}`;
+
+  const counts = execFileSync("git", ["rev-list", "--left-right", "--count", `HEAD...${mirrorHead}`], { ...localGit, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split(/\s+/).map(Number);
+  const [laptopOnly, hostOnly] = counts;
+  if (laptopOnly > 0 && hostOnly === 0) return `laptop has ${laptopOnly} unpushed commits; the host runs ${branch}`;
+  if (laptopOnly === 0 && hostOnly > 0) return `laptop is ${hostOnly} commits behind ${branch} (host fetched ${age(source.fetchedAt, now)})`;
+  return `laptop and ${branch} have diverged (${laptopOnly} and ${hostOnly} commits)`;
+}
 function describePending(pending: Pending) {
   if (pending.reason === "session-running") return "session running";
   if (pending.reason === "cloud-changed") return "cloud changed; use infinite sync --apply --force or infinite pull";
@@ -564,10 +624,13 @@ function describeSync(sync: ProjectDetail["sync"]) {
   const skipped = sync.skipped ? ` · ${sync.skipped} special file${sync.skipped === 1 ? "" : "s"} left out of the cloud scan` : "";
   return `synced ${age(sync.lastSyncedAt)} · applied ${age(sync.appliedAt)}${pending}${skipped}`;
 }
+function describeProjectStatus(detail: ProjectDetail) {
+  return detail.source?.mode === "github" ? describeSource(detail.source) : describeSync(detail.sync);
+}
 async function listLegacyProjects(projects: Me["projects"], api: { json<T>(path: string): Promise<T> }) {
   for (const project of projects) {
     const detail = await api.json<ProjectDetail>(`/projects/${project.id}`).catch(() => undefined);
-    console.log(`${project.id}  ${clean(project.name)}${detail ? `  · ${describeSync(detail.sync)}` : ""}`);
+    console.log(`${project.id}  ${clean(project.name)}${detail ? `  · ${describeProjectStatus(detail)}` : ""}`);
   }
 }
 function shellQuote(value: string) { return `'${value.replaceAll("'", "'\\''")}'`; }
@@ -580,7 +643,7 @@ async function listProjects(groups: ProjectGroupList, api: { json<T>(path: strin
     console.log(`${group.id}  ${clean(group.name)}${group.implicit ? "  (single-repo)" : ""}`);
     for (const repo of group.repos) {
       const detail = await api.json<ProjectDetail>(`/projects/${repo.projectId}`).catch(() => undefined);
-      console.log(`  ${repo.projectId}  ${clean(repo.name)}${detail ? `  · ${describeSync(detail.sync)}` : ""}`);
+      console.log(`  ${repo.projectId}  ${clean(repo.name)}${detail ? `  · ${describeProjectStatus(detail)}` : ""}`);
     }
   }
   if (groups.suggestions.length) {
@@ -747,7 +810,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         const local = !state ? "no local service" : !syncServiceRunning(state) ? `stale service record (pid ${state.pid} not running)`
           : `service pid ${state.pid} · ${clean(state.root)}${state.skipped ? ` · ${state.skipped} special file${state.skipped === 1 ? "" : "s"} left out` : ""}${state.problem ? ` · problem: ${clean(state.problem)}` : ""}`;
         const detail = me && await api.json<ProjectDetail>(`/projects/${id}`).catch(() => undefined);
-        console.log(`${id}  ${local}${detail ? ` · ${describeSync(detail.sync)}` : offline ? ` · ${offline}` : ""}`);
+        console.log(`${id}  ${local}${detail ? ` · ${describeProjectStatus(detail)}` : offline ? ` · ${offline}` : ""}`);
       }
       return true;
     }
@@ -833,8 +896,9 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     }
     if (command === "sync") {
       if (me.role !== "owner") throw new Error("Workspace sync requires an owner device key");
-      const mapped = !options["--project"] && !options["--apply"] ? await mappedProject() : undefined;
-      const projectId = String(mapped?.id ?? options["--project"] ?? localSyncProject(join(dirname(path), "sync"), config.origin) ?? config.projectId ?? me.projects[0]?.id ?? "");
+      const enrolled = !options["--project"] && !options["--apply"] ? boundTeamProject(config, path, process.cwd()) : undefined;
+      const mapped = !options["--project"] && !options["--apply"] && !enrolled ? await mappedProject() : undefined;
+      const projectId = String(enrolled ?? mapped?.id ?? options["--project"] ?? localSyncProject(join(dirname(path), "sync"), config.origin) ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!PROJECT_ID.test(projectId) || (!mapped && !me.projects.some(p => p.id === projectId))) throw new Error("Unknown project. Use infinite projects");
       if (options["--apply"]) {
         // A large tree can take minutes to publish; a refusal (409) leaves its reason in the pending marker.
@@ -844,6 +908,8 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         });
         console.log(describeSync(await applied.json() as ProjectDetail["sync"])); return true;
       }
+      const sourceDetail = await api.json<ProjectDetail>(`/projects/${projectId}`);
+      if (sourceDetail.source?.mode === "github") throw new Error("This project follows GitHub; laptop sync is off. Push to GitHub, or re-enroll with infinite repo init --source laptop.");
       const root = mapped?.root ?? gitRoot(realpathSync(process.cwd()));
       if (root === realpathSync(homedir()) || root === dirname(root)) throw new Error("Run inside a project directory; selecting the entire home or filesystem is not supported");
       progress.start(`Uploading ${clean(root)} to project ${projectId}`);
@@ -904,22 +970,34 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         } else validateNativeOpenCodeArgs(nativeArgs);
         if (!options["--detach"]) await (command === "codex" ? checkNativeCodex : checkNativeOpenCode)();
       }
-      const bound = !workspace && !options["--project"] ? boundTeamProject(config, path) : undefined;
-      const boundCwd = bound ? relative(gitRoot(realpathSync(process.cwd())), realpathSync(process.cwd())).split(sep).join("/") : undefined;
-      const mapped = !workspace && !options["--project"] && !bound ? await mappedProject() : undefined;
+      const boundProject = !workspace ? boundTeamProject(config, path) : undefined;
+      const bound = !options["--project"] ? boundProject : undefined;
+      const boundRoot = boundProject ? gitRoot(realpathSync(process.cwd())) : undefined;
+      const boundCwd = bound ? relative(boundRoot!, realpathSync(process.cwd())).split(sep).join("/") : undefined;
+      const mapped = !workspace && !options["--project"] && !boundProject ? await mappedProject() : undefined;
       const projectId = String(bound ?? mapped?.id ?? options["--project"] ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!mapped && !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
+      let launchDetail: ProjectDetail | undefined;
       if (mapped) {
-        progress.start(`Syncing ${clean(mapped.root)} to ${clean(mapped.path)}`);
-        await syncProject(projectId, mapped.root, true);
-        const detail = await api.json<ProjectDetail>(`/projects/${projectId}`);
-        if (!detail.sync.appliedManifest) throw new Error(`The mirrored workspace has not been applied. Inspect infinite sync --status; apply it with infinite sync --apply --project ${projectId} before launching.`);
-        progress.stop();
+        launchDetail = await api.json<ProjectDetail>(`/projects/${projectId}`);
+        if (launchDetail.source?.mode !== "github") {
+          progress.start(`Syncing ${clean(mapped.root)} to ${clean(mapped.path)}`);
+          await syncProject(projectId, mapped.root, true);
+          launchDetail = await api.json<ProjectDetail>(`/projects/${projectId}`);
+          if (!launchDetail.sync.appliedManifest) throw new Error(`The mirrored workspace has not been applied. Inspect infinite sync --status; apply it with infinite sync --apply --project ${projectId} before launching.`);
+          progress.stop();
+        }
       }
       if (!workspace) {
-        // A cloud session starts on the tree in place; laptop changes that wait for an apply are not in it.
-        const pending = (await api.json<ProjectDetail>(`/projects/${projectId}`).catch(() => undefined))?.sync?.pendingGeneration;
-        if (pending) console.error(`[Infinite] Laptop changes from ${age(pending.capturedAt ?? pending.receivedAt)} are pending; run infinite sync --apply`);
+        launchDetail ??= await api.json<ProjectDetail>(`/projects/${projectId}`).catch(() => undefined);
+        if (launchDetail?.source?.mode === "github") {
+          const comparisonRoot = boundProject === projectId ? boundRoot : undefined;
+          const status = comparisonRoot ? compareLaptop(comparisonRoot, launchDetail.source) : describeSource(launchDetail.source);
+          console.error(`[Infinite] ${status}`);
+        } else {
+          const pending = launchDetail?.sync?.pendingGeneration;
+          if (pending) console.error(`[Infinite] Laptop changes from ${age(pending.capturedAt ?? pending.receivedAt)} are pending; run infinite sync --apply`);
+        }
       }
       const requestId = randomUUID();
       console.error(`[Infinite] Launch ${requestId} on ${config.origin} · project ${projectId}`);

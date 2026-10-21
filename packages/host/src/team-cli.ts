@@ -7,11 +7,13 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
-import { createTeamSchema, teamDeliverySchema, teamPermissionsSchema, type TeamDelivery } from "./team-types.js";
+import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery } from "./team-types.js";
+import { describeSource } from "./client.js";
+import type { ProjectSourceStatus } from "./project-source.js";
 import { captureWorkspace } from "./workspace-checkpoint.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
 import { localProjectPath } from "./mirrored-projects.js";
-import { readSyncState, syncServiceRunning } from "./sync-service.js";
+import { readSyncState, stopSyncService, syncServiceRunning } from "./sync-service.js";
 import { canAskForBrief, chooseTeamBrief, failedTeamBriefRow, orderedTeamMembers, summaryMember, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, wrapText, type TeamBriefRow, type TeamBriefStatus, type TeamWatchCommand } from "./team-watch.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
@@ -71,7 +73,7 @@ function inferGitHubRepository(root: string): string {
     } catch { /* The bounded error below avoids echoing remote URLs or credentials. */ }
   }
   if (ownerRepo?.endsWith(".git")) ownerRepo = ownerRepo.slice(0, -4);
-  const parsed = teamDeliverySchema.shape.repository.safeParse(ownerRepo);
+  const parsed = githubRepositorySchema.safeParse(ownerRepo);
   if (!parsed.success) throw new Error("Git origin must be an HTTPS or SSH github.com OWNER/REPO URL without credentials; supply --repository OWNER/REPO.");
   return parsed.data;
 }
@@ -83,31 +85,53 @@ function inferBaseBranch(root: string): string {
     if (!ref.startsWith(prefix) || ref.length === prefix.length)
       throw new Error("origin/HEAD does not name an origin branch; supply --base-branch BRANCH.");
     const branch = ref.slice(prefix.length);
-    return teamDeliverySchema.shape.baseBranch.parse(branch);
+    return gitBranchSchema.parse(branch);
   }
   let branch: string | undefined;
   try { branch = git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]); } catch { /* Detached HEAD requires explicit configuration. */ }
   if (branch === "main" || branch === "master") return branch;
   throw new Error("Could not infer the default branch from origin/HEAD or a local main/master branch; supply --base-branch BRANCH.");
 }
-function requestedDelivery(root: string, options: Options, current: { revision: number; team?: { delivery?: TeamDelivery } }): TeamDelivery | undefined {
-  const suppliedTarget = ["--repository", "--base-branch", "--merge-method"].some(flag => options[flag] !== undefined);
+/** `baseBranch` is an explicit `--base-branch`; without it the branch comes from `origin/HEAD` or a local main/master. */
+export function inferProjectSource(root: string, option: string | undefined, baseBranch?: string): ProjectSource {
+  if (option === "laptop") return { mode: "laptop" };
+  // An explicit branch is validated before inference, so a bad value is an error rather than a silent fall back to laptop mode.
+  const explicit = baseBranch === undefined ? undefined : gitBranchSchema.parse(baseBranch);
+  const branch = () => explicit ?? inferBaseBranch(root);
+  if (option === "github") return { mode: "github", repository: inferGitHubRepository(root), baseBranch: branch() };
+  if (option !== undefined) throw new Error("--source must be github or laptop.");
+  try {
+    return { mode: "github", repository: inferGitHubRepository(root), baseBranch: branch() };
+  } catch {
+    return { mode: "laptop" };
+  }
+}
+
+export function requestedDelivery(root: string, options: Options, current: { revision: number; team?: { delivery?: TeamDelivery } }): TeamDelivery | undefined {
   const mode = options["--delivery"] === undefined ? undefined : String(options["--delivery"]);
   if (mode === undefined) {
-    if (suppliedTarget) throw new Error("--repository, --base-branch, and --merge-method require --delivery merge.");
+    if (options["--merge-method"] !== undefined) throw new Error("--merge-method requires --delivery merge.");
+    // --base-branch also names the branch a GitHub-tracked source follows, so it needs no --delivery.
+    if (options["--repository"] !== undefined) throw new Error("--repository requires --delivery merge or pr.");
     return current.revision > 0 ? current.team?.delivery : undefined;
   }
-  if (mode !== "merge" && mode !== "review") throw new Error("--delivery must be merge or review.");
+  if (mode !== "merge" && mode !== "pr" && mode !== "review") throw new Error("--delivery must be merge, pr, or review.");
   if (mode === "review") {
-    if (suppliedTarget) throw new Error("--repository, --base-branch, and --merge-method apply only to --delivery merge.");
+    if (options["--merge-method"] !== undefined) throw new Error("--merge-method applies only to --delivery merge.");
+    if (options["--repository"] !== undefined) throw new Error("--repository applies only to --delivery merge or pr.");
     return undefined;
   }
+  if (mode === "pr" && options["--merge-method"] !== undefined)
+    throw new Error("--merge-method applies only to --delivery merge.");
   const retained = current.revision > 0 ? current.team?.delivery : undefined;
+  const repository = options["--repository"] === undefined ? retained?.repository ?? inferGitHubRepository(root) : String(options["--repository"]);
+  const baseBranch = options["--base-branch"] === undefined ? retained?.baseBranch ?? inferBaseBranch(root) : String(options["--base-branch"]);
+  if (mode === "pr") return teamDeliverySchema.parse({ mode, repository, baseBranch });
   return teamDeliverySchema.parse({
     mode,
-    repository: options["--repository"] === undefined ? retained?.repository ?? inferGitHubRepository(root) : String(options["--repository"]),
-    baseBranch: options["--base-branch"] === undefined ? retained?.baseBranch ?? inferBaseBranch(root) : String(options["--base-branch"]),
-    mergeMethod: options["--merge-method"] === undefined ? retained?.mergeMethod : String(options["--merge-method"]),
+    repository,
+    baseBranch,
+    mergeMethod: options["--merge-method"] === undefined ? (retained?.mode === "merge" ? retained.mergeMethod : undefined) : String(options["--merge-method"]),
   });
 }
 function inspectSourceHead(root: string): { commit: string; branch?: string } {
@@ -495,6 +519,14 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
   const stateDir = join(dirname(configPath), "team-cli", identity);
   const mappingsPath = join(stateDir, "repo-mappings.json"), receiptsPath = join(stateDir, "receipts.json");
   if (command === "repo") {
+    if (positional[0] === "refresh") {
+      if (positional.length !== 1) throw new Error("Usage: infinite repo refresh [--project ID]");
+      const selected = options["--project"] === undefined ? boundTeamProject(config, configPath, process.cwd()) ?? "" : String(options["--project"]);
+      if (!projectIdPattern.test(selected)) throw new Error("No repository project is bound to this directory. Run infinite repo init or use --project ID.");
+      const status = await api.json<ProjectSourceStatus>(`/projects/${selected}/source/refresh`, {}, undefined, undefined, "POST");
+      process.stderr.write(`[Infinite] ${describeSource(status)}\n`);
+      return true;
+    }
     if (["link", "unlink", "links"].includes(positional[0])) {
       const action = positional[0];
       if (positional.length !== (action === "links" ? 1 : 2))
@@ -519,7 +551,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       console.log(JSON.stringify(result, null, 2));
       return true;
     }
-    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--teamwork PATH|none] [--setup-json JSON] [--check-json JSON] [--delivery merge|review] [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase] [--linear-team UUID] [--linear-project UUID]");
+    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--source github|laptop] [--teamwork PATH|none] [--setup-json JSON] [--check-json JSON] [--delivery merge|pr|review] [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase] [--linear-team UUID] [--linear-project UUID]");
     const requestedDirectory = canonicalDirectory(positional[1] ?? process.cwd());
     const gitResult = gitRootOrNonGit(requestedDirectory);
     const defaultsPath = join(stateDir, "directory-defaults.json");
@@ -528,7 +560,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
     const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
     if ("nonGit" in gitResult) {
-      const unsupported = ["--project", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit"].filter(flag => options[flag] !== undefined);
+      const unsupported = ["--project", "--source", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit"].filter(flag => options[flag] !== undefined);
       if (unsupported.length) throw new Error(`This directory is not a Git repository, so ${unsupported.join(", ")} cannot be used here. Run repo init in a Git repository for enrollment, or use only --linear-team and --linear-project to save directory defaults.`);
       if (!explicitLinearTeam && explicitLinearProject && !inheritedDefault?.teamId)
         throw new Error("--linear-project requires --linear-team or an inherited directory Linear team.");
@@ -545,6 +577,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       return true;
     }
     const root = gitResult.root;
+    const projectSource = inferProjectSource(root, options["--source"] === undefined ? undefined : String(options["--source"]), options["--base-branch"] === undefined ? undefined : String(options["--base-branch"]));
     const teamwork = options["--teamwork"] === undefined ? undefined : String(options["--teamwork"]) === "none" ? null : canonicalTeamworkPath(String(options["--teamwork"]), process.cwd(), root);
     const status = git(root, ["status", "--porcelain", "--untracked-files=all"]);
     if (status) throw new Error("Repository must be clean before onboarding. Commit or remove tracked and untracked changes first.");
@@ -637,13 +670,15 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       linearDefaultsFrom = rootDefault.origin;
     }
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}) };
+    const sourceSupported = me.teams?.projectSource === 1;
+    const enrolledSource: ProjectSource = sourceSupported ? projectSource : { mode: "laptop" };
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.
     const linearIntent = (request: Record<string, any>) => request.linear === undefined ? targetLinear ?? null : request.linear;
     const teamworkIntent = (request: Record<string, any>) => request.teamwork === undefined ? target.teamwork ?? null : request.teamwork;
-    requestId = body.requestId = resumePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)), requestId, options["--request-id"] !== undefined, rawArgs);
+    requestId = body.requestId = resumePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(prior.source) === JSON.stringify(body.source) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)), requestId, options["--request-id"] !== undefined, rawArgs);
     if (uploadSource) {
       assertSourceUnchanged();
       process.stderr.write(`[Infinite] Request ${requestId}\n`);
@@ -680,14 +715,28 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     assertSourceUnchanged();
     await postMutation(api, receiptsPath, `${key}:repo-init:${requestId}`, `/projects/${selected}/team`, body, "PUT", !uploadSource);
+    if (sourceSupported && projectSource.mode === "github") {
+      // A project that follows GitHub refuses laptop uploads, so a service still running for it would only report errors.
+      const syncStateFile = join(dirname(configPath), "sync", `${selected}.json`);
+      const syncState = readSyncState(syncStateFile);
+      if (syncState && syncState.origin === config.origin && syncServiceRunning(syncState) && stopSyncService(syncStateFile))
+        process.stderr.write(`[Infinite] Stopped the laptop sync service for ${selected}; this project now follows GitHub.\n`);
+      try {
+        const refreshed = await api.json<ProjectSourceStatus>(`/projects/${selected}/source/refresh`, {}, undefined, undefined, "POST");
+        process.stderr.write(`[Infinite] ${describeSource(refreshed)}\n`);
+      } catch (error) {
+        const message = error instanceof Error ? clean(error.message) : "unknown error";
+        process.stderr.write(`[Infinite] Warning: source refresh failed: ${message}\n`);
+      }
+    }
     const output = await api.json<any>(`/projects/${selected}/team`);
     mappings[key] = { projectId: selected, source: sourceKind }; privateJson(mappingsPath, mappings);
     if (output.linear?.teamId) {
       await saveDirectoryDefault(defaultsPath, root, { teamId: z.uuid().parse(output.linear.teamId), ...(output.linear.projectId ? { projectId: z.uuid().parse(output.linear.projectId) } : {}) });
     }
     if (explicitProject || uploadSource) { config.projectId = selected; privateJson(configPath, config); }
-    const source = uploadSource && !head.commit ? "empty cloud baseline" : uploadSource ? `local commit ${head.commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout";
-    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, teamwork: output.teamwork, revision: output.revision, execution: output.execution, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source }, null, 2));
+    const sourceSnapshot = uploadSource && !head.commit ? "empty cloud baseline" : uploadSource ? `local commit ${head.commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout";
+    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, teamwork: output.teamwork, revision: output.revision, execution: output.execution, projectSource: enrolledSource, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source: sourceSnapshot }, null, 2));
     return true;
   }
   const [subcommand, id, ...rest] = positional;

@@ -93,6 +93,8 @@ export interface Project {
   linear?: { teamId: string; projectId?: string };
   /** Absolute host directory that holds this project's team runs, outside every project root. */
   teamworkDir?: string;
+  /** Where the host's copy of this project comes from: GitHub (followed by the host) or laptop workspace sync. Absent means laptop. */
+  source?: import("./team-types.js").ProjectSource;
 }
 export interface AgentProfile {
   command: string;
@@ -125,6 +127,8 @@ export interface Config {
   deployment?: import("./deployment.js").Deployment;
   /** Workspace sync. `homeDir` overrides the server home used for folder mapping; `sharedGroup` permits a separate agent account. */
   sync?: { sharedGroup?: boolean; homeDir?: string };
+  /** GitHub-tracked project sources: mirror directory, refresh period, and test-only remote overrides (refused on cloud hosts). */
+  source?: { mirrorDir?: string; refreshMinutes?: number; remoteOverrides?: Record<string, string> };
   /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
   summaries?: { model: string; apiKeyFile: string; baseUrl: string };
   /** Optional Jev readings for turn-finished lines and generated session titles. */

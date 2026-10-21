@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { lstatSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const permissionSet = Object.freeze({
@@ -27,9 +27,14 @@ function assertObject(value, name) {
 
 function readJsonFile(path, name) {
   let info;
-  try { info = lstatSync(path); } catch { fail(`${name} is unavailable.`); }
+  try { info = lstatSync(path); } catch (error) {
+    if (error?.code === "ENOENT") fail(`${name} is unavailable.`);
+    fail(`${name} is unreadable.`);
+  }
   if (info.isSymbolicLink() || !info.isFile() || (info.mode & 0o022) !== 0) fail(`${name} must be a regular, non-writable file.`);
-  try { return JSON.parse(readFileSync(path, "utf8")); } catch { fail(`${name} is malformed.`); }
+  let text;
+  try { text = readFileSync(path, "utf8"); } catch { fail(`${name} is unreadable.`); }
+  try { return JSON.parse(text); } catch { fail(`${name} is malformed.`); }
 }
 
 function canonicalSlug(value) {
@@ -90,10 +95,10 @@ function loadConfig(path) {
   if (typeof path !== "string" || !path) fail("Usage: --config FILE <gh|credential|status>.");
   const value = readJsonFile(path, "Client config");
   assertObject(value, "client config");
-  if (Object.keys(value).some(key => !["tokenDirectory", "githubCli", "repositories"].includes(key)) || typeof value.tokenDirectory !== "string" || !value.tokenDirectory.startsWith("/") || typeof value.githubCli !== "string" || !value.githubCli.startsWith("/") || !Array.isArray(value.repositories)) fail("Client config must contain absolute tokenDirectory/githubCli paths and a repositories list.");
-  const repositories = value.repositories.map(canonicalSlug);
+  if (Object.keys(value).some(key => !["tokenDirectory", "githubCli", "repositories"].includes(key)) || typeof value.tokenDirectory !== "string" || !value.tokenDirectory.startsWith("/") || typeof value.githubCli !== "string" || !value.githubCli.startsWith("/") || value.repositories !== undefined && !Array.isArray(value.repositories)) fail("Client config must contain absolute tokenDirectory/githubCli paths and an optional repositories list.");
+  const repositories = value.repositories?.map(canonicalSlug);
   const seen = new Set();
-  for (const repository of repositories) {
+  for (const repository of repositories ?? []) {
     const key = repository.toLowerCase();
     if (seen.has(key)) fail("Client config contains duplicate repositories.");
     seen.add(key);
@@ -109,7 +114,16 @@ function loadConfig(path) {
 }
 
 function configured(config, repository) {
-  return config.repositories.find(value => value.toLowerCase() === repository.toLowerCase());
+  const explicit = config.repositories?.find(value => value.toLowerCase() === repository.toLowerCase());
+  if (explicit) return explicit;
+  if (config.repositories) return undefined;
+  try {
+    lstatSync(tokenPath(config, repository));
+    return repository;
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    fail("Token cache is unreadable.");
+  }
 }
 
 function tokenPath(config, repository) {
@@ -332,13 +346,30 @@ async function credential(config, args) {
 
 function status(config, args) {
   if (args.length > 1) fail("Usage: status [OWNER/REPO].");
-  const repositories = args.length ? [canonicalSlug(args[0])] : config.repositories;
+  const repositories = args.length ? [canonicalSlug(args[0])] : config.repositories ?? discoverRepositories(config);
   const result = repositories.map(repository => {
     if (!configured(config, repository)) return { repository, configured: false, cache: "not-applicable" };
     const cache = cacheStatus(config, repository);
     return { repository, configured: true, cache: cache.state, ...(cache.expiresAt ? { expiresAt: cache.expiresAt } : {}) };
   });
   process.stdout.write(`${JSON.stringify(args.length === 1 ? result[0] : { repositories: result }, null, 2)}\n`);
+}
+
+function discoverRepositories(config) {
+  let entries;
+  try { entries = readdirSync(config.tokenDirectory); } catch { fail("Token directory is unreadable."); }
+  const repositories = [];
+  for (const entry of entries) {
+    if (!/^[a-f0-9]{64}\.json$/u.test(entry)) continue;
+    const path = `${config.tokenDirectory}/${entry}`;
+    const raw = readJsonFile(path, "Token cache");
+    assertObject(raw, "token cache");
+    let repository;
+    try { repository = canonicalSlug(raw.repository); } catch { fail("Token cache repository is invalid."); }
+    if (entry !== `${createHash("sha256").update(repository.toLowerCase()).digest("hex")}.json`) fail("Token cache filename does not match its repository.");
+    repositories.push(repository);
+  }
+  return repositories.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 }
 
 async function main(argv) {

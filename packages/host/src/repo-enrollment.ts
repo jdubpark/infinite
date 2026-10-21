@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { z } from "zod";
 import { validateLinearConfig } from "./config.js";
 import type { Config, Project } from "./types.js";
-import { teamProjectSchema, type TeamCommand } from "./team-types.js";
+import { projectSourceSchema, teamProjectSchema, type ProjectSource, type TeamCommand } from "./team-types.js";
 import { TeamError, teamCommand } from "./team-workspace.js";
 import { unseal, writeSealed } from "./vault.js";
 import { homeRelativePath } from "./mirrored-projects.js";
@@ -18,6 +18,7 @@ export const repoEnrollmentRequestSchema = z.object({
   team: enrollmentTeamSchema,
   linear: z.union([enrollmentLinearSchema, z.null()]).optional(),
   teamwork: z.union([z.string().refine(homeRelativePath), z.null()]).optional(),
+  source: projectSourceSchema.optional(),
 }).strict();
 export type RepoEnrollmentRequest = z.infer<typeof repoEnrollmentRequestSchema>;
 
@@ -28,6 +29,7 @@ export interface RepoEnrollmentView {
   team?: z.infer<typeof enrollmentTeamSchema>;
   linear?: z.infer<typeof enrollmentLinearSchema>;
   teamwork?: string | null;
+  source?: ProjectSource;
   revision: number;
   execution: "cloud" | "local";
   hostSetup: { ready: boolean; missing: string[] };
@@ -39,6 +41,8 @@ interface StoredEnrollment {
   /** null records an explicit removal; absence means no project overlay was saved. */
   linear?: z.infer<typeof enrollmentLinearSchema> | null;
   teamwork?: string | null;
+  /** Absent on enrollments saved before source modes existed; those projects follow the laptop. */
+  source?: ProjectSource;
   revision: number;
 }
 interface Receipt { fingerprint: string; projectId: string; path: string; response: RepoEnrollmentView }
@@ -152,6 +156,7 @@ export class RepoEnrollmentService {
       team: structuredClone(request.team),
       linear: request.linear === undefined ? inheritedLinear : request.linear,
       ...(request.teamwork !== undefined ? { teamwork: request.teamwork === null ? null : this.relativeTeamworkPath(teamworkPath!) } : current?.teamwork !== undefined ? { teamwork: current.teamwork } : project.teamworkDir ? { teamwork: this.relativeTeamworkPath(teamworkPath!) } : {}),
+      ...(request.source ? { source: structuredClone(request.source) } : current?.source ? { source: current.source } : {}),
       revision: nextRevision,
     };
     const prospective: Config = { ...this.config, projects: this.config.projects.map(item => item.id === projectId ? { ...item, team: entry.team, ...(entry.teamwork ? { teamworkDir: teamworkPath } : {}), ...(entry.linear === null ? { linear: undefined } : entry.linear ? { linear: entry.linear } : {}) } : item) };
@@ -162,6 +167,7 @@ export class RepoEnrollmentService {
       throw new TeamError(409, "project-changed", "The repository changed during enrollment validation. Refresh it before saving.");
 
     const responseProject: Project = { ...project, team: entry.team as Project["team"] };
+    if (entry.source) responseProject.source = entry.source; else delete responseProject.source;
     if (entry.teamwork) responseProject.teamworkDir = teamworkPath;
     else delete responseProject.teamworkDir;
     if (entry.linear) responseProject.linear = entry.linear;
@@ -175,6 +181,7 @@ export class RepoEnrollmentService {
     writeSealed(this.file, this.key, "repo-enrollments", next);
     this.store = next;
     Object.assign(project, { team: entry.team });
+    if (entry.source) project.source = entry.source; else delete project.source;
     if (entry.teamwork) project.teamworkDir = teamworkPath;
     else delete project.teamworkDir;
     if (entry.linear === null) delete project.linear;
@@ -249,6 +256,7 @@ export class RepoEnrollmentService {
       ...(project.team ? { team: structuredClone(project.team) as RepoEnrollmentView["team"] } : {}),
       ...(project.linear ? { linear: { ...project.linear } } : {}),
       ...(saved && Object.hasOwn(saved, "teamwork") ? { teamwork: saved.teamwork ?? null } : Object.hasOwn(project, "teamworkDir") ? { teamwork: project.teamworkDir ? this.relativeTeamworkPath(project.teamworkDir) : null } : {}),
+      ...(project.source ? { source: structuredClone(project.source) } : {}),
       revision,
       execution: this.config.environment === "cloud" ? "cloud" : "local",
       hostSetup: { ready: missing.length === 0, missing },
@@ -270,6 +278,7 @@ export class RepoEnrollmentService {
       else if (Object.hasOwn(enrollment, "teamwork")) delete project.teamworkDir;
     } catch { return; }
     project.team = enrollment.team as Project["team"];
+    if (enrollment.source) project.source = enrollment.source; else delete project.source;
     if (Object.hasOwn(enrollment, "linear")) {
       if (enrollment.linear) project.linear = enrollment.linear;
       else delete project.linear;

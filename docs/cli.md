@@ -53,7 +53,8 @@ infinite board [--project PROJECT_ID]
 ```
 
 `projects` lists explicit groups and implicit single-repository projects, followed
-by suggested groups and the exact command to create each. `start` resolves the
+by suggested groups and the exact command to create each. Rows for `github`
+projects show the source status line from [GitHub-tracked sources](teams.md#status). `start` resolves the
 current Git root's enrolled repository binding and starts a mission in its
 containing group; `--project` selects a group directly. Mission controls read the
 current revision before submitting an action. `board` refreshes every two
@@ -67,7 +68,9 @@ subtask summary; team rows use `infinite team watch`.
 Initialize a project from a clean Git checkout, then start and control teams from that directory:
 
 ```sh
-infinite repo init [DIRECTORY] [--project PROJECT_ID] [--teamwork PATH|none]
+infinite repo init [DIRECTORY] [--project PROJECT_ID] [--source github|laptop] [--teamwork PATH|none]
+infinite repo init --delivery pr --repository OWNER/REPO --base-branch main
+infinite repo refresh [--project PROJECT_ID]
 infinite repo init --check-json '[{"command":"make","args":["test"]}]'
 infinite repo init --linear-team TEAM_UUID --linear-project PROJECT_UUID
 infinite team start "Add a feature"
@@ -97,6 +100,34 @@ text changes. `--logs` starts in the review log, and
 `infinite team status TEAM_ID --logs` prints the current revision's logs once.
 `--json` prints the team record. See [Goals and agent teams](teams.md) for the
 full key list.
+
+`repo init` takes these source and delivery options:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--source github` | Chosen when `origin` is a `github.com` URL | The host follows the base branch and refuses laptop sync for the project. The followed branch comes from `origin/HEAD`, else local `main` or `master`. |
+| `--source laptop` | Chosen otherwise | Workspace sync from this checkout. |
+| `--delivery review` | Default for new enrollments | Reviewed work stays on the host, with no provider delivery. |
+| `--delivery merge` | None | The delivery member merges the reviewed commit on GitHub. The host refreshes after the merge report. |
+| `--delivery pr` | None | The delivery member pushes the reviewed branch and opens a pull request. The owner merges on GitHub. |
+| `--repository OWNER/REPO` | Read from `origin` | Delivery target for `merge` and `pr`. |
+| `--base-branch BRANCH` | `origin/HEAD`, else local `main` or `master` | The branch a GitHub source follows, and the delivery base for `merge` and `pr`. |
+| `--merge-method` | None | Squash, merge, or rebase, for `--delivery merge` only. |
+
+`--repository` requires `--delivery merge` or `pr`; `--base-branch` also works alone to name the followed branch. When
+`--delivery` is omitted, an existing enrollment keeps its delivery policy.
+Running `repo init` in an enrolled GitHub checkout switches it to `github` mode.
+
+For a `github` project, `repo init` refreshes the source once and prints its status
+line. A failed refresh prints a warning and keeps the enrollment. When a laptop
+sync service was running for the project, `repo init` stops it and says so. The JSON
+output includes `projectSource`, with `mode` and, for `github`, `repository` and
+`baseBranch`. A host that predates this field reports `{ "mode": "laptop" }`.
+
+`infinite repo refresh` fetches the base branch from GitHub now and fast-forwards
+the working tree when no session is using it. It prints the source status line. It
+fails for a project in `laptop` mode. The status line is described in
+[GitHub-tracked sources](teams.md#status).
 
 Linear IDs are saved during enrollment; team commands do not need them again.
 To reuse them across repositories, initialize their parent folder once:
@@ -183,9 +214,10 @@ infinite pull PROJECT_ID --output NEW_DIRECTORY
 ```
 
 - `sync` starts a detached service that keeps the configured cloud project current with the Git root of the current directory, one way, including ignored and untracked files.
-- `--status` lists each project's local service and sync state, and works while the host is unreachable.
+- `--status` lists each project's local service and sync state, and works while the host is unreachable. A `github` project shows its source status line instead of sync state.
 - `--apply` applies a pending generation; `--force` also replaces cloud changes made since the last apply.
 - `--stop` ends the local service.
+- `sync` refuses a project in `github` mode and starts no service. See [Source modes](workspace-sync.md#source-modes).
 - `pull` downloads the current cloud project tree into a new directory and prints its path, without writing into the checkout.
 
 [Workspace sync](workspace-sync.md) defines the scope, apply rules, pending reasons, and limits.

@@ -149,6 +149,7 @@ The coordinator reports through its mission report tool:
 | `answer-child` | Answers an open subteam decision within the mission's objective and steering. Recorded as answered by the coordinator, in the mission and in the subteam. |
 | `question` | Opens a mission decision for the owner. With `subtaskId` and `childDecisionId`, the owner's answer is forwarded to that subteam decision. |
 | `steer-subtask` | Sends direction to a running or blocked subteam, such as an owner answer or direction that changes work under way. The subteam stops its members and replans under a new revision. Held while the subteam is paused; refused, and the coordinator told, when the subtask has no running or blocked subteam or the subteam refuses the direction. |
+| `resize-subtask` | Selects worker capacity with `subtaskId`, `parallelism` (1–4), and `summary`. Updates a queued subtask or durably forwards the change to its active subteam. A solo subtask permits only one worker. Lowering capacity lets running workers finish and holds new starts. |
 | `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. |
 | `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, and no owner decision is open. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
 | `blocked` | Moves the mission to `blocked` with the summary as its reason. |
@@ -166,8 +167,12 @@ refusal that says so, together with every message that arrived meanwhile.
 Three missed or refused reports in a row block the mission.
 
 Size rules: a `solo` subtask starts a subteam with parallelism 1, and a `team`
-subtask uses its `parallelism` (1–4). The coordinator chooses the size; a simple
-mission may dispatch exactly one solo subtask.
+subtask starts with its coordinator-selected `parallelism` (1–4). The subteam
+PM can select capacity in its plan or discovery report, and the mission
+coordinator can resize a queued or active team subtask up to four workers as
+independent work grows or shrinks. Solo subtasks remain limited to one. These
+choices do not expand deadlines, member budgets, permissions, or repository
+scope. A simple mission may dispatch exactly one solo subtask.
 
 Each subtask's `objective` carries the self-contained assignment brief described
 in [Roles and execution](teams.md#roles-and-execution): one coherent outcome,

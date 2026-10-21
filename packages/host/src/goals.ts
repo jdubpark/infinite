@@ -10,6 +10,7 @@ import { addRollups, emptyRollup } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
 
 type Action = { requestId: string; revision: number };
+/** `parallelism` remains readable only so a pre-migration queued owner control can be discarded safely. */
 type PendingControl = { action: "pause" | "resume" | "cancel" | "steer" | "parallelism"; requestId: string; teamId: string; revision: number; text?: string; parallelism?: number };
 type GoalExtensionIntent = Action & { minutes: number; fingerprint: string; teamId?: string; targetDeadlineAt?: string; targetCeilingAt?: string; failures?: number };
 type Stored = {
@@ -129,10 +130,10 @@ export class GoalService {
       const project = this.config.projects.find(value => value.id === request.projectId);
       if (!project?.team || (!project.team.checks.length && !project.team.establishChecks)) throw new TeamError(409, "goal-project-not-configured", "Configure required checks or authorize the team to establish them before a goal can start.");
       if (request.linearIssueId && !project.linear) throw new TeamError(409, "linear-not-configured", "Configure Linear for this project before linking an issue.");
-      const { requestId, ...fields } = request;
+      const { requestId, parallelism: _legacyParallelism, ...fields } = request;
       const createdAt = now();
       const stored: Stored = { fingerprint, receipts: {}, goal: {
-        ...fields, maxTotalMinutes: request.maxTotalMinutes ?? request.maxMinutes, linearTracking: Boolean(project.linear), id: requestId, revision: 1, status: "running", createdAt, updatedAt: createdAt,
+        ...fields, parallelism: 4, maxTotalMinutes: request.maxTotalMinutes ?? request.maxMinutes, linearTracking: Boolean(project.linear), id: requestId, revision: 1, status: "running", createdAt, updatedAt: createdAt,
         deadlineAt: new Date(Date.parse(createdAt) + request.maxMinutes * 60000).toISOString(),
         ceilingAt: new Date(Date.parse(createdAt) + (request.maxTotalMinutes ?? request.maxMinutes) * 60000).toISOString(),
         lineup: structuredClone(this.config.teams!.lineup!), cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
@@ -285,22 +286,9 @@ export class GoalService {
     });
   }
   setParallelism(id: string, input: Action & { parallelism: number }) {
-    const body = goalParallelismSchema.parse(input);
-    return this.enqueue(() => {
-      const stored = this.record(id), goal = stored.goal;
-      if (this.replay(stored, "parallelism", body)) return structuredClone(goal);
-      if (!["running", "needs-input", "paused"].includes(goal.status))
-        throw new TeamError(409, "goal-not-running", "Only a running or paused goal can change its worker limit.");
-      if (stored.launch) throw new TeamError(409, "goal-launch-pending", "The next feature is being attached. Retry after it appears.");
-      this.admit(stored, "parallelism", body);
-      if (goal.parallelism !== body.parallelism) {
-        const previous = goal.parallelism;
-        goal.parallelism = body.parallelism;
-        this.setControl(stored, "parallelism", { parallelism: body.parallelism });
-        this.event(stored, `The owner changed the worker limit from ${previous} to ${body.parallelism}. It applies to the active cycle and later cycles.`);
-      }
-      this.save(stored); return structuredClone(goal);
-    });
+    goalParallelismSchema.parse(input);
+    this.record(id);
+    return Promise.reject(new TeamError(409, "agent-managed-capacity", "Goal worker capacity is agent-managed. The project manager selects a limit for each cycle."));
   }
   outcome(id: string, input: Action & { result: "achieved" | "not-achieved" | "inconclusive"; summary: string; evidence: string }) {
     const body = goalOutcomeSchema.parse(input);
@@ -354,25 +342,26 @@ export class GoalService {
   private async applyControl(stored: Stored) {
     const control = stored.control;
     if (!control) return true;
+    if (control.action === "parallelism") {
+      stored.control = undefined;
+      this.event(stored, "A legacy owner worker-limit change was discarded because capacity is agent-managed.");
+      this.save(stored);
+      return true;
+    }
     const body = { requestId: control.requestId, revision: control.revision };
     try {
       if (control.action === "steer") await this.teams.steer(control.teamId, { ...body, text: control.text! });
-      else if (control.action === "parallelism") await this.teams.setParallelism(control.teamId, { ...body, parallelism: control.parallelism! });
       else await this.teams[control.action](control.teamId, body);
     } catch (error) {
       if (this.closed) return false;
       if (!(error instanceof TeamError)) throw error;
       if (["members-stopping", "team-operation-running"].includes(error.code)) return false;
-      if (error.code === "stale-team-revision" && ["pause", "cancel", "parallelism"].includes(control.action)) {
+      if (error.code === "stale-team-revision" && ["pause", "cancel"].includes(control.action)) {
         const team = this.teams.get(control.teamId);
         stored.control = { ...control, requestId: randomUUID(), revision: team.revision };
         this.save(stored); return false;
       }
       stored.control = undefined;
-      if (control.action === "parallelism") {
-        this.event(stored, `The worker limit could not be applied to the active cycle: ${error.message}`);
-        this.save(stored); return false;
-      }
       if (!["paused", "cancelled", "limit-reached"].includes(stored.goal.status)) stored.goal.status = "blocked";
       stored.goal.reason = error.message;
       this.event(stored, `The goal action could not be applied: ${error.message}`); this.save(stored); return false;

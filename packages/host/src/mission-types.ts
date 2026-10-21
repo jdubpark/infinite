@@ -27,7 +27,7 @@ export const missionSubtaskPlanSchema = z.object({
   repoProjectId: z.string().regex(/^[a-z0-9-]{1,80}$/),
   title: z.string().trim().min(1).max(100),
   objective: z.string().trim().min(1).max(12000),
-  /** `solo` runs one implementer; `team` lets the subteam coordinator run up to `parallelism` workers. */
+  /** Initial worker limit; solo has a ceiling of 1 and team subtasks can later scale up to the host ceiling of 4. */
   size: z.enum(["solo", "team"]),
   parallelism: z.number().int().min(1).max(4).default(1),
   dependsOn: z.array(subtaskId).max(12).default([]),
@@ -37,6 +37,7 @@ export type MissionSubtaskPlan = z.infer<typeof missionSubtaskPlanSchema>;
 /** Reports from the mission coordinator. Subteam members keep using `TeamReport`. */
 export const missionReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("dispatch"), summary: z.string().trim().min(1).max(4000), subtasks: z.array(missionSubtaskPlanSchema).min(1).max(12) }).strict(),
+  z.object({ kind: z.literal("resize-subtask"), subtaskId, parallelism: z.number().int().min(1).max(4), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("answer-child"), subtaskId, decisionId: z.uuid(), text: z.string().trim().min(1).max(8000) }).strict(),
   z.object({ kind: z.literal("cancel-subtask"), subtaskId, reason: z.string().trim().min(1).max(2000) }).strict(),
   /** Forwards owner direction or an owner answer to a running subteam; the subteam replans under a new revision. */

@@ -164,6 +164,7 @@ export const createTeamSchema = z.object({
   useConfiguredLineup: z.boolean().optional(),
   title: z.string().trim().min(1).max(100),
   objective: z.string().trim().min(1).max(24000),
+  /** Legacy request field. Capacity is selected by the project manager after planning. */
   parallelism: z.number().int().min(1).max(4).default(2),
 }).strict();
 export type CreateTeam = z.infer<typeof createTeamSchema>;
@@ -211,8 +212,8 @@ export const teamTaskPlanSchema = z.object({
 export type TeamTaskPlan = z.infer<typeof teamTaskPlanSchema>;
 export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("permission-decision"), decisionId: z.uuid(), verdict: z.enum(["approve-once", "escalate"]), summary: z.string().trim().min(1).max(2000) }).strict(),
-  z.object({ kind: z.literal("plan"), summary: z.string().min(1).max(4000), brief: teamBriefSchema.optional(), tasks: z.array(teamTaskPlanSchema).min(1).max(12), verification: teamVerificationSchema.optional() }).strict(),
-  z.object({ kind: z.literal("explore"), summary: z.string().min(1).max(4000), tasks: z.array(teamScoutPlanSchema).min(1).max(3) }).strict(),
+  z.object({ kind: z.literal("plan"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), brief: teamBriefSchema.optional(), tasks: z.array(teamTaskPlanSchema).min(1).max(12), verification: teamVerificationSchema.optional() }).strict(),
+  z.object({ kind: z.literal("explore"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), tasks: z.array(teamScoutPlanSchema).min(1).max(3) }).strict(),
   z.object({ kind: z.literal("findings"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("no-change"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), reason: z.string().min(1).max(4000) }).strict(),
@@ -342,6 +343,8 @@ export interface TeamRun {
   stopReason?: "deadline" | "member-limit";
   title: string;
   objective: string;
+  /** Maximum worker slots allowed for this run; absent on legacy records. */
+  parallelismCeiling?: number;
   parallelism: number;
   revision: number;
   status: TeamStatus;

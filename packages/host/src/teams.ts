@@ -47,6 +47,7 @@ const holdsWorkerSlot = (member: TeamMember, revision: number) => member.revisio
   (["queued", "running", "unavailable"].includes(member.status) || member.status === "reported" && !member.exitConfirmedAt);
 const inactiveTeamStatuses = new Set(["cancelled", "ready-for-review", "merged", "no-change"]);
 const activeTeamRun = (status: string) => !inactiveTeamStatuses.has(status);
+const capacityCeiling = (run: Pick<TeamRun, "parallelismCeiling" | "handoff">) => run.parallelismCeiling ?? (run.handoff ? 2 : 4);
 export const providerInputReason = "A provider needs user input. Open the member session to respond; the team will not approve it.";
 const permissionReviewReason = "The permission coordinator is reviewing a provider request.";
 /** Whether a delegated permission decision still holds this member's open prompt. */
@@ -159,6 +160,17 @@ export class TeamService {
       const stored = unseal<Stored>(key, `team:${id}`, readFileSync(join(this.directory, file), "utf8"));
       if (stored.run.id !== id) throw new TeamError(409, "invalid-team-record", "A team record cannot be authenticated.");
       this.records.set(id, stored);
+      // Older standalone runs persisted the owner's chosen parallelism. Move them to host-owned
+      // capacity on restore; mission runs are migrated by MissionService, which knows solo/team size.
+      if (stored.run.parallelismCeiling === undefined && !stored.run.missionId &&
+          !["cancelled", "ready-for-review", "merged", "no-change"].includes(stored.run.status)) {
+        const ceiling = stored.run.handoff ? 2 : 4;
+        const previous = stored.run.parallelism;
+        stored.run.parallelismCeiling = ceiling;
+        stored.run.parallelism = ceiling;
+        this.event(stored, `Legacy worker capacity was moved to agent management: ${previous} to ${ceiling} (capacity ceiling ${ceiling}).`);
+        this.save(stored);
+      }
       if (stored.pending) {
         for (const check of stored.run.checks) if (check.status === "running") { check.status = "interrupted"; check.finishedAt = timestamp(); }
         const pending = stored.pending, run = stored.run;
@@ -249,7 +261,7 @@ export class TeamService {
       ...(run.permissionDecisions ? { permissionDecisions: run.permissionDecisions.map(({ prompt: _prompt, ...decision }) => decision) } : {}),
     };
     const withUsage = teamUsage(members.map(({ prompt: _prompt, ...member }) => member), run.provider, this.usage);
-    const max = run.handoff ? 2 : 4;
+    const max = capacityCeiling(run);
     const ready = run.tasks.filter(task => task.status === "pending" && task.dependsOn.every(id => run.tasks.find(item => item.id === id)?.status === "integrated")).length +
       (run.discovery && run.discovery.revision === run.revision && !run.discovery.completedAt ? run.discovery.tasks.filter(task => task.status === "pending").length : 0);
     const workers = { limit: run.parallelism, max, running: members.filter(member => holdsWorkerSlot(member, run.revision)).length, ready };
@@ -283,6 +295,22 @@ export class TeamService {
   statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal), mission: Boolean(stored.run.missionId) })); }
   /** Read mission ownership without building a view or updating external tracking. */
   missionIdOf(id: string): string | undefined { return this.record(id).run.missionId; }
+  /** Restores the mission-authored size boundary for subteams persisted before ceilings were stored. */
+  ensureMissionCapacityCeiling(id: string, missionId: string, ceiling: number): number | undefined {
+    if (!Number.isInteger(ceiling) || ceiling < 1 || ceiling > 4)
+      throw new TeamError(409, "team-parallelism-limit", "The assigned worker capacity ceiling must be between one and the host limit.");
+    const stored = this.record(id), run = stored.run;
+    if (run.missionId !== missionId) return undefined;
+    if (["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status)) return undefined;
+    if (run.parallelismCeiling === ceiling && run.parallelism <= ceiling) return run.parallelism;
+    const previousCeiling = run.parallelismCeiling;
+    const previous = run.parallelism;
+    run.parallelismCeiling = ceiling;
+    if (run.parallelism > ceiling) run.parallelism = ceiling;
+    this.event(stored, `Mission capacity was reconciled from ceiling ${previousCeiling ?? "unset"} to ${ceiling}; the worker limit is ${previous} to ${run.parallelism}.`);
+    this.save(stored);
+    return run.parallelism;
+  }
   get(id: string): TeamView { return this.view(this.record(id)); }
   rateTask(id: string, taskId: string, input: { requestId: string; score: number; note?: string }) {
     const stored = this.record(id), task = stored.run.tasks.find(item => item.id === taskId);
@@ -327,10 +355,10 @@ export class TeamService {
     return this.createRun(createTeamSchema.parse(request), { goal: teamGoalContextSchema.parse(goal), lineup: teamLineupSchema.parse(lineup) }, linearTracking);
   }
   /** A mission subteam is an ordinary run of one repository under that repository's own policies; the mission pins its lineup. */
-  createForMission(request: CreateTeam, missionId: string, lineup: TeamLineup, options: { baseRunId?: string } = {}): Promise<TeamView> {
+  createForMission(request: CreateTeam, missionId: string, lineup: TeamLineup, options: { baseRunId?: string; parallelismCeiling?: number } = {}): Promise<TeamView> {
     const parsed = createTeamSchema.parse(request);
     const project = this.config.projects.find(item => item.id === parsed.projectId);
-    return this.createRun(parsed, { missionId, ...(options.baseRunId ? { baseRunId: options.baseRunId } : {}), lineup: teamLineupSchema.parse(lineup) }, Boolean(project?.linear));
+    return this.createRun(parsed, { missionId, ...(options.baseRunId ? { baseRunId: options.baseRunId } : {}), parallelismCeiling: options.parallelismCeiling ?? 4, lineup: teamLineupSchema.parse(lineup) }, Boolean(project?.linear));
   }
   assertHandoffPolicy(policy: HandoffPolicy) {
     const project = this.config.projects.find(item => item.id === policy.projectId);
@@ -349,13 +377,16 @@ export class TeamService {
     this.assertHandoffPolicy(policy);
     return this.createRun(parsed, { handoff, handoffPolicy: policy, lineup: policy.lineup }, Boolean(policy.linear));
   }
-  private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; missionId?: string; baseRunId?: string; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup }, linearTracking = false): Promise<TeamView> {
+  private createRun(parsed: CreateTeam, internal?: { goal?: TeamGoalContext; missionId?: string; parallelismCeiling?: number; baseRunId?: string; handoff?: TeamHandoffContext; handoffPolicy?: HandoffPolicy; lineup: TeamLineup }, linearTracking = false): Promise<TeamView> {
     return this.enqueue(async () => {
       // Preserve the fingerprints written before lineup selection existed.
       const { useConfiguredLineup, ...singleProviderRequest } = parsed;
-      const prior = this.records.get(parsed.requestId), fingerprint = digest(internal ? { request: parsed, ...internal } : useConfiguredLineup ? parsed : singleProviderRequest);
+      // The host derives the ceiling; adding it must not change a pending mission launch's identity.
+      const { parallelismCeiling: _ceiling, ...creationContext } = internal ?? {};
+      const prior = this.records.get(parsed.requestId), fingerprint = digest(internal ? { request: parsed, ...creationContext } : useConfiguredLineup ? parsed : singleProviderRequest);
       if (prior) {
         if (prior.fingerprint !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team request.");
+        if (internal?.missionId) this.ensureMissionCapacityCeiling(parsed.requestId, internal.missionId, internal.parallelismCeiling ?? 4);
         return this.view(prior);
       }
       const project = this.config.projects.find(item => item.id === parsed.projectId);
@@ -404,7 +435,13 @@ export class TeamService {
       const root = project.teamworkDir ?? this.config.teams.workspaceDir;
       const fallbackTitle = parsed.objective.trim().split("\n")[0]!.slice(0, 100).trim();
       const titleSource = !internal?.goal && !internal?.handoff && !internal?.missionId && parsed.title === fallbackTitle ? "request" as const : undefined;
-      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: structuredClone(project.team.permissions), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelism: parsed.parallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      const ceiling = internal?.parallelismCeiling ?? (internal?.handoff ? 2 : 4);
+      if (!Number.isInteger(ceiling) || ceiling < 1 || ceiling > 4 || internal?.handoff && ceiling > 2)
+        throw new TeamError(409, "team-parallelism-limit", "The assigned worker capacity ceiling must be between one and the host limit.");
+      const initialParallelism = internal?.missionId ? parsed.parallelism : ceiling;
+      if (initialParallelism > ceiling)
+        throw new TeamError(409, "team-parallelism-limit", "The initial worker limit exceeds this run's capacity ceiling.");
+      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: structuredClone(project.team.permissions), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelismCeiling: ceiling, parallelism: initialParallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
           throw new TeamError(409, "delivery-lineup-required", "Automatic delivery requires a configured strong coordinator and independent strong reviewer.");
@@ -524,21 +561,24 @@ export class TeamService {
     });
   }
   setParallelism(id: string, input: TeamParallelism) {
+    teamParallelismSchema.parse(input);
+    this.record(id);
+    return Promise.reject(new TeamError(409, "agent-managed-capacity", "Worker capacity is agent-managed. The project manager or mission coordinator selects the worker limit."));
+  }
+  setMissionParallelism(id: string, input: TeamParallelism) {
     const body = teamParallelismSchema.parse(input);
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
-      if (this.replay(stored, "parallelism", body)) return this.view(stored);
-      if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
+      if (this.replay(stored, "mission-parallelism", body)) return this.view(stored);
+      if (!run.missionId) throw new TeamError(409, "agent-managed-capacity", "Mission capacity changes must target a mission subteam.");
       if (["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status))
-        throw new TeamError(409, "team-not-running", "The worker limit can only change while the team is running.");
-      if (run.handoff && body.parallelism > 2)
-        throw new TeamError(409, "team-parallelism-limit", "Handoff teams support at most two workers.");
-      if (!this.mutation(stored, "parallelism", body)) return this.view(stored);
-      if (run.parallelism !== body.parallelism) {
-        const previous = run.parallelism;
-        run.parallelism = body.parallelism;
-        this.event(stored, `The owner changed the worker limit from ${previous} to ${body.parallelism}.`);
-      }
+        throw new TeamError(409, "team-not-running", "The mission subteam has already finished.");
+      if (body.parallelism > capacityCeiling(run))
+        throw new TeamError(409, "team-parallelism-limit", `This subteam supports at most ${capacityCeiling(run)} workers.`);
+      if (!this.mutation(stored, "mission-parallelism", body)) return this.view(stored);
+      const previous = run.parallelism;
+      run.parallelism = body.parallelism;
+      this.event(stored, `The mission coordinator set the worker limit from ${previous} to ${body.parallelism} (capacity ceiling ${capacityCeiling(run)}).`);
       this.save(stored);
       return this.view(stored);
     });
@@ -1444,6 +1484,14 @@ export class TeamService {
     catch (error) { if (error instanceof Error && /configured session limit/.test(error.message)) { stored.run.reason = "Waiting for an available host session slot."; this.save(stored); return; } throw error; }
     member.status = result.status === "unavailable" ? "unavailable" : "running"; member.startedAt ??= timestamp(); this.save(stored);
   }
+  private applyProjectManagerCapacity(stored: Stored, requested?: number) {
+    const run = stored.run, ceiling = capacityCeiling(run), limit = requested ?? ceiling;
+    if (limit > ceiling)
+      throw new TeamError(409, "team-parallelism-limit", `The project manager selected ${limit} workers, above this run's capacity ceiling of ${ceiling}.`);
+    const previous = run.parallelism;
+    run.parallelism = limit;
+    this.event(stored, `The project manager set the worker limit from ${previous} to ${limit} (capacity ceiling ${ceiling}).`);
+  }
   private consume(stored: Stored, member: TeamMember) {
     const run = stored.run, report = member.report!;
     if (member.role === "permission-coordinator") { this.consumePermissionCoordinator(stored, member); return; }
@@ -1471,7 +1519,10 @@ export class TeamService {
       if (run.discovery || run.tasks.length || !run.lineup) throw new TeamError(409, "discovery-already-used", "A team may request one read-only discovery batch before implementation planning.");
       if (new Set(report.tasks.map(task => task.id)).size !== report.tasks.length) throw new TeamError(409, "invalid-discovery", "Discovery task IDs must be unique.");
       this.taskProfiles(run, report.tasks);
+      if (report.parallelism !== undefined && report.parallelism > capacityCeiling(run))
+        throw new TeamError(409, "team-parallelism-limit", `The project manager selected ${report.parallelism} workers, above this run's capacity ceiling of ${capacityCeiling(run)}.`);
       this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
+        this.applyProjectManagerCapacity(stored, report.parallelism);
         run.discovery = { revision: run.revision, summary: report.summary, tasks: report.tasks.map(task => ({ ...task, status: "pending" })) };
         run.status = "discovering";
         this.event(stored, `The coordinator requested ${report.tasks.length} read-only discovery tasks.`);
@@ -1502,6 +1553,8 @@ export class TeamService {
     if (report.kind === "plan") {
       validateTeamPlan(report.tasks);
       this.taskProfiles(run, report.tasks);
+      if (report.parallelism !== undefined && report.parallelism > capacityCeiling(run))
+        throw new TeamError(409, "team-parallelism-limit", `The project manager selected ${report.parallelism} workers, above this run's capacity ceiling of ${capacityCeiling(run)}.`);
       if (report.verification && !run.establishChecks && !run.verification) {
         if (run.verificationCorrections?.includes(run.revision)) {
           this.block(stored, new TeamError(409, "verification-not-authorized", "A plan cannot replace the project's configured checks."));
@@ -1525,6 +1578,7 @@ export class TeamService {
       if (run.goal && report.tasks.some(task => task.paths.some(path => !teamPathAllowed(path, run.goal!.allowedPaths))))
         throw new TeamError(409, "goal-scope-violation", "The plan proposes paths outside the approved goal scope.");
       this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
+        this.applyProjectManagerCapacity(stored, report.parallelism);
         const remaining = [...report.tasks];
         run.tasks = [];
         while (remaining.length) {

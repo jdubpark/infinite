@@ -9,7 +9,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import { stopSessionWorkers, waitFor } from "./helpers.js";
 import { inProcessHost } from "./helpers.js";
-import { writeSealed } from "../packages/host/src/vault.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, missionBoard, type ProjectGroupLookup } from "../packages/host/src/missions.js";
@@ -677,7 +677,7 @@ test("a mission coordinator reports through its own MCP tool and envelope, separ
   assert.deepEqual(await tools({ INFINITE_MISSION_ASSIGNMENT: "", INFINITE_TEAM_ASSIGNMENT: JSON.stringify({ runId: missionId, memberId, revision: 3, role: "implementer" }) }), ["report"]);
 });
 
-type FakeRun = { id: string; projectId: string; missionId: string; status: TeamView["status"]; revision: number; updatedAt: string;
+type FakeRun = { id: string; projectId: string; missionId: string; status: TeamView["status"]; revision: number; updatedAt: string; parallelism?: number; parallelismCeiling?: number;
   decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string }[] };
 
 /**
@@ -725,9 +725,12 @@ function scripted() {
   };
   const runs = new Map<string, FakeRun>(), standalone = new Set<string>(), failing = new Set<string>();
   let resumeBusy = false;
-  const created: { request: CreateTeam; options?: { baseRunId?: string } }[] = [];
+  const created: { request: CreateTeam; options?: { baseRunId?: string; parallelismCeiling?: number } }[] = [];
   const answers: { teamId: string; decisionId: string; text: string; by?: string }[] = [];
   const steers: { teamId: string; text: string }[] = [];
+  const capacityCalls: { teamId: string; requestId: string; revision: number; parallelism: number }[] = [];
+  const capacityReceipts = new Map<string, string>();
+  let loseCapacityReply = false, bumpCapacityRevision = false;
   const steerReceipts = new Map<string, string>();
   let steerLimit: boolean | Set<string> = false, steerBusy = false, loseSteerReply = false;
   const view = (run: FakeRun) => ({ ...structuredClone(run), title: run.id, tasks: [], usage: emptyRollup() }) as unknown as TeamView;
@@ -739,11 +742,11 @@ function scripted() {
       const current = runs.get(id);
       return Boolean(current && !["cancelled", "ready-for-review", "merged", "no-change"].includes(current.status));
     },
-    async createForMission(request: CreateTeam, missionId: string, _lineup: TeamLineup, options?: { baseRunId?: string }) {
+    async createForMission(request: CreateTeam, missionId: string, _lineup: TeamLineup, options?: { baseRunId?: string; parallelismCeiling?: number }) {
       if (runs.has(request.requestId)) return view(run(request.requestId));
       if (failing.has(request.projectId)) throw new TeamError(409, "team-start-failed", "The repository could not start a team run.");
       created.push({ request, options });
-      runs.set(request.requestId, { id: request.requestId, projectId: request.projectId, missionId, status: "implementing", revision: 1, decisions: [], updatedAt: new Date().toISOString() });
+      runs.set(request.requestId, { id: request.requestId, projectId: request.projectId, missionId, status: "implementing", revision: 1, decisions: [], updatedAt: new Date().toISOString(), parallelism: request.parallelism, parallelismCeiling: options?.parallelismCeiling });
       return view(run(request.requestId));
     },
     get: (id: string) => view(run(id)),
@@ -753,6 +756,22 @@ function scripted() {
       const target = run(id);
       target.decisions.find(item => item.id === decisionId)!.answer = body.text;
       if (target.decisions.every(item => item.answer)) set(id, { status: "implementing" });
+      return view(target);
+    },
+    async setMissionParallelism(id: string, body: { requestId: string; revision: number; parallelism: number }) {
+      const fingerprint = JSON.stringify(body), prior = capacityReceipts.get(body.requestId);
+      capacityCalls.push({ teamId: id, ...body });
+      if (prior) {
+        if (prior !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
+        return view(run(id));
+      }
+      const target = run(id);
+      if (bumpCapacityRevision) { bumpCapacityRevision = false; target.revision++; }
+      if (body.revision !== target.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
+      if (body.parallelism > (target.parallelismCeiling ?? 4)) throw new TeamError(409, "team-parallelism-limit", "The subteam capacity ceiling was exceeded.");
+      capacityReceipts.set(body.requestId, fingerprint);
+      target.parallelism = body.parallelism;
+      if (loseCapacityReply) { loseCapacityReply = false; throw new TeamError(409, "team-operation-running", "The reply was lost after the capacity change was recorded."); }
       return view(target);
     },
     // Mirrors TeamService.steer: a known request replays, then busy, stale, and limit refusals, then a new revision.
@@ -795,13 +814,15 @@ function scripted() {
   const attempt = async (n: number) => (await waitFor(async () => attempts[n - 1], value => Boolean(value), 20000))!;
   const parse = (prompt: string, label: string) => JSON.parse(prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
   return {
-    missions, runs, standalone, failing, created, answers, steers, set,
+    missions, runs, standalone, failing, created, answers, steers, capacityCalls, set,
     /** Later steers of these subteams, or of every subteam, are refused at the steering limit. */
     limitSteering: (teamIds?: string[]) => { steerLimit = teamIds ? new Set(teamIds) : true; },
     /** Subteam steers are refused as busy until released. */
     holdSteers: (held: boolean) => { steerBusy = held; },
     /** The next steer is recorded by the subteam, but the mission sees a retryable error instead of its reply. */
     loseNextSteerReply: () => { loseSteerReply = true; },
+    loseNextCapacityReply: () => { loseCapacityReply = true; },
+    bumpNextCapacityRevision: () => { bumpCapacityRevision = true; },
     remove: () => { removed = true; },
     attempts: () => attempts.length,
     attempt,
@@ -838,7 +859,105 @@ function scripted() {
 }
 const plan = (id: string, repoProjectId: string, dependsOn: string[] = []) =>
   ({ id, repoProjectId, title: `Subtask ${id}`, objective: `Do ${id}`, size: "solo" as const, parallelism: 1, dependsOn });
+const teamPlan = (id: string, repoProjectId: string, parallelism = 1, dependsOn: string[] = []) =>
+  ({ id, repoProjectId, title: `Subtask ${id}`, objective: `Do ${id}`, size: "team" as const, parallelism, dependsOn });
 const teamOf = (mission: Mission, subtaskId: string) => mission.subtasks.find(item => item.id === subtaskId)?.teamId;
+
+test("mission restore adopts a legacy pending solo launch and persists capacity once", () => {
+  const root = realpathSync(mkdtempSync("/tmp/inf-mission-capacity-restore-"));
+  const stateDir = join(root, "state"), key = randomBytes(32), missionId = randomUUID(), teamId = randomUUID();
+  mkdirSync(join(stateDir, "missions"), { recursive: true, mode: 0o700 });
+  const at = new Date().toISOString();
+  const mission: Mission = { id: missionId, groupId: "shop", groupName: "Shop", repoProjectIds: ["api"], title: "Legacy mission", objective: "Scale the solo subtask safely",
+    maxSubtasks: 8, maxMinutes: 30, deadlineAt: new Date(Date.now() + 30 * 60000).toISOString(), revision: 1, status: "working", createdAt: at, updatedAt: at,
+    lineup, subtasks: [{ id: "legacy-solo", repoProjectId: "api", title: "Legacy solo", objective: "One worker only", size: "solo", parallelism: 4, dependsOn: [], status: "queued" }],
+    decisions: [], steering: [], events: [] };
+  const stored = { mission, fingerprint: "legacy", receipts: {}, folder: root, repos: [], attempts: [], inbox: [], notes: [], notified: [],
+    launches: { "legacy-solo": { requestId: teamId, projectId: "api", provider: lineup.coordinator.provider, useConfiguredLineup: true, title: "Legacy solo", objective: "One worker only", parallelism: 4 } }, ops: [], refusals: 0 };
+  const file = join(stateDir, "missions", `${missionId}.sealed`);
+  writeSealed(file, key, `mission:${missionId}`, stored);
+  let parallelism = 4, ceiling: number | undefined, reconciliations = 0;
+  const teams = {
+    useMissionReservations() {},
+    ensureMissionCapacityCeiling(_id: string, linkedMission: string, expected: number) {
+      assert.equal(linkedMission, missionId);
+      if (ceiling !== expected || parallelism > expected) {
+        ceiling = expected;
+        parallelism = Math.min(parallelism, expected);
+        reconciliations++;
+      }
+      return parallelism;
+    },
+  } as unknown as TeamService;
+  const config: Config = { port: 0, origin: "http://127.0.0.1", keyFile: join(root, "key"), stateDir, runDir: join(root, "run"), tokens: [],
+    environment: "local", enableDemo: false, maxSessions: 4, projects: [], agents: {}, teams: { workspaceDir: join(root, "teams"), lineup } };
+  const groups: ProjectGroupLookup = { get: () => { throw new Error("Restore must not query the project group"); } };
+  try {
+    const first = new MissionService(config, key, {} as Manager, teams, groups);
+    const persisted = unseal<{ mission: Mission }>(key, `mission:${missionId}`, readFileSync(file, "utf8")).mission;
+    assert.equal(persisted.subtasks[0].parallelism, 1, "The restored mission mirror is durably clamped to the solo ceiling");
+    assert.equal(persisted.events.filter(event => /worker limits were reconciled/.test(event.text)).length, 1);
+    first.close();
+
+    const second = new MissionService(config, key, {} as Manager, teams, groups);
+    const restoredAgain = unseal<{ mission: Mission }>(key, `mission:${missionId}`, readFileSync(file, "utf8")).mission;
+    assert.equal(restoredAgain.subtasks[0].parallelism, 1);
+    assert.equal(restoredAgain.events.filter(event => /worker limits were reconciled/.test(event.text)).length, 1, "A second restore does not repeat the migration");
+    assert.equal(reconciliations, 1);
+    second.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("mission capacity resizes queued and active subtasks with retry, stale-revision, and solo boundaries", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "A team subtask, its queued follow-up, and a solo subtask", subtasks: [
+      teamPlan("a", "api", 2), teamPlan("b", "api", 1, ["a"]), plan("solo", "web"),
+    ] });
+    const started = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")) && Boolean(teamOf(mission, "solo")));
+    const teamId = teamOf(started, "a")!, soloId = teamOf(started, "solo")!;
+    assert.equal(h.runs.get(teamId)?.parallelismCeiling, 4);
+    assert.equal(h.runs.get(teamId)?.parallelism, 2);
+    assert.equal(h.get(id).subtasks.find(item => item.id === "b")?.status, "queued");
+
+    const poke = async () => {
+      h.set(teamId, { status: "needs-input", decisions: [{ id: randomUUID(), memberId: randomUUID(), revision: h.runs.get(teamId)!.revision, question: "Keep working?", options: [], createdAt: new Date().toISOString() }] });
+      return h.attempt(h.attempts() + 1);
+    };
+    await poke();
+    await h.report(2, { kind: "resize-subtask", subtaskId: "b", parallelism: 3, summary: "The queued follow-up has three independent tasks ready." });
+    const queued = await until(() => h.get(id), mission => mission.subtasks.find(item => item.id === "b")?.parallelism === 3);
+    assert.equal(queued.subtasks.find(item => item.id === "b")?.status, "queued");
+    assert.equal(teamOf(queued, "b"), undefined);
+
+    await poke();
+    h.loseNextCapacityReply();
+    await h.report(3, { kind: "resize-subtask", subtaskId: "a", parallelism: 4, summary: "Four independent tasks are ready with little repository contention." });
+    await until(() => h.get(id), mission => mission.events.some(event => /set subtask a to a 4-worker limit/.test(event.text)));
+    const replayed = h.capacityCalls.filter(call => call.teamId === teamId && call.parallelism === 4);
+    assert.equal(replayed.length, 2, "A lost reply retries the durable child operation");
+    assert.equal(replayed[0].requestId, replayed[1].requestId, "An uncertain delivery replays the same request receipt");
+    assert.equal(replayed[0].revision, replayed[1].revision);
+    assert.equal(h.runs.get(teamId)?.parallelism, 4);
+    assert.equal(h.get(id).events.filter(event => /set subtask a to a 4-worker limit/.test(event.text)).length, 1);
+
+    await poke();
+    h.bumpNextCapacityRevision();
+    await h.report(4, { kind: "resize-subtask", subtaskId: "a", parallelism: 1, summary: "Repository contention is higher, so drain to one active worker." });
+    await until(() => h.get(id), mission => mission.events.some(event => /set subtask a to a 1-worker limit/.test(event.text)));
+    const rebound = h.capacityCalls.filter(call => call.teamId === teamId && call.parallelism === 1);
+    assert.equal(rebound.length, 2, "A stale team revision is refreshed and retried");
+    assert.notEqual(rebound[0].requestId, rebound[1].requestId, "A new revision uses a new idempotency key");
+    assert.notEqual(rebound[0].revision, rebound[1].revision);
+    assert.equal(h.runs.get(teamId)?.parallelism, 1);
+
+    await poke();
+    await h.report(5, { kind: "resize-subtask", subtaskId: "solo", parallelism: 2, summary: "The solo subtask has two independent tasks." });
+    await until(() => h.get(id), mission => mission.events.some(event => /resize-subtask report was refused/.test(event.text)));
+    assert.equal(h.runs.get(soloId)?.parallelism, 1, "A mission coordinator cannot grow a solo subtask beyond one worker");
+  } finally { h.close(); }
+});
 
 test("a coordinator result that predates owner direction is not applied, and a create retry outlives its group", { timeout: 60000 }, async () => {
   const h = scripted();
@@ -974,18 +1093,18 @@ test("a subtask with two same-repository predecessors starts from the later run'
     const { id } = await h.create();
     await h.report(1, { kind: "dispatch", summary: "Layered changes", subtasks: [plan("a", "api"), plan("a2", "api"), plan("w", "web", ["a"]), plan("b", "api", ["w", "a", "a2"])] });
     const first = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
-    assert.equal(h.created[0].options, undefined, "The first subtask starts from the repository");
+    assert.equal(h.created[0].options?.baseRunId, undefined, "The first subtask starts from the repository");
     assert.deepEqual(first.subtasks.find(subtask => subtask.id === "a2")?.dependsOn, ["a"]);
     assert.ok(first.events.some(event => /added same-repository dependencies/i.test(event.text) && event.text.includes("a2 depends on a")));
     h.set(teamOf(first, "a")!, { status: "ready-for-review" });
     const second = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a2") && teamOf(mission, "w")));
     const options = (subtaskId: string) => h.created.find(item => item.request.requestId === teamOf(h.get(id), subtaskId))!.options;
-    assert.deepEqual(options("a2"), { baseRunId: teamOf(second, "a") });
-    assert.equal(options("w"), undefined, "Work in another repository is not a base");
+    assert.equal(options("a2")?.baseRunId, teamOf(second, "a"));
+    assert.equal(options("w")?.baseRunId, undefined, "Work in another repository is not a base");
     h.set(teamOf(second, "w")!, { status: "ready-for-review" });
     h.set(teamOf(second, "a2")!, { status: "ready-for-review" });
     await until(() => h.get(id), mission => Boolean(teamOf(mission, "b")));
-    assert.deepEqual(options("b"), { baseRunId: teamOf(second, "a2") }, "b builds on a2, which already includes a");
+    assert.equal(options("b")?.baseRunId, teamOf(second, "a2"), "b builds on a2, which already includes a");
     assert.match(h.created.at(-1)!.request.objective, /starts from the finished work of subtask a2/);
   } finally { h.close(); }
 });
@@ -1007,7 +1126,7 @@ test("a no-change predecessor keeps the latest reviewed same-repository run as t
 
     const third = await until(() => h.get(id), mission => Boolean(teamOf(mission, "after")));
     const afterTeamId = teamOf(third, "after")!;
-    assert.deepEqual(h.created.find(item => item.request.requestId === afterTeamId)?.options, { baseRunId: reviewedTeamId });
+    assert.equal(h.created.find(item => item.request.requestId === afterTeamId)?.options?.baseRunId, reviewedTeamId);
   } finally { h.close(); }
 });
 
@@ -1040,11 +1159,11 @@ test("same-repository subtasks dispatched later are chained and start from the e
     h.set(firstTeamId, { status: "ready-for-review" });
     const launched = await until(() => h.get(id), mission => Boolean(teamOf(mission, "second")));
     const secondTeamId = teamOf(launched, "second")!;
-    assert.deepEqual(h.created.find(item => item.request.requestId === secondTeamId)?.options, { baseRunId: firstTeamId });
+    assert.equal(h.created.find(item => item.request.requestId === secondTeamId)?.options?.baseRunId, firstTeamId);
     h.set(secondTeamId, { status: "ready-for-review" });
     const thirdLaunched = await until(() => h.get(id), mission => Boolean(teamOf(mission, "third")));
     const thirdTeamId = teamOf(thirdLaunched, "third")!;
-    assert.deepEqual(h.created.find(item => item.request.requestId === thirdTeamId)?.options, { baseRunId: secondTeamId });
+    assert.equal(h.created.find(item => item.request.requestId === thirdTeamId)?.options?.baseRunId, secondTeamId);
   } finally { h.close(); }
 });
 

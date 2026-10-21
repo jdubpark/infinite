@@ -217,6 +217,7 @@ async function main() {
     if (scenario === "bootstrap-change" && assignment.revision > 1)
       verification.checks[0].args.push("--different");
     const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
+      ...(scenario === "live-limit" ? { parallelism: 1 } : {}),
       ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) };
     if (scenario === "bootstrap-override") {
       let rejection;

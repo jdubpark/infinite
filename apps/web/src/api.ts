@@ -101,7 +101,7 @@ export type Me = {
   capabilities?: { signals: boolean; answer: boolean; push: boolean; dictation?: { model: string } };
   providers: string[];
   projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { establishChecks?: true; checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
-  teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
+  teams?: { enabled: boolean; lineup?: TeamLineup };
   goals?: { enabled: boolean };
   providerLimits?: ProviderLimit[];
   usage?: { enabled: boolean; budgets: Partial<Record<string, UsageBudget>> };

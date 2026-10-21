@@ -18,7 +18,7 @@ import {
   MEMBER_LABELS, memberKind, newer, openDecisions, pendingApprovals, ROLE_NAMES, shortDate, TEAM_LABELS, taskGroups, taskKind, teamControls, teamKind, teamPhases, teamProgress, workerStatus,
   type ModelProfile, type PhaseState, type TeamCheck, type TeamDecision, type TeamMember, type TeamTask, type TeamView,
 } from "./model";
-import { Choices, Clamp, Disclosure, LinearChip, LineupView, ProfileLine, providerName, RequestStatus, Section, SteerBox, t } from "./parts";
+import { Clamp, Disclosure, LinearChip, LineupView, ProfileLine, providerName, RequestStatus, Section, SteerBox, t } from "./parts";
 import { useRunRequest } from "./useRunRequest";
 import { AgentApproval } from "./TeamApprovals";
 import { AgentLog, JevcodeSummary } from "./TeamSummary";
@@ -172,12 +172,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           <LinearChip tracking={team.linear} fresh={fresh} />
         </View>
         <Text style={s.workerStatus} numberOfLines={2}>{workerStatus(team)}</Text>
-        {owns && !["cancelled", "ready-for-review", "merged", "no-change"].includes(team.status) ? <View style={s.workerControl}>
-          <Text style={t.label}>Worker limit</Text>
-          <Choices values={Array.from({ length: team.workers?.max ?? 4 }, (_, index) => index + 1)} selected={team.workers?.limit ?? team.parallelism} disabled={locked || !fresh}
-            label={String} onSelect={parallelism => { if (parallelism !== team.parallelism) send("/parallelism", "Worker limit", { parallelism }); }} />
-          <Text style={t.note}>The team starts a worker when a task is ready and stops it when the task is done, up to this limit. You can change the limit while the team runs.</Text>
-        </View> : null}
+        <Text style={t.note}>The PM and coordinator adjust workers as work changes.</Text>
         {team.linear?.reason ? <Text style={t.warning}>{team.linear.reason}</Text> : null}
       </View>
       <View style={s.sticky}>

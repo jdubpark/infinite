@@ -399,7 +399,11 @@ coordinator to select and build work within those boundaries.
 | `extendMinutes` | 0 | 0–240 minutes added each time the deadline arrives while an agent is active; 0 turns extensions off |
 | `maxTotalMinutes` | `maxMinutes` | 5–1,440 minutes, at least `maxMinutes`; the ceiling for the deadline, including extensions |
 | `maxMembers` | 24 | 4–200 member attempts across the goal, including scouts, questions resumed as new attempts, review, repair, and escalation |
-| `parallelism` | 3 | 1–4 concurrent workers within a cycle, subject to host session capacity; the owner can change it while the goal runs |
+
+The PM and coordinator choose worker capacity within the host's ceiling of four
+concurrent workers. Worker capacity is not an owner setting. The host starts
+workers for ready tasks and releases their slots when their processes stop;
+host session capacity still applies.
 
 Pausing does not extend the deadline or restore consumed attempts. Steering can
 change the direction, but cannot expand the approved paths, deadline, or limits.
@@ -689,16 +693,24 @@ answer and working copy. It takes the next free slot ahead of tasks that have
 not started. A stalled or time-limited worker's replacement continues in the
 slot its predecessor held.
 
-The owner can raise or lower the limit while a team or goal runs. Raising it
-starts more ready tasks on the next scheduling pass. Lowering it never stops a
-running worker; it only holds new starts until fewer workers than the new limit
-are running. A change does not create a new team revision or discard reports.
+The PM selects capacity in its plan or discovery report, based on independent
+work, dependencies, contention, and remaining budgets. A mission coordinator
+can adjust a subteam's capacity as work changes. Raising capacity starts more
+ready tasks on the next scheduling pass. Lowering it never stops a running
+worker; it holds new starts until fewer workers than the new limit are running.
+A capacity change does not discard reports or create a new team revision.
+
+PM `plan` and `explore` reports accept optional `parallelism` (1–4), bounded by
+the team's ceiling. Omission uses the allowed capacity for older reports.
+Mission coordinators use `resize-subtask` to change a queued or active
+subteam's current capacity. Implementers and reviewers cannot resize workers.
 
 The limit counts concurrent workers, not member attempts. It does not change
-`maxMembers`, deadlines or spend. Host session capacity still applies. Handoff
+`maxMembers` or deadlines. Host session capacity still applies. Handoff
 teams allow 1–2.
 
-The owner sets the limit; agents cannot change it.
+Owners monitor workers and steer objectives; worker capacity has no owner
+control in the web, phone, or Mac clients.
 
 Team and goal views show "{running} of {limit} workers running", plus a note when
 ready tasks are waiting for a worker.
@@ -1194,15 +1206,15 @@ mutation returns the current Goal or Team record.
 | `POST /api/goals/:id/steer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/goals/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner |
 | `POST /api/goals/:id/extend` | `requestId`, `revision`, `minutes` (5–1,440) | Owner |
-| `POST /api/goals/:id/parallelism` | `requestId`, `revision`, `parallelism` (1–4) | Owner |
 | `POST /api/goals/:id/outcome` | `requestId`, `revision`, `result`, `summary`, `evidence` | Owner/controller |
 
 Creation requires `requestId` (UUID), `projectId`, `title` (up to 100 characters),
 `objective` (12,000), and `successCriteria` (4,000). Optional arrays are
 `nonGoals` (20 entries, 1,000 characters each), `evidence` (20 entries, 2,000
 characters each), and `allowedPaths` (1–32 entries, 300 characters each).
-`maxRuns`, `maxMinutes`, `extendMinutes`, `maxTotalMinutes`, `maxMembers`, and
-`parallelism` use the limits above.
+`maxRuns`, `maxMinutes`, `extendMinutes`, `maxTotalMinutes`, and `maxMembers`
+use the limits above. Legacy creation requests may include `parallelism`, but
+it does not select worker capacity.
 The host also limits the combined creation request to 40 KiB. On a mapped
 project, optional `linearIssueId` accepts an existing issue UUID or identifier
 (up to 100 characters); omitting it creates a new parent issue.
@@ -1214,9 +1226,9 @@ It leaves scope and budgets unchanged. Outcome `result` is `achieved`,
 pending operation. Resume requires a paused goal whose deadline has not expired;
 extend the goal first if it has.
 
-A parallelism change applies to the active cycle and later cycles. It is refused
-with `goal-not-running` for a goal that is not running, needing input or paused,
-and with `goal-launch-pending` while the next cycle is attaching.
+The legacy goal parallelism endpoint refuses owner capacity changes; each
+cycle's PM selects capacity for its work. The refusal uses `409` with
+`code: "agent-managed-capacity"`.
 
 ### Teams
 
@@ -1224,12 +1236,11 @@ and with `goal-launch-pending` while the next cycle is attaching.
 | --- | --- | --- |
 | `GET /api/teams` | None; returns `{teams}` | Any paired device |
 | `GET /api/teams/:id` | None; returns reports and check evidence | Any paired device |
-| `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, `parallelism`, optional `useConfiguredLineup` | Owner |
+| `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, optional `useConfiguredLineup` | Owner |
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
-| `POST /api/teams/:id/parallelism` | `requestId`, `revision`, `parallelism` (1–4; 1–2 for handoff teams) | Owner; standalone teams |
 
 ## Model scorecard
 
@@ -1244,11 +1255,12 @@ Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route
 remains available for its active cycle while the goal is running.
 
-A parallelism change is refused with `goal-owned-team` for a goal-owned team and
-with `team-not-running` for a cancelled, ready-for-review, merged or no-change
-team. A value above a handoff team's maximum is refused with
-`team-parallelism-limit`. Stale revisions and request conflicts follow the usual
-rules.
+The legacy team parallelism endpoint refuses owner capacity changes with `409`
+and `code: "agent-managed-capacity"`. Legacy team creation requests may include
+`parallelism`, but it does not select worker
+capacity. PM reports and mission coordinator actions remain bounded by the
+host's ceiling; handoff teams permit at most two workers and solo mission
+subtasks permit one.
 
 `GET /api/me` advertises `teams: {enabled, maxParallelism, lineup?}`,
 `goals: {enabled}`, each project's configured checks, and optional

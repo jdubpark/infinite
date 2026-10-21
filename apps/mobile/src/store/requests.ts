@@ -2,10 +2,10 @@ import { useCallback, useSyncExternalStore } from "react";
 
 export type CreationRequest = { requestId: string; backend: "infinite" | "cmux"; provider: string; projectId: string; title: string; prompt: string };
 export type LifecycleRequest = { requestId: string; action: "stop" | "resume" };
-export type TeamCreationRequest = { requestId: string; projectId: string; provider: string; useConfiguredLineup?: boolean; title: string; objective: string; parallelism: number };
+export type TeamCreationRequest = { requestId: string; projectId: string; provider: string; useConfiguredLineup?: boolean; title: string; objective: string };
 export type GoalCreationRequest = {
   requestId: string; projectId: string; linearIssueId?: string; title: string; objective: string; successCriteria: string;
-  nonGoals: string[]; allowedPaths: string[]; evidence: string[]; maxRuns: number; maxMinutes: number; maxMembers: number; parallelism: number;
+  nonGoals: string[]; allowedPaths: string[]; evidence: string[]; maxRuns: number; maxMinutes: number; maxMembers: number;
 };
 export type MissionCreationRequest = { requestId: string; groupId: string; objective: string };
 /** A steer, answer, lifecycle action or outcome for one team or goal, sent with the revision it was decided against. */

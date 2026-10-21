@@ -638,7 +638,7 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/teams/:id/steer", requireRole(["owner", "controller"]), async (req, res) =>
     res.json(await teams.steer(standaloneTeam(req.params.id), teamMutationSchema.parse(req.body))));
   app.post("/api/teams/:id/parallelism", requireRole(["owner"]), async (req, res) =>
-    res.json(await teams.setParallelism(standaloneTeam(req.params.id), teamParallelismSchema.parse(req.body))));
+    res.json(await teams.setParallelism(id.parse(req.params.id), teamParallelismSchema.parse(req.body))));
   app.post("/api/teams/:id/decisions/:decisionId/answer", requireRole(["owner", "controller"]), async (req, res) => {
     const teamId = id.parse(req.params.id), decisionId = id.parse(req.params.decisionId), body = teamMutationSchema.parse(req.body);
     if (teams.get(teamId).missionId) throw new TeamError(409, "mission-owned-team", "The mission coordinator answers this subteam's decisions and escalates owner questions to the mission.");

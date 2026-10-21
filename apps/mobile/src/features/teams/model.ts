@@ -48,7 +48,7 @@ export type TeamView = {
   permissionDecisions?: PermissionDecision[];
 };
 
-/** Live implementer capacity, with the creation limit as a fallback for older hosts. */
+/** Older hosts omit worker counts, so their reported parallelism backs the live status. */
 export function workerStatus(team: Pick<TeamView, "parallelism" | "workers">): string {
   if (!team.workers) return `Up to ${team.parallelism} workers`;
   const { running, limit, ready } = team.workers;

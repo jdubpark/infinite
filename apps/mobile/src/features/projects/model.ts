@@ -46,3 +46,10 @@ export function combineLabel(suggestion: ProjectGroupSuggestion, groups: Project
   const joined = names.length > 2 ? `${names.slice(0, -1).join(", ")}, and ${names.at(-1)}` : names.join(" and ");
   return `Combine ${joined}`;
 }
+
+/** The checkout a new goal or session uses for a project: its team-ready primary, else a team-ready checkout, else the primary. */
+export function preferredCheckout(group: ProjectGroup): ProjectGroupCheckout | undefined {
+  const primary = primaryCheckout(group);
+  if (primary?.teamReady) return primary;
+  return checkoutsOf(group).find(checkout => checkout.teamReady) ?? primary;
+}

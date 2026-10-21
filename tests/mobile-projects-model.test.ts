@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { checkoutsOf, combineLabel, groupActivity, groupContaining, primaryCheckout, projectSections, visibleGroups } from "../apps/mobile/src/features/projects/model.ts";
+import { checkoutsOf, combineLabel, groupActivity, groupContaining, preferredCheckout, primaryCheckout, projectSections, visibleGroups } from "../apps/mobile/src/features/projects/model.ts";
 import type { BoardItem, ProjectGroup, ProjectGroupCheckout, ProjectGroupRepo } from "../apps/mobile/src/api/client.ts";
 
 const item = (overrides: Partial<BoardItem> = {}): BoardItem => ({
@@ -38,4 +38,13 @@ test("projectSections splits hidden projects and combineLabel names the projects
   assert.deepEqual(sections.hidden.map(value => value.id), ["old"]);
   assert.equal(combineLabel(sections.suggestions[0]!, sections.visible), "Combine Shop API and Shop Web");
   assert.equal(combineLabel({ name: "x", repos: [], groupIds: ["shop-api", "shop-web", "missing"], reason: "shared-parent" }, sections.visible), "Combine Shop API, Shop Web, and missing");
+});
+
+test("preferredCheckout picks the team-ready primary, then any team-ready checkout, then the primary", () => {
+  assert.equal(preferredCheckout(sample)?.projectId, "sample-main");
+  const notReady = group("notready", [{ projectId: "nr-main", name: "main", path: "/home/dev/nr-main", checkouts: [checkout("nr-main", true, false), checkout("nr-codex", false, true)] }]);
+  assert.equal(preferredCheckout(notReady)?.projectId, "nr-codex");
+  const none = group("none", [{ projectId: "none-main", name: "main", path: "/home/dev/none-main", checkouts: [checkout("none-main", true, false)] }]);
+  assert.equal(preferredCheckout(none)?.projectId, "none-main");
+  assert.equal(preferredCheckout(group("empty", [])), undefined);
 });

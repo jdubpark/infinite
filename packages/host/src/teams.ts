@@ -1543,7 +1543,7 @@ export class TeamService {
     // All launch fields were persisted with the queued member before this call.
     if (!this.hasLaunch(member) && member.role !== "permission-coordinator") {
       const configuredProject = stored.run.handoff?.project ?? this.config.projects.find(project => project.id === stored.run.projectId)?.team;
-      await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject), assignment: assignment(member), memberBaseCommit: member.baseCommit }, this.config.teams?.commandPrefix);
+      await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role), assignment: assignment(member), memberBaseCommit: member.baseCommit }, this.config.teams?.commandPrefix);
     }
     let result;
     try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession({ requestId: member.sessionId, provider: member.provider ?? stored.run.provider, projectId: stored.run.projectId, title: member.title, prompt: member.prompt }, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true)); }

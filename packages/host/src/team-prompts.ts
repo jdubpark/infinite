@@ -49,9 +49,9 @@ export type TeamContextSnapshot = {
   feedback: string | null;
 };
 /** Full prompt evidence saved outside the checkout's tracked and untracked project files. */
-export function teamContext(run: TeamRun, feedback?: string, configuredProject?: Pick<TeamProject, "setup" | "checks">): TeamContextSnapshot {
+export function teamContext(run: TeamRun, feedback?: string, configuredProject?: Pick<TeamProject, "setup" | "checks">, role?: TeamMember["role"]): TeamContextSnapshot {
   const continuations = (run as TeamRun & { continuations?: TeamContinuationSnapshot[] }).continuations ?? [];
-  return {
+  const snapshot: TeamContextSnapshot = {
     schemaVersion: 1,
     runId: run.id,
     revision: run.revision,
@@ -84,6 +84,17 @@ export function teamContext(run: TeamRun, feedback?: string, configuredProject?:
     memberReports: (run.members ?? []).filter(member => member.role !== "permission-coordinator").map(({ memberId, revision, role, taskId, status, baseCommit, report, stoppedReason }) => ({ memberId, revision, role, ...(taskId ? { taskId } : {}), status, baseCommit, ...(report ? { report } : {}), ...(stoppedReason ? { stoppedReason } : {}) })),
     feedback: feedback ?? null,
   };
+  if (role === "implementer") {
+    const taskEvidence = ({ rubric: _rubric, ownerRating: _rating, diffStat: _stat, ...task }: TeamTask): TeamTask => task;
+    snapshot.tasks = snapshot.tasks.map(taskEvidence);
+    snapshot.continuations = snapshot.continuations.map(item => ({ ...item, tasks: item.tasks.map(taskEvidence) }));
+    snapshot.memberReports = snapshot.memberReports.map(item => {
+      if (item.report?.kind !== "review") return item;
+      const { rubric: _rubric, ...report } = item.report;
+      return { ...item, report };
+    });
+  }
+  return snapshot;
 }
 function codePointsWithin(text: string, maxBytes: number, fromEnd = false) {
   if (maxBytes <= 0) return "";

@@ -109,6 +109,26 @@ test("review prompt bounds derived evidence while preserving objective and immut
   assert.ok(implementerPrompt.includes(run.tasks[0].instructions), "implementers retain the complete task contract inline");
 });
 
+test("implementer context retains narrative history while withholding task ratings and review rubrics", () => {
+  const run = largeRun();
+  run.tasks[0].ownerRating = { score: 1, note: "Owner scoring evidence", at: "2026-10-21T00:00:00.000Z" };
+  const score = { score: 1, why: "Reviewer scoring evidence" };
+  run.tasks[0].rubric = { version: 1, correctness: score, cleanliness: score, extensibility: score, docs: score, reviewerProfileId: "reviewer" };
+  run.continuations = [{ revision: 1, requestId: "prior", at: "2026-10-21T00:00:00.000Z", reason: "Retain prior work", headCommit: run.headCommit!, tasks: run.tasks }];
+  run.members = [{ memberId: "reviewer", revision: 1, role: "reviewer", report: { kind: "review", verdict: "approved", summary: "Useful narrative evidence", rubric: [{ taskId: run.tasks[0].id, correctness: score, cleanliness: score, extensibility: score, docs: score }] } } as TeamRun["members"][number]];
+  const snapshot = teamContext(run, undefined, undefined, "implementer");
+  const serialized = JSON.stringify(snapshot);
+  assert.equal(snapshot.tasks[0].ownerRating, undefined);
+  assert.equal(snapshot.tasks[0].rubric, undefined);
+  assert.equal(snapshot.continuations[0].tasks[0].ownerRating, undefined);
+  assert.equal(snapshot.continuations[0].tasks[0].rubric, undefined);
+  assert.equal("rubric" in snapshot.memberReports[0].report!, false);
+  assert.ok(serialized.includes("Useful narrative evidence"));
+  assert.equal(snapshot.tasks[0].instructions, run.tasks[0].instructions);
+  assert.equal(snapshot.continuations[0].tasks[0].summary, run.tasks[0].summary);
+  assert.match(JSON.stringify(teamContext(run)), /"ownerRating"/);
+});
+
 test("a distinct Linear issue description remains complete inline", () => {
   const run = largeRun();
   const description = `Additional owner-visible issue requirement. ${"Preserve its full provenance. ".repeat(120)}`;

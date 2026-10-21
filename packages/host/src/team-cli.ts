@@ -1009,7 +1009,21 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     // These actions can repeat on purpose (pause, resume, pause), so an unconfirmed one is never resumed implicitly.
     resumePendingIntent(receiptsPath, `team-${subcommand}:`, endpoint, prior => subcommand === "steer" || subcommand === "answer" ? prior.text === body.text : true, requestId, true, rawArgs);
-    outputTeam(await postMutation(api, receiptsPath, `team-${subcommand}:${requestId}`, endpoint, body), Boolean(options["--json"])); return true;
+    const key = `team-${subcommand}:${requestId}`;
+    try {
+      outputTeam(await postMutation(api, receiptsPath, key, endpoint, body), Boolean(options["--json"]));
+    } catch (error) {
+      const status = (error as { status?: number })?.status;
+      if (status !== undefined && [400, 401, 403, 404, 409, 410, 422].includes(status)) {
+        const records = readPrivateJson(receiptsPath, {}) as Record<string, any>;
+        if (records[key]?.state === "pending" && records[key].requestId === requestId && records[key].endpoint === endpoint) {
+          records[key].state = "refused";
+          privateJson(receiptsPath, records);
+        }
+      }
+      throw error;
+    }
+    return true;
   }
   throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|cancel|revoke-permissions ...");
 }

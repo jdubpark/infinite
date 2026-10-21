@@ -158,7 +158,10 @@ every team workspace.
 
 Agents can write the mirror. The API account creates it, but the fetch that
 fills it runs as the agent identity through `teams.commandPrefix`. On the Ubuntu
-template only that identity can reach the GitHub App token. The mirror is
+template only that identity can reach the GitHub App token. A constrained
+launcher that clears global Git configuration must attach that credential helper
+to the mirror fetch itself, for example as `-c credential.https://github.com.helper=…`
+on that one operation; without it a private repository fails as `auth`. The mirror is
 group-writable with the setgid bit (`2770`) when `sync.sharedGroup` is set, and
 `0750` otherwise. This grants agents no power over the base that they lack today,
 because they already write the project directory that team runs clone. The mirror
@@ -174,6 +177,9 @@ time. It does these steps in order:
 1. Fetch the base branch from GitHub into the mirror, through the command prefix.
    A failure records a category (`auth`, `network`, `not-found`, or `other`) and a
    fixed message. The stored message never contains Git output, a URL, or a token.
+   After a failure the timer waits twice as long before each further attempt,
+   from the refresh interval up to one hour, until a fetch succeeds. An explicit
+   refresh and the refresh before a team run always attempt the fetch.
 2. If the mirror head moved and no cloud session is running or starting in the
    project directory, fast-forward the working tree to the new head and record
    `appliedAt`. Team runs, goals, and handoffs do not count as sessions here,

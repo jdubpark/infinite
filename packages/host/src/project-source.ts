@@ -7,6 +7,8 @@ import { syncFailure, type SyncFailureCategory } from "./project-sync.js";
 import { TeamError, teamCommand, teamGitArgs } from "./team-workspace.js";
 
 const FETCH_TIMEOUT_MS = 120_000;
+/** Longest wait between timer retries of a failing fetch; the wait doubles from the refresh interval per consecutive failure. */
+const MAX_FETCH_RETRY_MS = 60 * 60_000;
 const COMMAND_TIMEOUT_MS = 30_000;
 const STAGED_EDITS_MESSAGE = "Staged edits left in the host checkout before a refresh from GitHub";
 const SAVED_CHANGES_MESSAGE = "Edits left in the host checkout before a refresh from GitHub";
@@ -47,6 +49,10 @@ export interface ProjectSourceStatus {
   appliedHead?: string;
   fetchedAt?: string;
   appliedAt?: string;
+  /** Last fetch attempt, successful or not. */
+  attemptedAt?: string;
+  /** Consecutive failed fetch attempts since the last successful one; timer refreshes back off on it. */
+  fetchFailures?: number;
   pending?: { reason: SourcePendingReason; category?: SourceFetchCategory | SyncFailureCategory; message?: string; since: string };
   /** Local branches holding tracked edits a session left in the working tree before a refresh. */
   savedBranches?: string[];
@@ -161,7 +167,8 @@ export class ProjectSourceService {
     const message = category === "auth"
       ? `grant the GitHub App access to ${repository}`
       : FETCH_MESSAGES[category];
-    return this.savePending(projectId, status, { reason: "fetch-failed", category, message }, source);
+    const attempted = { ...status, attemptedAt: new Date().toISOString(), fetchFailures: (status.fetchFailures ?? 0) + 1 };
+    return this.savePending(projectId, attempted, { reason: "fetch-failed", category, message }, source);
   }
   private sourceMatches(projectId: string, source: { repository: string; baseBranch: string }) {
     const current = this.config.projects.find(project => project.id === projectId)?.source;
@@ -196,6 +203,11 @@ export class ProjectSourceService {
     const source = { repository: project.source.repository, baseBranch: project.source.baseBranch };
     let status = this.status(projectId);
     if (options?.maxAgeMs !== undefined && status.fetchedAt && Date.now() - Date.parse(status.fetchedAt) < options.maxAgeMs) return status;
+    // A timer refresh retries a failing fetch at a doubling interval so an unreachable repository is not fetched every tick.
+    if (options?.maxAgeMs !== undefined && status.fetchFailures && status.attemptedAt) {
+      const wait = Math.min(options.maxAgeMs * 2 ** (status.fetchFailures - 1), MAX_FETCH_RETRY_MS);
+      if (Date.now() - Date.parse(status.attemptedAt) < wait) return status;
+    }
 
     const remote = mirrorRemoteUrl(source, this.config.source?.remoteOverrides?.[projectId]);
     const mirror = this.mirrorPath(projectId);
@@ -218,10 +230,13 @@ export class ProjectSourceService {
 
     if (!this.sourceMatches(projectId, source)) return this.status(projectId);
     const fetchedStatus = status.pending?.reason === "fetch-failed" ? withoutPending(status) : status;
+    delete fetchedStatus.fetchFailures;
+    const now = new Date().toISOString();
     status = {
       ...fetchedStatus,
       mirrorHead: fetchedHead,
-      fetchedAt: new Date().toISOString(),
+      fetchedAt: now,
+      attemptedAt: now,
     };
     this.writeStatus(projectId, status, source);
 

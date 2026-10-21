@@ -384,3 +384,33 @@ test("a checkout the host cannot read reports a permission failure, not a missin
     } finally { chmodSync(locked, 0o755); }
   } finally { f.close(); }
 });
+
+test("a timer refresh backs off a failing fetch while an explicit refresh retries at once", async () => {
+  const f = fixture({ prefix: true });
+  try {
+    const service = f.service();
+    f.config.source!.remoteOverrides!.example = join(f.root, "missing.git");
+    const fetches = () => readFileSync(join(f.prefixReceipts, "commands.jsonl"), "utf8").trim().split("\n").filter(line => line.includes('"fetch"')).length;
+
+    const failed = await service.refresh("example", { maxAgeMs: 60_000 });
+    assert.equal(failed.pending?.reason, "fetch-failed");
+    assert.equal(failed.fetchFailures, 1);
+    assert.ok(failed.attemptedAt);
+    const attempts = fetches();
+
+    const skipped = await service.refresh("example", { maxAgeMs: 60_000 });
+    assert.equal(fetches(), attempts, "a timer refresh inside the backoff window does not fetch");
+    assert.equal(skipped.fetchFailures, 1);
+
+    const retried = await service.refresh("example");
+    assert.equal(fetches(), attempts + 1, "an explicit refresh fetches at once");
+    assert.equal(retried.fetchFailures, 2);
+
+    f.config.source!.remoteOverrides!.example = f.origin;
+    const recovered = await service.refresh("example");
+    assert.equal(recovered.pending, undefined);
+    assert.equal(recovered.fetchFailures, undefined);
+    assert.equal(recovered.mirrorHead, f.commitA);
+    assert.ok(recovered.attemptedAt && recovered.fetchedAt);
+  } finally { f.close(); }
+});

@@ -3,9 +3,10 @@ import { Alert, ScrollView, StyleSheet, Text, TextInput, View } from "react-nati
 import { useRouter } from "expo-router";
 import * as Crypto from "expo-crypto";
 import { PROVIDER_NAMES } from "@infinite/attention";
-import { ago, api, ApiError, connectionKey, pendingLabel, sourceLabel, type Connection, type Me, type ProjectDetail, type SessionRow } from "../../api/client";
+import { ago, api, ApiError, connectionKey, pendingLabel, sourceLabel, type Connection, type Me, type ProjectDetail, type ProjectGroupList, type SessionRow } from "../../api/client";
 import { creations } from "../../store/requests";
 import { usePoll } from "../../api/usePoll";
+import { checkoutsOf, groupContaining, preferredCheckout, visibleGroups } from "../projects/model";
 import { Button } from "../../components/Button";
 import { useKeyboardPadding } from "../../components/keyboard";
 import { TopBar } from "../../components/Glass";
@@ -34,7 +35,13 @@ export function Create({ connection }: { connection: Connection }) {
   const providers = me?.backendProviders?.[backend] ?? (backend === "infinite" ? me?.providers ?? [] : []);
   const selectedProvider = providers.find(value => value === provider) ?? providers[0];
   const projects = me?.projects ?? [];
-  const selectedProject = projects.some(item => item.id === project) ? project : projects[0]?.id;
+  // Older hosts lack /project-groups; the poll then stays null and the host project buttons remain.
+  const { data: groupList } = usePoll(() => api<ProjectGroupList>(connection, "/project-groups"), 4000, [connection]);
+  const groups = groupList ? visibleGroups(groupList.groups) : null;
+  const selectedGroup = groups && project ? groupContaining(request ? groupList!.groups : groups, project) : undefined;
+  const selectedProject = project && (selectedGroup || projects.some(item => item.id === project)) ? project : groups ? (groups[0] ? preferredCheckout(groups[0])?.projectId : undefined) : projects[0]?.id;
+  const workspaceGroup = groups ? groupContaining(groups, selectedProject ?? "") : undefined;
+  const checkouts = workspaceGroup ? checkoutsOf(workspaceGroup) : [];
   // Only a cloud host receives laptop sync; a local host is the laptop.
   const syncs = me?.environment === "cloud";
   const { data: polledDetail, refresh: refreshDetail } = usePoll(() => syncs && selectedProject ? api<ProjectDetail>(connection, `/projects/${selectedProject}`) : Promise.resolve(null), 5000, [connection, selectedProject, syncs]);
@@ -97,7 +104,13 @@ export function Create({ connection }: { connection: Connection }) {
       <Text style={s.label}>Session host</Text>
       <View style={s.choices}>{(me?.backends ?? ["infinite"]).map(value => <Button key={value} title={value === "cmux" ? "cmux" : "Infinite"} secondary={backend !== value} disabled={locked} onPress={() => { setBackend(value); setProvider(undefined); }} />)}</View>
       <Text style={s.label}>Project</Text>
-      <View style={s.choices}>{projects.map(item => <Button key={item.id} title={item.name} secondary={selectedProject !== item.id} disabled={locked} onPress={() => { setProject(item.id); setSyncError(""); setSourceError(""); }} />)}</View>
+      {groups ? <>
+        <View style={s.choices}>{groups.map(group => <Button key={group.id} title={group.name} secondary={workspaceGroup?.id !== group.id} disabled={locked} onPress={() => { const next = preferredCheckout(group)?.projectId; if (next) { setProject(next); setSyncError(""); setSourceError(""); } }} />)}</View>
+        {checkouts.length > 1 ? <>
+          <Text style={s.label}>Checkout</Text>
+          <View style={s.choices}>{checkouts.map(checkout => <Button key={checkout.projectId} title={checkout.name} secondary={selectedProject !== checkout.projectId} disabled={locked} onPress={() => { setProject(checkout.projectId); setSyncError(""); setSourceError(""); }} />)}</View>
+        </> : null}
+      </> : <View style={s.choices}>{projects.map(item => <Button key={item.id} title={item.name} secondary={selectedProject !== item.id} disabled={locked} onPress={() => { setProject(item.id); setSyncError(""); setSourceError(""); }} />)}</View>}
       {displayDetail?.source?.mode === "github" ? <>
         <Text style={s.note} numberOfLines={2}>{sourceLabel(displayDetail.source)}</Text>
         {me?.role === "owner" ? <Button busy={refreshingSource} title={refreshingSource ? "Refreshing…" : "Refresh from GitHub"} secondary disabled={refreshingSource || !online} onPress={() => void refreshSource()} /> : null}

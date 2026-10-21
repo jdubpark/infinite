@@ -44,6 +44,10 @@ infinite close SESSION_ID  # confirm before ending its provider process
 ```sh
 infinite projects [--json]
 infinite projects group NAME REPO_ID...
+infinite projects rename PROJECT_ID NAME
+infinite projects hide PROJECT_ID
+infinite projects show PROJECT_ID
+infinite projects primary PROJECT_ID CHECKOUT_ID
 infinite start [--project PROJECT_ID] "task"
 infinite mission status MISSION_ID [--json]
 infinite mission answer MISSION_ID DECISION_ID "text"
@@ -52,11 +56,20 @@ infinite mission pause|resume|cancel MISSION_ID
 infinite board [--project PROJECT_ID]
 ```
 
-`projects` lists explicit groups and implicit single-repository projects, followed
-by suggested groups and the exact command to create each. Rows for `github`
-projects show the source status line from [GitHub-tracked sources](teams.md#status). `start` resolves the
-current Git root's enrolled repository binding and starts a mission in its
-containing group; `--project` selects a group directly. Mission controls read the
+`projects` lists each project, then its repositories. A repository with several
+checkouts shows its checkout count, and each checkout appears beneath it with
+`· primary` on the primary checkout that missions use by default. Rows for
+`github` checkouts show the source status line from
+[GitHub-tracked sources](teams.md#status). Hidden projects print under a
+`Hidden` heading. Suggested groups follow, with the exact command to create
+each. `projects rename` changes a project's name, `hide` and `show` move a
+project out of and back into pickers and board chips, and `primary` makes one
+checkout the primary of its repository. Each verb reads the project's current
+revision and sends one update. `start` resolves the current Git root's enrolled
+checkout and starts a mission in its containing project, sending that checkout
+with the mission. `--project` accepts a project ID or a checkout ID. A project ID
+lets the host choose the repository's checkout, and a checkout ID starts the
+mission on that checkout. Mission controls read the
 current revision before submitting an action. `board` refreshes every two
 seconds in a terminal: use Up/Down to select a row, Tab to change the composer
 target, Enter to open the selected row or submit a mission, `a` to answer its

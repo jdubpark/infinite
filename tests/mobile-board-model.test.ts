@@ -23,6 +23,8 @@ test("project filtering retains only items belonging to that group", () => {
   const rows = [item({ id: "a", groupId: "a" }), item({ id: "b", groupId: "b" }), item({ id: "standalone", groupId: undefined })];
   assert.deepEqual(filterBoard(rows, "a").map(row => row.id), ["a"]);
   assert.deepEqual(filterBoard(rows).map(row => row.id), ["a", "b", "standalone"]);
+  const team = item({ id: "team-run", kind: "team", groupId: "project" });
+  assert.deepEqual(filterBoard([...rows, team], "project").map(row => row.id), ["team-run"]);
 });
 
 test("mission decisions remain open until an answer is recorded", () => {

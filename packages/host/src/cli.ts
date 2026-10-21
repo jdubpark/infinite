@@ -238,6 +238,8 @@ infinite repo init --permissions off        Disable delegation for future runs
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite projects [--json]                 List projects and suggested groups
 infinite projects group NAME REPO_ID...    Create a multi-repository project
+infinite projects rename|hide|show ID       Rename or hide a project
+infinite projects primary ID CHECKOUT_ID   Choose the checkout a project works in
 infinite start [--project ID] "task"       Start a mission
 infinite mission status|answer|steer|pause|resume|cancel ...
 infinite board [--project ID]              Watch the owner board

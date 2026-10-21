@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import * as Crypto from "expo-crypto";
-import { api, ApiError, connectionKey, type Connection, type Me } from "../../api/client";
+import { api, ApiError, connectionKey, type Connection, type Me, type ProjectGroupList } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
+import { checkoutsOf, groupContaining, preferredCheckout, visibleGroups } from "../projects/model";
 import { Button } from "../../components/Button";
 import { useKeyboardPadding } from "../../components/keyboard";
 import { FloatingNotice } from "../../components/FloatingNotice";
@@ -33,6 +34,9 @@ export function GoalCreate({ connection }: { connection: Connection }) {
   const pending = creation.pending;
   const { data: me, online, stale, refresh } = usePoll(() => api<Me>(connection, "/me"), 5000, [connection]);
   const projects = me?.projects ?? [];
+  // Older hosts lack /project-groups; the poll then stays null and the host project chips remain.
+  const { data: groupList } = usePoll(() => api<ProjectGroupList>(connection, "/project-groups"), 5000, [connection]);
+  const groups = groupList ? visibleGroups(groupList.groups) : null;
   const [project, setProject] = useState(pending?.projectId);
   const [linearIssueId, setLinearIssueId] = useState(pending?.linearIssueId ?? "");
   const [title, setTitle] = useState(pending?.title ?? "");
@@ -49,8 +53,12 @@ export function GoalCreate({ connection }: { connection: Connection }) {
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   // A send started before this screen remounted is still in flight; its result re-renders through the store.
   const busy = sending || Boolean(pending && inFlight.has(pending.requestId));
-  const projectId = projects.some(value => value.id === project) ? project! : (projects.find(teamReady) ?? projects[0])?.id;
+  const selectedGroup = groups && project ? groupContaining(pending ? groupList!.groups : groups, project) : undefined;
+  const firstGroup = groups?.find(group => preferredCheckout(group)?.teamReady) ?? groups?.[0];
+  const projectId = project && (selectedGroup || projects.some(value => value.id === project)) ? project : groups ? (firstGroup ? preferredCheckout(firstGroup)?.projectId : undefined) : (projects.find(teamReady) ?? projects[0])?.id;
   const selectedProject = projects.find(value => value.id === projectId);
+  const workspaceGroup = groups ? groupContaining(groups, projectId ?? "") : undefined;
+  const checkouts = workspaceGroup ? checkoutsOf(workspaceGroup) : [];
   const locked = busy || Boolean(pending) || me?.role !== "owner";
   const ready = Boolean(me?.goals?.enabled && me.teams?.lineup && teamReady(selectedProject));
   const complete = Boolean(objective.trim() && successCriteria.trim() && allowedPaths.trim());
@@ -111,8 +119,17 @@ export function GoalCreate({ connection }: { connection: Connection }) {
       {field("Success criteria", successCriteria, setSuccessCriteria, { multiline: true, maxLength: 4000, placeholder: "What evidence would show the goal was achieved?" })}
       {field("Goal name (optional)", title, setTitle, { maxLength: 100, placeholder: "Uses the first line of the outcome" })}
       <Text style={t.label}>Workspace</Text>
-      <Choices values={projects.map(value => value.id)} selected={projectId} disabled={locked} onSelect={value => { setProject(value); setLinearIssueId(""); }}
-        label={value => { const item = projects.find(candidate => candidate.id === value)!; return teamReady(item) ? item.name : `${item.name} · setup required`; }} />
+      {groups ? <>
+        <Choices values={groups.map(group => group.id)} selected={workspaceGroup?.id} disabled={locked}
+          onSelect={value => { const next = preferredCheckout(groups.find(group => group.id === value)!)?.projectId; if (next) { setProject(next); setLinearIssueId(""); } }}
+          label={value => { const group = groups.find(candidate => candidate.id === value)!; return checkoutsOf(group).some(checkout => checkout.teamReady) ? group.name : `${group.name} · setup required`; }} />
+        {checkouts.length > 1 ? <>
+          <Text style={t.label}>Checkout</Text>
+          <Choices values={checkouts.map(checkout => checkout.projectId)} selected={projectId} disabled={locked} onSelect={value => { setProject(value); setLinearIssueId(""); }}
+            label={value => checkouts.find(checkout => checkout.projectId === value)!.name} />
+        </> : null}
+      </> : <Choices values={projects.map(value => value.id)} selected={projectId} disabled={locked} onSelect={value => { setProject(value); setLinearIssueId(""); }}
+        label={value => { const item = projects.find(candidate => candidate.id === value)!; return teamReady(item) ? item.name : `${item.name} · setup required`; }} />}
       {selectedProject && !teamReady(selectedProject) ? <Text style={t.warning}>Select a workspace with required team checks.</Text> : null}
       {selectedProject?.team?.establishChecks ? <Text style={t.note}>The first team will establish build and test commands; later cycles keep the same commands.</Text> : null}
       {selectedProject?.linear?.enabled ? field("Existing Linear issue (optional)", linearIssueId, setLinearIssueId, { maxLength: 100, literal: true, placeholder: "Issue identifier or UUID", note: "Leave empty to create a goal issue. Each cycle gets a child issue; workflow states stay under your control." }) : null}

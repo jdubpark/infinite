@@ -18,7 +18,7 @@ infinite --local-ui opencode [--model PROVIDER/MODEL] [--prompt "Task"]
 infinite list [--json]
 infinite resources [--watch] [--json]
 infinite close SESSION_ID [--yes] [--takeover] [--json]
-infinite projects
+infinite projects [group NAME REPO_ID... | rename ID NAME | hide ID | show ID | primary ID CHECKOUT_ID]
 infinite resume [session ID or unique prefix]
 infinite monitor [session ID or unique prefix]
 infinite recover SESSION_ID [--output NEW_DIRECTORY]

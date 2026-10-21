@@ -32,6 +32,7 @@ type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel"; subta
 type Stored = {
   mission: Mission;
   fingerprint: string;
+  requestFingerprints?: string[];
   receipts: Record<string, string>;
   folder: string;
   repos: MissionPromptRepo[];
@@ -144,21 +145,38 @@ export class MissionService {
   replayCreate(input: CreateMission) {
     const request = createMissionSchema.parse(input), prior = this.records.get(request.requestId);
     if (!prior) return undefined;
-    if (prior.fingerprint !== digest(request)) throw new TeamError(409, "request-conflict", "This request ID belongs to a different mission.");
+    const fingerprint = digest(request);
+    if (prior.fingerprint !== fingerprint && !prior.requestFingerprints?.includes(fingerprint))
+      throw new TeamError(409, "request-conflict", "This request ID belongs to a different mission.");
     return this.view(prior);
   }
-  create(input: CreateMission) {
+  create(input: CreateMission, originalInput?: CreateMission) {
     const request = createMissionSchema.parse(input);
+    const originalFingerprint = originalInput && digest(createMissionSchema.parse(originalInput));
     return this.enqueue(() => {
       const replayed = this.replayCreate(request);
       if (replayed) return replayed;
       const fingerprint = digest(request);
       if (!this.enabled()) throw new TeamError(409, "missions-not-configured", "Configure a team lineup with a strong coordinator and reviewer before starting a mission.");
       const group = this.groups.get(request.groupId);
+      const checkoutIds = new Set(group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId)));
+      if (request.checkouts?.some(projectId => !checkoutIds.has(projectId)))
+        throw new TeamError(400, "mission-checkout-invalid", "Choose checkouts that belong to this project.");
+      const checkoutEvents: string[] = [];
       const repos: MissionPromptRepo[] = group.repos.map(repo => {
-        const project = this.config.projects.find(item => item.id === repo.projectId);
-        if (!project) throw new TeamError(409, "mission-repository-missing", `Repository ${repo.projectId} is no longer enrolled on this host.`);
-        return { projectId: project.id, name: project.name, path: realpathSync(project.path), teamReady: Boolean(project.team && (project.team.checks.length || project.team.establishChecks)) };
+        const requested = repo.checkouts.find(checkout => request.checkouts?.includes(checkout.projectId));
+        const chosen = requested
+          ?? repo.checkouts.find(checkout => checkout.primary && checkout.teamReady)
+          ?? repo.checkouts.find(checkout => checkout.teamReady)
+          ?? repo.checkouts.find(checkout => checkout.primary)
+          ?? repo.checkouts[0];
+        if (!chosen) throw new TeamError(409, "mission-repository-missing", `Repository ${repo.projectId} has no enrolled checkout on this host.`);
+        const project = this.config.projects.find(item => item.id === chosen.projectId);
+        if (!project) throw new TeamError(409, "mission-repository-missing", `Repository ${chosen.projectId} is no longer enrolled on this host.`);
+        const teamReady = Boolean(project.team && (project.team.checks.length || project.team.establishChecks));
+        if (!requested && chosen.projectId !== repo.projectId)
+          checkoutEvents.push(`Repository ${repo.name}: the primary checkout is not configured for subteams; using ${chosen.projectId}.`);
+        return { projectId: project.id, name: repo.name, path: realpathSync(project.path), teamReady };
       });
       if (!repos.some(repo => repo.teamReady)) throw new TeamError(409, "mission-project-not-configured", "Configure required checks, or authorize a team to establish them, in at least one repository of this project.");
       const lineup = structuredClone(this.config.teams!.lineup!), profile = this.config.agents[lineup.coordinator.provider];
@@ -171,13 +189,15 @@ export class MissionService {
       catch { throw new TeamError(409, "team-model-profile-conflict", "Move model, effort, and fallback-model arguments from provider profiles into the team lineup before starting a mission."); }
       const folder = this.missionFolder(request.requestId, repos);
       const createdAt = now();
-      const stored: Stored = { fingerprint, receipts: {}, folder, repos, attempts: [], inbox: [{ type: "start" }], notes: [], notified: [], launches: {}, ops: [], refusals: 0, mission: {
+      const stored: Stored = { fingerprint, ...(originalFingerprint && originalFingerprint !== fingerprint ? { requestFingerprints: [originalFingerprint] } : {}),
+        receipts: {}, folder, repos, attempts: [], inbox: [{ type: "start" }], notes: [], notified: [], launches: {}, ops: [], refusals: 0, mission: {
         id: request.requestId, groupId: group.id, groupName: group.name, repoProjectIds: repos.map(repo => repo.projectId),
         title: request.title ?? request.objective.split("\n")[0].trim().slice(0, 100), objective: request.objective,
         maxSubtasks: request.maxSubtasks, maxMinutes: request.maxMinutes, deadlineAt: new Date(Date.parse(createdAt) + request.maxMinutes * 60000).toISOString(),
         revision: 1, status: "planning", createdAt, updatedAt: createdAt, lineup, subtasks: [], decisions: [], steering: [], events: [],
       } };
       this.event(stored, "Mission approved. The coordinator will inspect the repositories and dispatch subtasks.");
+      for (const text of checkoutEvents) this.event(stored, text);
       this.records.set(stored.mission.id, stored); this.save(stored);
       return this.view(stored);
     });
@@ -888,26 +908,33 @@ function missionDetail(mission: Mission, teamById: Map<string, TeamView>) {
 }
 
 /** The owner's board: missions, plus team runs and goals that no mission started. Goal cycles appear through their goal. */
-export function missionBoard(missions: Mission[], teams: TeamView[], goals: ProductGoal[], projects: Config["projects"]): Board {
+export function missionBoard(
+  missions: Mission[], teams: TeamView[], goals: ProductGoal[], projects: Config["projects"],
+  containing: (projectId: string) => { id: string; name: string } | undefined,
+): Board {
   const projectName = (id: string) => projects.find(project => project.id === id)?.name ?? id;
   const teamById = new Map(teams.map(team => [team.id, team]));
   const items: BoardItem[] = [];
   for (const mission of missions) {
     const column: BoardColumn = ["needs-input", "blocked"].includes(mission.status) || promptedSubtask(mission, teamById) ? "needs-input" : mission.status === "ready-for-review" ? "review" : mission.status === "cancelled" ? "ended" : "working";
-    items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: mission.groupId, projectName: mission.groupName, column, status: mission.status,
+    // A mission started before its checkout folded keeps its pinned record; the row follows the project that holds that checkout now.
+    const owner = mission.repoProjectIds.map(id => containing(id)).find(Boolean);
+    items.push({ kind: "mission", id: mission.id, title: mission.title, groupId: owner?.id ?? mission.groupId, projectName: owner?.name ?? mission.groupName, column, status: mission.status,
       detail: oneLine(missionDetail(mission, teamById)), updatedAt: mission.updatedAt,
       subtasks: subtaskCounts(mission) });
   }
   for (const team of teams) {
     if (team.missionId || team.goal) continue;
+    const owner = containing(team.projectId);
     const column: BoardColumn = ["needs-input", "blocked"].includes(team.status) || waitsOnProvider(team) ? "needs-input" : team.status === "ready-for-review" ? "review" : ["merged", "no-change", "cancelled"].includes(team.status) ? "ended" : "working";
-    items.push({ kind: "team", id: team.id, title: team.title, projectName: projectName(team.projectId), column, status: team.status, detail: oneLine(teamDetail(team)), updatedAt: team.updatedAt });
+    items.push({ kind: "team", id: team.id, title: team.title, ...(owner ? { groupId: owner.id } : {}), projectName: owner?.name ?? projectName(team.projectId), column, status: team.status, detail: oneLine(teamDetail(team)), updatedAt: team.updatedAt });
   }
   for (const goal of goals) {
+    const owner = containing(goal.projectId);
     const column: BoardColumn = ["needs-input", "blocked"].includes(goal.status) || (["running", "paused"].includes(goal.status) && goal.activeTeamId && waitsOnProvider(teamById.get(goal.activeTeamId))) ? "needs-input" : ["running", "paused"].includes(goal.status) ? "working" : goal.status === "ready-for-review" ? "review" : "ended";
     const active = goal.activeTeamId ? teamById.get(goal.activeTeamId) : undefined;
     const detail = openTeamQuestion(active) ?? (goal.status === "running" && active ? `Feature ${goal.cycles.length}: ${teamDetail(active)}` : goal.reason ?? goal.status);
-    items.push({ kind: "goal", id: goal.id, title: goal.title, projectName: projectName(goal.projectId), column, status: goal.status, detail: oneLine(detail), updatedAt: goal.updatedAt });
+    items.push({ kind: "goal", id: goal.id, title: goal.title, ...(owner ? { groupId: owner.id } : {}), projectName: owner?.name ?? projectName(goal.projectId), column, status: goal.status, detail: oneLine(detail), updatedAt: goal.updatedAt });
   }
   const order: BoardColumn[] = ["needs-input", "working", "review", "ended"];
   items.sort((a, b) => order.indexOf(a.column) - order.indexOf(b.column) || b.updatedAt.localeCompare(a.updatedAt));

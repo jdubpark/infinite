@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createServer as createNetServer } from "node:net";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
@@ -55,8 +56,11 @@ function harness() {
   const at = new Date().toISOString();
   const groups: ProjectGroupLookup = { get: id => {
     if (id !== "shop") throw new TeamError(404, "project-group-not-found", "This project does not exist.");
-    return { id, name: "Shop", implicit: false, revision: 1, createdAt: at, updatedAt: at,
-      repos: [{ projectId: "api", name: "API", path: api }, { projectId: "web", name: "Web", path: web }] };
+    return { id, name: "Shop", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: at, updatedAt: at,
+      repos: [
+        { projectId: "api", name: "API", path: api, checkouts: [{ projectId: "api", name: "API", path: api, primary: true, teamReady: true }] },
+        { projectId: "web", name: "Web", path: web, checkouts: [{ projectId: "web", name: "Web", path: web, primary: true, teamReady: true }] },
+      ] };
   } };
   let services: { teams: TeamService; missions: MissionService } | undefined;
   const open = () => {
@@ -94,6 +98,33 @@ const standaloneRequest = (projectId: string): CreateTeam => ({
   requestId: randomUUID(), projectId, provider: "claude", useConfiguredLineup: true,
   title: "Standalone run", objective: "Make an independent repository change", parallelism: 1,
 });
+
+function missionCheckoutAdmission(primaryReady: boolean) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "mission-checkouts-")));
+  const project = (id: string) => { const path = join(root, id); mkdirSync(path); return path; };
+  const api = project("api"), apiAlt = project("api-alt");
+  const checks = [{ command: process.execPath, args: ["-e", "0"] }];
+  const config: Config = { port: 0, origin: "http://127.0.0.1", keyFile: join(root, "key"), stateDir: join(root, "state"), runDir: join(root, "run"), tokens: [],
+    environment: "local", enableDemo: false, maxSessions: 24, agents: { claude: { command: process.execPath, args: [] } },
+    projects: [
+      { id: "api", name: "API", path: api, ...(primaryReady ? { team: { checks } } : {}) },
+      { id: "api-alt", name: "API alternate", path: apiAlt, team: { checks } },
+    ], teams: { workspaceDir: join(root, "teams"), lineup } };
+  const at = new Date().toISOString();
+  const groups: ProjectGroupLookup = { get: id => {
+    if (id !== "shop") throw new TeamError(404, "project-group-not-found", "This project does not exist.");
+    return { id, name: "Shop", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: at, updatedAt: at,
+      repos: [
+        { projectId: "api", name: "API", path: api, checkouts: [
+          { projectId: "api", name: "API", path: api, primary: true, teamReady: primaryReady },
+          { projectId: "api-alt", name: "API alternate", path: apiAlt, primary: false, teamReady: true },
+        ] },
+      ] };
+  } };
+  const teams = { useMissionReservations() {}, isActiveRun() { return false; } };
+  const missions = new MissionService(config, randomBytes(32), {} as Manager, teams as unknown as TeamService, groups);
+  return { missions, close: () => { missions.close(); rmSync(root, { recursive: true, force: true }); } };
+}
 
 test("mission-managed sessions refuse direct human input but keep answers, reads, and standalone access", { timeout: 15000 }, async () => {
   const host = await inProcessHost();
@@ -385,6 +416,49 @@ test("mission prompt keeps 21 open child questions under the byte limit without 
   assert.match(bounded.prompt, new RegExp(`${oversizedMessages.length - bounded.includedMessageCount} more messages are waiting`));
 });
 
+test("a mission pins a team-ready alternate checkout when its primary checkout is not configured", async () => {
+  const h = missionCheckoutAdmission(false);
+  try {
+    const mission = await h.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Update the API", maxSubtasks: 8, maxMinutes: 30 });
+    assert.deepEqual(mission.repoProjectIds, ["api-alt"]);
+    assert.ok(mission.events.some(event => /the primary checkout is not configured for subteams; using/i.test(event.text)), "the mission records why it selected the alternate checkout");
+  } finally { h.close(); }
+});
+
+test("a mission pins a team-ready primary checkout without a primary-not-configured event", async () => {
+  const h = missionCheckoutAdmission(true);
+  try {
+    const mission = await h.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Update the API", maxSubtasks: 8, maxMinutes: 30 });
+    assert.deepEqual(mission.repoProjectIds, ["api"]);
+    assert.equal(mission.events.some(event => /the primary checkout is not configured for subteams; using/i.test(event.text)), false);
+  } finally { h.close(); }
+});
+
+test("mission checkout overrides pin the requested alternate and reject checkouts outside the group", async () => {
+  const h = missionCheckoutAdmission(false);
+  try {
+    const mission = await h.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Update the API", maxSubtasks: 8, maxMinutes: 30, checkouts: ["api-alt"] });
+    assert.deepEqual(mission.repoProjectIds, ["api-alt"]);
+    assert.equal(mission.events.some(event => /the primary checkout is not configured for subteams; using/i.test(event.text)), false);
+
+    await assert.rejects(
+      h.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Update the API", maxSubtasks: 8, maxMinutes: 30, checkouts: ["outside"] }),
+      (error: TeamError) => error.status === 400 && error.code === "mission-checkout-invalid",
+    );
+  } finally { h.close(); }
+});
+
+test("mission create replays the original host-project group alias after canonicalizing its group id", async () => {
+  const h = missionCheckoutAdmission(true);
+  try {
+    const original: CreateMission = { requestId: randomUUID(), groupId: "api", objective: "Update the API", maxSubtasks: 8, maxMinutes: 30 };
+    const created = await h.missions.create({ ...original, groupId: "shop" }, original);
+    const replayed = h.missions.replayCreate(original);
+    assert.equal(replayed?.id, created.id);
+    assert.equal(replayed?.groupId, "shop");
+  } finally { h.close(); }
+});
+
 test("a mission dispatches dependent subteams across two repositories, routes their questions, and reports only after every subtask finishes", { timeout: 240000 }, async () => {
   const h = harness();
   try {
@@ -570,7 +644,7 @@ test("a mission refuses invalid dispatches, and pausing and cancelling reach its
     await waitFor(async () => teams.get(teamId).status, status => status === "cancelled", 30000);
     const ended = await until(() => missions.get(created.id), mission => mission.coordinator?.status === "stopped" && mission.subtasks[0].status === "cancelled");
     assert.equal(ended.subtasks[0].teamStatus, "cancelled");
-    assert.deepEqual(missionBoard([ended], [], [], []).items[0].subtasks, { total: 0, running: 0, done: 0 }, "Cancelled subtasks do not count toward the board's done/total");
+    assert.deepEqual(missionBoard([ended], [], [], [], () => undefined).items[0].subtasks, { total: 0, running: 0, done: 0 }, "Cancelled subtasks do not count toward the board's done/total");
     await assert.rejects(missions.steer(created.id, { requestId: randomUUID(), revision: ended.revision, text: "More" }), (error: TeamError) => error.code === "mission-not-running");
   } finally { await h.close(); }
 });
@@ -710,8 +784,11 @@ function scripted() {
   const at = new Date().toISOString();
   const groups: ProjectGroupLookup = { get: id => {
     if (id !== "shop" || removed) throw new TeamError(404, "project-group-not-found", "This project does not exist.");
-    return { id, name: "Shop", implicit: false, revision: 1, createdAt: at, updatedAt: at,
-      repos: [{ projectId: "api", name: "API", path: config.projects[0].path }, { projectId: "web", name: "Web", path: config.projects[1].path }] };
+    return { id, name: "Shop", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: at, updatedAt: at,
+      repos: [
+        { projectId: "api", name: "API", path: config.projects[0].path, checkouts: [{ projectId: "api", name: "API", path: config.projects[0].path, primary: true, teamReady: true }] },
+        { projectId: "web", name: "Web", path: config.projects[1].path, checkouts: [{ projectId: "web", name: "Web", path: config.projects[1].path, primary: true, teamReady: true }] },
+      ] };
   } };
   const missions = new MissionService(config, randomBytes(32), manager as unknown as Manager, teams as unknown as TeamService, groups);
   missions.start();

@@ -11,7 +11,7 @@ import type { TeamView } from "../packages/host/src/team-types.js";
 import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { Config } from "../packages/host/src/types.js";
 
-const projects: Config["projects"] = [{ id: "api", name: "API", path: "/srv/repos/api" }, { id: "web", name: "Web", path: "/srv/repos/web" }];
+const projects: Config["projects"] = [{ id: "api", name: "API", path: "/srv/repos/api" }, { id: "web", name: "Web", path: "/srv/repos/web" }, { id: "docs", name: "Docs", path: "/srv/repos/docs" }];
 const at = (minute: number) => new Date(Date.UTC(2026, 0, 1, 0, minute)).toISOString();
 const mission = (status: Mission["status"], minute: number, extra: Partial<Mission> = {}) => ({
   id: randomUUID(), groupId: "shop", groupName: "Shop", repoProjectIds: ["api", "web"], title: `Mission ${status}`, objective: "Ship it", status,
@@ -38,11 +38,17 @@ test("the board maps missions, standalone teams, and goals to columns and hides 
     mission("blocked", 5, { reason: "The coordinator reported a blocker." }), mission("ready-for-review", 6, { result: { summary: "Both repositories are ready.", revision: 2, at: at(6) } }),
     mission("cancelled", 7),
   ];
-  const teams = [subteam, cycle, asking, team("blocked", 8, { reason: "Checks failed." }), team("reviewing", 9), team("paused", 10), team("ready-for-review", 11),
+  const teams = [subteam, cycle, asking, team("working", 7, { id: "unmapped-team", projectId: "docs", title: "Unmapped team" }), team("blocked", 8, { reason: "Checks failed." }), team("reviewing", 9), team("paused", 10), team("ready-for-review", 11),
     team("merged", 12), team("no-change", 13), team("cancelled", 14)];
   const goals = [goal("running", 15), goal("paused", 16), goal("needs-input", 17), goal("blocked", 18), goal("ready-for-review", 19),
     goal("no-opportunity", 20), goal("limit-reached", 21), goal("achieved", 22), goal("cancelled", 23)];
-  const { items } = missionBoard(missions, teams, goals, projects);
+  const containing = (projectId: string) => ["api", "web"].includes(projectId) ? { id: "shop", name: "Shop" } : undefined;
+  // A mission that pinned "api" before folding follows the project that holds "api" now.
+  const legacy = mission("working", 30, { groupId: "api", groupName: "API", repoProjectIds: ["api"], title: "Legacy mission" });
+  const legacyRow = missionBoard([legacy], [], [], projects, containing).items[0]!;
+  assert.equal(legacyRow.groupId, "shop");
+  assert.equal(legacyRow.projectName, "Shop");
+  const { items } = missionBoard(missions, teams, goals, projects, containing);
   const column = (kind: string, status: string) => items.filter(item => item.kind === kind && item.status === status).map(item => item.column);
 
   assert.equal(items.length, missions.length + teams.length - 2 + goals.length);
@@ -68,9 +74,15 @@ test("the board maps missions, standalone teams, and goals to columns and hides 
   assert.equal(find("Mission working").projectName, "Shop");
   assert.equal(find("Mission working").groupId, "shop");
   assert.equal(find("Team needs-input").detail, "Which format? Pick one.");
+  assert.equal(find("Team needs-input").projectName, "Shop");
+  assert.equal(find("Team needs-input").groupId, "shop");
   assert.equal(find("Team blocked").detail, "Checks failed.");
-  assert.equal(find("Team reviewing").projectName, "API");
-  assert.equal(find("Goal running").projectName, "Web");
+  assert.equal(find("Team reviewing").projectName, "Shop");
+  assert.equal(find("Team reviewing").groupId, "shop");
+  assert.equal(find("Goal running").projectName, "Shop");
+  assert.equal(find("Goal running").groupId, "shop");
+  assert.equal(find("Unmapped team").projectName, "Docs");
+  assert.ok(!Object.hasOwn(find("Unmapped team"), "groupId"));
 });
 
 test("a member stopped on a provider prompt moves its run, mission, or goal to needs-input, and an ended mission drops its open question", () => {
@@ -86,7 +98,7 @@ test("a member stopped on a provider prompt moves its run, mission, or goal to n
       subtasks: [{ id: "b", repoProjectId: "web", title: "Client", objective: "x", size: "solo", parallelism: 1, dependsOn: [], status: "running", teamId: prompted.id }] }),
   ] as Mission[];
   const goals = [goal("running", 7, { title: "Prompted goal", activeTeamId: goalRun.id }), goal("cancelled", 8, { title: "Cancelled goal", activeTeamId: goalRun.id })];
-  const { items } = missionBoard(missions, [prompted, standalone, goalRun, finished], goals, projects);
+  const { items } = missionBoard(missions, [prompted, standalone, goalRun, finished], goals, projects, () => undefined);
   const find = (title: string) => items.find(item => item.title === title)!;
   assert.equal(find("Prompted").column, "needs-input");
   assert.equal(find("Prompted").detail, `Subtask a: ${waiting}`);

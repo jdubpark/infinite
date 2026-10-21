@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
-import { api, ApiError, connectionKey, type Connection, type Mission, type ProjectGroup } from "../../api/client";
+import { api, ApiError, connectionKey, type BoardItem, type Connection, type Mission, type ProjectGroup, type ProjectGroupSuggestion } from "../../api/client";
 import { Button } from "../../components/Button";
 import { Sheet, SheetRow } from "../../components/Glass";
+import { CombineRow } from "../projects/CombineRow";
+import { groupActivity, visibleGroups } from "../projects/model";
 import { missionCreations, type MissionCreationRequest } from "../../store/requests";
 import { theme } from "../../theme";
 
@@ -12,8 +14,9 @@ const LAST_PROJECT_KEY = "infinite.mobile.last-project";
 const inFlight = new Set<string>();
 
 /** A project-targeted mission creator. An uncertain retry reuses its stored request body and ID. */
-export function Composer({ connection, groups, onCreated }: {
-  connection: Connection; groups: ProjectGroup[]; onCreated: (mission: Mission) => void;
+export function Composer({ connection, groups, items, suggestions, owner, onCreated, onManage, onChanged }: {
+  connection: Connection; groups: ProjectGroup[]; items: BoardItem[]; suggestions: ProjectGroupSuggestion[]; owner: boolean;
+  onCreated: (mission: Mission) => void; onManage: () => void; onChanged: () => void;
 }) {
   const machine = connectionKey(connection);
   const state = missionCreations.use(machine);
@@ -22,21 +25,23 @@ export function Composer({ connection, groups, onCreated }: {
   const [objective, setObjective] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [sending, setSending] = useState(false);
+  const [pickerMessage, setPickerMessage] = useState<string | null>(null);
   const mounted = useRef(true);
   const latest = useRef(onCreated);
   useEffect(() => { latest.current = onCreated; });
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const busy = sending || Boolean(pending && inFlight.has(`${machine}/${pending.requestId}`));
-  const selected = groups.find(group => group.id === groupId) ?? groups[0];
+  const visible = useMemo(() => visibleGroups(groups), [groups]);
+  const selected = visible.find(group => group.id === groupId) ?? visible[0];
 
   useEffect(() => {
     let live = true;
     void SecureStore.getItemAsync(LAST_PROJECT_KEY).then(saved => {
-      if (live && groups.some(group => group.id === saved)) setGroupId(saved!);
-      else if (live && groups.length) setGroupId(groups[0]!.id);
-    }).catch(() => { if (live && groups.length) setGroupId(groups[0]!.id); });
+      if (live && visible.some(group => group.id === saved)) setGroupId(saved!);
+      else if (live && visible.length) setGroupId(visible[0]!.id);
+    }).catch(() => { if (live && visible.length) setGroupId(visible[0]!.id); });
     return () => { live = false; };
-  }, [groups]);
+  }, [visible]);
 
   function choose(group: ProjectGroup) {
     setGroupId(group.id);
@@ -73,11 +78,11 @@ export function Composer({ connection, groups, onCreated }: {
 
   return <View style={s.dock}>
     <View style={s.composer}>
-      <SheetRow glyph="target" label={selected?.name ?? (groups.length ? "Choose a project" : "No projects available")}
-        detail={selected ? `${selected.repos.length} ${selected.repos.length === 1 ? "repository" : "repositories"}` : undefined}
+      <SheetRow glyph="target" label={selected?.name ?? (visible.length ? "Choose a project" : groups.length ? "No visible projects" : "No projects available")}
+        detail={selected ? groupActivity(items, selected.id) : undefined}
         onPress={() => setPickerOpen(true)} disabled={!groups.length || busy || Boolean(pending)} />
       <TextInput accessibilityLabel="Mission objective" value={objective} onChangeText={setObjective}
-        placeholder="What should this project do?" placeholderTextColor={theme.colors.placeholder}
+        placeholder="What should we work on?" placeholderTextColor={theme.colors.placeholder}
         multiline maxLength={24000} editable={!busy && !pending} style={s.input} textAlignVertical="top" />
       <View style={s.actions}>
         {state.message ? <Text accessibilityLiveRegion="polite" style={s.message}>{state.message}</Text> : null}
@@ -87,9 +92,13 @@ export function Composer({ connection, groups, onCreated }: {
     </View>
     <Sheet visible={pickerOpen} onClose={() => setPickerOpen(false)} title="Choose a project">
       <ScrollView style={s.projects} keyboardShouldPersistTaps="handled">
-        {groups.map(group => <SheetRow key={group.id} selected={group.id === selected?.id} glyph="target" label={group.name}
-          detail={`${group.repos.length} ${group.repos.length === 1 ? "repository" : "repositories"}`}
-          onPress={() => choose(group)} />)}
+        {visible.map(group => <SheetRow key={group.id} selected={group.id === selected?.id} glyph="target" label={group.name}
+          detail={groupActivity(items, group.id)} onPress={() => choose(group)} />)}
+        {owner ? suggestions.map(suggestion => <CombineRow key={suggestion.groupIds.join("+")} connection={connection}
+          suggestion={suggestion} groups={groups} onCombined={() => { setPickerMessage(null); onChanged(); }}
+          onError={setPickerMessage} />) : null}
+        {pickerMessage ? <Text accessibilityLiveRegion="polite" style={s.pickerMessage}>{pickerMessage}</Text> : null}
+        <SheetRow glyph="forward" label="Manage projects" onPress={() => { setPickerOpen(false); onManage(); }} />
       </ScrollView>
     </Sheet>
   </View>;
@@ -102,4 +111,5 @@ const s = StyleSheet.create({
   actions: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingHorizontal: 6 },
   message: { flex: 1, color: theme.colors.mutedInk, fontSize: 12, lineHeight: 17 },
   projects: { maxHeight: 420 },
+  pickerMessage: { marginVertical: 8, paddingHorizontal: 10, fontSize: 12, lineHeight: 17, color: theme.colors.error },
 });

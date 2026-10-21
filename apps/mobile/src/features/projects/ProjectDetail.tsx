@@ -111,7 +111,7 @@ export function ProjectDetail({ connection, id }: { connection: Connection; id: 
         </View> : null}
       </Section>
 
-      {group.repos.map(repo => <Section key={repo.projectId} title={repo.name}>
+      {group.repos.map(repo => <Section key={repo.projectId} title={group.repos.length > 1 || repo.name !== group.name ? repo.name : "Checkouts"}>
         {[...repo.checkouts].sort((a, b) => Number(b.primary) - Number(a.primary)).map(checkout => {
           const movable = owner && !checkout.primary;
           const body = <>

@@ -39,3 +39,28 @@ test("captureIdentity prefers the remote, falls back to the lowest root commit, 
   const odd: GitReader = (_cwd, args) => args[0] === "config" ? "nonsense" : "abcd";
   assert.equal(captureIdentity({ id: "d", path: "/home/dev/odd" }, odd)?.key, "root:abcd");
 });
+
+test("readGit captures a real repository's remote from a linked worktree too", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const { readGit } = await import("../packages/host/src/checkout-identity.js");
+  const root = mkdtempSync(join(tmpdir(), "identity-"));
+  try {
+    const main = join(root, "main");
+    const run = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { stdio: "pipe", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } });
+    execFileSync("git", ["init", "-q", main], { stdio: "pipe" });
+    run(main, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "root");
+    run(main, "remote", "add", "origin", "git@github.com:example/sample.git");
+    run(main, "worktree", "add", "-q", "--detach", join(root, "linked"), "HEAD");
+    for (const path of [main, join(root, "linked")]) {
+      assert.equal(captureIdentity({ id: "x", path }, readGit)?.key, "remote:github.com/example/sample", path);
+    }
+    run(main, "remote", "remove", "origin");
+    const rooted = captureIdentity({ id: "x", path: join(root, "linked") }, readGit);
+    assert.equal(rooted?.key, `root:${run(main, "rev-list", "--max-parents=0", "HEAD").toString().trim()}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

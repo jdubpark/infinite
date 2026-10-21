@@ -15,9 +15,17 @@ export type CheckoutIdentity = {
 /** Trimmed stdout of `git -C cwd ...args`, or undefined when Git fails, is missing, or exceeds five seconds. */
 export type GitReader = (cwd: string, args: string[]) => string | undefined;
 
+/**
+ * Enrolled checkouts are often owned by the agent user, not the host's service user, and Git refuses to read a
+ * repository another user owns ("dubious ownership"). The reads here are metadata lookups that run no hooks, so
+ * the ownership check is waived per invocation; the file-system monitor is forced off because it is the one
+ * repository-configured command those lookups could otherwise start.
+ */
+const READ_ONLY_GIT = ["-c", "safe.directory=*", "-c", "core.fsmonitor=false"];
+
 export const readGit: GitReader = (cwd, args) => {
   try {
-    return execFileSync("git", ["-C", cwd, ...args], {
+    return execFileSync("git", [...READ_ONLY_GIT, "-C", cwd, ...args], {
       encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
     }).trim();
   } catch {

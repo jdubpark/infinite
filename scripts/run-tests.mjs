@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-// These integration files are sensitive to PTY contention or short lease and provider-flush windows.
-const serialFiles = new Set(["continuity.test.ts", "summary.test.ts", "worker-attention.test.ts"]);
+// These integration files are sensitive to PTY contention, filesystem events, or short lease and provider-flush windows.
+const serialFiles = new Set(["continuity.test.ts", "laptop-service.test.ts", "summary.test.ts", "worker-attention.test.ts"]);
 const testFiles = readdirSync(new URL("../tests/", import.meta.url))
   .filter((name) => name.endsWith(".test.ts"))
   .sort();

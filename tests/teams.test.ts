@@ -17,6 +17,7 @@ import type { HandoffPolicy, TeamHandoffContext } from "../packages/host/src/han
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON } from "../packages/host/src/team-workspace.js";
 
 // The shared fallback lineup used by delivery and permission tests; the limit tests below define their own.
 import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
@@ -563,7 +564,12 @@ test("a team builds concurrently in isolated copies and produces checked, review
     assert.ok(commands.some(command => command.cwd === f.source && command.command === "git"), "Source Git inspection must use the configured execution identity");
     for (const worker of workers)
       assert.ok(commands.some(command => command.cwd === worker.cwd && command.command === "git" && command.args.includes("add")), "Git must not stage agent-controlled files as the API identity");
-    assert.ok(commands.some(command => command.cwd === finished.workspace && command.command === process.execPath && command.args.includes("check.mjs")), "Configured checks must use the execution identity");
+    const checkCommands = commands.filter(command => command.command === process.execPath && command.args.includes("check.mjs"));
+    assert.ok(checkCommands.length > 0, "Configured checks must use the execution identity");
+    for (const command of checkCommands) {
+      assert.ok(command.cwd.startsWith(join(dirname(finished.workspace), "verification") + "/"), "Configured checks must run in a separate verification copy");
+      assert.equal(git(command.cwd, "rev-parse", "HEAD"), finished.headCommit, "The checked commit must match the reviewed integration commit");
+    }
   } finally { owner.close(); viewer.close(); await f.close(); }
 });
 
@@ -900,6 +906,132 @@ test("review approval cannot make an integration checkout changed after verifica
   } finally { await f.close(); }
 });
 
+test("a configured check cannot change the canonical integration checkout and Resume replans from a clean head", { timeout: 120000 }, async () => {
+  const f = await fixture("check-mutates");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const blocked = await f.settled(created.body.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.ok(blocked.checks.some(check => check.status === "passed"), "The configured check itself exits successfully");
+    assert.equal(readFileSync(join(blocked.workspace, "a.txt"), "utf8"), "revision 1\n", "verification writes must stay in their disposable copy");
+    assert.ok(blocked.events.some(event => /disposable verification workspace: .*\/verification\//.test(event.text)), "the retained verification copy must be discoverable");
+    const setupRuns = readFileSync(join(f.receipts, "permission-setup.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.ok(setupRuns.some(record => record.cwd.includes("/verification/")), "configured setup must run in the verification copy");
+    const key = readFileSync(f.host.config.keyFile);
+    const persisted = unseal<any>(key, `team:${blocked.id}`, readFileSync(join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`), "utf8"));
+    assert.equal(persisted.verificationRecovery?.failure, "verification-changed-files", "the structured recovery intent must be durable");
+
+    const resumeAction = { requestId: randomUUID(), revision: blocked.revision };
+    const resumed = await waitFor(() => f.host.fetchApi(`/teams/${blocked.id}/resume`, "owner", resumeAction), result => result.body?.code !== "members-stopping", 30000);
+    assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
+    assert.equal(resumed.body.status, "planning");
+    assert.equal(resumed.body.revision, blocked.revision + 1);
+    assert.equal(resumed.body.review, undefined);
+    assert.equal(resumed.body.members.length, blocked.members.length, "Resume keeps prior member evidence");
+    assert.notEqual(resumed.body.workspace, blocked.workspace);
+    assert.equal(git(resumed.body.workspace, "rev-parse", "HEAD"), blocked.headCommit);
+    assert.equal(git(resumed.body.workspace, "status", "--porcelain"), "");
+    assert.equal(readFileSync(join(blocked.workspace, "a.txt"), "utf8"), "revision 1\n", "recovery must leave the original integration copy intact");
+    assert.ok(resumed.body.events.some(event => /Original integration copy preserved at .*; fresh workspace at .*recovery\//.test(event.text)), "recovery paths must remain discoverable");
+    await waitFor(() => f.get(blocked.id), run => run.members.some(member => member.revision === resumed.body.revision), 30000);
+    const replanning = unseal<any>(key, `team:${blocked.id}`, readFileSync(join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`), "utf8"));
+    assert.equal(replanning.verificationRecovery, undefined, "later saves must not restore the consumed recovery marker");
+  } finally { await f.close(); }
+});
+
+test("a legacy completed read-only check failure resumes only from its current exact guard reason", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    stored.run.status = "blocked";
+    stored.run.reason = LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON;
+    stored.run.checks = stored.run.checks.map((check: TeamRun["checks"][number]) => ({ ...check, status: "failed", exitCode: 1, finishedAt: check.finishedAt ?? new Date().toISOString() }));
+    stored.pending = { id: randomUUID(), kind: "check", revision: stored.run.revision };
+    stored.checkHead = undefined;
+    writeFileSync(join(finished.workspace, "a.txt"), "Auto-fixed in the preserved legacy workspace\n");
+    writeSealed(file, key, `team:${finished.id}`, stored);
+
+    await f.host.start();
+    const blocked = await f.get(finished.id);
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.reason, LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, "constructor recovery must preserve exact current provenance");
+    assert.equal(blocked.resumable, true);
+    const resume = { requestId: randomUUID(), revision: blocked.revision };
+    const response = await waitFor(() => f.host.fetchApi(`/teams/${blocked.id}/resume`, "owner", resume), result => result.status !== 409 || result.body.code !== "members-stopping", 30000);
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.equal(response.body.status, "planning");
+    assert.equal(response.body.revision, blocked.revision + 1);
+    assert.notEqual(response.body.workspace, finished.workspace);
+    assert.equal(git(response.body.workspace, "rev-parse", "HEAD"), blocked.headCommit);
+    assert.equal(git(response.body.workspace, "status", "--porcelain"), "");
+    assert.equal(readFileSync(join(finished.workspace, "a.txt"), "utf8"), "Auto-fixed in the preserved legacy workspace\n");
+    assert.ok(response.body.members.length >= blocked.members.length, "member evidence remains available across recovery");
+    assert.equal(response.body.checks.length, blocked.checks.length, "rejected check evidence is retained");
+  } finally { await f.close(); }
+});
+
+test("a stale read-only event cannot authorize a completed check with another current reason", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    stored.run.status = "blocked";
+    stored.run.reason = "A different current failure.";
+    stored.run.events.push({ at: new Date().toISOString(), text: LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON });
+    stored.pending = { id: randomUUID(), kind: "check", revision: stored.run.revision };
+    stored.checkHead = undefined;
+    writeSealed(file, key, `team:${finished.id}`, stored);
+
+    await f.host.start();
+    const blocked = await f.get(finished.id);
+    assert.equal(blocked.status, "blocked");
+    assert.match(blocked.reason ?? "", /host restarted during a workspace or verification operation/);
+    assert.equal(blocked.resumable, false);
+    const response = await f.host.fetchApi(`/teams/${blocked.id}/resume`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.equal(response.status, 409);
+    assert.equal(response.body.code, "team-reconciliation-required");
+  } finally { await f.close(); }
+});
+
+test("a legacy-looking unknown pending operation with delivery intent remains reconciliation-only", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    stored.run.status = "blocked";
+    stored.run.reason = LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON;
+    stored.pending = { id: randomUUID(), kind: "result", revision: stored.run.revision };
+    stored.checkHead = undefined;
+    stored.deliveryAttempt = { memberId: "unknown-delivery-member", revision: stored.run.revision, headCommit: stored.run.headCommit };
+    writeSealed(file, key, `team:${finished.id}`, stored);
+
+    await f.host.start();
+    const blocked = await f.get(finished.id);
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.resumable, false);
+    const response = await f.host.fetchApi(`/teams/${blocked.id}/resume`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.equal(response.status, 409);
+    assert.equal(response.body.code, "team-reconciliation-required");
+  } finally { await f.close(); }
+});
+
 test("a check past teams.checkMinutes blocks a resumable run without spending a correction round", { timeout: 120000 }, async () => {
   const f = await fixture("lifecycle", undefined, { teams: { checkMinutes: 0.05 } });
   let checkPid: number | undefined;
@@ -989,6 +1121,9 @@ test("steering cannot disguise a check interrupted by API restart as a new plann
     });
     assert.equal(response.status, 409, "An orphaned check must require reconciliation rather than claim replanning");
     assert.equal(response.body.code, "team-reconciliation-required");
+    const resume = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: checking.revision });
+    assert.equal(resume.status, 409, "An interrupted pending check is not a proven completed verification failure");
+    assert.equal(resume.body.code, "team-reconciliation-required");
     const unchanged = await f.get(id);
     assert.equal(unchanged.status, "blocked");
     assert.equal(unchanged.revision, checking.revision);
@@ -1360,6 +1495,24 @@ test("project-manager prompts list configured setup and checks and forbid unauth
   assert.match(prompt, /checks run after integration and are fixed/);
   assert.match(prompt, /plan MUST NOT include verification/);
   assert.match(prompt, /say so in the summary and have tasks run additional commands \(such as a workspace's lint or typecheck\) themselves and report results/);
+});
+
+test("read-only prompts forbid repository outputs while delivery keeps its pinned Git authority", () => {
+  const base = { provider: "demo", revision: 1, projectId: "example-project", objective: "Inspect and implement a small feature", baseCommit: "a".repeat(40), headCommit: "b".repeat(40), steering: [], tasks: [], checks: [], members: [] };
+  const run = base as unknown as TeamRun;
+  for (const role of ["project-manager", "scout", "reviewer"] as const) {
+    const prompt = teamPrompt(run, role);
+    assert.match(prompt, /Read-only roles must leave every tracked and untracked repository file unchanged/);
+    assert.match(prompt, /Do not run commands, scripts, or options that auto-fix, format in place, generate tracked or untracked repository outputs/);
+    assert.match(prompt, /write reports or temporary files inside the repository/);
+    assert.match(prompt, /Read-only Git metadata operations, including fetches used for inspection, remain allowed/);
+    assert.match(prompt, /does not prohibit separately approved delivery Git operations/);
+  }
+  const delivery = teamPrompt({ ...run, branch: "infinite/team-example", delivery: { mode: "pr", repository: "example/app", baseBranch: "main" } } as TeamRun, "delivery");
+  assert.match(delivery, /Use approved Git\/GitHub tools, including an approved CLI when available/);
+  assert.match(delivery, /Push infinite\/team-example to the pinned repository/);
+  assert.match(delivery, /Never merge the pull request/);
+  assert.doesNotMatch(delivery, /Read-only roles must leave every tracked and untracked repository file unchanged/);
 });
 
 test("a rejected team report exposes the host's actionable 4xx response", async () => {

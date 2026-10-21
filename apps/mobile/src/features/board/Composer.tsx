@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import { api, ApiError, connectionKey, type BoardItem, type Connection, type Mission, type ProjectGroup, type ProjectGroupSuggestion } from "../../api/client";
 import { Button } from "../../components/Button";
 import { Sheet, SheetRow } from "../../components/Glass";
+import { Glyph } from "../../components/Icon";
 import { CombineRow } from "../projects/CombineRow";
 import { groupActivity, visibleGroups } from "../projects/model";
 import { missionCreations, type MissionCreationRequest } from "../../store/requests";
@@ -33,6 +34,7 @@ export function Composer({ connection, groups, items, suggestions, owner, onCrea
   const busy = sending || Boolean(pending && inFlight.has(`${machine}/${pending.requestId}`));
   const visible = useMemo(() => visibleGroups(groups), [groups]);
   const selected = visible.find(group => group.id === groupId) ?? visible[0];
+  const sendDisabled = !selected || !objective.trim() || busy || Boolean(pending);
 
   useEffect(() => {
     let live = true;
@@ -81,14 +83,20 @@ export function Composer({ connection, groups, items, suggestions, owner, onCrea
       <SheetRow glyph="target" label={selected?.name ?? (visible.length ? "Choose a project" : groups.length ? "No visible projects" : "No projects available")}
         detail={selected ? groupActivity(items, selected.id) : undefined}
         onPress={() => setPickerOpen(true)} disabled={!groups.length || busy || Boolean(pending)} />
-      <TextInput accessibilityLabel="Mission objective" value={objective} onChangeText={setObjective}
-        placeholder="What should we work on?" placeholderTextColor={theme.colors.placeholder}
-        multiline maxLength={24000} editable={!busy && !pending} style={s.input} textAlignVertical="top" />
-      <View style={s.actions}>
+      <View style={s.prompt}>
+        <TextInput accessibilityLabel="Mission objective" value={objective} onChangeText={setObjective}
+          placeholder="What should we work on?" placeholderTextColor={theme.colors.placeholder}
+          multiline maxLength={24000} editable={!busy && !pending} style={s.input} textAlignVertical="top" />
+        <Pressable accessibilityRole="button" accessibilityLabel={busy ? "Sending mission" : "Send mission"}
+          accessibilityState={{ disabled: sendDisabled, busy }} disabled={sendDisabled} onPress={submit}
+          style={({ pressed }) => [s.send, (pressed || sendDisabled) && s.dim]}>
+          {busy ? <ActivityIndicator size="small" color={theme.colors.white} /> : <Glyph name="send" size={20} color={theme.colors.white} />}
+        </Pressable>
+      </View>
+      {state.message || (pending && !busy) ? <View style={s.actions}>
         {state.message ? <Text accessibilityLiveRegion="polite" style={s.message}>{state.message}</Text> : null}
         {pending ? <Button compact secondary title="Retry" disabled={busy} onPress={() => void transmit(pending)} /> : null}
-        <Button title={busy ? "Sending…" : "Send"} disabled={!selected || !objective.trim() || busy || Boolean(pending)} onPress={submit} />
-      </View>
+      </View> : null}
     </View>
     <Sheet visible={pickerOpen} onClose={() => setPickerOpen(false)} title="Choose a project">
       <ScrollView style={s.projects} keyboardShouldPersistTaps="handled">
@@ -105,9 +113,12 @@ export function Composer({ connection, groups, items, suggestions, owner, onCrea
 }
 
 const s = StyleSheet.create({
-  dock: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 10, backgroundColor: theme.colors.paper, borderTopWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },
+  dock: { paddingHorizontal: 12, paddingTop: 8, backgroundColor: theme.colors.paper, borderTopWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },
   composer: { padding: 8, borderRadius: theme.radius.panel, backgroundColor: theme.colors.white, gap: 4 },
-  input: { minHeight: 54, maxHeight: 112, paddingHorizontal: 10, paddingVertical: 8, fontSize: 15, lineHeight: 21, color: theme.colors.ink },
+  prompt: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
+  input: { flex: 1, minHeight: 48, maxHeight: 112, paddingHorizontal: 10, paddingVertical: 12, fontSize: 15, lineHeight: 21, color: theme.colors.ink },
+  send: { width: 48, height: 48, borderRadius: 24, alignItems: "center", justifyContent: "center", backgroundColor: theme.colors.forest },
+  dim: { opacity: 0.45 },
   actions: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingHorizontal: 6 },
   message: { flex: 1, color: theme.colors.mutedInk, fontSize: 12, lineHeight: 17 },
   projects: { maxHeight: 420 },

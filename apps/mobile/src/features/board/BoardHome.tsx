@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
-import { ActivityIndicator, StyleSheet } from "react-native";
+import { ActivityIndicator, Platform, StyleSheet } from "react-native";
 import { useRouter } from "expo-router";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { useBottomTabBarHeight } from "expo-router/js-tabs";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { api, closeConnection, connectionKey, type Me } from "../../api/client";
+import { useKeyboardPadding } from "../../components/keyboard";
 import { identifyConnection } from "../../store/connection";
 import { forgetMachine, useSharedMachine } from "../../store/machines";
 import { registerForPush, unregisterPush, type PushState } from "../../push/register";
@@ -17,6 +19,11 @@ const PUSH_NOTES: Record<PushState, string> = {
 
 export function BoardHome() {
   const router = useRouter();
+  const keyboardHeight = useKeyboardPadding();
+  const tabBarHeight = useBottomTabBarHeight();
+  const insets = useSafeAreaInsets();
+  // Android's keyboard height excludes the system inset; the tab bar already reserves it.
+  const keyboardPadding = Math.max(0, keyboardHeight - tabBarHeight + (Platform.OS === "android" ? insets.bottom : 0));
   const { loaded, active, connection, profiles, select } = useSharedMachine();
   const [push, setPush] = useState<Record<string, PushState>>({});
   useEffect(() => {
@@ -39,8 +46,9 @@ export function BoardHome() {
     await removal;
     if (profiles.length === 1) router.replace("/pair");
   }
-  if (!loaded || !connection) return <SafeAreaView style={s.safe}><ActivityIndicator style={s.loading} color={theme.colors.forest} /></SafeAreaView>;
-  return <SafeAreaView style={s.safe}>
+  // The tab bar owns the bottom inset, including Android's system navigation area.
+  if (!loaded || !connection) return <SafeAreaView edges={["top", "left", "right"]} style={s.safe}><ActivityIndicator style={s.loading} color={theme.colors.forest} /></SafeAreaView>;
+  return <SafeAreaView edges={["top", "left", "right"]} style={[s.safe, { paddingBottom: keyboardPadding }]}>
     <Board key={active} connection={connection} machines={profiles} onSelectMachine={id => void select(id)}
       onAddMachine={() => router.push({ pathname: "/pair", params: { pair: "true" } })} onDisconnect={() => void disconnect()}
       pushNote={push[active] ? PUSH_NOTES[push[active]] : undefined} />

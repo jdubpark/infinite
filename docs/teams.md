@@ -655,6 +655,19 @@ observed problem, evidence, data shape, acceptance criteria, expected effect,
 and whether the interface changes. Prompts call for a concise brief and useful
 tasks, without process documents or artificial subdivisions.
 
+Each assignment gives a light worker one coherent outcome and the smallest
+necessary set of owned paths, with explicit exclusions. Its `instructions`
+contain the requested behavior, inspected source paths and entry points, agreed
+data/interface contracts and applicable error cases, constraints and dependency
+outputs, observable acceptance criteria, and exact focused check commands with
+expected results. Those checks supplement the run's required verification.
+The coordinator settles product and shared-interface decisions before dispatch,
+splits independent outcomes, and orders shared-interface work before consumers.
+Workers choose routine implementation details within that brief; a missing
+material requirement or required path goes through the existing question or
+blocker report with the exact gap and smallest proposed resolution. These are
+prompt instructions, not host validation of a brief's semantic completeness.
+
 The coordinator prefers `light` profiles for bounded research and implementation
 and selects from the configured pool. Each plan has 1–12 tasks. The host rejects
 unknown profiles, missing dependencies, cycles, duplicate task IDs, and

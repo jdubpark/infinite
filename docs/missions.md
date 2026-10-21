@@ -169,6 +169,14 @@ Size rules: a `solo` subtask starts a subteam with parallelism 1, and a `team`
 subtask uses its `parallelism` (1–4). The coordinator chooses the size; a simple
 mission may dispatch exactly one solo subtask.
 
+Each subtask's `objective` carries the self-contained assignment brief described
+in [Roles and execution](teams.md#roles-and-execution): one coherent outcome,
+bounded paths and exclusions, source pointers, agreed interfaces, constraints,
+dependency outputs, acceptance criteria, and focused checks. The mission
+coordinator resolves material product and interface decisions before dispatch;
+dependent objectives repeat the same shared contract. This is prompt guidance,
+not a host check that the objective is unambiguous.
+
 Scheduling: a subtask starts when every dependency is `done`. The host adds a
 dependency from each later subtask to the latest earlier, non-cancelled subtask
 in the same repository, including when the subtasks arrive in separate

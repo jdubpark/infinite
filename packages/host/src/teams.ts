@@ -1011,16 +1011,20 @@ export class TeamService {
       this.escalatePermissionDecision(stored, decision, "The target's changed files could not be listed for review.", "The permission request remains with the user because its changed files could not be listed for review.");
       return false;
     }
-    const feedback = JSON.stringify({ decisionId: decision.id, ownerScope: run.permissions.scope, objective: run.objective,
+    // The prompt already includes the complete objective and pinned owner scope.
+    const feedback = JSON.stringify({ decisionId: decision.id,
       targetAssignment: assignment(target), targetCwd: decision.targetCwd, targetTask: task ?? null,
       targetChangedPaths: changedPaths.slice(0, 100), targetChangedPathCount: changedPaths.length,
       acceptedChecks: this.requiredChecks(run) ?? null, prompt: decision.prompt });
-    if (Buffer.byteLength(feedback, "utf8") > 16_000) {
-      this.escalatePermissionDecision(stored, decision, "The recorded permission evidence exceeds the coordinator prompt limit and cannot be reviewed without truncation.", "The permission request remains with the user because its complete evidence exceeds the review limit.");
+    let member: TeamMember;
+    try {
+      member = this.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, undefined, run.lineup.coordinator);
+      member.prompt = teamPrompt(run, "permission-coordinator", undefined, feedback, member.provider ?? run.provider, member.modelProfile);
+    } catch (error) {
+      if (!(error instanceof TeamError) || error.code !== "team-prompt-too-large") throw error;
+      this.escalatePermissionDecision(stored, decision, "The complete evidence exceeds the 80 KiB coordinator prompt limit and cannot be reviewed without truncation.", "The permission request remains with the user because its complete evidence exceeds the review limit.");
       return false;
     }
-    const member = this.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, undefined, run.lineup.coordinator);
-    member.prompt = teamPrompt(run, "permission-coordinator", undefined, feedback, member.provider ?? run.provider, member.modelProfile);
     decision.coordinatorMemberId = member.memberId;
     const selectedProfile = this.config.agents[member.provider ?? run.provider];
     if (member.provider !== "claude" || !selectedProfile) {

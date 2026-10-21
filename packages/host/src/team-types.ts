@@ -169,6 +169,8 @@ export const createTeamSchema = z.object({
 export type CreateTeam = z.infer<typeof createTeamSchema>;
 export const teamMutationSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000) }).strict();
 export const teamActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
+export const teamContinueSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000).optional() }).strict();
+export type TeamContinue = z.infer<typeof teamContinueSchema>;
 export const teamTaskRatingSchema = z.object({ requestId: z.uuid(), score: z.number().int().min(1).max(5), note: z.string().trim().max(1000).optional() }).strict();
 export const teamParallelismSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), parallelism: z.number().int().min(1).max(4) }).strict();
 export type TeamParallelism = z.infer<typeof teamParallelismSchema>;
@@ -243,6 +245,8 @@ export interface TeamMember extends TeamAssignment {
   cwd: string;
   baseCommit: string;
   prompt: string;
+  /** Full assignment feedback for the private context file; omitted from client views. */
+  contextFeedback?: string;
   startedAt?: string;
   reportedAt?: string;
   /** The latest attention activity the host observed for this member while it had no report. */
@@ -276,6 +280,16 @@ export interface TeamTask extends TeamTaskPlan {
   /** Each provider-limit switch of this task's member; a replacement can itself be switched. */
   limitSwitches?: { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string }[];
 }
+export interface TeamContinuation {
+  revision: number;
+  requestId: string;
+  at: string;
+  reason: string;
+  headCommit: string;
+  tasks: TeamTask[];
+  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
+  brief?: TeamBrief;
+}
 export interface TeamScout extends TeamScoutPlan {
   status: "pending" | "running" | "waiting" | "complete";
   memberId?: string;
@@ -296,12 +310,15 @@ export interface TeamDecision {
 export interface TeamCheck {
   command: TeamCommand;
   phase?: "setup";
+  headCommit?: string;
   status: "running" | "passed" | "failed" | "interrupted";
   startedAt: string;
   finishedAt?: string;
   exitCode?: number | null;
   output: string;
   revision: number;
+  /** Correction round that launched this verification attempt. */
+  round?: number;
 }
 export interface TeamRun {
   /** Explicit owner delegation pinned at creation. Old runs remain opted out. */
@@ -352,21 +369,25 @@ export interface TeamRun {
   baseCommit: string;
   headCommit?: string;
   tasks: TeamTask[];
+  continuations?: TeamContinuation[];
   members: TeamMember[];
   decisions: TeamDecision[];
   checks: TeamCheck[];
   steering: { text: string; revision: number; at: string }[];
   events: { at: string; text: string }[];
   reason?: string;
+  /** TeamError.code for the current blocked state; absent on legacy records. */
+  blockCode?: string;
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
   round: number;
 }
 /** `providerLimits` is the host's active limit memory at read time, shared by every run. */
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions"> & {
-  members: Omit<TeamMember, "prompt">[];
+  members: Omit<TeamMember, "prompt" | "contextFeedback">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt">[];
   usage: UsageRollup;
   providerLimits: ProviderLimit[];
   workers: { limit: number; max: number; running: number; ready: number };
   resumable: boolean;
+  continuable: boolean;
 };

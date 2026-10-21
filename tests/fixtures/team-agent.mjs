@@ -429,6 +429,10 @@ async function main() {
     saveReceipt();
     await report({ kind: "result", summary: `Implemented ${assignment.taskId}.txt` });
   } else if (assignment.role === "integrator") {
+    if (scenario === "repeat-failed-check") {
+      await report({ kind: "result", summary: "No implementation change is required for this verification result" });
+      return;
+    }
     if (scenario === "integrator-limit" && receipt.provider === "claude") {
       writeFileSync("repair.txt", "partial repair from the limited integrator\n");
       console.log("You've hit your session limit · resets 3:45pm");

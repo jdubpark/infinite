@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertMemberReadOnly, prepareRecoveredWorkspace, prepareVerificationWorkspace, TeamError } from "../packages/host/src/team-workspace.js";
+import { assertMemberReadOnly, prepareRecoveredWorkspace, prepareVerificationWorkspace, TeamError, writeTeamContext } from "../packages/host/src/team-workspace.js";
 
 function git(cwd: string, ...args: string[]) {
   return execFileSync("git", ["-C", cwd, ...args], {
@@ -58,6 +58,57 @@ test("verification and recovery clones pin exact commits and keep recovery sibli
     assert.equal(git(integration, "rev-parse", "HEAD"), base, "recovery must preserve the original integration checkout");
     assert.equal(git(integration, "status", "--porcelain"), "");
   } finally { rmSync(runRoot, { recursive: true, force: true }); }
+});
+
+test("team context streams large snapshots through the command prefix into Git metadata only", async () => {
+  const root = realpathSync(repository().root);
+  const prefix = {
+    command: process.execPath,
+    args: ["-e", "const {spawnSync}=require('node:child_process');const r=spawnSync(process.argv[1],process.argv.slice(2),{stdio:'inherit'});process.exit(r.status??1)"],
+  };
+  const context = { runId: "run-id", revision: 7, payload: "🧭".repeat(40000) };
+  const target = join(root, ".git", "infinite-team-context.json");
+  try {
+    await writeTeamContext(root, context, prefix);
+    assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), context);
+    assert.equal(lstatSync(target).mode & 0o777, 0o400, "agents receive a read-only snapshot");
+    assert.equal(git(root, "status", "--porcelain"), "", "Git metadata writes do not alter tracked or untracked project files");
+
+    const retry = { ...context, revision: 8, payload: "replacement context" };
+    await writeTeamContext(root, retry, prefix);
+    assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), retry, "a retry atomically replaces a regular prior snapshot");
+    assert.equal(git(root, "status", "--porcelain"), "");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("team context refuses Git metadata and destination symlinks", async () => {
+  const firstRepo = repository();
+  const first = { ...firstRepo, root: realpathSync(firstRepo.root) };
+  const outside = mkdtempSync(join(tmpdir(), "team-context-outside-"));
+  const sentinel = join(outside, "sentinel.txt");
+  writeFileSync(sentinel, "keep this file");
+  try {
+    symlinkSync(sentinel, join(first.root, ".git", "infinite-team-context.json"));
+    await assert.rejects(writeTeamContext(first.root, { safe: true }), (error: unknown) =>
+      error instanceof TeamError && error.code === "team-context-write-failed");
+    assert.equal(readFileSync(sentinel, "utf8"), "keep this file");
+    assert.equal(git(first.root, "status", "--porcelain"), "");
+  } finally { rmSync(first.root, { recursive: true, force: true }); }
+
+  const secondRepo = repository();
+  const second = { ...secondRepo, root: realpathSync(secondRepo.root) };
+  const realMetadata = join(outside, "real-git");
+  try {
+    renameSync(join(second.root, ".git"), realMetadata);
+    symlinkSync(realMetadata, join(second.root, ".git"));
+    await assert.rejects(writeTeamContext(second.root, { safe: true }), (error: unknown) =>
+      error instanceof TeamError && ["team-context-write-failed", "workspace-operation-failed"].includes(error.code));
+    assert.equal(readFileSync(sentinel, "utf8"), "keep this file");
+    assert.equal(existsSync(join(realMetadata, "infinite-team-context.json")), false);
+  } finally {
+    rmSync(second.root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
 });
 
 test("read-only diagnostics identify the workspace context and safely bound changed paths", async () => {

@@ -1379,6 +1379,10 @@ small,
 .team-floating-message > span { min-width: 0; flex: 1; }
 .team-notice-dismiss { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 22px; height: 22px; margin: -3px -5px -3px 0; padding: 0; border: 0; background: transparent; color: inherit; cursor: pointer; }
 .team-composer-area form { display: flex; align-items: flex-end; gap: 12px; }
+.team-composer-area form.team-continuation-form { display: grid; grid-template-columns: minmax(0, 1fr); align-items: stretch; gap: 0; }
+.team-composer-area .team-continuation-form .form-note { margin: 0 0 10px; }
+.team-composer-area .team-continuation-form .team-steer-dictation { width: 100%; min-width: 0; }
+.team-composer-area .team-continuation-form .dictation-field-control { width: 100%; }
 .team-composer-area textarea { min-width: 0; background: #fff; max-height: 180px; resize: vertical; font-size: 13px; }
 .team-composer-area .primary { flex-shrink: 0; font-size: 12px; gap: 12px; }
 .team-pending { display: flex; align-items: center; flex-wrap: nowrap; gap: 8px 16px; font-size: 12px; color: inherit; overflow: hidden; white-space: nowrap; }

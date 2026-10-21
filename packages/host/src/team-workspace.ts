@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve, relative, isAbsolute, parse } from "node:path";
@@ -22,10 +23,10 @@ export function teamGitArgs(cwd: string, args: string[]) {
   return ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args];
 }
 /** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
-export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand): Promise<CommandResult> {
+export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
     const env = teamCommandEnvironment();
-    const child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+    const child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false;
     const stop = () => {
       interrupted = true;
@@ -40,7 +41,14 @@ export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSig
       truncated ||= output.length + text.length > 65536;
       output = (output + text).slice(-65536);
     };
-    child.stdout.on("data", chunk => { capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); }); child.stderr.on("data", capture);
+    child.stdout!.on("data", chunk => { capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); }); child.stderr!.on("data", capture);
+    if (input !== undefined) {
+      child.stdin!.on("error", error => {
+        truncated = true;
+        if ((error as NodeJS.ErrnoException).code !== "EPIPE") capture(Buffer.from("\n[The host could not send configured team input.]\n"));
+      });
+      child.stdin!.end(input, "utf8");
+    }
     const timer = setTimeout(stop, timeoutMs); timer.unref();
     const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", stop); };
     signal?.addEventListener("abort", stop, { once: true });
@@ -198,6 +206,80 @@ export async function prepareMemberWorkspace(workspace: string, memberId: string
   await git(cwd, ["remote", "remove", "origin"], prefix, 30000, signal);
   await git(cwd, ["checkout", "--detach", baseCommit], prefix, 30000, signal);
   return realpathSync(cwd);
+}
+const writeTeamContextScript = `
+const fs = require("node:fs");
+const path = require("node:path");
+const metadata = path.join(process.cwd(), ".git");
+const name = process.argv[1];
+const chunks = [];
+let directoryFd, fileFd, temporary;
+function fail() { throw new Error("unsafe context destination"); }
+function targetInfo(target) {
+  try {
+    const info = fs.lstatSync(target);
+    if (info.isSymbolicLink() || !info.isFile()) fail();
+    return info;
+  } catch (error) {
+    if (error && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+process.stdin.on("data", chunk => chunks.push(chunk));
+process.stdin.on("end", () => {
+  try {
+    const noFollow = fs.constants.O_NOFOLLOW;
+    if (!noFollow) fail();
+    const metadataInfo = fs.lstatSync(metadata);
+    if (!metadataInfo.isDirectory() || metadataInfo.isSymbolicLink() || fs.realpathSync(metadata) !== metadata) fail();
+    directoryFd = fs.openSync(metadata, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0) | noFollow);
+    const openedInfo = fs.fstatSync(directoryFd);
+    if (!openedInfo.isDirectory() || openedInfo.dev !== metadataInfo.dev || openedInfo.ino !== metadataInfo.ino) fail();
+    const target = path.join(metadata, "infinite-team-context.json");
+    targetInfo(target);
+    temporary = path.join(metadata, ".infinite-team-context." + name + ".tmp");
+    fileFd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+    const content = Buffer.concat(chunks);
+    JSON.parse(content.toString("utf8"));
+    fs.writeFileSync(fileFd, content);
+    fs.fchmodSync(fileFd, 0o400);
+    fs.fsyncSync(fileFd);
+    fs.closeSync(fileFd);
+    fileFd = undefined;
+    const currentMetadata = fs.lstatSync(metadata);
+    if (!currentMetadata.isDirectory() || currentMetadata.isSymbolicLink() || currentMetadata.dev !== openedInfo.dev || currentMetadata.ino !== openedInfo.ino || fs.realpathSync(metadata) !== metadata) fail();
+    targetInfo(target);
+    fs.renameSync(temporary, target);
+    temporary = undefined;
+    fs.fsyncSync(directoryFd);
+    fs.closeSync(directoryFd);
+    directoryFd = undefined;
+    process.stdout.write("INFINITE_TEAM_CONTEXT_WRITTEN:" + name);
+  } catch {
+    try { if (fileFd !== undefined) fs.closeSync(fileFd); } catch {}
+    try { if (temporary) fs.unlinkSync(temporary); } catch {}
+    try { if (directoryFd !== undefined) fs.closeSync(directoryFd); } catch {}
+    process.stderr.write("The host refused an unsafe Git metadata context write.\\n");
+    process.exitCode = 1;
+  }
+});
+`;
+/** Store complete agent context in ignored Git metadata, atomically replacing only a regular prior snapshot. */
+export async function writeTeamContext(cwd: string, context: unknown, prefix?: TeamCommand, signal?: AbortSignal): Promise<void> {
+  let serialized: string | undefined;
+  try { serialized = JSON.stringify(context, null, 2); } catch { throw new TeamError(409, "team-context-invalid", "The team context could not be serialized safely."); }
+  if (serialized === undefined) throw new TeamError(409, "team-context-invalid", "The team context must be a JSON value.");
+  let info: ReturnType<typeof lstatSync>, canonical: string;
+  try { info = lstatSync(cwd); canonical = realpathSync(cwd); }
+  catch { throw new TeamError(409, "invalid-workspace", "The member workspace must be an accessible real Git repository."); }
+  if (!info.isDirectory() || info.isSymbolicLink() || canonical !== resolve(cwd))
+    throw new TeamError(409, "invalid-workspace", "The member workspace must be a real directory without a symlink path.");
+  if (await git(canonical, ["rev-parse", "--show-toplevel"], prefix, 30000, signal) !== canonical)
+    throw new TeamError(409, "invalid-workspace", "The member workspace must be a Git repository root.");
+  const nonce = randomUUID();
+  const result = await teamCommand({ command: process.execPath, args: ["-e", writeTeamContextScript, nonce] }, canonical, signal, 30000, prefix, `${serialized}\n`);
+  if (result.exitCode !== 0 || result.interrupted || result.truncated || !result.stdout.includes(`INFINITE_TEAM_CONTEXT_WRITTEN:${nonce}`))
+    throw new TeamError(409, "team-context-write-failed", "The complete team context could not be stored safely in Git metadata; do not launch this member.");
 }
 /** Retain the reported merge object without changing the reviewed working tree. */
 export async function captureDeliveryBaseline(workspace: string, memberCwd: string, reviewedHead: string, mergeCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {

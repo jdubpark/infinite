@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
-import { dirname, join, resolve, relative, isAbsolute, parse } from "node:path";
+import { basename, dirname, join, resolve, relative, isAbsolute, parse } from "node:path";
 import type { TeamCommand, TeamTaskPlan } from "./team-types.js";
 
 export class TeamError extends Error {
@@ -211,9 +211,134 @@ export async function captureDeliveryBaseline(workspace: string, memberCwd: stri
   await git(workspace, ["update-ref", "refs/infinite/delivery", mergeCommit], prefix, 30000, signal);
 }
 export async function teamHead(cwd: string, prefix?: TeamCommand, signal?: AbortSignal) { return git(cwd, ["rev-parse", "HEAD"], prefix, 30000, signal); }
-export async function assertMemberReadOnly(cwd: string, base: string, prefix?: TeamCommand, signal?: AbortSignal) {
-  if (await teamHead(cwd, prefix, signal) !== base || await git(cwd, ["status", "--porcelain=v1", "--untracked-files=all"], prefix, 30000, signal))
-    throw new TeamError(409, "read-only-role-changed-files", "A read-only agent changed its working copy. Its report cannot advance the team.");
+export type ReadOnlyWorkspaceContext = "verification" | "setup" | "integration" | "member";
+export const LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON = "A read-only agent changed its working copy. Its report cannot advance the team.";
+const readOnlyContextCode: Record<ReadOnlyWorkspaceContext, string> = {
+  verification: "verification-changed-files",
+  setup: "setup-changed-files",
+  integration: "integration-changed-files",
+  member: "read-only-role-changed-files",
+};
+const readOnlyContextLabel: Record<ReadOnlyWorkspaceContext, string> = {
+  verification: "verification workspace",
+  setup: "setup workspace",
+  integration: "integration workspace",
+  member: "read-only member workspace",
+};
+const MAX_DIAGNOSTIC_PATHS = 8;
+const MAX_DIAGNOSTIC_PATH_LENGTH = 96;
+const CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+function quotedDiagnosticPath(path: string) {
+  const safe = path.replace(CONTROL_OR_BIDI, character => `\\u${character.codePointAt(0)!.toString(16).padStart(4, "0")}`);
+  const bounded = [...safe].length > MAX_DIAGNOSTIC_PATH_LENGTH ? `${[...safe].slice(0, MAX_DIAGNOSTIC_PATH_LENGTH - 1).join("")}…` : safe;
+  return JSON.stringify(bounded);
+}
+/** Parse NUL-delimited porcelain paths without ever interpreting filenames as records or terminal text. */
+function changedPathsFromStatus(status: string) {
+  const records = status.split("\0").filter(Boolean), paths: string[] = [];
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (record.length < 4 || record[2] !== " ") continue;
+    paths.push(record.slice(3));
+    if (/[RC]/.test(record.slice(0, 2)) && records[index + 1] !== undefined) paths.push(records[++index]);
+  }
+  return paths;
+}
+function shortCommit(commit: string) { return /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit) ? commit.slice(0, 12) : "unknown"; }
+function readOnlyDiagnostic(context: ReadOnlyWorkspaceContext, base: string, head: string, paths: string[]) {
+  const headDrift = head !== base
+    ? `HEAD changed from ${shortCommit(base)} to ${shortCommit(head)}.`
+    : `HEAD still matches pinned commit ${shortCommit(base)}.`;
+  const shown = paths.slice(0, MAX_DIAGNOSTIC_PATHS).map(quotedDiagnosticPath);
+  const omitted = Math.max(0, paths.length - shown.length);
+  const changed = paths.length
+    ? `Changed paths (${paths.length}): ${shown.join(", ")}${omitted ? `; ${omitted} additional changed path${omitted === 1 ? "" : "s"} omitted` : ""}.`
+    : "There are no working-tree paths in the change; the difference is in HEAD only.";
+  return `The ${readOnlyContextLabel[context]} is not read-only. ${headDrift} ${changed} Its report cannot advance the team.`;
+}
+/** Keep verification diagnostics separate from member blame, while refusing every HEAD or file mutation. */
+export async function assertMemberReadOnly(cwd: string, base: string, prefix?: TeamCommand, signal?: AbortSignal, context: ReadOnlyWorkspaceContext = "member") {
+  const head = await teamHead(cwd, prefix, signal);
+  const repositoryRoot = await git(cwd, ["rev-parse", "--show-toplevel"], prefix, 30000, signal);
+  const status = await git(repositoryRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], prefix, 30000, signal);
+  const changed = changedPathsFromStatus(status);
+  if (head !== base || changed.length)
+    throw new TeamError(409, readOnlyContextCode[context], readOnlyDiagnostic(context, base, head, changed));
+}
+
+type SiblingWorkspaceKind = "verification" | "recovery";
+function safeWorkspaceId(id: string) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)) throw new TeamError(409, "invalid-workspace", "A copied workspace needs a path-safe identity.");
+  return id;
+}
+function ensureSiblingWorkspaceParent(workspace: string, kind: SiblingWorkspaceKind, id: string) {
+  safeWorkspaceId(id);
+  let workspaceInfo: ReturnType<typeof lstatSync>, canonicalWorkspace: string;
+  try { workspaceInfo = lstatSync(workspace); canonicalWorkspace = realpathSync(workspace); }
+  catch { throw new TeamError(409, "invalid-workspace", "The source workspace is not an accessible real directory."); }
+  if (!workspaceInfo.isDirectory() || workspaceInfo.isSymbolicLink())
+    throw new TeamError(409, "invalid-workspace", "The source workspace must be a real directory.");
+  const sourceParent = dirname(canonicalWorkspace);
+  const parentName = basename(sourceParent);
+  const runDirectory = basename(canonicalWorkspace) === "integration"
+    ? sourceParent
+    : parentName === "recovery" || parentName === "verification"
+      ? dirname(sourceParent)
+      : undefined;
+  if (!runDirectory) throw new TeamError(409, "invalid-workspace", "A copied workspace must be an integration or recovery checkout inside its original run.");
+  if (runDirectory !== sourceParent) {
+    let copiedParent: ReturnType<typeof lstatSync>;
+    try { copiedParent = lstatSync(sourceParent); } catch { throw unsafeTeamRoot(); }
+    if (!copiedParent.isDirectory() || copiedParent.isSymbolicLink() || !hostOwned(copiedParent)) throw unsafeTeamRoot();
+  }
+  let runInfo: ReturnType<typeof lstatSync>;
+  try { runInfo = lstatSync(runDirectory); } catch { throw unsafeTeamRoot(); }
+  if (!runInfo.isDirectory() || runInfo.isSymbolicLink() || !hostOwned(runInfo)) throw unsafeTeamRoot();
+
+  const parent = join(runDirectory, kind);
+  let parentInfo: ReturnType<typeof lstatSync> | undefined;
+  try { parentInfo = lstatSync(parent); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw unsafeTeamRoot();
+    try { mkdirSync(parent, { mode: 0o700 }); } catch (mkdirError) { if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError; }
+    try { parentInfo = lstatSync(parent); } catch { throw unsafeTeamRoot(); }
+  }
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || !hostOwned(parentInfo)) throw unsafeTeamRoot();
+  chmodDirectoryNoFollow(parent, 0o2770);
+
+  const destination = join(parent, id);
+  try { lstatSync(destination); throw new TeamError(409, "workspace-exists", `A ${kind} workspace already exists and needs explicit reconciliation.`); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return { source: canonicalWorkspace, destination };
+}
+async function preparePinnedWorkspaceClone(workspace: string, kind: SiblingWorkspaceKind, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal, branch?: string) {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(baseCommit)) throw new TeamError(409, "invalid-workspace-baseline", "The copied workspace baseline is invalid.");
+  const { source, destination } = ensureSiblingWorkspaceParent(workspace, kind, id);
+  const top = await git(source, ["rev-parse", "--show-toplevel"], prefix, 30000, signal);
+  if (realpathSync(top) !== source) throw new TeamError(409, "project-not-git-root", "The copied workspace source must be a Git repository root.");
+  if (await git(source, ["cat-file", "-t", baseCommit], prefix, 30000, signal) !== "commit")
+    throw new TeamError(409, "invalid-workspace-baseline", "The copied workspace baseline must identify a commit.");
+  await git(dirname(destination), ["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", source, destination], prefix, 120000, signal);
+  await git(destination, ["remote", "remove", "origin"], prefix, 30000, signal);
+  if (branch) {
+    await git(destination, ["check-ref-format", "--branch", branch], prefix, 30000, signal);
+    await git(destination, ["checkout", "-B", branch, baseCommit], prefix, 30000, signal);
+  } else await git(destination, ["checkout", "--detach", baseCommit], prefix, 30000, signal);
+  if (await teamHead(destination, prefix, signal) !== baseCommit || await git(destination, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], prefix, 30000, signal))
+    throw new TeamError(409, "workspace-copy-changed", `The ${kind} workspace did not match its requested clean baseline. The copy was preserved for inspection.`);
+  return { workspace: realpathSync(destination), ...(branch ? { branch } : {}), baseCommit };
+}
+/** Create a disposable, detached checkout of exactly the requested integration commit. */
+export async function prepareVerificationWorkspace(workspace: string, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {
+  const prepared = await preparePinnedWorkspaceClone(workspace, "verification", id, baseCommit, prefix, signal);
+  return { workspace: prepared.workspace, baseCommit: prepared.baseCommit };
+}
+/** Create a recovery copy beside the original integration checkout; retries never nest under a prior copy. */
+export async function prepareRecoveredWorkspace(workspace: string, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal, branch?: string) {
+  const prepared = await preparePinnedWorkspaceClone(workspace, "recovery", id, baseCommit, prefix, signal, branch);
+  return { workspace: prepared.workspace, ...(prepared.branch ? { branch: prepared.branch } : {}), baseCommit: prepared.baseCommit };
 }
 export function teamPathAllowed(path: string, allowed: string[]) { return allowed.some(prefix => prefix === "." || path === prefix || path.startsWith(`${prefix}/`)); }
 /** List all tracked, staged, and untracked paths changed from a member's base commit. */

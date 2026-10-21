@@ -697,11 +697,27 @@ the same working copy. Escalation consumes another member attempt. The scheduler
 rejects model choices outside the configured pools and a second escalation for
 the same task.
 
-The host runs the project's configured checks. Prompts prefer API, process,
-integration, or end-to-end checks that exercise changed behavior. Before adding
-a test, the agent must identify its observable contract, a credible regression,
-and the gap in existing coverage. Repository instructions still apply. Repair
-attempts are bounded; unresolved failures remain visible.
+The host runs setup and configured checks in a detached verification clone at
+the exact integration commit under review. After each command, the host requires
+the clone's HEAD and tracked and untracked paths to remain unchanged. A mutation
+is rejected with a diagnostic for the command context, bounded changed paths,
+and any HEAD drift. The verification clone never advances the integration
+branch, and the original integration checkout remains available for inspection.
+
+After a completed setup command or configured check changes its isolated
+verification clone, the same guarded Resume is available only when the
+current-revision check evidence is terminal and the recorded integration head
+is unchanged. Resume creates a clean sibling under recovery/ from that commit,
+starts a fresh plan there, and retains the original workspace and prior member
+and check evidence. Mutations during member setup or workspace preparation are
+not Resume-eligible; they require reconciliation and a new team. Other check or
+workspace blocks also require inspection and a new team.
+
+Prompts prefer API, process, integration, or end-to-end checks that exercise
+changed behavior. Before adding a test, the agent must identify its observable
+contract, a credible regression, and the gap in existing coverage. Repository
+instructions still apply. Repair attempts are bounded; unresolved failures
+remain visible.
 
 Each configured check may run for `teams.checkMinutes` (default 60). A check that
 runs past the limit is stopped and blocks the team with a resumable reason. The
@@ -987,6 +1003,17 @@ teamwork run by its directory: the API account creates each one, named
 `DATE-SLUG-REQUEST8`, before any Git command runs in it, and the provider
 account cannot create a directory with that owner.
 
+Verification and Resume also use `verification/ID` and `recovery/ID` beneath
+that same host-owned run directory. A constrained launcher must permit
+`clone --no-local --no-hardlinks --no-checkout -- SOURCE DESTINATION` from an
+existing team copy, `cat-file -t COMMIT`, `check-ref-format --branch BRANCH`,
+and `checkout --detach COMMIT`. Recovery uses `checkout -B BRANCH COMMIT`
+only in its fresh recovery clone. Read-only inspection uses
+`status --porcelain=v1 -z --untracked-files=all` in both team and project
+copies. Preserve the launcher's existing path, identity, branch, and commit
+restrictions when allowing these forms; verify them under the deployed Unix
+identities before activating a host update.
+
 GitHub-tracked sources add these operations. The host runs each through
 `teams.commandPrefix`, and a launcher that refuses one fails that refresh step:
 
@@ -1072,8 +1099,9 @@ animated spinner looks active. Older runs blocked by the former one-hour limit
 still resume. A team blocked only by a stall can resume with
 `infinite team resume ID`. That starts a fresh plan from the preserved
 integration commit and keeps the stopped member workspace.
-Resume waits until those members have stopped. Any other block, including an
-interrupted workspace or check operation, still requires inspection and a new
+Resume waits until those members have stopped. A changed verification clone has
+the separate guarded Resume path described above; other blocks, including an
+interrupted workspace or check operation, still require inspection and a new
 team. Stopping an agent does not prove that arbitrary detached tool
 descendants have stopped, and a current human input lease can prevent the
 scheduler from stopping a member. Such conflicts remain visible.

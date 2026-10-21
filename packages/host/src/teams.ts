@@ -2,7 +2,7 @@ import type { HandoffPolicy, TeamHandoffContext } from "./handoff-types.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import type { Config, Provider } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
@@ -17,7 +17,7 @@ import { ProviderLimits, switchesMember, type LimitObservation } from "./provide
 import type { LinearService } from "./linear.js";
 import type { Readings } from "./readings.js";
 import type { ProjectSourceService } from "./project-source.js";
-import { TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberWorkspace, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, teamCommand, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { oneShotPermissionOption, permissionEvidenceHash, refusedBeforeSend } from "./team-permissions.js";
 export { TeamError } from "./team-workspace.js";
@@ -30,6 +30,7 @@ type MissionReservationLookup = (projectId: string, exceptMissionId?: string) =>
 type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
   pending?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number };
+  verificationRecovery?: { pendingId: string; pendingKind: "check"; revision: number; headCommit: string; failure: "setup-changed-files" | "verification-changed-files" | "legacy-completed-check" };
   halt?: "pause" | "cancel" | "steer" | "block";
   deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
   checkHead?: string;
@@ -74,6 +75,23 @@ function diffStat(output?: string) {
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
 export const memberStallReason = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
 export const checkTimeoutReason = "A configured check ran past the team check time limit (teams.checkMinutes) and was stopped. No correction round was used; the integrated work was preserved.";
+const interruptedOperationReason = "The host restarted during a workspace or verification operation. Inspect the isolated workspace before starting a new team; the operation will not be replayed.";
+const verificationRecoveryReason = "A read-only verification command changed its workspace. Inspect the check evidence before resuming from the recorded integration commit.";
+const commitId = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
+function completedChecks(stored: Stored, revision: number) {
+  const checks = stored.run.checks.filter(check => check.revision === revision);
+  return checks.length > 0 && checks.every(check => (check.status === "passed" || check.status === "failed") && Boolean(check.finishedAt));
+}
+function validVerificationRecovery(stored: Stored) {
+  const { run, pending, verificationRecovery } = stored;
+  const head = run.headCommit;
+  return Boolean(pending && verificationRecovery && run.status === "blocked" && pending.kind === "check" &&
+    pending.id === verificationRecovery.pendingId && verificationRecovery.pendingKind === "check" &&
+    pending.revision === run.revision && verificationRecovery.revision === run.revision &&
+    head && commitId.test(head) && verificationRecovery.headCommit === head && stored.checkHead !== head &&
+    !stored.deliveryAttempt && !run.deliveryReceipt && !run.stopReason && completedChecks(stored, run.revision) &&
+    (verificationRecovery.failure === "legacy-completed-check" || verificationRecovery.failure === "setup-changed-files" || verificationRecovery.failure === "verification-changed-files"));
+}
 
 export function applyTeamBriefTitle(run: TeamRun, brief: TeamBrief | undefined, revision = run.revision) {
   run.brief = brief;
@@ -101,9 +119,10 @@ export function blockedTeamCanResume(input: {
   prepared: boolean;
   stopReason?: string;
   linearStatus?: string;
+  verificationRecovery?: boolean;
 }): boolean {
   return input.status === "blocked"
-    && (input.reason === memberStallReason || input.reason === memberTimeLimitReason || input.reason === checkTimeoutReason)
+    && (input.verificationRecovery === true || input.reason === memberStallReason || input.reason === memberTimeLimitReason || input.reason === checkTimeoutReason)
     && input.prepared
     && !input.pending
     && !input.deliveryAttempt
@@ -142,12 +161,27 @@ export class TeamService {
       this.records.set(id, stored);
       if (stored.pending) {
         for (const check of stored.run.checks) if (check.status === "running") { check.status = "interrupted"; check.finishedAt = timestamp(); }
+        const pending = stored.pending, run = stored.run;
+        const recoverableMarker = validVerificationRecovery(stored);
+        // Only the current reason is provenance. Historical event text may describe an unrelated revision.
+        const legacyGuardFailure = run.reason === LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON;
+        const legacyCompletedCheck = run.status === "blocked" && legacyGuardFailure && pending.kind === "check" &&
+          pending.revision === run.revision && Boolean(run.headCommit && commitId.test(run.headCommit)) && stored.checkHead !== run.headCommit &&
+          !stored.deliveryAttempt && !run.deliveryReceipt && !run.stopReason && completedChecks(stored, run.revision);
         if (stored.run.status === "cancelled") {
           stored.halt = "cancel";
           this.event(stored, "The host restarted with an unresolved operation from a cancelled team. The intent remains retained and will not be replayed.");
+        } else if (recoverableMarker || legacyCompletedCheck) {
+          if (!recoverableMarker) stored.verificationRecovery = {
+            pendingId: pending.id, pendingKind: "check", revision: pending.revision, headCommit: run.headCommit!, failure: "legacy-completed-check",
+          };
+          run.status = "blocked"; stored.halt = "block";
+          run.reason ??= verificationRecoveryReason;
+          this.event(stored, "The host restarted with a completed verification operation. Its rejected evidence and original integration workspace were preserved for review.");
         } else {
           stored.run.status = "blocked"; stored.halt = "block";
-          stored.run.reason = "The host restarted during a workspace or verification operation. Inspect the isolated workspace before starting a new team; the operation will not be replayed.";
+          stored.run.reason = interruptedOperationReason;
+          delete stored.verificationRecovery;
           this.event(stored, stored.run.reason);
         }
         // Retain the intent so resume cannot disguise an ambiguous operation.
@@ -190,15 +224,17 @@ export class TeamService {
   }
   private canResume(stored: Stored, linearStatus = stored.run.linear?.status) {
     const run = stored.run;
+    const verificationRecovery = validVerificationRecovery(stored);
     return blockedTeamCanResume({
       status: run.status,
-      reason: run.reason,
-      pending: Boolean(stored.pending),
+      reason: verificationRecovery ? verificationRecoveryReason : run.reason,
+      pending: Boolean(stored.pending) && !verificationRecovery,
       deliveryAttempt: Boolean(stored.deliveryAttempt),
       deliveryReceipt: Boolean(run.deliveryReceipt),
       prepared: stored.prepared,
       stopReason: run.stopReason,
       linearStatus,
+      verificationRecovery,
     });
   }
   private view(stored: Stored): TeamView {
@@ -434,10 +470,10 @@ export class TeamService {
           if (project.team?.setup) {
             const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
             if (setup.exitCode !== 0 || setup.interrupted) throw new TeamError(409, "team-setup-failed", "The configured setup command failed. Inspect the isolated workspace before restarting.");
-            await assertMemberReadOnly(workspace.workspace, workspace.baseCommit, this.config.teams?.commandPrefix, signal);
+            await assertMemberReadOnly(workspace.workspace, workspace.baseCommit, this.config.teams?.commandPrefix, signal, "setup");
           }
           assertParent();
-          if (workspaceSource.head && !fromMirror) await assertMemberReadOnly(workspaceSource.path, workspaceSource.head, this.config.teams?.commandPrefix, signal);
+          if (workspaceSource.head && !fromMirror) await assertMemberReadOnly(workspaceSource.path, workspaceSource.head, this.config.teams?.commandPrefix, signal, "integration");
           return workspace;
         };
         // The refresh above has released its working-tree hold by now, so the ordinary project gate still applies:
@@ -559,14 +595,57 @@ export class TeamService {
   pause(id: string, input: Action) { return this.action(id, "pause", teamActionSchema.parse(input)); }
   resume(id: string, input: Action) { return this.action(id, "resume", teamActionSchema.parse(input)); }
   cancel(id: string, input: Action) { return this.action(id, "cancel", teamActionSchema.parse(input)); }
+  private async resumeVerificationRecovery(stored: Stored, body: Action, recovery: NonNullable<Stored["verificationRecovery"]>) {
+    const run = stored.run;
+    if (!this.canResume(stored) || this.commands.has(run.id))
+      throw new TeamError(409, "team-reconciliation-required", "This verification failure is no longer eligible for Resume. Inspect the retained workspace and evidence.");
+    if (stored.halt) throw new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
+    if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before sending this action.");
+    if (run.status === "cancelled") throw new TeamError(409, "team-cancelled", "This team has been cancelled.");
+    this.assertBudget(run);
+
+    const prefix = this.config.teams?.commandPrefix;
+    const originalWorkspace = run.workspace;
+    this.assertRunPath(stored, originalWorkspace);
+    const head = await teamHead(originalWorkspace, prefix);
+    if (head !== recovery.headCommit)
+      throw new TeamError(409, "verification-recovery-head-changed", "The integration HEAD changed after the verification failure. Its original workspace was preserved for reconciliation.");
+    const recovered = await prepareRecoveredWorkspace(originalWorkspace, randomUUID(), recovery.headCommit, prefix, undefined, run.branch);
+    this.assertRunPath(stored, recovered.workspace);
+    await assertMemberReadOnly(recovered.workspace, recovery.headCommit, prefix, undefined, "integration");
+    if (await teamHead(originalWorkspace, prefix) !== recovery.headCommit)
+      throw new TeamError(409, "verification-recovery-head-changed", "The integration HEAD changed while Resume prepared a clean copy. Its original workspace was preserved for reconciliation.");
+
+    await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
+    const next = structuredClone(stored);
+    if (!this.mutation(next, "resume", body)) return this.view(stored);
+    next.run.workspace = recovered.workspace;
+    next.pending = undefined;
+    delete next.verificationRecovery;
+    next.halt = undefined;
+    next.run.revision++; next.run.tasks = []; next.run.review = undefined; next.run.round = 0; next.checkHead = undefined;
+    next.run.brief = undefined; next.run.noChange = undefined;
+    if (next.run.discovery && !next.run.discovery.completedAt) next.run.discovery.completedAt = timestamp();
+    next.run.status = "planning"; next.run.reason = undefined;
+    const workspaceRoot = stored.root ?? this.config.teams?.workspaceDir ?? dirname(originalWorkspace);
+    const originalPath = relative(workspaceRoot, originalWorkspace).slice(0, 256);
+    const recoveredPath = relative(workspaceRoot, recovered.workspace).slice(0, 256);
+    this.event(next, `The team resumed from a clean workspace at the recorded integration commit. Original integration copy preserved at ${originalPath}; fresh workspace at ${recoveredPath}. Prior member and check evidence remains available under its original revision.`);
+    this.save(next);
+    Object.assign(stored, next);
+    return this.view(stored);
+  }
   private action(id: string, action: "pause" | "resume" | "cancel", body: Action) {
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, action, body)) return this.view(stored);
       if (action === "pause" && ["blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
-      if (action === "resume" && (stored.pending || stored.deliveryAttempt || run.deliveryReceipt || !stored.prepared || (run.status === "blocked" && !this.canResume(stored))))
+      const verificationRecovery = action === "resume" && validVerificationRecovery(stored) ? stored.verificationRecovery : undefined;
+      if (action === "resume" && ((stored.pending && !verificationRecovery) || stored.deliveryAttempt || run.deliveryReceipt || !stored.prepared || (run.status === "blocked" && !this.canResume(stored))))
         throw new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
+      if (action === "resume" && verificationRecovery && this.commands.has(id)) throw new TeamError(409, "team-operation-running", "The verification operation is still stopping. Retry Resume after it settles.");
       if (action === "resume" && stored.halt) throw new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
+      if (action === "resume" && verificationRecovery) return this.resumeVerificationRecovery(stored, body, verificationRecovery);
       if (!this.mutation(stored, action, body)) return this.view(stored);
       if (action === "resume") {
         if (run.status !== "paused" && !this.canResume(stored)) { this.save(stored); return this.view(stored); }
@@ -697,6 +776,13 @@ export class TeamService {
     })).catch(() => {});
   }
   private block(stored: Stored, error: unknown) {
+    const pending = stored.pending, run = stored.run;
+    const failure = error instanceof TeamError && (error.code === "setup-changed-files" || error.code === "verification-changed-files") ? error.code : undefined;
+    if (failure && pending?.kind === "check" && pending.revision === run.revision && run.status === "verifying" &&
+        run.headCommit && commitId.test(run.headCommit) && stored.checkHead !== run.headCommit && !stored.deliveryAttempt &&
+        !run.deliveryReceipt && !run.stopReason && !stored.halt && completedChecks(stored, run.revision)) {
+      stored.verificationRecovery = { pendingId: pending.id, pendingKind: "check", revision: pending.revision, headCommit: run.headCommit, failure };
+    } else if (pending?.kind === "check") delete stored.verificationRecovery;
     this.commands.get(stored.run.id)?.abort();
     void this.invalidatePermissionDecisions(stored, "The team became blocked before the permission request could be answered.");
     if (!["paused", "cancelled"].includes(stored.run.status)) { stored.run.status = "blocked"; stored.halt = "block"; }
@@ -928,7 +1014,7 @@ export class TeamService {
       if (stored.checkHead !== run.headCommit) { this.check(stored); return; }
       if (!run.review || run.review.revision !== run.revision) { this.prepareMember(stored, "reviewer"); return; }
       if (run.review.verdict === "approved") {
-        await assertMemberReadOnly(run.workspace, run.headCommit!, this.config.teams?.commandPrefix);
+        await assertMemberReadOnly(run.workspace, run.headCommit!, this.config.teams?.commandPrefix, undefined, "integration");
         this.assertBudget(run);
         if (run.delivery) {
           this.assertDelivery(stored);
@@ -1318,7 +1404,7 @@ export class TeamService {
       if (setup) {
         const result = await teamCommand(setup, cwd, signal, 600000, this.config.teams?.commandPrefix);
         if (result.exitCode !== 0 || result.interrupted) throw new TeamError(409, "team-setup-failed", "A member's configured setup command failed. Its isolated workspace was preserved.");
-        await assertMemberReadOnly(cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+        await assertMemberReadOnly(cwd, member.baseCommit, this.config.teams?.commandPrefix, signal, "setup");
       }
       return cwd;
     }, cwd => {
@@ -1344,7 +1430,7 @@ export class TeamService {
       const attempt = stored.deliveryAttempt;
       if (attempt && (attempt.memberId !== member.memberId || attempt.revision !== member.revision || attempt.headCommit !== member.baseCommit))
         throw new TeamError(409, "delivery-reconciliation-required", "A different delivery attempt is unresolved; inspect the remote pull request before continuing.");
-      await assertMemberReadOnly(stored.run.workspace, member.baseCommit, this.config.teams?.commandPrefix);
+      await assertMemberReadOnly(stored.run.workspace, member.baseCommit, this.config.teams?.commandPrefix, undefined, "integration");
       stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: member.baseCommit };
       this.save(stored);
     }
@@ -1371,7 +1457,7 @@ export class TeamService {
       if ((!run.goal && !run.handoff) || run.tasks.length) throw new TeamError(409, "invalid-no-change", "Only a goal coordinator can conclude that discovery found no justified change.");
       this.operation(stored, "result", async signal => {
         await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
-        await assertMemberReadOnly(run.workspace, run.headCommit!, this.config.teams?.commandPrefix, signal);
+        await assertMemberReadOnly(run.workspace, run.headCommit!, this.config.teams?.commandPrefix, signal, "integration");
       }, () => {
         run.noChange = { summary: report.summary, evidence: report.evidence }; run.status = "no-change"; run.reason = undefined;
         this.event(stored, "The coordinator reported no justified change and recorded its evidence. No implementation was started.");
@@ -1465,7 +1551,7 @@ export class TeamService {
       }
       this.operation(stored, "result", async signal => {
         await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
-        await assertMemberReadOnly(run.workspace, member.baseCommit, this.config.teams?.commandPrefix, signal);
+        await assertMemberReadOnly(run.workspace, member.baseCommit, this.config.teams?.commandPrefix, signal, "integration");
         if (report.kind === "delivery") {
           await this.enqueue(() => {
             if (this.closed) return;
@@ -1546,21 +1632,38 @@ export class TeamService {
     const run = stored.run, revision = run.revision, head = run.headCommit!;
     const required = this.requiredChecks(run);
     if (!required?.length) throw new TeamError(409, "verification-required", "Required verification commands have not been established; the team cannot be ready for review.");
-    const setup = run.establishChecks ? run.verification?.setup : undefined;
-    const commands = [...(setup ? [{ command: setup, phase: "setup" as const }] : []), ...required.map(command => ({ command }))];
+    const configuredProject = run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team;
+    const setup = run.establishChecks ? run.verification?.setup : configuredProject?.setup;
+    const commands = [
+      ...(setup ? [{ command: setup, phase: "setup" as const, context: "setup" as const }] : []),
+      ...required.map(command => ({ command, context: "verification" as const })),
+    ];
     run.status = "verifying";
     this.operation(stored, "check", async signal => {
       const results: typeof run.checks = [];
-      for (const entry of commands) {
+      this.assertRunPath(stored, run.workspace);
+      await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, signal, "integration");
+      const verification = await prepareVerificationWorkspace(run.workspace, randomUUID(), head, this.config.teams?.commandPrefix, signal);
+      this.assertRunPath(stored, verification.workspace);
+      if (verification.baseCommit !== head) throw new TeamError(409, "verification-head-mismatch", "The verification workspace did not start from the recorded integration commit.");
+      await this.enqueue(() => {
+        if (this.closed || stored.pending?.kind !== "check" || stored.pending.revision !== revision) return;
+        const root = stored.root ?? this.config.teams?.workspaceDir ?? dirname(run.workspace);
+        const verificationPath = relative(root, verification.workspace).slice(0, 256);
+        this.event(stored, `Configured checks are running in a disposable verification workspace: ${verificationPath}.`);
+        this.save(stored);
+      });
+      for (const { context, ...entry } of commands) {
         const check: TeamRun["checks"][number] = { ...entry, status: "running", startedAt: timestamp(), output: "", revision };
         await this.enqueue(() => { if (!this.closed) { run.checks.push(check); this.save(stored); } });
-        const result = await teamCommand(entry.command, run.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix);
+        const result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix);
         Object.assign(check, { status: result.interrupted ? "interrupted" : result.exitCode === 0 ? "passed" : "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output });
         results.push(check);
         await this.enqueue(() => { if (!this.closed) this.save(stored); });
+        if (!signal.aborted) await assertMemberReadOnly(verification.workspace, head, this.config.teams?.commandPrefix, signal, context);
         if (check.status !== "passed") break;
       }
-      if (!this.closed) await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix);
+      if (!this.closed && !signal.aborted) await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, signal, "integration");
       return results;
     }, results => {
       if (revision !== run.revision || stored.halt || run.status === "paused" || run.status === "cancelled") return;

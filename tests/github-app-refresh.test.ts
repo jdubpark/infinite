@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { chmodSync, chownSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { createHash, generateKeyPairSync } from "node:crypto";
 
 const script = resolve("scripts/github-app-refresh.mjs");
@@ -83,7 +84,7 @@ globalThis.fetch = async (input, init = {}) => {
 `;
 
 function fixture(repositories = [{ repository: "example/app", repositoryId: 17, installationId: 101 }], installations?: Array<{ installationId: number }>, discovered: Array<{ repository: string; repositoryId: number; installationId: number }> = []) {
-  const root = realpathSync(mkdtempSync(join(process.cwd(), ".github-app-refresh-")));
+  const root = realpathSync(mkdtempSync(join(homedir(), ".github-app-refresh-")));
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const privateKeyFile = join(root, "app-key.pem");
   const publicKeyFile = join(root, "app-public.pem");

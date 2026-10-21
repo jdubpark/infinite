@@ -934,6 +934,9 @@ test("a configured check cannot change the canonical integration checkout and Re
     assert.equal(git(resumed.body.workspace, "status", "--porcelain"), "");
     assert.equal(readFileSync(join(blocked.workspace, "a.txt"), "utf8"), "revision 1\n", "recovery must leave the original integration copy intact");
     assert.ok(resumed.body.events.some(event => /Original integration copy preserved at .*; fresh workspace at .*recovery\//.test(event.text)), "recovery paths must remain discoverable");
+    await waitFor(() => f.get(blocked.id), run => run.members.some(member => member.revision === resumed.body.revision), 30000);
+    const replanning = unseal<any>(key, `team:${blocked.id}`, readFileSync(join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`), "utf8"));
+    assert.equal(replanning.verificationRecovery, undefined, "later saves must not restore the consumed recovery marker");
   } finally { await f.close(); }
 });
 

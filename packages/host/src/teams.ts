@@ -621,7 +621,7 @@ export class TeamService {
     if (!this.mutation(next, "resume", body)) return this.view(stored);
     next.run.workspace = recovered.workspace;
     next.pending = undefined;
-    delete next.verificationRecovery;
+    next.verificationRecovery = undefined;
     next.halt = undefined;
     next.run.revision++; next.run.tasks = []; next.run.review = undefined; next.run.round = 0; next.checkHead = undefined;
     next.run.brief = undefined; next.run.noChange = undefined;

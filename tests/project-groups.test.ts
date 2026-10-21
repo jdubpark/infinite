@@ -547,3 +547,18 @@ test("a retired group id never aliases its replacement, and a prototype-named ch
     rmSync(f.root, { recursive: true, force: true });
   }
 });
+
+test("a GitHub-tracked project takes its identity from the source record without scanning", () => {
+  const f = fixture();
+  try {
+    f.config.projects.push({ id: "tracked", name: "Tracked", path: join(f.root, "apps", "tracked"), source: { mode: "github", repository: "example/alpha", baseBranch: "main" } });
+    const list = f.service().list();
+    const alpha = list.groups.find(group => group.id === "alpha")!;
+    const tracked = alpha.repos[0]!.checkouts.find(checkout => checkout.projectId === "tracked");
+    assert.equal(tracked?.identityFrom, "source");
+    assert.equal(tracked?.primary, true, "a source-tracked checkout is the default primary");
+    assert.equal(f.calls.get(join(f.root, "apps", "tracked")), undefined, "no git command ran in the tracked checkout");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});

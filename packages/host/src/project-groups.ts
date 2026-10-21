@@ -187,9 +187,9 @@ export class ProjectGroupService {
   }
 
   private sourceIdentity(project: Project): CheckoutIdentity | undefined {
-    const source = (project as Project & { source?: { repository?: string } }).source?.repository;
-    if (!source) return undefined;
-    const normalized = normalizeRemote(`https://github.com/${source}.git`);
+    // A GitHub-tracked project names its repository in its source record; no scan of the working tree is needed.
+    if (project.source?.mode !== "github") return undefined;
+    const normalized = normalizeRemote(`https://github.com/${project.source.repository}.git`);
     return normalized ? {
       projectId: project.id,
       key: normalized.key,

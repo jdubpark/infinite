@@ -160,7 +160,7 @@ export function createApp(config: Config, key: Buffer) {
   // TeamService ticks on every host and drives the ledger from its own session listing.
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
-  const projectGroups = new ProjectGroupService(config, key);
+  const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   missions.useUsage(usage);
   usage.useResolvers({
@@ -552,6 +552,7 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   app.get("/api/project-groups", requireRole(["owner", "controller", "viewer"]), (_req, res) => res.json(projectGroups.list()));
+  app.get("/api/project-groups/:id", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(projectGroups.get(projectGroupIdSchema.parse(req.params.id))));
   app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(projectGroups.create(createProjectGroupSchema.parse(req.body))));
   app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
   app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body))));
@@ -573,8 +574,11 @@ export function createApp(config: Config, key: Buffer) {
     // A retry returns the recorded mission even if the group or a handoff changed since it was admitted.
     const recorded = missions.replayCreate(body);
     if (recorded) return res.json(recorded);
-    for (const repo of projectGroups.get(body.groupId).repos) assertNoHandoff(repo.projectId);
-    return res.json(await missions.create(body));
+    const group = projectGroups.get(body.groupId);
+    const resolvedBody = { ...body, groupId: group.id };
+    for (const repo of group.repos)
+      for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
+    return res.json(await missions.create(resolvedBody, body));
   });
   // Mission controls and answers are owner-only, so every recorded mission answer is the owner's.
   app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
@@ -582,7 +586,7 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await missions.answer(id.parse(req.params.id), id.parse(req.params.decisionId), missionTextSchema.parse(req.body))));
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/missions/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await missions[action](id.parse(req.params.id), missionActionSchema.parse(req.body))));
-  app.get("/api/board", (_req, res) => res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects)));
+  app.get("/api/board", (_req, res) => res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => projectGroups.containing(id))));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
   app.post("/api/teams/:id/tasks/:taskId/rating", requireRole(["owner"]), (req, res) =>
     res.json(teams.rateTask(id.parse(req.params.id), z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).parse(req.params.taskId), teamTaskRatingSchema.parse(req.body))));

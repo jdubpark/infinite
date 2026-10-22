@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -104,47 +104,27 @@ test("owner-managed environment files load safely in sorted, layered order", () 
   }
 });
 
-test("the installer accepts only a single top-level export SHELL anchor", () => {
-  const root = mkdtempSync(join(tmpdir(), "infinite-anchor-"));
-  const check = (body: string) => {
-    const file = join(root, "wrapper.sh");
+test("the installer patches only a wrapper whose prefix matches the shipped one byte for byte", () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-prefix-"));
+  const reference = resolve("deploy/ubuntu/agent-wrapper.sh");
+  const refLines = readFileSync(reference, "utf8").split("\n");
+  const anchorIndex = refLines.indexOf("export SHELL=/bin/bash");
+  const prefix = refLines.slice(0, anchorIndex + 1).join("\n");
+  const hook = refLines[anchorIndex + 1];
+  const state = (body: string) => {
+    const file = join(root, "wrapper");
     writeFileSync(file, body);
-    return spawnSync("/bin/sh", ["-c", '. "$1"; infinite_wrapper_anchor_ok "$2"', "sh", anchorCheck, file]).status;
+    const result = spawnSync("/bin/sh", ["-c", '. "$1"; infinite_wrapper_prefix_state "$2" "$3"', "sh", anchorCheck, file, reference], { encoding: "utf8" });
+    return result.stdout.trim().split("\n")[0];
   };
   try {
-    assert.equal(check("#!/bin/sh\nexport PATH=/x\nexport SHELL=/bin/bash\nf() {\n  :\n}\nexec provider\n"), 0, "top-level anchor before functions");
-    assert.equal(check('#!/bin/sh\nlabel="{"\nexport SHELL=/bin/bash\nexec provider\n'), 0, "braces inside quotes are ignored");
-    assert.notEqual(check("unused() {\nexport SHELL=/bin/bash\n}\nexec provider\n"), 0, "anchor inside a function is refused");
-    assert.notEqual(check("export SHELL=/bin/bash\nexport SHELL=/bin/bash\n"), 0, "two anchors are refused");
-    assert.notEqual(check("if true; then\n  export SHELL=/bin/bash\nfi\n"), 0, "an indented anchor is refused");
-    assert.notEqual(check("exec provider\n"), 0, "a missing anchor is refused");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("the installer proves the hook executes by running the wrapper in self-test mode", () => {
-  const root = mkdtempSync(join(tmpdir(), "infinite-hook-"));
-  const hook = `. "${loader}" && infinite_load_env "${root}" ""`;
-  const tail = 'provider=$(basename "$0")\ncase "$provider" in\n  claude) echo PROVIDER-REACHED ;;\n  *) printf "Unknown agent launcher\\n" >&2; exit 64 ;;\nesac\necho PROVIDER-REACHED\n';
-  const proven = (name: string, body: string) => {
-    const file = join(root, name);
-    writeFileSync(file, body, { mode: 0o755 });
-    chmodSync(file, 0o755);
-    const result = spawnSync("/bin/sh", ["-c", '. "$1"; infinite_wrapper_hook_proven "$2"', "sh", anchorCheck, file], { encoding: "utf8" });
-    return { proven: result.status === 0, status: result.status, out: result.stdout + result.stderr };
-  };
-  try {
-    mkdirSync(join(root, "secrets"));
-    assert.equal(proven("good.probe", `#!/bin/sh\nset -eu\nexport SHELL=/bin/bash\n${hook}\n${tail}`).proven, true, "a top-level hook is proven");
-    assert.equal(proven("heredoc.probe", `#!/bin/sh\nset -eu\ncat <<'HELP' >/dev/null\nexport SHELL=/bin/bash\n${hook}\nHELP\n${tail}`).proven, false, "a hook inside heredoc text is not proven");
-    assert.equal(proven("comment-brace.probe", `#!/bin/sh\nset -eu\nunused() { # }\nexport SHELL=/bin/bash\n${hook}\n}\n${tail}`).proven, false, "a hook inside a function is not proven");
-    assert.equal(proven("claude", `#!/bin/sh\n${tail}`).status, 2, "a provider-named file is never executed");
-    for (const name of ["heredoc.probe", "comment-brace.probe"]) {
-      const file = join(root, name);
-      const run = spawnSync("/bin/sh", ["-c", 'INFINITE_AGENT_ENV_SELFTEST=1 "$1"', "sh", file], { encoding: "utf8" });
-      assert.doesNotMatch(run.stdout, /PROVIDER-REACHED/, `${name}: the self-test never reaches a provider launch`);
-    }
+    assert.equal(state(`${prefix}\n${hook}\nexec provider\n`), "patched");
+    assert.equal(state(`${prefix}\n\nprovider=$(basename "$0")\ncase "$provider" in codex) set -- --rehearsal "$@" ;; esac\nexec provider\n`), "patchable", "drift after the anchor is allowed");
+    assert.equal(state(`${prefix.replace("umask 077", "umask 022")}\nexec provider\n`), "drifted", "drift before the anchor is refused");
+    assert.equal(state(`#!/bin/sh\nunused() {\nexport SHELL=/bin/bash\n}\nexec provider\n`), "drifted", "an anchor inside a function is refused");
+    assert.equal(state(`#!/bin/sh\ncat <<'HELP' >/dev/null\nexport SHELL=/bin/bash\nHELP\nexec provider\n`), "drifted", "an anchor inside heredoc text is refused");
+    assert.equal(state(`#!/bin/sh\nprovider=claude\ncase "$provider" in claude) exec claude ;; esac\n${prefix}\n`), "drifted", "dispatch before the anchor is refused");
+    assert.equal(state("exec provider\n"), "drifted", "a missing anchor is refused");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

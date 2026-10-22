@@ -49,6 +49,7 @@ import { UnderstandingService } from "./understanding.js";
 import { UnderstandingCatalog, CatalogError } from "./understanding-catalog.js";
 import { UnderstandingRuntime } from "./understanding-runtime.js";
 import { createUnderstandingAdapter } from "./understanding-adapter.js";
+import { BehaviorError, UnderstandingBehaviorService } from "./understanding-behavior.js";
 import { BalanceService } from "./balances.js";
 import { LiveFeed, type LiveTopic } from "./live.js";
 import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/protocol";
@@ -300,6 +301,7 @@ export function createApp(config: Config, key: Buffer) {
   repositoryBriefings?.useUsage(usage);
   const understandingCatalog = new UnderstandingCatalog({ config, key, groups: projectGroups });
   const understandingRuntime = new UnderstandingRuntime({ config, key, groups: projectGroups, catalog: understandingCatalog, adapter: createUnderstandingAdapter(config) });
+  const understandingBehaviors = new UnderstandingBehaviorService({ config, key, groups: projectGroups, catalog: understandingCatalog, runtime: understandingRuntime });
   const understanding = new UnderstandingService({ config, key, manager, groups: projectGroups, missions, teams, goals, briefings: repositoryBriefings,
     knowledge: { read: workspaceId => ({ schemaVersion: 1, catalog: understandingCatalog.read(workspaceId), ...understandingRuntime.read(workspaceId) }) },
   });
@@ -569,11 +571,24 @@ export function createApp(config: Config, key: Buffer) {
   });
   app.get("/api/project-groups/:id/understanding/components/:componentId", requireRole(["owner", "controller", "viewer"]), (req, res) => {
     const componentId = z.string().regex(/^[A-Za-z0-9_-]{1,160}$/).parse(req.params.componentId);
-    const value = understandingRuntime.read(projectGroupIdSchema.parse(req.params.id));
+    const workspaceId = projectGroupIdSchema.parse(req.params.id);
+    const value = understandingRuntime.read(workspaceId);
     const component = value.components.find(item => item.id === componentId);
     if (!component) return void res.status(404).json({ error: "Component is unavailable in this workspace." });
-    return res.json({ component, relationships: value.relationships.filter(edge => edge.from === componentId || edge.to === componentId), coverage: value.coverage });
+    const behaviors = understandingBehaviors.list(workspaceId, componentId);
+    return res.json({ component, relationships: value.relationships.filter(edge => edge.from === componentId || edge.to === componentId), behaviors: behaviors.behaviors,
+      coverage: [...new Set([...value.coverage, ...behaviors.coverage])].slice(0, 200) });
   });
+  app.get("/api/project-groups/:id/understanding/behaviors", requireRole(["owner", "controller", "viewer"]), (req, res) =>
+    res.json(understandingBehaviors.list(projectGroupIdSchema.parse(req.params.id))));
+  app.get("/api/project-groups/:id/understanding/behaviors/:behaviorId", requireRole(["owner", "controller", "viewer"]), (req, res) =>
+    res.json(understandingBehaviors.get(projectGroupIdSchema.parse(req.params.id), String(req.params.behaviorId))));
+  app.get("/api/project-groups/:id/understanding/behaviors/:behaviorId/suite", requireRole(["owner", "controller", "viewer"]), (req, res) =>
+    res.json(understandingBehaviors.suite(projectGroupIdSchema.parse(req.params.id), String(req.params.behaviorId))));
+  app.post("/api/project-groups/:id/understanding/behaviors", requireRole(["owner"]), (req, res) =>
+    res.json(understandingBehaviors.save(projectGroupIdSchema.parse(req.params.id), req.body)));
+  app.post("/api/project-groups/:id/understanding/behaviors/:behaviorId/run", requireRole(["owner"]), (req, res) =>
+    res.status(202).json(understandingBehaviors.run(projectGroupIdSchema.parse(req.params.id), String(req.params.behaviorId), req.body)));
   app.post("/api/project-groups/:id/understanding/refresh", requireRole(["owner"]), (req, res) => {
     z.object({}).strict().parse(req.body);
     return res.status(202).json(understandingRuntime.refresh(projectGroupIdSchema.parse(req.params.id)));
@@ -1325,6 +1340,7 @@ export function createApp(config: Config, key: Buffer) {
       // `error` carries the message every client displays; a failed sync operation also names its category.
       if (error instanceof TeamError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof CatalogError) return res.status(error.statusCode).json({ code: "understanding-catalog", error: error.message });
+      if (error instanceof BehaviorError) return res.status(error.statusCode).json({ code: "understanding-behavior", error: error.message });
       if (error instanceof ProjectSyncError)
         return res.status(error.status).json({ code: error.code, error: error.message, ...(error.category ? { category: error.category, message: error.message } : {}) });
       if (error instanceof ProjectSourceError) return res.status(error.status).json({ error: error.message, code: error.code });
@@ -1391,6 +1407,7 @@ export function createApp(config: Config, key: Buffer) {
   server.once("close", () => missions.close());
   server.once("close", () => repositoryBriefings?.close());
   server.once("close", () => { void understandingRuntime.close(); });
+  server.once("close", () => { void understandingBehaviors.close(); });
   server.once("close", () => linear.close());
   server.once("close", () => handoffs.close());
   server.once("close", () => readings.stop());
@@ -1398,6 +1415,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

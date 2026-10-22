@@ -1,16 +1,19 @@
 import { readFileSync } from "node:fs";
-import type { KnowledgeCatalog, KnowledgeClaim, KnowledgeComponent, KnowledgeMaintenance, KnowledgeRelationship, WorkspaceKnowledge } from "@infinite/remote";
+import { createHash } from "node:crypto";
+import type { BehaviorCheckResult, BehaviorDefinition, BehaviorList, BehaviorModel, BehaviorPropertyResult, BehaviorRun, BehaviorSuite, KnowledgeBehavior, KnowledgeCatalog, KnowledgeClaim, KnowledgeComponent, KnowledgeMaintenance, KnowledgeRelationship, WorkspaceKnowledge } from "@infinite/remote";
 import type { ProjectGroupList } from "./project-group-types.js";
 import type { WorkspaceUnderstanding, UnderstandingArtifact, UnderstandingWork } from "@infinite/remote";
+import { behaviorDefinitionHash, validateBehaviorDefinition, checkBehaviorModel } from "./behavior-checker.js";
 
 type Options = Record<string, string | boolean>;
 type Api = { json<T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> };
 type IndexResponse = { components: Pick<KnowledgeComponent, "id" | "name" | "description" | "repositoryIds" | "pinned" | "retired" | "redirectTo">[]; coverage: string[] };
-type DetailResponse = { component: KnowledgeComponent; relationships: KnowledgeRelationship[]; coverage: string[] };
+type DetailResponse = { component: KnowledgeComponent; relationships: KnowledgeRelationship[]; coverage: string[]; behaviors?: KnowledgeBehavior[] };
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").trim();
 const short = (value: unknown, limit = 220) => { const text = clean(value); return text.length > limit ? `${text.slice(0, limit - 1)}…` : text; };
 const listed = (values: string[]) => values.length ? values.map(clean).join(", ") : "none";
 const validId = /^[A-Za-z0-9_-]{1,160}$/;
+const validBehaviorId = /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function artifactLines(artifact: UnderstandingArtifact): string[] {
@@ -111,8 +114,120 @@ function renderComponent(value: DetailResponse): string[] {
   for (const claim of c.difference.claims) lines.push(`Difference claim: ${claimText(claim)}`);
   for (const entry of c.history) lines.push(`History: ${entry.at} · ${entry.snapshotId} · ${entry.summary}`);
   for (const relationship of value.relationships) lines.push(`Relationship: ${relationship.from} ${relationship.kind} ${relationship.to} · ${relationship.basis} · ${relationship.summary}`);
+  for (const behavior of value.behaviors ?? []) lines.push(...renderBehavior(behavior));
   for (const coverage of [...c.coverage, ...value.coverage]) lines.push(`Coverage: ${coverage}`);
   return lines.map(clean);
+}
+
+function valueLines(values: Record<string, unknown>): string {
+  const entries = Object.entries(values).sort(([a], [b]) => a.localeCompare(b));
+  return entries.length ? entries.map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(", ") : "no variables";
+}
+function evidenceLines(evidence: { repositoryId: string; source: string; line: number | null; text?: string }[], prefix: string): string[] {
+  return evidence.map(item => `${prefix}${item.repositoryId ? `${item.repositoryId} · ` : ""}${item.source}${item.line === null ? "" : `:${item.line}`}${item.text ? ` · ${short(item.text)}` : ""}`);
+}
+function renderModel(label: "Current" | "Planned", model: BehaviorModel, result: BehaviorCheckResult | null): string[] {
+  const lines = [`  ${label} model · ${result?.status ?? "unchecked"}${result ? ` · ${result.exhaustive ? "exhaustive" : "bounded"} · ${result.exploredStates} states / ${result.exploredTransitions} transitions · checked ${result.checkedAt}` : ""}`];
+  if (result) lines.push(`    Limits: ${result.limits.maxStates} states · ${result.limits.maxTransitions} transitions · ${result.limits.timeoutMs} ms · ${result.limits.maxTraceSteps} trace steps`);
+  lines.push(`    Initial state: ${model.initial}`);
+  for (const state of model.states) lines.push(`    State ${state.id} · ${state.label}`);
+  for (const variable of model.variables) lines.push(`    Variable ${variable.id} · initial ${JSON.stringify(variable.initial)} · domain ${variable.domain.map(value => JSON.stringify(value)).join(", ")}`);
+  for (const transition of model.transitions) {
+    lines.push(`    Transition ${transition.id} · ${transition.from} → ${transition.to} · ${transition.label} · actor ${transition.actor} · event ${transition.event} · guard ${JSON.stringify(transition.guard)} · effects ${JSON.stringify(transition.effects)}`);
+    lines.push(...evidenceLines(transition.evidence, "      Source: "));
+  }
+  for (const property of model.properties) {
+    const outcome = result?.properties.find(item => item.id === property.id);
+    lines.push(`    Property ${property.id} · ${property.basis} · ${property.kind} · ${outcome?.status ?? (result ? "no result" : "unchecked")} · ${property.title}`);
+    lines.push(`      Requirement: ${property.requirement}`);
+    lines.push(...evidenceLines(property.evidence, "      Source: "));
+    if (outcome?.trace.length) {
+      lines.push(`      Ordered counterexample${outcome.traceTruncated ? " (truncated)" : ""}:`);
+      for (const [index, step] of outcome.trace.entries()) lines.push(`        ${index + 1}. ${step.state}${step.transitionId ? ` --${step.transitionId}→` : ""} · ${valueLines(step.values)}${step.summary ? ` · ${step.summary}` : ""}`);
+    }
+  }
+  if (result?.message) lines.push(`    Checker message: ${result.message}`);
+  return lines;
+}
+function renderBehavior(value: KnowledgeBehavior): string[] {
+  const definition = value.definition;
+  const lines = [`Behavior ${value.id} · r${value.revision} · ${value.status} · freshness ${value.freshness} · ${definition.title} · component ${definition.componentId}`,
+    `  Repository ${definition.repositoryId} · source snapshot ${definition.sourceSnapshotId} · requirement revision ${definition.requirementRevision} · updated ${value.updatedAt}`,
+    `  Current definition revision ${value.revision} · host freshness ${value.freshness}`,
+    `  Plan revisions: ${definition.planRevisions.map(item => `${item.id} r${item.revision}`).join(", ") || "none"}`];
+  for (const source of value.sources) lines.push(`  Captured source: ${source.repositoryId} · ${source.path}:${source.lines} · fingerprint ${source.hash}`);
+  for (const assumption of definition.assumptions) lines.push(`  Assumption: ${clean(assumption)}`);
+  for (const exclusion of definition.exclusions) lines.push(`  Exclusion: ${clean(exclusion)}`);
+  for (const run of value.runs) {
+    const sameDefinition = run.definitionRevision === value.revision && run.definitionHash === behaviorDefinitionHash(definition);
+    lines.push(`  Run ${run.id} · ${run.state} · definition revision ${run.definitionRevision}${sameDefinition ? " · current definition" : " · historical definition; model/property associations are unavailable"} · definition fingerprint ${run.definitionHash} · started ${run.startedAt}${run.finishedAt ? ` · finished ${run.finishedAt}` : ""}${run.message ? ` · ${short(run.message)}` : ""}`);
+    for (const [label, model, result] of [["Current", definition.current, run.current], ["Planned", definition.planned, run.planned]] as const) {
+      if (!result) {
+        if (model) lines.push(`    ${label} result · ${run.state === "running" ? "running" : "inconclusive"}`);
+        continue;
+      }
+      if (!model) {
+        lines.push(...renderHistoricalResult(label, result, "model is absent from the active definition"));
+        continue;
+      }
+      const sameModel = sameDefinition && result.modelHash === behaviorModelHash(model);
+      if (sameModel) lines.push(...renderModel(label, model, result));
+      else lines.push(...renderHistoricalResult(label, result, sameDefinition ? "model hash mismatch" : "older definition"));
+    }
+  }
+  if (!value.runs.length) {
+    lines.push(...renderModel("Current", definition.current, null));
+    if (definition.planned) lines.push(...renderModel("Planned", definition.planned, null));
+  }
+  lines.push("  Model evidence only; a passing finite-state check does not prove the implementation behaves this way.");
+  for (const coverage of value.coverage) lines.push(`  Coverage: ${coverage}`);
+  return lines.map(clean);
+}
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(",")}}`;
+}
+function behaviorModelHash(model: BehaviorModel): string {
+  return createHash("sha256").update(canonicalJson(model)).digest("hex");
+}
+function renderHistoricalResult(label: string, result: BehaviorCheckResult, reason: string): string[] {
+  const lines = [`  ${label} historical result · ${result.status} · ${reason} · model fingerprint ${result.modelHash} · ${result.exhaustive ? "exhaustive" : "bounded"} · ${result.exploredStates} states / ${result.exploredTransitions} transitions`,
+    `    Limits: ${result.limits.maxStates} states · ${result.limits.maxTransitions} transitions · ${result.limits.timeoutMs} ms · ${result.limits.maxTraceSteps} trace steps`];
+  if (result.message) lines.push(`    Checker message: ${result.message}`);
+  for (const property of result.properties) {
+    lines.push(`    Historical property ${property.id} · ${property.status} · reachable states ${property.reachableStates}`);
+    if (property.trace.length) {
+      lines.push(`      Ordered counterexample${property.traceTruncated ? " (truncated)" : ""}:`);
+      for (const [index, step] of property.trace.entries()) lines.push(`        ${index + 1}. ${step.state}${step.transitionId ? ` --${step.transitionId}→` : ""} · ${valueLines(step.values)}${step.summary ? ` · ${step.summary}` : ""}`);
+    }
+  }
+  return lines;
+}
+function renderBehaviorList(value: BehaviorList): string[] {
+  const lines = ["Behaviors"];
+  if (!value.behaviors.length) lines.push("No behavior definitions are recorded for this workspace.");
+  for (const behavior of value.behaviors) lines.push(...renderBehavior(behavior));
+  for (const coverage of value.coverage) lines.push(`Coverage: ${coverage}`);
+  return lines;
+}
+function renderSuite(value: BehaviorSuite): string[] {
+  const lines = ["Behavior suite"];
+  for (const file of value.files) lines.push(`File: ${file.path}`, ...file.content.split(/\r?\n/).map(line => `  ${line}`));
+  lines.push("Run a local finite-state check with: infinite understand check --file definition.json --json");
+  for (const coverage of value.coverage) lines.push(`Coverage: ${coverage}`);
+  return lines;
+}
+function checkLines(definition: BehaviorDefinition, current: BehaviorCheckResult, planned: BehaviorCheckResult | null): string[] {
+  const lines = [`Behavior check · ${definition.title} · component ${definition.componentId}`, `Source snapshot ${definition.sourceSnapshotId} · requirement revision ${definition.requirementRevision}`,
+    ...definition.planRevisions.map(item => `Plan revision: ${item.id} r${item.revision}`),
+    ...definition.assumptions.map(item => `Assumption: ${clean(item)}`),
+    ...definition.exclusions.map(item => `Exclusion: ${clean(item)}`),
+    ...renderModel("Current", definition.current, current)];
+  if (definition.planned && planned) lines.push(...renderModel("Planned", definition.planned, planned));
+  lines.push("Model evidence only; this result does not prove implementation behavior.");
+  return lines;
 }
 function renderMaintenance(value: KnowledgeMaintenance): string[] { return [`Maintenance · ${value.state} · jobs today ${value.jobsToday}/${value.dailyJobLimit}`, `Observed ${value.lastObservedAt ?? "never"} · published ${value.lastPublishedAt ?? "never"} · next ${value.nextAttemptAt ?? "not scheduled"}`, value.message ? `Message: ${value.message}` : ""].filter(Boolean).map(clean); }
 
@@ -173,9 +288,10 @@ export async function handleUnderstandingCommand(positional: string[], options: 
     return true;
   }
   const id = workspaceId(options);
-  if (["catalog", "components", "component", "refresh", "policy"].includes(command)) {
+  if (["catalog", "components", "component", "refresh", "policy", "behaviors", "behavior", "behavior-save", "behavior-run", "behavior-suite"].includes(command)) {
     if (command === "component" && (!arg || extra || !validId.test(arg))) throw new Error("Usage: infinite understand component COMPONENT_ID --workspace ID [--json]");
-    if (command !== "component" && (arg || extra)) throw new Error(`Usage: infinite understand ${command} --workspace ID [--json]`);
+    if (["behavior", "behavior-run", "behavior-suite"].includes(command) && (!arg || extra || !validBehaviorId.test(arg))) throw new Error(`Usage: infinite understand ${command} BEHAVIOR_ID --workspace ID [--json]`);
+    if (["catalog", "components", "refresh", "policy", "behaviors", "behavior-save"].includes(command) && (arg || extra)) throw new Error(`Usage: infinite understand ${command} --workspace ID [--json]`);
     if (command === "refresh") {
       requireOptions(options, ["--workspace", "--json"]);
       const value = await api.json<KnowledgeMaintenance>(route(id, "/refresh"), {}, undefined, undefined, "POST");
@@ -188,6 +304,39 @@ export async function handleUnderstandingCommand(positional: string[], options: 
       const envelope = { requestId: requestIdOption(options), revision: revisionOption(options), action: "update", value: readValue(options["--file"] as string) };
       const value = await api.json<KnowledgeCatalog>(route(id, "/catalog/policy"), envelope, undefined, undefined, "POST");
       printJsonOrLines(value, renderCatalog(value), Boolean(options["--json"]));
+      return true;
+    }
+    if (command === "behavior-save") {
+      requireOptions(options, ["--workspace", "--file", "--revision", "--request-id", "--json"]);
+      if (typeof options["--file"] !== "string") throw new Error("Behavior save requires --file with a JSON behavior definition");
+      const definition = validateBehaviorDefinition(readValue(options["--file"] as string));
+      const envelope = { requestId: requestIdOption(options), revision: revisionOption(options), definition };
+      const saved = await api.json<KnowledgeBehavior>(route(id, "/behaviors"), envelope, undefined, undefined, "POST");
+      printJsonOrLines(saved, renderBehavior(saved), Boolean(options["--json"]));
+      return true;
+    }
+    if (command === "behavior-run") {
+      requireOptions(options, ["--workspace", "--revision", "--request-id", "--json"]);
+      const request = { requestId: requestIdOption(options), revision: revisionOption(options) };
+      const value = await api.json<KnowledgeBehavior>(route(id, `/behaviors/${encodeURIComponent(arg!)}/run`), request, undefined, undefined, "POST");
+      printJsonOrLines(value, renderBehavior(value), Boolean(options["--json"]));
+      return true;
+    }
+    if (["behavior", "behavior-suite"].includes(command)) requireOptions(options, ["--workspace", "--json"]);
+    else if (command === "behaviors") requireOptions(options, ["--workspace", "--json"]);
+    if (command === "behaviors") {
+      const value = await api.json<BehaviorList>(route(id, "/behaviors"));
+      printJsonOrLines(value, renderBehaviorList(value), Boolean(options["--json"]));
+      return true;
+    }
+    if (command === "behavior") {
+      const value = await api.json<KnowledgeBehavior>(route(id, `/behaviors/${encodeURIComponent(arg!)}`));
+      printJsonOrLines(value, renderBehavior(value), Boolean(options["--json"]));
+      return true;
+    }
+    if (command === "behavior-suite") {
+      const value = await api.json<BehaviorSuite>(route(id, `/behaviors/${encodeURIComponent(arg!)}/suite`));
+      printJsonOrLines(value, renderSuite(value), Boolean(options["--json"]));
       return true;
     }
     requireOptions(options, ["--workspace", "--json"]);
@@ -218,4 +367,26 @@ export async function handleUnderstandingCommand(positional: string[], options: 
     return true;
   }
   throw new Error(`Unknown understand command: ${clean(command)}`);
+}
+
+/** Local model checking runs before the CLI attempts to load a paired client configuration. */
+export async function handleLocalBehaviorCheckCommand(argv: string[]): Promise<boolean> {
+  if (argv[0] !== "understand" || argv[1] !== "check") return false;
+  const options: Options = {};
+  for (let i = 2; i < argv.length; i++) {
+    const name = argv[i]!;
+    if (name === "--json") options[name] = true;
+    else if (name === "--file" && argv[i + 1] && !argv[i + 1]!.startsWith("--")) options[name] = argv[++i]!;
+    else throw new Error(`Unknown or incomplete local check option: ${name}`);
+  }
+  if (typeof options["--file"] !== "string") throw new Error("Usage: infinite understand check --file definition.json [--json]");
+  const definition: BehaviorDefinition = validateBehaviorDefinition(readValue(options["--file"] as string));
+  const [current, planned] = await Promise.all([
+    checkBehaviorModel(definition.current),
+    definition.planned ? checkBehaviorModel(definition.planned) : Promise.resolve(null),
+  ]);
+  const result = { current, planned };
+  printJsonOrLines(result, checkLines(definition, current, planned), Boolean(options["--json"]));
+  process.exitCode = current.status === "passed" && (planned === null || planned.status === "passed") ? 0 : 1;
+  return true;
 }

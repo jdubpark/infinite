@@ -11,6 +11,7 @@ export type {
   UnderstandingCitation, UnderstandingLink,
 } from "./understanding.js";
 export type * from "./understanding-knowledge.js";
+export type * from "./understanding-behavior.js";
 
 /** A Cloudflare Access service token; Cloudflare checks it before the connection reaches the relay. */
 export interface RemoteAccessToken { clientId: string; clientSecret: string }

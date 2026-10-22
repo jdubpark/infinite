@@ -288,6 +288,10 @@ struct UnderstandingKnowledgeView: View {
                 }
                 if owner { Button("Add plan") { openEditor(.plan, value: .null) }.disabled(!app.connected) }
             }
+            UnderstandingBehaviorView(app: app, group: group, componentID: value["id"].string,
+                currentSourceSnapshotID: value["current"]["snapshotId"].string, currentSourceState: value["current"]["state"].string,
+                behaviors: detail["behaviors"].array.filter { $0["definition"]["componentId"].string == value["id"].string },
+                onAccessDenied: { clearCache() })
             VStack(alignment: .leading, spacing: 7) {
                 Text("Difference from accepted plans").font(.headline)
                 Text(value["difference"]["summary"].string.isEmpty ? "No comparison summary is available." : value["difference"]["summary"].string).textSelection(.enabled)

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -170,6 +170,48 @@ test("a source fingerprint change during synthesis rejects the candidate generat
   s.runtime.refresh("workspace");
   await waitUntil(() => s.runtime.read("workspace").maintenance.state === "failed");
   assert.equal(s.runtime.read("workspace").components.length, 0);
+});
+
+test("a plan edit during another repository's final observation rejects the whole publication", { timeout: 20000 }, async t => {
+  let release: (() => void) | undefined;
+  let synthesized = false;
+  const adapter: UnderstandingAdapter = {
+    context: async root => {
+      if (synthesized && root === realpathSync(s.secondRoot))
+        await new Promise<void>(resolvePromise => { release = resolvePromise; });
+      const context = sampleContext(root);
+      return { ...context, components: context.components.slice(0, 1), edges: [] };
+    },
+    synthesize: async input => {
+      synthesized = true;
+      const generatedAt = new Date().toISOString();
+      return { components: input.components.map(component => ({ ...component,
+        current: { ...component.current, state: "ready" as const, summary: "Explanation of the original plan.", generatedAt },
+        difference: { ...component.difference, snapshotId: component.current.snapshotId, generatedAt,
+          planRevisions: component.planned.map(plan => ({ id: plan.id, revision: plan.revision })) },
+      })), coverage: [] };
+    },
+    delivery: async input => ({ repositoryId: input.repositoryId, state: "ready", observedAt: new Date().toISOString(), pullRequests: [], environments: [], coverage: [] }),
+  };
+  const s = setup(t, { adapter, multiRepo: true });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").maintenance.state === "idle");
+  const before = s.runtime.read("workspace").components.map(component => component.current);
+  const component = s.runtime.read("workspace").components.find(item => item.repositoryIds.includes("repo"))!;
+  const at = new Date().toISOString();
+  const original: KnowledgeCatalog = { ...catalog(), plans: [{ id: "plan", revision: 1,
+    componentId: component.id, repositoryIds: ["repo"], title: "Publication contract", text: "Original requirement",
+    status: "accepted", sourceUrl: null, workId: null, archived: false, createdAt: at, updatedAt: at, history: [],
+  }], policy: { ...catalog().policy, synthesis: true, delivery: true } };
+  s.setCatalog(original);
+  s.runtime.refresh("workspace");
+  await waitUntil(() => Boolean(release));
+  s.setCatalog({ ...original, revision: 2, plans: original.plans.map(plan => ({ ...plan, revision: 2, text: "Changed requirement" })) });
+  release!();
+  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state));
+  const after = s.runtime.read("workspace");
+  assert.equal(after.maintenance.state, "failed", "a previously checked repository's plan can change during the later await");
+  assert.deepEqual(after.components.map(item => item.current), before, "the prior generation remains published");
 });
 
 test("restart recovers an admitted running job without resetting its daily budget", { timeout: 20000 }, async t => {

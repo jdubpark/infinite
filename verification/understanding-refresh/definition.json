@@ -1,0 +1,1300 @@
+{
+  "schemaVersion": 1,
+  "id": "understanding-refresh-publication-template",
+  "title": "Understanding refresh publication fence",
+  "componentId": "TEMPLATE_COMPONENT_BIND_BEFORE_USE",
+  "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+  "sourceSnapshotId": "TEMPLATE_SOURCE_SNAPSHOT_BIND_BEFORE_USE",
+  "planRevisions": [
+    {
+      "id": "TEMPLATE_PLAN_A_BIND_BEFORE_USE",
+      "revision": 1
+    },
+    {
+      "id": "TEMPLATE_PLAN_B_BIND_BEFORE_USE",
+      "revision": 1
+    }
+  ],
+  "requirementRevision": "understanding-refresh-publication-v1",
+  "assumptions": [
+    "The finite pilot selects two hooked repositories from one workspace to expose the cross-repository await ordering.",
+    "Plan edits are host catalog operations and may interleave while a synthesis or context adapter is awaited.",
+    "The final synchronous plan read and publication have no intervening event-loop await.",
+    "Model values 0 and 1 are symbolic tokens for same-as-captured and changed observations, not actual source hashes or plan revision numbers."
+  ],
+  "exclusions": [
+    "External filesystem writes are an independent actor and can race a context scan or occur after the final fingerprint read.",
+    "The source invariant checks that candidate metadata retains its captured fingerprint; it does not prove live checkout freshness at publication.",
+    "Provider truth, deployment, owner acceptance, and other workspace sizes are outside this model."
+  ],
+  "current": {
+    "initial": "idle",
+    "states": [
+      {
+        "id": "idle",
+        "label": "Admitted refresh before component writers"
+      },
+      {
+        "id": "waiting_synthesis_a",
+        "label": "Await first repository writer"
+      },
+      {
+        "id": "waiting_synthesis_b",
+        "label": "Await second repository writer"
+      },
+      {
+        "id": "waiting_context_a",
+        "label": "Await first repository source revalidation"
+      },
+      {
+        "id": "repo_a_checked",
+        "label": "First repository source and plans validated"
+      },
+      {
+        "id": "waiting_context_b",
+        "label": "Await second repository source revalidation"
+      },
+      {
+        "id": "ready_to_publish",
+        "label": "All repository context calls have returned"
+      },
+      {
+        "id": "published",
+        "label": "Candidate generation persisted"
+      },
+      {
+        "id": "rejected",
+        "label": "Candidate generation rejected"
+      }
+    ],
+    "variables": [
+      {
+        "id": "captured_plan_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "live_plan_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "candidate_plan_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "captured_source_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "live_source_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "candidate_source_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "captured_plan_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "live_plan_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "candidate_plan_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "captured_source_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "live_source_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "candidate_source_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      }
+    ],
+    "transitions": [
+      {
+        "id": "admit_and_capture",
+        "from": "idle",
+        "to": "waiting_synthesis_a",
+        "label": "capture source and plan revisions before writers",
+        "actor": "host",
+        "event": "capture",
+        "guard": {
+          "op": "true"
+        },
+        "effects": {
+          "captured_plan_a": {
+            "variable": "live_plan_a"
+          },
+          "captured_plan_b": {
+            "variable": "live_plan_b"
+          },
+          "captured_source_a": {
+            "variable": "live_source_a"
+          },
+          "captured_source_b": {
+            "variable": "live_source_b"
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "complete_synthesis_a",
+        "from": "waiting_synthesis_a",
+        "to": "waiting_synthesis_b",
+        "label": "accept first writer output tied to captured inputs",
+        "actor": "writer",
+        "event": "synthesize",
+        "guard": {
+          "op": "true"
+        },
+        "effects": {
+          "candidate_plan_a": {
+            "variable": "captured_plan_a"
+          },
+          "candidate_source_a": {
+            "variable": "captured_source_a"
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "complete_synthesis_b",
+        "from": "waiting_synthesis_b",
+        "to": "waiting_context_a",
+        "label": "accept second writer output tied to captured inputs",
+        "actor": "writer",
+        "event": "synthesize",
+        "guard": {
+          "op": "true"
+        },
+        "effects": {
+          "candidate_plan_b": {
+            "variable": "captured_plan_b"
+          },
+          "candidate_source_b": {
+            "variable": "captured_source_b"
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "repo_a_source_check",
+        "from": "waiting_context_a",
+        "to": "repo_a_checked",
+        "label": "first repository source fingerprint and binding check passes",
+        "actor": "host",
+        "event": "revalidate",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_source_a"
+          },
+          "right": {
+            "variable": "candidate_source_a"
+          }
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "repo_a_source_check_rejects",
+        "from": "waiting_context_a",
+        "to": "rejected",
+        "label": "first repository source fingerprint or binding check fails",
+        "actor": "host",
+        "event": "reject",
+        "guard": {
+          "op": "neq",
+          "left": {
+            "variable": "live_source_a"
+          },
+          "right": {
+            "variable": "candidate_source_a"
+          }
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "begin_repo_b_context_await",
+        "from": "repo_a_checked",
+        "to": "waiting_context_b",
+        "label": "start second repository context call",
+        "actor": "host",
+        "event": "await-context",
+        "guard": {
+          "op": "true"
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "edit_repo_a_plan_during_repo_b_context",
+        "from": "waiting_context_b",
+        "to": "waiting_context_b",
+        "label": "catalog edit advances repo A plan while repo B context is awaited",
+        "actor": "catalog",
+        "event": "plan-update",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_plan_a"
+          },
+          "right": {
+            "value": 0
+          }
+        },
+        "effects": {
+          "live_plan_a": {
+            "value": 1
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 435
+          }
+        ]
+      },
+      {
+        "id": "external_filesystem_edit_a_during_repo_b_await",
+        "from": "waiting_context_b",
+        "to": "waiting_context_b",
+        "label": "external filesystem writer changes repo A after its fingerprint check",
+        "actor": "filesystem",
+        "event": "write",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_source_a"
+          },
+          "right": {
+            "value": 0
+          }
+        },
+        "effects": {
+          "live_source_a": {
+            "value": 1
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 427
+          }
+        ]
+      },
+      {
+        "id": "repo_b_context_and_source_check",
+        "from": "waiting_context_b",
+        "to": "ready_to_publish",
+        "label": "second repository source fingerprint and binding check passes",
+        "actor": "host",
+        "event": "revalidate",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_source_b"
+          },
+          "right": {
+            "variable": "candidate_source_b"
+          }
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "repo_b_source_check_rejects",
+        "from": "waiting_context_b",
+        "to": "rejected",
+        "label": "second repository source fingerprint or binding check fails",
+        "actor": "host",
+        "event": "reject",
+        "guard": {
+          "op": "neq",
+          "left": {
+            "variable": "live_source_b"
+          },
+          "right": {
+            "variable": "candidate_source_b"
+          }
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "workspace_plan_fence_publishes",
+        "from": "ready_to_publish",
+        "to": "published",
+        "label": "final no-await workspace plan check passes",
+        "actor": "host",
+        "event": "publish",
+        "guard": {
+          "op": "and",
+          "args": [
+            {
+              "op": "eq",
+              "left": {
+                "variable": "live_plan_a"
+              },
+              "right": {
+                "variable": "candidate_plan_a"
+              }
+            },
+            {
+              "op": "eq",
+              "left": {
+                "variable": "live_plan_b"
+              },
+              "right": {
+                "variable": "candidate_plan_b"
+              }
+            }
+          ]
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 441
+          }
+        ]
+      },
+      {
+        "id": "workspace_plan_fence_rejects",
+        "from": "ready_to_publish",
+        "to": "rejected",
+        "label": "final no-await workspace plan check catches a changed plan",
+        "actor": "host",
+        "event": "reject",
+        "guard": {
+          "op": "or",
+          "args": [
+            {
+              "op": "neq",
+              "left": {
+                "variable": "live_plan_a"
+              },
+              "right": {
+                "variable": "candidate_plan_a"
+              }
+            },
+            {
+              "op": "neq",
+              "left": {
+                "variable": "live_plan_b"
+              },
+              "right": {
+                "variable": "candidate_plan_b"
+              }
+            }
+          ]
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 441
+          }
+        ]
+      },
+      {
+        "id": "external_filesystem_edit_a_after_publish",
+        "from": "published",
+        "to": "published",
+        "label": "external filesystem changes repo A after publication",
+        "actor": "filesystem",
+        "event": "write",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_source_a"
+          },
+          "right": {
+            "value": 0
+          }
+        },
+        "effects": {
+          "live_source_a": {
+            "value": 1
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 427
+          }
+        ]
+      }
+    ],
+    "properties": [
+      {
+        "id": "published_plans_match_captured_revisions",
+        "title": "A published generation uses the captured plan revisions for every hooked repository",
+        "kind": "safety",
+        "states": [
+          "published"
+        ],
+        "predicate": {
+          "op": "and",
+          "args": [
+            {
+              "op": "eq",
+              "left": {
+                "variable": "candidate_plan_a"
+              },
+              "right": {
+                "variable": "captured_plan_a"
+              }
+            },
+            {
+              "op": "eq",
+              "left": {
+                "variable": "candidate_plan_b"
+              },
+              "right": {
+                "variable": "captured_plan_b"
+              }
+            },
+            {
+              "op": "eq",
+              "left": {
+                "variable": "live_plan_a"
+              },
+              "right": {
+                "variable": "candidate_plan_a"
+              }
+            },
+            {
+              "op": "eq",
+              "left": {
+                "variable": "live_plan_b"
+              },
+              "right": {
+                "variable": "candidate_plan_b"
+              }
+            }
+          ]
+        },
+        "requirement": "If a workspace generation is published, every hooked repository still has the plan revisions that its accepted writer output used.",
+        "basis": "proposed",
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 441
+          }
+        ]
+      },
+      {
+        "id": "published_candidate_retains_captured_source",
+        "title": "Published candidate metadata remains tied to the captured source fingerprints",
+        "kind": "safety",
+        "states": [
+          "published"
+        ],
+        "predicate": {
+          "op": "and",
+          "args": [
+            {
+              "op": "eq",
+              "left": {
+                "variable": "candidate_source_a"
+              },
+              "right": {
+                "variable": "captured_source_a"
+              }
+            },
+            {
+              "op": "eq",
+              "left": {
+                "variable": "candidate_source_b"
+              },
+              "right": {
+                "variable": "captured_source_b"
+              }
+            }
+          ]
+        },
+        "requirement": "A published candidate carries the same source fingerprints that were captured for its writer inputs.",
+        "basis": "proposed",
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 392
+          }
+        ]
+      }
+    ]
+  },
+  "planned": {
+    "initial": "idle",
+    "states": [
+      {
+        "id": "idle",
+        "label": "Admitted refresh before component writers"
+      },
+      {
+        "id": "waiting_synthesis_a",
+        "label": "Await first repository writer"
+      },
+      {
+        "id": "waiting_synthesis_b",
+        "label": "Await second repository writer"
+      },
+      {
+        "id": "waiting_context_a",
+        "label": "Await first repository source revalidation"
+      },
+      {
+        "id": "repo_a_checked",
+        "label": "First repository source and plans validated"
+      },
+      {
+        "id": "waiting_context_b",
+        "label": "Await second repository source revalidation"
+      },
+      {
+        "id": "ready_to_publish",
+        "label": "All repository context calls have returned"
+      },
+      {
+        "id": "workspace_plan_fence",
+        "label": "Final synchronous workspace plan fence"
+      },
+      {
+        "id": "published",
+        "label": "Candidate generation persisted"
+      },
+      {
+        "id": "rejected",
+        "label": "Candidate generation rejected"
+      }
+    ],
+    "variables": [
+      {
+        "id": "captured_plan_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "live_plan_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "candidate_plan_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "captured_source_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "live_source_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "candidate_source_a",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "captured_plan_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "live_plan_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "candidate_plan_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "captured_source_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "live_source_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      },
+      {
+        "id": "candidate_source_b",
+        "domain": [
+          0,
+          1
+        ],
+        "initial": 0
+      }
+    ],
+    "transitions": [
+      {
+        "id": "admit_and_capture",
+        "from": "idle",
+        "to": "waiting_synthesis_a",
+        "label": "capture source and plan revisions before writers",
+        "actor": "host",
+        "event": "capture",
+        "guard": {
+          "op": "true"
+        },
+        "effects": {
+          "captured_plan_a": {
+            "variable": "live_plan_a"
+          },
+          "captured_plan_b": {
+            "variable": "live_plan_b"
+          },
+          "captured_source_a": {
+            "variable": "live_source_a"
+          },
+          "captured_source_b": {
+            "variable": "live_source_b"
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "complete_synthesis_a",
+        "from": "waiting_synthesis_a",
+        "to": "waiting_synthesis_b",
+        "label": "accept first writer output tied to captured inputs",
+        "actor": "writer",
+        "event": "synthesize",
+        "guard": {
+          "op": "true"
+        },
+        "effects": {
+          "candidate_plan_a": {
+            "variable": "captured_plan_a"
+          },
+          "candidate_source_a": {
+            "variable": "captured_source_a"
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "complete_synthesis_b",
+        "from": "waiting_synthesis_b",
+        "to": "waiting_context_a",
+        "label": "accept second writer output tied to captured inputs",
+        "actor": "writer",
+        "event": "synthesize",
+        "guard": {
+          "op": "true"
+        },
+        "effects": {
+          "candidate_plan_b": {
+            "variable": "captured_plan_b"
+          },
+          "candidate_source_b": {
+            "variable": "captured_source_b"
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "repo_a_source_check",
+        "from": "waiting_context_a",
+        "to": "repo_a_checked",
+        "label": "first repository source fingerprint and binding check passes",
+        "actor": "host",
+        "event": "revalidate",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_source_a"
+          },
+          "right": {
+            "variable": "candidate_source_a"
+          }
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "repo_a_source_check_rejects",
+        "from": "waiting_context_a",
+        "to": "rejected",
+        "label": "first repository source fingerprint or binding check fails",
+        "actor": "host",
+        "event": "reject",
+        "guard": {
+          "op": "neq",
+          "left": {
+            "variable": "live_source_a"
+          },
+          "right": {
+            "variable": "candidate_source_a"
+          }
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "begin_repo_b_context_await",
+        "from": "repo_a_checked",
+        "to": "waiting_context_b",
+        "label": "start second repository context call",
+        "actor": "host",
+        "event": "await-context",
+        "guard": {
+          "op": "true"
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "edit_repo_a_plan_during_repo_b_context",
+        "from": "waiting_context_b",
+        "to": "waiting_context_b",
+        "label": "catalog edit advances repo A plan while repo B context is awaited",
+        "actor": "catalog",
+        "event": "plan-update",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_plan_a"
+          },
+          "right": {
+            "value": 0
+          }
+        },
+        "effects": {
+          "live_plan_a": {
+            "value": 1
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 435
+          }
+        ]
+      },
+      {
+        "id": "external_filesystem_edit_a_during_repo_b_await",
+        "from": "waiting_context_b",
+        "to": "waiting_context_b",
+        "label": "external filesystem writer changes repo A after its fingerprint check",
+        "actor": "filesystem",
+        "event": "write",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_source_a"
+          },
+          "right": {
+            "value": 0
+          }
+        },
+        "effects": {
+          "live_source_a": {
+            "value": 1
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 427
+          }
+        ]
+      },
+      {
+        "id": "repo_b_context_and_source_check",
+        "from": "waiting_context_b",
+        "to": "ready_to_publish",
+        "label": "second repository source fingerprint and binding check passes",
+        "actor": "host",
+        "event": "revalidate",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_source_b"
+          },
+          "right": {
+            "variable": "candidate_source_b"
+          }
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "repo_b_source_check_rejects",
+        "from": "waiting_context_b",
+        "to": "rejected",
+        "label": "second repository source fingerprint or binding check fails",
+        "actor": "host",
+        "event": "reject",
+        "guard": {
+          "op": "neq",
+          "left": {
+            "variable": "live_source_b"
+          },
+          "right": {
+            "variable": "candidate_source_b"
+          }
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 429
+          }
+        ]
+      },
+      {
+        "id": "enter_workspace_plan_fence",
+        "from": "ready_to_publish",
+        "to": "workspace_plan_fence",
+        "label": "all awaited context calls have returned",
+        "actor": "host",
+        "event": "check-plans",
+        "guard": {
+          "op": "true"
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 434
+          }
+        ]
+      },
+      {
+        "id": "workspace_plan_fence_publishes",
+        "from": "workspace_plan_fence",
+        "to": "published",
+        "label": "final workspace plan check passes",
+        "actor": "host",
+        "event": "publish",
+        "guard": {
+          "op": "and",
+          "args": [
+            {
+              "op": "eq",
+              "left": {
+                "variable": "live_plan_a"
+              },
+              "right": {
+                "variable": "candidate_plan_a"
+              }
+            },
+            {
+              "op": "eq",
+              "left": {
+                "variable": "live_plan_b"
+              },
+              "right": {
+                "variable": "candidate_plan_b"
+              }
+            }
+          ]
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 441
+          }
+        ]
+      },
+      {
+        "id": "workspace_plan_fence_rejects",
+        "from": "workspace_plan_fence",
+        "to": "rejected",
+        "label": "final workspace plan check catches a changed plan",
+        "actor": "host",
+        "event": "reject",
+        "guard": {
+          "op": "or",
+          "args": [
+            {
+              "op": "neq",
+              "left": {
+                "variable": "live_plan_a"
+              },
+              "right": {
+                "variable": "candidate_plan_a"
+              }
+            },
+            {
+              "op": "neq",
+              "left": {
+                "variable": "live_plan_b"
+              },
+              "right": {
+                "variable": "candidate_plan_b"
+              }
+            }
+          ]
+        },
+        "effects": {},
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 441
+          }
+        ]
+      },
+      {
+        "id": "external_filesystem_edit_a_after_plan_fence",
+        "from": "workspace_plan_fence",
+        "to": "workspace_plan_fence",
+        "label": "external filesystem changes repo A after the final host check",
+        "actor": "filesystem",
+        "event": "write",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_source_a"
+          },
+          "right": {
+            "value": 0
+          }
+        },
+        "effects": {
+          "live_source_a": {
+            "value": 1
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 427
+          }
+        ]
+      },
+      {
+        "id": "external_filesystem_edit_a_after_publish",
+        "from": "published",
+        "to": "published",
+        "label": "external filesystem changes repo A after publication",
+        "actor": "filesystem",
+        "event": "write",
+        "guard": {
+          "op": "eq",
+          "left": {
+            "variable": "live_source_a"
+          },
+          "right": {
+            "value": 0
+          }
+        },
+        "effects": {
+          "live_source_a": {
+            "value": 1
+          }
+        },
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 427
+          }
+        ]
+      }
+    ],
+    "properties": [
+      {
+        "id": "published_plans_match_captured_revisions",
+        "title": "A published generation uses the captured plan revisions for every hooked repository",
+        "kind": "safety",
+        "states": [
+          "published"
+        ],
+        "predicate": {
+          "op": "and",
+          "args": [
+            {
+              "op": "eq",
+              "left": {
+                "variable": "candidate_plan_a"
+              },
+              "right": {
+                "variable": "captured_plan_a"
+              }
+            },
+            {
+              "op": "eq",
+              "left": {
+                "variable": "candidate_plan_b"
+              },
+              "right": {
+                "variable": "captured_plan_b"
+              }
+            },
+            {
+              "op": "eq",
+              "left": {
+                "variable": "live_plan_a"
+              },
+              "right": {
+                "variable": "candidate_plan_a"
+              }
+            },
+            {
+              "op": "eq",
+              "left": {
+                "variable": "live_plan_b"
+              },
+              "right": {
+                "variable": "candidate_plan_b"
+              }
+            }
+          ]
+        },
+        "requirement": "If a workspace generation is published, every hooked repository still has the plan revisions that its accepted writer output used.",
+        "basis": "proposed",
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 441
+          }
+        ]
+      },
+      {
+        "id": "published_candidate_retains_captured_source",
+        "title": "Published candidate metadata remains tied to the captured source fingerprints",
+        "kind": "safety",
+        "states": [
+          "published"
+        ],
+        "predicate": {
+          "op": "and",
+          "args": [
+            {
+              "op": "eq",
+              "left": {
+                "variable": "candidate_source_a"
+              },
+              "right": {
+                "variable": "captured_source_a"
+              }
+            },
+            {
+              "op": "eq",
+              "left": {
+                "variable": "candidate_source_b"
+              },
+              "right": {
+                "variable": "captured_source_b"
+              }
+            }
+          ]
+        },
+        "requirement": "A published candidate carries the same source fingerprints that were captured for its writer inputs.",
+        "basis": "proposed",
+        "evidence": [
+          {
+            "repositoryId": "TEMPLATE_HOST_REPOSITORY_BIND_BEFORE_USE",
+            "source": "packages/host/src/understanding-runtime.ts",
+            "line": 392
+          }
+        ]
+      }
+    ]
+  }
+}

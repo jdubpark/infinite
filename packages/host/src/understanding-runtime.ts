@@ -427,13 +427,18 @@ export class UnderstandingRuntime {
         const fresh = parseRepoContext(await this.invoke(binding.root, options => this.adapter.context!(binding.root, options), MAX_CONTEXT_BYTES));
         const freshFingerprint = digest({ head: fresh.head, files: Object.entries(fresh.files).sort(([a], [b]) => a.localeCompare(b)) });
         if (realpathSync(fresh.repo) !== binding.root || freshFingerprint !== observation.fingerprint || fresh.head !== observation.head || !this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-generation-changed-during-hook");
-        if (currentPolicy.synthesis && this.adapter.synthesize) {
-          const currentCatalog = this.options.catalog.read(workspaceId);
-          const oldPlans = catalogAtStart.plans.filter(plan => !plan.archived && plan.repositoryIds.some(id => observation.repositoryIds.includes(id)));
-          const latestPlans = currentCatalog.plans.filter(plan => !plan.archived && plan.repositoryIds.some(id => observation.repositoryIds.includes(id)));
-          for (const component of observation.components) if (observation.completedSourceFingerprints[component.id] === observation.fingerprint &&
-            this.planKey(component.id, oldPlans) !== this.planKey(component.id, latestPlans)) throw new Error("plan-revisions-changed-during-synthesis");
-        }
+      }
+    }
+    // No await may separate this catalog check from publication: a later
+    // repository observation can yield to edits of an earlier repository's plans.
+    if (currentPolicy.synthesis && this.adapter.synthesize) {
+      const currentCatalog = this.options.catalog.read(workspaceId);
+      for (const binding of bindings.filter(item => hookedRepos.has(item.repo.projectId))) {
+        const observation = repos[binding.repo.projectId]; if (!observation) continue;
+        const oldPlans = catalogAtStart.plans.filter(plan => !plan.archived && plan.repositoryIds.some(id => observation.repositoryIds.includes(id)));
+        const latestPlans = currentCatalog.plans.filter(plan => !plan.archived && plan.repositoryIds.some(id => observation.repositoryIds.includes(id)));
+        for (const component of observation.components) if (observation.completedSourceFingerprints[component.id] === observation.fingerprint &&
+          this.planKey(component.id, oldPlans) !== this.planKey(component.id, latestPlans)) throw new Error("plan-revisions-changed-during-synthesis");
       }
     }
     if (!this.membershipStillCurrent(workspaceId, groupAtStart, bindings)) throw new Error("workspace-rebound-at-publish");

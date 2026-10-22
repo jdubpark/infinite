@@ -27,8 +27,10 @@ import type { Config, Provider, Role } from "./types.js";
 
 import { handleClientCommand } from "./client.js";
 import { handleMachineCommand } from "./machine-cli.js";
+import { handleLocalBehaviorCheckCommand } from "./understanding-cli.js";
 
-if (!await handleMachineCommand(process.argv.slice(2)) && !await handleClientCommand(process.argv.slice(2))) {
+const argv = process.argv.slice(2);
+if (!await handleLocalBehaviorCheckCommand(argv) && !await handleMachineCommand(argv) && !await handleClientCommand(argv)) {
 const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
@@ -241,6 +243,10 @@ infinite understand [--workspace ID] [--json] Read workspace Understanding
 infinite understand catalog|components|component ID|policy|refresh --workspace ID
 infinite understand create COLLECTION|update COLLECTION ID|archive COLLECTION ID --workspace ID
   Mutations require --revision N --request-id UUID; create/update/policy also require --file JSON
+infinite understand behaviors|behavior ID|behavior-suite ID --workspace ID [--json]
+infinite understand behavior-save --workspace ID --revision N --request-id UUID --file DEFINITION.json
+infinite understand behavior-run ID --workspace ID --revision N --request-id UUID
+infinite understand check --file DEFINITION.json [--json]  Check locally without host configuration
 infinite projects group NAME REPO_ID...    Create a multi-repository project
 infinite projects rename|hide|show ID       Rename or hide a project
 infinite projects primary ID CHECKOUT_ID   Choose the checkout a project works in

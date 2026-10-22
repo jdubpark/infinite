@@ -1,19 +1,20 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, Alert, Linking, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import * as Crypto from "expo-crypto";
-import type { KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeFeature, KnowledgeFeatureInput, KnowledgeMaintenance, KnowledgePlan, KnowledgePlanInput, KnowledgePolicy, KnowledgeProject, KnowledgeProjectInput, KnowledgeRelationship, UnderstandingRepository, UnderstandingWork, WorkspaceKnowledge } from "@infinite/remote";
+import type { KnowledgeBehavior, KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeFeature, KnowledgeFeatureInput, KnowledgeMaintenance, KnowledgePlan, KnowledgePlanInput, KnowledgePolicy, KnowledgeProject, KnowledgeProjectInput, KnowledgeRelationship, UnderstandingRepository, UnderstandingWork, WorkspaceKnowledge } from "@infinite/remote";
 import { useRouter } from "expo-router";
 import { ApiError, api, connectionKey, type Connection, type Me } from "../../api/client";
 import { Button } from "../../components/Button";
 import { Chip, Segmented, type SegmentOption } from "../../components/Glass";
 import { theme } from "../../theme";
 import { clearUnderstandingSummary } from "./offline-cache";
+import { BehaviorPanel } from "./BehaviorPanel";
 
 type Area = "catalog" | "components" | "delivery" | "maintenance";
 type CatalogTab = "projects" | "features" | "plans";
 type Mutation = { collection: string; id?: string; requestId: string; revision: number; action: "create" | "update" | "archive"; value?: unknown };
 type ComponentsIndex = { components: Pick<KnowledgeComponent, "id" | "name" | "description" | "repositoryIds" | "pinned" | "retired" | "redirectTo">[]; coverage: string[] };
-type ComponentDetail = { component: KnowledgeComponent; relationships: KnowledgeRelationship[]; coverage: string[] };
+type ComponentDetail = { component: KnowledgeComponent; relationships: KnowledgeRelationship[]; coverage: string[]; behaviors?: KnowledgeBehavior[] };
 type ComponentDisclosureState = { expanded: Record<string, boolean>; toggle: (id: string) => void };
 
 const areas: SegmentOption<Area>[] = [
@@ -222,7 +223,7 @@ export function KnowledgePanel({ connection, workspaceId, knowledge, readGenerat
       {catalogTab === "plans" ? <PlanList items={catalog?.plans ?? []} canEdit={canEdit} onCreate={() => openEditor("plans")} onEdit={item => openEditor("plans", item.id, item)} onArchive={item => confirmArchive(item.title, () => void submit("plans", "archive", item.id))} /> : null}
       <Coverage lines={catalog?.coverage ?? []} />
     </> : null}
-    {area === "components" ? <ComponentArea index={index} detail={visibleDetail} selected={selectedComponent} onSelect={navigateComponent} onDetailLayout={componentDetailDidLayout} onRefresh={refreshReads} canEdit={canEdit} onEdit={item => openEditor("components", item.id, item)} /> : null}
+    {area === "components" ? <ComponentArea index={index} detail={visibleDetail} selected={selectedComponent} onSelect={navigateComponent} onDetailLayout={componentDetailDidLayout} onRefresh={refreshReads} canEdit={canEdit} onAccessDenied={clearDeniedState} connection={connection} workspaceId={workspaceId} onEdit={item => openEditor("components", item.id, item)} /> : null}
     {area === "delivery" ? <DeliveryArea delivery={knowledge?.delivery ?? []} /> : null}
     {area === "maintenance" ? <MaintenanceArea knowledge={knowledge} maintenance={maintenance} catalog={catalog} canEdit={canEdit} owner={owner} busy={busy} onRefresh={refreshSources} onEditPolicy={() => openEditor("policy", undefined, catalog?.policy)} /> : null}
     {editor ? <CatalogEditor key={`${editor.collection}/${editor.id ?? "new"}`} collection={editor.collection} id={editor.id} initial={editor.value} catalog={catalog} repositories={repositories} components={index?.components ?? []} work={work} onCancel={() => setEditor(null)} onSave={submitEditor} busy={busy} locked={Boolean(pending)} /> : null}
@@ -285,7 +286,7 @@ function PlanList({ items, canEdit, onCreate, onEdit, onArchive }: { items: Know
   </View>;
 }
 
-function ComponentArea({ index, detail, selected, onSelect, onDetailLayout, onRefresh, canEdit, onEdit }: { index: ComponentsIndex | null; detail: ComponentDetail | null; selected: string; onSelect: (id: string) => void; onDetailLayout: (id: string) => void; onRefresh: () => void; canEdit: boolean; onEdit: (item: KnowledgeComponent) => void }) {
+function ComponentArea({ index, detail, selected, onSelect, onDetailLayout, onRefresh, canEdit, onAccessDenied, connection, workspaceId, onEdit }: { index: ComponentsIndex | null; detail: ComponentDetail | null; selected: string; onSelect: (id: string) => void; onDetailLayout: (id: string) => void; onRefresh: () => void; canEdit: boolean; onAccessDenied: () => void; connection: Connection; workspaceId: string; onEdit: (item: KnowledgeComponent) => void }) {
   const [expandedByComponent, setExpandedByComponent] = useState<Record<string, Record<string, boolean>>>({});
   const [detailHeights, setDetailHeights] = useState<Record<string, number>>({});
   const disclosureState: ComponentDisclosureState = {
@@ -299,7 +300,7 @@ function ComponentArea({ index, detail, selected, onSelect, onDetailLayout, onRe
       const height = event.nativeEvent.layout.height;
       setDetailHeights(previous => previous[selected] === height ? previous : { ...previous, [selected]: height });
       onDetailLayout(detail.component.id);
-    }}><ComponentDetailView detail={detail} components={entries} disclosureState={disclosureState} canEdit={canEdit} onEdit={() => onEdit(detail.component)} onSelect={onSelect} /></View> : <View key={`loading:${selected}`} style={[k.group, { minHeight: detailHeights[selected] ?? 0 }]}><Text style={k.heading}>{entries.find(item => item.id === selected)?.name || "Component"}</Text><ActivityIndicator color={theme.colors.forest} accessibilityLabel="Loading component details" /></View>}
+    }}><ComponentDetailView detail={detail} components={entries} disclosureState={disclosureState} canEdit={canEdit} onAccessDenied={onAccessDenied} connection={connection} workspaceId={workspaceId} onEdit={() => onEdit(detail.component)} onSelect={onSelect} /></View> : <View key={`loading:${selected}`} style={[k.group, { minHeight: detailHeights[selected] ?? 0 }]}><Text style={k.heading}>{entries.find(item => item.id === selected)?.name || "Component"}</Text><ActivityIndicator color={theme.colors.forest} accessibilityLabel="Loading component details" /></View>}
   </View>;
   return <View style={k.stack}>
     <View style={k.sectionHead}><Text style={k.heading}>System components · {entries.length}</Text><Button compact secondary title="Reload" onPress={onRefresh} /></View>
@@ -312,7 +313,7 @@ function ComponentArea({ index, detail, selected, onSelect, onDetailLayout, onRe
   </View>;
 }
 
-function ComponentDetailView({ detail, components, disclosureState, canEdit, onEdit, onSelect }: { detail: ComponentDetail; components: ComponentsIndex["components"]; disclosureState: ComponentDisclosureState; canEdit: boolean; onEdit: () => void; onSelect: (id: string) => void }) {
+function ComponentDetailView({ detail, components, disclosureState, canEdit, onAccessDenied, connection, workspaceId, onEdit, onSelect }: { detail: ComponentDetail; components: ComponentsIndex["components"]; disclosureState: ComponentDisclosureState; canEdit: boolean; onAccessDenied: () => void; connection: Connection; workspaceId: string; onEdit: () => void; onSelect: (id: string) => void }) {
   const { component, relationships } = detail;
   const nameOf = (id: string) => (id === component.id ? component.name : components.find(item => item.id === id)?.name) || "Unavailable component";
   const latestObservation = component.current.sources.map(source => source.observedAt).sort().at(-1);
@@ -332,6 +333,7 @@ function ComponentDetailView({ detail, components, disclosureState, canEdit, onE
       <Text style={k.sectionTitle}>Planned</Text>
       {component.planned.length ? component.planned.map(plan => <View key={plan.id} style={k.plan}><Text style={k.title}>{plan.title} · {plan.status === "accepted" ? "Accepted" : plan.status === "superseded" ? "Superseded" : "Proposed"}</Text><Text selectable style={k.body}>{plan.text}</Text><Text style={k.meta}>Updated {date(plan.updatedAt)}</Text></View>) : <Text style={k.note}>No recorded plans are linked to this component.</Text>}
     </View>
+    <BehaviorPanel key={`${component.id}:${(detail.behaviors ?? []).map(item => `${item.id}:${item.revision}`).join("|")}`} connection={connection} workspaceId={workspaceId} componentId={component.id} currentSourceSnapshotId={component.current.snapshotId} currentSourceState={component.current.state} behaviors={detail.behaviors} canRun={canEdit} onAccessDenied={onAccessDenied} />
     <View style={k.group}>
       <Text style={k.sectionTitle}>Difference · {component.difference.state}</Text>
       <Text selectable style={k.body}>{component.difference.summary}</Text>

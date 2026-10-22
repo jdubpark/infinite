@@ -689,7 +689,6 @@ struct TeamCreateView: View {
     @State private var project = ""
     @State private var provider = "claude"
     @State private var useLineup = false
-    @State private var parallelism = 2
     @State private var busy = false
     @State private var error = ""
     @State private var clearPending = false
@@ -717,7 +716,6 @@ struct TeamCreateView: View {
                 if !useLineup {
                     Picker("Agent provider", selection: $provider) { ForEach(providers, id: \.self) { Text(providerName($0)).tag($0) } }
                 }
-                Stepper("Parallel implementers: \(parallelism)", value: $parallelism, in: 1...app.teamParallelismLimit)
             }.disabled(pending)
             VStack(alignment: .leading, spacing: 4) {
                 Text("Feature request or PRD").font(.callout)
@@ -733,6 +731,8 @@ struct TeamCreateView: View {
             }
             Text("Work runs on the server in isolated workspaces with the provider permissions configured there. Permission prompts still need your response in the agent session.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("The PM and coordinator adjust workers as work changes.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if !useLineup && provider == "demo" { Text("Rehearsal uses a local test process. It does not call an AI model or implement a real feature.").font(.caption).foregroundStyle(.orange) }
             if pending {
                 Text("A team request is pending. Retry uses its original request identity. Check the team list before starting a different one.").font(.callout).foregroundStyle(.orange)
@@ -745,7 +745,7 @@ struct TeamCreateView: View {
                 Button(busy ? "Starting…" : pending ? "Retry same request" : "Start team") {
                     busy = true
                     Task {
-                        do { try await app.createTeam(projectID: project, provider: effectiveProvider, useLineup: useLineup, title: title, objective: objective, parallelism: parallelism); dismiss() }
+                        do { try await app.createTeam(projectID: project, provider: effectiveProvider, useLineup: useLineup, title: title, objective: objective); dismiss() }
                         catch { self.error = error.localizedDescription }
                         busy = false
                     }

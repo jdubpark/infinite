@@ -118,12 +118,8 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
       </Section>
 
       <Section title="Work limits">
-        <Text style={t.body}>{goal.cycles.length}/{goal.maxRuns} cycles · {goal.memberCount}/{goal.maxMembers} agents · Worker limit {goal.parallelism}</Text>
-        {owns && ["running", "needs-input", "paused"].includes(goal.status) ? <View style={s.workerControl}>
-          <Choices values={[1, 2, 3, 4]} selected={goal.parallelism} disabled={locked || !fresh}
-            label={String} onSelect={parallelism => { if (parallelism !== goal.parallelism) send("parallelism", "Worker limit", { parallelism }); }} />
-          <Text style={t.note}>The team starts a worker when a task is ready and stops it when the task is done, up to this limit. You can change the limit while the goal runs; a change applies to the active cycle and later cycles.</Text>
-        </View> : null}
+        <Text style={t.body}>{goal.cycles.length}/{goal.maxRuns} cycles · {goal.memberCount}/{goal.maxMembers} agents · Workers {goal.activeTeamId ? workerStatus(activeTeam ?? { parallelism: goal.parallelism }) : "Agent-managed"}</Text>
+        <Text style={t.note}>The PM and coordinator adjust workers as work changes.</Text>
         <Text style={t.note}>Deadline {shortDate(goal.deadlineAt)}: {goal.maxMinutes} minutes from creation. Pausing does not extend it.</Text>
       </Section>
 
@@ -214,7 +210,6 @@ const s = StyleSheet.create({
   overlayRoot: { position: "relative" },
   empty: { padding: 30, gap: 15, alignItems: "center" },
   titleBlock: { paddingBottom: 4, gap: 8 },
-  workerControl: { gap: 4 },
   metaRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
   body: { paddingHorizontal: 16, paddingTop: 2, gap: 10, paddingBottom: 24 },
   record: { gap: 4, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },

@@ -6,12 +6,12 @@ import { createInterface } from "node:readline";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
-import { applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
-import type { CreateTeam, TeamBrief, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
+import { TeamError, applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
+import { createTeamSchema, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamModelProfile, type TeamRun, type TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import type { HandoffPolicy, TeamHandoffContext } from "../packages/host/src/handoff-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
@@ -604,13 +604,14 @@ test("review rubrics drop self-grading, integration records docs/tests, and owne
   } finally { await f.close(); }
 });
 
-test("a finished implementer releases its slot so a third independent task can start", { timeout: 120000 }, async () => {
+test("legacy create capacity is ignored and ready work uses the PM-selected limit", { timeout: 120000 }, async () => {
   const f = await fixture("scale-up", undefined, {}, { parallelism: 2 });
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const finished = await f.settled(created.body.id);
     assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.workers.limit, 4, "Omitted PM capacity defaults to the host ceiling despite the legacy create value of two");
     assert.deepEqual(finished.tasks.map(task => task.status), ["integrated", "integrated", "integrated"]);
     const workers = readdirSync(f.receipts).filter(name => name.endsWith(".json"))
       .map(name => JSON.parse(readFileSync(join(f.receipts, name), "utf8")))
@@ -621,11 +622,12 @@ test("a finished implementer releases its slot so a third independent task can s
     const moments = workers.flatMap(worker => [[worker.startedAt, 1], [worker.finishedAt, -1] as [number, number]] as [number, number][]).sort((a, b) => a[0] - b[0]);
     let running = 0, maximum = 0;
     for (const [, delta] of moments) { running += delta; maximum = Math.max(maximum, running); }
-    assert.ok(maximum <= 2, `Observed ${maximum} overlapping implementers`);
+    assert.ok(maximum <= 4, `Observed ${maximum} overlapping implementers`);
+    assert.ok(maximum >= 2, "Independent ready work uses the capacity selected by the PM");
   } finally { await f.close(); }
 });
 
-test("an owner can raise a running team's worker limit and retries are scoped to their request body", { timeout: 120000 }, async () => {
+test("an owner cannot change agent-managed capacity and the refusal does not mutate the limit", { timeout: 120000 }, async () => {
   const f = await fixture("live-limit", undefined, {}, { parallelism: 1 });
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
@@ -635,28 +637,18 @@ test("an owner can raise a running team's worker limit and retries are scoped to
     assert.deepEqual(before.workers, { limit: 1, max: 4, running: 1, ready: 1 });
     const request = { requestId: randomUUID(), revision: before.revision, parallelism: 2 };
     const changed = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", request);
-    assert.equal(changed.status, 200, JSON.stringify(changed.body));
-    assert.equal(changed.body.revision, before.revision);
-    assert.equal(changed.body.workers.limit, 2);
-    const retry = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", request);
-    assert.equal(retry.status, 200);
-    assert.equal(retry.body.revision, before.revision);
-    const conflict = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", { ...request, parallelism: 1 });
-    assert.deepEqual([conflict.status, conflict.body.code], [409, "request-conflict"]);
-    const stale = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", { requestId: randomUUID(), revision: before.revision + 1, parallelism: 1 });
-    assert.deepEqual([stale.status, stale.body.code], [409, "stale-team-revision"]);
+    assert.deepEqual([changed.status, changed.body.code], [409, "agent-managed-capacity"]);
+    const unchanged = await f.get(before.id);
+    assert.deepEqual([unchanged.revision, unchanged.workers.limit], [before.revision, 1]);
     for (const role of ["controller", "viewer"] as const)
       assert.equal((await f.host.fetchApi(`/teams/${before.id}/parallelism`, role, { requestId: randomUUID(), revision: before.revision, parallelism: 1 })).status, 403);
-    await waitFor(() => readdirSync(f.receipts).filter(name => name.endsWith(".json"))
-      .map(name => JSON.parse(readFileSync(join(f.receipts, name), "utf8")))
-      .some(value => value.runId === before.id && value.role === "implementer" && value.taskId === "b"), Boolean, 30000);
     writeFileSync(join(f.receipts, `${before.id}.release`), "release", { mode: 0o600 });
     const finished = await f.settled(before.id);
     assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
-    assert.equal(finished.workers.limit, 2);
+    assert.equal(finished.workers.limit, 1);
     assert.equal(finished.revision, before.revision);
     const closed = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", { requestId: randomUUID(), revision: finished.revision, parallelism: 1 });
-    assert.deepEqual([closed.status, closed.body.code], [409, "team-not-running"]);
+    assert.deepEqual([closed.status, closed.body.code], [409, "agent-managed-capacity"]);
   } finally { await f.close(); }
 });
 
@@ -1878,6 +1870,8 @@ test("a permission coordinator back from an outage during a current review runs 
 test("an answered implementer waits for a slot under a lowered worker limit, then continues", async () => {
   const f = schedulerFixture();
   try {
+    f.run.missionId = randomUUID();
+    f.run.parallelismCeiling = 4;
     const original = f.run.members[0], at = new Date().toISOString();
     const active = { ...original, role: "implementer" as const, taskId: "a", startedAt: at, lastActivityAt: at };
     const waiting = { ...original, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer" as const, taskId: "b", status: "waiting" as const,
@@ -1890,7 +1884,7 @@ test("an answered implementer waits for a slot under a lowered worker limit, the
     f.writeTeam();
     const teams = f.openTeam();
     const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
-    await teams.setParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 1 });
+    await teams.setMissionParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 1 });
     await teams.answer(f.run.id, f.run.decisions[0].id, { requestId: randomUUID(), revision: 1, text: "Yes" });
     await scheduler.step(scheduler.record(f.run.id));
     const held = teams.get(f.run.id);
@@ -1898,7 +1892,7 @@ test("an answered implementer waits for a slot under a lowered worker limit, the
     assert.deepEqual(held.members.map(member => [member.taskId, member.status]), [["a", "running"], ["b", "waiting"]]);
     assert.equal(held.decisions[0].answer, "Yes");
 
-    await teams.setParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 2 });
+    await teams.setMissionParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 2 });
     await scheduler.step(scheduler.record(f.run.id));
     const resumed = teams.get(f.run.id);
     assert.deepEqual(resumed.members.map(member => [member.taskId, member.status]), [["a", "running"], ["b", "stopped"], ["b", "queued"]]);
@@ -1906,6 +1900,67 @@ test("an answered implementer waits for a slot under a lowered worker limit, the
     assert.equal(resumed.members[2].cwd, waiting.cwd);
     assert.equal(resumed.tasks[1].memberId, resumed.members[2].memberId);
   } finally { f.close(); }
+});
+
+test("restoring an active legacy solo mission subteam enforces its size ceiling", async () => {
+  const f = schedulerFixture();
+  try {
+    const missionId = randomUUID();
+    f.run.missionId = missionId;
+    f.run.parallelism = 4;
+    delete f.run.parallelismCeiling;
+    f.run.status = "implementing";
+    f.writeTeam();
+    const teams = f.openTeam();
+    assert.equal(teams.ensureMissionCapacityCeiling(f.run.id, missionId, 1), 1);
+    const migrated = teams.get(f.run.id);
+    assert.deepEqual([migrated.parallelism, migrated.workers.max], [1, 1]);
+    assert.ok(migrated.events.some(event => /Mission capacity was reconciled from ceiling unset to 1/.test(event.text)));
+    assert.equal(teams.ensureMissionCapacityCeiling(f.run.id, randomUUID(), 4), undefined, "A different mission cannot migrate this run");
+  } finally { f.close(); }
+});
+
+test("restoring an active legacy standalone run moves its owner-selected limit to the host ceiling", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.parallelism = 1;
+    delete f.run.parallelismCeiling;
+    f.run.status = "implementing";
+    f.writeTeam();
+    const migrated = f.openTeam().get(f.run.id);
+    assert.deepEqual([migrated.parallelism, migrated.workers.max], [4, 4]);
+    assert.ok(migrated.events.some(event => /Legacy worker capacity was moved to agent management: 1 to 4/.test(event.text)));
+  } finally { f.close(); }
+});
+
+test("a persisted mission team replays a legacy create identity when capacity ceiling becomes derived", { timeout: 60000 }, async () => {
+  const f = await fixture("success", fallbackLineup, {}, { noServer: true });
+  let teams: import("../packages/host/src/teams.js").TeamService | undefined;
+  try {
+    const missionId = randomUUID(), request = { ...f.create(), parallelism: 1 };
+    const parsed = createTeamSchema.parse(request), pinnedLineup = teamLineupSchema.parse(fallbackLineup);
+    teams = await f.openTeamService({ start: false });
+    const created = await teams.createForMission(request, missionId, fallbackLineup, { parallelismCeiling: 1 });
+    await teams.idle();
+    teams.close();
+    const file = join(f.host.config.stateDir, "teams", `${created.id}.sealed`), key = readFileSync(f.host.config.keyFile);
+    const persisted = unseal<any>(key, `team:${created.id}`, readFileSync(file, "utf8"));
+    // This is the fingerprint a pre-upgrade createForMission wrote: derived capacity was not part of identity.
+    persisted.fingerprint = createHash("sha256").update(JSON.stringify({ request: parsed, missionId, lineup: pinnedLineup })).digest("hex");
+    // A legacy pending solo child may have started from an owner-selected value and no stored ceiling.
+    persisted.run.parallelism = 4;
+    delete persisted.run.parallelismCeiling;
+    writeSealed(file, key, `team:${created.id}`, persisted);
+
+    teams = await f.openTeamService({ start: false });
+    const replay = await teams.createForMission(request, missionId, fallbackLineup, { parallelismCeiling: 1 });
+    assert.equal(replay.id, created.id);
+    assert.equal(replay.missionId, missionId);
+    assert.deepEqual([replay.parallelism, replay.workers.max], [1, 1], "Replaying a pending solo launch restores its one-worker ceiling");
+    await assert.rejects(teams.setMissionParallelism(created.id, { requestId: randomUUID(), revision: replay.revision, parallelism: 2 }),
+      (error: unknown) => error instanceof TeamError && error.code === "team-parallelism-limit", "The mission coordinator cannot grow the adopted solo child above one worker");
+    assert.equal(teams.list().filter(run => run.id === created.id).length, 1, "Replaying parent launch adoption does not create a second child");
+  } finally { teams?.close(); await f.close(); }
 });
 
 test("an old member that still shows activity is not stalled after a restart", { timeout: 60000 }, async () => {

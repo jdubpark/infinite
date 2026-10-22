@@ -1365,10 +1365,6 @@ small,
 .team-history time { font-size: 11px; color: var(--muted); }
 .team-history p { font-size: 12px; line-height: 1.7; margin: 6px 0 0; overflow-wrap: anywhere; }
 .team-actions { display: flex; justify-content: space-between; padding-top: 18px; }
-.team-worker-limit { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 18px; }
-.team-worker-limit label { margin: 0; font-size: 13px; }
-.team-worker-limit select { width: auto; min-height: 36px; padding: 6px 10px; }
-.team-worker-limit .form-note { flex: 0 0 100%; margin: 0; }
 .team-cancel { color: #9d382a; }
 .team-composer-area { position: relative; padding: 18px 42px 22px; border-top: 1px solid var(--rule); flex-shrink: 0; }
 .team-composer-area > p { font-size: 12px; margin-bottom: 12px; }
@@ -1475,7 +1471,6 @@ small,
 .goal-budget dt { margin-bottom: 7px; color: var(--muted); font-size: 12px; }
 .goal-budget dd { margin: 0; font-size: 17px; }
 .goal-budget small { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; }
-.goal-worker-select { display: block; width: auto; min-width: 150px; min-height: 36px; margin-top: 10px; padding: 6px 10px; font-size: 14px; }
 .goal-active-cycle > p { margin-bottom: 8px; }
 .goal-cycle { padding: 24px 0; border-top: 1px solid var(--rule); }
 .goal-cycle:last-child { padding-bottom: 0; }

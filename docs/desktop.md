@@ -115,7 +115,8 @@ revision it was based on; a request the host refuses as stale refreshes the
 run, and one whose delivery is unconfirmed stays visible for a retry with the
 same request identity. The dashboard polls its run every two seconds while it is
 shown. **New single-repo team…** (⇧⌘N) still starts a team directly in one
-workspace with a name, agents, parallelism, and a longer brief.
+workspace with a name, agents, and a longer brief. The PM and coordinator choose
+worker capacity; the client shows worker status without a capacity control.
 
 Recent sessions stay attached and rendered off-screen, so switching back is
 immediate and keeps scrollback. Up to three terminals stay mounted; opening a

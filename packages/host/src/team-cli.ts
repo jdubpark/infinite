@@ -758,7 +758,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const provider = String(options["--provider"] ?? me.teams?.lineup?.coordinator?.provider ?? "");
     if (!provider) throw new Error("The host has no configured team lineup. Set one up on the host or use --provider PROVIDER for a single-provider team.");
     let requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
-    const body = createTeamSchema.parse({ requestId, projectId, provider, useConfiguredLineup: options["--provider"] === undefined, title: String(options["--title"] ?? objective.split("\n")[0].slice(0, 100)), objective, parallelism: 2 });
+    const body = createTeamSchema.parse({ requestId, projectId, provider, useConfiguredLineup: options["--provider"] === undefined, title: String(options["--title"] ?? objective.split("\n")[0].slice(0, 100)), objective });
     requestId = body.requestId = resumePendingIntent(receiptsPath, "team-start:", "/teams", prior => prior.projectId === body.projectId && prior.provider === body.provider && prior.useConfiguredLineup === body.useConfiguredLineup && prior.title === body.title && prior.objective === body.objective, requestId, options["--request-id"] !== undefined, rawArgs);
     const team = await postMutation(api, receiptsPath, `team-start:${requestId}`, "/teams", body);
     outputTeam(team, Boolean(options["--json"])); return true;

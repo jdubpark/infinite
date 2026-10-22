@@ -204,7 +204,7 @@ export type Me = {
   backendProviders?: { infinite: Provider[]; cmux?: Provider[] };
   projects?: TeamProject[];
   capabilities?: { signals: boolean; answer: boolean; push: boolean; dictation?: { model: string } };
-  teams?: { enabled: boolean; maxParallelism: number; lineup?: TeamLineup };
+  teams?: { enabled: boolean; lineup?: TeamLineup };
   goals?: { enabled: boolean };
   usage?: { enabled: boolean; budgets?: Record<string, unknown> };
 };

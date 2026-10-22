@@ -737,7 +737,7 @@ test("mixed teams pin real worker launches across configuration changes, restart
           }
         }
         assert.equal(settings.get("command"), process.execPath);
-        assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT"]);
+        assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"]);
         assert.equal(settings.get("tools.report.approval_mode"), "approve");
         assert.match(worker.prompt ?? "", /report tool of the infinite_team MCP server/);
       } else {

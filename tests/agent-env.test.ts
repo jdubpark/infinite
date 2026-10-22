@@ -10,10 +10,10 @@ const loader = resolve("deploy/ubuntu/agent-env.sh");
 const anchorCheck = resolve("deploy/ubuntu/agent-anchor.sh");
 const shells = ["/bin/sh", ...["dash", "bash"].filter((shell) => spawnSync(shell, ["-c", ":"]).status === 0)];
 
-function runLoader(root: string, projectId: string, shell = "/bin/sh", extraArgs: string[] = []) {
+function runLoader(root: string, projectId: string, shell = "/bin/sh", extraArgs: string[] = [], hostEnv: Record<string, string> = {}) {
   const result = spawnSync(shell, [...extraArgs, "-c", 'set -eu; . "$1"; infinite_load_env "$2" "$3"; env', "sh", loader, root, projectId], {
     cwd: root,
-    env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...hostEnv },
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
@@ -58,6 +58,9 @@ test("owner-managed environment files load safely in sorted, layered order", () 
       "HISTCMD=not-a-number",
       "FUNCNAME=value",
       "CRLF=value\r",
+      "OPENCODE_SERVER_PASSWORD=from-file",
+      "OPENCODE_CONFIG_CONTENT={}",
+      "HOST_OWNED=from-file",
       "",
     ].join("\n"));
     mkdirSync(join(root, "projects", "other"), { recursive: true });
@@ -86,6 +89,13 @@ test("owner-managed environment files load safely in sorted, layered order", () 
       assert.equal(values.has(special), false, `${special} is denied`);
     assert.equal(values.has("HIJACKED"), false, "a file key cannot redirect project selection");
     assert.equal(values.get("CRLF"), "value", "a trailing carriage return is stripped");
+    assert.equal(values.has("OPENCODE_SERVER_PASSWORD"), false, "OpenCode credentials are denied");
+    assert.equal(values.has("OPENCODE_CONFIG_CONTENT"), false, "OpenCode config is denied");
+    const withHost = runLoader(root, "p1", "/bin/sh", [], { HOST_OWNED: "from-host", OPENCODE_SERVER_PASSWORD: "host-secret", SAME: "host-same" });
+    assert.equal(withHost.values.get("HOST_OWNED"), "from-host", "a host-injected variable is never overridden by a file");
+    assert.equal(withHost.values.get("OPENCODE_SERVER_PASSWORD"), "host-secret");
+    assert.equal(withHost.values.get("SAME"), "host-same", "layering between files never beats the host");
+    assert.match(withHost.stderr, /HOST_OWNED is set by the host/);
     assert.equal(values.has("WORLD_SECRET"), false);
     assert.match(stderr, new RegExp(`infinite_load_env: skipping ${join(root, "secrets", "world.env")}: world-writable`));
     for (const shell of shells) {

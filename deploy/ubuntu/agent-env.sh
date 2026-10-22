@@ -55,12 +55,19 @@ _infinite_env_load_file() {
     # Denied: launcher-owned keys, this loader's own namespace (any leading
     # underscore), and names the shell interprets on assignment.
     case $_infinite_env_key in
-      PATH|HOME|SHELL|TMPDIR|LD_*|XDG_*|INFINITE_*|SUDO_*|npm_config_prefix|provider) continue ;;
+      PATH|HOME|SHELL|TMPDIR|LD_*|XDG_*|INFINITE_*|SUDO_*|OPENCODE_SERVER_*|OPENCODE_CONFIG_CONTENT|npm_config_prefix|provider) continue ;;
       _*) continue ;;
       IFS|OPTIND|OPTARG|PS1|PS2|PS3|PS4|PWD|OLDPWD|SHLVL|LINENO|RANDOM|SECONDS|PPID|UID|EUID|GROUPS) continue ;;
       ENV|BASH_ENV|BASH*|ZDOTDIR|CDPATH|FPATH|MAIL|MAILPATH|MAILCHECK|HIST*|LC_ALL|LANG|LC_*) continue ;;
       SHELLOPTS|FUNCNAME|DIRSTACK|PIPESTATUS|REPLY|TMOUT|COMP_*|COMPREPLY|EXECIGNORE|GLOBIGNORE|IGNOREEOF|INPUTRC) continue ;;
       POSIXLY_CORRECT|PROMPT_COMMAND|PROMPT_DIRTRIM|HOSTNAME|HOSTTYPE|MACHTYPE|OSTYPE|OPTERR|EMACS|INSIDE_EMACS|CHILD_MAX) continue ;;
+    esac
+    # Files are additive: a variable the host already injected (sudoers
+    # env_keep: session tokens, OpenCode credentials) is never overridden.
+    case $_infinite_env_preexisting in
+      *"$_infinite_env_nl$_infinite_env_key$_infinite_env_nl"*)
+        _infinite_env_warn "$_infinite_env_file" "$_infinite_env_key is set by the host"
+        continue ;;
     esac
     # No deny list is complete across shells: a readonly or arithmetic name
     # makes the assignment fatal under set -e. Probe it in a subshell first;
@@ -78,6 +85,10 @@ infinite_load_env() {
   _infinite_env_dir=$1
   _infinite_env_project_id=$2
   _infinite_env_agent_uid=$(id -u)
+  _infinite_env_nl=$(printf '\n_'); _infinite_env_nl=${_infinite_env_nl%_}
+  # Names already in the environment before any file is read, one per line
+  # with surrounding newlines so exact matching works in case patterns.
+  _infinite_env_preexisting=$_infinite_env_nl$(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')$_infinite_env_nl
 
   for _infinite_env_file in "$_infinite_env_dir"/secrets/*.env; do
     [ -e "$_infinite_env_file" ] || [ -L "$_infinite_env_file" ] || continue

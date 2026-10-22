@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
 import { buildLaunch, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
+import { addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
 import { claudeConfigPath, recordClaudeTrust } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -13,6 +14,18 @@ import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 const hooks = { url: "http://127.0.0.1:4321/hook", token: "tok" };
 const relay = "/opt/infinite/packages/host/dist/hook-relay.js";
 const enabled = { claude: true, codex: true };
+
+test("worker launch passes only a valid session project ID", () => {
+  const valid: Record<string, string> = {};
+  addProjectIdToLaunchEnv(valid, "Project.1_name-2");
+  assert.equal(valid.INFINITE_PROJECT_ID, "Project.1_name-2");
+
+  for (const projectId of ["bad/id", "has space", "", undefined]) {
+    const env: Record<string, string> = {};
+    addProjectIdToLaunchEnv(env, projectId);
+    assert.equal(Object.hasOwn(env, "INFINITE_PROJECT_ID"), false, `invalid project ID ${String(projectId)} is omitted`);
+  }
+});
 
 test("team model selection preserves configured provider permissions and refuses competing model controls", () => {
   const selections: TeamModelProfile[] = [
@@ -221,7 +234,7 @@ test("Codex team launch configures its authenticated MCP report tool and require
       assert.match(serverArgs[1], /^file:\/\/\/.+\/tsx\//);
     }
     // A mission coordinator's assignment reaches the host-side MCP server, which reports over loopback for the sandboxed agent.
-    assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT"]);
+    assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"]);
     assert.equal(settings.get("tools.report.approval_mode"), "approve");
     assert.equal(settings.get("tools.mission_report.approval_mode"), "approve");
     assert.ok(launch.args.includes("--sandbox") && launch.args.includes("workspace-write"));

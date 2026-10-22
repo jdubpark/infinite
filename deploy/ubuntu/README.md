@@ -71,6 +71,20 @@ On Ubuntu 24.04, check Bubblewrap's namespace support before a Codex tool run. I
 
 Install `deploy/ubuntu/infinite.sudoers` as `/etc/sudoers.d/infinite` after checking it with `visudo -cf`. Its `env_keep` lines pass the per-session hook listener address and token through to the agent account; without them Claude Code and Codex hooks, and the chat transcript they carry, never reach the worker, and sessions fall back to screen heuristics. `INFINITE_TRUSTED_WORKSPACE` lets the Claude wrapper record folder trust for team members when `teams.trustWorkspaces` is on. Existing sessions keep their old environment; end and recreate them after installing the file.
 
+## Session environment files
+
+The provider wrappers load owner-managed files from `/usr/local/libexec/infinite`: sorted `secrets/*.env` files first, then `android.env`, then `projects/PROJECT_ID.env` for a safe project ID. Later values override earlier values. The host sets `INFINITE_PROJECT_ID` from the session's project; the wrapper uses it only to select that project's file. Create `secrets/` and `projects/` as `root:infinite-agent` mode `0750`, and keep files `root:infinite-agent` mode `0640` so the agent can read them without changing them.
+
+Each non-comment line is `KEY=value`. Values are literal text after the first `=`: the loader does not expand variables, process quotes, or evaluate shell syntax. `PATH_APPEND` appends its value to the wrapper's `PATH`. The loader skips unreadable files silently and skips non-regular files, files not owned by root or the agent, and world-writable files with a one-line warning. It never accepts `PATH`, `HOME`, `SHELL`, `TMPDIR`, `LD_*`, `XDG_*`, `INFINITE_*`, `SUDO_*`, wrapper-owned variables, `OPENCODE_SERVER_*`, `OPENCODE_CONFIG_CONTENT`, any key starting with `_`, any variable the host already set in the session (files are additive), or shell-interpreted names (`IFS`, `OPTIND`, `PS1`..`PS4`, `PWD`, `ENV`, `BASH_ENV`, `CDPATH`, locale variables) from files; a trailing carriage return is stripped. Any assignment a shell would reject (readonly or arithmetic names) is probed in a subshell first and skipped with a warning, so no file line can abort a launch. The installer never executes or parses a wrapper to decide where the hook goes: it patches a wrapper only when its first lines, through `export SHELL=/bin/bash`, are byte-identical to the shipped `deploy/ubuntu/agent-wrapper.sh` (`deploy/ubuntu/agent-anchor.sh`), and inserts the hook right after that known straight-line prefix. Drift after the anchor is allowed; a wrapper that differs before the anchor is refused with a message to reconcile it by hand. The patched copy is re-verified the same way before it replaces the original, and owner, group and mode are preserved.
+
+After updating the release checkout, install the loader and patch installed provider wrappers with `sudo sh deploy/ubuntu/install-agent-env.sh`. The script is offline and idempotent; it makes a `.before-agent-env-TIMESTAMP` copy before each wrapper patch. To patch an installed wrapper manually, insert this line immediately after `export SHELL=/bin/bash`:
+
+```sh
+[ -r /usr/local/libexec/infinite/agent-env.sh ] && . /usr/local/libexec/infinite/agent-env.sh && infinite_load_env /usr/local/libexec/infinite "${INFINITE_PROJECT_ID:-}"
+```
+
+Add `INFINITE_PROJECT_ID` to sudoers `env_keep`, validate the policy with `visudo -cf`, and restart the host service for new sessions to receive the ID. Existing sessions retain their original environment until recreated.
+
 ## Configure Infinite
 
 Build a release from this checkout using `npm ci --workspace @infinite/host --workspace @infinite/web --include-workspace-root` and `npm run build`. Build as an unprivileged build user, then install the resulting tree under `/opt/infinite` with root-owned files. Keep the pinned lockfile. Mobile dependencies are unnecessary on the execution server.

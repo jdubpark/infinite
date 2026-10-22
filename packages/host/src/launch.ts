@@ -251,7 +251,7 @@ export function buildLaunch(
     for (const [key, value] of Object.entries({
       command: process.execPath,
       args: serverArgs,
-      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT"],
+      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"],
       "tools.report.approval_mode": "approve",
       "tools.mission_report.approval_mode": "approve",
     })) args.push("-c", `mcp_servers.infinite_team.${key}=${JSON.stringify(value)}`);

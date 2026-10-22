@@ -96,7 +96,9 @@ selected host project. A new remote source receives a committed Git snapshot;
 ignored files and uncommitted changes are not included. Existing cloud sources
 are not replaced by enrollment. Setup and verification commands belong to that
 repository, while the coordinator, workers, and reviewer come from the host's
-configured lineup. First-time repository enrollment delegates current one-shot
+configured lineup. The host passes the selected project ID to Ubuntu provider
+wrappers as `INFINITE_PROJECT_ID`, which selects an optional project environment
+file on that host. First-time repository enrollment delegates current one-shot
 tool requests to the strong coordinator by default; `--permissions off` opts out.
 The repository policy bounds that authority; see
 [Delegating permission decisions](#delegating-permission-decisions).

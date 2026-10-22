@@ -8,6 +8,7 @@ fi
 
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 loader=$script_dir/agent-env.sh
+. "$script_dir/agent-anchor.sh"
 target=/usr/local/libexec/infinite
 hook_line='[ -r /usr/local/libexec/infinite/agent-env.sh ] && . /usr/local/libexec/infinite/agent-env.sh && infinite_load_env /usr/local/libexec/infinite "${INFINITE_PROJECT_ID:-}"'
 
@@ -32,9 +33,8 @@ for provider in claude codex codex-app-server grok opencode; do
     printf '%s\n' "Already patched $wrapper"
     continue
   fi
-  anchors=$(grep -Fcx 'export SHELL=/bin/bash' "$wrapper" || true)
-  if [ "$anchors" -ne 1 ]; then
-    printf '%s\n' "Cannot patch $wrapper: expected exactly one 'export SHELL=/bin/bash' line, found $anchors" >&2
+  if ! infinite_wrapper_anchor_ok "$wrapper"; then
+    printf '%s\n' "Cannot patch $wrapper: the 'export SHELL=/bin/bash' anchor must appear exactly once, at top level, before any function or brace group (see deploy/ubuntu/agent-anchor.sh)" >&2
     exit 1
   fi
 

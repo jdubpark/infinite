@@ -58,8 +58,17 @@ _infinite_env_load_file() {
       PATH|HOME|SHELL|TMPDIR|LD_*|XDG_*|INFINITE_*|SUDO_*|npm_config_prefix|provider) continue ;;
       _*) continue ;;
       IFS|OPTIND|OPTARG|PS1|PS2|PS3|PS4|PWD|OLDPWD|SHLVL|LINENO|RANDOM|SECONDS|PPID|UID|EUID|GROUPS) continue ;;
-      ENV|BASH_ENV|BASH*|ZDOTDIR|CDPATH|FPATH|MAIL|MAILPATH|MAILCHECK|HISTFILE|HISTSIZE|LC_ALL|LANG|LC_*) continue ;;
+      ENV|BASH_ENV|BASH*|ZDOTDIR|CDPATH|FPATH|MAIL|MAILPATH|MAILCHECK|HIST*|LC_ALL|LANG|LC_*) continue ;;
+      SHELLOPTS|FUNCNAME|DIRSTACK|PIPESTATUS|REPLY|TMOUT|COMP_*|COMPREPLY|EXECIGNORE|GLOBIGNORE|IGNOREEOF|INPUTRC) continue ;;
+      POSIXLY_CORRECT|PROMPT_COMMAND|PROMPT_DIRTRIM|HOSTNAME|HOSTTYPE|MACHTYPE|OSTYPE|OPTERR|EMACS|INSIDE_EMACS|CHILD_MAX) continue ;;
     esac
+    # No deny list is complete across shells: a readonly or arithmetic name
+    # makes the assignment fatal under set -e. Probe it in a subshell first;
+    # a fatal assignment only kills the subshell, and the key is skipped.
+    if ! ( export "$_infinite_env_key=$_infinite_env_value" ) 2>/dev/null; then
+      _infinite_env_warn "$_infinite_env_file" "cannot export $_infinite_env_key"
+      continue
+    fi
     export "$_infinite_env_key=$_infinite_env_value"
   done < "$_infinite_env_file"
   return 0

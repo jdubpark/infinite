@@ -7,8 +7,11 @@ import { spawnSync } from "node:child_process";
 
 const loader = resolve("deploy/ubuntu/agent-env.sh");
 
-function runLoader(root: string, projectId: string) {
-  const result = spawnSync("/bin/sh", ["-c", '. "$1"; infinite_load_env "$2" "$3"; env', "sh", loader, root, projectId], {
+const anchorCheck = resolve("deploy/ubuntu/agent-anchor.sh");
+const shells = ["/bin/sh", ...["dash", "bash"].filter((shell) => spawnSync(shell, ["-c", ":"]).status === 0)];
+
+function runLoader(root: string, projectId: string, shell = "/bin/sh", extraArgs: string[] = []) {
+  const result = spawnSync(shell, [...extraArgs, "-c", 'set -eu; . "$1"; infinite_load_env "$2" "$3"; env', "sh", loader, root, projectId], {
     cwd: root,
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
     encoding: "utf8",
@@ -51,6 +54,9 @@ test("owner-managed environment files load safely in sorted, layered order", () 
       "_infinite_env_dir=/nonexistent",
       "OPTIND=not-a-number",
       "IFS=x",
+      "SHELLOPTS=errexit",
+      "HISTCMD=not-a-number",
+      "FUNCNAME=value",
       "CRLF=value\r",
       "",
     ].join("\n"));
@@ -81,12 +87,37 @@ test("owner-managed environment files load safely in sorted, layered order", () 
     assert.equal(values.has("HIJACKED"), false, "a file key cannot redirect project selection");
     assert.equal(values.get("CRLF"), "value", "a trailing carriage return is stripped");
     assert.equal(values.has("WORLD_SECRET"), false);
-    assert.equal(stderr.trim(), `infinite_load_env: skipping ${join(root, "secrets", "world.env")}: world-writable`);
+    assert.match(stderr, new RegExp(`infinite_load_env: skipping ${join(root, "secrets", "world.env")}: world-writable`));
+    for (const shell of shells) {
+      const posixArgs = shell === "bash" ? ["--posix"] : [];
+      const run = runLoader(root, "p1", shell, posixArgs);
+      assert.equal(run.values.get("PROJECT_ONLY"), "project-value", `${shell}: hostile shell-special keys do not abort loading`);
+      for (const fatal of ["SHELLOPTS", "HISTCMD", "FUNCNAME"]) assert.notEqual(run.values.get(fatal), "errexit", `${shell}: ${fatal}`);
+    }
     assert.equal(existsSync(join(root, "pwned")), false, "value text is never evaluated");
 
     assert.equal(runLoader(root, "missing").values.has("PROJECT_ONLY"), false, "a missing project file is harmless");
     assert.equal(runLoader(root, "").values.has("PROJECT_ONLY"), false, "an empty project id is harmless");
     assert.equal(runLoader(root, "bad/id").values.has("PROJECT_ONLY"), false, "unsafe project ids do not select a file");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the installer accepts only a single top-level export SHELL anchor", () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-anchor-"));
+  const check = (body: string) => {
+    const file = join(root, "wrapper.sh");
+    writeFileSync(file, body);
+    return spawnSync("/bin/sh", ["-c", '. "$1"; infinite_wrapper_anchor_ok "$2"', "sh", anchorCheck, file]).status;
+  };
+  try {
+    assert.equal(check("#!/bin/sh\nexport PATH=/x\nexport SHELL=/bin/bash\nf() {\n  :\n}\nexec provider\n"), 0, "top-level anchor before functions");
+    assert.equal(check('#!/bin/sh\nlabel="{"\nexport SHELL=/bin/bash\nexec provider\n'), 0, "braces inside quotes are ignored");
+    assert.notEqual(check("unused() {\nexport SHELL=/bin/bash\n}\nexec provider\n"), 0, "anchor inside a function is refused");
+    assert.notEqual(check("export SHELL=/bin/bash\nexport SHELL=/bin/bash\n"), 0, "two anchors are refused");
+    assert.notEqual(check("if true; then\n  export SHELL=/bin/bash\nfi\n"), 0, "an indented anchor is refused");
+    assert.notEqual(check("exec provider\n"), 0, "a missing anchor is refused");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

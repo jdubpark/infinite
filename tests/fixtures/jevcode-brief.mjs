@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 const receiptPath = process.argv[2];
 // Optional mode after the receipt path: fail (exit 1), skip (an unrefreshed brief), empty (no brief yet)
 // or disabled (the repository is not opted in).
-const mode = ["fail", "skip", "empty", "disabled"].includes(process.argv[3]) ? process.argv[3] : null;
+const mode = ["fail", "skip", "empty", "disabled", "invalid", "large"].includes(process.argv[3]) ? process.argv[3] : null;
 const fail = mode === "fail";
 const args = process.argv.slice(mode ? 4 : 3);
 const repo = args[args.indexOf("--repo") + 1];
@@ -22,7 +22,8 @@ if (fail) process.exit(1);
 
 const activity = input.trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
 const marker = activity.findIndex(message => message.text.includes("FINAL_TRANSCRIPT_MARKER"));
-const evidence = marker < 0 ? [] : [{ source: "activity:1", line: marker + 1, path: null, text: activity[marker].text }];
+const evidence = mode === "large" ? Array.from({ length: 50 }, (_, line) => ({ source: "README.md", line: line + 1, path: null, text: "source excerpt ".repeat(750) }))
+  : marker < 0 ? [] : [{ source: "activity:1", line: marker + 1, path: null, text: activity[marker].text }];
 
 const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 const root = execFileSync("git", ["-C", repo, "rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
@@ -43,7 +44,7 @@ process.stdout.write(JSON.stringify({
   base,
   generatedAt: new Date().toISOString(),
   fingerprint: "a".repeat(40),
-  brief: { summary: marker < 0 ? "Fixture repository brief." : `Fixture repository brief includes ${activity[marker].text}.`, architecture: [], review: [], changes: [], checks: [], guidance: [], unknowns: [], diagrams: [] },
+  brief: { summary: mode === "invalid" ? "" : marker < 0 ? "Fixture repository brief." : `Fixture repository brief includes ${activity[marker].text}.`, architecture: [], review: [], changes: [], checks: [], guidance: [], unknowns: [], diagrams: [] },
   evidence,
   coverage: ["fixture repository"]
 }));

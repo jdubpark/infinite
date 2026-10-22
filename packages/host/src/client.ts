@@ -21,6 +21,7 @@ import { localProjectPath } from "./mirrored-projects.js";
 import type { ProjectSourceStatus } from "./project-source.js";
 import { boundTeamProject, forgetBoundTeamProject, handleTeamClientCommand } from "./team-cli.js";
 import { handleBoardClientCommand, projectsLines } from "./board-cli.js";
+import { handleUnderstandingCommand } from "./understanding-cli.js";
 import type { ProjectGroupList } from "./project-group-types.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
@@ -469,7 +470,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "list", "usage", "cost", "resources", "close", "sync", "pull", "team", "repo"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "resources", "close", "sync", "pull", "team", "repo"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
@@ -477,7 +478,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
-  const strings = new Set(["--client-config", "--project", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
+  const strings = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
   const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
   const option = () => {
     const name = args.shift()!;
@@ -737,6 +738,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     // Existing local-host list remains available before a laptop is paired.
     if (command === "list" && !existsSync(path) && !options["--client-config"] && !process.env.INFINITE_CLIENT_CONFIG) return false;
     const config = loadConfig(path), api = connection(config);
+    if (command === "understand") return await handleUnderstandingCommand(positional, options, api);
     if (command === "team" || command === "repo") {
       return await handleTeamClientCommand(command, positional, options, config, api, path, argv);
     }

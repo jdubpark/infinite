@@ -119,6 +119,10 @@ type Job = {
   waiters: { resolve: (summary: RepositorySummary) => void; reject: (error: Error) => void }[];
 };
 type Tracked = { cursor: number; createdAt: number; checkpointDue?: number };
+type BriefingRetention = {
+  capture(session: Session, location: Location): Promise<unknown>;
+  persist(session: Session, location: Location, summary: RepositorySummary, captured: unknown): Promise<void>;
+};
 
 function inside(root: string, candidate: string): boolean {
   const child = relative(root, candidate);
@@ -220,9 +224,12 @@ export class RepositoryBriefings {
   private readonly inFlight = new Map<string, Job>();
   private readonly reports = new Map<string, RepositorySummary>();
   private readonly latest = new Map<string, BriefingStatus>();
+  private readonly statusUpdatedAt = new Map<string, number>();
   private readonly controllers = new Set<AbortController>();
   private readonly lastAttempt = new Map<string, number>();
+  private retention?: BriefingRetention;
   useUsage(service: { recordBriefing(projectId: string, sessionId: string, at: string, usage: BriefingUsage | null): void }) { this.usageRecorder = service; }
+  useRetention(retention: BriefingRetention) { this.retention = retention; }
   private readonly closeWaiters: (() => void)[] = [];
 
   constructor(
@@ -276,6 +283,12 @@ export class RepositoryBriefings {
       this.setStatus(session.id, status);
       return status;
     }
+  }
+
+  /** Snapshot current briefing lifecycle labels without probing a session or scheduling work. */
+  understandingStatuses() {
+    return [...this.latest.entries()].map(([sessionId, status]) => ({ sessionId, state: status.state,
+      attemptedAt: this.lastAttempt.get(sessionId), updatedAt: this.statusUpdatedAt.get(sessionId)!, ...(status.error ? { error: status.error } : {}) }));
   }
 
   async summarize(session: Session, from: string): Promise<RepositorySummary | Omit<RepositorySummary, "repository">> {
@@ -458,7 +471,11 @@ export class RepositoryBriefings {
         this.lastAttempt.delete(ready.session.id);
         this.lastAttempt.set(ready.session.id, Date.now());
         while (this.lastAttempt.size > MAX_TRACKED) this.lastAttempt.delete(this.lastAttempt.keys().next().value!);
+          // Capture the enrolled source before the model call; persistence revalidates it after await.
+          const retentionCapture = this.retention ? await this.retention.capture(ready.session, ready.location) : undefined;
           const summary = await this.run(ready);
+          if (this.retention && retentionCapture !== undefined)
+            await this.retention.persist(ready.session, ready.location, summary, retentionCapture);
           this.inFlight.delete(ready.key);
           this.reports.set(ready.key, summary);
           if (this.reports.size > MAX_CACHE) this.reports.delete(this.reports.keys().next().value!);
@@ -553,7 +570,12 @@ export class RepositoryBriefings {
   private setStatus(id: string, status: BriefingStatus): void {
     this.latest.delete(id);
     this.latest.set(id, status);
-    while (this.latest.size > MAX_STATUS) this.latest.delete(this.latest.keys().next().value!);
+    this.statusUpdatedAt.set(id, Date.now());
+    while (this.latest.size > MAX_STATUS) {
+      const oldest = this.latest.keys().next().value!;
+      this.latest.delete(oldest);
+      this.statusUpdatedAt.delete(oldest);
+    }
   }
 
   private trimTracked(): void {

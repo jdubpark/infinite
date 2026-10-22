@@ -40,7 +40,7 @@ public enum DeviceKeychain {
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let data = item as? Data, let token = String(data: data, encoding: .utf8) else { throw DesktopError("Unlock Keychain or pair this device again.") }
         return token
     }
-    public static func remove(_ id: String) throws {
+    public static func remove(_ id: String, service: String = service) throws {
         let status = SecItemDelete([kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: id] as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw DesktopError("Keychain could not remove this device key.") }
     }

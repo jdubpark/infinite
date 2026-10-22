@@ -314,6 +314,13 @@ export class TeamService {
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+  /** Persisted team records for the read-only Understanding view; performs no tracker or usage refresh. */
+  understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.run)); }
+  understandingOwnsSession(runId: string, memberId: string, sessionId: string, projectId: string): boolean {
+    const stored = this.records.get(runId);
+    return Boolean(stored && stored.run.projectId === projectId && stored.run.members.some(member =>
+      member.memberId === memberId && member.sessionId === sessionId && member.runId === runId));
+  }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
   statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal), mission: Boolean(stored.run.missionId) })); }
   /** Read mission ownership without building a view or updating external tracking. */

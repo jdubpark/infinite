@@ -34,9 +34,13 @@ infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--
 infinite repo init --permissions off        Disable delegation for future runs
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]
+infinite understand [--workspace ID] [--json]  Read workspace Understanding
+infinite understand catalog|components|component ID|policy|refresh --workspace ID
+infinite understand create COLLECTION|update COLLECTION ID|archive COLLECTION ID --workspace ID
+  Mutations require --revision N --request-id UUID; create/update/policy also require --file JSON
 infinite team status [ID] [--json] [--logs] | team watch ID [--logs] | team pull TEAM_ID [--json]
-  status ID prints open decisions and the Jevcode summary. Watch keeps it full screen.
-  l review logs · s summary · ←→ or n/p agent · ↑↓ j/k space scroll · a ask Jevcode · q quit
+  status ID prints open decisions and the Brief. Watch keeps it full screen.
+  l review logs · s summary · ←→ or n/p agent · ↑↓ j/k space scroll · a refresh Brief · q quit
   --logs starts in the review log. --json prints the team record.
 infinite team steer ID TEXT | team answer ID QUESTION_ID TEXT
 infinite team continue ID [TEXT] [--json] [--request-id UUID]

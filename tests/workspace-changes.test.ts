@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -8,8 +8,16 @@ import { QUIET_CAPTURE_MS, shouldCaptureWorkspace, watchWorkspaceChanges } from 
 
 const macOnly = { skip: process.platform !== "darwin" };
 
-test("watchWorkspaceChanges is unavailable outside macOS", { skip: process.platform === "darwin" }, () => {
-  assert.equal(watchWorkspaceChanges([]), undefined);
+function fixture(t: TestContext) {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "workspace-changes-")));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const root = join(base, "workspace");
+  mkdirSync(root);
+  return { root, cacheDir: join(base, "watch-cache") };
+}
+
+test("watchWorkspaceChanges is unavailable outside macOS", { skip: process.platform === "darwin" }, async () => {
+  assert.equal(await watchWorkspaceChanges([], "unused"), undefined);
 });
 
 test("the quiet-window gate captures only when a reason requires it", () => {
@@ -24,43 +32,50 @@ test("the quiet-window gate captures only when a reason requires it", () => {
   assert.equal(shouldCaptureWorkspace({ changed: false, previousFailed: false, lastCaptureStartedAt: recentStart, now: recentStart }), true);
 });
 
-test("starts dirty and becomes quiet after take", macOnly, () => {
-  const root = mkdtempSync(join(tmpdir(), "workspace-changes-"));
-  const changes = watchWorkspaceChanges([root]);
-  assert.ok(changes);
-  try {
-    assert.equal(changes.take(), true);
-    assert.equal(changes.take(), false);
-  } finally {
-    changes.close();
-    rmSync(root, { recursive: true, force: true });
+test("native and fallback watches become quiet, including skipped special files", macOnly, async t => {
+  for (const nativeAvailable of [true, false]) {
+    const { root, cacheDir } = fixture(t);
+    execFileSync("mkfifo", [join(root, "pipe")]);
+    // An unusable cache exercises real native startup failure, without a test hook.
+    if (!nativeAvailable) writeFileSync(cacheDir, "occupied");
+    const changes = await watchWorkspaceChanges([root], cacheDir);
+    assert.ok(changes);
+    try {
+      assert.equal(await changes.take(), true);
+      assert.equal(await changes.take(), false, "native unavailability must not force an idle capture every tick");
+    } finally { await changes.close(); }
   }
 });
 
-test("a file write marks the workspace dirty", macOnly, async () => {
-  const root = mkdtempSync(join(tmpdir(), "workspace-changes-"));
-  const changes = watchWorkspaceChanges([root]);
+test("file writes, new subdirectories, and replaced files mark the workspace dirty", macOnly, async t => {
+  const { root, cacheDir } = fixture(t);
+  const changes = await watchWorkspaceChanges([root], cacheDir);
   assert.ok(changes);
   try {
-    assert.equal(changes.take(), true);
-    assert.equal(changes.take(), false);
-    writeFileSync(join(root, "change.txt"), "changed");
-
-    const deadline = Date.now() + 5000;
-    let dirty = false;
-    while (!dirty && Date.now() < deadline) {
-      dirty = changes.take();
-      if (!dirty) await new Promise(resolve => setTimeout(resolve, 25));
-    }
-    assert.equal(dirty, true, "the watcher should report the file write within five seconds");
-  } finally {
-    changes.close();
-    rmSync(root, { recursive: true, force: true });
-  }
+    assert.equal(await changes.take(), true);
+    assert.equal(await changes.take(), false);
+    const directory = join(root, "new");
+    mkdirSync(directory);
+    const file = join(directory, "change.txt");
+    writeFileSync(file, "created");
+    assert.equal(await changes.take(), true, "new directory topology marks the workspace dirty");
+    assert.equal(await changes.take(), false);
+    writeFileSync(file, "edited");
+    assert.equal(await changes.take(), true, "the new file stays watched after re-registration");
+    assert.equal(await changes.take(), false);
+    const replacement = join(root, "replacement");
+    writeFileSync(replacement, "replaced");
+    renameSync(replacement, file);
+    assert.equal(await changes.take(), true, "atomic replacement marks the workspace dirty");
+    assert.equal(await changes.take(), false);
+    writeFileSync(file, "edited again");
+    assert.equal(await changes.take(), true, "the replacement inode stays watched");
+    assert.equal(await changes.take(), false);
+  } finally { await changes.close(); }
 });
 
-test("a Git worktree metadata change marks the workspace dirty", macOnly, async () => {
-  const root = mkdtempSync(join(tmpdir(), "workspace-changes-"));
+test("a Git worktree metadata change marks the workspace dirty", macOnly, async t => {
+  const { root, cacheDir } = fixture(t);
   const repository = join(root, "repository");
   const worktree = join(root, "worktree");
   mkdirSync(repository);
@@ -69,38 +84,38 @@ test("a Git worktree metadata change marks the workspace dirty", macOnly, async 
     git("init", "--quiet");
     git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "seed");
     git("worktree", "add", "--quiet", "-b", "linked", worktree);
-    const changes = watchWorkspaceChanges([worktree]);
+    const changes = await watchWorkspaceChanges([worktree], cacheDir);
     assert.ok(changes);
     try {
-      assert.equal(changes.take(), true);
-      assert.equal(changes.take(), false);
+      assert.equal(await changes.take(), true);
+      assert.equal(await changes.take(), false);
       writeFileSync(join(repository, ".git", "workspace-watch-marker"), "changed");
 
       const deadline = Date.now() + 5000;
       let dirty = false;
       while (!dirty && Date.now() < deadline) {
-        dirty = changes.take();
+        dirty = await changes.take();
         if (!dirty) await new Promise(resolve => setTimeout(resolve, 25));
       }
       assert.equal(dirty, true, "the watcher should include the Git common directory");
     } finally {
-      changes.close();
+      await changes.close();
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("moving the main repository and repairing the worktree pointer moves the metadata watch", macOnly, async () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "workspace-changes-")));
+test("moving the main repository and repairing the worktree pointer moves the metadata watch", macOnly, async t => {
+  const { root, cacheDir } = fixture(t);
   const repository = join(root, "repository"), moved = join(root, "moved");
   const worktree = join(root, "worktree");
   mkdirSync(repository);
   const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
-  const settle = async (changes: { take(): boolean }, want: boolean) => {
+  const settle = async (changes: { take(): Promise<boolean> }, want: boolean) => {
     const deadline = Date.now() + 5000;
     for (;;) {
-      const dirty = changes.take();
+      const dirty = await changes.take();
       if (dirty === want || Date.now() > deadline) return dirty;
       await new Promise(resolve => setTimeout(resolve, want ? 25 : 300));
     }
@@ -109,10 +124,10 @@ test("moving the main repository and repairing the worktree pointer moves the me
     git(repository, "init", "--quiet");
     git(repository, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "seed");
     git(repository, "worktree", "add", "--quiet", "-b", "linked", worktree);
-    const changes = watchWorkspaceChanges([worktree]);
+    const changes = await watchWorkspaceChanges([worktree], cacheDir);
     assert.ok(changes);
     try {
-      assert.equal(changes.take(), true);
+      assert.equal(await changes.take(), true);
       renameSync(repository, moved);
       git(moved, "worktree", "repair", worktree);
       assert.equal(await settle(changes, true), true, "the rewritten pointer marks the workspace dirty");
@@ -120,25 +135,25 @@ test("moving the main repository and repairing the worktree pointer moves the me
       writeFileSync(join(moved, ".git", "workspace-watch-marker"), "changed");
       assert.equal(await settle(changes, true), true, "metadata at the new location is watched");
     } finally {
-      changes.close();
+      await changes.close();
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("a Git metadata resolution failure stays dirty", macOnly, () => {
-  const root = mkdtempSync(join(tmpdir(), "workspace-changes-"));
+test("a Git metadata resolution failure stays dirty", macOnly, async t => {
+  const { root, cacheDir } = fixture(t);
   const changesRoot = join(root, "workspace");
   mkdirSync(changesRoot);
   writeFileSync(join(changesRoot, ".git"), "gitdir: missing\n");
-  const changes = watchWorkspaceChanges([changesRoot]);
+  const changes = await watchWorkspaceChanges([changesRoot], cacheDir);
   assert.ok(changes);
   try {
-    assert.equal(changes.take(), true);
-    assert.equal(changes.take(), true);
+    assert.equal(await changes.take(), true);
+    assert.equal(await changes.take(), true);
   } finally {
-    changes.close();
+    await changes.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -388,7 +388,7 @@ async function askForBrief(api: Api, team: any, rows: BriefRow[], signal: AbortS
   if (!chosen || !canAskForBrief(team, rows)) return rows;
   const card = teamSummaryText(team, rows, checkedAt, true, Date.now()).split("\n");
   const footer = card.pop() ?? "";
-  show([...card, "", "Asking Jevcode for a summary. This can take a few minutes.", "", footer].join("\n"));
+  show([...card, "", "Refreshing the Brief. This can take a few minutes.", "", footer].join("\n"));
   try {
     // json() caps every call at 15 seconds. A repository brief can take longer, so this uses request().
     const response = await api.request(`/sessions/${chosen.sessionId}/summary?after=0`, undefined, AbortSignal.any([signal, AbortSignal.timeout(180000)]));
@@ -844,7 +844,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
             previous = text;
           } else if (!id) {
             for (const team of teams) console.log(`${teamMonitorText(team)}\n`);
-            if (teams.length) console.log("Open one team for the Jevcode summary: infinite team status ID\n");
+            if (teams.length) console.log("Open one team for its Brief: infinite team status ID\n");
           } else {
             const team = teams[0];
             const action = pending;
@@ -874,7 +874,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
               const failed = rows.find(row => row.fetchError);
               const briefInProgress = chosen && (chosen.status.state === "pending" || chosen.status.state === "running");
               const hasBrief = Boolean(chosen?.status.summary?.repository?.brief?.summary || chosen?.status.summary?.text);
-              const progress = briefInProgress ? hasBrief ? "Jevcode is updating this summary." : "Jevcode is writing the summary." : "";
+              const progress = briefInProgress ? hasBrief ? "Understanding is updating this Brief." : "Understanding is writing the Brief." : "";
               const failureStatus = failed ? `Summary refresh failed: ${failed.fetchError}` : "";
               show(teamSummaryText(team, rows, clock(), interactive, interactive ? Date.now() : undefined, tty), failureStatus || (tty ? progress : ""));
             }

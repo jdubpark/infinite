@@ -21,7 +21,7 @@ import {
 import { Clamp, Disclosure, LinearChip, LineupView, ProfileLine, providerName, RequestStatus, Section, SteerBox, t } from "./parts";
 import { useRunRequest } from "./useRunRequest";
 import { AgentApproval } from "./TeamApprovals";
-import { AgentLog, JevcodeSummary } from "./TeamSummary";
+import { AgentLog, UnderstandingSummary } from "./TeamSummary";
 import { orderedMembers } from "./summary";
 import { CostLine, RatingControl, RubricLine } from "../cost/parts";
 import { useTaskRating } from "../cost/useCost";
@@ -268,7 +268,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           </Card>
         </Section> : null}
 
-        <Section title="Summary"><JevcodeSummary connection={connection} team={team} /></Section>
+        <Section title="Brief"><UnderstandingSummary connection={connection} team={team} /></Section>
       </View> : null}
 
       {tab === "tasks" ? <View>

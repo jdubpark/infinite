@@ -5,6 +5,13 @@ import {
   type CipherChannel, type RandomBytes, type RemoteMethod, type RemoteRequest, type RemoteTerminalCommand, type RemoteEventsCommand, type TerminalInput,
 } from "./protocol.js";
 
+export type {
+  WorkspaceUnderstanding, UnderstandingRepository, UnderstandingWork, UnderstandingWorkKind,
+  UnderstandingPlan, UnderstandingArtifact, UnderstandingBrief, UnderstandingClaim,
+  UnderstandingCitation, UnderstandingLink,
+} from "./understanding.js";
+export type * from "./understanding-knowledge.js";
+
 /** A Cloudflare Access service token; Cloudflare checks it before the connection reaches the relay. */
 export interface RemoteAccessToken { clientId: string; clientSecret: string }
 export interface RemoteConnection { url: string; token: string; relay?: { machineId: string }; access?: RemoteAccessToken }

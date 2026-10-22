@@ -36,7 +36,7 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
   if (options.roots.some(root => inside(root, directory))) throw new Error("Workspace cache must be outside the selected project");
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const storeDir = join(directory, "objects");
-  const changeDetector = watchWorkspaceChanges(options.roots);
+  const changeDetector = await watchWorkspaceChanges(options.roots, join(storeDir, "watch-cache"));
   let previous: WorkspaceManifest | undefined, recovered: string | undefined, lastFull = 0;
   let committed: { revision: number; epoch: number; id: string; entriesFingerprint: string } | undefined;
   let previousIterationFailed = false, lastCaptureStartedAt = 0;
@@ -65,14 +65,14 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
             recovered = fingerprint;
           }
         } else {
-          const changed = changeDetector?.take() ?? true;
+          const changed = await changeDetector?.take() ?? true;
           const checkpointCurrent = !!committed && status.acknowledged === true && status.revision === committed.revision && status.checkpoint?.id === committed.id;
           const capture = shouldCaptureWorkspace({ changed, previousFailed: previousIterationFailed, lastCaptureStartedAt, checkpointCurrent });
           if (capture) {
             const begin = await control("sync/begin");
             const forceFull = Date.now() - lastFull > 60000;
             // Clear events received during sync/begin just before capture; later events schedule another capture.
-            changeDetector?.take();
+            await changeDetector?.take();
             lastCaptureStartedAt = Date.now();
             const manifest = await captureWorkspace({ roots: options.roots, cwd: options.cwd, storeDir, signal, previous, forceFull });
             if (forceFull) lastFull = Date.now();
@@ -102,7 +102,7 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
       }
       await delay(3000, undefined, { signal }).catch(() => {});
     }
-  } finally { changeDetector?.close(); }
+  } finally { await changeDetector?.close(); }
 }
 
 /** Check the installed executable before creating a cloud session. */

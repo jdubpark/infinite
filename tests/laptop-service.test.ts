@@ -17,8 +17,6 @@ test("laptop sync commits once while idle, follows file changes, and recommits u
   const root = join(base, "workspace");
   mkdirSync(root);
   writeFileSync(join(root, "file.txt"), "one\n");
-  // FSEvents can still deliver the fixture's own writes just after a watch starts; a real tree exists well before its service.
-  await delay(1000);
 
   const revision = 7;
   const checkpoint = { id: "initial" };

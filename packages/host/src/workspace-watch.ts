@@ -65,20 +65,24 @@ async function helper(cacheDir: string): Promise<string> {
  * Registers a kernel vnode filter for every entry on local APFS, including
  * ignored/build files. Directory topology changes require watch recreation.
  * Resource limits, special files and nested mounts are explicit blockers.
+ * Change-notification watches skip special files, matching sync capture output;
+ * their containing directories still detect replacement/removal. Capture guards
+ * retain the strict default. Change-notification startup may return invalid so
+ * its owner can report dirty and retry registration after writers settle.
  * Equal valid revisions detect ordinary write/metadata syscalls, NOT writable
  * shared mappings: real MAP_SHARED writes can change bytes without vnode events.
  * A best-effort capture must report its observation span and stable-read/hash
  * evidence separately. Atomic consistency requires a filesystem snapshot or
  * enforced exclusion of every writer; this watcher cannot certify that property.
  */
-export async function createWorkspaceWatch(roots: string[], cacheDir: string): Promise<WorkspaceWatch> {
+export async function createWorkspaceWatch(roots: string[], cacheDir: string, options: { purpose?: "capture" | "changes" } = {}): Promise<WorkspaceWatch> {
   if (process.platform !== "darwin") throw new Error("Workspace change watch is unsupported on this platform");
   if (!roots.length || roots.length > 64 || roots.some(root => !isAbsolute(root) || root.includes("\0"))) {
     throw new Error("Workspace watch requires between one and 64 absolute directory roots");
   }
   const canonicalRoots = await Promise.all(roots.map(root => realpath(root)));
   const binary = await helper(cacheDir);
-  const child = spawn(binary, [...new Set(canonicalRoots)], { stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(binary, [...(options.purpose === "changes" ? ["--changes"] : []), ...new Set(canonicalRoots)], { stdio: ["pipe", "pipe", "pipe"] });
   let closed = false, failure: Error | undefined, nextId = 1, lastRevision = -1, input = "";
   let closing: Promise<void> | undefined;
   const pending = new Map<number, {
@@ -143,7 +147,7 @@ export async function createWorkspaceWatch(roots: string[], cacheDir: string): P
     await closing;
   }
   try {
-    if (!(await ready).valid) throw new Error("Workspace watch lost events during startup");
+    if (!(await ready).valid && options.purpose !== "changes") throw new Error("Workspace watch lost events during startup");
   } catch (error) { await close(); throw error; }
   return {
     async flush() {

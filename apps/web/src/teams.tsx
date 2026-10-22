@@ -254,7 +254,7 @@ function eventDetail(event: LogEvent) {
   const value = event.data.message ?? event.data.text ?? event.data.error;
   return typeof value === "string" ? value : "";
 }
-function JevcodeSummary({ team, rows, failed, asking, error, onRequest }: {
+function RepositorySummary({ team, rows, failed, asking, error, onRequest }: {
   team: TeamView; rows: { sessionId: string; status: BriefingView }[]; failed: boolean; asking: boolean; error: string;
   onRequest: (sessionId: string) => void;
 }) {
@@ -268,8 +268,8 @@ function JevcodeSummary({ team, rows, failed, asking, error, onRequest }: {
   const canAsk = !text && (chosen?.status.state === "empty" || chosen?.status.state === "failed");
   const age = when ? ago(when) : "";
   return <section className="team-section team-summary" aria-live="polite">
-    <div className="team-section-heading"><h2>Jevcode summary</h2><span className="quiet" title={updating ? "Jevcode is updating this summary." : undefined}>{[brief || chosen?.status.summary?.engine === "jevcode" ? "Jevcode" : "Session summary", member ? roles[member.role].name : "", when ? date(when) : "", age, updating ? "Updating" : ""].filter(Boolean).join(" · ")}</span></div>
-    {!text && <p className="quiet">{failed ? "The Jevcode summary could not be loaded." : !rows.length ? (team.members.length ? "Loading the Jevcode summary…" : "No agent session is available for a Jevcode summary.") : updating ? "Jevcode is writing the summary." : chosen?.status.error || "No Jevcode summary yet."}</p>}
+    <div className="team-section-heading"><h2>Brief</h2><span className="quiet" title={updating ? "The Understanding service is updating this brief." : undefined}>{[brief || chosen?.status.summary?.engine === "jevcode" ? "Repository brief" : "Session summary", member ? roles[member.role].name : "", when ? date(when) : "", age, updating ? "Updating" : ""].filter(Boolean).join(" · ")}</span></div>
+    {!text && <p className="quiet">{failed ? "The brief could not be loaded." : !rows.length ? (team.members.length ? "Loading the brief…" : "No agent session is available for a brief.") : updating ? "The Understanding service is writing the brief." : chosen?.status.error || "No brief yet."}</p>}
     {text && <>
       <p className="team-summary-lead">{brief?.summary ?? text}</p>
       {brief?.architecture?.length ? <details className="team-summary-fold"><summary>System shape <span className="quiet">{brief.architecture.length}</span></summary><ul className="team-summary-list">{brief.architecture.map((item, index) => <li key={index}>{item.text}</li>)}</ul></details> : null}
@@ -282,10 +282,10 @@ function JevcodeSummary({ team, rows, failed, asking, error, onRequest }: {
       {brief?.checks?.length ? <><h3>Check evidence <span className="quiet">{brief.checks.length}</span></h3><ul className="team-summary-list">{brief.checks.map((item, index) => <li key={index}>{item.text}</li>)}</ul></> : null}
       {brief?.guidance?.length ? <details className="team-summary-fold"><summary>Guidance for agents <span className="quiet">{brief.guidance.length}</span></summary><ul className="team-summary-list">{brief.guidance.map((item, index) => <li key={index}>{[item.basis, item.text].filter(Boolean).join(": ")}</li>)}</ul></details> : null}
       {brief?.unknowns?.length ? <><h3>Gaps and unknowns <span className="quiet">{brief.unknowns.length}</span></h3><ul className="team-summary-list">{brief.unknowns.map((item, index) => <li key={index}>{item}</li>)}</ul></> : null}
-      <p className="quiet">This is the Jevcode agent’s reading of recorded activity and the repository. It is not completion or approval.</p>
+      <p className="quiet">This generated brief describes recorded activity and a source snapshot. It does not establish completion or approval.</p>
     </>}
     {error && <p className="error" role="alert">{error}</p>}
-    {canAsk && coordinatorId && <button className="text-button" disabled={asking} onClick={() => onRequest(chosen?.sessionId ?? coordinatorId)}>{asking ? "Asking Jevcode… this can take a few minutes" : "Ask Jevcode for a summary"}</button>}
+    {canAsk && coordinatorId && <button className="text-button" disabled={asking} onClick={() => onRequest(chosen?.sessionId ?? coordinatorId)}>{asking ? "Generating brief… this can take a few minutes" : "Generate a brief"}</button>}
   </section>;
 }
 function TeamLogs({ member, session, events, stale, follow, setFollow, onOpen }: {
@@ -460,7 +460,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
         })()}
         {selectedMember ? <TeamLogs member={selectedMember} session={logSession?.id === selectedMember.sessionId ? logSession : null} events={logEvents} stale={logs.stale} follow={followLog} setFollow={setFollowLog} onOpen={() => openSession(selectedMember.sessionId)} /> : <p className="quiet">This run has no agents yet.</p>}
         <button type="button" className="text-button team-back-summary" onClick={() => setMode("summary")}>Back to summary</button>
-      </> : <JevcodeSummary team={team} rows={briefs} failed={briefing.failed} asking={asking} error={briefError} onRequest={sessionId => void requestSummary(sessionId)} />}
+      </> : <RepositorySummary team={team} rows={briefs} failed={briefing.failed} asking={asking} error={briefError} onRequest={sessionId => void requestSummary(sessionId)} />}
       <details className="team-run-details"><summary>Run details</summary>
       {team.brief && <section className="team-section"><h2>Opportunity brief <span className="quiet">(agent proposal)</span></h2><TeamBriefView brief={team.brief} /></section>}
       {team.discovery && <section className="team-section"><h2>Discovery</h2><p className="team-prose">{team.discovery.summary}</p>{team.discovery.tasks.map(task => <article className="team-task" key={task.id}><div className="team-task-heading"><h3>{task.title}</h3><span className="team-task-state">{task.status}</span></div>{team.lineup?.implementers.find(profile => profile.id === task.agentProfileId) && <ModelProfile profile={team.lineup.implementers.find(profile => profile.id === task.agentProfileId)!} />}{task.summary && <p className="team-prose">{task.summary}</p>}{task.evidence && <EvidenceList evidence={task.evidence} />}<details><summary>Scout instructions</summary><p className="team-prose">{task.instructions}</p></details></article>)}</section>}

@@ -41,6 +41,9 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (goal && UUID.test(goal[1])) return method === "GET" ? !goal[2] : method === "POST" && Boolean(goal[2]);
   if (method === "GET" && url.pathname === "/api/board") return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/project-groups") return true;
+  if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding$/.test(url.pathname)) return true;
+  if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding\/(?:catalog|components(?:\/[A-Za-z0-9_-]{1,160})?)$/.test(url.pathname)) return true;
+  if (method === "POST" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding\/(?:refresh|catalog\/(?:projects|features|plans|components|policy)(?:\/[A-Za-z0-9_-]{1,160})?)$/.test(url.pathname)) return true;
   if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
   if (["PUT", "DELETE"].includes(method) && /^\/api\/project-groups\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
   if (["GET", "POST"].includes(method) && url.pathname === "/api/missions") return true;

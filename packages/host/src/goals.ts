@@ -84,6 +84,8 @@ export class GoalService {
   }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state or usage. */
   statuses() { return [...this.records.values()].map(({ goal }) => ({ id: goal.id, title: goal.title, status: goal.status, reason: goal.reason })); }
+  /** Persisted goal records for the read-only Understanding view; performs no tracker or usage refresh. */
+  understandingRecords() { return [...this.records.values()].map(({ goal }) => structuredClone(goal)); }
   list() { return [...this.records.values()].map(({ goal }) => this.get(goal.id)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   get(id: string) {
     const goal = structuredClone(this.record(id).goal);

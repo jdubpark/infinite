@@ -189,7 +189,7 @@ async function pendingReason(options: SyncServiceOptions, signal: AbortSignal): 
 async function runSyncService(): Promise<void> {
   const abort = new AbortController();
   let released = false, reported = false, options: SyncServiceOptions | undefined, reason: string | undefined;
-  let changeDetector: ReturnType<typeof watchWorkspaceChanges>;
+  let changeDetector: Awaited<ReturnType<typeof watchWorkspaceChanges>>;
   const stop = () => abort.abort();
   const disconnected = () => { if (!released) stop(); };
   const detach = (value: unknown) => {
@@ -241,12 +241,12 @@ async function runSyncService(): Promise<void> {
     // `held`: the host kept the last pushed content but cannot apply it for a lasting reason.
     let previous: WorkspaceManifest | undefined, committed: string | undefined, lastFull = 0, failures = 0, pushFailures = 0, held = false;
     let firstIteration = true, previousIterationFailed = false, lastCaptureStartedAt = 0, lastPendingCheckAt = 0;
-    changeDetector = watchWorkspaceChanges([config.root]);
+    changeDetector = await watchWorkspaceChanges([config.root], join(config.storeDir, "watch-cache"));
     while (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) {
       let content: string | undefined, pushing = false;
       try {
         progress();
-        const changed = changeDetector?.take() ?? true;
+        const changed = await changeDetector?.take() ?? true;
         const capture = firstIteration || shouldCaptureWorkspace({ changed, previousFailed: previousIterationFailed, lastCaptureStartedAt, checkpointCurrent: true });
         firstIteration = false;
         if (capture) {
@@ -312,7 +312,7 @@ async function runSyncService(): Promise<void> {
     }
   } catch (error) { process.exitCode = 1; if (error instanceof Error && error.message !== STARTUP_ERROR) reason ??= error.message; }
   finally {
-    changeDetector?.close();
+    await changeDetector?.close();
     stop(); clearTimeout(startup);
     process.off("disconnect", disconnected); process.off("message", detach);
     for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(name, stop);

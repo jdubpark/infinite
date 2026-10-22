@@ -45,6 +45,10 @@ import type { Config, Role, Receipt, Session } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
+import { UnderstandingService } from "./understanding.js";
+import { UnderstandingCatalog, CatalogError } from "./understanding-catalog.js";
+import { UnderstandingRuntime } from "./understanding-runtime.js";
+import { createUnderstandingAdapter } from "./understanding-adapter.js";
 import { BalanceService } from "./balances.js";
 import { LiveFeed, type LiveTopic } from "./live.js";
 import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/protocol";
@@ -294,6 +298,11 @@ export function createApp(config: Config, key: Buffer) {
     ? new RepositoryBriefings(config.repositoryBriefings, manager, config.projects, config.teams?.workspaceDir)
     : undefined;
   repositoryBriefings?.useUsage(usage);
+  const understandingCatalog = new UnderstandingCatalog({ config, key, groups: projectGroups });
+  const understandingRuntime = new UnderstandingRuntime({ config, key, groups: projectGroups, catalog: understandingCatalog, adapter: createUnderstandingAdapter(config) });
+  const understanding = new UnderstandingService({ config, key, manager, groups: projectGroups, missions, teams, goals, briefings: repositoryBriefings,
+    knowledge: { read: workspaceId => ({ schemaVersion: 1, catalog: understandingCatalog.read(workspaceId), ...understandingRuntime.read(workspaceId) }) },
+  });
   async function inputAuthority(sessionId: string, res: express.Response) {
     // Retained workers from earlier releases hash the entire request. Adding
     // optional fields would make a pre-upgrade receipt impossible to retry.
@@ -552,6 +561,31 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   app.get("/api/project-groups", requireRole(["owner", "controller", "viewer"]), (_req, res) => res.json(projectGroups.list()));
+  app.get("/api/project-groups/:id/understanding", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(understanding.get(projectGroupIdSchema.parse(req.params.id))));
+  app.get("/api/project-groups/:id/understanding/catalog", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(understandingCatalog.read(projectGroupIdSchema.parse(req.params.id))));
+  app.get("/api/project-groups/:id/understanding/components", requireRole(["owner", "controller", "viewer"]), (req, res) => {
+    const value = understandingRuntime.read(projectGroupIdSchema.parse(req.params.id));
+    return res.json({ components: value.components.map(({ id, name, description, repositoryIds, pinned, retired, redirectTo }) => ({ id, name, description, repositoryIds, pinned, retired, redirectTo })), coverage: value.coverage });
+  });
+  app.get("/api/project-groups/:id/understanding/components/:componentId", requireRole(["owner", "controller", "viewer"]), (req, res) => {
+    const componentId = z.string().regex(/^[A-Za-z0-9_-]{1,160}$/).parse(req.params.componentId);
+    const value = understandingRuntime.read(projectGroupIdSchema.parse(req.params.id));
+    const component = value.components.find(item => item.id === componentId);
+    if (!component) return void res.status(404).json({ error: "Component is unavailable in this workspace." });
+    return res.json({ component, relationships: value.relationships.filter(edge => edge.from === componentId || edge.to === componentId), coverage: value.coverage });
+  });
+  app.post("/api/project-groups/:id/understanding/refresh", requireRole(["owner"]), (req, res) => {
+    z.object({}).strict().parse(req.body);
+    return res.status(202).json(understandingRuntime.refresh(projectGroupIdSchema.parse(req.params.id)));
+  });
+  app.post(["/api/project-groups/:id/understanding/catalog/:collection", "/api/project-groups/:id/understanding/catalog/:collection/:entityId"], requireRole(["owner"]), (req, res) => {
+    const workspaceId = projectGroupIdSchema.parse(req.params.id);
+    const collection = z.enum(["projects", "features", "plans", "components", "policy"]).parse(req.params.collection);
+    const entityId = req.params.entityId === undefined ? undefined : z.string().regex(/^[A-Za-z0-9_-]{1,160}$/).parse(req.params.entityId);
+    return res.json(understandingCatalog.mutate(workspaceId, collection, entityId, req.body, {
+      work: understanding.workReferences(workspaceId), components: understandingRuntime.read(workspaceId).components,
+    }));
+  });
   app.get("/api/project-groups/:id", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(projectGroups.get(projectGroupIdSchema.parse(req.params.id))));
   app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(projectGroups.create(createProjectGroupSchema.parse(req.body))));
   app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
@@ -1290,6 +1324,7 @@ export function createApp(config: Config, key: Buffer) {
     ) => {
       // `error` carries the message every client displays; a failed sync operation also names its category.
       if (error instanceof TeamError) return res.status(error.status).json({ code: error.code, error: error.message });
+      if (error instanceof CatalogError) return res.status(error.statusCode).json({ code: "understanding-catalog", error: error.message });
       if (error instanceof ProjectSyncError)
         return res.status(error.status).json({ code: error.code, error: error.message, ...(error.category ? { category: error.category, message: error.message } : {}) });
       if (error instanceof ProjectSourceError) return res.status(error.status).json({ error: error.message, code: error.code });
@@ -1348,12 +1383,14 @@ export function createApp(config: Config, key: Buffer) {
   // The timer checks each tick which projects follow GitHub, so one enrolled while the server runs is picked up too.
   server.once("listening", () => projectSource.start());
   if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });
+  server.once("listening", () => understandingRuntime.start());
   server.once("listening", () => balances.start());
   server.once("close", () => teams.close());
   server.once("close", () => { usage.close(); balances.close(); });
   server.once("close", () => goals.close());
   server.once("close", () => missions.close());
   server.once("close", () => repositoryBriefings?.close());
+  server.once("close", () => { void understandingRuntime.close(); });
   server.once("close", () => linear.close());
   server.once("close", () => handoffs.close());
   server.once("close", () => readings.stop());
@@ -1361,6 +1398,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = repositoryBriefings?.close() ?? Promise.resolve(); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

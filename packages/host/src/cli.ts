@@ -237,6 +237,10 @@ infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--
 infinite repo init --permissions off        Disable delegation for future runs
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite projects [--json]                 List projects and suggested groups
+infinite understand [--workspace ID] [--json] Read workspace Understanding
+infinite understand catalog|components|component ID|policy|refresh --workspace ID
+infinite understand create COLLECTION|update COLLECTION ID|archive COLLECTION ID --workspace ID
+  Mutations require --revision N --request-id UUID; create/update/policy also require --file JSON
 infinite projects group NAME REPO_ID...    Create a multi-repository project
 infinite projects rename|hide|show ID       Rename or hide a project
 infinite projects primary ID CHECKOUT_ID   Choose the checkout a project works in
@@ -244,7 +248,7 @@ infinite start [--project ID] "task"       Start a mission
 infinite mission status|answer|steer|pause|resume|cancel ...
 infinite board [--project ID]              Watch the owner board
 infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
-infinite team status [ID] [--logs]          Show teams, or one team's Jevcode summary
+infinite team status [ID] [--logs]          Show teams, or one team's Brief
 infinite team watch ID [--logs]             Follow the summary; l logs, n/p agents, b summary
 infinite team steer ID TEXT                 Steer an active team
 infinite team answer ID QUESTION_ID TEXT    Answer a pending question

@@ -17,5 +17,6 @@ export default function TabsLayout() {
   }}>
     <Tabs.Screen name="index" options={{ title: "Board", tabBarAccessibilityLabel: "Board", tabBarIcon: ({ focused }) => <Glyph name="stack" size={20} color={focused ? theme.colors.forest : theme.colors.mutedInk} /> }} />
     <Tabs.Screen name="sessions" options={{ title: "Sessions", tabBarAccessibilityLabel: "Sessions inbox", tabBarIcon: ({ focused }) => <Glyph name="terminal" size={20} color={focused ? theme.colors.forest : theme.colors.mutedInk} /> }} />
+    <Tabs.Screen name="understanding" options={{ title: "Understand", tabBarAccessibilityLabel: "Understand workspaces", tabBarIcon: ({ focused }) => <Glyph name="target" size={20} color={focused ? theme.colors.forest : theme.colors.mutedInk} /> }} />
   </Tabs>;
 }

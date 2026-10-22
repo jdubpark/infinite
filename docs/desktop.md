@@ -12,6 +12,29 @@ The API upgrade preserved all seven existing agents. Physical phone continuity a
 complete authenticated provider UI parity remain unqualified; see the acceptance
 record below.
 
+## Workspace Understanding
+
+Open **Understand** and choose a workspace. **Work** retains the original
+mission, team, and goal states and recorded results. **System** opens retained
+repository briefs and requested work. **Knowledge** adds owner-maintained
+projects, features, component plans, and a component map with sourced
+relationships. Each component separates **Current**, **Planned**, and
+**Difference**, with source paths, revisions, observation times, and coverage.
+
+Owners can edit the catalog, request a source refresh, and configure bounded
+background maintenance through the shared
+[Workspace Understanding API](repository-briefings.md#workspace-understanding).
+Catalog conflicts retain the draft for explicit resubmission. An uncertain
+response can retry the same request identity. Reading starts no analysis job
+and changes no work status. Provider checks and deployment observations remain
+separate from proof that a service is live.
+
+The desktop retains encrypted snapshots for up to four workspaces, bounded to
+8 MiB and 24 hours. Offline observations display their capture time and disable
+mutations. Cache scope includes the server, credentials, workspace, and
+membership revision; an authorization denial clears the matching view.
+Hosts without the endpoint show upgrade guidance.
+
 ## Layout
 
 The main window is a sidebar beside one page. The sidebar starts with project

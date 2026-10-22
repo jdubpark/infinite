@@ -28,6 +28,7 @@ static int queue_fd;
 static size_t watch_count;
 static uint64_t revision;
 static bool invalid;
+static bool changes_only;
 
 static void error(const char *code) {
   printf("{\"error\":\"%s\"}\n", code);
@@ -48,19 +49,30 @@ static int watch_fd(int fd, bool directory, bool ancestor) {
 
 /* Every directory is registered BEFORE enumeration. A subsequent entry change
  * invalidates this watch, because newly added/replaced entries are not covered.
- * Traversal never follows symlinks and refuses special files and nested mounts.
+ * Traversal never follows symlinks and refuses nested mounts. Capture guards
+ * also refuse special files; notification watches skip their contents.
  */
 static int watch_tree(int parent, const char *name, dev_t device, unsigned int depth) {
   if (depth > MAX_DEPTH) { error("depth-limit"); return -1; }
   struct stat info;
-  int fd = openat(parent, name, O_EVTONLY | O_SYMLINK | O_CLOEXEC);
+  if (changes_only) {
+    if (fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) < 0) { error("entry-unavailable"); return -1; }
+    /* Opening a FIFO can block, and a socket cannot be opened as a vnode. Its
+     * already-registered parent detects replacement with a capturable entry. */
+    if (!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode) && !S_ISLNK(info.st_mode)) return 0;
+  }
+  int fd = openat(parent, name, O_EVTONLY | O_SYMLINK | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0 || fstat(fd, &info) < 0) {
     if (fd >= 0) close(fd);
     error(errno == EMFILE || errno == ENFILE ? "watch-limit" : "entry-unavailable");
     return -1;
   }
-  if (info.st_dev != device || (!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode) && !S_ISLNK(info.st_mode))) {
-    close(fd); error("unsupported-entry"); return -1;
+  if (info.st_dev != device) { close(fd); error("unsupported-entry"); return -1; }
+  if (!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode) && !S_ISLNK(info.st_mode)) {
+    close(fd);
+    /* Sync does not capture special files. The parent watch covers replacement. */
+    if (changes_only) return 0;
+    error("unsupported-entry"); return -1;
   }
   if (watch_fd(fd, S_ISDIR(info.st_mode), false) < 0) { close(fd); return -1; }
   if (!S_ISDIR(info.st_mode)) return 0;
@@ -130,7 +142,9 @@ static void report(uint64_t id) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2 || argc > 65) return 2;
+  changes_only = argc > 1 && strcmp(argv[1], "--changes") == 0;
+  int first_root = changes_only ? 2 : 1;
+  if (argc - first_root < 1 || argc - first_root > 64) return 2;
   struct rlimit limit;
   if (getrlimit(RLIMIT_NOFILE, &limit) == 0) {
     rlim_t desired = MAX_WATCHES + MAX_DEPTH + 16;
@@ -139,7 +153,7 @@ int main(int argc, char **argv) {
   }
   queue_fd = kqueue();
   if (queue_fd < 0) { error("queue-unavailable"); return 2; }
-  for (int i = 1; i < argc; i++) {
+  for (int i = first_root; i < argc; i++) {
     struct stat info;
     struct statfs filesystem;
     if (argv[i][0] != '/' || lstat(argv[i], &info) < 0 || !S_ISDIR(info.st_mode) ||

@@ -98,22 +98,26 @@ struct TeamResumeFailure: Equatable {
     @Published var selectedTeamID: String? {
         didSet {
             if selectedTeamID != oldValue, let oldValue { pruneTeamModel(oldValue) }
-            if selectedTeamID != nil { showingHome = false; showingCost = false; selectedMissionID = nil }
+            if selectedTeamID != nil { showingHome = false; showingCost = false; showingUnderstanding = false; selectedMissionID = nil }
         }
     }
     /// A selected mission shows its detail the same way; a mission and a team are never both open.
     @Published var selectedMissionID: String? {
         didSet {
             if selectedMissionID != oldValue, let oldValue { pruneMissionModel(oldValue) }
-            if selectedMissionID != nil { showingHome = false; showingCost = false; selectedTeamID = nil; teamOpenedFrom = nil }
+            if selectedMissionID != nil { showingHome = false; showingCost = false; showingUnderstanding = false; selectedTeamID = nil; teamOpenedFrom = nil }
         }
     }
     /// The mission whose subtask opened the current team page, so that page can lead back to it.
     @Published var teamOpenedFrom: String?
     /// Home, the project board, covers the session panes the same way; it is the first page after connecting.
-    @Published var showingHome = true { didSet { if showingHome { showingCost = false } } }
+    @Published var showingHome = true { didSet { if showingHome { showingCost = false; showingUnderstanding = false } } }
     /// The cost view covers the panes like Home; one of Home, Cost, a mission, or a team shows at a time.
-    @Published var showingCost = false { didSet { if showingCost { showingHome = false; selectedTeamID = nil; selectedMissionID = nil } } }
+    @Published var showingCost = false { didSet { if showingCost { showingHome = false; showingUnderstanding = false; selectedTeamID = nil; selectedMissionID = nil } } }
+    /// Read-only workspace facts, separate from the existing project board.
+    @Published var showingUnderstanding = false { didSet { if showingUnderstanding { showingHome = false; showingCost = false; selectedTeamID = nil; selectedMissionID = nil } } }
+    /// Last workspace selected in Understand, so returning from another page preserves the scope.
+    @Published var understandingWorkspaceID: String?
     private(set) var cost: CostModel?
     /// The project Home's board is narrowed to; nil shows every project.
     @Published var projectFilter: String?
@@ -162,7 +166,14 @@ struct TeamResumeFailure: Equatable {
         model.setDisplayVisible(displayVisible)
         cost = model; return model
     }
-    func showCost() { showingCost = true }
+    func showCost() { showingUnderstanding = false; showingCost = true }
+    func showUnderstanding(workspace: String? = nil) {
+        selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil
+        let requested = workspace ?? understandingWorkspaceID ?? projectFilter
+        if let requested, projectGroups.group(requested) != nil { understandingWorkspaceID = requested }
+        else if understandingWorkspaceID == nil { understandingWorkspaceID = projectGroups.groups.first?.id }
+        showingCost = false; showingHome = false; showingUnderstanding = true
+    }
     var teamLineup: JSON { me["teams"]["lineup"] }
     var teamParallelismLimit: Int { let value = me["teams"]["maxParallelism"].int; return max(1, min(4, value == 0 ? 4 : value)) }
     func projectName(_ id: String) -> String { projects.first { $0["id"].string == id }?["name"].string ?? id }
@@ -266,6 +277,7 @@ struct TeamResumeFailure: Equatable {
         connected = false; connecting = true; sessions = []; resources = .null; me = .null
         teams = []; selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil; projectFilter = nil; showingHome = true; teamModels.removeAll(); teamResumeFailures = [:]; teamsFresh = false
         projectGroups = .empty; board = .empty; boardFresh = false; boardError = ""; missionModels.removeAll(); cost = nil
+        showingUnderstanding = false; understandingWorkspaceID = nil
         sessionsLoaded = false; teamsLoaded = false
         sessionFreshness.recovered(); teamFreshness.recovered()
         for terminal in previousTerminals { await terminal.detach() }
@@ -375,6 +387,7 @@ struct TeamResumeFailure: Equatable {
             if groups != projectGroups { projectGroups = groups }
             if next != board { board = next }
             if let filter = projectFilter, groups.group(filter) == nil { projectFilter = nil }
+            if let workspaceID = understandingWorkspaceID, groups.group(workspaceID) == nil { understandingWorkspaceID = nil }
             if !boardFresh { boardFresh = true }
             if !boardError.isEmpty { boardError = "" }
             pruneDetailModels()
@@ -387,11 +400,12 @@ struct TeamResumeFailure: Equatable {
     }
     /// Home for every project, or narrowed to one.
     func showHome(project: String? = nil) {
+        showingUnderstanding = false
         selectedTeamID = nil; selectedMissionID = nil; teamOpenedFrom = nil
         projectFilter = project; showingHome = true
     }
     /// A team page, remembering the mission it was opened from.
-    func openTeam(_ id: String, from mission: String? = nil) { selectedTeamID = id; teamOpenedFrom = mission }
+    func openTeam(_ id: String, from mission: String? = nil) { showingUnderstanding = false; selectedTeamID = id; teamOpenedFrom = mission }
     func missionModel(for id: String) -> MissionModel? {
         if let existing = missionModels[id] { return existing }
         guard let client else { return nil }
@@ -465,7 +479,7 @@ struct TeamResumeFailure: Equatable {
         for id in Array(missionModels.keys) { pruneMissionModel(id) }
     }
     /// Leaving a team for one of its member sessions.
-    func openSession(_ id: String) { selectedTeamID = nil; selectedMissionID = nil; showingHome = false; showingCost = false; selectedID = id }
+    func openSession(_ id: String) { selectedTeamID = nil; selectedMissionID = nil; showingUnderstanding = false; showingHome = false; showingCost = false; selectedID = id }
     func createTeam(projectID: String, provider: String, useLineup: Bool, title: String, objective: String, parallelism: Int) async throws {
         guard let client else { throw DesktopError("Connect to a server first.") }
         let profileID = activeID

@@ -324,7 +324,14 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     assert.deepEqual(await client.request("/dictation/cleanup", { body: { text: "um add retries" } }), { count: 10, method: "POST", path: "/api/dictation/cleanup" });
     // A project, by its id or by one of its checkouts' host project ids, is readable by any paired role.
     assert.deepEqual(await client.request("/project-groups/shop"), { count: 11, method: "GET", path: "/api/project-groups/shop" });
-    for (const [method, path] of [["POST", `/missions/${missionId}/answer/not-a-uuid`], ["GET", `/missions/${missionId}/steer`], ["GET", "/project-groups/Shop"], ["PUT", "/project-groups/Shop"], ["GET", "/dictation/cleanup"]] as const)
+    assert.deepEqual(await client.request("/project-groups/shop/understanding"), { count: 12, method: "GET", path: "/api/project-groups/shop/understanding" });
+    assert.deepEqual(await client.request("/project-groups/shop/understanding/catalog"), { count: 13, method: "GET", path: "/api/project-groups/shop/understanding/catalog" });
+    assert.deepEqual(await client.request("/project-groups/shop/understanding/components/cmp_123"), { count: 14, method: "GET", path: "/api/project-groups/shop/understanding/components/cmp_123" });
+    assert.deepEqual(await client.request("/project-groups/shop/understanding/catalog/plans", { body: {} }), { count: 15, method: "POST", path: "/api/project-groups/shop/understanding/catalog/plans" });
+    assert.deepEqual(await client.request("/project-groups/shop/understanding/refresh", { body: {} }), { count: 16, method: "POST", path: "/api/project-groups/shop/understanding/refresh" });
+    for (const [method, path] of [["DELETE", "/project-groups/shop/understanding/catalog/plans"], ["GET", "/project-groups/shop/understanding/refresh"], ["POST", "/project-groups/shop/understanding/catalog/credentials"], ["GET", "/project-groups/shop/understanding/components/cmp_123/extra"]] as const)
+      await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
+    for (const [method, path] of [["POST", `/missions/${missionId}/answer/not-a-uuid`], ["GET", `/missions/${missionId}/steer`], ["GET", "/project-groups/Shop"], ["PUT", "/project-groups/Shop"], ["GET", "/project-groups/shop/understanding/extra"], ["POST", "/project-groups/shop/understanding"], ["GET", "/dictation/cleanup"]] as const)
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
     runner.oversized();
     await assert.rejects(client.request("/me"), (error: RemoteError) => error.status === 413 && error.code === "response-too-large");

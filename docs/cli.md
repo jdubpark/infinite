@@ -39,6 +39,45 @@ infinite close SESSION_ID  # confirm before ending its provider process
 
 `usage` prints the current and previous month, plan fees, account balances, and a 30-day bar chart in the local timezone. `projects`, `project`, `goal`, and `models` show the corresponding roll-up. Every form accepts `--json`; `models` accepts `--role ROLE`. Unpriced totals are marked `≥`. Balances are shown only when the provider returned one; otherwise the CLI prints `—`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
 
+## Workspace Understanding
+
+```sh
+infinite understand
+infinite understand --workspace WORKSPACE_ID
+infinite understand --workspace WORKSPACE_ID --json
+infinite understand catalog --workspace WORKSPACE_ID [--json]
+infinite understand components --workspace WORKSPACE_ID [--json]
+infinite understand component COMPONENT_ID --workspace WORKSPACE_ID [--json]
+infinite understand policy --workspace WORKSPACE_ID [--json]
+infinite understand refresh --workspace WORKSPACE_ID
+infinite understand create projects|features|plans --workspace WORKSPACE_ID --revision N --request-id UUID --file INPUT.json
+infinite understand update projects|features|plans|components ENTITY_ID --workspace WORKSPACE_ID --revision N --request-id UUID --file INPUT.json
+infinite understand archive projects|features|plans ENTITY_ID --workspace WORKSPACE_ID --revision N --request-id UUID
+infinite understand policy --workspace WORKSPACE_ID --revision N --request-id UUID --file POLICY.json
+```
+
+With no workspace selector, `understand` lists visible workspaces using existing
+project-group IDs. A selected workspace shows Work and repository-level System
+knowledge. Current briefs describe retained source snapshots; Planned content
+quotes recorded requests. The report preserves source status, revision,
+generation time, and coverage. It does not infer completion or deployment.
+`--json` returns the versioned response for tools. These reads start no analysis
+job and change no work status. `catalog`, `components`, and `component ID` read
+the complete owner catalog, component index, and one component's detail. The
+`policy` read shows maintenance controls; passing `--file`, `--revision`, and
+`--request-id` updates that policy. `refresh` queues host maintenance without
+changing work status.
+
+Catalog writes use a JSON object read from `--file`; the file is a value, never
+a shell command. Create requests use the request UUID as the new record ID.
+Every write requires the catalog revision observed by the caller and a UUID
+request ID. Reuse the same UUID only when retrying the identical request. The
+CLI does not fetch a revision or retry a write automatically. Archive takes no
+input file. The host enforces owner access. `--json` prints the response DTO.
+See [Workspace Understanding](repository-briefings.md#workspace-understanding).
+
+Existing `projects` commands continue to manage the same groups and checkouts.
+
 ## Projects, missions, and board
 
 ```sh

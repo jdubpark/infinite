@@ -139,6 +139,13 @@ export class MissionService {
     return mission;
   }
   list() { return [...this.records.values()].map(stored => this.view(stored)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+  /** Persisted mission records for the read-only Understanding view; performs no usage refresh. */
+  understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.mission)); }
+  understandingOwnsSession(missionId: string, memberId: string, sessionId: string, projectId: string): boolean {
+    const stored = this.records.get(missionId);
+    return Boolean(stored && stored.mission.repoProjectIds.includes(projectId) && stored.attempts.some(attempt =>
+      attempt.memberId === memberId && attempt.sessionId === sessionId));
+  }
   get(id: string) { return this.view(this.record(id)); }
 
   /** A create retry returns its recorded mission before any admission check runs again. */

@@ -177,14 +177,14 @@ function teamHeading(team: any, view: string) {
   return [`${clean(team?.id)} · ${clean(team?.status)} · revision ${clean(team?.revision)} · ${view}`, short(objective || team?.title, 500)];
 }
 
-/** Whether the chosen row has no written brief and Jevcode can be asked for one. */
+/** Whether the chosen row has no written brief and Understanding can be asked for one. */
 export function canAskForBrief(team: any, rows: { sessionId: string; status: TeamBriefStatus }[]) {
   const chosen = chooseTeamBrief(rows, summaryMember(team)?.sessionId);
   return Boolean(chosen && !briefBody(chosen.status) && (chosen.status.state === "empty" || chosen.status.state === "failed"));
 }
 
 /**
- * The default team card: decisions, then the Jevcode reading in the order the briefing contract
+ * The default team card: decisions, then the generated reading in the order the briefing contract
  * uses (outcome, system shape, ranked review questions, changes, checks, guidance, gaps).
  * The last line is the key bar or the next command; a watch pins it below the scrolled body.
  */
@@ -197,15 +197,15 @@ export function teamSummaryText(team: any, rows: { sessionId: string; status: Te
   const member = orderedTeamMembers(team).find(item => item?.sessionId === chosen?.sessionId) ?? coordinator;
   const brief = chosen?.status.summary?.repository?.brief;
   const text = briefBody(chosen?.status);
-  const label = brief || chosen?.status.summary?.engine === "jevcode" ? "JEVCODE SUMMARY" : "SESSION SUMMARY";
+  const label = brief || chosen?.status.summary?.engine === "jevcode" ? "BRIEF" : "SESSION SUMMARY";
   const when = briefWhen(chosen?.status);
   lines.push("", [label, member ? roleNames[member.role] ?? short(member.role, 24) : "", when ? briefTime(when, now) : ""].filter(Boolean).join(" · "));
   if (!text) {
     const pending = chosen?.status.state === "pending" || chosen?.status.state === "running";
-    lines.push(pending && !repainted ? "Jevcode is writing the summary." : short(chosen?.status.error || (rows.length ? "No Jevcode summary yet." : "No agent session is available for a summary."), 400));
-    if (interactive && canAskForBrief(team, rows)) lines.push("Press a to ask Jevcode for a summary.");
+    lines.push(pending && !repainted ? "Understanding is writing the Brief." : short(chosen?.status.error || (rows.length ? "No Brief yet." : "No agent session is available for a Brief."), 400));
+    if (interactive && canAskForBrief(team, rows)) lines.push("Press a to refresh the Brief.");
   } else {
-    if (!repainted && (chosen?.status.state === "pending" || chosen?.status.state === "running")) lines.push("Jevcode is updating this summary.");
+    if (!repainted && (chosen?.status.state === "pending" || chosen?.status.state === "running")) lines.push("Understanding is updating this Brief.");
     lines.push(short(brief?.summary || text, 1200));
     section(lines, "SYSTEM SHAPE", (brief?.architecture ?? []).map(item => item?.text ?? ""));
     section(lines, "REVIEW FIRST", (brief?.review ?? []).map(item => [
@@ -217,9 +217,9 @@ export function teamSummaryText(team: any, rows: { sessionId: string; status: Te
     section(lines, "CHECK EVIDENCE", (brief?.checks ?? []).map(item => item?.text ?? ""));
     section(lines, "GUIDANCE FOR AGENTS", (brief?.guidance ?? []).map(item => [item?.basis, item?.text].filter(Boolean).join(": ")));
     section(lines, "GAPS AND UNKNOWNS", brief?.unknowns ?? []);
-    lines.push("", "Jevcode's reading of recorded activity and the repository. It is not completion or approval.");
+    lines.push("", "Generated reading of recorded activity and the repository. It is not completion or approval.");
   }
-  const keys = ["l logs", ...(canAskForBrief(team, rows) ? ["a ask Jevcode"] : []), "q quit"].join(" · ");
+  const keys = ["l logs", ...(canAskForBrief(team, rows) ? ["a refresh Brief"] : []), "q quit"].join(" · ");
   const tail = interactive ? keys : `Review logs: infinite team status ${clean(team?.id)} --logs`;
   lines.push("", checkedAt ? `${clean(checkedAt)} · ${tail}` : tail);
   return lines.join("\n");

@@ -33,11 +33,11 @@ function Bullets({ title, items, limit = 3 }: { title: string; items: string[]; 
 }
 
 /**
- * The Jevcode reading of the team, in the briefing contract's order: outcome, review questions,
+ * The team brief, in the briefing contract's order: outcome, review questions,
  * changes, check evidence, and gaps, with system shape and guidance folded. It is not completion or
  * approval.
  */
-export function JevcodeSummary({ connection, team }: { connection: Connection; team: TeamView }) {
+export function UnderstandingSummary({ connection, team }: { connection: Connection; team: TeamView }) {
   const [asking, setAsking] = useState(false);
   const [askError, setAskError] = useState("");
   const [asked, setAsked] = useState<BriefRow | null>(null);
@@ -65,7 +65,8 @@ export function JevcodeSummary({ connection, team }: { connection: Connection; t
   const canAsk = !text && (state === "empty" || state === "failed") && Boolean(chosen?.sessionId);
   const written = briefTime(chosen?.status);
   const age = poll.data ? relativeAge(written, poll.data.at) : "";
-  const engine = brief || chosen?.status.summary?.engine === "jevcode" ? "Jevcode" : "Session summary";
+  const isBrief = Boolean(brief || chosen?.status.summary?.engine === "jevcode");
+  const label = isBrief ? "Brief" : "Session summary";
   const source = [member ? roleName(member.role) : "", updating ? "updating" : age].filter(Boolean).join(" · ");
 
   async function ask(sessionId: string) {
@@ -80,7 +81,7 @@ export function JevcodeSummary({ connection, team }: { connection: Connection; t
       const ready = Boolean(summary?.repository?.brief?.summary || summary?.text);
       setAsked({ sessionId, status: { state: ready ? "ready" : "empty", summary, ...(ready ? {} : { error: "No recorded chat is available for a repository brief." }) } });
     } catch (error) {
-      setAskError(error instanceof Error ? error.message : "Jevcode could not write a summary.");
+      setAskError(error instanceof Error ? error.message : "The brief could not be written.");
     } finally {
       client.close();
       askingRef.current = false;
@@ -90,8 +91,8 @@ export function JevcodeSummary({ connection, team }: { connection: Connection; t
 
   return <Card style={s.summary}>
     <View accessibilityLiveRegion="polite" style={s.head}>
-      {engine === "Jevcode" ? <View style={s.mark}><Text style={s.markText}>J</Text></View> : null}
-      <Text style={s.engine}>{engine}</Text>
+      {isBrief ? <View style={s.mark}><Text style={s.markText}>B</Text></View> : null}
+      <Text style={s.engine}>{label}</Text>
       <Text style={[t.note, s.fill]} numberOfLines={1}>{source}</Text>
     </View>
     {!text ? <Text style={t.note}>{
@@ -124,7 +125,7 @@ export function JevcodeSummary({ connection, team }: { connection: Connection; t
       <Text style={t.note}>Not completion or approval.</Text>
     </>}
     {askError ? <Text accessibilityRole="alert" style={t.error}>{askError}</Text> : null}
-    {canAsk && chosen ? <Button compact secondary title={asking ? "Writing… a few minutes" : "Summarize"} disabled={asking} onPress={() => void ask(chosen.sessionId)} /> : null}
+    {canAsk && chosen ? <Button compact secondary title={asking ? "Writing… a few minutes" : "Write brief"} disabled={asking} onPress={() => void ask(chosen.sessionId)} /> : null}
   </Card>;
 }
 

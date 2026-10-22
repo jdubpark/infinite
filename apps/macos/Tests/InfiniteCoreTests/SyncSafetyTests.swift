@@ -144,4 +144,73 @@ final class SyncSafetyTests: XCTestCase {
         XCTAssertEqual(DraftLocation(bundleID: "a/../b").directory, "Infinite/Drafts-a-..-b")
         XCTAssertNotEqual(DraftLocation(bundleID: "dev.infinite.desktop.beta"), DraftLocation(bundleID: "dev.infinite.desktop"))
     }
+
+    func testUnderstandingSnapshotCacheEncryptsAndScopesBoundedOfflineSnapshots() throws {
+        let location = DraftLocation(bundleID: "dev.infinite.test-\(UUID().uuidString.lowercased())")
+        let service = "\(location.service).understanding-snapshots"
+        let cacheDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Infinite/Understanding-\(URL(fileURLWithPath: location.directory).lastPathComponent)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: cacheDirectory)
+            try? DeviceKeychain.remove("snapshot-key", service: service)
+        }
+
+        let store = UnderstandingSnapshotStore(location: location)
+        let secretText = "private workspace source snapshot"
+        for index in 0..<5 {
+            try store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-\(index)",
+                                    membershipRevision: index, data: Data(secretText.utf8))
+        }
+        let encryptedFile = cacheDirectory.appendingPathComponent("workspace-snapshots.sealed")
+        let ciphertext = try Data(contentsOf: encryptedFile)
+        XCTAssertFalse(String(decoding: ciphertext, as: UTF8.self).contains(secretText))
+
+        let recent = try store.readRecent(host: "host-A", credential: "credential-A")
+        XCTAssertEqual(recent.count, 4)
+        XCTAssertNil(try store.read(host: "other-host", credential: "credential-A", workspace: "workspace-4", membershipRevision: 4))
+        XCTAssertNil(try store.read(host: "host-A", credential: "other-credential", workspace: "workspace-4", membershipRevision: 4))
+        XCTAssertNil(try store.read(host: "host-A", credential: "credential-A", workspace: "workspace-4", membershipRevision: 3))
+        XCTAssertNotNil(try store.read(host: "host-A", credential: "credential-A", workspace: "workspace-4", membershipRevision: 4))
+        XCTAssertNil(try store.read(host: "host-A", credential: "credential-A", workspace: "workspace-4", membershipRevision: 4,
+                                    now: Date().addingTimeInterval(25 * 60 * 60)))
+
+        let overview = try JSON.object(["schemaVersion": .number(1), "workspace": .object(["id": .string("workspace-4")])]).data()
+        let catalog = try JSON.object(["revision": .number(7), "projects": .array([])]).data()
+        let components = try JSON.array([.object(["id": .string("component-a")])]).data()
+        let detail = try JSON.object(["component": .object(["id": .string("component-a")]), "relationships": .array([])]).data()
+
+        // Exercise overview-first and knowledge-first writer orders, then cold-open as an offline reader.
+        try store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-4",
+                                membershipRevision: 4, data: overview)
+        try store.mergeKnowledge(host: "host-A", credential: "credential-A", workspace: "workspace-4",
+                                 membershipRevision: 4, catalog: catalog, components: components)
+        try store.mergeComponentDetail(host: "host-A", credential: "credential-A", workspace: "workspace-4",
+                                       membershipRevision: 4, id: "component-a", detail: detail)
+        try assertOfflineSnapshot(UnderstandingSnapshotStore(location: location), workspace: "workspace-4",
+                                  revision: 4, overview: overview, catalog: catalog, components: components, detail: detail)
+
+        try store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-4",
+                                membershipRevision: 4, data: overview)
+        try assertOfflineSnapshot(UnderstandingSnapshotStore(location: location), workspace: "workspace-4",
+                                  revision: 4, overview: overview, catalog: catalog, components: components, detail: detail)
+    }
+
+    private func assertOfflineSnapshot(_ store: UnderstandingSnapshotStore, workspace: String, revision: Int,
+                                       overview: Data, catalog: Data, components: Data, detail: Data,
+                                       file: StaticString = #filePath, line: UInt = #line) throws {
+        let cached = try XCTUnwrap(store.read(host: "host-A", credential: "credential-A", workspace: workspace,
+                                              membershipRevision: revision), file: file, line: line)
+        XCTAssertEqual(cached.envelope.overview, overview, file: file, line: line)
+        XCTAssertEqual(cached.envelope.catalog, catalog, file: file, line: line)
+        XCTAssertEqual(cached.envelope.components, components, file: file, line: line)
+        XCTAssertEqual(cached.envelope.componentDetails["component-a"], detail, file: file, line: line)
+        XCTAssertEqual(try JSON.parse(XCTUnwrap(cached.envelope.overview, file: file, line: line))["workspace"]["id"].string,
+                       workspace, file: file, line: line)
+        XCTAssertEqual(try JSON.parse(XCTUnwrap(cached.envelope.catalog, file: file, line: line))["revision"].int,
+                       7, file: file, line: line)
+        XCTAssertEqual(try JSON.parse(XCTUnwrap(cached.envelope.components, file: file, line: line)).array.first?["id"].string,
+                       "component-a", file: file, line: line)
+        XCTAssertEqual(try JSON.parse(XCTUnwrap(cached.envelope.componentDetails["component-a"], file: file, line: line))["component"]["id"].string,
+                       "component-a", file: file, line: line)
+    }
 }

@@ -126,6 +126,7 @@ struct DesktopView: View {
     /// While a mission or team is open nothing is selected, so any row leads back.
     private var selection: Binding<String?> {
         Binding(get: {
+            if app.showingUnderstanding { return "understand" }
             if app.showingHome { return app.projectFilter.map { "project:" + $0 } ?? "home" }
             if app.showingCost { return "cost" }
             if app.selectedTeamID == nil && app.selectedMissionID == nil, let id = app.selectedID { return "session:" + id }
@@ -134,14 +135,16 @@ struct DesktopView: View {
             guard let value else { return }
             let leavingSession = !app.showingHome && !app.showingCost && app.selectedTeamID == nil && app.selectedMissionID == nil
             if leavingSession, let current = app.selectedID, value != "session:" + current { app.terminals[current]?.markRead() }
-            if value == "cost" { app.showCost() }
+            if value == "understand" { app.showUnderstanding() }
+            else if value == "cost" { app.showCost() }
             else if value.hasPrefix("session:") { app.openSession(String(value.dropFirst(8))) }
             else { app.showHome(project: value.hasPrefix("project:") ? String(value.dropFirst(8)) : nil) }
         })
     }
-    private var missionModel: MissionModel? { app.showingHome || app.showingCost ? nil : app.selectedMissionID.flatMap(app.missionModel(for:)) }
-    private var teamModel: TeamModel? { app.showingHome || app.showingCost || missionModel != nil ? nil : app.selectedTeamID.flatMap(app.teamModel(for:)) }
+    private var missionModel: MissionModel? { app.showingHome || app.showingCost || app.showingUnderstanding ? nil : app.selectedMissionID.flatMap(app.missionModel(for:)) }
+    private var teamModel: TeamModel? { app.showingHome || app.showingCost || app.showingUnderstanding || missionModel != nil ? nil : app.selectedTeamID.flatMap(app.teamModel(for:)) }
     private var pageTitle: String {
+        if app.showingUnderstanding { return "Understand" }
         if app.showingHome { return app.projectFilter.flatMap(app.projectGroups.group)?.name ?? "Home" }
         if app.showingCost { return "Cost" }
         if let missionModel { return missionModel.mission.title }
@@ -195,6 +198,7 @@ struct DesktopView: View {
         return List(selection: selection) {
             if app.active != nil && !searching {
                 Label("Home", systemImage: "square.grid.2x2").tag("home").badge(waiting)
+                Label("Understand", systemImage: "sparkle.magnifyingglass").tag("understand")
                 if app.usageEnabled { Label("Cost", systemImage: "chart.bar.xaxis").tag("cost") }
             }
             if !groups.isEmpty {
@@ -280,7 +284,7 @@ struct DesktopView: View {
     @ViewBuilder private var detail: some View {
         VStack(spacing: 0) {
             // Session panes stay mounted underneath Home, Cost, missions, and team dashboards, so switching back is instant.
-            let covered = app.active == nil || app.showingHome || app.showingCost || missionModel != nil || teamModel != nil
+            let covered = app.active == nil || app.showingHome || app.showingCost || app.showingUnderstanding || missionModel != nil || teamModel != nil
             ZStack {
                 Group {
                     if app.mounted.isEmpty {
@@ -298,6 +302,7 @@ struct DesktopView: View {
                     } else { panes }
                 }.opacity(covered ? 0 : 1).allowsHitTesting(!covered).accessibilityHidden(covered)
                 if app.active == nil { welcome }
+                else if app.showingUnderstanding { UnderstandingView(app: app) }
                 else if app.showingHome { HomeView(app: app) }
                 else if app.showingCost, let cost = app.costModel() { CostView(app: app, model: cost) }
                 else if let missionModel { MissionDetailView(app: app, model: missionModel).id(missionModel.id) }

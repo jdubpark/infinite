@@ -43,6 +43,7 @@ import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
 import { buildLaunch } from "./launch.js";
+import { addProjectIdToLaunchEnv } from "./worker-env.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
@@ -1273,6 +1274,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       if (process.env[name]) env[name] = process.env[name]!;
     }
     env.TERM = "xterm-256color";
+    addProjectIdToLaunchEnv(env, session.projectId);
     if (session.team) {
       if (!hookServer) throw new Error("Team report channel could not start");
       // The verification flag is host policy; the agent's binding stays the stable assignment identity.

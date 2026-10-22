@@ -30,6 +30,15 @@ rejects unmet permissions instead of providing an interactive approval flow. Pro
 configured contributor use without changing provider terms or retention. See
 [Goals and agent teams](teams.md) for scope, routing, limits, and recovery.
 
+On the Ubuntu host, provider wrappers can load owner-managed environment files
+for host-wide credentials, Android tooling, and a selected project. Values are
+exported literally and never passed through `eval`, so file contents cannot
+execute shell substitutions or command syntax during loading. A deny list
+protects the launcher's `PATH`, home, shell, temporary and XDG paths, sudo and
+Infinite control variables, and wrapper-owned settings from file overrides.
+This keeps owner-supplied build credentials from changing the execution
+identity, launcher paths, or host-to-worker control channel.
+
 Optional Linear tracking sends configured goal and feature details to Linear.
 Its API credential stays in a private host file outside runtime and project
 roots and is never passed into agent environments. Clients receive issue

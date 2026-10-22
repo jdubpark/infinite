@@ -59,12 +59,18 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
     writeFileSync(join(source, "original.txt"), "The configured project remains unchanged.\n");
   if (!bootstrap) writeFileSync(join(source, "check.mjs"), [
     'import assert from "node:assert/strict";',
-    'import { existsSync, readFileSync } from "node:fs";',
+    'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
     'assert.match(readFileSync("a.txt", "utf8"), /^revision [1-9][0-9]*\\n$/);',
     'assert.equal(readFileSync("a.txt", "utf8"), readFileSync("b.txt", "utf8"));',
     'if (process.argv.includes("--prefix")) assert.equal(process.env.INFINITE_TEST_COMMAND_IDENTITY, "team-prefix");',
     'if (process.argv.includes("--fail")) { console.error("Configured verification failed"); process.exit(17); }',
     ...(scenario === "mixed" || scenario === "integrator-limit" ? ['if (!existsSync("repair.txt")) { console.error("Integration repair required"); process.exit(18); }'] : []),
+    ...(scenario === "check-mutates" ? [
+      `if (!existsSync(${JSON.stringify(join(receipts, "check-mutated"))})) {`,
+      `  writeFileSync(${JSON.stringify(join(receipts, "check-mutated"))}, "done\\n");`,
+      '  writeFileSync("a.txt", "Auto-fixed by verification\\n");',
+      "}",
+    ] : []),
   ].join("\n"));
   if (bootstrap) {
     git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "Empty project");
@@ -83,7 +89,7 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
   const hostConfig: Partial<Config> = {
     remote: { enabled: true },
     projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
-      team: { ...(scenario.startsWith("delivery") ? { delivery: options.deliveryMode === "pr" ? { mode: "pr" as const, repository: "example/app", baseBranch: "main" } : { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}), ...(scenario.startsWith("permissions") ? { setup: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--permission-setup", receipts] } } : {}), ...(scenario.startsWith("permissions") && scenario !== "permissions-off" ? { permissions: { mode: "coordinator" as const, scope: "Approve only read access needed to inspect this project for the stated objective.", maxDecisions: 2 } } : {}), checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
+      team: { ...(scenario.startsWith("delivery") ? { delivery: options.deliveryMode === "pr" ? { mode: "pr" as const, repository: "example/app", baseBranch: "main" } : { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}), ...(scenario.startsWith("permissions") || scenario === "check-mutates" ? { setup: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--permission-setup", receipts] } } : {}), ...(scenario.startsWith("permissions") && scenario !== "permissions-off" ? { permissions: { mode: "coordinator" as const, scope: "Approve only read access needed to inspect this project for the stated objective.", maxDecisions: 2 } } : {}), checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
         { command: process.execPath, args: ["check.mjs", ...(scenario.endsWith("failed-check") ? ["--fail"] : []), ...(scenario === "success" ? ["--prefix"] : [])] },
         ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
       ] }) } }],

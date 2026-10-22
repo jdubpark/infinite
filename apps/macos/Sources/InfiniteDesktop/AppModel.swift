@@ -175,7 +175,6 @@ struct TeamResumeFailure: Equatable {
         showingCost = false; showingHome = false; showingUnderstanding = true
     }
     var teamLineup: JSON { me["teams"]["lineup"] }
-    var teamParallelismLimit: Int { let value = me["teams"]["maxParallelism"].int; return max(1, min(4, value == 0 ? 4 : value)) }
     func projectName(_ id: String) -> String { projects.first { $0["id"].string == id }?["name"].string ?? id }
     /// Providers offered for a single-provider team, Claude Code first.
     var teamProviders: [String] { let all = me["providers"].array.map(\.string); return all.contains("claude") ? ["claude"] + all.filter { $0 != "claude" } : all }
@@ -480,7 +479,7 @@ struct TeamResumeFailure: Equatable {
     }
     /// Leaving a team for one of its member sessions.
     func openSession(_ id: String) { selectedTeamID = nil; selectedMissionID = nil; showingUnderstanding = false; showingHome = false; showingCost = false; selectedID = id }
-    func createTeam(projectID: String, provider: String, useLineup: Bool, title: String, objective: String, parallelism: Int) async throws {
+    func createTeam(projectID: String, provider: String, useLineup: Bool, title: String, objective: String) async throws {
         guard let client else { throw DesktopError("Connect to a server first.") }
         let profileID = activeID
         if pendingTeamCreation.pendingID == nil {
@@ -489,7 +488,7 @@ struct TeamResumeFailure: Equatable {
             let request = objective.trimmingCharacters(in: .whitespacesAndNewlines)
             let firstLine = request.split(whereSeparator: \.isNewline).first.map(String.init) ?? request
             var fields: [String: JSON] = ["requestId": .string(requestID), "projectId": .string(projectID), "provider": .string(provider),
-                                          "title": .string(name.isEmpty ? String(firstLine.prefix(100)) : name), "objective": .string(request), "parallelism": .number(Double(parallelism))]
+                                          "title": .string(name.isEmpty ? String(firstLine.prefix(100)) : name), "objective": .string(request)]
             if useLineup { fields["useConfiguredLineup"] = .bool(true) }
             var record = DraftRecord(); record.pendingID = requestID
             record.pendingText = String(decoding: try JSON.object(fields).data(), as: UTF8.self)

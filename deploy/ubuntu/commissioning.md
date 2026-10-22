@@ -58,6 +58,17 @@ Local receipts and screenshots (cloud continuity, active release, provider commi
 
 Authenticate inside the protected agent account. Do not authenticate as the administrator or API user, copy an entire laptop home, or depend on a forwarded laptop SSH agent.
 
+### Session environment files
+
+Before launching sessions that need owner-managed environment values, install the loader from the deployed release checkout:
+
+```sh
+sudo sh deploy/ubuntu/install-agent-env.sh
+sudo visudo -cf deploy/ubuntu/infinite.sudoers
+```
+
+Provision environment files as `root:infinite-agent` mode `0640`, keep `secrets/` and `projects/` at `root:infinite-agent` mode `0750`, and install the validated sudoers policy. See [Ubuntu deployment](README.md#session-environment-files) for file ordering, accepted keys, and the installed-wrapper patch. Existing sessions retain their old environment until recreated.
+
 Codex, Grok, and Claude authenticated through separate server logins. At the owner's request, OpenCode uses Meta and DeepSeek: only those two existing credential entries were copied from the laptop's OpenCode store into the encrypted agent home. Its unrelated provider entries were not transferred. The pending OpenCode ChatGPT login was cancelled.
 
 OpenCode enables the `meta` and `deepseek` providers, defaults new sessions to `meta/muse-spark-1.3-contributor`, and disables public session sharing. The installed catalog also offers `deepseek/deepseek-flash` (displayed as DeepSeek V4.1 Flash) and `deepseek/deepseek-v4-pro`. Meta's Contributor tier permits training on prompts and completions; the encrypted execution host does not change those provider terms. Commissioning uses disposable text only. [Meta tier terms](https://dev.meta.ai/docs/pricing-rate-limits#contributor-tier).

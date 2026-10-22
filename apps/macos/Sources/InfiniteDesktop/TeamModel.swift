@@ -82,8 +82,13 @@ struct TeamMutation: Equatable {
     }
     /// A mission's subteam is run by its coordinator: the owner reads it, and talks to the coordinator from the mission.
     var managed: Bool { run.managedByMission }
-    var canSteer: Bool { !managed && fresh && role != "viewer" && run.status != "cancelled" && !busy && pending == nil }
+    var canSteer: Bool { !managed && fresh && role != "viewer" && run.status != "cancelled" && !(run.status == "blocked" && run.value["continuable"].bool) && !busy && pending == nil }
     var canOwn: Bool { !managed && fresh && role == "owner" && !busy && pending == nil }
+    var offersContinue: Bool {
+        role == "owner" && run.status == "blocked" && run.value["continuable"].bool && !managed
+            && run.value["goal"] == .null && run.value["deliveryReceipt"] == .null && run.value["pullRequest"] == .null
+    }
+    var canContinue: Bool { offersContinue && fresh && !busy && pending == nil }
     func steer() async {
         let text = direction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
@@ -96,6 +101,11 @@ struct TeamMutation: Equatable {
     }
     func perform(_ action: String) async {
         await mutate(path: "/teams/\(run.id)/\(action)", label: action == "cancel" ? "Cancellation" : action.capitalizedFirst)
+    }
+    func continueRun() async {
+        let text = direction.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard canContinue, text.utf16.count <= 8000 else { return }
+        await mutate(path: "/teams/\(run.id)/continue", label: "Continue development", text: text.isEmpty ? nil : text)
     }
     private func mutate(path: String, label: String, text: String? = nil) async {
         guard !managed, !busy, pending == nil else { return }
@@ -124,6 +134,7 @@ struct TeamMutation: Equatable {
             let next = TeamRun(result); observe(next); pending = nil
             notice = "\(mutation.label) recorded · revision \(next.revision)."; noticeIsError = false
             if mutation.path.hasSuffix("/steer") { direction = "" }
+            if mutation.path.hasSuffix("/continue") && direction.trimmingCharacters(in: .whitespacesAndNewlines) == mutation.body["text"].string { direction = "" }
         } catch let error as DesktopError where error.code == "delivery-unknown" {
             pending = mutation; notice = "Delivery unconfirmed. Retry sends this exact request."; noticeIsError = true
         } catch let error as DesktopError where (400...499).contains(error.status) {

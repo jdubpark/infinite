@@ -28,7 +28,7 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   /** The journal position read for turn signals, and the latest turn boundary seen there. */
   signalCursor?: number; turnSignal?: { kind: string; at: string } };
 /** A subteam action recorded before it is sent, so a restart replays it under the same request ID. */
-type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; by?: "owner" | "coordinator" };
+type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator" };
 type Stored = {
   mission: Mission;
   fingerprint: string;
@@ -91,6 +91,20 @@ export class MissionService {
       if (stored.mission.id !== id) throw new TeamError(409, "invalid-mission-record", "A mission record cannot be authenticated.");
       this.records.set(id, stored);
       this.saved.set(id, digest(stored));
+      let capacityChanged = false;
+      for (const subtask of stored.mission.subtasks) {
+        const teamId = subtask.teamId ?? stored.launches[subtask.id]?.requestId;
+        if (!teamId) continue;
+        let parallelism: number | undefined;
+        try { parallelism = this.teams.ensureMissionCapacityCeiling(teamId, stored.mission.id, subtask.size === "solo" ? 1 : 4); }
+        catch (error) { if (!notFound(error)) throw error; }
+        if (parallelism !== undefined && subtask.parallelism !== parallelism) {
+          subtask.parallelism = parallelism;
+          capacityChanged = true;
+        }
+      }
+      if (capacityChanged) this.event(stored, "Subtask worker limits were reconciled from their persisted team capacity.");
+      if (capacityChanged) this.save(stored);
     }
     this.teams.useMissionReservations((projectId, exceptMissionId) => {
       for (const [missionId, stored] of this.records) {
@@ -373,6 +387,7 @@ export class MissionService {
   private queueOp(stored: Stored, op: Omit<ChildOp, "requestId">) {
     // A cancel supersedes any earlier action on the same subteam.
     if (op.kind === "cancel") stored.ops = stored.ops.filter(item => item.teamId !== op.teamId);
+    else if (op.kind === "parallelism") stored.ops = stored.ops.filter(item => item.kind !== "parallelism" || item.teamId !== op.teamId);
     stored.ops.push({ ...op, requestId: randomUUID() });
   }
   private message(stored: Stored, key: string, message: MissionMessage) {
@@ -401,7 +416,7 @@ export class MissionService {
       }
       const baseRunId = stored.bases?.[subtaskId];
       try {
-        const team = await this.teams.createForMission(request, mission.id, mission.lineup, baseRunId ? { baseRunId } : undefined);
+        const team = await this.teams.createForMission(request, mission.id, mission.lineup, { ...(baseRunId ? { baseRunId } : {}), parallelismCeiling: subtask.size === "solo" ? 1 : 4 });
         if (this.closed) return;
         Object.assign(subtask, { teamId: team.id, status: "running", teamStatus: team.status });
         const base = baseRunId && mission.subtasks.find(item => item.teamId === baseRunId);
@@ -485,6 +500,7 @@ export class MissionService {
       let team: TeamView;
       try { team = this.teams.get(subtask.teamId!); } catch (error) { if (notFound(error)) continue; throw error; }
       subtask.teamStatus = team.status;
+      if (!stored.ops.some(op => op.kind === "parallelism" && op.teamId === team.id)) subtask.parallelism = team.parallelism;
       const status = subtaskStatus(team.status), changed = status !== subtask.status;
       subtask.status = status;
       if (changed && status !== "running") this.event(stored, `Subtask ${subtask.id} is ${status} (subteam ${team.status}).`);
@@ -501,7 +517,7 @@ export class MissionService {
       let team: TeamView;
       try { team = this.teams.get(op.teamId); } catch (error) { if (notFound(error)) continue; throw error; }
       const settled = teamDone.has(team.status) || team.status === "cancelled";
-      if ((op.kind === "cancel" && settled) || (op.kind === "pause" && (settled || ["paused", "blocked"].includes(team.status))) || (op.kind === "resume" && team.status !== "paused")) continue;
+      if ((op.kind === "cancel" && settled) || (op.kind === "parallelism" && settled) || (op.kind === "pause" && (settled || ["paused", "blocked"].includes(team.status))) || (op.kind === "resume" && team.status !== "paused")) continue;
       // Steering restarts a paused or blocked subteam, so direction waits until both it and the mission are running again.
       if (op.kind === "steer" && (team.status === "paused" || stored.mission.status === "paused")) { remaining.push(op); continue; }
       if (op.kind === "steer" && settled) { steered.push(`Subtask ${op.subtaskId} finished before the direction reached it.`); continue; }
@@ -511,6 +527,7 @@ export class MissionService {
       try {
         if (op.kind === "answer") await this.teams.answer(op.teamId, op.decisionId!, { requestId: op.requestId, revision: op.revision, text: op.text! }, undefined, op.by ?? "owner");
         else if (op.kind === "steer") team = await this.teams.steer(op.teamId, { requestId: op.requestId, revision: op.revision!, text: op.text! });
+        else if (op.kind === "parallelism") team = await this.teams.setMissionParallelism(op.teamId, { requestId: op.requestId, revision: op.revision!, parallelism: op.parallelism! });
         else await this.teams[op.kind](op.teamId, { requestId: op.requestId, revision: op.revision });
       } catch (error) {
         if (this.closed) return;
@@ -525,6 +542,11 @@ export class MissionService {
         continue;
       }
       if (op.kind === "answer") this.event(stored, `Decision ${op.decisionId} of subtask ${op.subtaskId} was answered by the ${op.by}.`);
+      if (op.kind === "parallelism") {
+        const subtask = stored.mission.subtasks.find(item => item.id === op.subtaskId);
+        if (subtask) subtask.parallelism = team.parallelism;
+        this.event(stored, `The mission coordinator set subtask ${op.subtaskId} to a ${team.parallelism}-worker limit.`);
+      }
       if (op.kind === "steer") {
         // Mirror the restarted subteam now, so a report consumed on this tick sees it working.
         const subtask = stored.mission.subtasks.find(item => item.id === op.subtaskId);
@@ -780,6 +802,32 @@ export class MissionService {
         mission.dispatchSummary = report.summary;
         const edges = generated.length ? ` The host added same-repository dependencies: ${generated.map(edge => `${edge.subtaskId} depends on ${edge.predecessorId}`).join("; ")}.` : "";
         this.event(stored, `The coordinator dispatched ${plans.length} subtask${plans.length === 1 ? "" : "s"}.${edges}`);
+        break;
+      }
+      case "resize-subtask": {
+        if ((stored.ownerInputs ?? 0) !== (attempt.ownerInputs ?? 0)) {
+          this.event(stored, `The coordinator's resize-subtask report for ${subtask!.id} was not applied because the owner sent direction or an answer after that attempt started.`);
+          stored.inbox.push({ type: "refused", kind: report.kind, reason: "The owner sent direction or an answer after your previous attempt started. Reassess the worker limit before reporting again." });
+          return;
+        }
+        const ceiling = subtask!.size === "solo" ? 1 : 4;
+        if (report.parallelism > ceiling) return this.refuse(stored, report.kind, `Subtask ${subtask!.id} supports at most ${ceiling} worker${ceiling === 1 ? "" : "s"}.`);
+        if (subtask!.status === "queued" && !subtask!.teamId) {
+          subtask!.parallelism = report.parallelism;
+          const launch = stored.launches[subtask!.id];
+          if (launch) launch.parallelism = report.parallelism;
+          this.event(stored, `The mission coordinator set queued subtask ${subtask!.id} to a ${report.parallelism}-worker limit: ${report.summary}`);
+          break;
+        }
+        if (subtask!.status !== "running" || !subtask!.teamId)
+          return this.refuse(stored, report.kind, `Subtask ${subtask!.id} is not queued or running, so its worker limit cannot change.`, false);
+        let team: TeamView;
+        try { team = this.teams.get(subtask!.teamId); }
+        catch (error) { if (notFound(error)) return this.refuse(stored, report.kind, `The subteam for ${subtask!.id} no longer exists.`, false); throw error; }
+        if (team.missionId !== mission.id || team.projectId !== subtask!.repoProjectId)
+          return this.refuse(stored, report.kind, `The recorded subteam for ${subtask!.id} does not belong to this mission and repository.`, false);
+        this.queueOp(stored, { kind: "parallelism", subtaskId: subtask!.id, teamId: team.id, parallelism: report.parallelism });
+        this.event(stored, `The mission coordinator requested a ${report.parallelism}-worker limit for subtask ${subtask!.id}: ${report.summary}`);
         break;
       }
       case "answer-child": {

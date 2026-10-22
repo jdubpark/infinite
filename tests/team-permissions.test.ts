@@ -48,15 +48,28 @@ test("an explicit permission policy reviews and answers only the recorded one-sh
   } finally { await f.close(); }
 });
 
-test("a Codex screen-only permission review includes the target's changed paths", { timeout: 120000 }, async () => {
+test("a Codex permission review preserves a large objective and complete request evidence", { timeout: 120000 }, async () => {
   const f = await fixture("permissions-codex", permissionLineup);
   try {
-    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const objective = `Create independent files. ${"Keep the assigned scope. ".repeat(800)}Verify their integrated contents.`;
+    const created = await f.host.fetchApi("/teams", "owner", { ...f.create(), objective });
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const reviewing = await waitFor(() => f.get(created.body.id), run =>
+      run.permissionDecisions?.some(decision => decision.status === "escalated") ||
       run.permissionDecisions?.some(decision => decision.status === "reviewing") &&
-      existsSync(join(f.receipts, `${run.id}.judge-ready`)) &&
-      existsSync(join(f.receipts, `${run.id}.permission-feedback.json`)), 60000);
+        existsSync(join(f.receipts, `${run.id}.judge-ready`)) &&
+        existsSync(join(f.receipts, `${run.id}.permission-feedback.json`)), 60000);
+    assert.equal(reviewing.permissionDecisions[0].status, "reviewing", reviewing.permissionDecisions[0].reason);
+    const coordinator = reviewing.members.find(member => member.memberId === reviewing.permissionDecisions[0].coordinatorMemberId)!;
+    const launchPrompt = JSON.parse(readFileSync(join(f.receipts, `${coordinator.memberId}.json`), "utf8")).argv.at(-1) as string;
+    assert.equal(launchPrompt.split(objective).length, 2, "the complete owner objective reaches the reviewer once");
+    assert.equal(launchPrompt.split(reviewing.permissions!.scope).length, 2, "the pinned scope reaches the reviewer once");
+    const feedbackText = readFileSync(join(f.receipts, `${reviewing.id}.permission-feedback.json`), "utf8");
+    assert.equal(launchPrompt.split(feedbackText).length, 2, "the complete request evidence reaches the reviewer once");
+    const feedback = JSON.parse(feedbackText);
+    const target = reviewing.members.find(member => member.memberId === reviewing.permissionDecisions[0].targetMemberId)!;
+    assert.deepEqual(feedback.prompt, (await f.host.fetchApi(`/sessions/${target.sessionId}`)).body.attention.prompt);
+    assert.equal(feedback.targetTask.instructions, reviewing.tasks.find(task => task.id === target.taskId)!.instructions);
     // While the coordinator reviews, the run does not tell the person to answer the prompt.
     await waitFor(() => f.get(reviewing.id), run => run.reason === "The permission coordinator is reviewing a provider request.", 10000);
     writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
@@ -64,10 +77,30 @@ test("a Codex screen-only permission review includes the target's changed paths"
     const answered = await waitFor(() => f.get(reviewing.id), run => run.permissionDecisions?.[0]?.status === "answered", 30000);
     assert.equal(answered.permissionDecisions[0].receipt?.state, "delivered");
     assert.equal(answered.permissionDecisions[0].receipt?.result, "closed");
-    const feedback = JSON.parse(readFileSync(join(f.receipts, `${reviewing.id}.permission-feedback.json`), "utf8"));
     assert.ok(feedback.targetChangedPaths.includes("a.txt"), JSON.stringify(feedback.targetChangedPaths));
     assert.equal(feedback.targetChangedPathCount, feedback.targetChangedPaths.length);
     assert.deepEqual(feedback.acceptedChecks, [{ command: process.execPath, args: ["check.mjs"] }]);
+  } finally { await f.close(); }
+});
+
+test("permission evidence exceeding the full UTF-8 prompt budget escalates without launching a reviewer", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex", permissionLineup);
+  try {
+    const project = await f.host.fetchApi("/projects/rehearsal/team", "owner");
+    const configured = await f.host.fetchApi("/projects/rehearsal/team", "owner", {
+      requestId: randomUUID(), revision: project.body.revision,
+      team: { ...project.body.team, permissions: { ...project.body.team.permissions, scope: "界".repeat(4000) } },
+    }, {}, "PUT");
+    assert.equal(configured.status, 200, JSON.stringify(configured.body));
+    const created = await f.host.fetchApi("/teams", "owner", { ...f.create(), objective: "界".repeat(23000) });
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const escalated = await waitFor(() => f.get(created.body.id), run => run.permissionDecisions?.[0]?.status === "escalated", 60000);
+    assert.match(escalated.permissionDecisions[0].reason ?? "", /evidence exceeds.*prompt limit.*without truncation/);
+    assert.equal(escalated.permissionDecisions[0].receipt, undefined);
+    assert.equal(escalated.members.some(member => member.role === "permission-coordinator"), false);
+    assert.notEqual(escalated.status, "blocked");
+    const target = escalated.members.find(member => member.memberId === escalated.permissionDecisions[0].targetMemberId)!;
+    assert.equal((await f.host.fetchApi(`/sessions/${target.sessionId}`)).body.attention.state, "needs-you");
   } finally { await f.close(); }
 });
 

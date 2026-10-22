@@ -30,6 +30,23 @@ rejects unmet permissions instead of providing an interactive approval flow. Pro
 configured contributor use without changing provider terms or retention. See
 [Goals and agent teams](teams.md) for scope, routing, limits, and recovery.
 
+On the Ubuntu host, provider wrappers can load owner-managed environment files
+for host-wide credentials, Android tooling, and a selected project. Values are
+exported literally and never passed through `eval`, so file contents cannot
+execute shell substitutions or command syntax during loading. A deny list
+protects the launcher's `PATH`, home, shell, temporary and XDG paths, sudo and
+Infinite control variables, and wrapper-owned settings from file overrides,
+and also rejects the loader's own underscore-prefixed namespace and names the
+shell interprets on assignment (`IFS`, `OPTIND`, `PS1`..`PS4`, `PWD`, `ENV`,
+`BASH_ENV`, `CDPATH`, locale variables and similar), so a file cannot redirect
+project selection or abort the wrapper. A trailing carriage return is dropped.
+Files are additive: a variable the host already injected into the session
+(sudoers `env_keep`, such as the native token and OpenCode credentials) is
+never overridden by a file, and `OPENCODE_SERVER_*` / `OPENCODE_CONFIG_CONTENT`
+are denied outright.
+This keeps owner-supplied build credentials from changing the execution
+identity, launcher paths, or host-to-worker control channel.
+
 Optional Linear tracking sends configured goal and feature details to Linear.
 Its API credential stays in a private host file outside runtime and project
 roots and is never passed into agent environments. Clients receive issue

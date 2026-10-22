@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
-import { dirname, join, resolve, relative, isAbsolute, parse } from "node:path";
+import { basename, dirname, join, resolve, relative, isAbsolute, parse } from "node:path";
 import type { TeamCommand, TeamTaskPlan } from "./team-types.js";
 
 export class TeamError extends Error {
@@ -22,10 +23,10 @@ export function teamGitArgs(cwd: string, args: string[]) {
   return ["-c", `safe.directory=${cwd}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "user.name=Infinite", "-c", "user.email=agent@example.invalid", ...args];
 }
 /** Commands are argv arrays, from owner configuration or an explicitly authorized plan. */
-export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand): Promise<CommandResult> {
+export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string): Promise<CommandResult> {
   return new Promise((resolveResult, reject) => {
     const env = teamCommandEnvironment();
-    const child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+    const child = spawn(prefix?.command ?? command.command, prefix ? [...prefix.args, command.command, ...command.args] : command.args, { cwd, env, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     let output = "", stdout = "", interrupted = false, settled = false, truncated = false;
     const stop = () => {
       interrupted = true;
@@ -40,7 +41,14 @@ export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSig
       truncated ||= output.length + text.length > 65536;
       output = (output + text).slice(-65536);
     };
-    child.stdout.on("data", chunk => { capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); }); child.stderr.on("data", capture);
+    child.stdout!.on("data", chunk => { capture(chunk); stdout = (stdout + chunk.toString("utf8")).slice(-65536); }); child.stderr!.on("data", capture);
+    if (input !== undefined) {
+      child.stdin!.on("error", error => {
+        truncated = true;
+        if ((error as NodeJS.ErrnoException).code !== "EPIPE") capture(Buffer.from("\n[The host could not send configured team input.]\n"));
+      });
+      child.stdin!.end(input, "utf8");
+    }
     const timer = setTimeout(stop, timeoutMs); timer.unref();
     const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", stop); };
     signal?.addEventListener("abort", stop, { once: true });
@@ -199,6 +207,80 @@ export async function prepareMemberWorkspace(workspace: string, memberId: string
   await git(cwd, ["checkout", "--detach", baseCommit], prefix, 30000, signal);
   return realpathSync(cwd);
 }
+const writeTeamContextScript = `
+const fs = require("node:fs");
+const path = require("node:path");
+const metadata = path.join(process.cwd(), ".git");
+const name = process.argv[1];
+const chunks = [];
+let directoryFd, fileFd, temporary;
+function fail() { throw new Error("unsafe context destination"); }
+function targetInfo(target) {
+  try {
+    const info = fs.lstatSync(target);
+    if (info.isSymbolicLink() || !info.isFile()) fail();
+    return info;
+  } catch (error) {
+    if (error && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+process.stdin.on("data", chunk => chunks.push(chunk));
+process.stdin.on("end", () => {
+  try {
+    const noFollow = fs.constants.O_NOFOLLOW;
+    if (!noFollow) fail();
+    const metadataInfo = fs.lstatSync(metadata);
+    if (!metadataInfo.isDirectory() || metadataInfo.isSymbolicLink() || fs.realpathSync(metadata) !== metadata) fail();
+    directoryFd = fs.openSync(metadata, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0) | noFollow);
+    const openedInfo = fs.fstatSync(directoryFd);
+    if (!openedInfo.isDirectory() || openedInfo.dev !== metadataInfo.dev || openedInfo.ino !== metadataInfo.ino) fail();
+    const target = path.join(metadata, "infinite-team-context.json");
+    targetInfo(target);
+    temporary = path.join(metadata, ".infinite-team-context." + name + ".tmp");
+    fileFd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+    const content = Buffer.concat(chunks);
+    JSON.parse(content.toString("utf8"));
+    fs.writeFileSync(fileFd, content);
+    fs.fchmodSync(fileFd, 0o400);
+    fs.fsyncSync(fileFd);
+    fs.closeSync(fileFd);
+    fileFd = undefined;
+    const currentMetadata = fs.lstatSync(metadata);
+    if (!currentMetadata.isDirectory() || currentMetadata.isSymbolicLink() || currentMetadata.dev !== openedInfo.dev || currentMetadata.ino !== openedInfo.ino || fs.realpathSync(metadata) !== metadata) fail();
+    targetInfo(target);
+    fs.renameSync(temporary, target);
+    temporary = undefined;
+    fs.fsyncSync(directoryFd);
+    fs.closeSync(directoryFd);
+    directoryFd = undefined;
+    process.stdout.write("INFINITE_TEAM_CONTEXT_WRITTEN:" + name);
+  } catch {
+    try { if (fileFd !== undefined) fs.closeSync(fileFd); } catch {}
+    try { if (temporary) fs.unlinkSync(temporary); } catch {}
+    try { if (directoryFd !== undefined) fs.closeSync(directoryFd); } catch {}
+    process.stderr.write("The host refused an unsafe Git metadata context write.\\n");
+    process.exitCode = 1;
+  }
+});
+`;
+/** Store complete agent context in ignored Git metadata, atomically replacing only a regular prior snapshot. */
+export async function writeTeamContext(cwd: string, context: unknown, prefix?: TeamCommand, signal?: AbortSignal): Promise<void> {
+  let serialized: string | undefined;
+  try { serialized = JSON.stringify(context, null, 2); } catch { throw new TeamError(409, "team-context-invalid", "The team context could not be serialized safely."); }
+  if (serialized === undefined) throw new TeamError(409, "team-context-invalid", "The team context must be a JSON value.");
+  let info: ReturnType<typeof lstatSync>, canonical: string;
+  try { info = lstatSync(cwd); canonical = realpathSync(cwd); }
+  catch { throw new TeamError(409, "invalid-workspace", "The member workspace must be an accessible real Git repository."); }
+  if (!info.isDirectory() || info.isSymbolicLink() || canonical !== resolve(cwd))
+    throw new TeamError(409, "invalid-workspace", "The member workspace must be a real directory without a symlink path.");
+  if (await git(canonical, ["rev-parse", "--show-toplevel"], prefix, 30000, signal) !== canonical)
+    throw new TeamError(409, "invalid-workspace", "The member workspace must be a Git repository root.");
+  const nonce = randomUUID();
+  const result = await teamCommand({ command: process.execPath, args: ["-e", writeTeamContextScript, nonce] }, canonical, signal, 30000, prefix, `${serialized}\n`);
+  if (result.exitCode !== 0 || result.interrupted || result.truncated || !result.stdout.includes(`INFINITE_TEAM_CONTEXT_WRITTEN:${nonce}`))
+    throw new TeamError(409, "team-context-write-failed", "The complete team context could not be stored safely in Git metadata; do not launch this member.");
+}
 /** Retain the reported merge object without changing the reviewed working tree. */
 export async function captureDeliveryBaseline(workspace: string, memberCwd: string, reviewedHead: string, mergeCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {
   await git(workspace, ["fetch", "--no-tags", "--", memberCwd, mergeCommit], prefix, 30000, signal);
@@ -211,9 +293,134 @@ export async function captureDeliveryBaseline(workspace: string, memberCwd: stri
   await git(workspace, ["update-ref", "refs/infinite/delivery", mergeCommit], prefix, 30000, signal);
 }
 export async function teamHead(cwd: string, prefix?: TeamCommand, signal?: AbortSignal) { return git(cwd, ["rev-parse", "HEAD"], prefix, 30000, signal); }
-export async function assertMemberReadOnly(cwd: string, base: string, prefix?: TeamCommand, signal?: AbortSignal) {
-  if (await teamHead(cwd, prefix, signal) !== base || await git(cwd, ["status", "--porcelain=v1", "--untracked-files=all"], prefix, 30000, signal))
-    throw new TeamError(409, "read-only-role-changed-files", "A read-only agent changed its working copy. Its report cannot advance the team.");
+export type ReadOnlyWorkspaceContext = "verification" | "setup" | "integration" | "member";
+export const LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON = "A read-only agent changed its working copy. Its report cannot advance the team.";
+const readOnlyContextCode: Record<ReadOnlyWorkspaceContext, string> = {
+  verification: "verification-changed-files",
+  setup: "setup-changed-files",
+  integration: "integration-changed-files",
+  member: "read-only-role-changed-files",
+};
+const readOnlyContextLabel: Record<ReadOnlyWorkspaceContext, string> = {
+  verification: "verification workspace",
+  setup: "setup workspace",
+  integration: "integration workspace",
+  member: "read-only member workspace",
+};
+const MAX_DIAGNOSTIC_PATHS = 8;
+const MAX_DIAGNOSTIC_PATH_LENGTH = 96;
+const CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+function quotedDiagnosticPath(path: string) {
+  const safe = path.replace(CONTROL_OR_BIDI, character => `\\u${character.codePointAt(0)!.toString(16).padStart(4, "0")}`);
+  const bounded = [...safe].length > MAX_DIAGNOSTIC_PATH_LENGTH ? `${[...safe].slice(0, MAX_DIAGNOSTIC_PATH_LENGTH - 1).join("")}…` : safe;
+  return JSON.stringify(bounded);
+}
+/** Parse NUL-delimited porcelain paths without ever interpreting filenames as records or terminal text. */
+function changedPathsFromStatus(status: string) {
+  const records = status.split("\0").filter(Boolean), paths: string[] = [];
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (record.length < 4 || record[2] !== " ") continue;
+    paths.push(record.slice(3));
+    if (/[RC]/.test(record.slice(0, 2)) && records[index + 1] !== undefined) paths.push(records[++index]);
+  }
+  return paths;
+}
+function shortCommit(commit: string) { return /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit) ? commit.slice(0, 12) : "unknown"; }
+function readOnlyDiagnostic(context: ReadOnlyWorkspaceContext, base: string, head: string, paths: string[]) {
+  const headDrift = head !== base
+    ? `HEAD changed from ${shortCommit(base)} to ${shortCommit(head)}.`
+    : `HEAD still matches pinned commit ${shortCommit(base)}.`;
+  const shown = paths.slice(0, MAX_DIAGNOSTIC_PATHS).map(quotedDiagnosticPath);
+  const omitted = Math.max(0, paths.length - shown.length);
+  const changed = paths.length
+    ? `Changed paths (${paths.length}): ${shown.join(", ")}${omitted ? `; ${omitted} additional changed path${omitted === 1 ? "" : "s"} omitted` : ""}.`
+    : "There are no working-tree paths in the change; the difference is in HEAD only.";
+  return `The ${readOnlyContextLabel[context]} is not read-only. ${headDrift} ${changed} Its report cannot advance the team.`;
+}
+/** Keep verification diagnostics separate from member blame, while refusing every HEAD or file mutation. */
+export async function assertMemberReadOnly(cwd: string, base: string, prefix?: TeamCommand, signal?: AbortSignal, context: ReadOnlyWorkspaceContext = "member") {
+  const head = await teamHead(cwd, prefix, signal);
+  const repositoryRoot = await git(cwd, ["rev-parse", "--show-toplevel"], prefix, 30000, signal);
+  const status = await git(repositoryRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], prefix, 30000, signal);
+  const changed = changedPathsFromStatus(status);
+  if (head !== base || changed.length)
+    throw new TeamError(409, readOnlyContextCode[context], readOnlyDiagnostic(context, base, head, changed));
+}
+
+type SiblingWorkspaceKind = "verification" | "recovery";
+function safeWorkspaceId(id: string) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)) throw new TeamError(409, "invalid-workspace", "A copied workspace needs a path-safe identity.");
+  return id;
+}
+function ensureSiblingWorkspaceParent(workspace: string, kind: SiblingWorkspaceKind, id: string) {
+  safeWorkspaceId(id);
+  let workspaceInfo: ReturnType<typeof lstatSync>, canonicalWorkspace: string;
+  try { workspaceInfo = lstatSync(workspace); canonicalWorkspace = realpathSync(workspace); }
+  catch { throw new TeamError(409, "invalid-workspace", "The source workspace is not an accessible real directory."); }
+  if (!workspaceInfo.isDirectory() || workspaceInfo.isSymbolicLink())
+    throw new TeamError(409, "invalid-workspace", "The source workspace must be a real directory.");
+  const sourceParent = dirname(canonicalWorkspace);
+  const parentName = basename(sourceParent);
+  const runDirectory = basename(canonicalWorkspace) === "integration"
+    ? sourceParent
+    : parentName === "recovery" || parentName === "verification"
+      ? dirname(sourceParent)
+      : undefined;
+  if (!runDirectory) throw new TeamError(409, "invalid-workspace", "A copied workspace must be an integration or recovery checkout inside its original run.");
+  if (runDirectory !== sourceParent) {
+    let copiedParent: ReturnType<typeof lstatSync>;
+    try { copiedParent = lstatSync(sourceParent); } catch { throw unsafeTeamRoot(); }
+    if (!copiedParent.isDirectory() || copiedParent.isSymbolicLink() || !hostOwned(copiedParent)) throw unsafeTeamRoot();
+  }
+  let runInfo: ReturnType<typeof lstatSync>;
+  try { runInfo = lstatSync(runDirectory); } catch { throw unsafeTeamRoot(); }
+  if (!runInfo.isDirectory() || runInfo.isSymbolicLink() || !hostOwned(runInfo)) throw unsafeTeamRoot();
+
+  const parent = join(runDirectory, kind);
+  let parentInfo: ReturnType<typeof lstatSync> | undefined;
+  try { parentInfo = lstatSync(parent); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw unsafeTeamRoot();
+    try { mkdirSync(parent, { mode: 0o700 }); } catch (mkdirError) { if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError; }
+    try { parentInfo = lstatSync(parent); } catch { throw unsafeTeamRoot(); }
+  }
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || !hostOwned(parentInfo)) throw unsafeTeamRoot();
+  chmodDirectoryNoFollow(parent, 0o2770);
+
+  const destination = join(parent, id);
+  try { lstatSync(destination); throw new TeamError(409, "workspace-exists", `A ${kind} workspace already exists and needs explicit reconciliation.`); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return { source: canonicalWorkspace, destination };
+}
+async function preparePinnedWorkspaceClone(workspace: string, kind: SiblingWorkspaceKind, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal, branch?: string) {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(baseCommit)) throw new TeamError(409, "invalid-workspace-baseline", "The copied workspace baseline is invalid.");
+  const { source, destination } = ensureSiblingWorkspaceParent(workspace, kind, id);
+  const top = await git(source, ["rev-parse", "--show-toplevel"], prefix, 30000, signal);
+  if (realpathSync(top) !== source) throw new TeamError(409, "project-not-git-root", "The copied workspace source must be a Git repository root.");
+  if (await git(source, ["cat-file", "-t", baseCommit], prefix, 30000, signal) !== "commit")
+    throw new TeamError(409, "invalid-workspace-baseline", "The copied workspace baseline must identify a commit.");
+  await git(dirname(destination), ["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", source, destination], prefix, 120000, signal);
+  await git(destination, ["remote", "remove", "origin"], prefix, 30000, signal);
+  if (branch) {
+    await git(destination, ["check-ref-format", "--branch", branch], prefix, 30000, signal);
+    await git(destination, ["checkout", "-B", branch, baseCommit], prefix, 30000, signal);
+  } else await git(destination, ["checkout", "--detach", baseCommit], prefix, 30000, signal);
+  if (await teamHead(destination, prefix, signal) !== baseCommit || await git(destination, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], prefix, 30000, signal))
+    throw new TeamError(409, "workspace-copy-changed", `The ${kind} workspace did not match its requested clean baseline. The copy was preserved for inspection.`);
+  return { workspace: realpathSync(destination), ...(branch ? { branch } : {}), baseCommit };
+}
+/** Create a disposable, detached checkout of exactly the requested integration commit. */
+export async function prepareVerificationWorkspace(workspace: string, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {
+  const prepared = await preparePinnedWorkspaceClone(workspace, "verification", id, baseCommit, prefix, signal);
+  return { workspace: prepared.workspace, baseCommit: prepared.baseCommit };
+}
+/** Create a recovery copy beside the original integration checkout; retries never nest under a prior copy. */
+export async function prepareRecoveredWorkspace(workspace: string, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal, branch?: string) {
+  const prepared = await preparePinnedWorkspaceClone(workspace, "recovery", id, baseCommit, prefix, signal, branch);
+  return { workspace: prepared.workspace, ...(prepared.branch ? { branch: prepared.branch } : {}), baseCommit: prepared.baseCommit };
 }
 export function teamPathAllowed(path: string, allowed: string[]) { return allowed.some(prefix => prefix === "." || path === prefix || path.startsWith(`${prefix}/`)); }
 /** List all tracked, staged, and untracked paths changed from a member's base commit. */

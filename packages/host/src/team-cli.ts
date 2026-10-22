@@ -758,7 +758,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const provider = String(options["--provider"] ?? me.teams?.lineup?.coordinator?.provider ?? "");
     if (!provider) throw new Error("The host has no configured team lineup. Set one up on the host or use --provider PROVIDER for a single-provider team.");
     let requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
-    const body = createTeamSchema.parse({ requestId, projectId, provider, useConfiguredLineup: options["--provider"] === undefined, title: String(options["--title"] ?? objective.split("\n")[0].slice(0, 100)), objective, parallelism: 2 });
+    const body = createTeamSchema.parse({ requestId, projectId, provider, useConfiguredLineup: options["--provider"] === undefined, title: String(options["--title"] ?? objective.split("\n")[0].slice(0, 100)), objective });
     requestId = body.requestId = resumePendingIntent(receiptsPath, "team-start:", "/teams", prior => prior.projectId === body.projectId && prior.provider === body.provider && prior.useConfiguredLineup === body.useConfiguredLineup && prior.title === body.title && prior.objective === body.objective, requestId, options["--request-id"] !== undefined, rawArgs);
     const team = await postMutation(api, receiptsPath, `team-start:${requestId}`, "/teams", body);
     outputTeam(team, Boolean(options["--json"])); return true;
@@ -969,12 +969,34 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       return true;
     } finally { rmSync(temporary, { recursive: true, force: true }); }
   }
-  if (["steer", "answer", "pause", "resume", "cancel", "revoke-permissions"].includes(subcommand ?? "")) {
+  if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions"].includes(subcommand ?? "")) {
     if (!id) throw new Error(`Usage: infinite team ${subcommand} ID ...`);
     const current = await api.json<any>(`/teams/${id}`);
     const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
     let endpoint = subcommand === "revoke-permissions" ? `/teams/${id}/permissions/revoke` : `/teams/${id}/${subcommand}`, body: Record<string, unknown>;
-    if (subcommand === "steer") {
+    if (subcommand === "continue") {
+      const direction = rest.join(" ").trim();
+      if (rest.length && !direction) throw new Error("Direction for continuation must contain non-whitespace text.");
+      if (direction.length > 8000) throw new Error("Direction for continuation must be 8000 characters or fewer.");
+      endpoint = `/teams/${id}/continue`;
+      body = { requestId, revision: current.revision, ...(direction ? { text: direction } : {}) };
+      const records = readPrivateJson(receiptsPath, {}) as Record<string, any>;
+      const pending = Object.entries(records).find(([, value]) => value?.state === "pending" && typeof value.endpoint === "string" && value.endpoint.startsWith(`/teams/${id}/`));
+      const sameRequest = records[`team-continue:${requestId}`];
+      if (pending && (pending[1].endpoint !== endpoint || pending[1].requestId !== requestId)) {
+        if (pending[1].endpoint !== endpoint)
+          throw new Error("Another team mutation has an uncertain result. Inspect the team's current state and reconcile that request before continuing.");
+        const savedText = pending[1].body?.text;
+        const args = ["team", "continue", id, ...(typeof savedText === "string" ? [savedText] : []), "--request-id", pending[1].requestId];
+        throw new Error(`A continuation request has an uncertain result. Inspect this team's current state first. To retry the saved request with its original direction and identity, run: infinite ${args.map(shellQuote).join(" ")}`);
+      }
+      if (sameRequest?.endpoint === endpoint && sameRequest.body?.text !== body.text)
+        throw new Error("This request ID is saved with a different direction. Inspect the team and retry with the original direction and request ID.");
+      const savedRetry = sameRequest?.requestId === requestId && sameRequest?.endpoint === endpoint && sameRequest?.state === "pending";
+      const savedResult = sameRequest?.requestId === requestId && sameRequest?.endpoint === endpoint && sameRequest?.state === "confirmed";
+      if (!savedRetry && !savedResult && (current.status !== "blocked" || current.continuable !== true))
+        throw new Error("This team is not an eligible standalone blocked run. Refresh team status and resolve any open delivery or operation before continuing.");
+    } else if (subcommand === "steer") {
       const text = rest.join(" "); if (!text) throw new Error("Provide steering text.");
       body = { requestId, revision: current.revision, text };
     } else if (subcommand === "answer") {
@@ -987,7 +1009,21 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     // These actions can repeat on purpose (pause, resume, pause), so an unconfirmed one is never resumed implicitly.
     resumePendingIntent(receiptsPath, `team-${subcommand}:`, endpoint, prior => subcommand === "steer" || subcommand === "answer" ? prior.text === body.text : true, requestId, true, rawArgs);
-    outputTeam(await postMutation(api, receiptsPath, `team-${subcommand}:${requestId}`, endpoint, body), Boolean(options["--json"])); return true;
+    const key = `team-${subcommand}:${requestId}`;
+    try {
+      outputTeam(await postMutation(api, receiptsPath, key, endpoint, body), Boolean(options["--json"]));
+    } catch (error) {
+      const status = (error as { status?: number })?.status;
+      if (status !== undefined && [400, 401, 403, 404, 409, 410, 422].includes(status)) {
+        const records = readPrivateJson(receiptsPath, {}) as Record<string, any>;
+        if (records[key]?.state === "pending" && records[key].requestId === requestId && records[key].endpoint === endpoint) {
+          records[key].state = "refused";
+          privateJson(receiptsPath, records);
+        }
+      }
+      throw error;
+    }
+    return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|cancel|revoke-permissions ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|cancel|revoke-permissions ...");
 }

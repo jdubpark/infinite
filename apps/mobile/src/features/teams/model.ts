@@ -15,6 +15,7 @@ export type LinearTracking = { status: "pending" | "synced" | "blocked" | "error
 export type TeamEvidence = { source: string; observation: string };
 export type TeamBrief = { title: string; problem: string; evidence: TeamEvidence[]; dataShape: string; acceptance: string[]; expectedOutcome: string; uiChanges: boolean };
 export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { toProfileId: string; reason: string }; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
+export type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string }; brief?: TeamBrief };
 export type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string };
 export type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" };
 export type TeamWorkers = { limit: number; max: number; running: number; ready: number };
@@ -40,6 +41,8 @@ export type TeamView = {
   noChange?: { summary: string; evidence: TeamEvidence[] };
   /** The host can start a fresh plan from the preserved integration commit, as after a member's runtime limit. */
   resumable?: boolean;
+  continuable?: boolean;
+  continuations?: TeamContinuation[];
   /** Owner-authorized merge after review, pinned at creation; absent runs are review-only. */
   delivery?: { mode: "merge"; repository: string; baseBranch: string };
   /** Owner delegation of routine one-shot permissions to the coordinator, pinned at creation. */
@@ -48,7 +51,7 @@ export type TeamView = {
   permissionDecisions?: PermissionDecision[];
 };
 
-/** Live implementer capacity, with the creation limit as a fallback for older hosts. */
+/** Older hosts omit worker counts, so their reported parallelism backs the live status. */
 export function workerStatus(team: Pick<TeamView, "parallelism" | "workers">): string {
   if (!team.workers) return `Up to ${team.parallelism} workers`;
   const { running, limit, ready } = team.workers;
@@ -66,7 +69,13 @@ export function blockedTeamsFirst(teams: TeamView[]) {
 
 /** List resume is only available for a standalone blocked run its owner can restart. */
 export function canResumeBlockedTeam(team: TeamView, role: DeviceRole | undefined) {
-  return role === "owner" && team.status === "blocked" && team.resumable === true && !team.goal && !team.deliveryReceipt;
+  return role === "owner" && team.status === "blocked" && team.resumable === true && team.continuable !== true && !team.goal && !team.missionId && !team.deliveryReceipt && !team.pullRequest;
+}
+
+/** Continuation is an owner action for a safe standalone blocked run only. */
+export function canContinueBlockedTeam(team: TeamView, role: DeviceRole | undefined) {
+  return role === "owner" && team.status === "blocked" && team.continuable === true
+    && !team.goal && !team.missionId && !team.deliveryReceipt && !team.pullRequest;
 }
 
 export type GoalStatus = "running" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-opportunity" | "limit-reached" | "cancelled" | "achieved";
@@ -285,9 +294,9 @@ export function teamControls(team: TeamView, role: DeviceRole | undefined, fresh
   const deliveryReported = team.status === "merged" || Boolean(team.deliveryReceipt);
   return {
     answer: acts && !managed && !["paused", "cancelled"].includes(team.status),
-    steer: acts && !managed && !team.goal && team.status !== "cancelled" && !deliveryStarted,
+    steer: acts && !managed && !team.goal && team.status !== "cancelled" && !deliveryStarted && !canContinueBlockedTeam(team, "owner"),
     pause: owns && !deliveryReported && !["paused", "blocked", "ready-for-review", "no-change", "merged"].includes(team.status),
-    resume: owns && (team.status === "paused" || team.resumable === true) && !deliveryReported,
+    resume: owns && (team.status === "paused" || team.resumable === true) && !deliveryReported && !canContinueBlockedTeam(team, "owner"),
     cancel: owns,
   };
 }

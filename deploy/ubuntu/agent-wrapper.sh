@@ -12,6 +12,7 @@ export XDG_CACHE_HOME="$HOME/.cache"
 export PATH=/usr/local/bin:/usr/bin:/bin
 # Service accounts keep a disabled login shell; native tool runners still need bash.
 export SHELL=/bin/bash
+[ -r /usr/local/libexec/infinite/agent-env.sh ] && . /usr/local/libexec/infinite/agent-env.sh && infinite_load_env /usr/local/libexec/infinite "${INFINITE_PROJECT_ID:-}"
 
 provider=$(basename "$0")
 case "$provider" in

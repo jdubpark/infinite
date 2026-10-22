@@ -11,10 +11,10 @@ that request without selecting a sequence of follow-up improvements. Both flows
 show member sessions, questions, steering, file ownership, and verification
 records. The web interface supports desktop and narrow phone browsers. The
 native phone app has **Teams** and **Goals** tabs beside its sessions. It
-starts, answers, steers, pauses, resumes, and cancels runs with the same roles
-and request rules as the web client, and records goal outcomes. It opens member
-sessions, and a member session links back to its team. The Mac app shows Teams
-only.
+starts, answers, steers, pauses, resumes, continues eligible blocked runs, and
+cancels runs with the same roles and request rules as the web client, and
+records goal outcomes. It opens member sessions, and a member session links
+back to its team. The Mac app shows Teams only.
 
 A team opens on the same layout in the web client, the phone app, and
 `infinite team watch`. Open decisions come first. The Jevcode summary follows,
@@ -62,6 +62,7 @@ infinite team status TEAM_ID --logs
 infinite team watch TEAM_ID
 infinite team steer TEAM_ID "Keep the existing checkout layout"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing retry policy"
+infinite team continue TEAM_ID "Preserve the current checkout design"
 ```
 
 `infinite team status` without an ID lists each team's members, tasks, and open
@@ -95,7 +96,9 @@ selected host project. A new remote source receives a committed Git snapshot;
 ignored files and uncommitted changes are not included. Existing cloud sources
 are not replaced by enrollment. Setup and verification commands belong to that
 repository, while the coordinator, workers, and reviewer come from the host's
-configured lineup. First-time repository enrollment delegates current one-shot
+configured lineup. The host passes the selected project ID to Ubuntu provider
+wrappers as `INFINITE_PROJECT_ID`, which selects an optional project environment
+file on that host. First-time repository enrollment delegates current one-shot
 tool requests to the strong coordinator by default; `--permissions off` opts out.
 The repository policy bounds that authority; see
 [Delegating permission decisions](#delegating-permission-decisions).
@@ -399,7 +402,11 @@ coordinator to select and build work within those boundaries.
 | `extendMinutes` | 0 | 0–240 minutes added each time the deadline arrives while an agent is active; 0 turns extensions off |
 | `maxTotalMinutes` | `maxMinutes` | 5–1,440 minutes, at least `maxMinutes`; the ceiling for the deadline, including extensions |
 | `maxMembers` | 24 | 4–200 member attempts across the goal, including scouts, questions resumed as new attempts, review, repair, and escalation |
-| `parallelism` | 3 | 1–4 concurrent workers within a cycle, subject to host session capacity; the owner can change it while the goal runs |
+
+The PM and coordinator choose worker capacity within the host's ceiling of four
+concurrent workers. Worker capacity is not an owner setting. The host starts
+workers for ready tasks and releases their slots when their processes stop;
+host session capacity still applies.
 
 Pausing does not extend the deadline or restore consumed attempts. Steering can
 change the direction, but cannot expand the approved paths, deadline, or limits.
@@ -655,6 +662,19 @@ observed problem, evidence, data shape, acceptance criteria, expected effect,
 and whether the interface changes. Prompts call for a concise brief and useful
 tasks, without process documents or artificial subdivisions.
 
+Each assignment gives a light worker one coherent outcome and the smallest
+necessary set of owned paths, with explicit exclusions. Its `instructions`
+contain the requested behavior, inspected source paths and entry points, agreed
+data/interface contracts and applicable error cases, constraints and dependency
+outputs, observable acceptance criteria, and exact focused check commands with
+expected results. Those checks supplement the run's required verification.
+The coordinator settles product and shared-interface decisions before dispatch,
+splits independent outcomes, and orders shared-interface work before consumers.
+Workers choose routine implementation details within that brief; a missing
+material requirement or required path goes through the existing question or
+blocker report with the exact gap and smallest proposed resolution. These are
+prompt instructions, not host validation of a brief's semantic completeness.
+
 The coordinator prefers `light` profiles for bounded research and implementation
 and selects from the configured pool. Each plan has 1–12 tasks. The host rejects
 unknown profiles, missing dependencies, cycles, duplicate task IDs, and
@@ -676,16 +696,24 @@ answer and working copy. It takes the next free slot ahead of tasks that have
 not started. A stalled or time-limited worker's replacement continues in the
 slot its predecessor held.
 
-The owner can raise or lower the limit while a team or goal runs. Raising it
-starts more ready tasks on the next scheduling pass. Lowering it never stops a
-running worker; it only holds new starts until fewer workers than the new limit
-are running. A change does not create a new team revision or discard reports.
+The PM selects capacity in its plan or discovery report, based on independent
+work, dependencies, contention, and remaining budgets. A mission coordinator
+can adjust a subteam's capacity as work changes. Raising capacity starts more
+ready tasks on the next scheduling pass. Lowering it never stops a running
+worker; it holds new starts until fewer workers than the new limit are running.
+A capacity change does not discard reports or create a new team revision.
+
+PM `plan` and `explore` reports accept optional `parallelism` (1–4), bounded by
+the team's ceiling. Omission uses the allowed capacity for older reports.
+Mission coordinators use `resize-subtask` to change a queued or active
+subteam's current capacity. Implementers and reviewers cannot resize workers.
 
 The limit counts concurrent workers, not member attempts. It does not change
-`maxMembers`, deadlines or spend. Host session capacity still applies. Handoff
+`maxMembers` or deadlines. Host session capacity still applies. Handoff
 teams allow 1–2.
 
-The owner sets the limit; agents cannot change it.
+Owners monitor workers and steer objectives; worker capacity has no owner
+control in the web, phone, or Mac clients.
 
 Team and goal views show "{running} of {limit} workers running", plus a note when
 ready tasks are waiting for a worker.
@@ -697,11 +725,27 @@ the same working copy. Escalation consumes another member attempt. The scheduler
 rejects model choices outside the configured pools and a second escalation for
 the same task.
 
-The host runs the project's configured checks. Prompts prefer API, process,
-integration, or end-to-end checks that exercise changed behavior. Before adding
-a test, the agent must identify its observable contract, a credible regression,
-and the gap in existing coverage. Repository instructions still apply. Repair
-attempts are bounded; unresolved failures remain visible.
+The host runs setup and configured checks in a detached verification clone at
+the exact integration commit under review. After each command, the host requires
+the clone's HEAD and tracked and untracked paths to remain unchanged. A mutation
+is rejected with a diagnostic for the command context, bounded changed paths,
+and any HEAD drift. The verification clone never advances the integration
+branch, and the original integration checkout remains available for inspection.
+
+After a completed setup command or configured check changes its isolated
+verification clone, the same guarded Resume is available only when the
+current-revision check evidence is terminal and the recorded integration head
+is unchanged. Resume creates a clean sibling under recovery/ from that commit,
+starts a fresh plan there, and retains the original workspace and prior member
+and check evidence. Mutations during member setup or workspace preparation are
+not Resume-eligible; they require reconciliation and a new team. Other check or
+workspace blocks also require inspection and a new team.
+
+Prompts prefer API, process, integration, or end-to-end checks that exercise
+changed behavior. Before adding a test, the agent must identify its observable
+contract, a credible regression, and the gap in existing coverage. Repository
+instructions still apply. Repair attempts are bounded; unresolved failures
+remain visible.
 
 Each configured check may run for `teams.checkMinutes` (default 60). A check that
 runs past the limit is stopped and blocks the team with a resumable reason. The
@@ -987,6 +1031,17 @@ teamwork run by its directory: the API account creates each one, named
 `DATE-SLUG-REQUEST8`, before any Git command runs in it, and the provider
 account cannot create a directory with that owner.
 
+Verification and Resume also use `verification/ID` and `recovery/ID` beneath
+that same host-owned run directory. A constrained launcher must permit
+`clone --no-local --no-hardlinks --no-checkout -- SOURCE DESTINATION` from an
+existing team copy, `cat-file -t COMMIT`, `check-ref-format --branch BRANCH`,
+and `checkout --detach COMMIT`. Recovery uses `checkout -B BRANCH COMMIT`
+only in its fresh recovery clone. Read-only inspection uses
+`status --porcelain=v1 -z --untracked-files=all` in both team and project
+copies. Preserve the launcher's existing path, identity, branch, and commit
+restrictions when allowing these forms; verify them under the deployed Unix
+identities before activating a host update.
+
 GitHub-tracked sources add these operations. The host runs each through
 `teams.commandPrefix`, and a launcher that refuses one fails that refresh step:
 
@@ -1072,8 +1127,9 @@ animated spinner looks active. Older runs blocked by the former one-hour limit
 still resume. A team blocked only by a stall can resume with
 `infinite team resume ID`. That starts a fresh plan from the preserved
 integration commit and keeps the stopped member workspace.
-Resume waits until those members have stopped. Any other block, including an
-interrupted workspace or check operation, still requires inspection and a new
+Resume waits until those members have stopped. A changed verification clone has
+the separate guarded Resume path described above; other blocks, including an
+interrupted workspace or check operation, still require inspection and a new
 team. Stopping an agent does not prove that arbitrary detached tool
 descendants have stopped, and a current human input lease can prevent the
 scheduler from stopping a member. Such conflicts remain visible.
@@ -1092,12 +1148,34 @@ looks:
 * **Linear.** The tracked issue gets the reason, the next step and a `Blocked`
   label (see [Linear tracking](#linear-tracking)).
 * **App lists.** Web, phone and Mac list blocked runs first, with the reason.
-  The list offers Resume when the run can resume, the same rule as the team
-  page.
+  Team detail offers Continue development when the owner can continue safely;
+  Resume remains for the existing supported resume cases.
 
 The host never resumes a blocked run itself. `infinite team resume ID` replans
 from the integrated work when the block allows it; otherwise inspect the run and
 start a new one.
+
+An owner can continue a blocked standalone run when its current state is marked
+continuable. This is available only when the host can safely start a fresh
+revision without a goal, mission, handoff, or uncertain operation or delivery.
+No cancellation is needed. Continuation keeps the original team and tracked
+issue, integrated work, repository policies, and prior evidence, then starts a
+fresh plan. Required checks still apply to the new revision. Add optional
+direction with `infinite team continue TEAM_ID [TEXT]`; the direction is trimmed
+and limited to 8,000 characters. Use the web or phone form to continue from the
+team detail when the host reports this option.
+
+An unconfirmed continuation is never replayed automatically. Inspect the current
+team state first. If the host did not record it and you choose to retry, use the
+same request ID and the original direction, for example:
+
+```sh
+infinite team continue TEAM_ID "Preserve the current checkout design" --request-id REQUEST_UUID
+```
+
+The web, phone, and Mac clients keep an unconfirmed request available as
+**Retry same request**. Do not cancel the run or create a new continuation to
+resolve an uncertain result.
 
 ## Reports and recovery
 
@@ -1153,15 +1231,15 @@ mutation returns the current Goal or Team record.
 | `POST /api/goals/:id/steer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/goals/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner |
 | `POST /api/goals/:id/extend` | `requestId`, `revision`, `minutes` (5–1,440) | Owner |
-| `POST /api/goals/:id/parallelism` | `requestId`, `revision`, `parallelism` (1–4) | Owner |
 | `POST /api/goals/:id/outcome` | `requestId`, `revision`, `result`, `summary`, `evidence` | Owner/controller |
 
 Creation requires `requestId` (UUID), `projectId`, `title` (up to 100 characters),
 `objective` (12,000), and `successCriteria` (4,000). Optional arrays are
 `nonGoals` (20 entries, 1,000 characters each), `evidence` (20 entries, 2,000
 characters each), and `allowedPaths` (1–32 entries, 300 characters each).
-`maxRuns`, `maxMinutes`, `extendMinutes`, `maxTotalMinutes`, `maxMembers`, and
-`parallelism` use the limits above.
+`maxRuns`, `maxMinutes`, `extendMinutes`, `maxTotalMinutes`, and `maxMembers`
+use the limits above. Legacy creation requests may include `parallelism`, but
+it does not select worker capacity.
 The host also limits the combined creation request to 40 KiB. On a mapped
 project, optional `linearIssueId` accepts an existing issue UUID or identifier
 (up to 100 characters); omitting it creates a new parent issue.
@@ -1173,9 +1251,9 @@ It leaves scope and budgets unchanged. Outcome `result` is `achieved`,
 pending operation. Resume requires a paused goal whose deadline has not expired;
 extend the goal first if it has.
 
-A parallelism change applies to the active cycle and later cycles. It is refused
-with `goal-not-running` for a goal that is not running, needing input or paused,
-and with `goal-launch-pending` while the next cycle is attaching.
+The legacy goal parallelism endpoint refuses owner capacity changes; each
+cycle's PM selects capacity for its work. The refusal uses `409` with
+`code: "agent-managed-capacity"`.
 
 ### Teams
 
@@ -1183,12 +1261,16 @@ and with `goal-launch-pending` while the next cycle is attaching.
 | --- | --- | --- |
 | `GET /api/teams` | None; returns `{teams}` | Any paired device |
 | `GET /api/teams/:id` | None; returns reports and check evidence | Any paired device |
-| `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, `parallelism`, optional `useConfiguredLineup` | Owner |
+| `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, optional `useConfiguredLineup` | Owner |
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
+| `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
-| `POST /api/teams/:id/parallelism` | `requestId`, `revision`, `parallelism` (1–4; 1–2 for handoff teams) | Owner; standalone teams |
+
+The continue request accepts exactly `requestId`, `revision`, and optional
+`text`; omit `text` when no direction is needed. A supplied direction is trimmed
+and must contain 1–8,000 characters.
 
 ## Model scorecard
 
@@ -1203,11 +1285,12 @@ Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route
 remains available for its active cycle while the goal is running.
 
-A parallelism change is refused with `goal-owned-team` for a goal-owned team and
-with `team-not-running` for a cancelled, ready-for-review, merged or no-change
-team. A value above a handoff team's maximum is refused with
-`team-parallelism-limit`. Stale revisions and request conflicts follow the usual
-rules.
+The legacy team parallelism endpoint refuses owner capacity changes with `409`
+and `code: "agent-managed-capacity"`. Legacy team creation requests may include
+`parallelism`, but it does not select worker
+capacity. PM reports and mission coordinator actions remain bounded by the
+host's ceiling; handoff teams permit at most two workers and solo mission
+subtasks permit one.
 
 `GET /api/me` advertises `teams: {enabled, maxParallelism, lineup?}`,
 `goals: {enabled}`, each project's configured checks, and optional

@@ -50,7 +50,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   const mission = /^\/api\/missions\/([^/]+)(?:\/(steer|pause|resume|cancel|answer\/([^/]+)))?$/.exec(url.pathname);
   if (mission && UUID.test(mission[1])) return method === "GET" ? !mission[2]
     : method === "POST" && Boolean(mission[2]) && (!mission[3] || UUID.test(mission[3]));
-  const team = /^\/api\/teams\/([^/]+)(?:\/(steer|pause|resume|cancel|decisions\/([^/]+)\/answer))?$/.exec(url.pathname);
+  const team = /^\/api\/teams\/([^/]+)(?:\/(steer|pause|resume|continue|cancel|decisions\/([^/]+)\/answer))?$/.exec(url.pathname);
   if (team && UUID.test(team[1])) return method === "GET" ? !team[2]
     : method === "POST" && Boolean(team[2]) && (!team[3] || UUID.test(team[3]));
   if (["POST", "DELETE"].includes(method) && url.pathname === "/api/devices/push") return true;

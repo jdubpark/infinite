@@ -4,7 +4,7 @@ Defaults:infinite-host !requiretty
 # Per-session backend credential, not a model token or the recording key.
 Defaults:infinite-host env_keep += "INFINITE_NATIVE_TOKEN OPENCODE_SERVER_PASSWORD OPENCODE_SERVER_USERNAME OPENCODE_CONFIG_CONTENT"
 # Per-session loopback hooks and per-worker report capability. No owner/device credential is forwarded.
-Defaults:infinite-host env_keep += "INFINITE_HOOK_URL INFINITE_HOOK_TOKEN INFINITE_TEAM_ASSIGNMENT"
+Defaults:infinite-host env_keep += "INFINITE_HOOK_URL INFINITE_HOOK_TOKEN INFINITE_TEAM_ASSIGNMENT INFINITE_PROJECT_ID"
 # The member folder under an owner-trusted team root (teams.trustWorkspaces), for the Claude wrapper.
 Defaults:infinite-host env_keep += "INFINITE_TRUSTED_WORKSPACE"
 # Session prompts are command arguments; do not copy them to plaintext sudo logs.

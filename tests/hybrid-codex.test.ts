@@ -9,6 +9,9 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { WebSocketServer } from "ws";
 import { waitFor } from "./helpers.js";
+import { createHybridWorkspace } from "../packages/host/src/hybrid-workspace.js";
+import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
+import type { ExecutionState } from "../packages/host/src/types.js";
 
 test("hybrid wrapper leaves no executor, tunnel or native UI after abrupt client loss", { timeout: 20000 }, async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-hybrid-")));
@@ -78,4 +81,38 @@ setInterval(()=>{},1000);
     for (const ws of sockets.clients) ws.terminate(); sockets.close(); server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve())); rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+test("duplicate laptop disconnects preserve the grace timer and hand off the verified checkpoint once", { timeout: 20000 }, async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-disconnect-")));
+  const cwd = join(root, "laptop"), localStore = join(root, "local-blobs");
+  mkdirSync(cwd); writeFileSync(join(cwd, "evidence.txt"), "preserved");
+  let state: ExecutionState | undefined;
+  const selected: string[] = [], records: Record<string, unknown>[] = [];
+  const hybrid = await createHybridWorkspace({
+    workspace: { cwd, roots: [cwd] }, directory: join(root, "host"),
+    command: process.execPath, commandArgs: [resolve("tests/fixtures/native-codex.mjs")],
+    record: value => records.push(value), publish: value => { state = value; },
+    // Provider selection is a separate boundary; this coordinator must reach
+    // it once with the materialized, verified tree after the grace period.
+    select: async execution => { selected.push(execution.cwd); },
+  });
+  try {
+    hybrid.connection(true); hybrid.providerReady(true);
+    const boundary = await hybrid.control("sync/begin", {});
+    const manifest = await captureWorkspace({ cwd, roots: [cwd], storeDir: localStore });
+    for (const hash of new Set(manifest.entries.flatMap(entry => entry.chunks ?? [])))
+      await hybrid.control("sync/blob", { hash, base64: await readWorkspaceBlob(localStore, hash) });
+    await hybrid.control("sync/commit", { ...boundary, manifest });
+    assert.equal(state?.cloudReady, true);
+    hybrid.connection(false);
+    hybrid.connection(false);
+    const handedOff = await waitFor(async () => state, value => value?.location === "cloud" && value.state === "online", 10000);
+    assert.equal(handedOff?.checkpoint?.id, manifest.id);
+    assert.equal(selected.length, 1);
+    assert.equal(readFileSync(join(selected[0], "evidence.txt"), "utf8"), "preserved");
+    assert.equal(records.filter(value => value.action === "cloud-handoff-intent").length, 1);
+    assert.equal(records.filter(value => value.action === "cloud-handoff-selected").length, 1);
+  } finally { hybrid.close(); rmSync(root, { recursive: true, force: true }); }
 });

@@ -352,9 +352,30 @@ test("--laptop Codex uses the laptop project, hands off a verified checkpoint, a
     assert.ok((await native.rpc("fs/readFile", { path: "marker.txt" })).error);
     for (const method of ["command/exec", "command/exec/write", "fuzzyFileSearch", "fuzzyFileSearch/sessionStart", "gitDiffToRemote", "thread/shellCommand"])
       assert.ok((await native.rpc(method, { threadId: info.sessionId, cwd: host.config.projects[0].path })).error, `${method} must not operate on the host workspace`);
-    await native.rpc("turn/start", { threadId: info.sessionId, cwd: host.config.projects[0].path, input: [{ type: "text", text: "workspace edit" }] });
+    const beforeEditSignals = (await host.fetchApi(`${path}/events?types=signal`)).body.events;
+    const beforeEditSeq = Math.max(0, ...beforeEditSignals.map((event: any) => event.seq));
+    const editTurn = (await native.rpc("turn/start", { threadId: info.sessionId, cwd: host.config.projects[0].path,
+      input: [{ type: "text", text: "workspace edit held" }] })).result.turn;
+    assert.ok(editTurn.id, "the controlled edit turn has a provider identity");
+    const editStarted = await waitFor(async () => (await host.fetchApi(`${path}/events?types=signal`)).body.events,
+      events => events.some((event: any) => event.seq > beforeEditSeq && event.data.kind === "turn-start"));
+    const editStartEvent = editStarted.filter((event: any) => event.seq > beforeEditSeq && event.data.kind === "turn-start")
+      .sort((left: any, right: any) => right.seq - left.seq)[0];
+    await waitFor(async () => native.messages, messages => messages.some(message => message.method === "turn/started" && message.params?.turn?.id === editTurn.id));
+    await waitFor(async () => native.messages, messages => messages.some(message => message.method === "fixture/turn-held" &&
+      message.params?.turnId === editTurn.id), 20000);
     await waitFor(async () => readFileSync(cwd + "/agent-edit.txt", "utf8"), value => value === "LAPTOP_UNCOMMITTED\n".repeat(2));
     await waitFor(async () => (await host.fetchApi(path)).body.execution, value => value.cloudReady && value.checkpoint?.id !== ready.execution.checkpoint.id, 20000);
+    const openTurnSignals = (await host.fetchApi(`${path}/events?types=signal`)).body.events;
+    assert.ok(!openTurnSignals.some((event: any) => event.seq > editStartEvent.seq && event.data.kind === "turn-end"),
+      "a verified checkpoint can be ready before this provider turn completes");
+    assert.ok(!native.messages.some(message => message.method === "turn/completed" && message.params?.turn?.id === editTurn.id),
+      "the held provider turn remains open after checkpoint publication");
+    assert.equal((await native.rpc("fixture/release-turn")).result.released, true);
+    await waitFor(async () => native.messages, messages => messages.some(message => message.method === "turn/completed" &&
+      message.params?.turn?.id === editTurn.id && message.params?.turn?.status === "completed"), 20000);
+    await waitFor(async () => (await host.fetchApi(`${path}/events?types=signal`)).body.events,
+      events => events.some((event: any) => event.seq > editStartEvent.seq && event.data.kind === "turn-end"), 20000);
     const requests = readFileSync(host.config.projects[0].path + "/provider-requests.jsonl", "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.equal(requests.filter(request => request.method === "thread/start").length, 1);
     for (const request of requests.filter(request => ["thread/start", "turn/start"].includes(request.method))) {
@@ -365,6 +386,8 @@ test("--laptop Codex uses the laptop project, hands off a verified checkpoint, a
     process.kill(executorPid, "SIGTERM");
     const cloud = await waitFor(async () => (await host.fetchApi(path)).body.execution, value => value?.location === "cloud" && value.state === "online", 20000);
     assert.ok(cloud.checkpoint?.id); assert.ok(cloud.checkpoint?.capturedAt);
+    assert.deepEqual(JSON.parse(readFileSync(host.config.projects[0].path + "/provider-lifecycle-replay.json", "utf8")),
+      { threadId: info.sessionId, turnId: editTurn.id }, "late copies on the internal request connection must not rewind lifecycle state");
     assert.equal((await host.fetchApi(path)).body.status, "running", "executor loss must not replace or end the cloud conversation");
     assert.equal((await host.fetchApi(`${path}/native`)).body.sessionId, info.sessionId);
     assert.equal(readFileSync(host.config.projects[0].path + "/provider-pid", "utf8"), providerPid);
@@ -413,7 +436,8 @@ test("--laptop Codex uses the laptop project, hands off a verified checkpoint, a
     const uncertain = await connect(nativeUrl(host, uncertainSession.id, uncertainControl), { Authorization: `Bearer ${host.tokens.owner}` }); clients.push(uncertain.ws);
     const previous = (await uncertain.rpc("thread/read", { threadId: uncertainInfo.sessionId })).result.thread.environments;
     await uncertain.rpc("turn/start", { threadId: uncertainInfo.sessionId, input: [{ type: "text", text: "uncertain edit" }] });
-    await waitFor(async () => existsSync(uncertainCwd + "/uncertain-effect.txt"), Boolean);
+    await waitFor(async () => existsSync(uncertainCwd + "/uncertain-effect.txt")
+      ? readFileSync(uncertainCwd + "/uncertain-effect.txt", "utf8") : "", value => value === "performed\n");
     process.kill(uncertainPid, "SIGTERM");
     const paused = await waitFor(async () => (await host.fetchApi(uncertainPath)).body.execution, value => value?.state === "paused");
     assert.equal(paused.location, "laptop");

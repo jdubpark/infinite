@@ -217,6 +217,7 @@ async function main() {
     if (scenario === "bootstrap-change" && assignment.revision > 1)
       verification.checks[0].args.push("--different");
     const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
+      ...(scenario === "live-limit" ? { parallelism: 1 } : {}),
       ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) };
     if (scenario === "bootstrap-override") {
       let rejection;
@@ -429,6 +430,10 @@ async function main() {
     saveReceipt();
     await report({ kind: "result", summary: `Implemented ${assignment.taskId}.txt` });
   } else if (assignment.role === "integrator") {
+    if (scenario === "repeat-failed-check") {
+      await report({ kind: "result", summary: "No implementation change is required for this verification result" });
+      return;
+    }
     if (scenario === "integrator-limit" && receipt.provider === "claude") {
       writeFileSync("repair.txt", "partial repair from the limited integrator\n");
       console.log("You've hit your session limit · resets 3:45pm");

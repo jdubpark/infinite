@@ -382,33 +382,25 @@ test("goal pause and cancellation survive restart without allowing child control
   } finally { await f.close(); }
 });
 
-test("a goal worker limit updates its active cycle, replays safely, and stays owner-only", { timeout: 60000 }, async () => {
+test("goal capacity ignores the legacy owner value and rejects owner capacity changes", { timeout: 60000 }, async () => {
   const f = await fixture("cycles");
   try {
     const request = f.create();
     const created = await f.host.fetchApi("/goals", "owner", request);
     assert.equal(created.status, 200, JSON.stringify(created.body));
+    assert.equal(created.body.parallelism, 4, "The legacy goal create value does not set worker capacity");
     const active = await f.held(created.body.id), child = active.team!;
+    assert.equal(child.workers?.max, 4);
     const change = { requestId: randomUUID(), revision: active.goal.revision, parallelism: 4 };
     assert.equal((await f.host.fetchApi(`/goals/${request.requestId}/parallelism`, "controller", change)).status, 403);
     assert.equal((await f.host.fetchApi(`/goals/${request.requestId}/parallelism`, "viewer", change)).status, 403);
     const changed = await f.host.fetchApi(`/goals/${request.requestId}/parallelism`, "owner", change);
-    assert.equal(changed.status, 200, JSON.stringify(changed.body));
-    assert.equal(changed.body.parallelism, 4);
-    assert.equal(changed.body.revision, active.goal.revision + 1);
-    assert.ok(changed.body.events.some((event: { text: string }) => event.text === "The owner changed the worker limit from 2 to 4. It applies to the active cycle and later cycles."));
-    const updated = await waitFor(() => f.team(child.id), team => team.parallelism === 4 && team.workers?.limit === 4);
-    assert.equal(updated.workers?.max, 4);
-    const direct = await f.host.fetchApi(`/teams/${child.id}/parallelism`, "owner", { requestId: randomUUID(), revision: updated.revision, parallelism: 1 });
-    assert.deepEqual([direct.status, direct.body.code], [409, "goal-owned-team"]);
-    const retry = await f.host.fetchApi(`/goals/${request.requestId}/parallelism`, "owner", change);
-    assert.equal(retry.status, 200);
-    assert.equal(retry.body.revision, changed.body.revision);
-    assert.equal(retry.body.events.filter((event: { text: string }) => event.text === "The owner changed the worker limit from 2 to 4. It applies to the active cycle and later cycles.").length, 1);
-    const stale = await f.host.fetchApi(`/goals/${request.requestId}/parallelism`, "owner", { requestId: randomUUID(), revision: active.goal.revision, parallelism: 3 });
-    assert.equal(stale.status, 409);
-    assert.equal(stale.body.code, "stale-goal-revision");
-    assert.equal((await f.team(child.id)).parallelism, 4);
+    assert.deepEqual([changed.status, changed.body.code], [409, "agent-managed-capacity"]);
+    const after = await f.goal(request.requestId);
+    assert.equal(after.revision, active.goal.revision, "The rejected owner action does not revise the goal");
+    assert.equal((await f.team(child.id)).parallelism, child.parallelism, "The rejected owner action does not mutate the active team");
+    const direct = await f.host.fetchApi(`/teams/${child.id}/parallelism`, "owner", { requestId: randomUUID(), revision: child.revision, parallelism: 1 });
+    assert.deepEqual([direct.status, direct.body.code], [409, "agent-managed-capacity"]);
   } finally { await f.close(); }
 });
 
@@ -590,6 +582,24 @@ function extensionFixture() {
     writeGoal: (extra: object = {}) => f.writeRecord("goal", goal.id, { goal, receipts: {}, fingerprint: "fixture", ...extra }),
   };
 }
+
+test("a persisted legacy owner capacity control is discarded instead of changing the active team", async () => {
+  const f = extensionFixture();
+  let goals: GoalService | undefined;
+  try {
+    f.run.parallelismCeiling = 4;
+    f.run.parallelism = 1;
+    f.writeTeam();
+    const control = { action: "parallelism" as const, requestId: randomUUID(), teamId: f.run.id, revision: 1, parallelism: 4 };
+    f.writeGoal({ control });
+    const teams = f.openTeam();
+    goals = new GoalService(f.config, f.key, teams);
+    goals.start();
+    const saved = await waitFor(async () => f.readRecord<{ goal: ProductGoal; control?: unknown }>("goal", f.goal.id), value => !value.control);
+    assert.equal(teams.get(f.run.id).parallelism, 1);
+    assert.ok(saved.goal.events.some(event => /legacy owner worker-limit change was discarded/.test(event.text)));
+  } finally { goals?.close(); f.close(); }
+});
 
 for (const recovering of [false, true])
 test(`a member-limit extension rejection ${recovering ? "during recovery" : "reaches its caller and"} cannot strand a cancelled goal`, async () => {

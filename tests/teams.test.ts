@@ -6,17 +6,18 @@ import { createInterface } from "node:readline";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
-import { applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
-import type { CreateTeam, TeamBrief, TeamLineup, TeamModelProfile, TeamRun, TeamView } from "../packages/host/src/team-types.js";
+import { TeamError, applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
+import { createTeamSchema, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamModelProfile, type TeamRun, type TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import type { HandoffPolicy, TeamHandoffContext } from "../packages/host/src/handoff-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
 import { permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON } from "../packages/host/src/team-workspace.js";
 
 // The shared fallback lineup used by delivery and permission tests; the limit tests below define their own.
 import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
@@ -563,7 +564,12 @@ test("a team builds concurrently in isolated copies and produces checked, review
     assert.ok(commands.some(command => command.cwd === f.source && command.command === "git"), "Source Git inspection must use the configured execution identity");
     for (const worker of workers)
       assert.ok(commands.some(command => command.cwd === worker.cwd && command.command === "git" && command.args.includes("add")), "Git must not stage agent-controlled files as the API identity");
-    assert.ok(commands.some(command => command.cwd === finished.workspace && command.command === process.execPath && command.args.includes("check.mjs")), "Configured checks must use the execution identity");
+    const checkCommands = commands.filter(command => command.command === process.execPath && command.args.includes("check.mjs"));
+    assert.ok(checkCommands.length > 0, "Configured checks must use the execution identity");
+    for (const command of checkCommands) {
+      assert.ok(command.cwd.startsWith(join(dirname(finished.workspace), "verification") + "/"), "Configured checks must run in a separate verification copy");
+      assert.equal(git(command.cwd, "rev-parse", "HEAD"), finished.headCommit, "The checked commit must match the reviewed integration commit");
+    }
   } finally { owner.close(); viewer.close(); await f.close(); }
 });
 
@@ -598,13 +604,14 @@ test("review rubrics drop self-grading, integration records docs/tests, and owne
   } finally { await f.close(); }
 });
 
-test("a finished implementer releases its slot so a third independent task can start", { timeout: 120000 }, async () => {
+test("legacy create capacity is ignored and ready work uses the PM-selected limit", { timeout: 120000 }, async () => {
   const f = await fixture("scale-up", undefined, {}, { parallelism: 2 });
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const finished = await f.settled(created.body.id);
     assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.workers.limit, 4, "Omitted PM capacity defaults to the host ceiling despite the legacy create value of two");
     assert.deepEqual(finished.tasks.map(task => task.status), ["integrated", "integrated", "integrated"]);
     const workers = readdirSync(f.receipts).filter(name => name.endsWith(".json"))
       .map(name => JSON.parse(readFileSync(join(f.receipts, name), "utf8")))
@@ -615,11 +622,12 @@ test("a finished implementer releases its slot so a third independent task can s
     const moments = workers.flatMap(worker => [[worker.startedAt, 1], [worker.finishedAt, -1] as [number, number]] as [number, number][]).sort((a, b) => a[0] - b[0]);
     let running = 0, maximum = 0;
     for (const [, delta] of moments) { running += delta; maximum = Math.max(maximum, running); }
-    assert.ok(maximum <= 2, `Observed ${maximum} overlapping implementers`);
+    assert.ok(maximum <= 4, `Observed ${maximum} overlapping implementers`);
+    assert.ok(maximum >= 2, "Independent ready work uses the capacity selected by the PM");
   } finally { await f.close(); }
 });
 
-test("an owner can raise a running team's worker limit and retries are scoped to their request body", { timeout: 120000 }, async () => {
+test("an owner cannot change agent-managed capacity and the refusal does not mutate the limit", { timeout: 120000 }, async () => {
   const f = await fixture("live-limit", undefined, {}, { parallelism: 1 });
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
@@ -629,28 +637,18 @@ test("an owner can raise a running team's worker limit and retries are scoped to
     assert.deepEqual(before.workers, { limit: 1, max: 4, running: 1, ready: 1 });
     const request = { requestId: randomUUID(), revision: before.revision, parallelism: 2 };
     const changed = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", request);
-    assert.equal(changed.status, 200, JSON.stringify(changed.body));
-    assert.equal(changed.body.revision, before.revision);
-    assert.equal(changed.body.workers.limit, 2);
-    const retry = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", request);
-    assert.equal(retry.status, 200);
-    assert.equal(retry.body.revision, before.revision);
-    const conflict = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", { ...request, parallelism: 1 });
-    assert.deepEqual([conflict.status, conflict.body.code], [409, "request-conflict"]);
-    const stale = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", { requestId: randomUUID(), revision: before.revision + 1, parallelism: 1 });
-    assert.deepEqual([stale.status, stale.body.code], [409, "stale-team-revision"]);
+    assert.deepEqual([changed.status, changed.body.code], [409, "agent-managed-capacity"]);
+    const unchanged = await f.get(before.id);
+    assert.deepEqual([unchanged.revision, unchanged.workers.limit], [before.revision, 1]);
     for (const role of ["controller", "viewer"] as const)
       assert.equal((await f.host.fetchApi(`/teams/${before.id}/parallelism`, role, { requestId: randomUUID(), revision: before.revision, parallelism: 1 })).status, 403);
-    await waitFor(() => readdirSync(f.receipts).filter(name => name.endsWith(".json"))
-      .map(name => JSON.parse(readFileSync(join(f.receipts, name), "utf8")))
-      .some(value => value.runId === before.id && value.role === "implementer" && value.taskId === "b"), Boolean, 30000);
     writeFileSync(join(f.receipts, `${before.id}.release`), "release", { mode: 0o600 });
     const finished = await f.settled(before.id);
     assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
-    assert.equal(finished.workers.limit, 2);
+    assert.equal(finished.workers.limit, 1);
     assert.equal(finished.revision, before.revision);
     const closed = await f.host.fetchApi(`/teams/${before.id}/parallelism`, "owner", { requestId: randomUUID(), revision: finished.revision, parallelism: 1 });
-    assert.deepEqual([closed.status, closed.body.code], [409, "team-not-running"]);
+    assert.deepEqual([closed.status, closed.body.code], [409, "agent-managed-capacity"]);
   } finally { await f.close(); }
 });
 
@@ -900,6 +898,253 @@ test("review approval cannot make an integration checkout changed after verifica
   } finally { await f.close(); }
 });
 
+test("a configured check cannot change the canonical integration checkout and Resume replans from a clean head", { timeout: 120000 }, async () => {
+  const f = await fixture("check-mutates");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const blocked = await f.settled(created.body.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.ok(blocked.checks.some(check => check.status === "passed"), "The configured check itself exits successfully");
+    assert.equal(readFileSync(join(blocked.workspace, "a.txt"), "utf8"), "revision 1\n", "verification writes must stay in their disposable copy");
+    assert.ok(blocked.events.some(event => /disposable verification workspace: .*\/verification\//.test(event.text)), "the retained verification copy must be discoverable");
+    const setupRuns = readFileSync(join(f.receipts, "permission-setup.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.ok(setupRuns.some(record => record.cwd.includes("/verification/")), "configured setup must run in the verification copy");
+    const key = readFileSync(f.host.config.keyFile);
+    const persisted = unseal<any>(key, `team:${blocked.id}`, readFileSync(join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`), "utf8"));
+    assert.equal(persisted.verificationRecovery?.failure, "verification-changed-files", "the structured recovery intent must be durable");
+
+    const resumeAction = { requestId: randomUUID(), revision: blocked.revision };
+    const resumed = await waitFor(() => f.host.fetchApi(`/teams/${blocked.id}/resume`, "owner", resumeAction), result => result.body?.code !== "members-stopping", 30000);
+    assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
+    assert.equal(resumed.body.status, "planning");
+    assert.equal(resumed.body.revision, blocked.revision + 1);
+    assert.equal(resumed.body.review, undefined);
+    assert.equal(resumed.body.members.length, blocked.members.length, "Resume keeps prior member evidence");
+    assert.notEqual(resumed.body.workspace, blocked.workspace);
+    assert.equal(git(resumed.body.workspace, "rev-parse", "HEAD"), blocked.headCommit);
+    assert.equal(git(resumed.body.workspace, "status", "--porcelain"), "");
+    assert.equal(readFileSync(join(blocked.workspace, "a.txt"), "utf8"), "revision 1\n", "recovery must leave the original integration copy intact");
+    assert.ok(resumed.body.events.some(event => /Original integration copy preserved at .*; fresh workspace at .*recovery\//.test(event.text)), "recovery paths must remain discoverable");
+    await waitFor(() => f.get(blocked.id), run => run.members.some(member => member.revision === resumed.body.revision), 30000);
+    const replanning = unseal<any>(key, `team:${blocked.id}`, readFileSync(join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`), "utf8"));
+    assert.equal(replanning.verificationRecovery, undefined, "later saves must not restore the consumed recovery marker");
+  } finally { await f.close(); }
+});
+
+test("a legacy completed read-only check failure resumes only from its current exact guard reason", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    stored.run.status = "blocked";
+    stored.run.reason = LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON;
+    stored.run.checks = stored.run.checks.map((check: TeamRun["checks"][number]) => ({ ...check, status: "failed", exitCode: 1, finishedAt: check.finishedAt ?? new Date().toISOString() }));
+    stored.pending = { id: randomUUID(), kind: "check", revision: stored.run.revision };
+    stored.checkHead = undefined;
+    writeFileSync(join(finished.workspace, "a.txt"), "Auto-fixed in the preserved legacy workspace\n");
+    writeSealed(file, key, `team:${finished.id}`, stored);
+
+    await f.host.start();
+    const blocked = await f.get(finished.id);
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.reason, LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, "constructor recovery must preserve exact current provenance");
+    assert.equal(blocked.resumable, true);
+    const resume = { requestId: randomUUID(), revision: blocked.revision };
+    const response = await waitFor(() => f.host.fetchApi(`/teams/${blocked.id}/resume`, "owner", resume), result => result.status !== 409 || result.body.code !== "members-stopping", 30000);
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.equal(response.body.status, "planning");
+    assert.equal(response.body.revision, blocked.revision + 1);
+    assert.notEqual(response.body.workspace, finished.workspace);
+    assert.equal(git(response.body.workspace, "rev-parse", "HEAD"), blocked.headCommit);
+    assert.equal(git(response.body.workspace, "status", "--porcelain"), "");
+    assert.equal(readFileSync(join(finished.workspace, "a.txt"), "utf8"), "Auto-fixed in the preserved legacy workspace\n");
+    assert.ok(response.body.members.length >= blocked.members.length, "member evidence remains available across recovery");
+    assert.equal(response.body.checks.length, blocked.checks.length, "rejected check evidence is retained");
+  } finally { await f.close(); }
+});
+
+test("an unchanged required-check failure stops after one repair and owner Continue preserves the run across relay retries", { timeout: 150000 }, async () => {
+  const f = await fixture("repeat-failed-check");
+  const owner = createRemoteClient({ url: f.host.origin, token: f.host.tokens.owner });
+  try {
+    const created = await owner.request<TeamView>("/teams", { body: f.create() });
+    await f.settled(created.id);
+    const blocked = await waitFor(() => f.get(created.id), run => run.status === "blocked" && run.continuable && run.members.every(member => member.status === "stopped"), 30000);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.equal(blocked.blockCode, "repeated-check-failure");
+    assert.equal(blocked.reason, "The same required verification command failed again against an unchanged integration commit. No further identical repair was attempted; inspect the check output and continue with owner direction.");
+    assert.equal(blocked.continuable, true);
+    assert.equal(blocked.round, 1, "An identical failed check must not spend another correction round");
+    const failures = blocked.checks.filter(check => check.status === "failed");
+    assert.equal(failures.length, 2, "The required command ran again after one correction");
+    assert.equal(failures[0].headCommit, failures[1].headCommit, "The second failure is tied to the exact same integration commit");
+    assert.ok(blocked.members.every(member => member.status === "stopped"), "Continue is offered only after member exits are confirmed");
+    const integrator = blocked.members.find(member => member.role === "integrator" && member.revision === blocked.revision);
+    assert.ok(integrator);
+    const context = JSON.parse(readFileSync(join(integrator.cwd, ".git", "infinite-team-context.json"), "utf8"));
+    assert.deepEqual([context.runId, context.revision], [blocked.id, blocked.revision]);
+    assert.match(context.objective, /Create independent files/);
+    assert.match(context.feedback, /Configured verification failed/);
+    assert.match(context.feedback, /"exitCode":17/);
+
+    const key = readFileSync(f.host.config.keyFile);
+    const storedFile = join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`);
+    const rewriteStored = async (update: (stored: any) => void) => {
+      await f.host.stopApi();
+      const stored = unseal<any>(key, `team:${blocked.id}`, readFileSync(storedFile, "utf8"));
+      update(stored);
+      writeSealed(storedFile, key, `team:${blocked.id}`, stored);
+      await f.host.start();
+      return f.get(blocked.id);
+    };
+
+    for (const role of ["controller", "viewer"] as const) {
+      const denied = await f.host.fetchApi(`/teams/${blocked.id}/continue`, role, { requestId: randomUUID(), revision: blocked.revision });
+      assert.equal(denied.status, 403);
+    }
+    const extraField = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: blocked.revision, text: "Review the check.", skipChecks: true });
+    assert.equal(extraField.status, 400, "Continue rejects unrecognized fields instead of accepting a check-waiver option");
+    const stale = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: blocked.revision + 1 });
+    assert.deepEqual([stale.status, stale.body.code], [409, "stale-team-revision"]);
+
+    const legacyPromptTooLargeReason = "The team requirements exceed the prompt limit. Start a new team with consolidated requirements.";
+    const uncertain = await rewriteStored(stored => {
+      stored.run.blockCode = undefined;
+      stored.run.reason = legacyPromptTooLargeReason;
+      stored.run.permissionDecisions = [{ status: "uncertain" }];
+    });
+    assert.equal(uncertain.continuable, false, "An uncertain permission side effect blocks Continue even on a recognized legacy reason");
+    const uncertainDenied = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.deepEqual([uncertainDenied.status, uncertainDenied.body.code], [409, "team-continuation-unavailable"]);
+
+    const legacy = await rewriteStored(stored => { stored.run.permissionDecisions = []; });
+    assert.equal(legacy.continuable, true, "The exact legacy prompt-limit reason remains recognized without a stored error code");
+    for (const recoverable of [
+      { code: undefined, reason: "The team exhausted its two correction rounds. Review the check and agent evidence before continuing manually." },
+      { code: "agent-blocked", reason: "An agent reported a blocker that needs a new plan." },
+      { code: undefined, reason: "An agent exited without a valid structured report. Its task is unresolved." },
+    ]) {
+      const view = await rewriteStored(stored => { stored.run.blockCode = recoverable.code; stored.run.reason = recoverable.reason; });
+      assert.equal(view.continuable, true, `The recognized ${recoverable.code ?? "legacy"} blocked state can continue`);
+    }
+    const deliveryPending = await rewriteStored(stored => {
+      stored.deliveryAttempt = { memberId: randomUUID(), revision: blocked.revision, headCommit: blocked.headCommit! };
+    });
+    assert.equal(deliveryPending.continuable, false, "A delivery attempt is not replayable through Continue");
+    const deliveryDenied = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.deepEqual([deliveryDenied.status, deliveryDenied.body.code], [409, "team-continuation-unavailable"]);
+    const goalOwned = await rewriteStored(stored => {
+      delete stored.deliveryAttempt;
+      stored.run.goal = {};
+    });
+    assert.equal(goalOwned.continuable, false);
+    const goalDenied = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.deepEqual([goalDenied.status, goalDenied.body.code], [409, "goal-owned-team"]);
+    const legacyEligible = await rewriteStored(stored => { delete stored.run.goal; });
+    assert.equal(legacyEligible.continuable, true);
+
+    const dirtyPath = join(legacyEligible.workspace, "owner-continuation-check.txt");
+    writeFileSync(dirtyPath, "retain this edit when continuation is refused\n");
+    const dirty = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: legacyEligible.revision });
+    assert.equal(dirty.status, 409);
+    assert.equal(existsSync(dirtyPath), true, "Continuation refuses dirty work without deleting the owner's edit");
+    assert.equal(git(legacyEligible.workspace, "rev-parse", "HEAD"), blocked.headCommit);
+    rmSync(dirtyPath);
+
+    const request = { requestId: randomUUID(), revision: legacyEligible.revision, text: " Keep the original requirements and inspect the failed command evidence. " };
+    const continued = await owner.request<TeamView>(`/teams/${blocked.id}/continue`, { body: request });
+    assert.equal(continued.status, "planning");
+    assert.equal(continued.revision, blocked.revision + 1);
+    assert.equal(continued.continuable, false);
+    assert.equal(continued.objective, blocked.objective);
+    assert.equal(continued.baseCommit, blocked.baseCommit);
+    assert.equal(continued.workspace, blocked.workspace);
+    assert.equal(git(continued.workspace, "rev-parse", "HEAD"), blocked.headCommit);
+    assert.equal(git(continued.workspace, "status", "--porcelain"), "");
+    assert.equal(continued.tasks.length, 0, "The new revision starts a fresh plan");
+    assert.deepEqual(continued.continuations?.[0]?.tasks.map(task => [task.id, task.status, task.summary]),
+      blocked.tasks.map(task => [task.id, task.status, task.summary]));
+    assert.equal(continued.members.length, blocked.members.length);
+    assert.equal(continued.checks.length, blocked.checks.length, "Historical check evidence remains attached to the run");
+    assert.equal(continued.steering.at(-1)?.text, "Keep the original requirements and inspect the failed command evidence.");
+
+    await waitFor(() => f.get(blocked.id), run => run.members.some(member => member.role === "project-manager" && member.revision === continued.revision), 30000);
+    const active = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: continued.revision });
+    assert.equal(active.status, 409, "A live continuation cannot be started twice under a new request ID");
+    await f.host.stopApi();
+    await f.host.start();
+    const retry = await owner.request<TeamView>(`/teams/${blocked.id}/continue`, { body: request });
+    assert.equal(retry.revision, continued.revision, "A retry after restart returns the recorded continuation");
+    const recovered = await f.get(blocked.id);
+    assert.equal(recovered.members.filter(member => member.role === "project-manager" && member.revision === continued.revision).length, 1,
+      "Idempotent replay does not create a duplicate planner");
+
+    const conflict = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { ...request, text: "Different direction" });
+    assert.deepEqual([conflict.status, conflict.body.code], [409, "request-conflict"]);
+  } finally { owner.close(); await f.close(); }
+});
+
+test("a stale read-only event cannot authorize a completed check with another current reason", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    stored.run.status = "blocked";
+    stored.run.reason = "A different current failure.";
+    stored.run.events.push({ at: new Date().toISOString(), text: LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON });
+    stored.pending = { id: randomUUID(), kind: "check", revision: stored.run.revision };
+    stored.checkHead = undefined;
+    writeSealed(file, key, `team:${finished.id}`, stored);
+
+    await f.host.start();
+    const blocked = await f.get(finished.id);
+    assert.equal(blocked.status, "blocked");
+    assert.match(blocked.reason ?? "", /host restarted during a workspace or verification operation/);
+    assert.equal(blocked.resumable, false);
+    const response = await f.host.fetchApi(`/teams/${blocked.id}/resume`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.equal(response.status, 409);
+    assert.equal(response.body.code, "team-reconciliation-required");
+  } finally { await f.close(); }
+});
+
+test("a legacy-looking unknown pending operation with delivery intent remains reconciliation-only", { timeout: 120000 }, async () => {
+  const f = await fixture("success");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    await f.host.stopApi();
+    const file = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(file, "utf8"));
+    stored.run.status = "blocked";
+    stored.run.reason = LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON;
+    stored.pending = { id: randomUUID(), kind: "result", revision: stored.run.revision };
+    stored.checkHead = undefined;
+    stored.deliveryAttempt = { memberId: "unknown-delivery-member", revision: stored.run.revision, headCommit: stored.run.headCommit };
+    writeSealed(file, key, `team:${finished.id}`, stored);
+
+    await f.host.start();
+    const blocked = await f.get(finished.id);
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.resumable, false);
+    const response = await f.host.fetchApi(`/teams/${blocked.id}/resume`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.equal(response.status, 409);
+    assert.equal(response.body.code, "team-reconciliation-required");
+  } finally { await f.close(); }
+});
+
 test("a check past teams.checkMinutes blocks a resumable run without spending a correction round", { timeout: 120000 }, async () => {
   const f = await fixture("lifecycle", undefined, { teams: { checkMinutes: 0.05 } });
   let checkPid: number | undefined;
@@ -989,6 +1234,9 @@ test("steering cannot disguise a check interrupted by API restart as a new plann
     });
     assert.equal(response.status, 409, "An orphaned check must require reconciliation rather than claim replanning");
     assert.equal(response.body.code, "team-reconciliation-required");
+    const resume = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: checking.revision });
+    assert.equal(resume.status, 409, "An interrupted pending check is not a proven completed verification failure");
+    assert.equal(resume.body.code, "team-reconciliation-required");
     const unchanged = await f.get(id);
     assert.equal(unchanged.status, "blocked");
     assert.equal(unchanged.revision, checking.revision);
@@ -1362,6 +1610,24 @@ test("project-manager prompts list configured setup and checks and forbid unauth
   assert.match(prompt, /say so in the summary and have tasks run additional commands \(such as a workspace's lint or typecheck\) themselves and report results/);
 });
 
+test("read-only prompts forbid repository outputs while delivery keeps its pinned Git authority", () => {
+  const base = { provider: "demo", revision: 1, projectId: "example-project", objective: "Inspect and implement a small feature", baseCommit: "a".repeat(40), headCommit: "b".repeat(40), steering: [], tasks: [], checks: [], members: [] };
+  const run = base as unknown as TeamRun;
+  for (const role of ["project-manager", "scout", "reviewer"] as const) {
+    const prompt = teamPrompt(run, role);
+    assert.match(prompt, /Read-only roles must leave every tracked and untracked repository file unchanged/);
+    assert.match(prompt, /Do not run commands, scripts, or options that auto-fix, format in place, generate tracked or untracked repository outputs/);
+    assert.match(prompt, /write reports or temporary files inside the repository/);
+    assert.match(prompt, /Read-only Git metadata operations, including fetches used for inspection, remain allowed/);
+    assert.match(prompt, /does not prohibit separately approved delivery Git operations/);
+  }
+  const delivery = teamPrompt({ ...run, branch: "infinite/team-example", delivery: { mode: "pr", repository: "example/app", baseBranch: "main" } } as TeamRun, "delivery");
+  assert.match(delivery, /Use approved Git\/GitHub tools, including an approved CLI when available/);
+  assert.match(delivery, /Push infinite\/team-example to the pinned repository/);
+  assert.match(delivery, /Never merge the pull request/);
+  assert.doesNotMatch(delivery, /Read-only roles must leave every tracked and untracked repository file unchanged/);
+});
+
 test("a rejected team report exposes the host's actionable 4xx response", async () => {
   const message = "Plan rejected: remove verification and submit a corrected plan.";
   const server = createServer((request, response) => {
@@ -1604,6 +1870,8 @@ test("a permission coordinator back from an outage during a current review runs 
 test("an answered implementer waits for a slot under a lowered worker limit, then continues", async () => {
   const f = schedulerFixture();
   try {
+    f.run.missionId = randomUUID();
+    f.run.parallelismCeiling = 4;
     const original = f.run.members[0], at = new Date().toISOString();
     const active = { ...original, role: "implementer" as const, taskId: "a", startedAt: at, lastActivityAt: at };
     const waiting = { ...original, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer" as const, taskId: "b", status: "waiting" as const,
@@ -1616,7 +1884,7 @@ test("an answered implementer waits for a slot under a lowered worker limit, the
     f.writeTeam();
     const teams = f.openTeam();
     const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
-    await teams.setParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 1 });
+    await teams.setMissionParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 1 });
     await teams.answer(f.run.id, f.run.decisions[0].id, { requestId: randomUUID(), revision: 1, text: "Yes" });
     await scheduler.step(scheduler.record(f.run.id));
     const held = teams.get(f.run.id);
@@ -1624,7 +1892,7 @@ test("an answered implementer waits for a slot under a lowered worker limit, the
     assert.deepEqual(held.members.map(member => [member.taskId, member.status]), [["a", "running"], ["b", "waiting"]]);
     assert.equal(held.decisions[0].answer, "Yes");
 
-    await teams.setParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 2 });
+    await teams.setMissionParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 2 });
     await scheduler.step(scheduler.record(f.run.id));
     const resumed = teams.get(f.run.id);
     assert.deepEqual(resumed.members.map(member => [member.taskId, member.status]), [["a", "running"], ["b", "stopped"], ["b", "queued"]]);
@@ -1632,6 +1900,67 @@ test("an answered implementer waits for a slot under a lowered worker limit, the
     assert.equal(resumed.members[2].cwd, waiting.cwd);
     assert.equal(resumed.tasks[1].memberId, resumed.members[2].memberId);
   } finally { f.close(); }
+});
+
+test("restoring an active legacy solo mission subteam enforces its size ceiling", async () => {
+  const f = schedulerFixture();
+  try {
+    const missionId = randomUUID();
+    f.run.missionId = missionId;
+    f.run.parallelism = 4;
+    delete f.run.parallelismCeiling;
+    f.run.status = "implementing";
+    f.writeTeam();
+    const teams = f.openTeam();
+    assert.equal(teams.ensureMissionCapacityCeiling(f.run.id, missionId, 1), 1);
+    const migrated = teams.get(f.run.id);
+    assert.deepEqual([migrated.parallelism, migrated.workers.max], [1, 1]);
+    assert.ok(migrated.events.some(event => /Mission capacity was reconciled from ceiling unset to 1/.test(event.text)));
+    assert.equal(teams.ensureMissionCapacityCeiling(f.run.id, randomUUID(), 4), undefined, "A different mission cannot migrate this run");
+  } finally { f.close(); }
+});
+
+test("restoring an active legacy standalone run moves its owner-selected limit to the host ceiling", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.parallelism = 1;
+    delete f.run.parallelismCeiling;
+    f.run.status = "implementing";
+    f.writeTeam();
+    const migrated = f.openTeam().get(f.run.id);
+    assert.deepEqual([migrated.parallelism, migrated.workers.max], [4, 4]);
+    assert.ok(migrated.events.some(event => /Legacy worker capacity was moved to agent management: 1 to 4/.test(event.text)));
+  } finally { f.close(); }
+});
+
+test("a persisted mission team replays a legacy create identity when capacity ceiling becomes derived", { timeout: 60000 }, async () => {
+  const f = await fixture("success", fallbackLineup, {}, { noServer: true });
+  let teams: import("../packages/host/src/teams.js").TeamService | undefined;
+  try {
+    const missionId = randomUUID(), request = { ...f.create(), parallelism: 1 };
+    const parsed = createTeamSchema.parse(request), pinnedLineup = teamLineupSchema.parse(fallbackLineup);
+    teams = await f.openTeamService({ start: false });
+    const created = await teams.createForMission(request, missionId, fallbackLineup, { parallelismCeiling: 1 });
+    await teams.idle();
+    teams.close();
+    const file = join(f.host.config.stateDir, "teams", `${created.id}.sealed`), key = readFileSync(f.host.config.keyFile);
+    const persisted = unseal<any>(key, `team:${created.id}`, readFileSync(file, "utf8"));
+    // This is the fingerprint a pre-upgrade createForMission wrote: derived capacity was not part of identity.
+    persisted.fingerprint = createHash("sha256").update(JSON.stringify({ request: parsed, missionId, lineup: pinnedLineup })).digest("hex");
+    // A legacy pending solo child may have started from an owner-selected value and no stored ceiling.
+    persisted.run.parallelism = 4;
+    delete persisted.run.parallelismCeiling;
+    writeSealed(file, key, `team:${created.id}`, persisted);
+
+    teams = await f.openTeamService({ start: false });
+    const replay = await teams.createForMission(request, missionId, fallbackLineup, { parallelismCeiling: 1 });
+    assert.equal(replay.id, created.id);
+    assert.equal(replay.missionId, missionId);
+    assert.deepEqual([replay.parallelism, replay.workers.max], [1, 1], "Replaying a pending solo launch restores its one-worker ceiling");
+    await assert.rejects(teams.setMissionParallelism(created.id, { requestId: randomUUID(), revision: replay.revision, parallelism: 2 }),
+      (error: unknown) => error instanceof TeamError && error.code === "team-parallelism-limit", "The mission coordinator cannot grow the adopted solo child above one worker");
+    assert.equal(teams.list().filter(run => run.id === created.id).length, 1, "Replaying parent launch adoption does not create a second child");
+  } finally { teams?.close(); await f.close(); }
 });
 
 test("an old member that still shows activity is not stalled after a restart", { timeout: 60000 }, async () => {

@@ -411,11 +411,14 @@ test("retiring a component preserves bounded evidence through repeated refresh a
   let retired = false;
   const adapter: UnderstandingAdapter = {
     context: async root => { const value = sampleContext(root); if (retired) { value.components = []; value.edges = []; } return value; },
-    synthesize: async input => ({ components: input.components.map(component => ({ ...component,
-      current: { ...component.current, state: "ready" as const, generatedAt: new Date().toISOString() },
-      difference: { ...component.difference, snapshotId: component.current.snapshotId, generatedAt: new Date().toISOString() },
-      coverage: Array.from({ length: 100 }, (_, index) => `Source coverage ${index}`),
-    })), coverage: [] }),
+    synthesize: async input => {
+      const generatedAt = new Date().toISOString();
+      return { components: input.components.map(component => ({ ...component,
+        current: { ...component.current, state: "ready" as const, generatedAt },
+        difference: { ...component.difference, snapshotId: component.current.snapshotId, generatedAt },
+        coverage: Array.from({ length: 100 }, (_, index) => `Source coverage ${index}`),
+      })), coverage: [] };
+    },
   };
   const s = setup(t, { adapter });
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, synthesis: true } });

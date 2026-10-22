@@ -84,7 +84,7 @@ setInterval(()=>{},1000);
 });
 
 
-test("duplicate laptop disconnects preserve the grace timer and hand off the verified checkpoint once", { timeout: 20000 }, async () => {
+test("duplicate laptop disconnects and an early grace callback hand off the verified checkpoint once", { timeout: 20000 }, async context => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-disconnect-")));
   const cwd = join(root, "laptop"), localStore = join(root, "local-blobs");
   mkdirSync(cwd); writeFileSync(join(cwd, "evidence.txt"), "preserved");
@@ -106,8 +106,24 @@ test("duplicate laptop disconnects preserve the grace timer and hand off the ver
       await hybrid.control("sync/blob", { hash, base64: await readWorkspaceBlob(localStore, hash) });
     await hybrid.control("sync/commit", { ...boundary, manifest });
     assert.equal(state?.cloudReady, true);
+    let now = Date.now();
+    const began = now;
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = context.mock.method(Date, "now", () => now);
     hybrid.connection(false);
     hybrid.connection(false);
+    // Timer and wall clocks need not agree exactly. Run the grace callback
+    // just before its wall-clock deadline, then cross the deadline without
+    // another connection or activity event to rescue a lost callback.
+    now = began + 4999;
+    context.mock.timers.tick(5000);
+    await hybrid.control("sync/status", {});
+    assert.equal(selected.length, 0, "The original grace deadline must still be respected");
+    now = began + 5000;
+    context.mock.timers.tick(1);
+    await hybrid.control("sync/status", {});
+    context.mock.timers.reset();
+    clock.mock.restore();
     const handedOff = await waitFor(async () => state, value => value?.location === "cloud" && value.state === "online", 10000);
     assert.equal(handedOff?.checkpoint?.id, manifest.id);
     assert.equal(selected.length, 1);

@@ -138,7 +138,13 @@ export async function createHybridWorkspace(options: {
 
   async function handoff(): Promise<void> {
     if (closed || online || !connected || sticky || transitioning || blocker()) { publish(); return; }
-    if (Date.now() < reconnectDeadline) return;
+    const remaining = reconnectDeadline - Date.now();
+    if (remaining > 0) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(schedule, remaining);
+      reconnectTimer.unref();
+      return;
+    }
     transitioning = true; sticky = true; epoch += 1; publish();
     const selected = latest!;
     const unchanged = () => {

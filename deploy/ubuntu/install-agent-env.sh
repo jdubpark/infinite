@@ -30,8 +30,18 @@ for provider in claude codex codex-app-server grok opencode; do
     continue
   fi
   if grep -Fqx "$hook_line" "$wrapper"; then
-    printf '%s\n' "Already patched $wrapper"
-    continue
+    # Prove the existing hook runs (on a copy with a non-provider basename so
+    # nothing can be launched).
+    probe=$(mktemp "$wrapper.agent-env-probe.XXXXXX")
+    cp -p "$wrapper" "$probe"
+    if infinite_wrapper_hook_proven "$probe"; then
+      rm -f "$probe"
+      printf '%s\n' "Already patched $wrapper (hook verified)"
+      continue
+    fi
+    rm -f "$probe"
+    printf '%s\n' "$wrapper contains the hook line but it does not execute; fix the wrapper by hand" >&2
+    exit 1
   fi
   if ! infinite_wrapper_anchor_ok "$wrapper"; then
     printf '%s\n' "Cannot patch $wrapper: the 'export SHELL=/bin/bash' anchor must appear exactly once, at top level, before any function or brace group (see deploy/ubuntu/agent-anchor.sh)" >&2
@@ -55,6 +65,11 @@ for provider in claude codex codex-app-server grok opencode; do
   # it) and mode; the temporary file was created root:root.
   chown --reference="$wrapper" "$temporary"
   chmod --reference="$wrapper" "$temporary"
+  if ! infinite_wrapper_hook_proven "$temporary"; then
+    rm -f "$temporary"
+    printf '%s\n' "Patched copy of $wrapper never ran the loader hook (anchor not on the launch path); not installed, backup kept at $backup" >&2
+    exit 1
+  fi
   mv -f "$temporary" "$wrapper"
   printf '%s\n' "Patched $wrapper; backup: $backup"
 done

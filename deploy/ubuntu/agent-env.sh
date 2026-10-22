@@ -86,8 +86,15 @@ infinite_load_env() {
   _infinite_env_file=$_infinite_env_dir/android.env
   _infinite_env_load_file "$_infinite_env_file" "$_infinite_env_agent_uid"
 
-  case $_infinite_env_project_id in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
-  _infinite_env_file=$_infinite_env_dir/projects/$_infinite_env_project_id.env
-  _infinite_env_load_file "$_infinite_env_file" "$_infinite_env_agent_uid"
+  case $_infinite_env_project_id in ''|*[!A-Za-z0-9._-]*) ;; *)
+    _infinite_env_file=$_infinite_env_dir/projects/$_infinite_env_project_id.env
+    _infinite_env_load_file "$_infinite_env_file" "$_infinite_env_agent_uid" ;;
+  esac
+  # Installer self-test: prove this hook executes on the wrapper's real launch
+  # path, then stop before any provider starts (see agent-anchor.sh).
+  if [ -n "${INFINITE_AGENT_ENV_SELFTEST:-}" ]; then
+    printf 'infinite-agent-env: loaded\n'
+    exit 0
+  fi
   return 0
 }

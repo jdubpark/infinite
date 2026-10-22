@@ -122,3 +122,30 @@ test("the installer accepts only a single top-level export SHELL anchor", () => 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("the installer proves the hook executes by running the wrapper in self-test mode", () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-hook-"));
+  const hook = `. "${loader}" && infinite_load_env "${root}" ""`;
+  const tail = 'provider=$(basename "$0")\ncase "$provider" in\n  claude) echo PROVIDER-REACHED ;;\n  *) printf "Unknown agent launcher\\n" >&2; exit 64 ;;\nesac\necho PROVIDER-REACHED\n';
+  const proven = (name: string, body: string) => {
+    const file = join(root, name);
+    writeFileSync(file, body, { mode: 0o755 });
+    chmodSync(file, 0o755);
+    const result = spawnSync("/bin/sh", ["-c", '. "$1"; infinite_wrapper_hook_proven "$2"', "sh", anchorCheck, file], { encoding: "utf8" });
+    return { proven: result.status === 0, status: result.status, out: result.stdout + result.stderr };
+  };
+  try {
+    mkdirSync(join(root, "secrets"));
+    assert.equal(proven("good.probe", `#!/bin/sh\nset -eu\nexport SHELL=/bin/bash\n${hook}\n${tail}`).proven, true, "a top-level hook is proven");
+    assert.equal(proven("heredoc.probe", `#!/bin/sh\nset -eu\ncat <<'HELP' >/dev/null\nexport SHELL=/bin/bash\n${hook}\nHELP\n${tail}`).proven, false, "a hook inside heredoc text is not proven");
+    assert.equal(proven("comment-brace.probe", `#!/bin/sh\nset -eu\nunused() { # }\nexport SHELL=/bin/bash\n${hook}\n}\n${tail}`).proven, false, "a hook inside a function is not proven");
+    assert.equal(proven("claude", `#!/bin/sh\n${tail}`).status, 2, "a provider-named file is never executed");
+    for (const name of ["heredoc.probe", "comment-brace.probe"]) {
+      const file = join(root, name);
+      const run = spawnSync("/bin/sh", ["-c", 'INFINITE_AGENT_ENV_SELFTEST=1 "$1"', "sh", file], { encoding: "utf8" });
+      assert.doesNotMatch(run.stdout, /PROVIDER-REACHED/, `${name}: the self-test never reaches a provider launch`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

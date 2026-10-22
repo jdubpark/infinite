@@ -32,8 +32,9 @@ for provider in claude codex codex-app-server grok opencode; do
     printf '%s\n' "Already patched $wrapper"
     continue
   fi
-  if ! grep -Fqx 'export SHELL=/bin/bash' "$wrapper"; then
-    printf '%s\n' "Cannot patch $wrapper: missing export SHELL=/bin/bash" >&2
+  anchors=$(grep -Fcx 'export SHELL=/bin/bash' "$wrapper" || true)
+  if [ "$anchors" -ne 1 ]; then
+    printf '%s\n' "Cannot patch $wrapper: expected exactly one 'export SHELL=/bin/bash' line, found $anchors" >&2
     exit 1
   fi
 
@@ -50,6 +51,9 @@ for provider in claude codex codex-app-server grok opencode; do
     printf '%s\n' "Could not patch $wrapper; backup kept at $backup" >&2
     exit 1
   fi
+  # Keep the wrapper's owner, group (infinite-agent must stay able to run
+  # it) and mode; the temporary file was created root:root.
+  chown --reference="$wrapper" "$temporary"
   chmod --reference="$wrapper" "$temporary"
   mv -f "$temporary" "$wrapper"
   printf '%s\n' "Patched $wrapper; backup: $backup"

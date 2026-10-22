@@ -47,8 +47,15 @@ test("owner-managed environment files load safely in sorted, layered order", () 
       "KEY = spaced",
       "LITERAL=$(touch pwned)",
       "VALUE_EQUALS=first=second",
+      "_infinite_env_project_id=other",
+      "_infinite_env_dir=/nonexistent",
+      "OPTIND=not-a-number",
+      "IFS=x",
+      "CRLF=value\r",
       "",
     ].join("\n"));
+    mkdirSync(join(root, "projects", "other"), { recursive: true });
+    writeFileSync(join(root, "projects", "other.env"), "HIJACKED=yes\n");
     writeFileSync(join(root, "secrets", "b.env"), "ORDER=last\nSAME=secret-last\n");
     writeFileSync(join(root, "secrets", "world.env"), "WORLD_SECRET=must-skip\n", { mode: 0o666 });
     chmodSync(join(root, "secrets", "world.env"), 0o666);
@@ -69,6 +76,10 @@ test("owner-managed environment files load safely in sorted, layered order", () 
     for (const denied of ["INFINITE_X", "INFINITE_PROJECT_ID", "SUDO_USER", "XDG_DATA_HOME", "LD_PRELOAD", "npm_config_prefix", "provider"])
       assert.equal(values.has(denied), false, `${denied} is denied`);
     for (const malformed of ["1BAD", "no_equals", "KEY "]) assert.equal(values.has(malformed), false);
+    for (const special of ["_infinite_env_project_id", "_infinite_env_dir", "OPTIND", "IFS"])
+      assert.equal(values.has(special), false, `${special} is denied`);
+    assert.equal(values.has("HIJACKED"), false, "a file key cannot redirect project selection");
+    assert.equal(values.get("CRLF"), "value", "a trailing carriage return is stripped");
     assert.equal(values.has("WORLD_SECRET"), false);
     assert.equal(stderr.trim(), `infinite_load_env: skipping ${join(root, "secrets", "world.env")}: world-writable`);
     assert.equal(existsSync(join(root, "pwned")), false, "value text is never evaluated");

@@ -35,7 +35,11 @@ for host-wide credentials, Android tooling, and a selected project. Values are
 exported literally and never passed through `eval`, so file contents cannot
 execute shell substitutions or command syntax during loading. A deny list
 protects the launcher's `PATH`, home, shell, temporary and XDG paths, sudo and
-Infinite control variables, and wrapper-owned settings from file overrides.
+Infinite control variables, and wrapper-owned settings from file overrides,
+and also rejects the loader's own underscore-prefixed namespace and names the
+shell interprets on assignment (`IFS`, `OPTIND`, `PS1`..`PS4`, `PWD`, `ENV`,
+`BASH_ENV`, `CDPATH`, locale variables and similar), so a file cannot redirect
+project selection or abort the wrapper. A trailing carriage return is dropped.
 This keeps owner-supplied build credentials from changing the execution
 identity, launcher paths, or host-to-worker control channel.
 

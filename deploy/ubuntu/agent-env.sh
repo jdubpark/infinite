@@ -8,6 +8,7 @@ _infinite_env_warn() {
 _infinite_env_load_file() {
   _infinite_env_file=$1
   _infinite_env_agent_uid=$2
+  _infinite_env_cr=$(printf '\r')
   if [ ! -e "$_infinite_env_file" ] && [ ! -L "$_infinite_env_file" ]; then
     return 0
   fi
@@ -37,6 +38,7 @@ _infinite_env_load_file() {
   esac
 
   while IFS= read -r _infinite_env_line || [ -n "$_infinite_env_line" ]; do
+    _infinite_env_line=${_infinite_env_line%"$_infinite_env_cr"}
     case $_infinite_env_line in ''|'#'*) continue ;; esac
     case $_infinite_env_line in *=*) ;; *) continue ;; esac
     _infinite_env_key=${_infinite_env_line%%=*}
@@ -50,9 +52,13 @@ _infinite_env_load_file() {
       continue
     fi
 
+    # Denied: launcher-owned keys, this loader's own namespace (any leading
+    # underscore), and names the shell interprets on assignment.
     case $_infinite_env_key in
-      PATH|HOME|SHELL|TMPDIR|LD_*|XDG_*|INFINITE_*|SUDO_*|npm_config_prefix|provider)
-        continue ;;
+      PATH|HOME|SHELL|TMPDIR|LD_*|XDG_*|INFINITE_*|SUDO_*|npm_config_prefix|provider) continue ;;
+      _*) continue ;;
+      IFS|OPTIND|OPTARG|PS1|PS2|PS3|PS4|PWD|OLDPWD|SHLVL|LINENO|RANDOM|SECONDS|PPID|UID|EUID|GROUPS) continue ;;
+      ENV|BASH_ENV|BASH*|ZDOTDIR|CDPATH|FPATH|MAIL|MAILPATH|MAILCHECK|HISTFILE|HISTSIZE|LC_ALL|LANG|LC_*) continue ;;
     esac
     export "$_infinite_env_key=$_infinite_env_value"
   done < "$_infinite_env_file"

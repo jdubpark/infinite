@@ -103,7 +103,8 @@ export async function connectCodexEnvironments(options: {
       if (binary) throw new Error("Expected provider JSON");
       const message = object(JSON.parse(data.toString()));
       if (!message) throw new Error("Invalid provider JSON");
-      observe(message);
+      // Lifecycle state comes from the persistent observer via observe().
+      // Copies on this request connection can arrive after newer observer events.
       if (message.method !== undefined || typeof message.id !== "number") return;
       const entry = pending.get(message.id);
       if (!entry) return;

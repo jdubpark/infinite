@@ -57,9 +57,15 @@ async function main() {
       ] });
       return;
     }
-    if (cycleScenario && progress.completed === 0
-      && (!prompt.includes("progress starts at 0") || !prompt.includes("check.mjs validates progress")))
-      throw new Error("The planning coordinator did not receive the scouts' recorded evidence");
+    if (cycleScenario && progress.completed === 0) {
+      if (!prompt.includes(".git/infinite-team-context.json"))
+        throw new Error("The planning coordinator was not directed to the full discovery context");
+      const context = JSON.parse(readFileSync(".git/infinite-team-context.json", "utf8"));
+      const observations = (context.discovery?.tasks ?? []).flatMap(task => task.evidence ?? []).map(item => item.observation);
+      if (!observations.some(value => value.includes("progress starts at 0"))
+        || !observations.some(value => value.includes("check.mjs validates progress")))
+        throw new Error("The planning coordinator could not read the scouts' complete recorded evidence");
+    }
     const target = progress.completed + 1;
     await report({ kind: "plan", summary: `Implement progress step ${target}`, brief: {
       title: `Progress step ${target}`, problem: `The fixture is missing progress step ${target}`,

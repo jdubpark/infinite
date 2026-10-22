@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { approvalOwner, blockedTeamsFirst, canResumeBlockedTeam, goalControls, goalGroup, groupRuns, newer, openDecisions, pendingApprovals, taskKind, teamControls, teamGroup, teamKind, teamPhases, workerStatus, type PermissionDecision, type ProductGoal, type TeamMember, type TeamTask, type TeamView } from "../apps/mobile/src/features/teams/model.ts";
+import { approvalOwner, blockedTeamsFirst, canContinueBlockedTeam, canResumeBlockedTeam, goalControls, goalGroup, groupRuns, newer, openDecisions, pendingApprovals, taskKind, teamControls, teamGroup, teamKind, teamPhases, workerStatus, type PermissionDecision, type ProductGoal, type TeamMember, type TeamTask, type TeamView } from "../apps/mobile/src/features/teams/model.ts";
 import { age, initials } from "../apps/mobile/src/status.ts";
 import { runRequests } from "../apps/mobile/src/store/requests.ts";
 
@@ -123,6 +123,18 @@ test("blocked team runs lead the list stably and only eligible owners can resume
   assert.equal(canResumeBlockedTeam(team({ ...eligible, goal: { id: "goal", revision: 1, cycle: 1 } }), "owner"), false);
   assert.equal(canResumeBlockedTeam(team({ ...eligible, deliveryReceipt: { revision: 2, headCommit: "head", pullRequestUrl: "https://example.com/pr", mergeCommit: "merge", summary: "Reported", reportedAt: "2026-01-01T00:00:00.000Z" } }), "owner"), false);
   assert.equal(canResumeBlockedTeam(team({ status: "blocked" }), "owner"), false);
+  const continuable = team({ status: "blocked", resumable: true, continuable: true });
+  assert.equal(canContinueBlockedTeam(continuable, "owner"), true);
+  assert.equal(canContinueBlockedTeam(continuable, "controller"), false);
+  assert.equal(canContinueBlockedTeam(continuable, "viewer"), false);
+  assert.equal(canContinueBlockedTeam(team({ ...continuable, status: "implementing" }), "owner"), false);
+  assert.equal(canContinueBlockedTeam(team({ ...continuable, goal: { id: "goal", revision: 1, cycle: 1 } }), "owner"), false);
+  assert.equal(canContinueBlockedTeam(team({ ...continuable, missionId: "mission" }), "owner"), false);
+  assert.equal(canContinueBlockedTeam(team({ ...continuable, deliveryReceipt: { revision: 2, headCommit: "head", pullRequestUrl: "https://example.com/pr", mergeCommit: "merge", summary: "Reported", reportedAt: "2026-01-01T00:00:00.000Z" } }), "owner"), false);
+  assert.equal(canContinueBlockedTeam(team({ ...continuable, pullRequest: { revision: 2, headCommit: "head", pullRequestUrl: "https://example.com/pr", summary: "Open", reportedAt: "2026-01-01T00:00:00.000Z" } }), "owner"), false);
+  assert.equal(canResumeBlockedTeam(continuable, "owner"), false);
+  assert.equal(teamControls(continuable, "owner", true).resume, false);
+  assert.equal(teamControls(continuable, "owner", true).steer, false);
 });
 
 test("phone status icons show plan progress without reading a full ring as completion", () => {

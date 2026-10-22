@@ -969,6 +969,127 @@ test("a legacy completed read-only check failure resumes only from its current e
   } finally { await f.close(); }
 });
 
+test("an unchanged required-check failure stops after one repair and owner Continue preserves the run across relay retries", { timeout: 150000 }, async () => {
+  const f = await fixture("repeat-failed-check");
+  const owner = createRemoteClient({ url: f.host.origin, token: f.host.tokens.owner });
+  try {
+    const created = await owner.request<TeamView>("/teams", { body: f.create() });
+    await f.settled(created.id);
+    const blocked = await waitFor(() => f.get(created.id), run => run.status === "blocked" && run.continuable && run.members.every(member => member.status === "stopped"), 30000);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.equal(blocked.blockCode, "repeated-check-failure");
+    assert.equal(blocked.reason, "The same required verification command failed again against an unchanged integration commit. No further identical repair was attempted; inspect the check output and continue with owner direction.");
+    assert.equal(blocked.continuable, true);
+    assert.equal(blocked.round, 1, "An identical failed check must not spend another correction round");
+    const failures = blocked.checks.filter(check => check.status === "failed");
+    assert.equal(failures.length, 2, "The required command ran again after one correction");
+    assert.equal(failures[0].headCommit, failures[1].headCommit, "The second failure is tied to the exact same integration commit");
+    assert.ok(blocked.members.every(member => member.status === "stopped"), "Continue is offered only after member exits are confirmed");
+    const integrator = blocked.members.find(member => member.role === "integrator" && member.revision === blocked.revision);
+    assert.ok(integrator);
+    const context = JSON.parse(readFileSync(join(integrator.cwd, ".git", "infinite-team-context.json"), "utf8"));
+    assert.deepEqual([context.runId, context.revision], [blocked.id, blocked.revision]);
+    assert.match(context.objective, /Create independent files/);
+    assert.match(context.feedback, /Configured verification failed/);
+    assert.match(context.feedback, /"exitCode":17/);
+
+    const key = readFileSync(f.host.config.keyFile);
+    const storedFile = join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`);
+    const rewriteStored = async (update: (stored: any) => void) => {
+      await f.host.stopApi();
+      const stored = unseal<any>(key, `team:${blocked.id}`, readFileSync(storedFile, "utf8"));
+      update(stored);
+      writeSealed(storedFile, key, `team:${blocked.id}`, stored);
+      await f.host.start();
+      return f.get(blocked.id);
+    };
+
+    for (const role of ["controller", "viewer"] as const) {
+      const denied = await f.host.fetchApi(`/teams/${blocked.id}/continue`, role, { requestId: randomUUID(), revision: blocked.revision });
+      assert.equal(denied.status, 403);
+    }
+    const extraField = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: blocked.revision, text: "Review the check.", skipChecks: true });
+    assert.equal(extraField.status, 400, "Continue rejects unrecognized fields instead of accepting a check-waiver option");
+    const stale = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: blocked.revision + 1 });
+    assert.deepEqual([stale.status, stale.body.code], [409, "stale-team-revision"]);
+
+    const legacyPromptTooLargeReason = "The team requirements exceed the prompt limit. Start a new team with consolidated requirements.";
+    const uncertain = await rewriteStored(stored => {
+      stored.run.blockCode = undefined;
+      stored.run.reason = legacyPromptTooLargeReason;
+      stored.run.permissionDecisions = [{ status: "uncertain" }];
+    });
+    assert.equal(uncertain.continuable, false, "An uncertain permission side effect blocks Continue even on a recognized legacy reason");
+    const uncertainDenied = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.deepEqual([uncertainDenied.status, uncertainDenied.body.code], [409, "team-continuation-unavailable"]);
+
+    const legacy = await rewriteStored(stored => { stored.run.permissionDecisions = []; });
+    assert.equal(legacy.continuable, true, "The exact legacy prompt-limit reason remains recognized without a stored error code");
+    for (const recoverable of [
+      { code: undefined, reason: "The team exhausted its two correction rounds. Review the check and agent evidence before continuing manually." },
+      { code: "agent-blocked", reason: "An agent reported a blocker that needs a new plan." },
+      { code: undefined, reason: "An agent exited without a valid structured report. Its task is unresolved." },
+    ]) {
+      const view = await rewriteStored(stored => { stored.run.blockCode = recoverable.code; stored.run.reason = recoverable.reason; });
+      assert.equal(view.continuable, true, `The recognized ${recoverable.code ?? "legacy"} blocked state can continue`);
+    }
+    const deliveryPending = await rewriteStored(stored => {
+      stored.deliveryAttempt = { memberId: randomUUID(), revision: blocked.revision, headCommit: blocked.headCommit! };
+    });
+    assert.equal(deliveryPending.continuable, false, "A delivery attempt is not replayable through Continue");
+    const deliveryDenied = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.deepEqual([deliveryDenied.status, deliveryDenied.body.code], [409, "team-continuation-unavailable"]);
+    const goalOwned = await rewriteStored(stored => {
+      delete stored.deliveryAttempt;
+      stored.run.goal = {};
+    });
+    assert.equal(goalOwned.continuable, false);
+    const goalDenied = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.deepEqual([goalDenied.status, goalDenied.body.code], [409, "goal-owned-team"]);
+    const legacyEligible = await rewriteStored(stored => { delete stored.run.goal; });
+    assert.equal(legacyEligible.continuable, true);
+
+    const dirtyPath = join(legacyEligible.workspace, "owner-continuation-check.txt");
+    writeFileSync(dirtyPath, "retain this edit when continuation is refused\n");
+    const dirty = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: legacyEligible.revision });
+    assert.equal(dirty.status, 409);
+    assert.equal(existsSync(dirtyPath), true, "Continuation refuses dirty work without deleting the owner's edit");
+    assert.equal(git(legacyEligible.workspace, "rev-parse", "HEAD"), blocked.headCommit);
+    rmSync(dirtyPath);
+
+    const request = { requestId: randomUUID(), revision: legacyEligible.revision, text: " Keep the original requirements and inspect the failed command evidence. " };
+    const continued = await owner.request<TeamView>(`/teams/${blocked.id}/continue`, { body: request });
+    assert.equal(continued.status, "planning");
+    assert.equal(continued.revision, blocked.revision + 1);
+    assert.equal(continued.continuable, false);
+    assert.equal(continued.objective, blocked.objective);
+    assert.equal(continued.baseCommit, blocked.baseCommit);
+    assert.equal(continued.workspace, blocked.workspace);
+    assert.equal(git(continued.workspace, "rev-parse", "HEAD"), blocked.headCommit);
+    assert.equal(git(continued.workspace, "status", "--porcelain"), "");
+    assert.equal(continued.tasks.length, 0, "The new revision starts a fresh plan");
+    assert.deepEqual(continued.continuations?.[0]?.tasks.map(task => [task.id, task.status, task.summary]),
+      blocked.tasks.map(task => [task.id, task.status, task.summary]));
+    assert.equal(continued.members.length, blocked.members.length);
+    assert.equal(continued.checks.length, blocked.checks.length, "Historical check evidence remains attached to the run");
+    assert.equal(continued.steering.at(-1)?.text, "Keep the original requirements and inspect the failed command evidence.");
+
+    await waitFor(() => f.get(blocked.id), run => run.members.some(member => member.role === "project-manager" && member.revision === continued.revision), 30000);
+    const active = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { requestId: randomUUID(), revision: continued.revision });
+    assert.equal(active.status, 409, "A live continuation cannot be started twice under a new request ID");
+    await f.host.stopApi();
+    await f.host.start();
+    const retry = await owner.request<TeamView>(`/teams/${blocked.id}/continue`, { body: request });
+    assert.equal(retry.revision, continued.revision, "A retry after restart returns the recorded continuation");
+    const recovered = await f.get(blocked.id);
+    assert.equal(recovered.members.filter(member => member.role === "project-manager" && member.revision === continued.revision).length, 1,
+      "Idempotent replay does not create a duplicate planner");
+
+    const conflict = await f.host.fetchApi(`/teams/${blocked.id}/continue`, "owner", { ...request, text: "Different direction" });
+    assert.deepEqual([conflict.status, conflict.body.code], [409, "request-conflict"]);
+  } finally { owner.close(); await f.close(); }
+});
+
 test("a stale read-only event cannot authorize a completed check with another current reason", { timeout: 120000 }, async () => {
   const f = await fixture("success");
   try {

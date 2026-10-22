@@ -15,7 +15,7 @@ import { theme } from "../../theme";
 import { DictationNotice } from "../../dictation/DictationControls";
 import { useDictation } from "../../dictation/useDictation";
 import {
-  MEMBER_LABELS, memberKind, newer, openDecisions, pendingApprovals, ROLE_NAMES, shortDate, TEAM_LABELS, taskGroups, taskKind, teamControls, teamKind, teamPhases, teamProgress, workerStatus,
+  MEMBER_LABELS, memberKind, newer, openDecisions, pendingApprovals, ROLE_NAMES, shortDate, TEAM_LABELS, taskGroups, taskKind, canContinueBlockedTeam, teamControls, teamKind, teamPhases, teamProgress, workerStatus,
   type ModelProfile, type PhaseState, type TeamCheck, type TeamDecision, type TeamMember, type TeamTask, type TeamView,
 } from "./model";
 import { Clamp, Disclosure, LinearChip, LineupView, ProfileLine, providerName, RequestStatus, Section, SteerBox, t } from "./parts";
@@ -61,7 +61,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const [dockHeight, setDockHeight] = useState(0);
   const [taskId, setTaskId] = useState("");
   const request = useRunRequest<TeamView>(connection, `${machine}/team/${id}`, {
-    accepted: (result, sent) => { setRecorded(result); if (sent.path.endsWith("/steer")) setDirection(""); poll.refresh(); },
+    accepted: (result, sent) => { setRecorded(result); if (sent.path.endsWith("/steer") || sent.path.endsWith("/continue")) setDirection(""); poll.refresh(); },
     refused: poll.refresh,
   });
   const fresh = poll.online;
@@ -86,6 +86,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const controls = teamControls(team, me?.role, fresh);
   // Which controls the run offers at all; a stale view disables them in place rather than removing them.
   const offered = teamControls(team, me?.role, true);
+  const canContinue = canContinueBlockedTeam(team, me?.role);
+  const continuationEligible = team.status === "blocked" && team.continuable === true && !team.goal && !team.missionId && !team.deliveryReceipt && !team.pullRequest;
   const locked = request.busy || Boolean(request.pending);
   const decisions: TeamDecision[] = team.missionId ? [] : openDecisions(team);
   const listed = new Map((sessions ?? []).map(session => [session.id, session]));
@@ -200,7 +202,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           {/* The host's reason for an open agent prompt points at the member session; the approvals below answer it here. */}
           {team.reason && !approvals.length && !sessionsPoll.loading ? <Text style={kind === "blocked" ? t.error : t.warning}>{team.reason}</Text> : null}
           {owns ? <View style={s.controls}>
-            {(team.status === "paused" || team.resumable) && !team.deliveryReceipt ? <Button compact busy={Boolean(request.pending?.label === "Resume" && request.busy)} glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
+            {(team.status === "paused" || team.resumable) && !team.deliveryReceipt && !canContinue ? <Button compact busy={Boolean(request.pending?.label === "Resume" && request.busy)} glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
               : offered.pause ? <Button compact busy={Boolean(request.pending?.label === "Pause" && request.busy)} secondary glyph="pause" title="Pause" disabled={!controls.pause || locked} onPress={() => send("/pause", "Pause")} /> : null}
             <Button compact busy={Boolean(request.pending?.label === "Cancellation" && request.busy)} secondary glyph="close" title="Cancel…" disabled={!controls.cancel || locked} onPress={() => Alert.alert("Cancel this team?", "Stops its agents. Work and evidence stay.", [
               { text: "Keep running", style: "cancel" },
@@ -210,6 +212,15 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             <Button compact secondary glyph="target" title={`Goal cycle ${team.goal.cycle}`} onPress={() => router.push({ pathname: "/goal/[id]", params: { id: team.goal!.id, machine } })} />
                       </View> : null}
         </Card>
+        {canContinue ? <Card style={s.gapTop}>
+          <Text style={t.strong}>Continue this blocked run</Text>
+          <Text style={t.note}>A fresh plan preserves the current work, linked issue, policies, and evidence. Required checks still apply. If delivery is uncertain, retry the same request instead of starting another.</Text>
+          <Text style={t.label}>Direction for continuation (optional)</Text>
+          <TextInput accessibilityLabel="Direction for continuation" value={direction} onChangeText={setDirection} editable={fresh && !locked} multiline maxLength={8000}
+            placeholder="Add direction for the next plan…" placeholderTextColor={theme.colors.placeholder} style={s.answerInput} />
+          <Button title="Continue development" glyph="play" busy={Boolean(request.pending?.label === "Continue development" && request.busy)} disabled={!fresh || locked}
+            onPress={() => send("/continue", "Continue development", direction.trim() ? { text: direction.trim() } : {})} />
+        </Card> : null}
         {team.status === "ready-for-review" ? <Card style={s.gapTop}>
           <View style={s.line}><StatusIcon kind="review" size={16} /><Text style={[t.strong, s.fill]}>Ready for your review</Text><Text style={t.note}>team report</Text></View>
           <Button compact secondary title="Evidence" onPress={() => setTab("activity")} />
@@ -337,6 +348,24 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             {team.brief.evidence.map((item, index) => <Text key={index} style={t.note}>{item.source}: {item.observation}</Text>)}
           </Disclosure> : null}
         </Section>
+        {team.continuations?.length ? <Section title="Earlier blocked revisions" count={team.continuations.length}>
+          {team.continuations.map(continuation => <View key={continuation.requestId} style={s.record}>
+            <Text style={t.note}>Revision {continuation.revision} · continued {shortDate(continuation.at)}</Text>
+            <Text style={t.body}>{continuation.reason}</Text>
+            <Text selectable style={t.mono}>Preserved head commit · {continuation.headCommit}</Text>
+            <Disclosure title={`${continuation.tasks.length} preserved tasks`}>
+              {continuation.tasks.map(task => <View key={task.id} style={s.record}>
+                <Text style={t.strong}>{task.title} · {task.status}</Text>
+                {task.summary ? <Clamp text={task.summary} lines={4} /> : null}
+                <Text style={t.note}>{task.instructions}</Text>
+                {task.paths.length ? <Text selectable style={t.mono}>{task.paths.join(", ")}</Text> : null}
+                {task.commit ? <Text selectable style={t.mono}>Integrated commit · {task.commit}</Text> : null}
+              </View>)}
+            </Disclosure>
+            {continuation.review ? <Disclosure title={`Reviewer assessment · ${continuation.review.verdict}`}><Text style={t.body}>{continuation.review.summary}</Text>{continuation.review.uiEvidence ? <Text style={t.note}>{continuation.review.uiEvidence}</Text> : null}</Disclosure> : null}
+            {continuation.brief ? <Disclosure title="Preserved opportunity brief"><Text style={t.strong}>{continuation.brief.title}</Text><Clamp text={continuation.brief.problem} lines={4} />{continuation.brief.evidence.map((item, index) => <Text key={index} style={t.note}>{item.source}: {item.observation}</Text>)}</Disclosure> : null}
+          </View>)}
+        </Section> : null}
         {team.steering.length || answered.length ? <Section title="Your directions and decisions" count={team.steering.length + answered.length}>
           {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>Direction · rev {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
           {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · rev {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>{decision.answeredBy === "coordinator" ? "Mission coordinator" : "You"}: {decision.answer}</Text></View>)}
@@ -350,12 +379,12 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </View> : null}
     </ScrollView>
     <View style={s.dock} onLayout={(event) => setDockHeight(event.nativeEvent.layout.height)}>
-      {team.missionId ? <MissionManagedLine missionId={team.missionId} machine={machine} /> : <SteerBox value={direction} onChange={setDirection} dictation={dictation} placeholder="Direct the team…"
+      {team.missionId ? <MissionManagedLine missionId={team.missionId} machine={machine} /> : continuationEligible ? <Text style={t.note}>{me?.role === "owner" ? "Continue this run from Overview." : "Only an owner can continue this blocked run."}</Text> : <SteerBox value={direction} onChange={setDirection} dictation={dictation} placeholder="Direct the team…"
         enabled={controls.steer && !locked} busy={request.busy}
         note={team.status === "delivering" || team.status === "merged" || team.deliveryReceipt ? "Delivery started · check its PR first."
           : me?.role === "viewer" ? "View only."
           : team.goal ? "Steer from its goal."
-            : team.status === "cancelled" ? "Cancelled." : undefined}
+          : team.status === "cancelled" ? "Cancelled." : undefined}
         onSend={() => { const text = direction.trim(); if (text) send("/steer", "Direction", { text }); }} />}
     </View>
     <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh && me?.role !== undefined && me.role !== "viewer" && (me.role === "owner" || /\/(steer|answer)$/.test(request.pending?.path ?? ""))} />

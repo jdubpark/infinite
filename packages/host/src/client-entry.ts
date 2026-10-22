@@ -39,7 +39,9 @@ infinite team status [ID] [--json] [--logs] | team watch ID [--logs] | team pull
   l review logs · s summary · ←→ or n/p agent · ↑↓ j/k space scroll · a ask Jevcode · q quit
   --logs starts in the review log. --json prints the team record.
 infinite team steer ID TEXT | team answer ID QUESTION_ID TEXT
+infinite team continue ID [TEXT] [--json] [--request-id UUID]
 infinite team pause|resume|cancel ID
+  continue is owner-only for safe blocked runs; inspect status before retrying an uncertain request with its original direction and request ID.
 
 Put Infinite options before the provider. Everything after it is passed unchanged.
 Sessions run on the cloud machine. --laptop runs Codex tools in this directory with background cloud handoff.

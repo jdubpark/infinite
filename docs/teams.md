@@ -11,10 +11,10 @@ that request without selecting a sequence of follow-up improvements. Both flows
 show member sessions, questions, steering, file ownership, and verification
 records. The web interface supports desktop and narrow phone browsers. The
 native phone app has **Teams** and **Goals** tabs beside its sessions. It
-starts, answers, steers, pauses, resumes, and cancels runs with the same roles
-and request rules as the web client, and records goal outcomes. It opens member
-sessions, and a member session links back to its team. The Mac app shows Teams
-only.
+starts, answers, steers, pauses, resumes, continues eligible blocked runs, and
+cancels runs with the same roles and request rules as the web client, and
+records goal outcomes. It opens member sessions, and a member session links
+back to its team. The Mac app shows Teams only.
 
 A team opens on the same layout in the web client, the phone app, and
 `infinite team watch`. Open decisions come first. The Jevcode summary follows,
@@ -62,6 +62,7 @@ infinite team status TEAM_ID --logs
 infinite team watch TEAM_ID
 infinite team steer TEAM_ID "Keep the existing checkout layout"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing retry policy"
+infinite team continue TEAM_ID "Preserve the current checkout design"
 ```
 
 `infinite team status` without an ID lists each team's members, tasks, and open
@@ -1145,12 +1146,34 @@ looks:
 * **Linear.** The tracked issue gets the reason, the next step and a `Blocked`
   label (see [Linear tracking](#linear-tracking)).
 * **App lists.** Web, phone and Mac list blocked runs first, with the reason.
-  The list offers Resume when the run can resume, the same rule as the team
-  page.
+  Team detail offers Continue development when the owner can continue safely;
+  Resume remains for the existing supported resume cases.
 
 The host never resumes a blocked run itself. `infinite team resume ID` replans
 from the integrated work when the block allows it; otherwise inspect the run and
 start a new one.
+
+An owner can continue a blocked standalone run when its current state is marked
+continuable. This is available only when the host can safely start a fresh
+revision without a goal, mission, handoff, or uncertain operation or delivery.
+No cancellation is needed. Continuation keeps the original team and tracked
+issue, integrated work, repository policies, and prior evidence, then starts a
+fresh plan. Required checks still apply to the new revision. Add optional
+direction with `infinite team continue TEAM_ID [TEXT]`; the direction is trimmed
+and limited to 8,000 characters. Use the web or phone form to continue from the
+team detail when the host reports this option.
+
+An unconfirmed continuation is never replayed automatically. Inspect the current
+team state first. If the host did not record it and you choose to retry, use the
+same request ID and the original direction, for example:
+
+```sh
+infinite team continue TEAM_ID "Preserve the current checkout design" --request-id REQUEST_UUID
+```
+
+The web, phone, and Mac clients keep an unconfirmed request available as
+**Retry same request**. Do not cancel the run or create a new continuation to
+resolve an uncertain result.
 
 ## Reports and recovery
 
@@ -1238,9 +1261,14 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `GET /api/teams/:id` | None; returns reports and check evidence | Any paired device |
 | `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, optional `useConfiguredLineup` | Owner |
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
+| `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
+
+The continue request accepts exactly `requestId`, `revision`, and optional
+`text`; omit `text` when no direction is needed. A supplied direction is trimmed
+and must contain 1–8,000 characters.
 
 ## Model scorecard
 

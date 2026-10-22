@@ -24,6 +24,10 @@ struct TeamDetailView: View {
     @State private var expandedTasks: Set<String> = []
     @State private var fullRequest = false
     private var team: TeamRun { model.run }
+    private var continuationEligible: Bool {
+        team.status == "blocked" && team.value["continuable"].bool && !team.managedByMission
+            && team.value["goal"] == .null && team.value["deliveryReceipt"] == .null && team.value["pullRequest"] == .null
+    }
     var body: some View {
         VStack(spacing: 0) {
             header.padding(.horizontal, 14).padding(.vertical, 10)
@@ -92,7 +96,7 @@ struct TeamDetailView: View {
                 .help(model.displayStale ? "Updates unavailable. Controls stay disabled until the next successful refresh." : "")
             if model.role == "owner" && team.status != "cancelled" && !model.managed {
                 Menu {
-                    let resumes = team.status == "paused" || team.offersResume
+                    let resumes = team.status == "paused" || (team.offersResume && !model.offersContinue)
                     if resumes || !["blocked", "ready-for-review"].contains(team.status) {
                         Button(resumes ? "Resume team" : "Pause team") { Task { await model.perform(resumes ? "resume" : "pause") } }.disabled(!model.canOwn)
                     }
@@ -289,6 +293,42 @@ struct TeamDetailView: View {
                 }
             }
         }
+        let continuations = team.value["continuations"].array
+        if !continuations.isEmpty {
+            DisclosureGroup("Earlier blocked revisions (\(continuations.count))") {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(continuations.enumerated()), id: \.offset) { _, continuation in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Revision \(continuation["revision"].int) · continued \(teamDate(continuation["at"].string))")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Text(continuation["reason"].string).font(.callout).textSelection(.enabled)
+                            Text("Preserved head commit · \(continuation["headCommit"].string)").font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                            ForEach(Array(continuation["tasks"].array.enumerated()), id: \.offset) { _, task in
+                                DisclosureGroup("\(task["title"].string) · \(task["status"].string)") {
+                                    if !task["summary"].string.isEmpty { Text(task["summary"].string).font(.callout).textSelection(.enabled) }
+                                    Text(task["instructions"].string).font(.caption).textSelection(.enabled)
+                                    let paths = task["paths"].array.map(\.string).joined(separator: ", ")
+                                    if !paths.isEmpty { Text("Paths · \(paths)").font(.caption).textSelection(.enabled) }
+                                    if !task["commit"].string.isEmpty { Text("Integrated commit · \(task["commit"].string)").font(.system(size: 11, design: .monospaced)).textSelection(.enabled) }
+                                }
+                            }
+                            if continuation["review"] != .null {
+                                Text("Reviewer assessment · \(continuation["review"]["verdict"].string)").font(.caption.weight(.semibold))
+                                Text(continuation["review"]["summary"].string).font(.callout).textSelection(.enabled)
+                            }
+                            if continuation["brief"] != .null {
+                                DisclosureGroup("Preserved opportunity brief") {
+                                    Text(continuation["brief"]["problem"].string).font(.callout).textSelection(.enabled)
+                                    ForEach(Array(continuation["brief"]["evidence"].array.enumerated()), id: \.offset) { _, item in
+                                        Text("\(item["source"].string): \(item["observation"].string)").font(.caption).textSelection(.enabled)
+                                    }
+                                }
+                            }
+                        }.padding(.vertical, 5)
+                    }
+                }.padding(.top, 6)
+            }
+        }
         if !team.events.isEmpty {
             DisclosureGroup("Run history (\(team.events.count))") {
                 VStack(alignment: .leading, spacing: 6) {
@@ -315,6 +355,26 @@ struct TeamDetailView: View {
             }
             if model.role == "viewer" { Text("This device can view the team. An owner or controller can answer decisions and send direction.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
             else if team.status == "cancelled" { Text("This run is cancelled. Its work and evidence remain available above.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
+            else if continuationEligible {
+                if model.role == "owner" {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Direction for continuation (optional)").font(.caption.weight(.semibold))
+                        Text("A fresh plan uses the preserved work, issue, policies, and evidence. Required checks still apply. Retry an unconfirmed request with the same identity.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        PromptEditor(text: Binding(get: { model.direction }, set: { model.direction = $0 }), placeholder: "Add direction for the next plan…",
+                                     enabled: model.canContinue && model.direction.utf16.count <= 8000, transparent: true, submit: { Task { await model.continueRun() } })
+                            .frame(height: 64).glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        HStack {
+                            Text(model.notice.isEmpty ? "Your existing run and checks stay in place." : model.notice)
+                                .font(.system(size: 11)).foregroundStyle(model.noticeIsError ? Color.orange : .secondary).lineLimit(2).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Button { Task { await model.continueRun() } } label: {
+                                Group { if model.busy { ProgressView().controlSize(.small) } else { Label("Continue development", systemImage: "arrow.clockwise") } }
+                            }.buttonStyle(.borderedProminent).disabled(!model.canContinue || model.direction.utf16.count > 8000)
+                        }
+                    }
+                } else { Text("Only an owner can continue this blocked run.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
+            }
             else {
                 PromptEditor(text: Binding(get: { model.direction }, set: { model.direction = $0 }), placeholder: "Give the team a direction or change the requirements…",
                              enabled: model.canSteer, transparent: true, submit: { Task { await model.steer() } })

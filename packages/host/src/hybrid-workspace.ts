@@ -281,7 +281,7 @@ export async function createHybridWorkspace(options: {
       if (closed) return;
       const changed = online !== value;
       online = value; connected ||= value;
-      clearTimeout(reconnectTimer);
+      if (changed) clearTimeout(reconnectTimer);
       if (!value && changed) {
         reconnectDeadline = Date.now() + 5000;
         reconnectTimer = setTimeout(schedule, 5000);

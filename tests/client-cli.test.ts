@@ -615,6 +615,51 @@ test("an uncertain team start is resumed under its saved request ID instead of s
   } finally { proxy.closeAllConnections(); await new Promise<void>(resolve => proxy.close(() => resolve())); await run.close(); }
 });
 
+test("CLI continuation releases definitive rejections and preserves uncertain request identity", { timeout: 30000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "infinite-continue-cli-"));
+  const id = randomUUID(), first = randomUUID(), uncertain = randomUUID();
+  const received: { requestId: string; revision: number; text: string }[] = [];
+  let revision = 1, outcome: "rejected" | "uncertain" | "confirmed" = "rejected";
+  const server = createServer(async (req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    if (req.method === "GET") {
+      res.end(JSON.stringify({ id, revision, status: revision < 4 ? "blocked" : "planning", continuable: revision < 4 }));
+      return;
+    }
+    let content = "";
+    for await (const chunk of req) content += chunk;
+    received.push(JSON.parse(content));
+    if (outcome === "rejected") {
+      revision++; res.statusCode = 409; res.end(JSON.stringify({ code: "stale-team-revision" }));
+    } else if (outcome === "uncertain") {
+      revision = 4; res.statusCode = 503; res.end(JSON.stringify({ code: "unavailable" }));
+    } else res.end(JSON.stringify({ id, revision: 4, status: "planning" }));
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const clientFile = join(root, "client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: randomBytes(32).toString("hex") }), { mode: 0o600 });
+  const entry = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+  const run = (requestId: string) => exec(process.execPath, [...entry, "team", "continue", id, "Preserve the required checks", "--request-id", requestId, "--json"]);
+  try {
+    await assert.rejects(run(first), error => /409/.test(String(error)));
+    await assert.rejects(exec(process.execPath, [...entry, "team", "steer", id, "Keep the scope", "--request-id", randomUUID()]), error => /409/.test(String(error)));
+    outcome = "uncertain";
+    await assert.rejects(run(uncertain), error => /503/.test(String(error)));
+    assert.equal(received.length, 3, "Definitively rejected continuation and steering actions must allow a new request at the refreshed revision");
+    assert.equal(received[2].revision, 3);
+    await assert.rejects(run(randomUUID()), error => /uncertain result/.test(String(error)));
+    assert.equal(received.length, 3, "An uncertain request must block a new identity without another POST");
+    outcome = "confirmed";
+    const result = JSON.parse((await run(uncertain)).stdout);
+    assert.equal(result.revision, 4);
+    assert.deepEqual(received[3], received[2], "Retry keeps the original identity, revision and direction after a host revision change");
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("team CLI answers a decision and steers through the host API", { timeout: 120000 }, async () => {
   const run = await teamFixture("question"), clientFile = join(run.host.root, "question-client.json");
   writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });

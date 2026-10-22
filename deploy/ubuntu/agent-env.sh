@@ -64,11 +64,15 @@ _infinite_env_load_file() {
     esac
     # Files are additive: a variable the host already injected (sudoers
     # env_keep: session tokens, OpenCode credentials) is never overridden.
-    case $_infinite_env_preexisting in
-      *"$_infinite_env_nl$_infinite_env_key$_infinite_env_nl"*)
-        _infinite_env_warn "$_infinite_env_file" "$_infinite_env_key is set by the host"
-        continue ;;
-    esac
+    # The key matched ^[A-Za-z_][A-Za-z0-9_]*$ above, so this eval only
+    # tests whether that one name is set; earlier files in this load may
+    # still be layered over.
+    if eval "[ -n \"\${$_infinite_env_key+x}\" ]"; then
+      case $_infinite_env_file_set in
+        *"$_infinite_env_nl$_infinite_env_key$_infinite_env_nl"*) ;;
+        *) _infinite_env_warn "$_infinite_env_file" "$_infinite_env_key is set by the host"; continue ;;
+      esac
+    fi
     # No deny list is complete across shells: a readonly or arithmetic name
     # makes the assignment fatal under set -e. Probe it in a subshell first;
     # a fatal assignment only kills the subshell, and the key is skipped.
@@ -77,6 +81,7 @@ _infinite_env_load_file() {
       continue
     fi
     export "$_infinite_env_key=$_infinite_env_value"
+    _infinite_env_file_set=$_infinite_env_file_set$_infinite_env_key$_infinite_env_nl
   done < "$_infinite_env_file"
   return 0
 }
@@ -86,9 +91,9 @@ infinite_load_env() {
   _infinite_env_project_id=$2
   _infinite_env_agent_uid=$(id -u)
   _infinite_env_nl=$(printf '\n_'); _infinite_env_nl=${_infinite_env_nl%_}
-  # Names already in the environment before any file is read, one per line
-  # with surrounding newlines so exact matching works in case patterns.
-  _infinite_env_preexisting=$_infinite_env_nl$(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')$_infinite_env_nl
+  # Names exported by files during this load, newline-delimited, so that a
+  # later file may layer over an earlier one but never over the host.
+  _infinite_env_file_set=$_infinite_env_nl
 
   for _infinite_env_file in "$_infinite_env_dir"/secrets/*.env; do
     [ -e "$_infinite_env_file" ] || [ -L "$_infinite_env_file" ] || continue

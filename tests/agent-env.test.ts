@@ -11,16 +11,17 @@ const anchorCheck = resolve("deploy/ubuntu/agent-anchor.sh");
 const shells = ["/bin/sh", ...["dash", "bash"].filter((shell) => spawnSync(shell, ["-c", ":"]).status === 0)];
 
 function runLoader(root: string, projectId: string, shell = "/bin/sh", extraArgs: string[] = [], hostEnv: Record<string, string> = {}) {
-  const result = spawnSync(shell, [...extraArgs, "-c", 'set -eu; . "$1"; infinite_load_env "$2" "$3"; env', "sh", loader, root, projectId], {
+  // NUL-separated so a multi-line value cannot masquerade as another entry.
+  const result = spawnSync(shell, [...extraArgs, "-c", 'set -eu; . "$1"; infinite_load_env "$2" "$3"; env -0', "sh", loader, root, projectId], {
     cwd: root,
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...hostEnv },
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
   const values = new Map<string, string>();
-  for (const line of result.stdout.split(/\r?\n/)) {
-    const equals = line.indexOf("=");
-    if (equals > 0) values.set(line.slice(0, equals), line.slice(equals + 1));
+  for (const entry of result.stdout.split("\0")) {
+    const equals = entry.indexOf("=");
+    if (equals > 0) values.set(entry.slice(0, equals), entry.slice(equals + 1));
   }
   return { values, stderr: result.stderr };
 }
@@ -96,6 +97,12 @@ test("owner-managed environment files load safely in sorted, layered order", () 
     assert.equal(withHost.values.get("OPENCODE_SERVER_PASSWORD"), "host-secret");
     assert.equal(withHost.values.get("SAME"), "host-same", "layering between files never beats the host");
     assert.match(withHost.stderr, /HOST_OWNED is set by the host/);
+    for (const shell of shells) {
+      const multiline = runLoader(root, "p1", shell, shell === "bash" ? ["--posix"] : [], { REAL: "first line\nEXPO_TOKEN=anything\nORDER=x", HOST_OWNED: "from-host" });
+      assert.equal(multiline.values.get("EXPO_TOKEN"), "host-token", `${shell}: a multiline host value cannot invent host-owned names`);
+      assert.equal(multiline.values.get("ORDER"), "last", `${shell}: layering between files still applies`);
+      assert.equal(multiline.values.get("HOST_OWNED"), "from-host", `${shell}: host variables still win`);
+    }
     assert.equal(values.has("WORLD_SECRET"), false);
     assert.match(stderr, new RegExp(`infinite_load_env: skipping ${join(root, "secrets", "world.env")}: world-writable`));
     for (const shell of shells) {

@@ -153,10 +153,11 @@ test("ordinary prompts reference complete authoritative text when Unicode would 
   assert.ok(teamContext(run).ownerSteering[0].text === ownerDirection);
 });
 
-test("project-manager context exposes recent continuation task evidence without replacing the full snapshot", () => {
+test("project-manager context preserves recovery and continuation evidence within its prompt budget", () => {
   const run = largeRun();
   const continuedTask: TeamTask = { ...run.tasks[0], id: "prior-task", status: "blocked", summary: "Prior task failed its acceptance check." };
-  const continued = { ...run, continuations: [{ revision: 1, requestId: "request-id", at: "2026-10-21T00:00:00.000Z", reason: "Continue with the unresolved task.", headCommit: "c".repeat(40), tasks: [continuedTask] }] } as TeamRun;
+  const recovery = { attempts: 1, status: "planning" as const, source: { code: "agent-blocked", memberId: "worker", revision: 1, reason: `Shared return contract needs repair. ${"界".repeat(30000)}`, at: "2026-10-21T00:00:00.000Z" } };
+  const continued = { ...run, recovery, continuations: [{ revision: 1, requestId: "request-id", at: "2026-10-21T00:00:00.000Z", reason: "Continue with the unresolved task.", headCommit: "c".repeat(40), tasks: [continuedTask] }] } as TeamRun;
   const prompt = teamPrompt(continued, "project-manager", undefined, undefined, "demo");
 
   assert.match(prompt, /Recent continuation evidence/);
@@ -164,6 +165,10 @@ test("project-manager context exposes recent continuation task evidence without 
   assert.match(prompt, /Prior task failed its acceptance check/);
   assert.match(prompt, /full continuation task and review history there before replanning/);
   assert.equal(teamContext(continued).continuations[0].tasks[0].summary, continuedTask.summary);
+  assert.deepEqual(teamContext(continued).recovery, recovery);
+  assert.match(prompt, /Automatic recovery attempt 1 of 2/);
+  assert.match(prompt, /Shared return contract needs repair/);
+  assert.ok(Buffer.byteLength(prompt) <= PROMPT_LIMIT_BYTES);
 });
 
 test("permission evidence stays complete inline and an over-budget review fails closed", () => {

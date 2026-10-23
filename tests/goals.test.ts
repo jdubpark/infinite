@@ -58,7 +58,7 @@ async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof star
   const create = (): CreateGoal => ({ requestId: randomUUID(), projectId: "rehearsal", title: "Improve the progress flow",
     objective: "Build two small progress improvements using the existing data", successCriteria: "Two useful progress steps are available",
     nonGoals: [scenario === "delivery" ? "Changing files outside the feature directory" : "Publishing or changing files outside the feature directory"], allowedPaths: ["features"],
-    evidence: ["The fixture progress data starts at zero"], maxRuns: 2, maxMinutes: 5, maxMembers: 12, parallelism: 2 });
+    evidence: ["The fixture progress data starts at zero"], maxRuns: scenario === "recoverable-blocker" ? 1 : 2, maxMinutes: 5, maxMembers: 12, parallelism: 2 });
   const goal = async (id: string): Promise<ProductGoal> => {
     const response = await host.fetchApi(`/goals/${id}`); assert.equal(response.status, 200, JSON.stringify(response.body)); return response.body;
   };
@@ -225,6 +225,30 @@ test("a goal with no justified change records evidence without starting implemen
     assert.equal(run.headCommit, f.base);
     assert.equal(git(run.workspace, "status", "--porcelain"), "");
     assert.equal((await f.host.fetchApi(`/goals/${stopped.id}/resume`, "owner", { requestId: randomUUID(), revision: stopped.revision })).status, 409);
+  } finally { await f.close(); }
+});
+
+test("a recoverable child report keeps its goal active through the bounded PM repair", { timeout: 120000 }, async () => {
+  const f = await fixture("recoverable-blocker");
+  try {
+    const created = await f.host.fetchApi("/goals", "owner", f.create());
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const recovering = await waitFor(async () => {
+      const goal = await f.goal(created.body.id);
+      const team = goal.activeTeamId ? await f.team(goal.activeTeamId) : undefined;
+      return { goal, team };
+    }, value => value.team?.recovery?.status === "stopping" || value.team?.recovery?.status === "planning");
+    await waitFor(() => existsSync(join(f.receipts, `${recovering.team!.id}.recovery-pm-started`)), value => value);
+    const currentGoal = await f.goal(created.body.id), currentTeam = await f.team(recovering.team!.id);
+    assert.equal(currentTeam.status, "planning");
+    assert.equal(currentTeam.recovery?.status, "planning");
+    assert.equal(currentGoal.status, "running", "The goal remains supervised while its child PM is repairing the report");
+    writeFileSync(join(f.receipts, `${currentTeam.id}.release-recovery-pm`), "continue", { mode: 0o600 });
+
+    const settled = await f.settled(created.body.id);
+    assert.equal(settled.status, "ready-for-review", JSON.stringify(settled));
+    assert.equal(settled.cycles.length, 1);
+    assert.equal(settled.cycles[0].status, "ready-for-review");
   } finally { await f.close(); }
 });
 

@@ -325,6 +325,215 @@ test("a lifecycle run cannot be bundled before review", { timeout: 60000 }, asyn
   } finally { await f.close(); }
 });
 
+test("a blocked worker report is diagnosed by a bounded PM recovery while sibling evidence is retained", { timeout: 120000 }, async () => {
+  const f = await fixture("agent-blocked-once");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const stopping = await waitFor(() => f.get(created.body.id), run => run.status === "blocked" || run.recovery?.status === "stopping", 30000);
+    assert.equal(stopping.status, "planning", JSON.stringify(stopping));
+    assert.equal(stopping.recovery?.status, "stopping");
+    assert.equal(stopping.recovery?.attempts, 1);
+    assert.equal(stopping.recovery?.source.code, "agent-blocked");
+    assert.equal(stopping.recovery?.source.reportKind, "blocked");
+
+    await f.host.stopApi(); await f.host.start();
+    const restarted = await f.get(created.body.id);
+    assert.equal(restarted.status, "planning");
+    assert.equal(restarted.recovery?.status, "stopping", "Restart retains the confirmed-stop barrier without exposing a terminal blocked run");
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.revision, stopping.revision + 1);
+    assert.equal(finished.recovery?.status, "planning");
+    assert.equal(finished.recovery?.attempts, 1);
+    assert.equal(finished.recovery?.source.memberId, stopping.recovery?.source.memberId);
+    assert.equal(finished.members.filter(member => member.role === "project-manager").length, 2);
+    const blocked = finished.members.find(member => member.memberId === finished.recovery?.source.memberId);
+    assert.equal(blocked?.status, "stopped");
+    assert.equal(blocked?.report?.kind, "blocked", "the recovery keeps the original report as evidence");
+    const sibling = finished.members.find(member => member.revision === stopping.revision && member.taskId === "b");
+    assert.equal(sibling?.report?.kind, "result", "an independent report remains available after replanning");
+    assert.equal(readFileSync(join(finished.workspace, "a.txt"), "utf8"), "revision 2\n");
+    assert.equal(readFileSync(join(finished.workspace, "b.txt"), "utf8"), "revision 2\n");
+  } finally { await f.close(); }
+});
+
+test("automatic PM recovery stops after two attempts and retains each failed revision", { timeout: 150000 }, async () => {
+  const f = await fixture("agent-blocked-twice");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const blocked = await f.settled(created.body.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.equal(blocked.recovery?.status, "exhausted");
+    assert.equal(blocked.recovery?.attempts, 2);
+    assert.equal(blocked.blockCode, "agent-blocked");
+    assert.equal(blocked.members.filter(member => member.role === "project-manager").length, 3, "There is one initial PM and exactly two recovery PM attempts");
+    assert.equal(blocked.continuations?.length, 2, "Both prior revisions remain available as continuation evidence");
+    assert.equal(blocked.revision, 3);
+  } finally { await f.close(); }
+});
+
+for (const action of ["pause", "cancel"] as const)
+test(`an owner ${action} during the recovery stop barrier cannot be resurrected`, async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.recovery = { attempts: 1, status: "stopping", source: {
+      code: "agent-blocked", memberId: f.run.members[0].memberId, revision: 1, reportKind: "blocked", reason: "Worker reported a blocker", at: new Date().toISOString(),
+    } };
+    f.writeTeam();
+    const teams = f.openTeam();
+    const request = { requestId: randomUUID(), revision: 1 };
+    const result = action === "pause" ? await teams.pause(f.run.id, request) : await teams.cancel(f.run.id, request);
+    assert.equal(result.status, action === "pause" ? "paused" : "cancelled");
+    assert.equal(result.recovery?.status, "exhausted");
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+    await scheduler.step(scheduler.record(f.run.id));
+    await scheduler.step(scheduler.record(f.run.id));
+    const settled = teams.get(f.run.id);
+    assert.equal(settled.status, action === "pause" ? "paused" : "cancelled");
+    assert.equal(settled.members.length, 1, "No PM recovery launches after the owner's action");
+    assert.equal(settled.recovery?.status, "exhausted");
+  } finally { f.close(); }
+});
+
+test("a recovery stop barrier drains every stopped sibling report one page per tick without consuming it", async () => {
+  const f = schedulerFixture();
+  try {
+    const blockedMember = f.run.members[0]!;
+    blockedMember.status = "stopped";
+    blockedMember.report = { kind: "blocked", summary: "A recoverable blocker report." };
+    const sibling = { ...structuredClone(blockedMember), memberId: randomUUID(), role: "implementer" as const,
+      taskId: "sibling", title: "implementer: sibling", status: "stopped" as const, report: undefined };
+    const queued = { ...structuredClone(sibling), memberId: randomUUID(), sessionId: randomUUID(), taskId: "queued", title: "implementer: queued",
+      status: "queued" as const };
+    delete queued.startedAt;
+    f.run.members.push(sibling, queued);
+    f.journal.append("team-report", { requestId: randomUUID(), runId: f.run.id, memberId: blockedMember.memberId,
+      revision: blockedMember.revision, report: blockedMember.report });
+    for (let index = 0; index < 199; index++) f.journal.append("signal", { kind: "notice", type: "fixture" });
+    const siblingReport = { kind: "result", summary: "Independent work completed before the blocker." };
+    f.journal.append("team-report", { requestId: randomUUID(), runId: f.run.id, memberId: sibling.memberId,
+      revision: sibling.revision, report: siblingReport });
+    f.journal.append("lifecycle", { status: "exited" });
+    f.state.status = "exited";
+
+    f.writeTeam();
+    const teams = f.openTeam();
+    const scheduler = teams as unknown as { block(stored: unknown, error: TeamError, member: typeof blockedMember): void;
+      step(stored: unknown): Promise<void>; record(id: string): unknown };
+    scheduler.block(scheduler.record(f.run.id), new TeamError(409, "agent-blocked", blockedMember.report.summary), blockedMember);
+    await scheduler.step(scheduler.record(f.run.id));
+    let stopping = teams.get(f.run.id);
+    assert.equal(stopping.recovery?.status, "stopping", "The barrier remains while a final journal page is unread");
+    assert.equal(stopping.members.length, 3, "No recovery PM starts while journals are being drained");
+    assert.equal(stopping.members.find(member => member.memberId === sibling.memberId)?.report, undefined);
+    assert.ok(stopping.members.every(member => member.status === "stopped"));
+
+    await scheduler.step(scheduler.record(f.run.id));
+    stopping = teams.get(f.run.id);
+    assert.equal(stopping.recovery?.status, "stopping", "The confirmed final sequence must also be reached");
+    assert.equal(stopping.members.find(member => member.memberId === sibling.memberId)?.report?.kind, "result");
+    assert.equal(stopping.members.find(member => member.memberId === sibling.memberId)?.status, "stopped");
+    assert.equal(stopping.members.length, 3, "A sibling report is retained as evidence and is not consumed or integrated");
+    assert.equal(stopping.members.find(member => member.memberId === queued.memberId)?.status, "stopped",
+      "A never-launched queued sibling is not retried as a missing session on later pages");
+  } finally { f.close(); }
+});
+
+test("steering during recovery stopping supersedes recovery without adding a recovery revision", async () => {
+  const f = schedulerFixture();
+  try {
+    const member = f.run.members[0]!;
+    member.status = "stopped";
+    member.report = { kind: "blocked", summary: "Retain the original blocker." };
+    const source = { code: "agent-blocked", memberId: member.memberId, revision: 1, reportKind: "blocked" as const,
+      reason: member.report.summary, at: new Date().toISOString() };
+    f.run.recovery = { attempts: 1, status: "stopping", source };
+    f.run.status = "planning";
+    f.run.blockCode = "agent-blocked";
+    f.run.reason = source.reason;
+    f.writeTeam();
+    const teams = f.openTeam();
+    const steered = await teams.steer(f.run.id, { requestId: randomUUID(), revision: 1, text: "Continue with the owner's updated instruction." });
+    assert.equal(steered.revision, 2);
+    assert.equal(steered.recovery?.status, "exhausted");
+    assert.equal(steered.recovery?.attempts, 1);
+    assert.deepEqual(steered.recovery?.source, source, "Steering retains the original recovery evidence");
+
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; startAutomaticRecovery(stored: unknown, trackingReady: boolean): Promise<boolean>;
+      record(id: string): unknown };
+    await scheduler.step(scheduler.record(f.run.id));
+    let settled = teams.get(f.run.id);
+    assert.equal(settled.revision, 2);
+    assert.equal(settled.recovery?.status, "exhausted");
+    assert.equal(settled.members[0].status, "stopped");
+    assert.equal(await scheduler.startAutomaticRecovery(scheduler.record(f.run.id), true), false,
+      "The exhausted automatic-recovery intent cannot launch an extra PM");
+    settled = teams.get(f.run.id);
+    assert.equal(settled.revision, 2, "The old recovery intent does not create another revision");
+    assert.equal(settled.members.length, 1);
+    assert.equal(settled.recovery?.attempts, 1);
+    assert.deepEqual(settled.recovery?.source, source);
+  } finally { f.close(); }
+});
+
+test("a legacy standalone blocked report enters guarded recovery after restart", () => {
+  const f = schedulerFixture();
+  try {
+    const member = f.run.members[0];
+    member.status = "stopped";
+    member.report = { kind: "blocked", summary: "A recoverable worker report from the previous host." };
+    f.run.status = "blocked";
+    f.run.blockCode = "agent-blocked";
+    f.run.reason = member.report.summary;
+    f.writeTeam();
+    const teams = f.openTeam();
+    const recovered = teams.get(f.run.id);
+    assert.equal(recovered.status, "planning");
+    assert.equal(recovered.recovery?.status, "stopping");
+    assert.equal(recovered.recovery?.attempts, 1);
+    assert.equal(recovered.recovery?.source.memberId, member.memberId);
+    assert.equal(recovered.continuable, false, "Parent-owned Continue remains separate from automatic recovery");
+  } finally { f.close(); }
+});
+
+test("legacy blocked parent runs are never auto-unpaused by child recovery migration", () => {
+  const f = schedulerFixture();
+  try {
+    const member = f.run.members[0];
+    member.status = "stopped";
+    member.report = { kind: "blocked", summary: "A recoverable worker report from the previous host." };
+    f.run.missionId = randomUUID();
+    f.run.status = "blocked";
+    f.run.blockCode = "agent-blocked";
+    f.run.reason = member.report.summary;
+    f.writeTeam();
+    const teams = f.openTeam();
+    const retained = teams.get(f.run.id);
+    assert.equal(retained.status, "blocked");
+    assert.equal(retained.recovery, undefined);
+  } finally { f.close(); }
+});
+
+test("a standalone PM may report evidence-backed no-change without declaring a goal complete", { timeout: 120000 }, async () => {
+  const f = await fixture("no-change");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const run = await waitFor(() => f.get(created.body.id), current => current.status === "no-change", 30000);
+    assert.equal(run.status, "no-change", JSON.stringify(run));
+    assert.equal(run.goal, undefined);
+    assert.deepEqual(run.noChange?.evidence, [{ source: "Current implementation", observation: "The accepted behavior is already implemented and the required check covers it." }]);
+    assert.equal(run.tasks.length, 0);
+    assert.equal(run.members.length, 1);
+    assert.equal(run.members[0].role, "project-manager");
+    assert.equal(run.members[0].report?.kind, "no-change");
+    assert.equal(git(run.workspace, "rev-parse", "HEAD"), run.headCommit);
+    assert.equal(git(run.workspace, "status", "--porcelain"), "");
+  } finally { await f.close(); }
+});
+
 test("legacy team records without a saved root retain their workspace and branch", { timeout: 120000 }, async () => {
   const f = await fixture("success");
   try {
@@ -519,7 +728,7 @@ test("a replanned coordinator cannot change accepted verification commands", { t
     assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
     assert.match(blocked.reason ?? "", /verification.*(changed|different)|commands/i);
     assert.deepEqual(blocked.verification, accepted);
-    assert.equal(blocked.members.some(member => member.revision === 2 && member.role === "implementer"), false);
+    assert.equal(blocked.members.some(member => member.revision === blocked.revision && member.role === "implementer"), false);
   } finally { await f.close(); }
 });
 
@@ -667,15 +876,20 @@ test("mixed teams pin real worker launches across configuration changes, restart
     assert.equal(session.body.attention.prompt.source, "hook");
     writeFileSync(join(f.receipts, `${coordinator.memberId}.permission-release`), "continue", { mode: 0o600 });
     const waiting = await waitFor(() => f.get(created.body.id), run => run.status === "needs-input"
-      && run.decisions.length === 1 && run.tasks.find(task => task.id === "a")?.status === "integrated", 45000);
+      && run.decisions.length === 1 && run.recovery?.status === "planning", 45000);
     const reportedCoordinator = waiting.members.find(member => member.memberId === coordinator.memberId)!;
     assert.equal(reportedCoordinator.status, "stopped");
     assert.equal(reportedCoordinator.report?.kind, "plan");
     assert.equal(waiting.reason, undefined, "A stopped provider's permission notice must not remain while another member awaits a product decision");
     const decision = waiting.decisions[0];
     const original = waiting.members.find(member => member.memberId === decision.memberId)!;
-    assert.equal(original.taskId, "b");
-    assert.deepEqual(original.modelProfile, mixedLineup.implementers[1]);
+    assert.equal(original.role, "project-manager", "The owner question is routed through the PM after worker diagnosis");
+    assert.equal(waiting.recovery?.source.code, "agent-question");
+    assert.equal(waiting.recovery?.source.reportKind, "question");
+    const sourceMember = waiting.members.find(member => member.memberId === waiting.recovery?.source.memberId)!;
+    assert.equal(sourceMember.taskId, "b");
+    assert.deepEqual(sourceMember.modelProfile, mixedLineup.implementers[1]);
+    assert.ok(waiting.continuations?.[0]?.tasks.some(task => task.id === "a" && task.status === "integrated"), "Integrated sibling work remains in revision history");
     const changed = structuredClone(mixedLineup);
     const replacement = (profile: TeamLineup["coordinator"]): TeamLineup["coordinator"] => ({ id: profile.id, label: profile.label,
       provider: "codex", model: "gpt-6-sol", effort: "medium" });
@@ -703,7 +917,7 @@ test("mixed teams pin real worker launches across configuration changes, restart
     assert.deepEqual(finished.lineup, mixedLineup);
     const attempts = finished.members.filter(member => member.taskId === "b");
     assert.equal(attempts.length, 2, "An answer retry must create exactly one replacement worker");
-    assert.equal(attempts[0].cwd, attempts[1].cwd);
+    assert.notEqual(attempts[0].cwd, attempts[1].cwd, "A recovered revision gets a fresh worker workspace");
     assert.equal(finished.members.filter(member => member.role === "integrator").length, 1);
     assert.equal(finished.review?.verdict, "approved");
     assert.ok(finished.checks.some(check => check.status === "failed" && check.exitCode === 18));
@@ -879,6 +1093,7 @@ test("task ownership preserves filename bytes and refuses an out-of-scope file b
     const blocked = await f.settled(created.body.id);
     assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
     assert.match(blocked.reason ?? "", /outside its assigned paths/);
+    assert.equal(blocked.recovery, undefined, "Scope violations remain hard blockers");
     assert.equal(blocked.checks.length, 0, "The scope violation must be detected before verification can fail for a missing file");
     assert.notEqual(blocked.tasks.find(task => task.id === "a")?.status, "integrated");
     assert.equal(git(f.source, "status", "--porcelain"), "");
@@ -1454,6 +1669,8 @@ test("a Claude member that hits a usage limit continues on its fallback with its
     const team = await run.settled(waiting.id);
     assert.equal(team.status, "ready-for-review", JSON.stringify(team));
     const task = team.tasks.find(t => t.id === "a")!;
+    assert.ok(team.decisions.some(decision => decision.answeredBy === "owner" && decision.answer === "Compact"),
+      "The owner answered the PM's planning question before implementation was planned");
     assert.equal(task.limitSwitches?.length, 1);
     const [switched] = task.limitSwitches!;
     const limited = team.members.find(m => m.memberId === switched.memberId)!;
@@ -1465,7 +1682,7 @@ test("a Claude member that hits a usage limit continues on its fallback with its
     assert.equal(switched.resetsAt, expected, "The reset time comes from the provider's notice");
     assert.equal(task.escalation, undefined, "A limit switch does not use the task's escalation");
     const attempts = team.members.filter(m => m.taskId === "a");
-    assert.deepEqual(attempts.map(m => m.modelProfile?.id), ["haiku", "haiku", "deepseek-light"], "The question retry and the switch are each a new member attempt");
+    assert.deepEqual(attempts.map(m => m.modelProfile?.id), ["haiku", "deepseek-light"], "The limit switch creates exactly one fallback attempt");
     assert.equal(new Set(attempts.map(m => m.cwd)).size, 1);
     assert.equal(limited.status, "stopped");
     assert.equal(limited.stoppedReason, `Claude Code usage limit, resets ${hhmm}`);
@@ -1475,20 +1692,21 @@ test("a Claude member that hits a usage limit continues on its fallback with its
     assert.equal(team.providerLimits[0]?.runId, team.id);
     assert.equal(team.providerLimits[0]?.expiresAt, expected, "The host entry lasts until the stated reset");
     assert.equal((await run.host.fetchApi("/me")).body.providerLimits[0]?.expiresAt, expected);
-    const replacement = receipts.find(r => r.memberId === attempts[2].memberId);
+    const replacement = receipts.find(r => r.memberId === attempts[1].memberId);
     assert.equal(replacement?.model, "deepseek/deepseek-flash");
     assert.equal(replacement?.sawPartial, true, "The fallback starts in the limited member's working copy");
     const prompt: string = replacement.prompt;
-    assert.match(prompt, /\n\nUser answered: Compact\n\n/, "The fallback keeps the user's recorded answer");
+    assert.match(prompt, /Owner answered "Which display label should the first file use\?": Compact/, "The fallback keeps the owner's recorded planning answer");
     assert.match(prompt, /partial edits are present in this working copy and have passed the host's path-scope check/);
     assert.ok(prompt.includes("Pipe a JSON object matching the above schema to this command:") && !prompt.includes("mcp__infinite_team__report"), "The fallback reports the OpenCode way");
-    assert.ok(prompt.includes(`Requested runtime profile: ${JSON.stringify(attempts[2].modelProfile)}.`) && !prompt.includes('Requested runtime profile: {"id":"haiku"'));
+    assert.ok(prompt.includes(`Requested runtime profile: ${JSON.stringify(attempts[1].modelProfile)}.`) && !prompt.includes('Requested runtime profile: {"id":"haiku"'));
     assert.equal(readFileSync(join(team.workspace, "a.txt"), "utf8"), "revision 1\n");
     assert.ok(receipts.every(receipt => receipt.trustedWorkspace === undefined && !(receipt.argv ?? []).some((arg: string) => arg.startsWith("projects="))),
       "Without owner trust in the team roots, members must keep their providers' folder prompts");
 
     const second = await run.settled((await run.host.fetchApi("/teams", "owner", run.create())).body.id);
     assert.ok(second.events.some(e => e.text === `Haiku implementer launched on DeepSeek Flash: Claude Code is limited until ${hhmm}`), JSON.stringify(second.events));
+    assert.equal(second.decisions.length, 0, "The PM owner question is asked once across the fixture runs");
     assert.equal(second.members.filter(m => m.modelProfile?.provider === "claude").length, 0);
     assert.equal(second.members.find(m => m.taskId === "a")?.modelProfile?.id, "deepseek-light");
   } finally { await run.close(); }

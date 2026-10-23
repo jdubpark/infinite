@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
-import type { TeamRun, TeamTask } from "../packages/host/src/team-types.js";
+import { teamReportSchema, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
 
@@ -164,6 +164,44 @@ test("project-manager context exposes recent continuation task evidence without 
   assert.match(prompt, /Prior task failed its acceptance check/);
   assert.match(prompt, /full continuation task and review history there before replanning/);
   assert.equal(teamContext(continued).continuations[0].tasks[0].summary, continuedTask.summary);
+});
+
+test("blocked reports accept bounded structured evidence and preserve it in coordinator context", () => {
+  const legacy = { kind: "blocked", summary: "The provider tool was unavailable." };
+  assert.deepEqual(teamReportSchema.parse(legacy), legacy, "older summary-only blocked reports remain valid");
+  const report = {
+    ...legacy,
+    blocker: {
+      cause: { status: "hypothesis", detail: "The configured provider lacks the required tool." },
+      issueRefs: ["TASK-123"],
+      sourceRefs: ["packages/host/src/team-prompts.ts@abc123"],
+      attemptedFixes: [{ fix: "Checked the configured tools for this assignment.", outcome: "The required tool remains unavailable." }],
+      proposedRecovery: "Ask the owner to provide an authorized tool or choose another supported workflow.",
+      prevention: "Check required provider capabilities before dispatch.",
+      validationEvidence: [{ sourceRef: "packages/host/src/team-prompts.ts", observation: "The prompt pins the available provider tools." }],
+    },
+  };
+  assert.deepEqual(teamReportSchema.parse(report), report);
+  assert.equal(teamReportSchema.safeParse({ ...report, blocker: { ...report.blocker, arbitraryCommand: "run this" } }).success, false,
+    "strict evidence objects cannot grow executable fields");
+  assert.equal(teamReportSchema.safeParse({ ...report, blocker: { ...report.blocker, validationEvidence: [] } }).success, false,
+    "candidate blocker evidence requires a source or check observation");
+  assert.equal(teamReportSchema.safeParse({ ...report, blocker: { ...report.blocker, proposedRecovery: "x".repeat(1201) } }).success, false,
+    "reported recovery remains bounded");
+
+  const run = largeRun();
+  run.status = "blocked";
+  run.reason = report.summary;
+  run.members = [{ memberId: "blocked-worker", revision: run.revision, role: "implementer", status: "reported", cwd: "/workspace", baseCommit: run.baseCommit,
+    sessionId: "session", title: "Blocked worker", prompt: "", cursor: 0, stopRequestId: "stop", report: teamReportSchema.parse(report),
+  } as TeamRun["members"][number]];
+  assert.deepEqual(teamContext(run).memberReports[0].report, report,
+    "the durable team context snapshot retains structured blocker evidence from the member report");
+  const prompt = teamPrompt(run, "project-manager", undefined, undefined, "demo");
+  assert.match(prompt, /installed infinite-team shared-knowledge workflow/);
+  assert.match(prompt, /host project ID is not necessarily a brain repository ID/);
+  assert.match(prompt, /inspect prior structured blocker evidence before recovery/);
+  assert.match(prompt, /A report, candidate lesson, continuation, or owner-facing status is not a verified resolution/);
 });
 
 test("permission evidence stays complete inline and an over-budget review fails closed", () => {

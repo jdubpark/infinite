@@ -505,8 +505,15 @@ export class MissionService {
       subtask.status = status;
       if (changed && status !== "running") this.event(stored, `Subtask ${subtask.id} is ${status} (subteam ${team.status}).`);
       if (!live.has(mission.status)) continue;
-      if (status !== "running")
-        this.message(stored, `${team.id}:${status}:${team.revision}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status, ...(team.reason ? { reason: team.reason } : {}) });
+      if (status !== "running") {
+        const matchingBlockedReports = status === "blocked" && team.status === "blocked" && team.blockCode === "agent-blocked"
+          ? team.members.filter(member => member.revision === team.revision && member.report?.kind === "blocked" && member.report.summary === team.reason)
+          : [];
+        const blocker = matchingBlockedReports.length === 1 && matchingBlockedReports[0].report?.kind === "blocked"
+          ? matchingBlockedReports[0].report.blocker
+          : undefined;
+        this.message(stored, `${team.id}:${status}:${team.revision}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status, ...(team.reason ? { reason: team.reason } : {}), ...(blocker ? { blocker } : {}) });
+      }
       for (const decision of team.decisions.filter(item => item.revision === team.revision && !item.answer))
         this.message(stored, `${team.id}:${decision.id}`, { type: "child-decision", subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options });
     }

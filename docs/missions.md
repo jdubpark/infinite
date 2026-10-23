@@ -152,7 +152,7 @@ The coordinator reports through its mission report tool:
 | `resize-subtask` | Selects worker capacity with `subtaskId`, `parallelism` (1–4), and `summary`. Updates a queued subtask or durably forwards the change to its active subteam. A solo subtask permits only one worker. Lowering capacity lets running workers finish and holds new starts. |
 | `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. |
 | `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, and no owner decision is open. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
-| `blocked` | Moves the mission to `blocked` with the summary as its reason. |
+| `blocked` | Moves the mission to `blocked` with the summary as its reason. The optional structured blocker evidence is retained in the coordinator attempt report; it is agent-reported evidence, not host-verified cause or resolution. |
 | `wait` | Ends the attempt without a decision. Refused while a subteam decision is open that the coordinator has neither answered nor escalated. Otherwise accepted only while something else will start a later attempt: an open owner decision, a subteam that is not paused, or a queued subtask that can start without anyone acting. A queued subtask whose repository any paused or blocked run holds does not count, since that run keeps the repository reserved after the others finish. |
 
 Each attempt must end with one report. An attempt whose session ends its turn
@@ -165,6 +165,16 @@ files before it confirms its exit, including across a host restart, is applied
 as usual and is not counted as missing. The next attempt starts with a
 refusal that says so, together with every message that arrived meanwhile.
 Three missed or refused reports in a row block the mission.
+
+The mission coordinator cannot run commands or retrieve shared knowledge
+directly. Its prompt asks relevant subteam briefs to use the installed Infinite
+team shared-knowledge workflow, resolve their configured repository scope, and
+return any task/blocker lessons as advisory evidence. Host project IDs are not
+assumed to be knowledge repository IDs. A lookup gap is reported; the coordinator
+does not claim direct retrieval or guaranteed lesson publication. Subteam cause,
+fix, and prevention claims need source or check evidence. They remain distinct
+from a reviewed lesson and from a verified resolution; normal subteam
+authorization, verification, recovery, and budget rules continue to apply.
 
 Size rules: a `solo` subtask starts a subteam with parallelism 1, and a `team`
 subtask starts with its coordinator-selected `parallelism` (1–4). The subteam
@@ -209,11 +219,22 @@ when its subteam reaches `ready-for-review`, `merged`, or `no-change`;
 
 Escalation: when a subteam opens a decision or becomes blocked, the host sends
 the coordinator a message naming the subtask, the decision ID, and the question
-or reason. Each coordinator attempt receives at most 30 messages; the rest wait
-for the next attempt. Every open subteam decision is also listed in each
+or reason. A blocked subteam message carries its structured blocker evidence
+only when one current-revision `agent-blocked` report unambiguously matches the
+host's blocking reason; summary-only and ambiguous reports carry no structured
+evidence. The blocker object is limited to 12 KiB of UTF-8 JSON. These agent
+claims remain advisory and are not host-verified lessons. Each coordinator attempt receives
+at most 30 messages; the rest wait for the next attempt. Every open subteam decision is also listed in each
 attempt's mission state, read from the subteams, so none depends on a message. Only the coordinator's `question` report reaches the owner. Provider
 permission prompts are unaffected and keep their existing owner or delegated
 coordinator path per repository.
+
+A direct `blocked` report from the mission coordinator ends that mission. The
+report remains in its durable coordinator-attempt record, but the current
+mission lifecycle has no resume or steer action for a mission in `blocked`
+status. The owner must start a new mission to authorize another coordinator
+attempt; the host does not replay the old report or treat a continuation as a
+resolution.
 
 A run outside the mission that holds a repository changes state without
 reaching the mission. When a ready subtask's repository is held only by paused

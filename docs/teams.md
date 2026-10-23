@@ -675,6 +675,22 @@ material requirement or required path goes through the existing question or
 blocker report with the exact gap and smallest proposed resolution. These are
 prompt instructions, not host validation of a brief's semantic completeness.
 
+Project managers are prompted to use the installed Infinite team shared-knowledge
+workflow before planning or recovery, after resolving the repository's configured
+knowledge scope. Host project IDs are not assumed to be knowledge repository IDs.
+Lookup may be unavailable; the coordinator then uses current repository sources
+and reports the gap. Retrieved lessons are advisory and must be checked against
+current sources and checks. A blocked report may include bounded cause
+(`observed`, `hypothesis`, or `unknown`), issue and source references, attempted
+fixes and outcomes, proposed recovery and prevention, and validation evidence.
+The structured evidence object is limited to 12 KiB of UTF-8 JSON. The host
+stores that report as agent evidence; it does not verify the cause,
+resolve the blocker, or publish a lesson automatically. Lesson changes follow
+the configured single-writer workflow and need a durable receipt and a different
+strong reviewer when the role is permitted to propose them. A continuation or
+claimed fix does not establish resolution. Existing recovery authorization,
+head, quiescence, idempotency, and budget checks remain in force.
+
 The coordinator prefers `light` profiles for bounded research and implementation
 and selects from the configured pool. Each plan has 1–12 tasks. The host rejects
 unknown profiles, missing dependencies, cycles, duplicate task IDs, and

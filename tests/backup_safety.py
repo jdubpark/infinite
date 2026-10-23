@@ -1,12 +1,15 @@
 """Exercise the backup boundary with synthetic procfs and a stateful service controller."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import closing
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -27,14 +30,44 @@ class BackupSafety(unittest.TestCase):
         self.source = root / "data"
         self.output = root / "output"
         self.proc = root / "proc"
-        for path in (self.source, self.output, self.proc):
+        self.brain = root / "brain"
+        self.brain_config = root / "brain-service.json"
+        self.brain_unit = root / "brain.service"
+        self.brain_runtime = root / "runtime"
+        for path in (self.source, self.output, self.proc, self.brain):
             path.mkdir()
+        self.brain.chmod(0o700)
         for name in ("control", "control-home", "agent-home", "workspaces", "cmux"):
             (self.source / name).mkdir()
             (self.source / name / "fixture").write_text(name + " state")
-        self.groups = {unit: "/system.slice/" + unit for unit in ("infinite.service", "infinite-cmux.service")}
+        for name in ("knowledge.sqlite3", "routing.sqlite3", "queue.sqlite3"):
+            with closing(sqlite3.connect(self.brain / name)) as database:
+                database.execute("CREATE TABLE records (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                database.execute("INSERT INTO records VALUES ('snapshot-generation', 'fixture')")
+                database.commit()
+            (self.brain / name).chmod(0o600)
+        self.brain_config.write_text(json.dumps({"directory": str(self.brain)}) + "\n")
+        self.brain_config.chmod(0o600)
+        self.brain_unit.write_text("[Service]\nExecStart=/usr/bin/python3 brain_service.py\n")
+        self.brain_unit.chmod(0o644)
+        self.brain_runtime = self.brain_runtime / "scripts"
+        self.brain_runtime.mkdir(parents=True)
+        for name in ("brain_service.py", "brain.py", "routing.py"):
+            path = self.brain_runtime / name
+            path.write_text("synthetic runtime: " + name + "\n")
+            path.chmod(0o644)
+        profiles = self.brain_runtime.parent / "profiles.json"
+        profiles.write_text('{"implementers": []}\n')
+        profiles.chmod(0o644)
+        self.config = {"brainService": "brain.service", "brainDirectory": str(self.brain),
+                       "brainConfig": str(self.brain_config), "brainUnitFiles": [str(self.brain_unit)],
+                       "brainRuntimeFiles": [str(self.brain_runtime / name) for name in ("brain_service.py", "brain.py", "routing.py")] + [str(profiles)]}
+        self.groups = {unit: "/system.slice/" + unit for unit in ("infinite.service", "infinite-cmux.service", "brain.service")}
         self.writer("101", self.groups["infinite.service"])
         self.writer("102", self.groups["infinite-cmux.service"])
+        self.writer("104", self.groups["brain.service"])
+        (self.proc / "104" / "cmdline").write_bytes(("/usr/bin/python3\0" + str(self.brain_runtime / "brain_service.py") + "\0--config\0" + str(self.brain_config) + "\0").encode())
+        (self.output / "previous.tar.gz.age").write_bytes(b"known-good prior archive")
         self.frozen = set()
         self.calls = []
         self.copied = []
@@ -42,8 +75,18 @@ class BackupSafety(unittest.TestCase):
         self.partial_freeze_error = False
         self.thaw_error = False
         self.watchdog_fires = False
+        self.exec_config = str(self.brain_config)
+        self.exec_extra = ""
         self.addCleanup(patch.stopall)
         patch.object(backup, "Path", side_effect=lambda path: self.proc if str(path) == "/proc" else Path(path)).start()
+        real_stat = Path.stat
+        def stat_with_system_owner(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if path in (self.brain_config, self.brain_unit, *map(Path, self.config["brainRuntimeFiles"])):
+                values = tuple(result)
+                return os.stat_result(values[:4] + (0,) + values[5:])
+            return result
+        patch.object(Path, "stat", new=stat_with_system_owner).start()
         patch.object(backup.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.getuid())).start()
         patch.object(backup.shutil, "disk_usage", return_value=SimpleNamespace(free=10 * 1024 ** 3)).start()
         patch.object(backup, "run", side_effect=self.run_command).start()
@@ -71,6 +114,16 @@ class BackupSafety(unittest.TestCase):
                     return "loaded" if unit in self.groups else "not-found"
                 if "--property=ControlGroup" in args:
                     return self.groups[unit]
+                if "User" in args:
+                    return "brain-user"
+                if "FragmentPath" in args:
+                    return str(self.brain_unit)
+                if "DropInPaths" in args:
+                    return ""
+                if "ExecStart" in args:
+                    return "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 " + str(self.brain_runtime / "brain_service.py") + " --config " + self.exec_config + self.exec_extra + " ; ignore_errors=no ; }"
+                if "MainPID" in args:
+                    return "104"
                 if "FreezerState" in args:
                     return "frozen" if unit in self.frozen else "running"
             if action == "freeze":
@@ -92,73 +145,126 @@ class BackupSafety(unittest.TestCase):
             self.assertEqual(self.frozen, set(self.groups), "Copy started without freezing every supported writer")
             original, destination = Path(args[-2]), Path(args[-1])
             shutil.copytree(original, destination)
-            self.copied.append((original.name, (destination / "fixture").read_text()))
-            if original.name == "cmux":
+            if original.name == "brain":
+                databases = sorted(path.name for path in destination.glob("*.sqlite3"))
+                for name in databases:
+                    with closing(sqlite3.connect(destination / name)) as database:
+                        self.assertEqual(database.execute("SELECT value FROM records WHERE key='snapshot-generation'").fetchone(), ("fixture",))
+                self.copied.append((original.name, databases))
+            else:
+                self.copied.append((original.name, (destination / "fixture").read_text()))
+            if original.name == "brain":
                 if self.watchdog_fires:
-                    self.frozen.discard("infinite-cmux.service")
+                    self.frozen.discard("brain.service")
                 if self.copy_error:
                     raise subprocess.TimeoutExpired(args, 30)
             return ""
         raise AssertionError("Unexpected external command: " + repr(args))
 
     def assert_no_snapshot_published(self):
-        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(sorted(path.name for path in self.output.iterdir()), ["previous.tar.gz.age"])
+        self.assertEqual((self.output / "previous.tar.gz.age").read_bytes(), b"known-good prior archive")
         self.assertEqual(list(self.source.glob(".backup-*")), [])
 
-    def test_two_service_snapshot_copies_cmux_and_thaws_both_after_timeout(self):
+    def test_snapshot_copies_all_brain_databases_together_and_thaws_every_writer_after_timeout(self):
         with self.assertRaises(subprocess.TimeoutExpired):
-            backup.create_backup(self.source, self.output, "age1synthetic")
+            backup.create_backup(self.source, self.output, "age1synthetic", self.config)
         self.assertIn(("cmux", "cmux state"), self.copied)
+        self.assertIn(("brain", ["knowledge.sqlite3", "queue.sqlite3", "routing.sqlite3"]), self.copied)
         self.assertEqual(self.frozen, set())
         watchdog = next(call for call in self.calls if call[0] == "systemd-run")
-        self.assertEqual(watchdog[-2:], ("infinite.service", "infinite-cmux.service"))
+        self.assertEqual(watchdog[-3:], ("infinite.service", "infinite-cmux.service", "brain.service"))
         self.assert_no_snapshot_published()
 
     def test_partial_freeze_and_thaw_failure_still_attempts_both_and_keeps_watchdog(self):
         self.partial_freeze_error = True
         self.thaw_error = True
         with self.assertRaisesRegex(RuntimeError, "watchdog remains armed"):
-            backup.create_backup(self.source, self.output, "age1synthetic")
+            backup.create_backup(self.source, self.output, "age1synthetic", self.config)
         thaws = [call[2] for call in self.calls if call[:2] == ("systemctl", "thaw")]
-        self.assertEqual(thaws, ["infinite.service", "infinite-cmux.service"])
+        self.assertEqual(thaws, ["infinite.service", "infinite-cmux.service", "brain.service"])
         self.assertFalse(any(call[:2] == ("systemctl", "stop") for call in self.calls))
-        self.assertEqual([call.args[0][2] for call in self.emergency.call_args_list], ["infinite.service", "infinite-cmux.service"])
+        self.assertEqual([call.args[0][2] for call in self.emergency.call_args_list], ["infinite.service", "infinite-cmux.service", "brain.service"])
         self.assertEqual(self.copied, [])
         self.assert_no_snapshot_published()
 
     def test_untracked_writer_is_rejected_before_any_freeze(self):
         self.writer("103", "/system.slice/untracked.service")
         with self.assertRaisesRegex(RuntimeError, "outside"):
-            backup.create_backup(self.source, self.output, "age1synthetic")
+            backup.create_backup(self.source, self.output, "age1synthetic", self.config)
         self.assertFalse(any(call[0] == "systemd-run" or call[:2] == ("systemctl", "freeze") for call in self.calls))
 
     def test_broad_service_cgroup_is_rejected(self):
         self.groups["infinite.service"] = "/system.slice"
         self.writer("101", "/system.slice")
         with self.assertRaisesRegex(RuntimeError, "unexpected cgroup"):
-            backup.create_backup(self.source, self.output, "age1synthetic")
+            backup.create_backup(self.source, self.output, "age1synthetic", self.config)
         self.assertEqual(self.copied, [])
 
     def test_host_without_cmux_retains_original_directory_coverage(self):
         del self.groups["infinite-cmux.service"]
         shutil.rmtree(self.proc / "102")
         shutil.rmtree(self.source / "cmux")
-        services, _, names, writers = backup.backup_plan(self.source)
-        self.assertEqual(services, ["infinite.service"])
-        self.assertEqual(set(names), {"control", "control-home", "agent-home", "workspaces"})
-        self.assertEqual(set(writers), {"101"})
+        services, _, names, writers, _ = backup.backup_plan(self.source, self.config)
+        self.assertEqual(services, ["infinite.service", "brain.service"])
+        self.assertEqual(set(names), {"control", "control-home", "agent-home", "workspaces", "brain"})
+        self.assertEqual(set(writers), {"101", "104"})
+
+    def test_legacy_backup_plan_is_supported_when_no_brain_is_installed(self):
+        del self.groups["brain.service"]
+        shutil.rmtree(self.proc / "104")
+        services, _, names, _, brain = backup.backup_plan(self.source, {})
+        self.assertEqual(services, ["infinite.service", "infinite-cmux.service"])
+        self.assertEqual(set(names), {"control", "control-home", "agent-home", "workspaces", "cmux"})
+        self.assertIsNone(brain)
+
+    def test_partial_brain_configuration_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "complete service, store"):
+            backup.backup_plan(self.source, {"brainService": "brain.service"})
+
+    def test_brain_main_process_must_use_exact_config_argv(self):
+        cmdline = self.proc / "104" / "cmdline"
+        writer = str(self.brain_runtime / "brain_service.py")
+        for decoy in (str(self.brain_config) + ".other", "prefix-" + str(self.brain_config)):
+            with self.subTest(decoy=decoy):
+                cmdline.write_bytes(("/usr/bin/python3\0" + writer + "\0--config\0" + decoy + "\0").encode())
+                with self.assertRaisesRegex(RuntimeError, "exactly match"):
+                    backup.backup_plan(self.source, self.config)
+
+    def test_effective_unit_rejects_config_prefix_suffix_and_extra_argv(self):
+        for decoy, extra in ((str(self.brain_config) + ".other", ""),
+                             ("prefix-" + str(self.brain_config), ""),
+                             (str(self.brain_config), " --config " + str(self.brain_config))):
+            with self.subTest(decoy=decoy, extra=extra):
+                self.exec_config = decoy
+                self.exec_extra = extra
+                with self.assertRaisesRegex(RuntimeError, "exactly match"):
+                    backup.backup_plan(self.source, self.config)
+
+    def test_brain_main_process_rejects_extra_decoy_argv(self):
+        cmdline = self.proc / "104" / "cmdline"
+        cmdline.write_bytes(("/usr/bin/python3\0" + str(self.brain_runtime / "brain_service.py") + "\0--config\0" + str(self.brain_config) + "\0--config\0" + str(self.brain_config) + "\0").encode())
+        with self.assertRaisesRegex(RuntimeError, "exactly match"):
+            backup.backup_plan(self.source, self.config)
+
+    def test_active_unconfigured_brain_writer_fails_closed(self):
+        process = self.proc / "105"
+        process.mkdir()
+        (process / "cmdline").write_bytes(b"/usr/bin/python3\0brain_service.py\0--config\0private.json\0")
+        with self.assertRaisesRegex(RuntimeError, "brain writer is running"):
+            backup.assert_no_unconfigured_brain_writer()
 
     def test_cmux_directory_symlink_is_rejected(self):
         shutil.rmtree(self.source / "cmux")
         (self.source / "cmux").symlink_to(self.source / "workspaces", target_is_directory=True)
         with self.assertRaisesRegex(RuntimeError, "real directories"):
-            backup.backup_plan(self.source)
+            backup.backup_plan(self.source, self.config)
 
     def test_watchdog_thaw_during_copy_rejects_snapshot_and_thaws_other_service(self):
         self.copy_error = False
         self.watchdog_fires = True
         with self.assertRaisesRegex(RuntimeError, "Watchdog thawed"):
-            backup.create_backup(self.source, self.output, "age1synthetic")
+            backup.create_backup(self.source, self.output, "age1synthetic", self.config)
         self.assertEqual(self.frozen, set())
         self.assert_no_snapshot_published()
 

@@ -1,12 +1,14 @@
 # Encrypted backups and restore verification
 
-The single-tenant backup uses an owner-generated age identity. Only its public recipient is installed on the server. A snapshot contains the agent home (including native credentials/history), project workspaces, encrypted Infinite records, control home, optional cmux daemon state and enrollment identities, and `/etc/infinite` configuration. Temporary files and the separate vault/LUKS recovery keys are excluded. The final archive is encrypted before it is written outside the LUKS volume.
+The single-tenant backup uses an owner-generated age identity. Only its public recipient is installed on the server. A snapshot contains the agent home (including native credentials/history), project workspaces, encrypted Infinite records, control home, optional cmux daemon state and enrollment identities, and `/etc/infinite` configuration. When the shared brain service is installed, the snapshot also contains its complete state directory and the configured service JSON, unit fragment, and drop-ins. Temporary files and the separate vault/LUKS recovery keys are excluded. The final archive is encrypted before it is written outside the LUKS volume.
+
+The shared brain has one independent service writer. It stores knowledge, advisory routing observations, and durable queued mutations in `knowledge.sqlite3`, `routing.sqlite3`, and `queue.sqlite3` in the same private directory. Configure all five `brain*` fields in `/etc/infinite/backup.json` to enable protection. The directory must be on the encrypted application volume, owned by the brain service account, and mode 0700. The service JSON must name that exact directory. List the effective systemd unit fragment and every drop-in in `brainUnitFiles`. `brainRuntimeFiles` must list, in order, `brain_service.py`, `brain.py`, `routing.py`, and `profiles.json` from one directory. The supported command is exactly `/usr/bin/python3 <brainRuntimeFiles[0]> --config <brainConfig>`; preflight compares both systemd's effective argv and the running main process argv against it. Config, unit, and runtime files must be root-owned and not writable by group or other users. A partial configuration, missing database, uncovered unit file, unsupported writer, or inactive service fails preflight. A host with no installed brain can keep the base backup configuration; an active unconfigured brain writer blocks the backup.
 
 The server remains trusted while running: an attacker with active root can read its mounted data. Keeping the backup decryption identity off the server protects the stored archive; it does not make ordinary execution operator-confidential.
 
 ## Consistency and failure behavior
 
-All `infinite-host` and `infinite-agent` processes must belong to the exact `infinite.service` or installed `infinite-cmux.service` cgroup under `system.slice`; the script rejects other writers under those identities. Both installed services must be active. It freezes all supported service cgroups before copying, checks writer membership again while frozen, syncs storage, and copies the application directories to a root-private staging directory on the encrypted volume. SQLite database and WAL files are copied together, including cmux `.sqlite3` databases. It then thaws every service before compression/encryption. This is a crash-consistent filesystem snapshot, not a snapshot of process memory or an application-wide business transaction. Restoring cmux state does not restore a live PTY process; reinstall its separately managed runtime and service before reconnecting clients.
+All `infinite-host` and `infinite-agent` processes must belong to the exact `infinite.service` or installed `infinite-cmux.service` cgroup under `system.slice`; the script rejects other writers under those identities. The configured brain service must also be active in its own exact cgroup, and every process owned by its service account must belong to one of the covered cgroups. The script freezes every covered service before copying, checks service identity and writer membership again while frozen, syncs storage, and copies each data directory to a root-private staging directory on the encrypted volume. It copies the brain directory as a unit, including SQLite database, WAL, shared-memory, and rollback-journal files. A queued operation left in `applying` remains in `queue.sqlite3`; after restore, the service retries it through its normal idempotent writer path. The script then thaws every service before compression/encryption. This is a crash-consistent filesystem snapshot, not a snapshot of process memory or an application-wide business transaction. Restoring cmux state does not restore a live PTY process; reinstall its separately managed runtime and service before reconnecting clients.
 
 The copy must finish within 30 seconds. An independent systemd timer thaws every covered service after 45 seconds even if the backup process is killed. A failed or timed-out copy is not published. A thaw failure does not prevent attempts to thaw the other service and leaves the watchdog armed. Free-space checks preserve a 2 GiB margin plus estimated snapshot capacity on both filesystems. Large workspaces that cannot meet this pause bound need a filesystem snapshot backend rather than a longer pause. Do not run untracked writers as root while taking a backup. `infinite-backup --preflight-only` validates service, writer, and directory coverage without freezing or copying data.
 
@@ -19,21 +21,32 @@ Install distribution `age`, Python 3, GNU tar/coreutils with POSIX ACL support, 
 ```json
 {
   "recipient": "age1REPLACE_WITH_OWNER_PUBLIC_RECIPIENT",
-  "outputDir": "/data/infinite-backups"
+  "outputDir": "/data/infinite-backups",
+  "brainService": "your-brain.service",
+  "brainDirectory": "/srv/infinite-data/brain",
+  "brainConfig": "/etc/infinite/brain.json",
+  "brainUnitFiles": ["/etc/systemd/system/your-brain.service"],
+  "brainRuntimeFiles": [
+    "/usr/local/libexec/infinite-brain/scripts/brain_service.py",
+    "/usr/local/libexec/infinite-brain/scripts/brain.py",
+    "/usr/local/libexec/infinite-brain/scripts/routing.py",
+    "/usr/local/libexec/infinite-brain/profiles.json"
+  ]
 }
 ```
 
-Save this as root-owned `/etc/infinite/backup.json`, mode 0600. Install `backup.py` as `/usr/local/libexec/infinite-backup` and the service/timer units into `/etc/systemd/system`. Run a backup and validate recovery before enabling the timer:
+The brain entries are required when the shared brain service is installed. Add each active systemd drop-in to `brainUnitFiles`. Keep the brain service JSON's `directory` equal to `brainDirectory`; keep the service unit, JSON, and writer runtime recoverable together. The archive preserves the Python modules in `config/brain-runtime/scripts/` with `profiles.json` one directory above, as required by the routing module. Their SHA-256 hashes appear in `manifest.json`. Save the backup configuration as root-owned `/etc/infinite/backup.json`, mode 0600. Install `backup.py` as `/usr/local/libexec/infinite-backup` and the service/timer units into `/etc/systemd/system`. Run preflight, take a backup, and validate recovery before enabling the timer:
 
 ```sh
 sudo systemctl daemon-reload
+sudo /usr/local/libexec/infinite-backup --preflight-only
 sudo systemctl start infinite-backup.service
 sudo journalctl -u infinite-backup.service --no-pager
 # After the owner verifies the downloaded archive:
 sudo systemctl enable --now infinite-backup.timer
 ```
 
-The timer runs daily at 03:30 UTC plus up to 15 minutes of randomized delay. It creates encrypted archives on the rented host. **It does not upload them to independent storage.** An S3-compatible destination/account and restricted upload credentials remain necessary for automatic off-host protection while the laptop is offline. A manually downloaded encrypted laptop copy is already independent of the rented server, but its freshness stops when the laptop is disconnected.
+The timer runs daily at 03:30 UTC plus up to 15 minutes of randomized delay. It creates encrypted archives on the server. It does not upload them to independent storage. A manually downloaded encrypted copy protects against server loss only as of its download time. Automatic off-host protection still needs an independent destination, restricted upload credentials, retention rules, and a monitored upload receipt. The backup currently covers none of those upload steps.
 
 ## Restore verification
 
@@ -49,6 +62,8 @@ python3 deploy/ubuntu/verify-backup.py BACKUP.tar.gz.age \
 The destination must not already exist. The verifier checks the ciphertext checksum, decrypts/authenticates the archive, safely extracts files, verifies every manifest file hash/size, and runs SQLite integrity checks on the restored databases. External symlinks are skipped and listed in `external-links.json`; restore required links only after installing and verifying their external dependencies. It does not follow arbitrary archive links or restore directly over a live environment.
 
 This is a content verification copy, not an operational filesystem restore. Python extraction does not apply numeric owners or POSIX ACLs and may restrict file modes; the receipt reports this explicitly and counts ACL records present in the archive. New archives use GNU tar PAX access/default ACL records. Older archives without those records cannot recover named-user or default ACLs from their file hashes.
+
+The verifier runs SQLite integrity checks, but that does not prove the brain can serve restored records or resume queued work. For a restore rehearsal, use a disposable Linux system with no live service directories mounted. Extract the authenticated archive into a new private directory, restore the numeric owner and mode for `data/brain`, and use the archived runtime files and unit files rather than locally installed brain code. Configure the isolated unit to use that runtime copy and the archived JSON; change only the isolated test copy's socket and allowed test UID if the original values do not fit the recovery environment. Start the writer from that copy; query knowledge, routing recommendations, and queue state through its Unix socket. Include a queued or `applying` job in the rehearsal and confirm the service reports its durable state after restart. Keep the rehearsal disconnected from production agents. Record the restored database names, integrity results, permission checks, and service query results separately from the archive checksum receipt.
 
 For operational recovery, first complete the content check above. Use a fresh isolated Linux recovery environment with encrypted storage and no live application directories mounted. Preserve the original numeric user/group IDs, inspect `external-links.json`, and authenticate the archive completely before restoring its ownership, modes, and ACLs with GNU tar. The recovery destination must be a new empty private directory:
 

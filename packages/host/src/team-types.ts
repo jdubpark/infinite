@@ -212,6 +212,20 @@ export const teamTaskPlanSchema = z.object({
   dependsOn: z.array(taskId).max(12),
 }).strict();
 export type TeamTaskPlan = z.infer<typeof teamTaskPlanSchema>;
+/** Bounded evidence reported with a blocker. This is an observation, never executable policy. */
+export const blockerEvidenceSchema = z.object({
+  cause: z.object({ status: z.enum(["observed", "hypothesis", "unknown"]), detail: z.string().trim().min(1).max(1200) }).strict(),
+  issueRefs: z.array(z.string().trim().min(1).max(300)).max(8).default([]),
+  sourceRefs: z.array(z.string().trim().min(1).max(500)).max(12).default([]),
+  attemptedFixes: z.array(z.object({ fix: z.string().trim().min(1).max(800), outcome: z.string().trim().min(1).max(800) }).strict()).max(8).default([]),
+  proposedRecovery: z.string().trim().min(1).max(1200),
+  prevention: z.string().trim().min(1).max(1200),
+  validationEvidence: z.array(z.object({ sourceRef: z.string().trim().min(1).max(500), observation: z.string().trim().min(1).max(1000) }).strict()).min(1).max(8),
+}).strict().superRefine((evidence, context) => {
+  if (Buffer.byteLength(JSON.stringify(evidence), "utf8") > 12 * 1024)
+    context.addIssue({ code: "custom", message: "Blocker evidence must fit within 12 KiB of UTF-8 JSON" });
+});
+export type BlockerEvidence = z.infer<typeof blockerEvidenceSchema>;
 export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("permission-decision"), decisionId: z.uuid(), verdict: z.enum(["approve-once", "escalate"]), summary: z.string().trim().min(1).max(2000) }).strict(),
   z.object({ kind: z.literal("plan"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), brief: teamBriefSchema.optional(), tasks: z.array(teamTaskPlanSchema).min(1).max(12), verification: teamVerificationSchema.optional() }).strict(),
@@ -225,7 +239,7 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("delivery-repair"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("pull-request"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]) }).strict(),
-  z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
 ]);
 export type TeamReport = z.infer<typeof teamReportSchema>;
 export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: teamReportSchema }).strict();

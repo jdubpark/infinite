@@ -65,7 +65,7 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
       </Pressable>
       <LiveStatus online={poll.online} loading={poll.loading} seen={poll.seen} stale={poll.stale} />
     </View>
-    <ScrollView style={s.list} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled"
+    <ScrollView style={s.list} contentContainerStyle={[s.content, owner && s.contentWithComposer]} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <Text style={s.title} accessibilityRole="header">Board</Text>
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filters}>
@@ -139,6 +139,7 @@ const s = StyleSheet.create({
   toggle: { width: 24, height: 24, borderRadius: 12, alignItems: "center", justifyContent: "center", backgroundColor: theme.colors.secondarySurface },
   list: { flex: 1 },
   content: { paddingHorizontal: 16, paddingBottom: 12 },
+  contentWithComposer: { paddingBottom: 88 },
   title: { fontSize: 28, lineHeight: 34, fontWeight: "700", color: theme.colors.ink, letterSpacing: -0.6, marginTop: 4 },
   filters: { flexDirection: "row", gap: 6, paddingVertical: 12, paddingRight: 16 },
   subtitle: { marginTop: -7, marginBottom: 2, fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },

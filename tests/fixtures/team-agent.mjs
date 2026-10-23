@@ -40,7 +40,7 @@ if (process.argv[2] === "--hold-check") {
 // the runner must discover results, commits, and check outcomes through production paths.
 const [scenario, receiptDir] = process.argv.slice(2);
 const assignment = JSON.parse(process.env.INFINITE_TEAM_ASSIGNMENT ?? "null");
-if (scenario === "stall-slow-stop") process.on("SIGTERM", () => setTimeout(() => process.exit(0), 2000));
+if (scenario === "stall-slow-stop" || scenario === "agent-blocked-once") process.on("SIGTERM", () => setTimeout(() => process.exit(0), 2000));
 if (!assignment || !process.env.INFINITE_HOOK_URL || !process.env.INFINITE_HOOK_TOKEN)
   throw new Error("The team worker did not provide its reporting capability");
 const receiptFile = join(receiptDir, `${assignment.memberId}.json`);
@@ -168,7 +168,41 @@ async function main() {
     process.exit(0);
   }
   if (assignment.role === "project-manager") {
-    if (scenario === "mixed") {
+    if (scenario === "no-change") {
+      await report({ kind: "no-change", summary: "The requested behavior already exists in the inspected project.", evidence: [
+        { source: "Current implementation", observation: "The accepted behavior is already implemented and the required check covers it." },
+      ] });
+      return;
+    }
+    if (scenario === "limit" && !existsSync(join(receiptDir, "limit-owner-question-asked"))) {
+      writeFileSync(join(receiptDir, "limit-owner-question-asked"), "asked", { mode: 0o600 });
+      await report({ kind: "question", question: "Which display label should the first file use?", options: ["Detailed", "Compact"] });
+      return;
+    }
+    if (scenario.startsWith("agent-blocked-") && assignment.revision > 1) {
+      await report({ kind: "plan", summary: "Replan the blocked assignment while retaining the independent report as evidence", tasks: [
+        { id: "a", title: "Build the first file", instructions: "Write a.txt with the current revision", paths: ["a.txt"], dependsOn: [] },
+        { id: "b", title: "Build the second file", instructions: "Write b.txt with the current revision", paths: ["b.txt"], dependsOn: [] },
+      ] });
+      return;
+    }
+    if ((scenario === "bootstrap-replan" || scenario === "bootstrap-change") && assignment.revision === 2) {
+      const recoveryQuestion = join(receiptDir, `${assignment.runId}.bootstrap-recovery-asked`);
+      if (!existsSync(recoveryQuestion)) {
+        writeFileSync(recoveryQuestion, "asked", { mode: 0o600 });
+        await report({ kind: "question", question: "Should the already accepted verification remain mandatory for this work?", options: ["Keep it mandatory", "Review it after replanning"] });
+        return;
+      }
+    }
+    if (scenario === "mixed" && assignment.revision > 1) {
+      const recoveryQuestion = join(receiptDir, `${assignment.runId}.mixed-recovery-asked`);
+      if (!existsSync(recoveryQuestion)) {
+        writeFileSync(recoveryQuestion, "asked", { mode: 0o600 });
+        await report({ kind: "question", question: "Which display label should the second file use?", options: ["Detailed", "Compact"] });
+        return;
+      }
+    }
+    if (scenario === "mixed" && assignment.revision === 1) {
       const response = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
         method: "POST",
         headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
@@ -191,6 +225,7 @@ async function main() {
       { id: "a", title: "Build the first file", instructions: "Write a.txt with the current revision", paths: ["a.txt"], dependsOn: [] },
       { id: "b", title: "Build the second file", instructions: "Write b.txt with the current revision", paths: ["b.txt"], dependsOn: [] },
     ];
+    if (scenario === "mixed") tasks[1].dependsOn = ["a"];
     if (scenario === "scale-up") tasks.push({ id: "c", title: "Build the third file", instructions: "Write c.txt with the current revision", paths: ["c.txt"], dependsOn: [] });
     if (scenario.startsWith("bootstrap")) tasks[0].paths.push("check.mjs");
     if (scenario === "usage") {
@@ -214,7 +249,7 @@ async function main() {
     if (scenario === "rubric") { tasks[0].agentProfileId = "haiku"; tasks[1].agentProfileId = "codex-light"; tasks[0].paths.push("docs", "tests"); }
     const verification = { setup: { command: process.execPath, args: [process.argv[1], "--bootstrap-setup", scenario] },
       checks: [{ command: process.execPath, args: ["check.mjs"] }] };
-    if (scenario === "bootstrap-change" && assignment.revision > 1)
+    if (scenario === "bootstrap-change" && assignment.revision > 2)
       verification.checks[0].args.push("--different");
     const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
       ...(scenario === "live-limit" ? { parallelism: 1 } : {}),
@@ -253,7 +288,23 @@ async function main() {
       verdict: scenario === "permissions-escalate" ? "escalate" : "approve-once",
       summary: "The request is limited to reading the assigned project file for the stated objective." });
   } else if (assignment.role === "implementer") {
-    if (scenario !== "live-limit") await waitForPeer();
+    if (scenario !== "live-limit" && scenario !== "mixed") await waitForPeer();
+    const shouldBlock = scenario === "agent-blocked-once" && assignment.revision === 1 || scenario === "agent-blocked-twice" && assignment.revision <= 3;
+    if (shouldBlock && assignment.taskId === "a") {
+      if (scenario === "agent-blocked-once") {
+      const until = Date.now() + 20000;
+      while (!existsSync(join(receiptDir, `${assignment.runId}.b-reported`))) {
+        if (Date.now() >= until) throw new Error("The independent sibling did not report before the blocker");
+        await new Promise(resolve => setTimeout(resolve, 40));
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      await report({ kind: "blocked", summary: "The first assignment hit a recoverable worker issue." });
+      return;
+    }
+    if (scenario === "agent-blocked-once" && assignment.revision === 1 && assignment.taskId === "b") {
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
     if (scenario === "scale-up" && assignment.taskId === "a") {
       const until = Date.now() + 20000;
       while (!readdirSync(receiptDir).filter(name => name.endsWith(".json"))
@@ -278,12 +329,6 @@ async function main() {
       return;
     }
     if (scenario.startsWith("limit") && receipt.provider === "claude" && receipt.argv[receipt.argv.indexOf("--model") + 1] === "claude-haiku-5-5") {
-      // In `limit`, the first attempt asks a question so the limited attempt carries a user answer.
-      if (scenario === "limit" && !existsSync(asked)) {
-        writeFileSync(asked, "asked", { mode: 0o600 });
-        await report({ kind: "question", question: "Which display label should the first file use?", options: ["Detailed", "Compact"] });
-        return;
-      }
       // Partial work, then Claude Code's limit notice and its StopFailure hook. The notice comes
       // first so the hook arrives as its corroboration: a hook alone switches the member before a
       // later notice could record the host-level limit. The member idles without reporting.
@@ -429,6 +474,10 @@ async function main() {
     receipt.finishedAt = Date.now();
     saveReceipt();
     await report({ kind: "result", summary: `Implemented ${assignment.taskId}.txt` });
+    if (scenario === "agent-blocked-once" && assignment.revision === 1 && assignment.taskId === "b") {
+      writeFileSync(join(receiptDir, `${assignment.runId}.b-reported`), "reported", { mode: 0o600 });
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
   } else if (assignment.role === "integrator") {
     if (scenario === "repeat-failed-check") {
       await report({ kind: "result", summary: "No implementation change is required for this verification result" });

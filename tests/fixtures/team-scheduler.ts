@@ -37,6 +37,10 @@ export function schedulerFixture() {
   let reads = 0;
   const manager = {
     list: async () => [],
+    meta: (requestedId: string) => {
+      if (requestedId === sessionId) return {};
+      throw Object.assign(new Error("Session metadata is unavailable."), { code: "ENOENT" });
+    },
     state: async () => structuredClone({ ...state, seq: journal.seq }),
     events: (requestedId: string, after: number, limit: number, types?: Set<string>) => {
       assert.equal(requestedId, sessionId);

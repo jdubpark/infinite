@@ -1107,11 +1107,13 @@ above are unchanged; sessions outside team runs never receive this trust.
 
 ## Team questions and steering
 
-A member can explicitly ask a question with suggested options. The team records
-the question and stops that assignment; independent tasks can continue. An owner
-or controller answers from the team page. The answer is recorded and a new
-assignment receives the applicable context. This is a product decision, separate
-from the provider's tool permission dialogs.
+A member can explicitly ask a question with suggested options. Eligible worker
+questions first reach the project manager through bounded recovery, with the
+original question retained. The manager resolves routine task dependencies and
+ownership, or asks the owner for a material decision. Project-manager and
+delivery questions retain the direct decision path: an owner or controller
+answers from the team page, and a new assignment receives the recorded answer.
+Provider tool permission dialogs use their separate permission policy.
 
 For a standalone team, steering records a new requirements revision. Earlier
 member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated
@@ -1136,8 +1138,26 @@ scheduler from stopping a member. Such conflicts remain visible.
 
 ## Blocked runs
 
-A blocked run waits for the owner, so the host flags it everywhere the owner
-looks:
+Routine agent blockers go to the team's project manager for diagnosis and a
+corrected plan. The host allows at most two automatic recovery attempts per run,
+retains the blocker and earlier member evidence, confirms that previous members
+have stopped, and verifies the recorded integration commit before replanning.
+The run stays in planning while recovery is active, so a goal or mission keeps
+supervising it. A mission coordinator resolves remaining dependencies and
+ownership issues through its subteam controls.
+
+A project manager may explicitly report `no-change` with evidence when the
+request is already satisfied, no implementation tasks have been planned, and
+the integration head still equals the original source commit.
+The host verifies that the manager and integration workspaces are unchanged.
+This ends the team with an agent finding, without declaring a product goal
+achieved or user acceptance complete.
+
+Recovery preserves the approved objective, required checks, independent review,
+permission decisions, and execution limits. It does not replay uncertain
+workspace or delivery operations, override scope violations, or resume an
+explicitly paused or cancelled run. A hard stop or exhausted recovery remains
+blocked and visible to the owner:
 
 * **Phone push.** With push enabled, the host announces new runs, completion,
   cancellation and runs that need the owner. Stuck events are high priority;
@@ -1151,9 +1171,10 @@ looks:
   Team detail offers Continue development when the owner can continue safely;
   Resume remains for the existing supported resume cases.
 
-The host never resumes a blocked run itself. `infinite team resume ID` replans
-from the integrated work when the block allows it; otherwise inspect the run and
-start a new one.
+Existing eligible agent-report blockers can enter the same bounded manager
+recovery. `infinite team resume ID` remains available for the supported recovery
+cases below; otherwise inspect the retained evidence before choosing the next
+action.
 
 An owner can continue a blocked standalone run when its current state is marked
 continuable. This is available only when the host can safely start a fresh

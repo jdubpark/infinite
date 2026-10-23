@@ -337,6 +337,12 @@ export interface TeamRun {
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
   /** Agent-reported open pull request for a `pr` delivery; the owner merges it on GitHub. Not host verification. */
   pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string };
+  /** Bounded PM recovery of routine report/protocol failures; member reports remain the evidence source. */
+  recovery?: {
+    attempts: number;
+    status: "stopping" | "planning" | "exhausted";
+    source: { code: string; memberId: string; revision: number; reportKind?: TeamReport["kind"]; reason: string; at: string };
+  };
   /** The base came from the host mirror while the latest fetch from GitHub failed. */
   baseStale?: { fetchedAt?: string; reason: "fetch-failed"; category: "auth" | "network" | "not-found" | "other" };
   /** A continuation kept its parent's base while the mirror already holds a newer base-branch head. */

@@ -897,6 +897,23 @@ export class MissionService {
         break;
       }
       case "blocked":
+        // A coordinator can be carrying a stale blocker report while a subteam's own
+        // project manager is still trying its bounded, in-scope recovery. Keep that
+        // work supervised and wait for its next state change before asking again.
+        if (mission.subtasks.some(item => {
+          if (!item.teamId) return false;
+          try {
+            const team = this.teams.get(item.teamId);
+            return team.status === "planning" && (team.recovery?.status === "stopping" || team.recovery?.status === "planning");
+          } catch (error) { if (notFound(error)) return false; throw error; }
+        })) {
+          const reason = `A subteam's bounded recovery is still in progress. Reassess the mission blocker after it finishes. Your deferred report was: ${report.summary}`;
+          this.event(stored, `The coordinator's blocked report was deferred: ${reason}`);
+          // Do not count this as a refusal or put it in the wake inbox. A child
+          // status change will wake the next attempt and carry this note forward.
+          stored.notes.push({ type: "refused", kind: report.kind, reason });
+          break;
+        }
         this.stop(stored, "blocked", report.summary);
         this.event(stored, "The coordinator reported that the mission is blocked.");
         break;

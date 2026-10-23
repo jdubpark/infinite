@@ -678,6 +678,7 @@ test("a mission coordinator reports through its own MCP tool and envelope, separ
 });
 
 type FakeRun = { id: string; projectId: string; missionId: string; status: TeamView["status"]; revision: number; updatedAt: string; parallelism?: number; parallelismCeiling?: number;
+  recovery?: { attempts: number; status: "stopping" | "planning" | "exhausted"; source: { code: string; memberId: string; revision: number; reportKind?: string; reason: string; at: string } };
   decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string }[] };
 
 /**
@@ -1416,6 +1417,39 @@ test("direction for a blocked subteam waits while the mission is paused, and is 
     await h.missions.resume(id, { requestId: randomUUID(), revision: h.get(id).revision });
     await until(() => h.steers, steers => steers.length === 1);
     assert.equal(h.runs.get(teamId)!.status, "planning");
+  } finally { h.close(); }
+});
+
+test("a mission blocked report waits for an active bounded subteam recovery without starting retry attempts", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = teamOf(await until(() => h.get(id), mission => Boolean(teamOf(mission, "a"))), "a")!;
+    const decision = { id: randomUUID(), memberId: randomUUID(), revision: 1, question: "Should the API stay backward compatible?", options: ["Yes", "No"], createdAt: new Date().toISOString() };
+    h.set(teamId, { status: "needs-input", decisions: [decision] });
+    await h.attempt(2);
+    h.set(teamId, { status: "planning", recovery: { attempts: 1, status: "planning", source: {
+      code: "agent-blocked", memberId: decision.memberId, revision: 1, reportKind: "blocked", reason: "The worker found a routine implementation issue.", at: new Date().toISOString(),
+    } } });
+
+    await h.report(2, { kind: "blocked", summary: "The API change is blocked." });
+    const deferred = await until(() => h.get(id), mission => mission.status === "blocked" || mission.events.some(event => /blocked report was deferred/.test(event.text)));
+    assert.ok(deferred.events.some(event => /blocked report was deferred/.test(event.text)), "The active subteam recovery defers a stale mission-level blocker");
+    assert.equal(deferred.status, "working");
+    assert.equal(h.runs.get(teamId)?.status, "planning", "The child remains supervised during its repair window");
+    await new Promise(done => setTimeout(done, 1200));
+    assert.equal(h.attempts(), 2, "A deferred report does not immediately wake the same coordinator into a refusal loop");
+
+    h.set(teamId, { status: "blocked", recovery: { attempts: 2, status: "exhausted", source: {
+      code: "agent-blocked", memberId: decision.memberId, revision: 1, reportKind: "blocked", reason: "The bounded recovery was exhausted.", at: new Date().toISOString(),
+    } } });
+    await h.attempt(3);
+    const deferredNote = (await h.messages(3)).find((message: { type: string; kind?: string }) => message.type === "refused" && message.kind === "blocked");
+    assert.match(deferredNote?.reason ?? "", /The API change is blocked/, "The next attempt retains the original report alongside the exhausted child state");
+    await h.report(3, { kind: "blocked", summary: "The bounded recovery could not resolve the issue." });
+    assert.equal((await until(() => h.get(id), mission => mission.status === "blocked")).status, "blocked",
+      "A coordinator can still report a terminal blocker after recovery is exhausted");
   } finally { h.close(); }
 });
 

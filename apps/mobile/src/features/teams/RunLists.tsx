@@ -9,7 +9,7 @@ import { StatusIcon } from "../../components/Icon";
 import { age } from "../../status";
 import { theme } from "../../theme";
 import {
-  blockedTeamsFirst, canResumeBlockedTeam, GOAL_LABELS, goalGroup, goalKind, groupRuns, newer, openDecisions, pendingApprovals, shortDate, TEAM_LABELS, teamGroup, teamKind, teamProgress, teamReady,
+  blockedTeamsFirst, canContinueBlockedTeam, canResumeBlockedTeam, GOAL_LABELS, goalGroup, goalKind, groupRuns, newer, openDecisions, pendingApprovals, shortDate, TEAM_LABELS, teamGroup, teamKind, teamProgress, teamReady,
   type ProductGoal, type RunGroup, type TeamView,
 } from "./model";
 import { providerName, RequestStatus } from "./parts";
@@ -82,6 +82,7 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
     }).catch(() => {}); },
   });
   const canResume = canResumeBlockedTeam(team, role);
+  const canContinue = canContinueBlockedTeam(team, role);
   const resume = () => request.send(`/teams/${team.id}/resume`, "Resume", team.revision);
   const { kind: rowKind } = canResume ? { kind: "blocked" as const } : { kind };
   return <View style={s.runRowWrap}>
@@ -109,8 +110,9 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
         </View>
       </Pressable>
       {canResume ? <Button compact busy={request.busy} secondary title="Resume" disabled={request.busy || Boolean(request.pending)} onPress={resume} /> : null}
+      {canContinue ? <Button compact secondary title="Continue" onPress={onOpen} /> : null}
     </View>
-    {canResume || request.pending || request.message ? <RequestStatus request={request} bottom={74} canRetry={role === "owner"} /> : null}
+    {canResume || canContinue || request.pending || request.message ? <RequestStatus request={request} bottom={74} canRetry={role === "owner"} /> : null}
   </View>;
 }
 

@@ -969,12 +969,43 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       return true;
     } finally { rmSync(temporary, { recursive: true, force: true }); }
   }
-  if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions"].includes(subcommand ?? "")) {
+  if (subcommand === "retire-member") {
+    const [memberId, ...textParts] = rest, text = textParts.join(" ").trim();
+    const identity = String(options["--identity"] ?? "").trim();
+    if (!id || !memberId || !text || !identity || !/^[a-f0-9]{64}$/.test(identity))
+      throw new Error("Usage: infinite team retire-member ID MEMBER_ID TEXT... --identity HASH [--request-id UUID] [--json]");
+    const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
+    const endpoint = `/teams/${id}/members/${memberId}/retire`;
+    const key = `team-retire-member:${requestId}`;
+    const records = readPrivateJson(receiptsPath, {}) as Record<string, any>;
+    const saved = records[key];
+    if (saved && (saved.endpoint !== endpoint || saved.body?.identity !== identity || saved.body?.text !== text))
+      throw new Error("This request ID is saved with a different retirement. Retry its original member, identity and explanation.");
+    resumePendingIntent(receiptsPath, "team-retire-member:", endpoint, () => true, requestId, true, rawArgs);
+    let body: Record<string, unknown>;
+    if (saved) body = saved.body;
+    else {
+      const current = await api.json<any>(`/teams/${id}`);
+      const inspection = await api.json<any>(`/teams/${id}/members/${memberId}/runtime`);
+      if (inspection.identity !== identity) throw new Error("The inspected runtime identity changed. Inspect the member again before retiring it.");
+      body = { requestId, revision: current.revision, sessionId: inspection.sessionId, identity, text };
+    }
+    outputTeam(await postMutation(api, receiptsPath, key, endpoint, body), Boolean(options["--json"]));
+    return true;
+  }
+  if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions", "reconcile-verification"].includes(subcommand ?? "")) {
     if (!id) throw new Error(`Usage: infinite team ${subcommand} ID ...`);
     const current = await api.json<any>(`/teams/${id}`);
     const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
     let endpoint = subcommand === "revoke-permissions" ? `/teams/${id}/permissions/revoke` : `/teams/${id}/${subcommand}`, body: Record<string, unknown>;
-    if (subcommand === "continue") {
+    if (subcommand === "reconcile-verification") {
+      const pendingId = String(options["--pending"] ?? "").trim(), headCommit = String(options["--head"] ?? "").trim();
+      const attestationText = [options["--processes-stopped"], ...rest].filter(value => typeof value === "string").join(" ").trim();
+      if (!pendingId || !headCommit || options["--processes-stopped"] === undefined || !attestationText)
+        throw new Error("Usage: infinite team reconcile-verification ID --pending PENDING_ID --head COMMIT --processes-stopped TEXT... [--request-id UUID] [--json]");
+      endpoint = `/teams/${id}/reconcile-verification`;
+      body = { requestId, revision: current.revision, pendingId, headCommit, attestation: { boundary: "check-only", processesStopped: true, text: attestationText } };
+    } else if (subcommand === "continue") {
       const direction = rest.join(" ").trim();
       if (rest.length && !direction) throw new Error("Direction for continuation must contain non-whitespace text.");
       if (direction.length > 8000) throw new Error("Direction for continuation must be 8000 characters or fewer.");
@@ -1025,5 +1056,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|cancel|revoke-permissions ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|reconcile-verification|retire-member|cancel|revoke-permissions ...");
 }

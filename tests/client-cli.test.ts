@@ -660,6 +660,57 @@ test("CLI continuation releases definitive rejections and preserves uncertain re
   }
 });
 
+for (const action of ["reconcile-verification", "retire-member"] as const) {
+  test(`CLI recovery ${action} preserves its request after a lost acknowledgement`, { timeout: 30000 }, async () => {
+    const root = mkdtempSync(join(tmpdir(), "infinite-recovery-cli-"));
+    const id = randomUUID(), member = randomUUID(), sessionId = randomUUID(), pendingId = randomUUID(), requestId = randomUUID();
+    const headCommit = "a".repeat(40), identity = "b".repeat(64), text = "Confirmed the isolated runtime is stopped";
+    const endpoint = action === "retire-member" ? `/api/teams/${id}/members/${member}/retire` : `/api/teams/${id}/reconcile-verification`;
+    const received: Record<string, unknown>[] = [];
+    let runtimeReads = 0;
+    const server = createServer(async (req, res) => {
+      res.setHeader("Content-Type", "application/json");
+      if (req.method === "GET" && req.url?.endsWith("/runtime")) {
+        runtimeReads++;
+        if (received.length) { res.statusCode = 409; res.end(JSON.stringify({ code: "member-retirement-unavailable" })); }
+        else res.end(JSON.stringify({ sessionId, identity }));
+        return;
+      }
+      if (req.method === "GET" && req.url === `/api/teams/${id}`) {
+        res.end(JSON.stringify({ id, revision: received.length ? 2 : 1, status: received.length ? "verifying" : "blocked" }));
+        return;
+      }
+      if (req.method !== "POST" || req.url !== endpoint) { res.statusCode = 404; res.end("{}"); return; }
+      let content = "";
+      for await (const chunk of req) content += chunk;
+      received.push(JSON.parse(content));
+      if (received.length === 1) { res.statusCode = 503; res.end(JSON.stringify({ code: "unavailable" })); }
+      else res.end(JSON.stringify({ id, revision: 2, status: "verifying" }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const clientFile = join(root, "client.json");
+    writeFileSync(clientFile, JSON.stringify({ origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: randomBytes(32).toString("hex") }), { mode: 0o600 });
+    const args = action === "retire-member" ? [member, text, "--identity", identity]
+      : ["--pending", pendingId, "--head", headCommit, "--processes-stopped", text];
+    const run = () => exec(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"),
+      "--client-config", clientFile, "team", action, id, ...args, "--request-id", requestId, "--json"]);
+    try {
+      await assert.rejects(run(), error => /503/.test(String(error)));
+      assert.deepEqual(received[0], action === "retire-member" ? { requestId, revision: 1, sessionId, identity, text }
+        : { requestId, revision: 1, pendingId, headCommit, attestation: { boundary: "check-only", processesStopped: true, text } });
+      assert.equal(JSON.parse((await run()).stdout).id, id);
+      assert.deepEqual(received[1], received[0], "retry keeps the original preconditions after the host advances");
+      assert.equal(JSON.parse((await run()).stdout).id, id);
+      assert.equal(received.length, 2, "a confirmed CLI receipt does not post another recovery");
+      if (action === "retire-member") assert.equal(runtimeReads, 1, "saved recovery retries do not require a retired runtime to remain inspectable");
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 test("team CLI answers a decision and steers through the host API", { timeout: 120000 }, async () => {
   const run = await teamFixture("question"), clientFile = join(run.host.root, "question-client.json");
   writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });

@@ -7,7 +7,7 @@ import { z } from "zod";
 import { workerCall, type WorkerError } from "./ipc.js";
 import { controlActor, type PairedDevice } from "./device-control.js";
 import type { Manager } from "./manager.js";
-import type { ControlActor, ControlLease, Receipt, TerminalSnapshot, WorkerState } from "./types.js";
+import type { ControlActor, Receipt, TerminalSnapshot, WorkerState } from "./types.js";
 
 // A snapshot is a rendered journal prefix. Watch before capturing it; every
 // subsequent delta starts strictly after its cursor, even during heavy output.
@@ -99,7 +99,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
           serial = serial.then(async () => {
             // A managed session's fallback lease is not kept alive past its provider prompt.
             if (managed && (await manager.state(match[1])).attention?.state !== "needs-you") return;
-            await workerCall(manager.config.runDir, match[1], { op: "control", action: "renew", actor, leaseId: held });
+            await manager.controlSession(match[1], { op: "control", action: "renew", actor, leaseId: held });
           }).catch(() => { leaseId = undefined; fail(1011); });
         }
       });
@@ -109,7 +109,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
         // Let any in-flight claim settle before releasing. A stale release can
         // never clear a newer owner's lease (the worker checks its generation).
         void serial.then(async () => {
-          if (leaseId) await workerCall(manager.config.runDir, match[1], { op: "control", action: "release", actor, leaseId });
+          if (leaseId) await manager.controlSession(match[1], { op: "control", action: "release", actor, leaseId });
         }).catch(() => {});
       });
       const send = (value: unknown) => new Promise<void>((resolve, reject) => {
@@ -163,13 +163,13 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
                 await send({ refusal: { requestId: input.requestId, code: "unsupported" } }); return;
               }
               const { requestId, ...request } = input;
-              const control = await workerCall<ControlLease | null>(manager.config.runDir, match[1], { ...request, actor });
+              const control = await manager.controlSession(match[1], { ...request, actor });
               leaseId = control?.id;
               await send({ requestId, control });
               return;
             }
             if (state.capabilities?.inputControl && legacy && !leaseId && !(managed && input.op === "resize")) {
-              leaseId = (await workerCall<ControlLease>(manager.config.runDir, match[1], { op: "control", action: "claim", actor })).id;
+              leaseId = (await manager.controlSession(match[1], { op: "control", action: "claim", actor }))!.id;
             }
             const suppliedLease = legacy ? leaseId : input.leaseId;
             if (state.capabilities?.inputControl && !suppliedLease) {

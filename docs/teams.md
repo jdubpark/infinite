@@ -326,6 +326,64 @@ branches, pull requests and confirmed results before considering any new action.
 A changed baseline still needs a fresh implementation and review; this action
 does not waive checks, reconcile edited files, or expand provider access.
 
+### Restart-interrupted verification
+
+An owner can reconcile a check only when the team is blocked with the host's
+restart-interruption reason, the same check operation is still pending, every
+member is stopped, the exact integrated head is unchanged and clean, and the
+retained check records show that the final configured command was interrupted.
+Result, prepare, member, permission, and delivery uncertainty stays fenced.
+The operator must first establish that the old check processes have exited:
+the host cannot see check processes orphaned by a previous API process (for
+example, when `systemd` uses `KillMode=process` or a sudo command prefix is
+configured). Before attesting, confirm that no process from the interrupted
+check remains and that no process has a working directory under the team root.
+The attestation is an operator claim, not host verification.
+
+Use `POST /api/teams/:id/reconcile-verification` with `requestId`, `revision`,
+`pendingId`, `headCommit`, and `attestation: { boundary: "check-only",
+processesStopped: true, text }`. The CLI form is
+`infinite team reconcile-verification ID --pending PENDING_ID --head COMMIT
+--processes-stopped TEXT... [--request-id UUID] [--json]`.
+
+This clears only the interrupted check intent. It preserves the run, issue,
+revision, tasks, members, head, old check records, and workspace; the scheduler
+starts fresh verification in a new disposable workspace, followed by the
+normal independent review. Reusing the request ID and body returns the saved
+state. A different body with that ID is refused. Refusal codes include
+`stale-team-revision`, `team-cancelled`, `linear-reconciliation-required`,
+`verification-reconciliation-unavailable`,
+`verification-reconciliation-operation-changed`,
+`verification-reconciliation-head-changed`, and
+`verification-policy-changed`; a dirty integration workspace returns
+`integration-changed-files`.
+
+An owner can retire a current-revision reviewer whose report is missing and
+whose runtime is in `recording-error`, then let the scheduler start one fresh
+reviewer at the same verified head. First inspect
+`GET /api/teams/:id/members/:memberId/runtime`, verify the assignment and
+process identity, confirm no person controls the session, and establish that
+the integration head and member checkout are unchanged. Then POST
+`/api/teams/:id/members/:memberId/retire` with `requestId`, `revision`,
+`sessionId`, `identity`, and a short operator statement. The CLI form is
+`infinite team retire-member ID MEMBER_ID TEXT... --identity HASH
+[--request-id UUID] [--json]`.
+
+Retirement freezes the recorded tree with `SIGSTOP`, rescans and records new
+descendants, then uses `SIGKILL` once the tree is quiescent. It never sends
+`SIGCONT` or runs termination handlers. The host signals its own processes and the
+sudo launcher directly. Agent-owned descendants are signaled only through the
+configured team command boundary, after a per-process start-time recheck.
+Unknown owners are observed but never signaled; retirement remains blocked
+until they exit, then retry with the same request ID and inspected identity.
+The original session journal, recording-gap evidence, reports, and workspace
+remain available. Restoring recording is unsupported. The scheduler creates
+the replacement only after the recorded process tree has exited and the old
+checkout passes its read-only check. Refusal codes include
+`stale-team-revision`, `member-retirement-unavailable`,
+`runtime-identity-changed`, `retirement-processes-alive`,
+`retirement-boundary-unavailable`, `control-busy`, and `runtime-retiring`.
+
 After the host records a `merge` report, it refreshes the project, so the merged
 commit reaches the host before the owner reads the result.
 

@@ -31,7 +31,7 @@ import { UsageService } from "./usage-service.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
-import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
+import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecard } from "./scorecard.js";
 import { GoalService } from "./goals.js";
 import { MissionService, missionBoard } from "./missions.js";
@@ -690,6 +690,12 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await teams.continueRun(standaloneTeam(req.params.id), teamContinueSchema.parse(req.body))));
   app.post("/api/teams/:id/reconcile-delivery", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.reconcileDelivery(standaloneTeam(req.params.id), teamMutationSchema.parse(req.body))));
+  app.post("/api/teams/:id/reconcile-verification", requireRole(["owner"]), async (req, res) =>
+    res.json(await teams.reconcileVerification(standaloneTeam(req.params.id), teamVerificationReconcileSchema.parse(req.body))));
+  app.get("/api/teams/:id/members/:memberId/runtime", requireRole(["owner"]), async (req, res) =>
+    res.json(await teams.inspectMemberRuntime(standaloneTeam(req.params.id), id.parse(req.params.memberId))));
+  app.post("/api/teams/:id/members/:memberId/retire", requireRole(["owner"]), async (req, res) =>
+    res.json(await teams.retireMember(standaloneTeam(req.params.id), id.parse(req.params.memberId), teamMemberRetireSchema.parse(req.body))));
   app.post("/api/teams/:id/parallelism", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.setParallelism(id.parse(req.params.id), teamParallelismSchema.parse(req.body))));
   app.post("/api/teams/:id/decisions/:decisionId/answer", requireRole(["owner", "controller"]), async (req, res) => {
@@ -1096,7 +1102,7 @@ export function createApp(config: Config, key: Buffer) {
     }).strict().parse(req.body);
     if (!(await manager.state(sessionId)).capabilities?.inputControl)
       return void res.status(409).json({ error: "This session uses an older worker without input control", code: "unsupported" });
-    res.json({ control: await workerCall(config.runDir, sessionId, { op: "control", ...body, actor: res.locals.actor }) });
+    res.json({ control: await manager.controlSession(sessionId, { op: "control", ...body, actor: res.locals.actor }) });
   });
   // Only a directly paired owner CLI can send terminal control bytes. Browser
   // cookies and controller/viewer keys retain their existing narrower inputs.

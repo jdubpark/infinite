@@ -3,6 +3,7 @@ import test from "node:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { MemoryRecord } from "@infinite/remote";
 import { HonchoMemoryAdapter } from "../packages/host/src/memory/adapters/honcho.js";
 import { projectionManifestDigest, SqliteProjectionLedger } from "../packages/host/src/memory/adapters/ledger.js";
@@ -128,16 +129,21 @@ test("source-event receipts survive restart and changed bytes quarantine the pro
 });
 
 test("replacement projection seals a complete manifest and activates with epoch and generation CAS", async t => {
-  const dir=mkdtempSync(join(tmpdir(),"infinite-memory-rebuild-")),path=join(dir,"projection.sqlite");let current=partition;const ledger=openLedger(path,()=>current);t.after(()=>{ledger.close();rmSync(dir,{recursive:true,force:true});});
+  const dir=mkdtempSync(join(tmpdir(),"infinite-memory-rebuild-")),path=join(dir,"projection.sqlite");let current=partition;let ledger=openLedger(path,()=>current);t.after(()=>{ledger.close();rmSync(dir,{recursive:true,force:true});});
   await beginRebuild(ledger,[]);
   await ledger.sealRebuild({partition,expectedSourceManifestDigest:projectionManifestDigest([])});await ledger.activateGeneration({partition,expectedCurrentGenerationId:null,expectedBindingEpoch:3,expectedSourceEpoch:7});
-  const rebuilding={...partition,generationId:"generation-replacement"};const rebuilt=mapping({partition:rebuilding});const digest=projectionManifestDigest([rebuilt]);
+  current={...partition,sourceEpoch:8};
+  const rebuilding={...current,generationId:"generation-replacement"};const rebuilt=mapping({partition:rebuilding});const digest=projectionManifestDigest([rebuilt]);
   await beginRebuild(ledger,[rebuilt],rebuilding);
   await assert.rejects(ledger.sealRebuild({partition:rebuilding,expectedSourceManifestDigest:digest}),/incomplete/);await assert.rejects(ledger.writeRebuildBatch({partition:rebuilding,cursor:"cursor-1",batchDigest:"wrong",mappings:[rebuilt]}),/digest/);
   await writeBatch(ledger,"cursor-1",[rebuilt],rebuilding);await writeBatch(ledger,"cursor-1",[rebuilt],rebuilding);await ledger.sealRebuild({partition:rebuilding,expectedSourceManifestDigest:digest});
-  await ledger.activateGeneration({partition:rebuilding,expectedCurrentGenerationId:"generation-a",expectedBindingEpoch:3,expectedSourceEpoch:7});assert.equal(ledger.isQuarantined(partition),true);assert.throws(()=>ledger.assertServingPartition(partition),/quarantined/);
+  await assert.rejects(ledger.activateGeneration({partition:rebuilding,expectedCurrentGenerationId:"wrong-generation",expectedBindingEpoch:3,expectedSourceEpoch:8}),/compare-and-swap/);
+  await assert.rejects(ledger.activateGeneration({partition:rebuilding,expectedCurrentGenerationId:"generation-a",expectedBindingEpoch:3,expectedSourceEpoch:7}),/epoch compare-and-swap/);
+  await assert.rejects(ledger.activateGeneration({partition:{...rebuilding,sourceEpoch:7},expectedCurrentGenerationId:"generation-a",expectedBindingEpoch:3,expectedSourceEpoch:7}),/canonical binding or source epoch changed/);
+  await ledger.activateGeneration({partition:rebuilding,expectedCurrentGenerationId:"generation-a",expectedBindingEpoch:3,expectedSourceEpoch:8});assert.equal(ledger.isQuarantined(partition),true);assert.throws(()=>ledger.assertServingPartition(partition),/canonical binding or source epoch changed/);
+  ledger.close();ledger=openLedger(path,()=>current);assert.equal(ledger.isQuarantined(partition),true);
   assert.deepEqual(await ledger.findCandidate(rebuilding,rebuilt.handle),rebuilt);
-  await assert.rejects(ledger.activateGeneration({partition:rebuilding,expectedCurrentGenerationId:null,expectedBindingEpoch:3,expectedSourceEpoch:7}),/compare-and-swap/);current={...partition,bindingEpoch:4};await assert.rejects(ledger.findCandidate(rebuilding,rebuilt.handle),/canonical binding or source epoch changed/);
+  await assert.rejects(ledger.activateGeneration({partition:rebuilding,expectedCurrentGenerationId:null,expectedBindingEpoch:3,expectedSourceEpoch:8}),/compare-and-swap/);current={...current,bindingEpoch:4};await assert.rejects(ledger.findCandidate(rebuilding,rebuilt.handle),/canonical binding or source epoch changed/);
 });
 
 test("projection manifest has fixed canonical digest vectors including the generation partition", () => {
@@ -195,6 +201,16 @@ test("ledger encrypts linked identifiers and rejects a wrong vault key", async t
   const sourceEvent=event();const adapter=new LexicalMemoryAdapter(ledger,emptySource);await adapter.indexSourceEvent({event:sourceEvent,processingAllowed:false});
   ledger.close();const bytes=readFileSync(path).toString("utf8");for(const secret of [partition.workspaceId,partition.collectionId,partition.generationId,sourceEvent.sourceEnrollmentId,sourceEvent.sourceId,sourceEvent.sourceRevision,sourceEvent.eventId,sourceEvent.payloadHash,sourceEvent.recordId]) assert.equal(bytes.includes(secret),false,`plaintext identifier ${secret} absent`);
   assert.throws(()=>new SqliteProjectionLedger(path,Buffer.alloc(32,0x2a),()=>{}),/vault key mismatch/);
+});
+
+test("pre-repair active pointers without their partition key fail closed at ledger construction", t => {
+  const dir = mkdtempSync(join(tmpdir(), "infinite-memory-old-ledger-"));
+  const path = join(dir, "projection.sqlite");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const legacy = new DatabaseSync(path);
+  legacy.exec("CREATE TABLE projection_active (collection_key TEXT PRIMARY KEY, generation_key TEXT NOT NULL, binding_key TEXT NOT NULL, source_key TEXT NOT NULL)");
+  legacy.close();
+  assert.throws(() => openLedger(path, () => partition), /schema requires rebuild: active generation partition is missing/);
 });
 
 test("Honcho does not issue unmetered semantic requests",async()=>{

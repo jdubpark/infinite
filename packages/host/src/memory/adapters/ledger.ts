@@ -58,13 +58,20 @@ export class SqliteProjectionLedger implements MemoryProjectionLedger {
     this.db.exec("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA secure_delete = ON; PRAGMA trusted_schema = OFF;");
     const check = this.db.prepare("PRAGMA quick_check").get() as { quick_check?: string } | undefined;
     if (check?.quick_check !== "ok") { this.db.close(); this.zeroKeys(); throw new Error("projection ledger is corrupt and must remain quarantined"); }
+    const activeColumns = this.db.prepare("PRAGMA table_info(projection_active)").all() as Array<{ name: string }>;
+    if (activeColumns.length && !activeColumns.some(column => column.name === "partition_key")) {
+      this.db.close();
+      this.zeroKeys();
+      throw new Error("projection ledger schema requires rebuild: active generation partition is missing");
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS projection_generations (
         partition_key TEXT PRIMARY KEY, state TEXT NOT NULL CHECK (state IN ('building','ready','sealed','active','retired','quarantined')),
         reason_cipher TEXT, manifest_key TEXT, expected_count INTEGER
       );
       CREATE TABLE IF NOT EXISTS projection_active (
-        collection_key TEXT PRIMARY KEY, generation_key TEXT NOT NULL, binding_key TEXT NOT NULL, source_key TEXT NOT NULL
+        collection_key TEXT PRIMARY KEY, generation_key TEXT NOT NULL, binding_key TEXT NOT NULL, source_key TEXT NOT NULL,
+        partition_key TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS projection_rebuild_batches (
         partition_key TEXT NOT NULL, cursor_key TEXT NOT NULL, digest_key TEXT NOT NULL, PRIMARY KEY(partition_key,cursor_key)
@@ -84,6 +91,11 @@ export class SqliteProjectionLedger implements MemoryProjectionLedger {
       catch { this.db.close(); this.zeroKeys(); throw new Error("projection ledger vault key mismatch; ledger remains quarantined"); }
     } else {
       this.db.prepare("INSERT INTO projection_meta(name,value_cipher) VALUES('key-check',?)").run(this.encrypt("meta", "key-check", "infinite-ledger-v1"));
+    }
+    if (this.db.prepare("SELECT 1 FROM projection_active WHERE partition_key IS NULL OR typeof(partition_key)!='text' OR length(partition_key)=0 LIMIT 1").get()) {
+      this.db.close();
+      this.zeroKeys();
+      throw new Error("projection ledger schema requires rebuild: active generation partition is missing");
     }
   }
 
@@ -235,7 +247,40 @@ export class SqliteProjectionLedger implements MemoryProjectionLedger {
       throw error;
     }
   }
-  async activateGeneration(i:{partition:MemoryAdapterPartition;expectedCurrentGenerationId:string|null;expectedBindingEpoch:number;expectedSourceEpoch:number}):Promise<void>{const p=i.partition;this.verifyCanonicalCurrent(p);if(p.bindingEpoch!==i.expectedBindingEpoch||p.sourceEpoch!==i.expectedSourceEpoch)throw new Error("generation epoch compare-and-swap failed");const collection=this.key("collection",p.collectionId),generation=this.key("generation",p.generationId),expectedGeneration=i.expectedCurrentGenerationId===null?null:this.key("generation",i.expectedCurrentGenerationId),binding=this.key("binding-epoch",String(p.bindingEpoch)),source=this.key("source-epoch",String(p.sourceEpoch));const before=this.db.prepare("SELECT generation_key,binding_key,source_key FROM projection_active WHERE collection_key=?").get(collection) as {generation_key:string;binding_key:string;source_key:string}|undefined;if((before?.generation_key??null)!==expectedGeneration)throw new Error("active generation compare-and-swap failed");if(before&&(before.binding_key!==binding||before.source_key!==source))throw new Error("active generation epoch compare-and-swap failed");const g=this.db.prepare("SELECT state FROM projection_generations WHERE partition_key=?").get(this.partition(p)) as {state:string}|undefined;if(g?.state!=="sealed")throw new Error("only a sealed generation can be activated");this.db.exec("BEGIN IMMEDIATE");try{const active=this.db.prepare("SELECT generation_key,binding_key,source_key FROM projection_active WHERE collection_key=?").get(collection) as {generation_key:string;binding_key:string;source_key:string}|undefined;if((active?.generation_key??null)!==expectedGeneration)throw new Error("active generation compare-and-swap failed");if(active&&(active.binding_key!==binding||active.source_key!==source))throw new Error("active generation epoch compare-and-swap failed");if(active){const oldPart=this.partition({...p,generationId:i.expectedCurrentGenerationId!});this.db.prepare("UPDATE projection_generations SET state='quarantined',reason_cipher=? WHERE partition_key=?").run(this.encrypt("reason",oldPart,"superseded generation awaiting verified retirement"),oldPart);}this.db.prepare("INSERT INTO projection_active(collection_key,generation_key,binding_key,source_key) VALUES(?,?,?,?) ON CONFLICT(collection_key) DO UPDATE SET generation_key=excluded.generation_key,binding_key=excluded.binding_key,source_key=excluded.source_key").run(collection,generation,binding,source);this.db.prepare("UPDATE projection_generations SET state='active' WHERE partition_key=? AND state='sealed'").run(this.partition(p));this.verifyCanonicalCurrent(p);this.db.exec("COMMIT");}catch(e){this.db.exec("ROLLBACK");throw e;}this.verifyCanonicalCurrent(p);}
+  async activateGeneration(input: Parameters<MemoryProjectionLedger["activateGeneration"]>[0]): Promise<void> {
+    const { partition } = input;
+    this.assertCanonicalCurrent(partition);
+    if (partition.bindingEpoch !== input.expectedBindingEpoch || partition.sourceEpoch !== input.expectedSourceEpoch)
+      throw new Error("generation epoch compare-and-swap failed");
+    const collection = this.key("collection", partition.collectionId);
+    const generation = this.key("generation", partition.generationId);
+    const expectedGeneration = input.expectedCurrentGenerationId === null ? null : this.key("generation", input.expectedCurrentGenerationId);
+    const part = this.partition(partition);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const active = this.db.prepare("SELECT generation_key,partition_key FROM projection_active WHERE collection_key=?")
+        .get(collection) as { generation_key: string; partition_key: string } | undefined;
+      // CAS the old identity independently of the replacement's current epochs.
+      if ((active?.generation_key ?? null) !== expectedGeneration) throw new Error("active generation compare-and-swap failed");
+      const replacement = this.db.prepare("SELECT state FROM projection_generations WHERE partition_key=?")
+        .get(part) as { state: State } | undefined;
+      if (replacement?.state !== "sealed") throw new Error("only a sealed generation can be activated");
+      if (active) {
+        // This key retains the old epoch tuple, even when its projection is empty.
+        const quarantined = this.db.prepare("UPDATE projection_generations SET state='quarantined',reason_cipher=? WHERE partition_key=?")
+          .run(this.encrypt("reason", active.partition_key, "superseded generation awaiting verified retirement"), active.partition_key);
+        if (quarantined.changes !== 1) throw new Error("active generation partition is unavailable; rebuild required");
+      }
+      this.db.prepare("INSERT INTO projection_active(collection_key,generation_key,binding_key,source_key,partition_key) VALUES(?,?,?,?,?) ON CONFLICT(collection_key) DO UPDATE SET generation_key=excluded.generation_key,binding_key=excluded.binding_key,source_key=excluded.source_key,partition_key=excluded.partition_key")
+        .run(collection, generation, this.key("binding-epoch", String(partition.bindingEpoch)), this.key("source-epoch", String(partition.sourceEpoch)), part);
+      this.db.prepare("UPDATE projection_generations SET state='active' WHERE partition_key=? AND state='sealed'").run(part);
+      this.assertCanonicalCurrent(partition);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
 
   close():void{if(this.closed)return;this.closed=true;this.db.close();this.zeroKeys();}
   /** Called only inside the same transaction that records its event or rebuild cursor. */

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -110,7 +110,7 @@ type Harness = {
   owner: MemoryPrincipalSelector;
   now: () => number;
   setNow(value: number): void;
-  openStore(): Promise<MemoryStoreService>;
+  openStore(overrides?: Partial<MemoryStoreOptions>): Promise<MemoryStoreService>;
 };
 
 function createHarness(initialTime = Date.parse("2026-10-23T12:00:00.000Z")): Harness {
@@ -146,8 +146,8 @@ function createHarness(initialTime = Date.parse("2026-10-23T12:00:00.000Z")): Ha
     recoveryPublicKey,
     now,
   };
-  const openStore = async () => {
-    const store = new MemoryStoreService(options);
+  const openStore = async (overrides: Partial<MemoryStoreOptions> = {}) => {
+    const store = new MemoryStoreService({ ...options, ...overrides });
     stores.push(store);
     await store.openRecovery();
     return store;
@@ -237,6 +237,36 @@ test("the canonical store stays closed without a fresh signed witness and provis
   const collectionId = await createCollection(store, ownerSelector, 2);
   harness.principals.set(viewer.deviceId!, { ...viewer, collectionIds: [collectionId] });
   await rejectsMemoryError(Promise.resolve().then(() => store.lexicalCandidates({ kind: "device", deviceId: viewer.deviceId! }, workspaceId, { mode: "exact", collectionIds: [collectionId], query: "unknown content", limit: 20 })), "not_found");
+});
+
+test("canonical vault authentication rejects wrong, missing and corrupt key checks without changing existing database bytes", async t => {
+  const harness = createHarness();
+  cleanup(t, harness);
+  const initial = await harness.openStore();
+  provision(initial);
+  const collectionId = await createCollection(initial, ownerSelector, 2);
+  initial.close();
+  const before = readFileSync(harness.databasePath);
+  const count = harness.stores.length;
+  await assert.rejects(harness.openStore({ vaultKey: Buffer.alloc(32, 0x24) }), /vault key authentication/);
+  assert.equal(harness.stores.length, count, "wrong key is rejected before a usable store or recovery exists");
+  assert.deepEqual(readFileSync(harness.databasePath), before);
+  const reopened = await harness.openStore();
+  assert.equal(reopened.recoveryReady, true);
+  assert.equal(provision(reopened).value.workspaceId, workspaceId);
+  assert.equal(reopened.listCollections(ownerSelector, workspaceId).value.items[0]!.collectionId, collectionId);
+  reopened.close();
+  for (const defect of ["missing", "corrupt", "oversized"] as const) {
+    const databasePath = join(harness.directory, `${defect}.sqlite`);
+    copyFileSync(harness.databasePath, databasePath);
+    const alter = new DatabaseSync(databasePath);
+    if (defect === "missing") alter.exec("DELETE FROM memory_meta WHERE key='vault_key_check'");
+    else alter.prepare("UPDATE memory_meta SET value=? WHERE key='vault_key_check'").run(defect === "corrupt" ? "invalid ciphertext" : "x".repeat(513));
+    alter.close();
+    const damaged = readFileSync(databasePath);
+    await assert.rejects(harness.openStore({ databasePath }), /vault key authentication/);
+    assert.deepEqual(readFileSync(databasePath), damaged, `${defect} key check must not be replaced or repaired`);
+  }
 });
 
 test("mutations commit atomically, replay exact receipts, reject changed retries and keep payload bytes encrypted across restart", async t => {
@@ -401,9 +431,18 @@ test("task scope, task epochs, recall modes, evidence lineage and final-send exp
   });
   const expiringId = responseValue(expiringRecord.value).receipt.resourceId;
   const expiringRead = store.getRecord(ownerSelector, expiringId);
+  const freshChildRead = store.getRecord(taskSelector, childId);
+  const epochsBefore = store.currentAuthorizationSnapshot(taskSelector, workspaceId).value;
+  store.revalidateResponse(taskSelector, freshChildRead.fence);
   harness.setNow(harness.now() + 1_000);
   await rejectsMemoryError(Promise.resolve().then(() => store.revalidateResponse(ownerSelector, expiringRead.fence)), "not_found");
-  await rejectsMemoryError(Promise.resolve().then(() => store.revalidateResponse(ownerSelector, childRead.fence)), "not_found");
+  store.revalidateResponse(taskSelector, freshChildRead.fence);
+  harness.setNow(Date.parse(parentExpiry));
+  const epochsAfter = store.currentAuthorizationSnapshot(taskSelector, workspaceId).value;
+  assert.equal(epochsAfter.servingEpoch, epochsBefore.servingEpoch);
+  assert.equal(epochsAfter.grantEpoch, epochsBefore.grantEpoch);
+  assert.equal(epochsAfter.currentBinding.bindingEpoch, epochsBefore.currentBinding.bindingEpoch);
+  await rejectsMemoryError(Promise.resolve().then(() => store.revalidateResponse(taskSelector, freshChildRead.fence)), "not_found");
 
   task = { ...task, expiresAt: "not-a-valid-time" };
   harness.principals.set(taskSelector.taskBindingId, task);
@@ -598,4 +637,50 @@ test("acknowledged erase removes the record and purges encrypted projection outb
   assert.equal(recordRow.encrypted_payload, null);
   assert.equal(recordRow.lifecycle, "erased");
   await rejectsMemoryError(Promise.resolve().then(() => store.getRecord(ownerSelector, recordId)), "not_found");
+});
+
+test("a pre-erasure closed snapshot reconciles newer witness erase and archive without reviving content-bearing outbox jobs", async t => {
+  for (const operation of ["record_erase", "record_archive"] as const) {
+    const harness = createHarness();
+    cleanup(t, harness);
+    const store = await harness.openStore();
+    provision(store);
+    const collectionId = await createCollection(store, ownerSelector, 2);
+    const created = await store.mutate({ actor: ownerSelector, workspaceId,
+      request: mutation(3, 1, { type: "record_create", collectionId, payload: recordPayload("synthetic restored projection content") }) });
+    const recordId = responseValue(created.value).receipt.resourceId;
+    store.close();
+    const restoredPath = join(harness.directory, "restored.sqlite");
+    copyFileSync(harness.databasePath, restoredPath);
+    const inspectSnapshot = new DatabaseSync(restoredPath, { readOnly: true });
+    const original = inspectSnapshot.prepare("SELECT event_id,state,encrypted_payload FROM memory_outbox WHERE kind='projection-refresh'").get() as { event_id: string; state: string; encrypted_payload: string };
+    inspectSnapshot.close();
+    assert.equal(original.state, "pending");
+    const live = await harness.openStore();
+    const acknowledged = await live.mutate({ actor: ownerSelector, workspaceId,
+      request: mutation(4, 1, operation === "record_erase"
+        ? { type: "record_erase", recordId, reasonCode: "owner_request" }
+        : { type: "record_archive", recordId }) });
+    assert.ok("receipt" in acknowledged.value);
+    const head = harness.witness.deltas.at(-1)!;
+    assert.equal(head.sequence, 1);
+    live.close();
+    const restored = await harness.openStore({ databasePath: restoredPath });
+    assert.equal(restored.recoveryReady, true);
+    await rejectsMemoryError(Promise.resolve().then(() => restored.getRecord(ownerSelector, recordId)), "not_found");
+    const inspect = new DatabaseSync(restoredPath, { readOnly: true });
+    const projection = inspect.prepare("SELECT state,encrypted_payload FROM memory_outbox WHERE event_id=?").get(original.event_id) as { state: string; encrypted_payload: string };
+    const record = inspect.prepare("SELECT lifecycle,encrypted_payload FROM memory_records WHERE record_id=?").get(recordId) as { lifecycle: string; encrypted_payload: string | null };
+    const checkpoint = inspect.prepare("SELECT sequence,head_hash FROM memory_recovery_state WHERE singleton=1").get();
+    const tokens = inspect.prepare("SELECT COUNT(*) AS count FROM memory_lexical_tokens WHERE record_id=?").get(recordId) as { count: number };
+    inspect.close();
+    assert.equal(projection.state, "discarded");
+    assert.notEqual(projection.encrypted_payload, original.encrypted_payload);
+    assert.equal(record.lifecycle, operation === "record_erase" ? "erased" : "archived");
+    if (operation === "record_erase") {
+      assert.equal(record.encrypted_payload, null);
+      assert.equal(tokens.count, 0);
+    }
+    assert.deepEqual({ ...checkpoint }, { sequence: head.sequence, head_hash: head.deltaHash });
+  }
 });

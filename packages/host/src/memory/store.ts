@@ -7,7 +7,7 @@ import {
   randomUUID,
   timingSafeEqual,
 } from "node:crypto";
-import { chmodSync, mkdirSync, statSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { SQLInputValue } from "node:sqlite";
@@ -123,6 +123,8 @@ type MutationResultContext = { resourceId: string; resultingRevision: number; co
 
 const CURRENT_SCHEMA_VERSION = 1;
 const CURRENT_KEY_VERSION = 1;
+const VAULT_KEY_CHECK = "infinite-memory-vault-key-v1";
+const MAX_VAULT_KEY_CHECK_BYTES = 512;
 const MAX_WORKSPACE_RECORDS = 10_000;
 const MAX_HOST_RECORDS = 100_000;
 const MAX_DATABASE_BYTES = 2 * 1024 * 1024 * 1024;
@@ -367,12 +369,39 @@ export class MemoryStoreService implements MemoryStoreContract {
     this.identifierKey = this.deriveKey("opaque-identifiers");
     this.cursorKey = this.deriveKey("cursor-authentication");
     mkdirSync(dirname(options.databasePath), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(options.databasePath);
-    chmodSync(options.databasePath, 0o600);
-    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA busy_timeout=5000; PRAGMA wal_autocheckpoint=1000;");
-    this.db.exec(SCHEMA);
-    this.db.exec(`PRAGMA user_version=${CURRENT_SCHEMA_VERSION};`);
-    this.ensureStoreMetadata();
+    let database: DatabaseSync | undefined;
+    try {
+      let initialize = false;
+      try {
+        // Only a file created exclusively by this constructor may receive a new
+        // key check. Existing empty or pre-sentinel databases are refused.
+        closeSync(openSync(options.databasePath, "wx", 0o600));
+        initialize = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      if (!initialize) {
+        const reader = new DatabaseSync(options.databasePath, { readOnly: true });
+        try { this.authenticateStoreMetadata(reader); } finally { reader.close(); }
+      }
+      database = new DatabaseSync(options.databasePath);
+      this.db = database;
+      // Recheck on the writer before any persistent PRAGMA or schema mutation.
+      if (!initialize) this.authenticateStoreMetadata(database);
+      chmodSync(options.databasePath, 0o600);
+      database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA busy_timeout=5000; PRAGMA wal_autocheckpoint=1000;");
+      if (initialize) {
+        this.transaction(() => {
+          this.db.exec(SCHEMA);
+          this.db.exec(`PRAGMA user_version=${CURRENT_SCHEMA_VERSION};`);
+          this.initializeStoreMetadata();
+        });
+      }
+    } catch (error) {
+      database?.close();
+      for (const key of [this.encryptionKey, this.indexKey, this.identifierKey, this.cursorKey]) key.fill(0);
+      throw error;
+    }
     if (options.recoveryWitness && options.recoveryPublicKey) {
       this.recovery = new MemoryRecoveryCoordinator({
         witness: options.recoveryWitness,
@@ -397,14 +426,26 @@ export class MemoryStoreService implements MemoryStoreContract {
     return Buffer.from(hkdfSync("sha256", this.options.vaultKey, Buffer.from("infinite-memory-kdf-v1"), Buffer.from(`infinite-memory:${purpose}:v${CURRENT_KEY_VERSION}`), 32));
   }
 
-  private ensureStoreMetadata(): void {
-    const version = this.one("SELECT value FROM memory_meta WHERE key='key_version'");
-    if (version && version.value !== String(CURRENT_KEY_VERSION)) throw new Error("Unsupported memory key version");
-    this.run("INSERT OR IGNORE INTO memory_meta(key,value) VALUES('key_version',?)", String(CURRENT_KEY_VERSION));
-    const schemaVersion = this.one("SELECT value FROM memory_meta WHERE key='schema_version'");
-    if (schemaVersion && schemaVersion.value !== String(CURRENT_SCHEMA_VERSION)) throw new Error("Unsupported memory schema version");
-    this.run("INSERT OR IGNORE INTO memory_meta(key,value) VALUES('schema_version',?)", String(CURRENT_SCHEMA_VERSION));
-    this.run("INSERT OR IGNORE INTO memory_recovery_state(singleton,sequence,head_hash) VALUES(1,0,?)", MEMORY_RECOVERY_GENESIS_HASH);
+  private authenticateStoreMetadata(database: DatabaseSync): void {
+    try {
+      const check = database.prepare("SELECT CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=? THEN value ELSE NULL END AS value FROM memory_meta WHERE key='vault_key_check'")
+        .get(MAX_VAULT_KEY_CHECK_BYTES) as { value: string | null } | undefined;
+      if (!check || typeof check.value !== "string"
+        || this.unseal<unknown>("memory_meta", "vault_key_check", CURRENT_KEY_VERSION, check.value) !== VAULT_KEY_CHECK) throw new Error();
+    } catch {
+      throw new Error("Memory vault key authentication failed; existing databases require a valid encrypted key check");
+    }
+    const version = database.prepare("SELECT value FROM memory_meta WHERE key='key_version'").get() as { value: unknown } | undefined;
+    if (version?.value !== String(CURRENT_KEY_VERSION)) throw new Error("Unsupported memory key version");
+    const schemaVersion = database.prepare("SELECT value FROM memory_meta WHERE key='schema_version'").get() as { value: unknown } | undefined;
+    if (schemaVersion?.value !== String(CURRENT_SCHEMA_VERSION)) throw new Error("Unsupported memory schema version");
+  }
+
+  private initializeStoreMetadata(): void {
+    this.run("INSERT INTO memory_meta(key,value) VALUES('vault_key_check',?)", this.seal("memory_meta", "vault_key_check", CURRENT_KEY_VERSION, VAULT_KEY_CHECK));
+    this.run("INSERT INTO memory_meta(key,value) VALUES('key_version',?)", String(CURRENT_KEY_VERSION));
+    this.run("INSERT INTO memory_meta(key,value) VALUES('schema_version',?)", String(CURRENT_SCHEMA_VERSION));
+    this.run("INSERT INTO memory_recovery_state(singleton,sequence,head_hash) VALUES(1,0,?)", MEMORY_RECOVERY_GENESIS_HASH);
   }
 
   private assertOpen(): void {
@@ -1302,6 +1343,10 @@ export class MemoryStoreService implements MemoryStoreContract {
           if (!localIntent) this.run("UPDATE memory_epochs SET serving_epoch=serving_epoch+1,grant_epoch=grant_epoch+?,source_epoch=source_epoch+? WHERE workspace_key=?",
             delta.action === "grant-revoke" ? 1 : 0, delta.action === "source-revoke" ? 1 : 0, delta.workspaceKey);
         }
+        // A restored snapshot can contain the original content-bearing job even
+        // when it has no local erase/archive intent. Witness denial must purge it
+        // in the same transaction as the tombstone and checkpoint advancement.
+        if (delta.action === "erase" || delta.action === "revoke") this.purgeRecordOutboxPayloads(delta.objectKey);
       }
       this.run("UPDATE memory_recovery_state SET sequence=?,head_hash=? WHERE singleton=1", checkpoint.sequence, checkpoint.headHash);
     });

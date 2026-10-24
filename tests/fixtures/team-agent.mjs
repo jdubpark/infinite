@@ -1,5 +1,5 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -8,6 +8,31 @@ if (process.argv[2] === "--command-prefix") {
   const [, receiptDir, command, ...args] = process.argv.slice(2);
   appendFileSync(join(receiptDir, "commands.jsonl"), JSON.stringify({ command, args, cwd: process.cwd() }) + "\n", { mode: 0o600 });
   const child = spawn(command, args, { stdio: "inherit", env: { ...process.env, INFINITE_TEST_COMMAND_IDENTITY: "team-prefix" } });
+  child.once("error", () => process.exit(127));
+  child.once("exit", code => process.exit(code ?? 128));
+  await new Promise(() => {});
+}
+if (process.argv[2] === "--mirror-restricted-prefix") {
+  // Models the deployed launcher: inside a bare source mirror only the pinned base-branch fetch and rev-parse run.
+  const [, receiptDir, command, ...args] = process.argv.slice(2);
+  const gitSubcommand = () => {
+    let index = 0;
+    while (args[index] === "-c" || args[index] === "-C") index += 2;
+    return args[index];
+  };
+  const inBareRepository = () => {
+    for (let directory = realpathSync(process.cwd()); ; directory = dirname(directory)) {
+      const config = join(directory, "config");
+      if (existsSync(config) && /bare\s*=\s*true/.test(readFileSync(config, "utf8"))) return true;
+      if (dirname(directory) === directory) return false;
+    }
+  };
+  if (command === "git" && inBareRepository() && !["fetch", "rev-parse"].includes(gitSubcommand())) {
+    appendFileSync(join(receiptDir, "mirror-commands.jsonl"), JSON.stringify({ cwd: process.cwd(), args, refused: true }) + "\n", { mode: 0o600 });
+    process.stderr.write("team-command: only the pinned base-branch fetch and rev-parse are permitted in a source mirror\n");
+    process.exit(126);
+  }
+  const child = spawn(command, args, { stdio: "inherit", env: process.env });
   child.once("error", () => process.exit(127));
   child.once("exit", code => process.exit(code ?? 128));
   await new Promise(() => {});

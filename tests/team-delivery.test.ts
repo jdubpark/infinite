@@ -1,23 +1,38 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fixture, git, limitLineup } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
-import { TeamError } from "../packages/host/src/teams.js";
-import type { TeamMember, TeamReport, TeamRun } from "../packages/host/src/team-types.js";
+import { TeamError, type TeamService } from "../packages/host/src/teams.js";
+import { teamDeliveryReconcileSchema, type TeamDeliveryReconcile, type TeamMember, type TeamReport, type TeamRun } from "../packages/host/src/team-types.js";
+import { unseal } from "../packages/host/src/vault.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import { teamPrompt } from "../packages/host/src/team-prompts.js";
 
-async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: string) => void) {
+type DeliveryStored = {
+  run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root: string;
+  checkHead?: string; halt?: string; deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
+  pending?: { id: string; kind: "result" | "member" | "check" | "prepare"; revision: number;
+    source?: { memberId: string; role: TeamMember["role"]; cwd: string; baseCommit: string; headCommit: string; workspace: "member" | "integration" };
+    failure?: { code?: string; reason: string; at: string } };
+};
+const deliveryInternals = (teams: TeamService) => teams as unknown as {
+  records: Map<string, DeliveryStored>; commands: Map<string, AbortController>;
+  save(stored: DeliveryStored): void; step(stored: DeliveryStored): Promise<void>; consume(stored: DeliveryStored, member: TeamMember): void;
+};
+
+async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: string) => void,
+  source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> | ((fixture: Awaited<ReturnType<typeof fixture>>) => Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">)) {
   const f = await fixture("delivery-fast", limitLineup, {}, { deliveryMode: mode, noServer: true });
-  const teams = await f.openTeamService({ onMerged, start: false });
   const id = randomUUID(), memberId = randomUUID(), branch = "infinite/team-delivery-test";
   git(f.source, "checkout", "-b", branch);
+  const sourceService = typeof source === "function" ? source(f) : source;
+  const teams = await f.openTeamService({ onMerged, ...(sourceService ? { source: sourceService } : {}), start: false });
   const root = join(f.host.config.teams!.workspaceDir, id);
   const workspace = join(root, "integration"), members = join(root, "members"), cwd = join(members, memberId);
-  mkdirSync(members, { recursive: true });
+  mkdirSync(members, { recursive: true, mode: 0o700 });
   git(f.source, "clone", "--no-hardlinks", f.source, workspace);
   git(workspace, "remote", "remove", "origin");
   const headCommit = git(workspace, "rev-parse", "HEAD");
@@ -31,7 +46,7 @@ async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: strin
     parallelism: 2, revision: 1, status: "delivering", createdAt: at, updatedAt: at, workspace, branch, baseCommit: headCommit, headCommit,
     tasks: [], members: [member], decisions: [], checks: [], steering: [], events: [], round: 0, delivery: policy,
     review: { verdict: "approved", summary: "Reviewed the exact integration head.", revision: 1 } };
-  const stored = { run, fingerprint: "fixture", receipts: {}, prepared: true, root: f.host.config.teams!.workspaceDir,
+  const stored: DeliveryStored = { run, fingerprint: "fixture", receipts: {}, prepared: true, root: f.host.config.teams!.workspaceDir,
     checkHead: headCommit, deliveryAttempt: { memberId, revision: 1, headCommit } };
   const internals = teams as unknown as { records: Map<string, typeof stored>; consume: (record: typeof stored, member: TeamMember) => void };
   internals.records.set(id, stored);
@@ -46,6 +61,77 @@ async function blockedDeliveryRecord() {
   h.member.status = "stopped";
   h.member.report = { kind: "blocked", summary: "The provider denied workflow-file publication." };
   return h;
+}
+
+async function failedMovedBaseDeliveryRecord() {
+  let mirror = "", moved = "";
+  let fetchMoved: (() => void) | undefined;
+  let source!: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">;
+  const sourceFactory = (f: Awaited<ReturnType<typeof fixture>>): Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> => {
+    mirror = join(f.host.root, "source-mirror.git");
+    git(f.source, "clone", "--bare", f.source, mirror);
+    fetchMoved = () => { git(mirror, "fetch", f.source, "main:refs/heads/main"); };
+    source = {
+      refresh: async () => ({ mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: moved }),
+      mirrorPath: () => mirror,
+      isGithub: () => true,
+      status: () => ({ mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: moved }),
+    } as Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">;
+    return source;
+  };
+  const h = await deliveryRecord("pr", undefined, sourceFactory);
+  try {
+    const f = h.f;
+    git(f.source, "checkout", "main");
+    git(f.source, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "Move base");
+    moved = git(f.source, "rev-parse", "HEAD");
+    h.run.lineup = structuredClone(limitLineup);
+    h.run.status = "delivering";
+    h.run.review = { verdict: "approved", summary: "Reviewed the exact integration head.", revision: h.run.revision };
+    h.stored.checkHead = h.headCommit;
+    h.member.status = "reported";
+    const report: TeamReport = { kind: "delivery-reconciliation", headCommit: h.headCommit, repository: "example/app", branch: h.run.branch,
+      baseHeadCommit: moved, disposition: "no-publication", summary: "Inspected the branch and pull requests; nothing was published." };
+    h.consume(report);
+    const failureCode = await waitFor(() => Promise.resolve(h.stored.pending?.failure?.code), code => Boolean(code), 10000);
+    assert.equal(failureCode, "workspace-operation-failed", JSON.stringify({ pending: h.stored.pending, run: h.run.status, reason: h.run.reason }));
+    assert.equal(h.run.deliveryRecovery?.attempts, 1);
+    h.member.status = "stopped";
+    deliveryInternals(h.teams).save(h.stored);
+    return { ...h, moved, source, useMirror: () => fetchMoved!() };
+  } catch (error) { await h.f.close(); throw error; }
+}
+
+type FailedDeliveryRecord = Awaited<ReturnType<typeof failedMovedBaseDeliveryRecord>>;
+function bindDeliveryRecord(h: FailedDeliveryRecord, stored: DeliveryStored) {
+  const memberId = h.member.memberId;
+  h.stored = stored; h.run = stored.run;
+  h.member = h.run.members.find(member => member.memberId === memberId)!;
+  deliveryInternals(h.teams).records.set(h.id, stored);
+}
+async function restartDeliveryRecord(h: FailedDeliveryRecord) {
+  h.teams.close(); await h.teams.idle();
+  h.teams = await h.f.openTeamService({ source: h.source, start: false });
+  bindDeliveryRecord(h, deliveryInternals(h.teams).records.get(h.id)!);
+  // One real stop-draining step clears the restart halt. Keep the scheduler off so no test agent launches.
+  if (h.stored.halt) await deliveryInternals(h.teams).step(h.stored);
+  assert.equal(h.stored.halt, undefined);
+}
+function failedDeliveryRequest(h: FailedDeliveryRecord): TeamDeliveryReconcile & { failedOperation: NonNullable<TeamDeliveryReconcile["failedOperation"]> } {
+  return { requestId: randomUUID(), revision: h.run.revision, text: "Reinspect current remote state before acting.", failedOperation: {
+    pendingId: h.stored.pending!.id, headCommit: h.headCommit,
+    attestation: { boundary: "delivery-preparation", processesStopped: true, text: "The prior delivery preparation process has exited." },
+  } };
+}
+function persistedDelivery(h: FailedDeliveryRecord) {
+  return unseal<DeliveryStored>(readFileSync(h.f.host.config.keyFile), `team:${h.id}`,
+    readFileSync(join(h.f.host.config.stateDir, "teams", `${h.id}.sealed`), "utf8"));
+}
+function withoutUpdatedAt(stored: DeliveryStored) {
+  const copy = structuredClone(stored);
+  copy.run.updatedAt = "ignored save timestamp";
+  // Sealed JSON omits optional undefined fields present on the in-memory object.
+  return JSON.parse(JSON.stringify(copy));
 }
 
 test("owner-authorized delivery waits for exact-head checks and review, survives API restart, and records one merge claim", { timeout: 90000 }, async () => {
@@ -493,6 +579,265 @@ test("owner delivery reconciliation starts one strong worker at the pinned head 
     assert.equal(h.run.members.length, 2, "an idempotent retry must not queue another delivery member");
     assert.equal(h.stored.deliveryAttempt?.memberId, fresh.memberId);
   } finally { await h.f.close(); }
+});
+
+test("attested reconciliation clears only a settled moved-base preparation failure and preserves its receipt", { timeout: 90000 }, async () => {
+  const h = await failedMovedBaseDeliveryRecord();
+  try {
+    const pending = structuredClone(h.stored.pending!);
+    const previousReport = structuredClone(h.member.report);
+    const originalWorkspace = h.run.workspace;
+    await restartDeliveryRecord(h);
+    assert.deepEqual(h.stored.pending, pending, "the structured failure survives the generic restart reason");
+    assert.deepEqual(h.teams.get(h.id).pendingOperation, { id: pending.id, kind: "result", revision: 1, failed: true,
+      failureCode: "workspace-operation-failed", sourceMemberId: h.member.memberId, sourceRole: "delivery" });
+    const plain = { requestId: randomUUID(), revision: h.run.revision, text: "Inspect remote delivery state again." };
+    const beforePlain = structuredClone(h.stored);
+    await assert.rejects(h.teams.reconcileDelivery(h.id, plain), error => error instanceof TeamError && error.code === "delivery-reconciliation-unavailable");
+    assert.deepEqual(h.stored, beforePlain);
+    const request = failedDeliveryRequest(h);
+    const internals = deliveryInternals(h.teams), save = internals.save;
+    const saves: DeliveryStored[] = [];
+    internals.save = function (stored) { save.call(this, stored); saves.push(persistedDelivery(h)); };
+    try {
+      await h.teams.reconcileDelivery(h.id, request);
+      await waitFor(() => Promise.resolve(h.teams.get(h.id)), view => !view.pendingOperation && view.members.length === 2, 10000);
+    } finally { internals.save = save; }
+    assert.equal(saves[0]?.pending?.kind, "member", "the first durable reconciliation write already reserves member preparation");
+    assert.notEqual(saves[0]?.pending?.id, pending.id);
+    assert.equal(saves[0]?.run.deliveryOperationReconciliations?.[0]?.pendingId, pending.id);
+    assert.ok(saves[0]?.receipts[request.requestId], "the request receipt and replacement intent are saved together");
+    const prepared = h.teams.get(h.id);
+    assert.equal(prepared.revision, 1);
+    assert.equal(prepared.headCommit, h.headCommit);
+    assert.equal(prepared.members.length, 2);
+    const fresh = prepared.members.find(member => member.memberId !== h.member.memberId)!;
+    assert.equal(fresh.role, "delivery");
+    assert.equal(fresh.status, "queued");
+    assert.equal(fresh.modelProfile?.tier, "strong");
+    assert.equal(h.stored.deliveryAttempt?.memberId, fresh.memberId);
+    assert.equal(h.stored.pending, undefined);
+    assert.deepEqual(h.member.report, previousReport);
+    assert.equal(h.member.status, "stopped");
+    assert.equal(h.run.deliveryRecovery?.attempts, 1);
+    assert.equal(h.run.recovery?.attempts, 1);
+    assert.equal(h.run.deliveryRecovery?.status, "planning");
+    assert.equal(h.run.deliveryOperationReconciliations?.length, 1);
+    assert.deepEqual(h.run.deliveryOperationReconciliations?.[0], {
+      requestId: request.requestId, pendingId: pending.id, pendingKind: "result", revision: 1, headCommit: h.headCommit,
+      source: { memberId: h.member.memberId, role: "delivery" }, failure: pending.failure, report: previousReport,
+      recoveryAttempts: 1, attestation: request.failedOperation.attestation, at: h.run.deliveryOperationReconciliations![0]!.at,
+    });
+    const freshRecord = h.run.members.find(member => member.memberId === fresh.memberId)!;
+    assert.match(freshRecord.contextFeedback ?? "", /historical, not current remote evidence/);
+    assert.match(freshRecord.contextFeedback ?? "", /Prior delivery report/);
+    assert.match(freshRecord.contextFeedback ?? "", /Operator process-quiescence claim, not host-verified/);
+    assert.ok(freshRecord.contextFeedback?.includes(pending.failure!.at));
+    assert.match(freshRecord.contextFeedback ?? "", /pinned base head/);
+    assert.match(freshRecord.contextFeedback ?? "", /never create a duplicate pull request/);
+    assert.match(freshRecord.contextFeedback ?? "", /has not authorized a new credential/);
+    assert.ok(prepared.events.some(event => event.text.includes(pending.id) && event.text.includes("workspace-operation-failed")));
+    assert.equal(prepared.members.some(member => member.role === "integrator"), false);
+    assert.equal(prepared.pullRequest, undefined);
+    assert.equal(existsSync(join(h.f.receipts, "delivery-started.json")), false);
+    const receipt = structuredClone(h.run.deliveryOperationReconciliations);
+    await restartDeliveryRecord(h);
+    assert.deepEqual(h.run.deliveryOperationReconciliations, receipt, "old failure evidence survives another disk restart");
+    await h.teams.reconcileDelivery(h.id, request);
+    assert.equal(h.run.members.length, 2, "response-loss replay returns the saved result without queueing another member");
+    await assert.rejects(h.teams.reconcileDelivery(h.id, { ...request, text: "Different request intent." }),
+      error => error instanceof TeamError && error.code === "request-conflict");
+    await assert.rejects(h.teams.reconcileDelivery(h.id, { ...request, failedOperation: { ...request.failedOperation,
+      attestation: { ...request.failedOperation.attestation, text: "A different operator claim." } } }),
+    error => error instanceof TeamError && error.code === "request-conflict");
+
+    h.useMirror();
+    const freshMember = h.run.members.find(member => member.memberId === fresh.memberId)!;
+    freshMember.status = "reported";
+    freshMember.report = { kind: "delivery-reconciliation", headCommit: h.headCommit, repository: "example/app", branch: h.run.branch,
+      baseHeadCommit: h.moved, disposition: "no-publication", summary: "Fresh inspection found no publication and confirmed the moved base." };
+    deliveryInternals(h.teams).consume(h.stored, freshMember);
+    await waitFor(() => Promise.resolve(h.teams.get(h.id)), view => !view.pendingOperation && view.members.some(member => member.role === "integrator"), 10000);
+    assert.equal(h.run.deliveryRecovery?.attempts, 2);
+    assert.equal(h.run.recovery?.attempts, 2);
+    assert.equal(h.run.deliveryRecovery?.status, "replanning");
+    assert.equal(h.run.revision, 2);
+    assert.equal(h.run.baseCommit, h.moved);
+    assert.equal(h.run.members.find(member => member.role === "integrator")?.status, "queued");
+    assert.equal(h.run.pullRequest, undefined);
+    assert.equal(h.run.deliveryReceipt, undefined);
+    assert.equal(git(originalWorkspace, "rev-parse", "HEAD"), h.headCommit, "the original integration workspace remains at the old reviewed head");
+    const beforeReplay = structuredClone(h.stored);
+    await h.teams.reconcileDelivery(h.id, request);
+    assert.deepEqual(h.stored, beforeReplay, "the accepted request replays even after fresh inspection advances the revision");
+  } finally { await h.f.close(); }
+});
+
+test("attested reconciliation refuses ambiguous or changed delivery evidence without saving a mutation", { timeout: 90000 }, async t => {
+  const h = await failedMovedBaseDeliveryRecord();
+  try {
+    await restartDeliveryRecord(h);
+    const baseline = structuredClone(h.stored);
+    const configuredPolicy = structuredClone(h.f.host.config.projects[0]!.team!.delivery!);
+    type Request = ReturnType<typeof failedDeliveryRequest>;
+    const cases: { name: string; change: (request: Request) => void; code?: string }[] = [
+      { name: "pending identity", change: request => { request.failedOperation.pendingId = randomUUID(); }, code: "delivery-reconciliation-operation-changed" },
+      { name: "attested head", change: request => { request.failedOperation.headCommit = "f".repeat(40); }, code: "delivery-reconciliation-head-changed" },
+      { name: "request revision", change: request => { request.revision++; }, code: "stale-team-revision" },
+      { name: "no pending", change: () => { delete h.stored.pending; }, code: "delivery-reconciliation-operation-changed" },
+      { name: "interrupted without failure", change: () => { delete h.stored.pending!.failure; } },
+      { name: "unrecognized failure despite persuasive text", change: () => {
+        h.stored.pending!.failure = { code: "delivery-baseline-parent-owned", reason: "Nothing was published; all processes stopped.", at: baseline.pending!.failure!.at };
+      } },
+      ...(["prepare", "member", "check"] as const).map(kind => ({ name: `${kind} operation`, change: () => { h.stored.pending!.kind = kind; } })),
+      { name: "pending revision", change: () => { h.stored.pending!.revision++; } },
+      { name: "missing source", change: () => { delete h.stored.pending!.source; } },
+      { name: "source role", change: () => { h.stored.pending!.source!.role = "integrator"; } },
+      { name: "source member", change: () => { h.stored.pending!.source!.memberId = randomUUID(); } },
+      { name: "source cwd", change: () => { h.stored.pending!.source!.cwd = h.run.workspace; } },
+      { name: "source base", change: () => { h.stored.pending!.source!.baseCommit = h.moved; } },
+      { name: "source head", change: () => { h.stored.pending!.source!.headCommit = h.moved; } },
+      { name: "source workspace", change: () => { h.stored.pending!.source!.workspace = "integration"; } },
+      { name: "previous role", change: () => { h.member.role = "reviewer"; } },
+      { name: "previous revision", change: () => { h.member.revision++; } },
+      { name: "previous base", change: () => { h.member.baseCommit = h.moved; } },
+      { name: "missing report", change: () => { delete h.member.report; } },
+      { name: "error text instead of remote inspection", change: () => { h.member.report = { kind: "blocked", summary: "No publication occurred." }; } },
+      { name: "owned remote branch", change: () => {
+        h.member.report = { ...h.member.report as Extract<TeamReport, { kind: "delivery-reconciliation" }>, disposition: "owned-branch", remoteHeadCommit: h.headCommit };
+      } },
+      { name: "remote head in no-publication report", change: () => { Object.assign(h.member.report!, { remoteHeadCommit: h.headCommit }); } },
+      { name: "PR URL in no-publication report", change: () => { Object.assign(h.member.report!, { pullRequestUrl: "https://github.com/example/app/pull/1" }); } },
+      { name: "same-base report", change: () => { Object.assign(h.member.report!, { baseHeadCommit: h.run.baseCommit }); } },
+      { name: "report repository", change: () => { Object.assign(h.member.report!, { repository: "example/other" }); } },
+      { name: "report branch", change: () => { Object.assign(h.member.report!, { branch: "infinite/other" }); } },
+      { name: "report head", change: () => { Object.assign(h.member.report!, { headCommit: h.moved }); } },
+      { name: "recorded PR", change: () => { h.run.pullRequest = { revision: 1, headCommit: h.headCommit,
+        pullRequestUrl: "https://github.com/example/app/pull/1", summary: "Existing PR", reportedAt: new Date().toISOString() }; } },
+      { name: "recorded delivery receipt", change: () => { h.run.deliveryReceipt = { revision: 1, headCommit: h.headCommit,
+        pullRequestUrl: "https://github.com/example/app/pull/1", mergeCommit: h.moved, summary: "Existing delivery", reportedAt: new Date().toISOString() }; } },
+      ...(["running", "unavailable", "queued", "reported"] as const).map(status => ({ name: `${status} member`, change: () => {
+        h.run.members.push({ ...h.member, memberId: randomUUID(), sessionId: randomUUID(), role: "reviewer", status, report: undefined });
+      } })),
+      ...(["pending", "reviewing", "approved", "answering", "uncertain"] as const).map(status => ({ name: `${status} permission`, change: () => {
+        h.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "policy", targetMemberId: h.member.memberId,
+          targetSessionId: h.member.sessionId, targetCwd: h.member.cwd, promptId: 1, promptHash: "prompt", evidenceHash: "evidence", prompt: {} as never,
+          option: 0, expiresAt: new Date(Date.now() + 60000).toISOString(), answerRequestId: randomUUID(), status }];
+      } })),
+      { name: "paused run", change: () => { h.run.status = "paused"; } },
+      { name: "cancelled run", change: () => { h.run.status = "cancelled"; }, code: "team-cancelled" },
+      { name: "active halt", change: () => { h.stored.halt = "block"; } },
+      { name: "changed recovery policy", change: () => { h.run.deliveryRecovery!.policyHash = "changed-policy"; } },
+      { name: "missing delivery recovery", change: () => { delete h.run.deliveryRecovery; } },
+      { name: "delivery recovery source", change: () => { h.run.deliveryRecovery!.sourceMemberId = randomUUID(); } },
+      { name: "delivery recovery base", change: () => { h.run.deliveryRecovery!.baseHeadCommit = h.headCommit; } },
+      { name: "delivery recovery head", change: () => { h.run.deliveryRecovery!.headCommit = h.moved; } },
+      { name: "delivery recovery revision", change: () => { h.run.deliveryRecovery!.revision++; } },
+      { name: "delivery recovery disposition", change: () => { h.run.deliveryRecovery!.disposition = "owned-branch"; } },
+      { name: "delivery recovery state", change: () => { h.run.deliveryRecovery!.status = "replanning"; } },
+      { name: "missing recovery", change: () => { delete h.run.recovery; } },
+      { name: "recovery source code", change: () => { h.run.recovery!.source.code = "workspace-operation-failed"; } },
+      { name: "recovery source member", change: () => { h.run.recovery!.source.memberId = randomUUID(); } },
+      { name: "recovery source revision", change: () => { h.run.recovery!.source.revision++; } },
+      { name: "changed configured policy", change: () => { h.f.host.config.projects[0]!.team!.delivery = { ...configuredPolicy, mode: "merge" }; }, code: "delivery-policy-changed" },
+      { name: "checks no longer current", change: () => { delete h.stored.checkHead; }, code: "delivery-not-reviewed" },
+      { name: "review no longer current", change: () => { delete h.run.review; }, code: "delivery-not-reviewed" },
+      { name: "weak coordinator", change: () => { h.run.lineup!.coordinator.tier = "light"; }, code: "delivery-lineup-required" },
+      { name: "unconfirmed Linear requirements", change: () => { h.run.linearTracking = true; }, code: "linear-reconciliation-required" },
+      { name: "delivery budget exhausted", change: () => { h.run.deliveryRecovery!.attempts = 2; }, code: "delivery-recovery-exhausted" },
+      { name: "total recovery budget exhausted", change: () => { h.run.recovery!.attempts = 2; }, code: "delivery-recovery-exhausted" },
+    ];
+    for (const scenario of cases) await t.test(scenario.name, async () => {
+      bindDeliveryRecord(h, structuredClone(baseline));
+      h.f.host.config.projects[0]!.team!.delivery = structuredClone(configuredPolicy);
+      const request = failedDeliveryRequest(h);
+      scenario.change(request);
+      deliveryInternals(h.teams).save(h.stored);
+      const before = structuredClone(h.stored), diskBefore = persistedDelivery(h);
+      await assert.rejects(h.teams.reconcileDelivery(h.id, request), error => error instanceof TeamError && error.status === 409 &&
+        error.code === (scenario.code ?? "delivery-reconciliation-unavailable"));
+      assert.deepEqual(deliveryInternals(h.teams).records.get(h.id), before, "refusal preserves the entire current state");
+      assert.deepEqual(persistedDelivery(h), diskBefore, "refusal writes no request or operation receipt");
+      assert.equal(deliveryInternals(h.teams).commands.size, 0);
+    });
+  } finally { await h.f.close(); }
+});
+
+test("attested reconciliation refuses dirty or changed original workspaces", { timeout: 90000 }, async t => {
+  const h = await failedMovedBaseDeliveryRecord();
+  try {
+    await restartDeliveryRecord(h);
+    for (const [cwd, label, dirtyCode] of [[h.run.workspace, "integration", "integration-changed-files"],
+      [h.member.cwd, "delivery", "read-only-role-changed-files"]] as const) {
+      for (const drift of [false, true]) await t.test(`${label} ${drift ? "head drift" : "dirty files"}`, async () => {
+        const dirty = join(cwd, "untracked-reconciliation-probe");
+        if (drift) git(cwd, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "commit", "--allow-empty", "-m", "Unexpected head");
+        else writeFileSync(dirty, "Unexpected edit\n");
+        const before = structuredClone(h.stored), diskBefore = persistedDelivery(h);
+        try {
+          await assert.rejects(h.teams.reconcileDelivery(h.id, failedDeliveryRequest(h)), error => error instanceof TeamError && error.status === 409 &&
+            error.code === (drift && label === "integration" ? "delivery-reconciliation-head-changed" : dirtyCode));
+          assert.deepEqual(deliveryInternals(h.teams).records.get(h.id), before);
+          assert.deepEqual(persistedDelivery(h), diskBefore);
+        } finally {
+          if (drift) git(cwd, "reset", "--hard", h.headCommit);
+          else unlinkSync(dirty);
+        }
+      });
+    }
+  } finally { await h.f.close(); }
+});
+
+test("attested reconciliation rolls back a synchronous preparation failure on disk and permits the same request after restart", { timeout: 90000 }, async () => {
+  const h = await failedMovedBaseDeliveryRecord();
+  try {
+    await restartDeliveryRecord(h);
+    const request = failedDeliveryRequest(h), before = structuredClone(h.stored);
+    const internals = deliveryInternals(h.teams), save = internals.save;
+    const failure = new Error("Fixture refused the replacement member intent write");
+    let injected = false;
+    internals.save = function (stored) {
+      if (!injected && stored.receipts[request.requestId]) {
+        injected = true;
+        assert.equal(stored.pending?.kind, "member");
+        assert.equal(stored.run.deliveryOperationReconciliations?.length, 1);
+        throw failure;
+      }
+      save.call(this, stored);
+    };
+    try { await assert.rejects(h.teams.reconcileDelivery(h.id, request), error => error === failure); }
+    finally { internals.save = save; }
+    assert.equal(injected, true, "the failure is after receipt creation and pending replacement, before side effects");
+    assert.deepEqual(withoutUpdatedAt(internals.records.get(h.id)!), withoutUpdatedAt(before));
+    const disk = persistedDelivery(h);
+    assert.deepEqual(withoutUpdatedAt(disk), withoutUpdatedAt(before));
+    assert.equal(Object.hasOwn(disk.run, "deliveryOperationReconciliations"), false, "a newly added receipt property must be removed");
+    assert.equal(disk.receipts[request.requestId], undefined);
+    assert.equal(internals.commands.size, 0, "the failed write leaves no active operation reservation");
+    await restartDeliveryRecord(h);
+    assert.deepEqual(h.stored.pending, before.pending);
+    assert.deepEqual(h.stored.receipts, before.receipts);
+    assert.equal(h.run.deliveryOperationReconciliations, undefined);
+    await h.teams.reconcileDelivery(h.id, request);
+    await waitFor(() => Promise.resolve(h.teams.get(h.id)), view => !view.pendingOperation && view.members.length === 2, 10000);
+    assert.equal(h.run.deliveryOperationReconciliations?.length, 1);
+    assert.equal(h.run.deliveryRecovery?.attempts, 1);
+    assert.equal(h.run.recovery?.attempts, 1);
+  } finally { await h.f.close(); }
+});
+
+test("delivery reconciliation accepts only an explicit strict process-quiescence attestation", () => {
+  const ordinary = { requestId: randomUUID(), revision: 1, text: "Inspect current delivery state." };
+  const failedOperation = { pendingId: randomUUID(), headCommit: "a".repeat(40),
+    attestation: { boundary: "delivery-preparation", processesStopped: true, text: "The operator confirmed all relevant processes exited." } };
+  assert.equal(teamDeliveryReconcileSchema.safeParse(ordinary).success, true);
+  assert.equal(teamDeliveryReconcileSchema.safeParse({ ...ordinary, failedOperation }).success, true);
+  for (const invalid of [
+    { ...failedOperation, pendingId: "unknown" }, { ...failedOperation, headCommit: "main" },
+    { ...failedOperation, unexpected: true }, { ...failedOperation, attestation: undefined },
+    ...[{ boundary: "check-only" }, { processesStopped: false }, { text: " " }, { text: "x".repeat(4001) }, { unexpected: true }]
+      .map(patch => ({ ...failedOperation, attestation: { ...failedOperation.attestation, ...patch } })),
+  ]) assert.equal(teamDeliveryReconcileSchema.safeParse({ ...ordinary, failedOperation: invalid }).success, false);
 });
 
 test("restart reserves a persisted blocked delivery attempt once without replaying its report", { timeout: 90000 }, async () => {

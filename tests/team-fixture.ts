@@ -125,6 +125,8 @@ process.exit(child.status ?? 1);
       commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },
     } : scenario === "result-operation-fails-once" ? {
       commandPrefix: { command: process.execPath, args: ["-e", resultFailurePrefix, receipts] },
+    } : scenario === "delivery-base-recovery" ? {
+      commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--mirror-restricted-prefix", receipts] },
     } : {}), ...config.teams },
   };
   let host: Host;

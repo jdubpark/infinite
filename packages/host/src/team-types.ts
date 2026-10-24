@@ -188,6 +188,12 @@ export const createTeamSchema = z.object({
 }).strict();
 export type CreateTeam = z.infer<typeof createTeamSchema>;
 export const teamMutationSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000) }).strict();
+export const teamDeliveryReconcileSchema = z.object({
+  requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000),
+  failedOperation: z.object({ pendingId: z.uuid(), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
+    attestation: z.object({ boundary: z.literal("delivery-preparation"), processesStopped: z.literal(true), text: z.string().trim().min(1).max(4000) }).strict() }).strict().optional(),
+}).strict();
+export type TeamDeliveryReconcile = z.infer<typeof teamDeliveryReconcileSchema>;
 export const teamVerificationReconcileSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), pendingId: z.uuid(),
   headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
   attestation: z.object({ boundary: z.literal("check-only"), processesStopped: z.literal(true), text: z.string().trim().min(1).max(4000) }).strict() }).strict();
@@ -390,6 +396,11 @@ export interface TeamRun {
     integratedHeadCommit?: string;
     disposition?: "no-publication" | "owned-branch" | "pull-request";
   };
+  /** Durable evidence that an owner cleared an attributed failed delivery-preparation gate. */
+  deliveryOperationReconciliations?: { requestId: string; pendingId: string; pendingKind: "result"; revision: number; headCommit: string;
+    source: { memberId: string; role: "delivery" }; failure: { code: string; reason: string; at: string };
+    report: Extract<TeamReport, { kind: "delivery-reconciliation" }> & { disposition: "no-publication" }; recoveryAttempts: number;
+    attestation: { boundary: "delivery-preparation"; processesStopped: true; text: string }; at: string }[];
   /** The base came from the host mirror while the latest fetch from GitHub failed. */
   baseStale?: { fetchedAt?: string; reason: "fetch-failed"; category: "auth" | "network" | "not-found" | "other" };
   /** A continuation kept its parent's base while the mirror already holds a newer base-branch head. */
@@ -439,7 +450,8 @@ export interface TeamRun {
 }
 /** `providerLimits` is the host's active limit memory at read time, shared by every run. */
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions"> & {
-  pendingOperation?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number; failed: boolean };
+  pendingOperation?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number; failed: boolean;
+    failureCode?: string; sourceMemberId?: string; sourceRole?: TeamMember["role"] };
   members: Omit<TeamMember, "prompt" | "contextFeedback">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt">[];
   usage: UsageRollup;

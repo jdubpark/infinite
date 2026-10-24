@@ -317,14 +317,51 @@ An owned remote branch or pull request is never rewritten by this path.
 After an explicitly blocked delivery attempt, an owner can request a fresh
 strong-coordinator reconciliation through
 `POST /api/teams/:id/reconcile-delivery` with `requestId`, `revision`, and a
-`text` field recording the resolved dependency and remote evidence. This is
-available only for a stopped standalone attempt with unchanged clean reviewed
-work, current checks and tracking, and no uncertain permission answer or saved
-delivery result. It preserves the earlier attempt and starts remote inspection
-under the same pinned delivery policy. The new member must reuse matching
-branches, pull requests and confirmed results before considering any new action.
-A changed baseline still needs a fresh implementation and review; this action
-does not waive checks, reconcile edited files, or expand provider access.
+`text` field recording the resolved dependency and remote evidence. The CLI is
+`infinite team reconcile-delivery ID TEXT... [--pending ID --head COMMIT
+--processes-stopped TEXT] [--request-id UUID] [--json]`. The three optional
+flags must be used together. They apply only to a settled pending `result`
+operation whose failure code is `workspace-operation-failed`,
+`invalid-workspace-baseline`, `workspace-copy-changed`, or
+`delivery-baseline-source-mismatch`, and whose exact source, stopped delivery
+member, no-publication report, moved base,
+revision, head, and pinned policy still match. The owner supplies an explicit
+process-quiescence attestation using the API's optional `failedOperation`:
+
+```json
+{
+  "pendingId": "<pending operation UUID>",
+  "headCommit": "<exact reviewed commit>",
+  "attestation": {
+    "boundary": "delivery-preparation",
+    "processesStopped": true,
+    "text": "<operator evidence that the preparation and delivery processes exited>"
+  }
+}
+```
+
+Read `pendingOperation.id`, `failureCode`, `sourceMemberId`, and `sourceRole`
+from the current team status. The request must also identify the current
+`revision` and a fresh `requestId`, which must be reused if the response is lost.
+Every member must be stopped, Linear must confirm current requirements, and
+both the integration and original delivery workspaces must be clean at the
+exact reviewed head. The host records the failure, original report,
+and attestation in `deliveryOperationReconciliations` before clearing the gate;
+the old result is never replayed. Recovery attempt counts do not reset. A fresh
+strong delivery member must inspect the current remote branch, pull request,
+CI, and pinned base head, then return a new structured report before any write.
+The attestation is an operator claim, not host verification. Unknown or
+interrupted operations, publication or permission uncertainty, dirty work,
+changed policy, paused runs, and exhausted recovery budget remain blocked.
+Refusals include `delivery-reconciliation-unavailable`,
+`delivery-reconciliation-operation-changed`,
+`delivery-reconciliation-head-changed`, `delivery-policy-changed`,
+`integration-changed-files`, and `delivery-recovery-exhausted`. The ordinary
+blocked-attempt flow remains available under the same pinned policy. A new
+member must reuse matching branches, pull requests and confirmed results before
+considering any new action. A changed baseline still needs a fresh
+implementation and review; this action does not waive checks, reconcile edited
+files, or expand provider access.
 
 ### Restart-interrupted verification
 
@@ -1151,11 +1188,16 @@ teamwork run by its directory: the API account creates each one, named
 account cannot create a directory with that owner.
 
 Verification and Resume also use `verification/ID` and `recovery/ID` beneath
-that same host-owned run directory. A constrained launcher must permit
-`clone --no-local --no-hardlinks --no-checkout -- SOURCE DESTINATION` from an
-existing team copy, `cat-file -t COMMIT`, `check-ref-format --branch BRANCH`,
-and `checkout --detach COMMIT`. Recovery uses `checkout -B BRANCH COMMIT`
-only in its fresh recovery clone. Read-only inspection uses
+that same host-owned run directory. Moved-base recovery clones the configured
+source into a fresh safe sibling with
+`clone --no-local --no-hardlinks --no-checkout -- MIRROR_PATH DESTINATION`,
+run from the team's recovery directory, then runs `remote remove origin`,
+`cat-file -t BASE`,
+`check-ref-format --branch BRANCH`, `checkout -B BRANCH BASE`, and
+`status --porcelain=v1 -z --untracked-files=all` only inside that clone. Only
+the pinned base fetch and `rev-parse` run in the source mirror. Verification
+copies use `checkout --detach COMMIT` in their destination. Recovery uses
+`checkout -B BRANCH COMMIT` only in its fresh recovery clone. Read-only inspection uses
 `status --porcelain=v1 -z --untracked-files=all` in both team and project
 copies. Preserve the launcher's existing path, identity, branch, and commit
 restrictions when allowing these forms; verify them under the deployed Unix

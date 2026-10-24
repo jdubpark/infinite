@@ -8,7 +8,7 @@ import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, currentPermissions } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions } from "./team-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamContext, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
@@ -416,7 +416,7 @@ export class TeamService {
     const ready = run.tasks.filter(task => task.status === "pending" && task.dependsOn.every(id => run.tasks.find(item => item.id === id)?.status === "integrated")).length +
       (run.discovery && run.discovery.revision === run.revision && !run.discovery.completedAt ? run.discovery.tasks.filter(task => task.status === "pending").length : 0);
     const workers = { limit: run.parallelism, max, running: members.filter(member => holdsWorkerSlot(member, run.revision)).length, ready };
-    return { ...safeRun, ...(stored.pending ? { pendingOperation: { id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failed: Boolean(stored.pending.failure) } } : {}), tasks: safeRun.tasks.map(task => { // Older records predate task.revision; steering clears the task list, so the retained run revision identifies their plan.
+    return { ...safeRun, ...(stored.pending ? { pendingOperation: { id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failed: Boolean(stored.pending.failure), ...(stored.pending.failure?.code ? { failureCode: stored.pending.failure.code } : {}), ...(stored.pending.source ? { sourceMemberId: stored.pending.source.memberId, sourceRole: stored.pending.source.role } : {}) } } : {}), tasks: safeRun.tasks.map(task => { // Older records predate task.revision; steering clears the task list, so the retained run revision identifies their plan.
       const revision = task.revision ?? safeRun.revision;
       const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
       const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
@@ -744,8 +744,8 @@ export class TeamService {
       return this.view(stored);
     });
   }
-  reconcileDelivery(id: string, input: Mutation) {
-    const body = teamMutationSchema.parse(input);
+  reconcileDelivery(id: string, input: TeamDeliveryReconcile) {
+    const body: TeamDeliveryReconcile = teamDeliveryReconcileSchema.parse(input);
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, "reconcile-delivery", body)) return this.view(stored);
@@ -758,8 +758,15 @@ export class TeamService {
         if (!this.linear || tracking?.status !== "synced")
           throw new TeamError(409, "linear-reconciliation-required", "Linear has not confirmed the current issue and requirements. Refresh tracking before delivery reconciliation.");
       }
-      if (run.status !== "blocked" || !stored.prepared || stored.pending || this.commands.has(id) || stored.halt)
-        throw new TeamError(409, "delivery-reconciliation-unavailable", "Delivery reconciliation requires a blocked, prepared team with no pending operation or active halt.");
+      const pending = stored.pending;
+      const failedOperation = body.failedOperation;
+      const unavailable = () => new TeamError(409, "delivery-reconciliation-unavailable", "Delivery reconciliation requires a blocked, prepared team with settled delivery evidence and no active halt.");
+      if (pending && !failedOperation) throw unavailable();
+      if (failedOperation && (!pending || pending.id !== failedOperation.pendingId))
+        throw new TeamError(409, "delivery-reconciliation-operation-changed", "The pending operation changed. Refresh the team and inspect its current evidence.");
+      if (failedOperation && failedOperation.headCommit !== run.headCommit)
+        throw new TeamError(409, "delivery-reconciliation-head-changed", "The attestation must name the current reviewed head.");
+      if (run.status !== "blocked" || !stored.prepared || this.commands.has(id) || stored.halt) throw unavailable();
       if (run.goal || run.missionId || run.handoff)
         throw new TeamError(409, "delivery-reconciliation-unavailable", "Only standalone teams can reconcile a delivery attempt.");
       if (run.stopReason || run.members.length >= 60)
@@ -768,6 +775,23 @@ export class TeamService {
       const attempt = stored.deliveryAttempt;
       const previous = attempt && run.members.find(member => member.memberId === attempt.memberId);
       const reconciliation = previous?.report?.kind === "delivery-reconciliation" ? previous.report : undefined;
+      const failureCodes = new Set(["workspace-operation-failed", "invalid-workspace-baseline", "workspace-copy-changed", "delivery-baseline-source-mismatch"]);
+      const recoveryAttempts = Math.max(run.deliveryRecovery?.attempts ?? 0, run.recovery?.attempts ?? 0);
+      const failedPendingEligible = Boolean(failedOperation && pending?.kind === "result" && pending.revision === run.revision &&
+        pending.failure?.code && failureCodes.has(pending.failure.code) && pending.source?.role === "delivery" && pending.source.workspace === "member" &&
+        pending.source.memberId === previous?.memberId && pending.source.memberId === attempt?.memberId && pending.source.cwd === previous?.cwd &&
+        pending.source.baseCommit === run.headCommit && pending.source.headCommit === run.headCommit && previous?.report?.kind === "delivery-reconciliation" &&
+        previous.report.disposition === "no-publication" && previous.report.repository === run.delivery?.repository &&
+        previous.report.branch === run.branch && previous.report.headCommit === run.headCommit && previous.report.remoteHeadCommit === undefined &&
+        previous.report.pullRequestUrl === undefined && previous.report.baseHeadCommit !== run.baseCommit && run.deliveryRecovery?.revision === run.revision &&
+        run.deliveryRecovery.headCommit === run.headCommit && run.deliveryRecovery.policyHash === digest(run.delivery) &&
+        run.deliveryRecovery.sourceMemberId === previous.memberId && run.deliveryRecovery.disposition === "no-publication" &&
+        run.deliveryRecovery.baseHeadCommit === previous.report.baseHeadCommit && ["planning", "exhausted"].includes(run.deliveryRecovery.status) &&
+        run.recovery?.source.code === "delivery-baseline-conflict" && run.recovery.source.memberId === previous.memberId &&
+        run.recovery.source.revision === run.revision);
+      if (failedOperation && !failedPendingEligible) throw unavailable();
+      if (failedPendingEligible && recoveryAttempts >= automaticRecoveryLimit)
+        throw new TeamError(409, "delivery-recovery-exhausted", "The team exhausted its delivery recovery allowance. Its failed operation and remote report remain retained.");
       const retainedFailure = previous?.report?.kind === "blocked" || Boolean(reconciliation && reconciliation.disposition !== "pull-request" &&
         reconciliation.repository === run.delivery?.repository && reconciliation.branch === run.branch && reconciliation.headCommit === run.headCommit);
       if (!attempt || !previous || previous.role !== "delivery" || previous.revision !== run.revision || previous.status !== "stopped" ||
@@ -793,26 +817,55 @@ export class TeamService {
       await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, undefined, "integration");
       await assertMemberReadOnly(previous.cwd, head, this.config.teams?.commandPrefix);
 
+      const priorRun = structuredClone(run);
       if (!this.mutation(stored, "reconcile-delivery", body)) return this.view(stored);
       const priorAttempt = structuredClone(attempt);
       const priorReport = structuredClone(previous.report);
+      const failedReceipt = failedPendingEligible && pending?.failure && failedOperation ? {
+        requestId: body.requestId, pendingId: pending.id, pendingKind: "result" as const, revision: pending.revision, headCommit: failedOperation.headCommit,
+        source: { memberId: pending.source!.memberId, role: "delivery" as const }, failure: { ...structuredClone(pending.failure), code: pending.failure.code! },
+        report: structuredClone(priorReport) as DeliveryReconciliationReport & { disposition: "no-publication" },
+        recoveryAttempts, attestation: structuredClone(failedOperation.attestation), at: timestamp(),
+      } : undefined;
       const feedback = [
         "Owner-authorized reconciliation of an interrupted delivery attempt.",
         `Owner reconciliation instructions: ${body.text}`,
         `Prior delivery member: ${previous.memberId}; prior revision: ${previous.revision}; pinned head: ${priorAttempt.headCommit}; branch: ${run.branch}.`,
-        `Prior blocked report (preserved verbatim in the original member record): ${JSON.stringify(priorReport)}`,
-        "Before any write or publication action, inspect the current remote branch, pull request, and CI state for this exact head. Reuse an existing branch or pull request and report completed work; never create a duplicate pull request.",
+        `Prior ${priorReport?.kind === "blocked" ? "blocked" : "delivery"} report (preserved verbatim in the original member record): ${JSON.stringify(priorReport)}`,
+        ...(failedReceipt ? [`The failure of pending operation ${failedReceipt.pendingId} (${failedReceipt.failure.code}, ${failedReceipt.failure.at}) is preserved in deliveryOperationReconciliations.`,
+          `Operator process-quiescence claim, not host-verified: ${JSON.stringify(failedReceipt.attestation.text)}`,
+          "The prior no-publication report is historical, not current remote evidence. Before any write or publication, re-inspect the remote branch, any pull request, CI, and the pinned base head, then report a fresh structured result."] :
+          ["Before any write or publication action, inspect the current remote branch, pull request, and CI state for this exact head."]),
+        "Reuse an existing branch or pull request and report completed work; never create a duplicate pull request.",
         "Keep the pinned delivery policy, repository, branch, base branch, reviewed head, required checks, and review unchanged. Do not bypass a denied action by switching credentials, tools, or routes. If required capability is still missing, stop and report the blocker. The host has not authorized a new credential or a broader permission.",
       ].join("\n\n");
-      this.prepareMember(stored, "delivery", undefined, feedback, member => {
-        stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: head };
-        run.deliveryRecovery = { attempts: run.deliveryRecovery?.attempts ?? 0, status: "planning", revision: run.revision, headCommit: head,
-          policyHash: digest(run.delivery!), sourceMemberId: member.memberId };
-        run.recovery = { attempts: run.recovery?.attempts ?? 0, status: "planning", source: { code: "delivery-recovery", memberId: previous.memberId,
-          revision: previous.revision, reportKind: previous.report!.kind, reason: body.text, at: timestamp() } };
-        run.reason = undefined; run.blockCode = undefined;
-        this.event(stored, `Owner authorized a fresh delivery reconciliation at ${head} on ${run.branch}; prior attempt ${previous.memberId} and its blocked report remain in team history.`);
-      });
+      try {
+        if (failedReceipt) {
+          run.deliveryOperationReconciliations ??= [];
+          run.deliveryOperationReconciliations.push(failedReceipt);
+          delete stored.pending;
+        }
+        this.event(stored, `Owner authorized a fresh delivery reconciliation at ${head} on ${run.branch}; prior attempt ${previous.memberId} and its delivery report remain in team history.${failedReceipt ? ` Failed operation ${failedReceipt.pendingId} (${failedReceipt.failure.code}, ${failedReceipt.failure.at}) was preserved. Operator claim, not host-verified: ${JSON.stringify(failedReceipt.attestation.text.slice(0, 500))}` : ""}`);
+        // prepareMember persists the receipt and replacement member intent together, before any copy work.
+        this.prepareMember(stored, "delivery", undefined, feedback, member => {
+          stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: head };
+          run.deliveryRecovery = { attempts: recoveryAttempts, status: "planning", revision: run.revision, headCommit: head,
+            policyHash: digest(run.delivery!), sourceMemberId: member.memberId };
+          run.recovery = { attempts: recoveryAttempts, status: "planning", source: { code: "delivery-recovery", memberId: previous.memberId,
+            revision: previous.revision, reportKind: previous.report!.kind, reason: body.text, at: timestamp() } };
+          run.reason = undefined; run.blockCode = undefined;
+        });
+      } catch (error) {
+        // A synchronous failure has not started the copy. Restore the whole run so newly added
+        // receipt fields cannot survive a rejected request, including on the next disk restore.
+        this.commands.get(id)?.abort(); this.commands.delete(id);
+        stored.pending = pending;
+        stored.run = priorRun;
+        stored.deliveryAttempt = priorAttempt;
+        delete stored.receipts[body.requestId];
+        this.save(stored);
+        throw error;
+      }
       return this.view(stored);
     });
   }

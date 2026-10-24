@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { assertMemberReadOnly, prepareRecoveredWorkspace, prepareVerificationWorkspace, TeamError, writeTeamContext } from "../packages/host/src/team-workspace.js";
+import { join, resolve } from "node:path";
+import { assertMemberReadOnly, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, teamCommand, teamGitArgs, TeamError, writeTeamContext } from "../packages/host/src/team-workspace.js";
 
 function git(cwd: string, ...args: string[]) {
   return execFileSync("git", ["-C", cwd, ...args], {
@@ -158,4 +158,73 @@ test("Git inspection failures stay distinct from read-only change diagnostics", 
     await assert.rejects(assertMemberReadOnly(root, "0".repeat(40)), (error: unknown) =>
       error instanceof TeamError && error.code === "workspace-operation-failed");
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("moved-base recovery copies from a source mirror through the restricted launcher", async () => {
+  const sandbox = realpathSync(mkdtempSync(join(tmpdir(), "team-workspace-mirror-")));
+  const source = join(sandbox, "source");
+  const mirror = join(sandbox, "mirror.git");
+  const receipts = join(sandbox, "receipts");
+  const runRoot = join(sandbox, "run");
+  const integration = join(runRoot, "integration");
+  const prefix = { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--mirror-restricted-prefix", receipts] };
+  const refusals = () => {
+    const file = join(receipts, "mirror-commands.jsonl");
+    return existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean).length : 0;
+  };
+  const commit = (cwd: string, message: string) => {
+    git(cwd, "add", "-A");
+    git(cwd, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", message);
+    return git(cwd, "rev-parse", "HEAD");
+  };
+  try {
+    mkdirSync(source);
+    mkdirSync(receipts, { mode: 0o700 });
+    git(source, "init", "--initial-branch=main");
+    writeFileSync(join(source, "README.md"), "Base README heading\n");
+    const base = commit(source, "base");
+    git(sandbox, "clone", "--bare", "--", source, mirror);
+    mkdirSync(runRoot);
+    git(runRoot, "clone", "--", source, "integration");
+    writeFileSync(join(source, "README.md"), "Upstream README heading\n");
+    const moved = commit(source, "move the base");
+    git(mirror, "fetch", "--no-tags", "--", source, "+refs/heads/main:refs/heads/main");
+
+    // The restriction is real: the mirror refuses object inspection but accepts the pinned fetch and rev-parse.
+    const inspected = await teamCommand({ command: "git", args: teamGitArgs(mirror, ["cat-file", "-t", moved]) }, mirror, undefined, 30000, prefix);
+    assert.equal(inspected.exitCode, 126);
+    assert.match(inspected.output, /only the pinned base-branch fetch and rev-parse are permitted/);
+    const pinned = await teamCommand({ command: "git", args: teamGitArgs(mirror, ["rev-parse", "refs/heads/main"]) }, mirror, undefined, 30000, prefix);
+    assert.equal(pinned.exitCode, 0);
+    assert.equal(pinned.stdout.trim(), moved);
+    const refusedBefore = refusals();
+
+    const recovery = await prepareRecoveryWorkspaceFromSource(integration, mirror, "moved-1", moved, prefix, undefined, "infinite/test");
+    assert.equal(recovery.workspace, join(runRoot, "recovery", "moved-1"));
+    assert.equal(recovery.baseCommit, moved);
+    assert.equal(recovery.branch, "infinite/test");
+    assert.equal(git(recovery.workspace, "rev-parse", "HEAD"), moved);
+    assert.equal(git(recovery.workspace, "symbolic-ref", "--short", "HEAD"), "infinite/test");
+    assert.equal(git(recovery.workspace, "status", "--porcelain"), "");
+    assert.equal(git(recovery.workspace, "remote"), "");
+    assert.equal(readFileSync(join(recovery.workspace, "README.md"), "utf8"), "Upstream README heading\n");
+    assert.equal(refusals(), refusedBefore, "the recovery copy must not inspect the mirror");
+
+    const tree = git(mirror, "rev-parse", `${moved}^{tree}`);
+    await assert.rejects(prepareRecoveryWorkspaceFromSource(integration, mirror, "tree-1", tree, prefix, undefined, "infinite/test"), (error: unknown) =>
+      error instanceof TeamError && error.code === "invalid-workspace-baseline");
+    const absent = "0123456789abcdef0123456789abcdef01234567";
+    await assert.rejects(prepareRecoveryWorkspaceFromSource(integration, mirror, "absent-1", absent, prefix, undefined, "infinite/test"), (error: unknown) =>
+      error instanceof TeamError && error.status === 409 && error.code === "workspace-operation-failed");
+    assert.ok(existsSync(join(runRoot, "recovery", "tree-1")), "a failed copy is retained for inspection");
+    assert.ok(existsSync(join(runRoot, "recovery", "absent-1")), "a failed copy is retained for inspection");
+
+    assert.equal(git(mirror, "rev-parse", "refs/heads/main"), moved, "the mirror must not change");
+    assert.equal(git(integration, "rev-parse", "HEAD"), base, "recovery must preserve the original integration checkout");
+    assert.equal(git(integration, "status", "--porcelain"), "");
+
+    const team = await prepareTeamWorkspaceFromMirror(mirror, moved, join(sandbox, "teams"), "team-1", "infinite/test", prefix);
+    assert.equal(git(team.workspace, "rev-parse", "HEAD"), moved);
+    assert.equal(git(team.workspace, "status", "--porcelain"), "");
+  } finally { rmSync(sandbox, { recursive: true, force: true }); }
 });

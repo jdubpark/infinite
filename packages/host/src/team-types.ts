@@ -54,6 +54,8 @@ export interface TeamPermissionDecision {
   promptId: number;
   promptHash: string;
   evidenceHash: string;
+  /** Binds inspected command sources and changed paths to this exact review. */
+  workspaceEvidenceHash?: string;
   prompt: Prompt;
   option: number;
   expiresAt: string;
@@ -244,6 +246,8 @@ export interface TeamMember extends TeamAssignment {
   title: string;
   status: "queued" | "running" | "waiting" | "reported" | "stopped" | "unavailable";
   cwd: string;
+  /** Host-assigned external directory for this member's temporary development files. */
+  scratchDirectory?: string;
   baseCommit: string;
   prompt: string;
   /** Full assignment feedback for the private context file; omitted from client views. */

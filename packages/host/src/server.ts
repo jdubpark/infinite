@@ -688,6 +688,8 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await teams.steer(standaloneTeam(req.params.id), teamMutationSchema.parse(req.body))));
   app.post("/api/teams/:id/continue", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.continueRun(standaloneTeam(req.params.id), teamContinueSchema.parse(req.body))));
+  app.post("/api/teams/:id/reconcile-delivery", requireRole(["owner"]), async (req, res) =>
+    res.json(await teams.reconcileDelivery(standaloneTeam(req.params.id), teamMutationSchema.parse(req.body))));
   app.post("/api/teams/:id/parallelism", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.setParallelism(id.parse(req.params.id), teamParallelismSchema.parse(req.body))));
   app.post("/api/teams/:id/decisions/:decisionId/answer", requireRole(["owner", "controller"]), async (req, res) => {

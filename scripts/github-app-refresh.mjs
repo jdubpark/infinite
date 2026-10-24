@@ -19,6 +19,7 @@ const EXPECTED_PERMISSIONS = Object.freeze({
   actions: "read",
   metadata: "read",
 });
+const WORKFLOW_PERMISSIONS = Object.freeze({ ...EXPECTED_PERMISSIONS, workflows: "write" });
 const TOKEN_FILE_SCHEMA = 1;
 
 class RefreshError extends Error {
@@ -100,7 +101,7 @@ function positiveId(value, code) {
 
 function validateConfig(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) fail("config-shape");
-  const allowed = ["appId", "privateKeyFile", "tokenDirectory", "tokenGroupId", "repositories", "installations"];
+  const allowed = ["appId", "privateKeyFile", "tokenDirectory", "tokenGroupId", "repositories", "installations", "workflowRepositories"];
   if (Object.keys(input).some((key) => !allowed.includes(key)) || ["appId", "privateKeyFile", "tokenDirectory", "tokenGroupId"].some((key) => !Object.hasOwn(input, key))) fail("config-shape");
   if (typeof input.appId !== "string" || !/^[0-9]{1,20}$/.test(input.appId)) fail("app-id");
   canonicalPath(input.privateKeyFile, "private-key-path");
@@ -110,6 +111,15 @@ function validateConfig(input) {
   if (input.repositories !== undefined && (!Array.isArray(input.repositories) || input.repositories.length > 500)) fail("repositories");
   if (input.installations !== undefined && (!Array.isArray(input.installations) || input.installations.length < 1 || input.installations.length > 100)) fail("installations");
   if ((!input.repositories || input.repositories.length === 0) && (!input.installations || input.installations.length === 0)) fail(input.installations ? "installations" : "repositories");
+  if (input.workflowRepositories !== undefined && (!Array.isArray(input.workflowRepositories) || input.workflowRepositories.length > 500)) fail("workflow-repositories");
+  const workflowRepositories = [];
+  const workflowNames = new Set();
+  for (const value of input.workflowRepositories ?? []) {
+    const repository = validateRepositoryName(value);
+    if (workflowNames.has(repository)) fail("workflow-repositories");
+    workflowNames.add(repository);
+    workflowRepositories.push(repository);
+  }
   const names = new Set();
   const ids = new Set();
   const repositories = (input.repositories ?? []).map((item) => {
@@ -130,7 +140,8 @@ function validateConfig(input) {
     installationIds.add(installationId);
     return { installationId };
   });
-  return { ...input, repositories, installations };
+  if (installations.length === 0 && workflowRepositories.some(repository => !names.has(repository))) fail("workflow-repository-not-configured");
+  return { ...input, repositories, installations, workflowRepositories };
 }
 
 function base64url(value) {
@@ -205,18 +216,24 @@ function tokenPath(directory, repository) {
   return join(directory, `${digest}.json`);
 }
 
-function exactPermissions(permissions) {
+function exactPermissions(permissions, expected = EXPECTED_PERMISSIONS) {
   if (!permissions || typeof permissions !== "object" || Array.isArray(permissions)) return false;
   const keys = Object.keys(permissions).sort();
-  const expectedKeys = Object.keys(EXPECTED_PERMISSIONS).sort();
-  return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index]) && expectedKeys.every((key) => permissions[key] === EXPECTED_PERMISSIONS[key]);
+  const expectedKeys = Object.keys(expected).sort();
+  return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index]) && expectedKeys.every((key) => permissions[key] === expected[key]);
+}
+
+function permissionsFor(config, repository) {
+  return config.workflowRepositories.includes(repository.repository)
+    ? Object.freeze({ ...EXPECTED_PERMISSIONS, workflows: "write" })
+    : EXPECTED_PERMISSIONS;
 }
 
 function validToken(value) {
   return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= MAX_TOKEN_BYTES && !/[\s\u0000-\u001f\u007f]/u.test(value);
 }
 
-async function cachedToken(path, repository, groupId, nowMs = Date.now()) {
+async function readCachedToken(path, groupId) {
   let info;
   try { info = await lstat(path); } catch (error) { if (error?.code === "ENOENT") return undefined; fail("cache-unavailable"); }
   if (info.isSymbolicLink() || !info.isFile()) fail("cache-not-regular-file");
@@ -237,10 +254,34 @@ async function cachedToken(path, repository, groupId, nowMs = Date.now()) {
   let data;
   try { data = JSON.parse(raw.toString("utf8")); } catch { return undefined; }
   try { exactKeys(data, ["schemaVersion", "repository", "repositoryId", "installationId", "token", "expiresAt", "permissions"], "cache-shape"); } catch { return undefined; }
-  if (!data || data.schemaVersion !== TOKEN_FILE_SCHEMA || data.repository !== repository.repository || data.repositoryId !== repository.repositoryId || data.installationId !== repository.installationId || !validToken(data.token) || !exactPermissions(data.permissions)) return undefined;
+  return data;
+}
+
+async function cachedToken(path, repository, groupId, expectedPermissions = EXPECTED_PERMISSIONS, nowMs = Date.now()) {
+  const data = await readCachedToken(path, groupId);
+  if (!data || data.schemaVersion !== TOKEN_FILE_SCHEMA || data.repository !== repository.repository || data.repositoryId !== repository.repositoryId || data.installationId !== repository.installationId || !validToken(data.token)) return undefined;
   const expires = Date.parse(data.expiresAt);
   if (!Number.isFinite(expires) || expires <= nowMs + TOKEN_VALID_FOR_MS || expires > nowMs + 75 * 60_000) return undefined;
-  return data;
+  if (exactPermissions(data.permissions, expectedPermissions)) return data;
+  if (exactPermissions(data.permissions, EXPECTED_PERMISSIONS) || exactPermissions(data.permissions, WORKFLOW_PERMISSIONS)) {
+    return { ...data, policyMismatch: true };
+  }
+  return undefined;
+}
+
+// Apply workflow opt-outs before key loading or discovery can fail. The cache directory
+// is issuer-owned; filenames are opaque hashes and never come from provider input.
+async function invalidateWorkflowOptOuts(config) {
+  const retained = new Set(config.workflowRepositories.map(name => basename(tokenPath(config.tokenDirectory, name))));
+  for (const entry of await readdir(config.tokenDirectory, { withFileTypes: true })) {
+    if (!/^[a-f0-9]{64}\.json$/.test(entry.name) || retained.has(entry.name)) continue;
+    const path = join(config.tokenDirectory, entry.name);
+    const data = await readCachedToken(path, config.tokenGroupId);
+    if (exactPermissions(data?.permissions, WORKFLOW_PERMISSIONS)) {
+      try { await unlink(path); }
+      catch (error) { if (error?.code !== "ENOENT") fail("cache-policy-invalidation-failed"); }
+    }
+  }
 }
 
 async function boundedBody(response, maxBytes = MAX_RESPONSE_BYTES) {
@@ -265,11 +306,11 @@ async function boundedBody(response, maxBytes = MAX_RESPONSE_BYTES) {
   return Buffer.concat(chunks, size).toString("utf8");
 }
 
-async function requestInstallationToken(repository, jwt) {
+async function requestInstallationToken(repository, jwt, permissions) {
   const endpoint = `${API}/app/installations/${repository.installationId}/access_tokens`;
   const payload = {
     repository_ids: [repository.repositoryId],
-    permissions: EXPECTED_PERMISSIONS,
+    permissions,
   };
   let response;
   try {
@@ -301,7 +342,7 @@ async function requestInstallationToken(repository, jwt) {
   if (!Array.isArray(body.repositories) || body.repositories.length !== 1) fail("provider-scope-invalid");
   const scope = body.repositories[0];
   if (!scope || scope.id !== repository.repositoryId || typeof scope.full_name !== "string" || scope.full_name.toLowerCase() !== repository.repository) fail("provider-scope-invalid");
-  if (!exactPermissions(body.permissions)) fail("provider-permissions-invalid");
+  if (!exactPermissions(body.permissions, permissions)) fail("provider-permissions-invalid");
   if (typeof body.expires_at !== "string") fail("provider-expiry-invalid");
   const expiresMs = Date.parse(body.expires_at);
   const nowMs = Date.now();
@@ -313,7 +354,7 @@ async function requestInstallationToken(repository, jwt) {
     installationId: repository.installationId,
     token: body.token,
     expiresAt: new Date(expiresMs).toISOString(),
-    permissions: EXPECTED_PERMISSIONS,
+    permissions,
   };
 }
 
@@ -465,7 +506,8 @@ async function writeTokenAtomically(directory, filePath, value, groupId) {
 
 async function refreshOne(repository, jwt, config) {
   const path = tokenPath(config.tokenDirectory, repository.repository);
-  const token = await requestInstallationToken(repository, jwt);
+  const permissions = permissionsFor(config, repository);
+  const token = await requestInstallationToken(repository, jwt, permissions);
   await writeTokenAtomically(config.tokenDirectory, path, token, config.tokenGroupId);
   return "refreshed";
 }
@@ -476,10 +518,11 @@ async function run(configPath) {
   let parsed;
   try { parsed = JSON.parse(configRaw.toString("utf8")); } catch { fail("config-json"); }
   const config = validateConfig(parsed);
-  await secureFile(config.privateKeyFile, "private-key", 1024 * 1024);
   await ensureTokenDirectory(config.tokenDirectory, config.tokenGroupId);
+  await invalidateWorkflowOptOuts(config);
+  await secureFile(config.privateKeyFile, "private-key", 1024 * 1024);
   const configuredTokens = await Promise.all(config.repositories.map(async (repository) => {
-    try { return await cachedToken(tokenPath(config.tokenDirectory, repository.repository), repository, config.tokenGroupId); }
+    try { return await cachedToken(tokenPath(config.tokenDirectory, repository.repository), repository, config.tokenGroupId, permissionsFor(config, repository)); }
     catch { return undefined; }
   }));
   const needsJwt = config.installations.length > 0 || configuredTokens.some((token) => !token);
@@ -495,10 +538,10 @@ async function run(configPath) {
   let repositories = config.repositories;
   if (config.installations.length > 0) repositories = await discoverRepositories(config, jwt);
   const currentTokens = await Promise.all(repositories.map(async (repository) => {
-    try { return { value: await cachedToken(tokenPath(config.tokenDirectory, repository.repository), repository, config.tokenGroupId) }; }
+    try { return { value: await cachedToken(tokenPath(config.tokenDirectory, repository.repository), repository, config.tokenGroupId, permissionsFor(config, repository)) }; }
     catch (error) { return { error: error instanceof RefreshError ? error.code : "cache-unavailable" }; }
   }));
-  const needsRefresh = currentTokens.some((cached) => !cached.error && !cached.value);
+  const needsRefresh = currentTokens.some((cached) => !cached.error && (!cached.value || cached.value.policyMismatch));
   if (needsRefresh && !jwt) {
     let key;
     try { key = createPrivateKey((await secureFile(config.privateKeyFile, "private-key", 1024 * 1024)).toString("utf8")); } catch (error) {
@@ -520,7 +563,17 @@ async function run(configPath) {
         results[index] = false;
         continue;
       }
-      if (currentTokens[index].value) {
+      if (currentTokens[index].value?.policyMismatch) {
+        try { await unlink(tokenPath(config.tokenDirectory, name)); }
+        catch (error) {
+          if (error?.code !== "ENOENT") {
+            console.error(`${name}: failed (cache-policy-invalidation-failed)`);
+            results[index] = false;
+            continue;
+          }
+        }
+      }
+      if (currentTokens[index].value && !currentTokens[index].value.policyMismatch) {
         console.log(`${name}: cached`);
         results[index] = true;
         continue;

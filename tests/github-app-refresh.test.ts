@@ -71,11 +71,13 @@ globalThis.fetch = async (input, init = {}) => {
   if (scenario === "http-error" || (scenario === "one-installation-fails" && installationId === 101)) {
     return new Response("sensitive-body-marker", { status: 401 });
   }
-  const permissions = { contents: "write", pull_requests: "write", checks: "read", statuses: "read", actions: "read", metadata: "read" };
+  const permissions = { ...body.permissions };
   const repositories = [{ id: repositoryId, full_name: configured.repository.split("/").map(part => part[0].toUpperCase() + part.slice(1)).join("/") }];
   const expiresAt = new Date(Date.now() + 45 * 60_000).toISOString();
   if (scenario === "wrong-scope") repositories[0].id += 1;
   if (scenario === "wrong-permissions") permissions.contents = "read";
+  if (scenario === "unexpected-workflow") permissions.workflows = "write";
+  if (scenario === "missing-workflow") delete permissions.workflows;
   if (scenario === "control-token") return new Response(JSON.stringify({ token: "opaque_test_token_value_42\u0000", expires_at: expiresAt, permissions, repositories }), { status: 201 });
   if (scenario === "bad-expiry") return new Response(JSON.stringify({ token: "opaque_test_token_value_42", expires_at: new Date(Date.now() + 80 * 60_000).toISOString(), permissions, repositories }), { status: 201 });
   if (scenario === "oversized") return new Response("x".repeat(70 * 1024), { status: 201 });
@@ -170,8 +172,57 @@ test("mints one-repository token with bounded permissions and reuses a fresh bou
   } finally { f.close(); }
 });
 
+test("workflow permission is opt-in per authorized repository and cache policy upgrades and downgrades", { timeout: 60_000 }, () => {
+  const repositories = [
+    { repository: "example/workflows", repositoryId: 71, installationId: 101 },
+    { repository: "example/ordinary", repositoryId: 72, installationId: 101 },
+  ];
+  const f = fixture(repositories);
+  try {
+    f.config.workflowRepositories = ["example/workflows"];
+    writeFileSync(f.configFile, JSON.stringify(f.config), { mode: 0o600 });
+    const first = f.run();
+    assert.equal(first.status, 0, first.stderr);
+    const initialCalls = f.requests().filter(call => call.body?.repository_ids);
+    const byId = new Map(initialCalls.map(call => [call.body.repository_ids[0], call.body.permissions]));
+    assert.deepEqual(byId.get(71), { contents: "write", pull_requests: "write", checks: "read", statuses: "read", actions: "read", metadata: "read", workflows: "write" });
+    assert.deepEqual(byId.get(72), { contents: "write", pull_requests: "write", checks: "read", statuses: "read", actions: "read", metadata: "read" });
+    assert.equal(JSON.parse(readFileSync(f.tokenFile("example/workflows"), "utf8")).permissions.workflows, "write");
+    assert.equal(Object.hasOwn(JSON.parse(readFileSync(f.tokenFile("example/ordinary"), "utf8")).permissions, "workflows"), false);
+
+    f.config.workflowRepositories = ["example/workflows", "example/ordinary"];
+    writeFileSync(f.configFile, JSON.stringify(f.config), { mode: 0o600 });
+    const upgraded = f.run();
+    assert.equal(upgraded.status, 0, upgraded.stderr);
+    assert.match(upgraded.stdout, /example\/workflows: cached/);
+    assert.match(upgraded.stdout, /example\/ordinary: refreshed/);
+    assert.equal(JSON.parse(readFileSync(f.tokenFile("example/ordinary"), "utf8")).permissions.workflows, "write");
+
+    f.config.workflowRepositories = [];
+    writeFileSync(f.configFile, JSON.stringify(f.config), { mode: 0o600 });
+    const callsBeforeFailedDowngrade = f.requests().filter(call => call.body?.repository_ids).length;
+    const failedDowngrade = f.run("http-error");
+    assert.equal(failedDowngrade.status, 1);
+    assert.match(failedDowngrade.stderr, /provider-http-401/);
+    assert.equal(exists(f.tokenFile("example/workflows")), false, "failed opt-out retained a workflow-capable cache");
+    assert.equal(exists(f.tokenFile("example/ordinary")), false, "failed policy refresh left a stale cache usable");
+    const failedDowngradeCalls = f.requests().filter(call => call.body?.repository_ids).slice(callsBeforeFailedDowngrade);
+    assert.equal(failedDowngradeCalls.length, 2, "policy changes must request replacement tokens even while old tokens are fresh");
+    for (const call of failedDowngradeCalls) assert.equal(Object.hasOwn(call.body.permissions, "workflows"), false);
+
+    const downgraded = f.run();
+    assert.equal(downgraded.status, 0, downgraded.stderr);
+    assert.match(downgraded.stdout, /example\/workflows: refreshed/);
+    assert.match(downgraded.stdout, /example\/ordinary: refreshed/);
+    for (const repository of repositories) {
+      const token = JSON.parse(readFileSync(f.tokenFile(repository.repository), "utf8"));
+      assert.equal(Object.hasOwn(token.permissions, "workflows"), false, `${repository.repository} retained workflow permission after opt-out`);
+    }
+  } finally { f.close(); }
+});
+
 test("rejects GitHub responses outside the configured repository, permission, or expiry contract", { timeout: 60_000 }, () => {
-  for (const scenario of ["wrong-scope", "wrong-permissions", "bad-expiry", "oversized", "http-error", "control-token"]) {
+  for (const scenario of ["wrong-scope", "wrong-permissions", "unexpected-workflow", "bad-expiry", "oversized", "http-error", "control-token"]) {
     const f = fixture();
     try {
       const result = f.run(scenario);
@@ -181,6 +232,15 @@ test("rejects GitHub responses outside the configured repository, permission, or
       assert.equal(f.requests().length, 1);
     } finally { f.close(); }
   }
+  const f = fixture();
+  try {
+    f.config.workflowRepositories = ["example/app"];
+    writeFileSync(f.configFile, JSON.stringify(f.config), { mode: 0o600 });
+    const result = f.run("missing-workflow");
+    assert.notEqual(result.status, 0, "a response missing the opted-in workflow permission unexpectedly succeeded");
+    assert.match(result.stderr, /provider-permissions-invalid/);
+    assert.equal(exists(f.tokenFile("example/app")), false);
+  } finally { f.close(); }
 });
 
 test("continues other configured repositories after one installation fails", { timeout: 30_000 }, () => {
@@ -434,6 +494,42 @@ test("rejects noncanonical or duplicate repository bindings before contacting Gi
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, scenario.reason);
       assert.equal(f.requests().length, 0);
+    } finally { f.close(); }
+  }
+});
+
+test("workflow opt-out removes the broader cache even when installation discovery fails", () => {
+  const repositories = [{ repository: "example/workflows", repositoryId: 71, installationId: 101 }];
+  const f = fixture([], [{ installationId: 101 }], repositories);
+  try {
+    f.config.workflowRepositories = ["example/workflows"];
+    writeFileSync(f.configFile, JSON.stringify(f.config), { mode: 0o600 });
+    assert.equal(f.run().status, 0);
+    assert.equal(JSON.parse(readFileSync(f.tokenFile("example/workflows"), "utf8")).permissions.workflows, "write");
+    f.config.workflowRepositories = [];
+    writeFileSync(f.configFile, JSON.stringify(f.config), { mode: 0o600 });
+    const failed = f.run("incomplete-discovery");
+    assert.notEqual(failed.status, 0);
+    assert.match(failed.stderr, /discovery-failed/);
+    assert.equal(exists(f.tokenFile("example/workflows")), false);
+  } finally { f.close(); }
+});
+
+test("workflow permission allowlists must be canonical, unique, and bound to a configured repository", () => {
+  const cases = [
+    { workflowRepositories: ["Example/app"], reason: /repository-name/ },
+    { workflowRepositories: ["example/app", "example/app"], reason: /workflow-repositories/ },
+    { workflowRepositories: ["example/unconfigured"], reason: /workflow-repository-not-configured/ },
+  ];
+  for (const scenario of cases) {
+    const f = fixture();
+    try {
+      f.config.workflowRepositories = scenario.workflowRepositories;
+      writeFileSync(f.configFile, JSON.stringify(f.config), { mode: 0o600 });
+      const result = f.run();
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, scenario.reason);
+      assert.equal(f.requests().length, 0, "invalid policy must fail before contacting GitHub");
     } finally { f.close(); }
   }
 });

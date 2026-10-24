@@ -294,6 +294,18 @@ Missing GitHub tools or authentication blocks delivery for review. It does not
 expand provider permissions, and a merge report does not establish human
 acceptance or product impact.
 
+After an explicitly blocked delivery attempt, an owner can request a fresh
+strong-coordinator reconciliation through
+`POST /api/teams/:id/reconcile-delivery` with `requestId`, `revision`, and a
+`text` field recording the resolved dependency and remote evidence. This is
+available only for a stopped standalone attempt with unchanged clean reviewed
+work, current checks and tracking, and no uncertain permission answer or saved
+delivery result. It preserves the earlier attempt and starts remote inspection
+under the same pinned delivery policy. The new member must reuse matching
+branches, pull requests and confirmed results before considering any new action.
+A changed baseline still needs a fresh implementation and review; this action
+does not waive checks, reconcile edited files, or expand provider access.
+
 After the host records a `merge` report, it refreshes the project, so the merged
 commit reaches the host before the owner reads the result.
 
@@ -902,9 +914,11 @@ change the scope or set a limit from one to twenty. Existing runs remain unchang
 An older host without delegation support requires an upgrade or an explicit
 `--permissions off` choice.
 
-The default scope approves one-time repository read, edit, build and test
-operations for the accepted task in its assigned workspace, including a one-time
-run of the task's tests or accepted checks outside the provider sandbox. It
+The default scope approves one-time development operations for the accepted
+objective and assigned role: repository inspection and fetch, scoped edits and
+staging, test planning, builds, tests and local browser checks. These may run
+outside the provider sandbox and use task-owned temporary files while preserving
+the assigned repository and path scope. It
 escalates new credentials, other repositories, global settings, deployment,
 destructive operations, persistent approvals, other permission bypasses and
 unclear effects. Delivery keeps its separate pinned policy.
@@ -923,14 +937,25 @@ A request qualifies when its evidence is complete: hook tool input that storage
 did not truncate, or a Codex "Would you like to run the following command?"
 dialog that shows its whole `$` command. Codex hooks are off by default, so
 Codex members reach the coordinator through the dialog. The review also gets the
-files the member changed against its base and the accepted checks; see
+files the member changed against its base, accepted checks, and bounded complete
+command-source files with hashes and explicit collection gaps. The host
+rechecks this snapshot before answering. New members receive a host-assigned
+external scratch directory for temporary scripts and check outputs; source
+collection reads only that assigned scratch root, never arbitrary temporary
+paths. A reviewer uses the objective and its
+review assignment; having no individual implementation task is normal. Delivery
+requests also carry the separate pinned policy, reviewed head and branch, and
+passing-check evidence. The host verifies the actual delivery workspace is clean
+and still at the reviewed commit before review and before answering. Git pushes
+use that literal commit SHA and explicit destination; ordinary workers cannot publish. See
 [security](security.md#delegated-team-permission-decisions) for the rule. Once a
 request qualifies, the host either starts the review or records an escalation
 with its reason, so clients show the prompt as the coordinator's only while it
-can act. Codex members are told their sandbox has no network, listeners or IPC
-sockets. They prefer checks that run inside it, ask to leave it only for a
-one-time run of the task's tests or an accepted check, and report what they
-skipped. The host runs the accepted checks after integration.
+can act. Codex members prefer operations that work inside their sandbox and
+request one-time execution when a necessary scoped development command needs
+network, listeners, IPC, or Git metadata access. The host runs the accepted checks
+after integration. An obsolete report-only reviewer cannot approve a later
+prompt or block another review merely because its shutdown is unavailable.
 
 Workspace trust, persistent allow rules, ambiguous prompts and unsupported native
 requests are never delegated; trust prompts disappear only when the owner trusts

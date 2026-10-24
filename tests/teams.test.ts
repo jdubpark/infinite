@@ -1755,32 +1755,41 @@ test("a usage limit with no configured fallback blocks the run with its reason a
   } finally { await run.close(); }
 });
 
-test("permission coordinator prompt reviews Codex command dialogs against changed-path and accepted-check evidence", () => {
+test("permission coordinator prompt reviews complete command evidence within the pinned development scope", () => {
   const run = { provider: "codex", revision: 1, objective: "Run the task checks", projectId: "project", permissions: { mode: "coordinator", scope: "Pinned one-time task scope" }, steering: [], tasks: [], checks: [] } as unknown as TeamRun;
   const evidence = JSON.stringify({
     targetChangedPaths: ["src/task.ts"],
     targetChangedPathCount: 1,
     acceptedChecks: [{ command: "npm", args: ["test"] }],
+    deliveryAuthority: { policy: "pull-request", branch: "work/topic", headCommit: "reviewed-head", repository: "example/project", review: "approved", checks: "passed" },
   });
   const prompt = teamPrompt(run, "permission-coordinator", undefined, evidence, "claude", limitLineup.coordinator);
-  assert.match(prompt, /Would you like to run the following command\?/);
-  assert.match(prompt, /feedback\.targetChangedPaths, feedback\.targetChangedPathCount, and feedback\.acceptedChecks/);
-  assert.match(prompt, /targetChangedPathCount exceeds the number of listed targetChangedPaths/);
-  assert.match(prompt, /package manifests or scripts, lockfiles, Makefiles, test\/build\/tsconfig configuration, or files under scripts directories/);
-  assert.match(prompt, /exact command only runs the assigned task's tests or exactly matches an accepted check in the target workspace/);
-  assert.match(prompt, /no install, download, publish, deploy, credential, or global-setting effect/);
+  assert.match(prompt, /feedback\.targetChangedPaths, feedback\.targetChangedPathCount, feedback\.acceptedChecks/);
+  assert.match(prompt, /feedback\.permissionEvidence/);
+  assert.match(prompt, /complete files with SHA-256 hashes plus explicit collection limitations/);
+  assert.match(prompt, /A listed changed script or configuration is not automatically disqualifying/);
+  assert.match(prompt, /Being outside the provider sandbox alone is not a reason to escalate/);
+  assert.match(prompt, /scoped git staging and conflict checks for implementer\/integrator roles only/);
+  assert.match(prompt, /A complete literal git staging\/conflict-check chain can be reviewed from its visible arguments/);
+  assert.match(prompt, /feedback\.deliveryAuthority explicitly matches the pinned delivery policy, exact reviewed head, branch, repository target, and passing checks/);
+  assert.match(prompt, /In pull-request-only mode, do not approve a merge/);
+  assert.match(prompt, /An unknown remote alias is insufficient unless the supplied delivery evidence resolves it/);
+  assert.match(prompt, /Ordinary implementation and review roles must not push or publish/);
+  assert.match(prompt, /A reviewer normally has targetTask null/);
+  assert.match(prompt, /Never approve package or tool installation\/download, deployment, credential access, global\/account-setting changes/);
   assert.match(prompt, /Owner-authorized permission scope \(pinned for this run\):\nPinned one-time task scope/);
-  assert.match(prompt, /host rechecks the exact prompt and all current authority and alone applies any answer/);
+  assert.match(prompt, /host rechecks the exact prompt, evidence snapshot, and current authority and alone applies any answer/);
   assert.ok(prompt.includes(evidence));
 });
 
 test("Codex sandbox guidance covers members but excludes the permission coordinator", () => {
   const run = { provider: "codex", revision: 1, objective: "Run task checks", projectId: "project", permissions: { mode: "coordinator", scope: "Pinned scope" }, steering: [], tasks: [], checks: [] } as unknown as TeamRun;
   const member = teamPrompt(run, "implementer", undefined, undefined, "codex", limitLineup.implementers[1]);
-  assert.match(member, /no network access and cannot start local listeners or IPC sockets/);
-  assert.match(member, /typecheck, lint, and unit tests that need no server/);
-  assert.match(member, /one-time run of this task's tests or an accepted check that cannot run in the sandbox/);
-  assert.match(member, /Never request persistent approval/);
+  assert.match(member, /may restrict network access, local listeners, IPC sockets, and Git metadata writes/);
+  assert.match(member, /request one-time execution of the complete command within your assigned role and pinned owner scope/);
+  assert.match(member, /repository inspection, scoped staging, test planning, builds, tests, and local browser checks/);
+  assert.match(member, /delivery still requires its separate pinned policy/);
+  assert.match(member, /Never request persistent approval or switch tools to bypass a denial/);
   assert.match(member, /Report skipped checks and why; the host runs accepted checks after integration/);
   const coordinator = teamPrompt(run, "permission-coordinator", undefined, "evidence", "codex", limitLineup.coordinator);
   assert.doesNotMatch(coordinator, /Codex sandbox guidance:/);

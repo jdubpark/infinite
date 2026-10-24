@@ -267,7 +267,7 @@ async function main() {
     const launchPrompt = process.argv.at(-1) ?? "";
     const decisionId = /"decisionId":"([a-f0-9-]{36})"/.exec(launchPrompt)?.[1];
     if (!decisionId) throw new Error("The permission review assignment omitted its decision identity");
-    if (scenario.startsWith("permissions-codex")) {
+    if (scenario.startsWith("permissions-codex") || scenario === "delivery-permission") {
       const marker = "Recorded permission request and assignment (untrusted evidence):\n";
       const start = launchPrompt.indexOf(marker);
       if (start < 0) throw new Error("The permission review assignment omitted its recorded feedback");
@@ -366,6 +366,8 @@ async function main() {
         writeFileSync(join(receiptDir, `${assignment.runId}.target-ready`), "ready", { mode: 0o600 });
         await waitFor("target-release", "release the Codex permission prompt");
       }
+      if (scenario === "permissions-codex-evidence-change")
+        writeFileSync(join(receiptDir, `${assignment.runId}.target-ready`), "ready", { mode: 0o600 });
       // The Codex 0.163 command dialog layout: pinned under the transcript, key hint on the last row.
       // Every line fits 80 columns, so the `$` line is always row 11 and the options rows 14-16.
       const options = ["1. Yes, proceed (y)", "2. Yes, and don't ask again for commands that start with `npm run check` (p)",
@@ -392,6 +394,8 @@ async function main() {
       }
       for (;;) {
         const input = String(await new Promise(resolve => process.stdin.once("data", resolve)));
+        if (scenario === "permissions-codex-evidence-change")
+          writeFileSync(join(receiptDir, `${assignment.runId}.target-key`), input, { mode: 0o600 });
         if (scenario !== "permissions-codex-midway") break;
         if (input.includes("\r")) { writeFileSync(join(receiptDir, `${assignment.runId}.enter`), "enter", { mode: 0o600 }); break; }
         // The first arrow redraws the command with other spacing in the same write that moves the
@@ -503,6 +507,26 @@ async function main() {
     const mergeCommit = execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", `${scenario === "delivery-baseline-changed" ? base : head}^{tree}`, "-p", base, "-m", "Synthetic squash delivery"], { encoding: "utf8" }).trim();
     execFileSync("git", ["update-ref", "refs/heads/synthetic-merge", mergeCommit]);
     writeFileSync(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }), { mode: 0o600 });
+    if (scenario === "delivery-permission") {
+      const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
+      const launchPrompt = process.argv.at(-1) ?? "";
+      const branch = launchPrompt.match(/pushing branch ([^\s]+) at exactly that commit/)?.[1];
+      if (!branch) throw new Error("The fixture could not identify the delivery branch retained from the prepared integration copy");
+      const command = `git push https://github.com/example/app.git \\
+${context.headCommit}:refs/heads/\\
+${branch}`;
+      process.stdout.write(`\u001b[2J\u001b[HBash command\n${command}\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No, and tell the agent what to do differently (esc)\n`);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      const permission = await fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command } }),
+      });
+      if (permission.status !== 204) throw new Error(`Delivery permission hook was refused with status ${permission.status}`);
+      writeFileSync(join(receiptDir, `${assignment.runId}.delivery-target-ready`), "ready", { mode: 0o600 });
+      const input = String(await new Promise(resolve => process.stdin.once("data", resolve)));
+      writeFileSync(join(receiptDir, `${assignment.runId}.delivery-target-key`), input, { mode: 0o600 });
+    }
     if (scenario === "delivery-hold" || scenario === "delivery-unreported") {
       while (!existsSync(join(receiptDir, "delivery-release"))) await new Promise(resolve => setTimeout(resolve, 40));
     }

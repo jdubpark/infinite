@@ -149,7 +149,11 @@ function cacheStatus(config, repository) {
     if (typeof raw.token !== "string" || Buffer.byteLength(raw.token, "utf8") > 16384 || raw.token.length === 0 || /[\s\u0000-\u001f\u007f]/u.test(raw.token)) return { state: "invalid" };
     if (typeof raw.expiresAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(raw.expiresAt) || !Number.isFinite(Date.parse(raw.expiresAt))) return { state: "invalid" };
     assertObject(raw.permissions, "token permissions");
-    if (Object.keys(raw.permissions).length !== Object.keys(permissionSet).length || Object.entries(permissionSet).some(([key, permission]) => raw.permissions[key] !== permission)) return { state: "invalid" };
+    const permissionKeys = Object.keys(raw.permissions).sort();
+    const baseKeys = Object.keys(permissionSet).sort();
+    const workflowEnabled = permissionKeys.length === baseKeys.length + 1 && permissionKeys.includes("workflows") && raw.permissions.workflows === "write";
+    const baseOnly = permissionKeys.length === baseKeys.length;
+    if ((!baseOnly && !workflowEnabled) || permissionKeys.some(key => !baseKeys.includes(key) && key !== "workflows") || Object.entries(permissionSet).some(([key, permission]) => raw.permissions[key] !== permission)) return { state: "invalid" };
     if (Date.parse(raw.expiresAt) < Date.now() + 60_000) return { state: "expired", expiresAt: raw.expiresAt };
     return { state: "ready", token: raw.token, expiresAt: raw.expiresAt };
   } catch { return { state: "invalid" }; }

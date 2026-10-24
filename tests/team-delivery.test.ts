@@ -37,6 +37,16 @@ async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: strin
   return { f, teams, run, member, stored, headCommit, id, consume(report: TeamReport) { member.report = report; internals.consume(stored, member); } };
 }
 
+async function blockedDeliveryRecord() {
+  const h = await deliveryRecord("merge");
+  h.run.lineup = structuredClone(limitLineup);
+  h.run.status = "blocked";
+  h.run.reason = "Delivery was blocked before a confirmed remote result.";
+  h.member.status = "stopped";
+  h.member.report = { kind: "blocked", summary: "The provider denied workflow-file publication." };
+  return h;
+}
+
 test("owner-authorized delivery waits for exact-head checks and review, survives API restart, and records one merge claim", { timeout: 90000 }, async () => {
   const f = await fixture("delivery-hold", limitLineup);
   try {
@@ -165,6 +175,60 @@ test("an exited delivery without a receipt is not merged or replayed by steering
     const receipts = readdirSync(f.receipts).filter(name => name.endsWith(".json")).map(name => JSON.parse(readFileSync(join(f.receipts, name), "utf8")));
     assert.equal(receipts.filter(receipt => receipt.role === "delivery").length, 1);
   } finally { await f.close(); }
+});
+
+test("owner delivery reconciliation refuses unsafe prior attempts without changing team state", { timeout: 90000 }, async () => {
+  const scenarios = ["dirty", "head-drift", "active-member", "uncertain-permission", "wrong-role"] as const;
+  for (const scenario of scenarios) {
+    const h = await blockedDeliveryRecord();
+    try {
+      if (scenario === "dirty") writeFileSync(join(h.run.workspace, "untracked-reconciliation-probe"), "dirty\n");
+      if (scenario === "head-drift") git(h.run.workspace, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "Drift from reviewed head");
+      if (scenario === "active-member") h.run.members.push({ ...h.member, memberId: randomUUID(), sessionId: randomUUID(), role: "reviewer", status: "running", report: undefined });
+      if (scenario === "uncertain-permission") h.run.permissionDecisions = [{ id: randomUUID(), revision: h.run.revision, policyHash: "policy", targetMemberId: h.member.memberId,
+        targetSessionId: h.member.sessionId, targetCwd: h.member.cwd, promptId: 1, promptHash: "prompt", evidenceHash: "evidence", prompt: {} as never,
+        option: 0, expiresAt: new Date(Date.now() + 60000).toISOString(), answerRequestId: randomUUID(), status: "uncertain" }];
+      if (scenario === "wrong-role") h.member.role = "reviewer";
+      const before = { revision: h.run.revision, status: h.run.status, members: h.run.members.length, attempt: structuredClone(h.stored.deliveryAttempt), events: h.run.events.length };
+      await assert.rejects(h.teams.reconcileDelivery(h.id, { requestId: randomUUID(), revision: h.run.revision, text: "Inspect current remote state before any delivery action." }),
+        error => error instanceof TeamError && error.status === 409);
+      assert.equal(h.run.revision, before.revision, scenario);
+      assert.equal(h.run.status, before.status, scenario);
+      assert.equal(h.run.members.length, before.members, scenario);
+      assert.deepEqual(h.stored.deliveryAttempt, before.attempt, scenario);
+      assert.equal(h.run.events.length, before.events, scenario);
+    } finally { await h.f.close(); }
+  }
+});
+
+test("owner delivery reconciliation starts one strong worker at the pinned head and retains the prior report", { timeout: 90000 }, async () => {
+  const h = await blockedDeliveryRecord();
+  try {
+    const priorAttempt = structuredClone(h.stored.deliveryAttempt);
+    const priorReport = structuredClone(h.member.report);
+    const request = { requestId: randomUUID(), revision: h.run.revision, text: "Check the branch, PR, and CI state before doing anything." };
+    await h.teams.reconcileDelivery(h.id, request);
+    const prepared = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.members.length === 2 && run.members.some(member => member.memberId !== h.member.memberId && member.status === "queued"), 10000);
+    const fresh = h.run.members.find(member => member.memberId !== h.member.memberId)!;
+    assert.equal(fresh.role, "delivery");
+    assert.equal(fresh.revision, h.run.revision);
+    assert.equal(fresh.baseCommit, h.headCommit);
+    assert.equal(fresh.modelProfile?.tier, "strong");
+    assert.notEqual(fresh.memberId, h.member.memberId);
+    assert.equal(h.stored.deliveryAttempt?.memberId, fresh.memberId);
+    assert.equal(h.stored.deliveryAttempt?.headCommit, priorAttempt?.headCommit);
+    assert.deepEqual(h.member.report, priorReport);
+    assert.equal(h.member.status, "stopped");
+    assert.match(fresh.contextFeedback ?? "", /Check the branch, PR, and CI state before doing anything/);
+    assert.match(fresh.contextFeedback ?? "", /Prior blocked report/);
+    assert.match(fresh.contextFeedback ?? "", /never create a duplicate pull request/);
+    assert.ok(prepared.events.some(event => event.text.includes(h.member.memberId) && event.text.includes(h.headCommit)));
+    assert.equal(existsSync(join(h.f.receipts, "delivery-started.json")), false, "reconciliation queues a worker but does not publish directly");
+
+    await h.teams.reconcileDelivery(h.id, request);
+    assert.equal(h.run.members.length, 2, "an idempotent retry must not queue another delivery member");
+    assert.equal(h.stored.deliveryAttempt?.memberId, fresh.memberId);
+  } finally { await h.f.close(); }
 });
 
 test("failed checks never launch delivery and a weak lineup cannot opt into merge", { timeout: 90000 }, async () => {

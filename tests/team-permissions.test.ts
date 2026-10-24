@@ -1,18 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { claimControl, waitFor } from "./helpers.js";
-import { fixture, limitLineup } from "./team-fixture.js";
+import { fixture, git, limitLineup } from "./team-fixture.js";
 import type { TeamLineup } from "../packages/host/src/team-types.js";
 import { refusedBeforeSend } from "../packages/host/src/team-permissions.js";
+import { permissionEvidenceDigest } from "../packages/host/src/team-permission-evidence.js";
 import { ContentError } from "../packages/host/src/session-content.js";
 
 const permissionLineup: TeamLineup = {
   ...limitLineup,
   coordinator: { ...limitLineup.coordinator, id: "claude-coordinator", label: "Claude coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
 };
+
+function addInspectableCheckPackage(f: Awaited<ReturnType<typeof fixture>>) {
+  const source = f.host.config.projects.find(project => project.id === "rehearsal")!.path;
+  const packageManifest = `${JSON.stringify({ scripts: { check: "node check.mjs" } }, null, 2)}\n`;
+  writeFileSync(join(source, "package.json"), packageManifest);
+  git(source, "add", "package.json");
+  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Add inspectable check script");
+  return { packageManifest, checkSource: readFileSync(join(source, "check.mjs"), "utf8") };
+}
 
 test("only a preflight or named worker refusal counts as an answer that sent nothing", () => {
   assert.equal(refusedBeforeSend(new ContentError("The assigned team member has no running managed terminal")), true);
@@ -51,6 +61,7 @@ test("an explicit permission policy reviews and answers only the recorded one-sh
 test("a Codex permission review preserves a large objective and complete request evidence", { timeout: 120000 }, async () => {
   const f = await fixture("permissions-codex", permissionLineup);
   try {
+    const inspectable = addInspectableCheckPackage(f);
     const objective = `Create independent files. ${"Keep the assigned scope. ".repeat(800)}Verify their integrated contents.`;
     const created = await f.host.fetchApi("/teams", "owner", { ...f.create(), objective });
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
@@ -67,9 +78,25 @@ test("a Codex permission review preserves a large objective and complete request
     const feedbackText = readFileSync(join(f.receipts, `${reviewing.id}.permission-feedback.json`), "utf8");
     assert.equal(launchPrompt.split(feedbackText).length, 2, "the complete request evidence reaches the reviewer once");
     const feedback = JSON.parse(feedbackText);
+    const permissionEvidence = feedback.permissionEvidence as { files: Array<{ path: string; content: string; sha256: string }>; limitations: string[]; digest: string };
+    const scriptEvidence = permissionEvidence.files.find(file => file.path === "check.mjs");
+    assert.ok(scriptEvidence, "the package command's local script source reaches the reviewer");
+    assert.equal(scriptEvidence.content, inspectable.checkSource, "the reviewer receives full source contents");
+    assert.equal(scriptEvidence.sha256, createHash("sha256").update(inspectable.checkSource).digest("hex"));
+    assert.deepEqual(permissionEvidence.limitations, [], "the mapped command source is complete within the evidence bounds");
+    assert.equal(permissionEvidence.digest, permissionEvidenceDigest(permissionEvidence));
+    const expectedWorkspaceEvidenceHash = createHash("sha256").update(JSON.stringify({
+      changedPaths: feedback.targetChangedPaths, evidence: permissionEvidence.digest,
+    })).digest("hex");
+    assert.equal(reviewing.permissionDecisions[0].workspaceEvidenceHash, expectedWorkspaceEvidenceHash,
+      "the stored guard hash covers changed paths and the bounded source snapshot");
     const target = reviewing.members.find(member => member.memberId === reviewing.permissionDecisions[0].targetMemberId)!;
     assert.deepEqual(feedback.prompt, (await f.host.fetchApi(`/sessions/${target.sessionId}`)).body.attention.prompt);
     assert.equal(feedback.targetTask.instructions, reviewing.tasks.find(task => task.id === target.taskId)!.instructions);
+    assert.equal(typeof feedback.targetScratchDirectory, "string");
+    assert.ok(existsSync(feedback.targetScratchDirectory), "the host-assigned temporary directory exists for the reviewed target");
+    const scratchRelativeToTarget = relative(target.cwd, feedback.targetScratchDirectory);
+    assert.ok(scratchRelativeToTarget.startsWith(`..${sep}`), "the target scratch directory stays outside its Git checkout");
     // While the coordinator reviews, the run does not tell the person to answer the prompt.
     await waitFor(() => f.get(reviewing.id), run => run.reason === "The permission coordinator is reviewing a provider request.", 10000);
     writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
@@ -80,6 +107,93 @@ test("a Codex permission review preserves a large objective and complete request
     assert.ok(feedback.targetChangedPaths.includes("a.txt"), JSON.stringify(feedback.targetChangedPaths));
     assert.equal(feedback.targetChangedPathCount, feedback.targetChangedPaths.length);
     assert.deepEqual(feedback.acceptedChecks, [{ command: process.execPath, args: ["check.mjs"] }]);
+  } finally { await f.close(); }
+});
+
+test("changed command source during a held review escalates without answering the prompt", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex-evidence-change", permissionLineup);
+  try {
+    addInspectableCheckPackage(f);
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const reviewing = await waitFor(() => f.get(created.body.id), run =>
+      run.permissionDecisions?.[0]?.status === "reviewing" && existsSync(join(f.receipts, `${run.id}.judge-ready`)) &&
+        existsSync(join(f.receipts, `${run.id}.target-ready`)), 60000);
+    const decision = reviewing.permissionDecisions![0]!;
+    const target = reviewing.members.find(member => member.memberId === decision.targetMemberId)!;
+    const before = await f.host.fetchApi(`/sessions/${target.sessionId}`);
+    const prompt = before.body.attention.prompt;
+    assert.equal(before.body.attention.state, "needs-you");
+    assert.ok(prompt?.id !== undefined && prompt.hash);
+
+    writeFileSync(join(target.cwd, "check.mjs"), `${readFileSync(join(target.cwd, "check.mjs"), "utf8")}\n// changed while permission review was held\n`);
+    writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
+    const escalated = await waitFor(() => f.get(reviewing.id), run => run.permissionDecisions?.[0]?.status === "escalated", 30000);
+    assert.match(escalated.permissionDecisions![0]!.reason ?? "", /inspected command sources or changed paths changed/i);
+    assert.equal(escalated.permissionDecisions![0]!.receipt, undefined);
+    assert.equal(existsSync(join(f.receipts, `${reviewing.id}.target-key`)), false, "no input key reaches the provider prompt");
+
+    const after = await f.host.fetchApi(`/sessions/${target.sessionId}`);
+    assert.equal(after.body.attention.state, "needs-you");
+    assert.equal(after.body.attention.prompt.id, prompt.id);
+    assert.equal(after.body.attention.prompt.hash, prompt.hash);
+  } finally { await f.close(); }
+});
+
+test("a changed delivery workspace head during permission review cannot authorize publication", { timeout: 180000 }, async () => {
+  const f = await fixture("delivery-permission", permissionLineup, {}, { deliveryMode: "pr" });
+  try {
+    const configured = await f.host.fetchApi("/projects/rehearsal/team", "owner");
+    const optedIn = await f.host.fetchApi("/projects/rehearsal/team", "owner", {
+      requestId: randomUUID(), revision: configured.body.revision,
+      team: { ...configured.body.team, permissions: {
+        mode: "coordinator", scope: "Review the exact owner-authorized delivery action for this run.", maxDecisions: 2,
+      } },
+    }, {}, "PUT");
+    assert.equal(optedIn.status, 200, JSON.stringify(optedIn.body));
+
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const targetReady = await waitFor(() => f.get(created.body.id), run => run.status === "blocked" ||
+      run.permissionDecisions?.[0]?.status === "reviewing" && existsSync(join(f.receipts, `${run.id}.delivery-target-ready`)), 60000);
+    assert.notEqual(targetReady.status, "blocked", JSON.stringify(targetReady));
+    const target = targetReady.members.find(member => member.role === "delivery")!;
+    const targetState = (await f.host.fetchApi(`/sessions/${target.sessionId}`)).body;
+    assert.equal(targetReady.permissionDecisions?.[0]?.status, "reviewing", JSON.stringify({ decisions: targetReady.permissionDecisions,
+      attention: targetState.attention, screen: targetState.screen }));
+    const reviewing = await waitFor(() => f.get(created.body.id), run =>
+      run.permissionDecisions?.[0]?.status === "reviewing" && existsSync(join(f.receipts, `${run.id}.judge-ready`)), 30000);
+    const decision = reviewing.permissionDecisions![0]!;
+    const coordinator = reviewing.members.find(member => member.memberId === decision.coordinatorMemberId)!;
+    const delivery = reviewing.members.find(member => member.memberId === decision.targetMemberId)!;
+    assert.equal(delivery.role, "delivery");
+    const targetBefore = await f.host.fetchApi(`/sessions/${delivery.sessionId}`);
+    const prompt = targetBefore.body.attention.prompt;
+    assert.equal(targetBefore.body.attention.state, "needs-you");
+    const expectedPush = [`git push https://github.com/example/app.git \\`, `${reviewing.headCommit}:refs/heads/\\`, reviewing.branch].join("\n");
+    assert.equal(prompt?.tool?.input?.command, expectedPush,
+      "the delivery request names the pinned repository URL, literal reviewed commit, and exact branch ref");
+    const feedback = JSON.parse(readFileSync(join(f.receipts, `${reviewing.id}.permission-feedback.json`), "utf8"));
+    assert.equal(feedback.deliveryAuthority.branch, reviewing.branch);
+    assert.equal(feedback.deliveryAuthority.headCommit, reviewing.headCommit);
+    assert.deepEqual(feedback.deliveryAuthority.policy, reviewing.delivery);
+
+    const changedHead = git(delivery.cwd, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid",
+      "commit", "--allow-empty", "-m", "Change delivery head during review");
+    assert.notEqual(changedHead, reviewing.headCommit);
+    writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
+    const escalated = await waitFor(() => f.get(reviewing.id), run => run.permissionDecisions?.[0]?.status === "escalated", 30000);
+    assert.match(escalated.permissionDecisions![0]!.reason ?? "", /head|workspace|reviewed/i);
+    assert.equal(escalated.permissionDecisions![0]!.receipt, undefined);
+    assert.equal(existsSync(join(f.receipts, `${reviewing.id}.delivery-target-key`)), false,
+      "the host does not send a key after the delivery head changed");
+    assert.equal(existsSync(join(f.receipts, "delivery-receipt.json")), false, "no delivery receipt is recorded");
+
+    const targetAfter = await f.host.fetchApi(`/sessions/${delivery.sessionId}`);
+    assert.equal(targetAfter.body.attention.state, "needs-you");
+    assert.equal(targetAfter.body.attention.prompt.id, prompt.id);
+    assert.equal(targetAfter.body.attention.prompt.hash, prompt.hash);
+    assert.equal(coordinator.role, "permission-coordinator");
   } finally { await f.close(); }
 });
 
@@ -336,6 +450,114 @@ test("a changed target prompt makes a pending approval ineligible", { timeout: 9
     writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
     const escalated = await waitFor(() => f.get(reviewing.id), run => run.permissionDecisions?.[0]?.status === "escalated", 30000);
     assert.equal(escalated.permissionDecisions[0].receipt, undefined);
+  } finally { await f.close(); }
+});
+
+test("an owner answer supersedes a late permission report when the obsolete reviewer cannot stop", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex", permissionLineup);
+  let reviewerControl: Awaited<ReturnType<typeof claimControl>> | undefined;
+  let reviewerSessionId: string | undefined;
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const reviewing = await waitFor(() => f.get(created.body.id), run =>
+      run.permissionDecisions?.[0]?.status === "reviewing" && existsSync(join(f.receipts, `${run.id}.judge-ready`)), 60000);
+    const decision = reviewing.permissionDecisions![0]!;
+    const coordinator = reviewing.members.find(member => member.memberId === decision.coordinatorMemberId)!;
+    reviewerSessionId = coordinator.sessionId;
+    const target = reviewing.members.find(member => member.memberId === decision.targetMemberId)!;
+    const targetSession = await waitFor(() => f.host.fetchApi(`/sessions/${target.sessionId}`),
+      result => result.body?.attention?.state === "needs-you" && result.body?.attention?.prompt?.kind === "permission", 15000);
+
+    // Keep the report-only reviewer from stopping immediately after its target becomes obsolete.
+    reviewerControl = await claimControl(f.host, coordinator.sessionId, "controller");
+    const ownerAnswer = await f.host.fetchApi(`/sessions/${target.sessionId}/answer`, "owner", {
+      requestId: randomUUID(), promptId: targetSession.body.attention.prompt.id, option: 0,
+    });
+    assert.equal(ownerAnswer.status, 200, JSON.stringify(ownerAnswer.body));
+    await waitFor(() => f.host.fetchApi(`/sessions/${target.sessionId}`), result => !result.body?.attention?.prompt, 15000);
+
+    // If the stale report reaches the ordinary result validator, this violates the reviewer's
+    // read-only workspace check. It must be ignored because the owner's answer already won.
+    writeFileSync(join(coordinator.cwd, "late-review-write.txt"), "outside the reviewer assignment\n");
+    writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
+    const lateReport = await waitFor(() => f.get(reviewing.id), run =>
+      run.members.some(member => member.memberId === coordinator.memberId && member.report?.kind === "permission-decision") &&
+      run.members.some(member => member.memberId === coordinator.memberId && member.status === "unavailable"), 30000);
+    assert.equal(lateReport.permissionDecisions?.[0]?.status, "escalated");
+    assert.equal(lateReport.permissionDecisions?.[0]?.receipt, undefined);
+    assert.notEqual(lateReport.status, "blocked", JSON.stringify(lateReport));
+
+    await f.host.fetchApi(`/sessions/${coordinator.sessionId}/control`, "controller",
+      { action: "release", leaseId: reviewerControl.lease.id }, reviewerControl.headers);
+    reviewerControl = undefined;
+    const finished = await f.settled(reviewing.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.permissionDecisions?.[0]?.status, "escalated");
+    assert.equal(finished.permissionDecisions?.[0]?.receipt, undefined, "a late reviewer report cannot deliver a second answer");
+    assert.deepEqual(finished.tasks.map(task => task.status), ["integrated", "integrated"]);
+  } finally {
+    if (reviewerControl && reviewerSessionId) await f.host.fetchApi(`/sessions/${reviewerSessionId}/control`, "controller",
+      { action: "release", leaseId: reviewerControl.lease.id }, reviewerControl.headers);
+    await f.close();
+  }
+});
+
+test("an unavailable reviewer with a terminal decision does not fence a later permission review", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex", permissionLineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const reviewing = await waitFor(() => f.get(created.body.id), run =>
+      run.permissionDecisions?.[0]?.status === "reviewing" && existsSync(join(f.receipts, `${run.id}.judge-ready`)), 60000);
+    const target = reviewing.members.find(member => member.memberId === reviewing.permissionDecisions![0]!.targetMemberId)!;
+    const targetPrompt = await waitFor(() => f.host.fetchApi(`/sessions/${target.sessionId}`), result =>
+      result.body?.attention?.state === "needs-you" && result.body?.attention?.prompt?.kind === "permission", 15000);
+
+    // Model a new prompt after the first review became terminal, while retaining the old
+    // report-only member as unavailable. The current prompt identity remains independently
+    // validated by maybeStartPermissionReview before its new coordinator can answer it.
+    const service = await f.openTeamService({ start: false });
+    const internal = service as unknown as {
+      records: Map<string, { run: typeof reviewing }>;
+      save(stored: unknown): void;
+      maybeStartPermissionReview(stored: unknown, member: unknown): Promise<boolean>;
+      get(id: string): typeof reviewing;
+    };
+    const stored = internal.records.get(reviewing.id)!;
+    const oldDecision = stored.run.permissionDecisions![0]!;
+    const oldCoordinator = stored.run.members.find(member => member.memberId === oldDecision.coordinatorMemberId)!;
+    oldDecision.status = "escalated";
+    oldDecision.promptId = targetPrompt.body.attention.prompt.id - 1;
+    oldCoordinator.status = "unavailable";
+    internal.save(stored);
+
+    assert.equal(await internal.maybeStartPermissionReview(stored, target), true,
+      "a terminal reviewer cannot fence review of a later permission prompt");
+    const restarted = await waitFor(() => Promise.resolve(internal.get(reviewing.id)), run =>
+      run.permissionDecisions?.length === 2 && run.permissionDecisions[1]?.status === "reviewing", 30000);
+    assert.equal(restarted.members.find(member => member.memberId === oldCoordinator.memberId)?.status, "unavailable",
+      "the stale reviewer remains visible until its exit is confirmed");
+    assert.equal(restarted.permissionDecisions![0]!.status, "escalated");
+    assert.equal(restarted.permissionDecisions![1]!.targetSessionId, target.sessionId);
+    assert.equal(restarted.permissionDecisions![1]!.promptId, targetPrompt.body.attention.prompt.id);
+
+    const successor = stored.run.members.find(member => member.memberId === restarted.permissionDecisions![1]!.coordinatorMemberId)!;
+    const successorDecision = stored.run.permissionDecisions![1]!;
+    successor.status = "unavailable";
+    for (const status of ["pending", "reviewing", "approved", "answering", "uncertain"] as const) {
+      successorDecision.status = status;
+      successorDecision.promptId = targetPrompt.body.attention.prompt.id - status.length - 1;
+      internal.save(stored);
+      assert.equal(await internal.maybeStartPermissionReview(stored, target), false,
+        `${status} reviewer decisions must continue to fence another review`);
+    }
+    successorDecision.status = "escalated";
+    successorDecision.promptId = targetPrompt.body.attention.prompt.id - 99;
+    successorDecision.coordinatorMemberId = "missing-review-assignment";
+    internal.save(stored);
+    assert.equal(await internal.maybeStartPermissionReview(stored, target), false,
+      "an active reviewer without a matching decision remains fenced as unknown work");
   } finally { await f.close(); }
 });
 

@@ -7,7 +7,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
-import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
+import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamDeliveryReconcileSchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
 import { describeSource } from "./client.js";
 import type { ProjectSourceStatus } from "./project-source.js";
 import { captureWorkspace } from "./workspace-checkpoint.js";
@@ -993,6 +993,29 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     outputTeam(await postMutation(api, receiptsPath, key, endpoint, body), Boolean(options["--json"]));
     return true;
   }
+  if (subcommand === "reconcile-delivery") {
+    const usage = "Usage: infinite team reconcile-delivery ID TEXT... [--pending ID --head COMMIT --processes-stopped TEXT] [--request-id UUID] [--json]";
+    const text = rest.join(" ").trim();
+    const pendingId = String(options["--pending"] ?? "").trim();
+    const headCommit = String(options["--head"] ?? "").trim();
+    const attestationText = String(options["--processes-stopped"] ?? "").trim();
+    const supplied = [options["--pending"], options["--head"], options["--processes-stopped"]].filter(value => value !== undefined).length;
+    if (!id || !text || supplied !== 0 && supplied !== 3 || supplied === 3 && (!pendingId || !headCommit || !attestationText))
+      throw new Error(usage);
+    const endpoint = `/teams/${id}/reconcile-delivery`;
+    const intent = { text, ...(supplied === 3 ? { failedOperation: { pendingId, headCommit,
+      attestation: { boundary: "delivery-preparation" as const, processesStopped: true as const, text: attestationText } } } : {}) };
+    const requestId = resumePendingIntent(receiptsPath, "team-reconcile-delivery:", endpoint,
+      prior => prior.text === intent.text && JSON.stringify(prior.failedOperation) === JSON.stringify(intent.failedOperation),
+      z.uuid().parse(String(options["--request-id"] ?? randomUUID())), options["--request-id"] !== undefined, rawArgs);
+    const key = `team-reconcile-delivery:${requestId}`;
+    const saved = (readPrivateJson(receiptsPath, {}) as Record<string, any>)[key];
+    if (saved && (saved.endpoint !== endpoint || saved.body?.text !== intent.text || JSON.stringify(saved.body?.failedOperation) !== JSON.stringify(intent.failedOperation)))
+      throw new Error("This request ID is saved with a different delivery reconciliation. Retry the original request or inspect the team first.");
+    const body = saved?.body ?? teamDeliveryReconcileSchema.parse({ requestId, revision: (await api.json<any>(`/teams/${id}`)).revision, ...intent });
+    outputTeam(await postMutation(api, receiptsPath, key, endpoint, body), Boolean(options["--json"]));
+    return true;
+  }
   if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions", "reconcile-verification"].includes(subcommand ?? "")) {
     if (!id) throw new Error(`Usage: infinite team ${subcommand} ID ...`);
     const current = await api.json<any>(`/teams/${id}`);
@@ -1056,5 +1079,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|reconcile-verification|retire-member|cancel|revoke-permissions ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|reconcile-delivery|reconcile-verification|retire-member|cancel|revoke-permissions ...");
 }

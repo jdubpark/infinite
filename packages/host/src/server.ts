@@ -31,7 +31,7 @@ import { UsageService } from "./usage-service.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
-import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
+import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecard } from "./scorecard.js";
 import { GoalService } from "./goals.js";
 import { MissionService, missionBoard } from "./missions.js";
@@ -689,7 +689,7 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/teams/:id/continue", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.continueRun(standaloneTeam(req.params.id), teamContinueSchema.parse(req.body))));
   app.post("/api/teams/:id/reconcile-delivery", requireRole(["owner"]), async (req, res) =>
-    res.json(await teams.reconcileDelivery(standaloneTeam(req.params.id), teamMutationSchema.parse(req.body))));
+    res.json(await teams.reconcileDelivery(standaloneTeam(req.params.id), teamDeliveryReconcileSchema.parse(req.body))));
   app.post("/api/teams/:id/reconcile-verification", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.reconcileVerification(standaloneTeam(req.params.id), teamVerificationReconcileSchema.parse(req.body))));
   app.get("/api/teams/:id/members/:memberId/runtime", requireRole(["owner"]), async (req, res) =>

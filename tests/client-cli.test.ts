@@ -661,12 +661,13 @@ test("CLI continuation releases definitive rejections and preserves uncertain re
   }
 });
 
-for (const action of ["reconcile-verification", "retire-member"] as const) {
+for (const action of ["reconcile-verification", "reconcile-delivery", "retire-member"] as const) {
   test(`CLI recovery ${action} preserves its request after a lost acknowledgement`, { timeout: 30000 }, async () => {
     const root = mkdtempSync(join(tmpdir(), "infinite-recovery-cli-"));
     const id = randomUUID(), member = randomUUID(), sessionId = randomUUID(), pendingId = randomUUID(), requestId = randomUUID();
     const headCommit = "a".repeat(40), identity = "b".repeat(64), text = "Confirmed the isolated runtime is stopped";
-    const endpoint = action === "retire-member" ? `/api/teams/${id}/members/${member}/retire` : `/api/teams/${id}/reconcile-verification`;
+    const endpoint = action === "retire-member" ? `/api/teams/${id}/members/${member}/retire`
+      : action === "reconcile-delivery" ? `/api/teams/${id}/reconcile-delivery` : `/api/teams/${id}/reconcile-verification`;
     const received: Record<string, unknown>[] = [];
     let runtimeReads = 0;
     const server = createServer(async (req, res) => {
@@ -692,14 +693,30 @@ for (const action of ["reconcile-verification", "retire-member"] as const) {
     const clientFile = join(root, "client.json");
     writeFileSync(clientFile, JSON.stringify({ origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`, token: randomBytes(32).toString("hex") }), { mode: 0o600 });
     const args = action === "retire-member" ? [member, text, "--identity", identity]
-      : ["--pending", pendingId, "--head", headCommit, "--processes-stopped", text];
-    const run = () => exec(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"),
-      "--client-config", clientFile, "team", action, id, ...args, "--request-id", requestId, "--json"]);
+      : action === "reconcile-delivery" ? ["Check remote state before any write", "--pending", pendingId, "--head", headCommit, "--processes-stopped", text]
+        : ["--pending", pendingId, "--head", headCommit, "--processes-stopped", text];
+    const run = (commandArgs = args, identity: string | null = requestId) => exec(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"),
+      "--client-config", clientFile, "team", action, id, ...commandArgs, ...(identity ? ["--request-id", identity] : []), "--json"]);
     try {
+      if (action === "reconcile-delivery") {
+        const flags = [["--pending", pendingId], ["--head", headCommit], ["--processes-stopped", text]];
+        for (const selected of [[0], [1], [2], [0, 1], [0, 2], [1, 2]])
+          await assert.rejects(run([args[0], ...selected.flatMap(index => flags[index])]), error => /Usage: infinite team reconcile-delivery/.test(String(error)));
+        await assert.rejects(run(args.slice(1)), error => /Usage: infinite team reconcile-delivery/.test(String(error)));
+        assert.equal(received.length, 0, "partial attestations and missing instructions never post");
+      }
       await assert.rejects(run(), error => /503/.test(String(error)));
       assert.deepEqual(received[0], action === "retire-member" ? { requestId, revision: 1, sessionId, identity, text }
-        : { requestId, revision: 1, pendingId, headCommit, attestation: { boundary: "check-only", processesStopped: true, text } });
-      assert.equal(JSON.parse((await run()).stdout).id, id);
+        : action === "reconcile-delivery" ? { requestId, revision: 1, text: "Check remote state before any write", failedOperation: { pendingId, headCommit, attestation: { boundary: "delivery-preparation", processesStopped: true, text } } }
+          : { requestId, revision: 1, pendingId, headCommit, attestation: { boundary: "check-only", processesStopped: true, text } });
+      if (action === "reconcile-delivery") {
+        for (const changed of [["Different instruction", ...args.slice(1)], args.map(value => value === headCommit ? "c".repeat(40) : value),
+          args.map(value => value === text ? "Different operator attestation" : value)])
+          await assert.rejects(run(changed), error => /different delivery reconciliation/.test(String(error)));
+        await assert.rejects(run(args, randomUUID()), error => /uncertain result/.test(String(error)));
+        assert.equal(received.length, 1, "a changed intent or new explicit identity cannot resend the uncertain request");
+      }
+      assert.equal(JSON.parse((await run(args, action === "reconcile-delivery" ? null : requestId)).stdout).id, id);
       assert.deepEqual(received[1], received[0], "retry keeps the original preconditions after the host advances");
       assert.equal(JSON.parse((await run()).stdout).id, id);
       assert.equal(received.length, 2, "a confirmed CLI receipt does not post another recovery");

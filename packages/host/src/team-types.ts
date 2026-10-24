@@ -225,6 +225,7 @@ export const teamReportSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
   z.object({ kind: z.literal("delivery"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("delivery-repair"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("delivery-reconciliation"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), repository: githubRepository, branch: gitBranch, baseHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i).optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("pull-request"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), summary: z.string().trim().min(1).max(4000) }).strict(),
   z.object({ kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]) }).strict(),
   z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000) }).strict(),
@@ -290,6 +291,7 @@ export interface TeamContinuation {
   requestId: string;
   at: string;
   reason: string;
+  baseCommit?: string;
   headCommit: string;
   tasks: TeamTask[];
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
@@ -344,8 +346,22 @@ export interface TeamRun {
   /** Bounded PM recovery of routine report/protocol failures; member reports remain the evidence source. */
   recovery?: {
     attempts: number;
-    status: "stopping" | "planning" | "exhausted";
+    status: "stopping" | "planning" | "complete" | "exhausted";
     source: { code: string; memberId: string; revision: number; reportKind?: TeamReport["kind"]; reason: string; at: string };
+  };
+  /** Bounded delivery inspection and baseline recovery; provider observations remain agent claims. */
+  deliveryRecovery?: {
+    attempts: number;
+    status: "stopping" | "planning" | "replanning" | "complete" | "exhausted";
+    revision: number;
+    headCommit: string;
+    policyHash: string;
+    sourceMemberId: string;
+    lastFailureHash?: string;
+    lastEvidenceHash?: string;
+    baseHeadCommit?: string;
+    integratedHeadCommit?: string;
+    disposition?: "no-publication" | "owned-branch" | "pull-request";
   };
   /** The base came from the host mirror while the latest fetch from GitHub failed. */
   baseStale?: { fetchedAt?: string; reason: "fetch-failed"; category: "auth" | "network" | "not-found" | "other" };

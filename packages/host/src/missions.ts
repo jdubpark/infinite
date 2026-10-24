@@ -904,7 +904,8 @@ export class MissionService {
           if (!item.teamId) return false;
           try {
             const team = this.teams.get(item.teamId);
-            return team.status === "planning" && (team.recovery?.status === "stopping" || team.recovery?.status === "planning");
+            return ["planning", "discovering", "implementing", "integrating", "verifying", "reviewing", "delivering"].includes(team.status)
+              && (team.recovery?.status === "stopping" || team.recovery?.status === "planning");
           } catch (error) { if (notFound(error)) return false; throw error; }
         })) {
           const reason = `A subteam's bounded recovery is still in progress. Reassess the mission blocker after it finishes. Your deferred report was: ${report.summary}`;

@@ -8,7 +8,7 @@ import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamContext, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
@@ -17,7 +17,7 @@ import { ProviderLimits, switchesMember, type LimitObservation } from "./provide
 import type { LinearService } from "./linear.js";
 import type { Readings } from "./readings.js";
 import type { ProjectSourceService } from "./project-source.js";
-import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { oneShotPermissionOption, permissionEvidenceHash, refusedBeforeSend } from "./team-permissions.js";
 import { collectPermissionEvidence } from "./team-permission-evidence.js";
@@ -28,9 +28,18 @@ type Action = { requestId: string; revision: number };
 type LimitSwitch = LimitObservation & { at: string; seq: number };
 type StartInProject = <T>(projectId: string, start: () => Promise<T>) => Promise<T>;
 type MissionReservationLookup = (projectId: string, exceptMissionId?: string) => string | undefined;
+type DeliveryReconciliationReport = Extract<TeamReport, { kind: "delivery-reconciliation" }>;
+function deliveryInspectionHash(report: DeliveryReconciliationReport) {
+  return digest({ headCommit: report.headCommit, repository: report.repository, branch: report.branch,
+    baseHeadCommit: report.baseHeadCommit, disposition: report.disposition, remoteHeadCommit: report.remoteHeadCommit });
+}
+type PendingOperation = { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number;
+  source?: { memberId: string; role: TeamMember["role"]; cwd: string; baseCommit: string; headCommit: string; workspace: "member" | "integration" };
+  failure?: { code?: string; reason: string; at: string };
+};
 type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
-  pending?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number };
+  pending?: PendingOperation;
   verificationRecovery?: { pendingId: string; pendingKind: "check"; revision: number; headCommit: string; failure: "setup-changed-files" | "verification-changed-files" | "legacy-completed-check" };
   halt?: "pause" | "cancel" | "steer" | "block";
   deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
@@ -86,15 +95,17 @@ const invalidNoChangeReason = "A no-change report is valid only before implement
 const wrongAgentReportReason = "An agent's report does not match its assigned role.";
 const automaticRecoveryCodes = new Set(["agent-blocked", "agent-question", "missing-agent-report", "invalid-no-change", "wrong-agent-report"]);
 const automaticRecoveryLimit = 2;
+const automaticOperationRecoveryCodes = new Set(["workspace-operation-failed", "read-only-role-changed-files", "task-scope-violation", "integration-conflict", "integration-changed-files"]);
 function roleAcceptsReport(role: TeamMember["role"], kind: NonNullable<TeamMember["report"]>["kind"]) {
   const expected: Record<TeamMember["role"], string[]> = {
     "permission-coordinator": ["permission-decision"], "project-manager": ["plan", "explore", "no-change"], scout: ["findings"],
-    implementer: ["result", "escalate"], integrator: ["result"], reviewer: ["review"], delivery: ["delivery", "delivery-repair", "pull-request"],
+    implementer: ["result", "escalate"], integrator: ["result"], reviewer: ["review"], delivery: ["delivery", "delivery-repair", "delivery-reconciliation", "pull-request"],
   };
   return kind === "question" || kind === "blocked" || expected[role].includes(kind);
 }
 const recoverableContinueCodes = new Set(["repair-limit", "team-prompt-too-large", "repeated-check-failure", "agent-blocked", "missing-agent-report"]);
 const interruptedOperationReason = "The host restarted during a workspace or verification operation. Inspect the isolated workspace before starting a new team; the operation will not be replayed.";
+const genericOperationFailureReason = "A team operation failed. Its workspaces and recorded evidence were preserved for inspection.";
 const verificationRecoveryReason = "A read-only verification command changed its workspace. Inspect the check evidence before resuming from the recorded integration commit.";
 const commitId = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
 function completedChecks(stored: Stored, revision: number) {
@@ -110,6 +121,49 @@ function validVerificationRecovery(stored: Stored) {
     head && commitId.test(head) && verificationRecovery.headCommit === head && stored.checkHead !== head &&
     !stored.deliveryAttempt && !run.deliveryReceipt && !run.stopReason && completedChecks(stored, run.revision) &&
     (verificationRecovery.failure === "legacy-completed-check" || verificationRecovery.failure === "setup-changed-files" || verificationRecovery.failure === "verification-changed-files"));
+}
+function terminalPermissionCoordinator(run: TeamRun, member: TeamMember) {
+  if (member.role !== "permission-coordinator") return false;
+  const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId && item.revision === member.revision);
+  return Boolean(decision && (["stale", "escalated"].includes(decision.status) ||
+    decision.status === "answered" && decision.receipt?.state === "delivered" && decision.receipt.result === "closed"));
+}
+function obsoletePermissionResult(stored: Stored, pending: PendingOperation) {
+  const { run } = stored;
+  if (run.status === "paused" || run.status === "cancelled" || stored.halt === "pause" || stored.halt === "cancel" || pending.kind !== "result" || pending.revision !== run.revision) return undefined;
+  const reported = run.members.filter(member => member.revision === pending.revision && member.report && roleAcceptsReport(member.role, member.report.kind));
+  const candidates = reported.filter(member => {
+    const report = member.report;
+    return member.role === "permission-coordinator" &&
+      (!pending.source || pending.source.memberId === member.memberId) && report?.kind === "permission-decision" &&
+      Boolean(run.permissionDecisions?.some(decision => decision.coordinatorMemberId === member.memberId && decision.id === report.decisionId &&
+        decision.revision === member.revision && terminalPermissionCoordinator(run, member)));
+  });
+  return candidates.length === 1 && (pending.source || reported.length === 1) ? candidates[0] : undefined;
+}
+function recoverableOperationFailure(stored: Stored, pending: PendingOperation) {
+  const { run } = stored, source = pending.source, failure = pending.failure;
+  if (!source || !failure || !failure.code || !automaticOperationRecoveryCodes.has(failure.code) || pending.kind !== "result" || pending.revision !== run.revision ||
+      source.role === "delivery" || source.role === "permission-coordinator" || source.headCommit !== run.headCommit ||
+      stored.deliveryAttempt || run.deliveryReceipt || run.pullRequest || run.stopReason || run.permissionsRevokedAt ||
+      run.linearTracking && run.linear?.status !== "synced" || ["paused", "cancelled"].includes(run.status) || stored.halt === "pause" || stored.halt === "cancel" ||
+      (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status))) return undefined;
+  const member = run.members.find(item => item.memberId === source.memberId && item.revision === pending.revision && item.role === source.role &&
+    item.cwd === source.cwd && item.baseCommit === source.baseCommit && item.report);
+  return member;
+}
+function recoverableUnattributedResult(stored: Stored, pending: PendingOperation) {
+  const { run } = stored;
+  const failureCode = pending.failure?.code ?? run.blockCode ?? (run.reason === genericOperationFailureReason ? "unattributed-result" : undefined);
+  const settledLegacy = !pending.failure && run.status === "blocked" && (run.reason === genericOperationFailureReason ||
+    Boolean(failureCode && automaticOperationRecoveryCodes.has(failureCode)));
+  if (pending.kind !== "result" || pending.source || !failureCode ||
+      !automaticOperationRecoveryCodes.has(failureCode) && failureCode !== "unattributed-result" || !pending.failure && !settledLegacy ||
+      pending.revision !== run.revision || stored.deliveryAttempt || run.deliveryReceipt || run.pullRequest ||
+      run.stopReason || run.permissionsRevokedAt || run.linearTracking && run.linear?.status !== "synced" ||
+      ["paused", "cancelled"].includes(run.status) || ["pause", "cancel", "steer"].includes(stored.halt ?? "") ||
+      (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status))) return false;
+  return true;
 }
 
 export function applyTeamBriefTitle(run: TeamRun, brief: TeamBrief | undefined, revision = run.revision) {
@@ -205,9 +259,44 @@ export class TeamService {
         const legacyCompletedCheck = run.status === "blocked" && legacyGuardFailure && pending.kind === "check" &&
           pending.revision === run.revision && Boolean(run.headCommit && commitId.test(run.headCommit)) && stored.checkHead !== run.headCommit &&
           !stored.deliveryAttempt && !run.deliveryReceipt && !run.stopReason && completedChecks(stored, run.revision);
-        if (stored.run.status === "cancelled") {
+        if (stored.run.status === "paused") {
+          stored.halt = "pause";
+          this.event(stored, "The host restarted with an unresolved operation from a paused team. The pause remains in effect and the intent will not be replayed.");
+        } else if (stored.run.status === "cancelled") {
           stored.halt = "cancel";
           this.event(stored, "The host restarted with an unresolved operation from a cancelled team. The intent remains retained and will not be replayed.");
+        } else if (obsoletePermissionResult(stored, pending)) {
+          stored.pending = undefined;
+          stored.halt = undefined;
+          run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
+          this.event(stored, "A retained permission-review result was dispositioned because its one-shot decision is already terminal. Its report and unavailable session record remain in history; no permission answer or report was replayed.");
+          this.save(stored);
+        } else if (recoverableOperationFailure(stored, pending) || recoverableUnattributedResult(stored, pending)) {
+          const sourceMember = recoverableOperationFailure(stored, pending);
+          if (!pending.failure) pending.failure = {
+            code: run.blockCode && automaticOperationRecoveryCodes.has(run.blockCode) ? run.blockCode : "unattributed-result",
+            reason: run.reason ?? "The host restarted with a result intent that has no member provenance. All original reports and workspaces are retained for coordinator diagnosis.",
+            at: timestamp(),
+          };
+          pending.failure.code ??= run.blockCode && automaticOperationRecoveryCodes.has(run.blockCode) ? run.blockCode : "unattributed-result";
+          const source = { code: pending.failure.code, memberId: sourceMember?.memberId ?? "unattributed", revision: pending.revision,
+            ...(sourceMember?.report ? { reportKind: sourceMember.report.kind } : {}),
+            reason: pending.failure.reason, at: pending.failure.at };
+          const attempts = run.recovery?.attempts ?? 0;
+          const reserved = run.recovery?.status === "stopping" && run.recovery.source.revision === pending.revision &&
+            run.recovery.source.memberId === source.memberId && run.recovery.source.code === source.code;
+          if (reserved) {
+            run.status = "planning"; stored.halt = "block"; run.reason = run.recovery!.source.reason; run.blockCode = run.recovery!.source.code;
+            this.event(stored, "The persisted automatic recovery reservation was restored without consuming another attempt.");
+          } else if (attempts < automaticRecoveryLimit) {
+            run.recovery = { attempts: attempts + 1, status: "stopping", source };
+            run.status = "planning"; stored.halt = "block"; run.reason = source.reason; run.blockCode = source.code;
+            this.event(stored, "The project manager will diagnose the retained result intent after write-capable members are confirmed stopped.");
+          } else {
+            run.recovery = { attempts, status: "exhausted", source };
+            run.status = "blocked"; stored.halt = "block"; run.reason = interruptedOperationReason; run.blockCode = source.code;
+          }
+          this.save(stored);
         } else if (recoverableMarker || legacyCompletedCheck) {
           if (!recoverableMarker) stored.verificationRecovery = {
             pendingId: pending.id, pendingKind: "check", revision: pending.revision, headCommit: run.headCommit!, failure: "legacy-completed-check",
@@ -237,6 +326,7 @@ export class TeamService {
         this.save(stored);
       }
       this.recoverLegacyBlocked(stored);
+      this.admitBlockedDeliveryRecovery(stored);
     }
   }
   /** The usage ledger this service prices member usage from; its tick also drives the ledger's reads. */
@@ -654,8 +744,11 @@ export class TeamService {
 
       const attempt = stored.deliveryAttempt;
       const previous = attempt && run.members.find(member => member.memberId === attempt.memberId);
+      const reconciliation = previous?.report?.kind === "delivery-reconciliation" ? previous.report : undefined;
+      const retainedFailure = previous?.report?.kind === "blocked" || Boolean(reconciliation && reconciliation.disposition !== "pull-request" &&
+        reconciliation.repository === run.delivery?.repository && reconciliation.branch === run.branch && reconciliation.headCommit === run.headCommit);
       if (!attempt || !previous || previous.role !== "delivery" || previous.revision !== run.revision || previous.status !== "stopped" ||
-          previous.report?.kind !== "blocked" || attempt.revision !== run.revision || !run.headCommit ||
+          !retainedFailure || attempt.revision !== run.revision || !run.headCommit ||
           attempt.headCommit !== run.headCommit || previous.baseCommit !== run.headCommit || !run.branch)
         throw new TeamError(409, "delivery-reconciliation-unavailable", "The recorded delivery attempt does not identify a stopped, blocked delivery report for the current reviewed head.");
       if (run.deliveryReceipt || run.pullRequest)
@@ -690,6 +783,10 @@ export class TeamService {
       ].join("\n\n");
       this.prepareMember(stored, "delivery", undefined, feedback, member => {
         stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: head };
+        run.deliveryRecovery = { attempts: run.deliveryRecovery?.attempts ?? 0, status: "planning", revision: run.revision, headCommit: head,
+          policyHash: digest(run.delivery!), sourceMemberId: member.memberId };
+        run.recovery = { attempts: run.recovery?.attempts ?? 0, status: "planning", source: { code: "delivery-recovery", memberId: previous.memberId,
+          revision: previous.revision, reportKind: previous.report!.kind, reason: body.text, at: timestamp() } };
         run.reason = undefined; run.blockCode = undefined;
         this.event(stored, `Owner authorized a fresh delivery reconciliation at ${head} on ${run.branch}; prior attempt ${previous.memberId} and its blocked report remain in team history.`);
       });
@@ -994,9 +1091,12 @@ export class TeamService {
     }
   }
   /** Persist an intent before external work. A restart keeps the unresolved intent blocked. */
-  private operation<T>(stored: Stored, kind: NonNullable<Stored["pending"]>["kind"], perform: (signal: AbortSignal) => Promise<T>, complete: (value: T) => void) {
+  private operation<T>(stored: Stored, kind: NonNullable<Stored["pending"]>["kind"], perform: (signal: AbortSignal) => Promise<T>, complete: (value: T) => void,
+    sourceMember?: TeamMember, sourceWorkspace: "member" | "integration" = "member") {
     if (stored.pending) throw new TeamError(409, "team-operation-running", "A team workspace operation is already running.");
-    const pending = { id: randomUUID(), kind, revision: stored.run.revision };
+    const pending: PendingOperation = { id: randomUUID(), kind, revision: stored.run.revision,
+      ...(sourceMember ? { source: { memberId: sourceMember.memberId, role: sourceMember.role, cwd: sourceMember.cwd, baseCommit: sourceMember.baseCommit,
+        headCommit: stored.run.headCommit ?? sourceMember.baseCommit, workspace: sourceWorkspace } } : {}) };
     const controller = new AbortController(); this.commands.set(stored.run.id, controller);
     stored.pending = pending; this.save(stored);
     void perform(controller.signal).then(value => this.enqueue(() => {
@@ -1013,12 +1113,77 @@ export class TeamService {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.delete(stored.run.id);
       // Failed side effects retain their intent; a pause must not make them replayable.
+      pending.failure = { code: error instanceof TeamError ? error.code : "workspace-operation-failed",
+        reason: error instanceof Error ? error.message : "A team workspace operation failed.", at: timestamp() };
+      this.save(stored);
       this.block(stored, error);
     })).catch(() => {});
+  }
+  private queueAutomaticDeliveryRecovery(stored: Stored, member: TeamMember, reason: string) {
+    const { run } = stored, attempt = stored.deliveryAttempt, policyHash = run.delivery ? digest(run.delivery) : undefined;
+    if (!attempt || !policyHash || member.role !== "delivery" || member.status !== "stopped" || member.report?.kind !== "blocked" || attempt.memberId !== member.memberId ||
+        attempt.revision !== run.revision || attempt.headCommit !== run.headCommit || member.baseCommit !== run.headCommit ||
+        run.deliveryReceipt || run.pullRequest || run.stopReason || run.permissionsRevokedAt || !run.delivery ||
+        !run.lineup?.coordinator || run.lineup.coordinator.tier !== "strong" || !run.headCommit ||
+        run.recovery?.status === "exhausted" || run.recovery?.status === "stopping" ||
+        ["complete", "exhausted"].includes(run.deliveryRecovery?.status ?? "") ||
+        !["blocked", "delivering", "planning"].includes(run.status) || ["paused", "cancelled"].includes(run.status) ||
+        stored.halt === "pause" || stored.halt === "cancel" || stored.halt === "steer" ||
+        (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status)) ||
+        run.linearTracking && run.linear?.status !== "synced") return false;
+    try { this.assertDelivery(stored); } catch { return false; }
+    const prior = run.deliveryRecovery;
+    const failureHash = digest({ headCommit: run.headCommit, policyHash, reason });
+    const attempts = Math.max(prior?.attempts ?? 0, run.recovery?.attempts ?? 0);
+    if (attempts >= automaticRecoveryLimit || prior?.lastFailureHash === failureHash) {
+      run.deliveryRecovery = { ...prior, attempts, status: "exhausted", revision: run.revision, headCommit: run.headCommit, policyHash,
+        sourceMemberId: member.memberId, lastFailureHash: failureHash };
+      run.recovery = { attempts, status: "exhausted", source: { code: "delivery-recovery", memberId: member.memberId, revision: member.revision,
+        reportKind: member.report.kind, reason, at: timestamp() } };
+      return false;
+    }
+    run.deliveryRecovery = { attempts: attempts + 1, status: "stopping", revision: run.revision, headCommit: run.headCommit, policyHash,
+      sourceMemberId: member.memberId, lastFailureHash: failureHash };
+    run.recovery = { attempts: attempts + 1, status: "stopping", source: { code: "delivery-recovery", memberId: member.memberId, revision: member.revision,
+      reportKind: member.report.kind, reason, at: timestamp() } };
+    run.status = "planning"; stored.halt = "block"; run.blockCode = "delivery-recovery"; run.reason = reason;
+    this.commands.get(run.id)?.abort();
+    this.event(stored, `The strong coordinator will inspect the exact remote branch and pull request before another delivery attempt (${attempts + 1} of ${automaticRecoveryLimit}).`);
+    this.save(stored);
+    return true;
+  }
+  private admitBlockedDeliveryRecovery(stored: Stored) {
+    const { run } = stored, attempt = stored.deliveryAttempt;
+    if (run.status !== "blocked" || stored.pending || this.commands.has(run.id) || !attempt ||
+        run.recovery?.status === "exhausted" || run.deliveryRecovery?.status === "exhausted") return;
+    const member = run.members.find(item => item.memberId === attempt.memberId && item.revision === attempt.revision);
+    if (member?.status === "stopped" && member.report?.kind === "blocked")
+      this.queueAutomaticDeliveryRecovery(stored, member, member.report.summary);
   }
   private block(stored: Stored, error: unknown, sourceMember?: TeamMember) {
     const pending = stored.pending, run = stored.run;
     const code = error instanceof TeamError ? error.code : undefined;
+    if (!pending && sourceMember?.role === "delivery" && sourceMember.report?.kind === "blocked" &&
+        this.queueAutomaticDeliveryRecovery(stored, sourceMember, sourceMember.report.summary)) return;
+    const operationSource = pending && recoverableOperationFailure(stored, pending);
+    const unattributedOperation = pending && recoverableUnattributedResult(stored, pending);
+    if ((operationSource || unattributedOperation) && !stored.deliveryAttempt && !run.deliveryReceipt && !run.pullRequest && !run.stopReason &&
+        !run.permissionsRevokedAt && (!run.linearTracking || run.linear?.status === "synced") && !["paused", "cancelled"].includes(run.status) &&
+        !["pause", "cancel", "steer"].includes(stored.halt ?? "")) {
+      const attempts = run.recovery?.attempts ?? 0;
+      const source = { code: pending!.failure?.code ?? "unattributed-result", memberId: operationSource?.memberId ?? "unattributed", revision: pending!.revision,
+        ...(operationSource?.report ? { reportKind: operationSource.report.kind } : {}),
+        reason: pending!.failure?.reason ?? (error instanceof Error ? error.message : "A retained result intent needs coordinator diagnosis."), at: pending!.failure?.at ?? timestamp() };
+      if (attempts < automaticRecoveryLimit) {
+        run.recovery = { attempts: attempts + 1, status: "stopping", source };
+        this.commands.get(run.id)?.abort();
+        void this.invalidatePermissionDecisions(stored, "The team is stopping members before an automatic PM recovery.");
+        run.status = "planning"; stored.halt = "block"; run.blockCode = source.code; run.reason = source.reason;
+        this.event(stored, "The project manager will diagnose the retained result after write-capable members stop; no result intent will be replayed.");
+        this.save(stored); return;
+      }
+      run.recovery = { attempts, status: "exhausted", source };
+    }
     const permissionUncertain = (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "escalated", "uncertain"].includes(decision.status));
     const recoverable = Boolean(code && automaticRecoveryCodes.has(code) && sourceMember && sourceMember.revision === run.revision &&
       sourceMember.role !== "delivery" && sourceMember.role !== "permission-coordinator" && !pending && !stored.deliveryAttempt &&
@@ -1049,20 +1214,70 @@ export class TeamService {
     this.commands.get(stored.run.id)?.abort();
     void this.invalidatePermissionDecisions(stored, "The team became blocked before the permission request could be answered.");
     if (!["paused", "cancelled"].includes(stored.run.status)) { stored.run.status = "blocked"; stored.halt = "block"; }
+    if (run.deliveryRecovery && run.deliveryRecovery.status !== "complete") {
+      run.deliveryRecovery.status = "exhausted";
+      if (run.recovery) run.recovery.status = "exhausted";
+    }
     stored.run.blockCode = code;
     stored.run.reason = stored.run.stopReason === "deadline" ? "The goal reached its deadline. Active work is being stopped and retained for inspection."
       : stored.run.stopReason === "member-limit" ? "The goal reached this run's agent attempt limit. Active work is being stopped and retained for inspection."
-        : error instanceof TeamError ? error.message : "A team operation failed. Its workspaces and recorded evidence were preserved for inspection.";
+        : error instanceof TeamError ? error.message : genericOperationFailureReason;
     this.event(stored, stored.run.reason); this.save(stored); this.trackBlocked(stored);
+  }
+  private async startAutomaticDeliveryRecovery(stored: Stored, trackingReady: boolean) {
+    const { run } = stored, recovery = run.recovery, delivery = run.deliveryRecovery;
+    const attempt = stored.deliveryAttempt;
+    const previous = attempt && run.members.find(member => member.memberId === attempt.memberId);
+    if (!recovery || !delivery || !attempt || !previous || previous.role !== "delivery" || previous.report?.kind !== "blocked" ||
+        delivery.status !== "stopping" || delivery.revision !== run.revision || delivery.headCommit !== run.headCommit ||
+        delivery.policyHash !== digest(run.delivery ?? null) || attempt.revision !== run.revision || attempt.headCommit !== run.headCommit ||
+        attempt.memberId !== previous.memberId || !trackingReady || stored.pending || this.commands.has(run.id) || run.deliveryReceipt || run.pullRequest ||
+        run.stopReason || run.permissionsRevokedAt || run.linearTracking && run.linear?.status !== "synced" ||
+        run.members.some(member => member.revision === recovery.source.revision && activeMember(member) && !terminalPermissionCoordinator(run, member)) ||
+        (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status))) {
+      this.block(stored, new TeamError(409, "delivery-reconciliation-required", "Automatic delivery recovery could not establish the same reviewed head, policy, stopped members, and permissions. Inspect retained delivery evidence."));
+      return true;
+    }
+    try {
+      this.assertBudget(run, true);
+      this.assertDelivery(stored);
+      this.assertRunPath(stored, run.workspace);
+      const head = run.headCommit;
+      if (!head || await teamHead(run.workspace, this.config.teams?.commandPrefix) !== head)
+        throw new TeamError(409, "delivery-recovery-head-changed", "The integration HEAD changed before delivery inspection.");
+      await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, undefined, "integration");
+      const feedback = [
+        `Automatic delivery reconciliation ${delivery.attempts} of ${automaticRecoveryLimit} under the unchanged owner policy.`,
+        `Prior delivery attempt ${previous.memberId} reported blocked at revision ${previous.revision}, head ${head}. Its full report remains in team history: ${JSON.stringify(previous.report)}`,
+        `Before any write or publication, inspect the exact remote repository ${run.delivery!.repository}, branch ${run.branch}, base ${run.delivery!.baseBranch}, and any pull request for this head. Reuse existing matching work and never create a duplicate PR.`,
+        `If no publication exists, report the structured delivery-reconciliation disposition with exact repository, branch, reviewed head, and current base head. A moved base with no publication may return to implementation for a fresh review. An owned branch or open PR must keep its exact remote head; do not rewrite or force-push it.`,
+        `If the same capability is still missing, report blocked. Do not switch tools, credentials, or routes, or request broader permissions.`,
+      ].join("\n\n");
+      this.prepareMember(stored, "delivery", undefined, feedback, member => {
+        stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: head };
+        delivery.status = "planning"; delivery.sourceMemberId = member.memberId;
+        recovery.status = "planning";
+        run.reason = undefined; run.blockCode = undefined;
+        this.event(stored, `A fresh strong-coordinator delivery inspection is queued for the same reviewed head ${head}; the previous blocked attempt remains in history.`);
+      });
+      run.status = "planning";
+      this.save(stored);
+    } catch (error) {
+      this.block(stored, error);
+    }
+    return true;
   }
   private async startAutomaticRecovery(stored: Stored, trackingReady: boolean) {
     const { run } = stored, recovery = run.recovery;
     if (!recovery || recovery.status !== "stopping" || run.status !== "planning" || stored.halt) return false;
-    if (!trackingReady || stored.pending || stored.deliveryAttempt || run.deliveryReceipt || run.pullRequest || run.stopReason ||
+    if (recovery.source.code === "delivery-recovery") return this.startAutomaticDeliveryRecovery(stored, trackingReady);
+    const operationPending = Boolean(stored.pending && (recoverableOperationFailure(stored, stored.pending) || recoverableUnattributedResult(stored, stored.pending)) &&
+      stored.pending.revision === recovery.source.revision && (recovery.source.memberId === "unattributed" || recovery.source.memberId === stored.pending.source?.memberId));
+    if (!trackingReady || stored.pending && !operationPending || stored.deliveryAttempt || run.deliveryReceipt || run.pullRequest || run.stopReason ||
         run.permissionsRevokedAt ||
         run.linearTracking && run.linear?.status !== "synced" ||
-        run.members.some(member => member.revision === recovery.source.revision && activeMember(member)) ||
-        (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "escalated", "uncertain"].includes(decision.status))) {
+        run.members.some(member => member.revision === recovery.source.revision && activeMember(member) && !terminalPermissionCoordinator(run, member)) ||
+        (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status))) {
       this.block(stored, new TeamError(409, "recovery-reconciliation-required", "The automatic recovery could not establish safe, authorized continuation. Inspect retained evidence and continue manually."));
       return true;
     }
@@ -1072,9 +1287,29 @@ export class TeamService {
       if (!head || !commitId.test(head) || await teamHead(run.workspace, this.config.teams?.commandPrefix) !== head)
         throw new TeamError(409, "recovery-head-changed", "The integration HEAD changed before automatic recovery. Inspect the retained workspace before continuing.");
       this.assertRunPath(stored, run.workspace);
-      await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, undefined, "integration");
+      const originalWorkspace = run.workspace;
+      let preservedWorkspace: string | undefined;
+      try { await assertMemberReadOnly(originalWorkspace, head, this.config.teams?.commandPrefix, undefined, "integration"); }
+      catch (error) {
+        if (!operationPending) throw error;
+        const clean = await prepareRecoveredWorkspace(originalWorkspace, randomUUID(), head, this.config.teams?.commandPrefix, undefined, run.branch);
+        this.assertRunPath(stored, clean.workspace);
+        await assertMemberReadOnly(clean.workspace, head, this.config.teams?.commandPrefix, undefined, "integration");
+        if (await teamHead(originalWorkspace, this.config.teams?.commandPrefix) !== head)
+          throw new TeamError(409, "recovery-head-changed", "The original integration HEAD changed while a clean recovery copy was prepared.");
+        run.workspace = clean.workspace;
+        preservedWorkspace = originalWorkspace;
+      }
       const source = recovery.source;
-      const feedback = `Automatic PM recovery ${recovery.attempts} of ${automaticRecoveryLimit}. Diagnose and resolve the reported ${source.code} from member ${source.memberId} at revision ${source.revision}. The original report and every sibling report remain in team history. Replan only within the existing objective, pinned verification, permissions, and parent scope. Do not bypass a provider denial or infer owner approval; ask the owner if a material decision is needed. Source evidence: ${source.reason}`;
+      const preservedCopy = preservedWorkspace
+        ? `The original integration workspace is preserved at ${preservedWorkspace}. Inspect its exact state and retained diff read-only against ${head}; its dirty or conflicted edits were not imported into the clean recovery workspace. Carry only approved work forward through a new assignment.`
+        : "The integration workspace matched the recorded head and was clean.";
+      const retainedMemberWorkspaces = run.members.filter(member => member.revision === source.revision && member.role !== "permission-coordinator").slice(0, 60)
+        .map(member => `${member.memberId} (${member.role}${member.taskId ? `, task ${member.taskId}` : ""}; ${member.status}; base ${member.baseCommit}): ${member.cwd}`);
+      const memberCopies = retainedMemberWorkspaces.length
+        ? `Retained member workspaces for affected revision ${source.revision} are listed below. Inspect them read-only at their recorded base commits; preserve the original copies and use a new assignment to carry only approved work forward.\n${retainedMemberWorkspaces.join("\n")}`
+        : "No non-permission member workspace was recorded for the affected revision.";
+      const feedback = `Automatic PM recovery ${recovery.attempts} of ${automaticRecoveryLimit}. Diagnose and resolve the reported ${source.code} from member ${source.memberId} at revision ${source.revision}. The original report and every sibling report remain in team history. ${preservedCopy} ${memberCopies} Replan only within the existing objective, pinned verification, permissions, and parent scope. Do not bypass a provider denial or infer owner approval; ask the owner if a material decision is needed. Source evidence: ${source.reason}`;
       const nextRevision = run.revision + 1;
       run.continuations = [...(run.continuations ?? []), {
         revision: run.revision, requestId: randomUUID(), at: timestamp(), reason: `Automatic PM recovery after ${source.code}: ${source.reason}`,
@@ -1093,6 +1328,7 @@ export class TeamService {
       if (run.discovery && !run.discovery.completedAt) run.discovery.completedAt = timestamp();
       recovery.status = "planning";
       run.status = "planning";
+      if (operationPending) stored.pending = undefined;
       stored.continuationHead = { revision: nextRevision, headCommit: head };
       this.event(stored, `The project manager is starting bounded recovery attempt ${recovery.attempts} from the clean integration head.`);
       this.prepareMember(stored, "project-manager", undefined, feedback);
@@ -1174,7 +1410,8 @@ export class TeamService {
         let all = true;
         const drainRevision = stored.halt === "block" && run.recovery?.status === "stopping" ? run.recovery.source.revision
           : stored.halt === "steer" && run.recovery ? run.revision - 1 : undefined;
-        const membersToStop = run.members.filter(member => activeMember(member) || drainRevision !== undefined && member.revision === drainRevision);
+        const membersToStop = run.members.filter(member => (activeMember(member) || drainRevision !== undefined && member.revision === drainRevision) &&
+          !(drainRevision !== undefined && member.revision === drainRevision && terminalPermissionCoordinator(run, member)));
         for (const member of membersToStop) {
           try {
             if (drainRevision === undefined || member.revision !== drainRevision) {
@@ -1193,7 +1430,9 @@ export class TeamService {
             if (page.more || member.cursor < stopped.seq) all = false;
           } catch { all = false; member.status = "unavailable"; }
         }
-        if (all && (!stored.pending || run.status === "blocked" || run.status === "cancelled")) { stored.halt = undefined; if (!["blocked", "cancelled"].includes(run.status)) run.reason = undefined; }
+        const safePendingRecovery = Boolean(run.recovery?.status === "stopping" && stored.pending &&
+          (recoverableOperationFailure(stored, stored.pending) || recoverableUnattributedResult(stored, stored.pending)));
+        if (all && (!stored.pending || safePendingRecovery || run.status === "blocked" || run.status === "cancelled")) { stored.halt = undefined; if (!["blocked", "cancelled"].includes(run.status)) run.reason = undefined; }
         this.save(stored); return;
       }
       if (await this.startAutomaticRecovery(stored, trackingReady)) return;
@@ -1324,7 +1563,9 @@ export class TeamService {
       }
       if (run.members.some(member => member.revision === run.revision && activeMember(member) && member.role !== "implementer" && member.role !== "permission-coordinator")) return;
       if (run.members.some(member => member.revision === run.revision && member.status === "waiting" && member.role !== "implementer" && member.role !== "permission-coordinator")) { run.status = "needs-input"; this.save(stored); return; }
-      if (!run.tasks.length) {
+      const reconciledBaseline = run.deliveryRecovery?.status === "replanning" && run.deliveryRecovery.revision === run.revision &&
+        Boolean(run.deliveryRecovery.integratedHeadCommit) && run.deliveryRecovery.integratedHeadCommit === run.headCommit;
+      if (!run.tasks.length && !reconciledBaseline) {
         if (run.members.some(member => member.revision === run.revision && member.role === "project-manager" && member.status === "waiting")) { run.status = "needs-input"; this.save(stored); return; }
         this.prepareMember(stored, "project-manager"); return;
       }
@@ -1351,6 +1592,7 @@ export class TeamService {
           this.prepareMember(stored, "delivery");
         } else {
           run.status = "ready-for-review"; run.reason = undefined;
+          if (run.recovery) run.recovery.status = "complete";
           this.event(stored, "The reviewer approved the integrated change and configured checks passed. Ready for human review; nothing was published."); this.save(stored);
         }
       }
@@ -1581,7 +1823,7 @@ export class TeamService {
       if ("receipt" in result) decision.receipt = result.receipt;
       member.status = "stopped";
       this.event(stored, result.status === "answered" ? "A one-shot permission option was delivered and the prompt closed." : "The permission request remains with the user.");
-    });
+    }, member);
   }
   private taskProfiles(run: TeamRun, tasks: { agentProfileId?: string }[]) {
     for (const task of tasks) {
@@ -1802,6 +2044,41 @@ export class TeamService {
       this.event(stored, `${member.title} queued in an isolated working copy.`);
     });
   }
+  private queueDeliveryRetryAfterEvidence(stored: Stored, member: TeamMember, report: DeliveryReconciliationReport) {
+    const { run } = stored, policyHash = digest(run.delivery ?? null), prior = run.deliveryRecovery;
+    const evidenceHash = deliveryInspectionHash(report);
+    const attempts = Math.max(prior?.attempts ?? 0, run.recovery?.attempts ?? 0);
+    if (attempts >= automaticRecoveryLimit || prior?.lastEvidenceHash === evidenceHash) {
+      run.deliveryRecovery = { attempts, status: "exhausted", revision: run.revision, headCommit: report.headCommit, policyHash,
+        sourceMemberId: member.memberId, lastEvidenceHash: evidenceHash, baseHeadCommit: report.baseHeadCommit, disposition: report.disposition };
+      run.recovery = { attempts, status: "exhausted", source: { code: "delivery-recovery", memberId: member.memberId, revision: member.revision,
+        reportKind: report.kind, reason: "The same no-publication or owned-branch evidence repeated without progress.", at: timestamp() } };
+      run.status = "blocked"; run.blockCode = "delivery-reconciliation-required";
+      run.reason = "Delivery inspection found no new remote evidence after the bounded recovery attempts. Review the retained reports before continuing.";
+      stored.halt = "block";
+      this.event(stored, "Automatic delivery recovery stopped after repeated unchanged remote evidence; no publication was inferred or repeated.");
+      this.save(stored); this.trackBlocked(stored); return;
+    }
+    this.assertBudget(run, true);
+    run.deliveryRecovery = { attempts: attempts + 1, status: "planning", revision: run.revision, headCommit: report.headCommit, policyHash,
+      sourceMemberId: member.memberId, lastEvidenceHash: evidenceHash, baseHeadCommit: report.baseHeadCommit, disposition: report.disposition };
+    run.recovery = { attempts: attempts + 1, status: "planning", source: { code: "delivery-recovery", memberId: member.memberId, revision: member.revision,
+      reportKind: report.kind, reason: report.summary, at: timestamp() } };
+    const feedback = [
+      `Automatic delivery attempt ${attempts + 1} of ${automaticRecoveryLimit}, after structured remote inspection.`,
+      `Prior attempt ${member.memberId} reported ${report.disposition} for exact reviewed head ${report.headCommit}, branch ${report.branch}, repository ${report.repository}, current base head ${report.baseHeadCommit}.`,
+      `Its report is agent evidence, not host verification: ${JSON.stringify(report)}`,
+      `Before any write or publication, inspect the current remote branch and PR again. Reuse the exact matching branch/PR; do not create a duplicate, rewrite an owned branch, force-push, or change credentials/tools.`,
+    ].join("\n\n");
+    this.prepareMember(stored, "delivery", undefined, feedback, next => {
+      stored.deliveryAttempt = { memberId: next.memberId, revision: next.revision, headCommit: report.headCommit };
+      run.deliveryRecovery!.sourceMemberId = next.memberId;
+      run.reason = undefined; run.blockCode = undefined;
+      this.event(stored, `A bounded delivery retry is queued for the unchanged reviewed head ${report.headCommit}; it must inspect remote state again.`);
+    });
+    run.status = "planning";
+    this.save(stored);
+  }
   private async launch(stored: Stored, member: TeamMember) {
     this.assertBudget(stored.run);
     this.assertRunPath(stored, member.cwd);
@@ -1821,6 +2098,13 @@ export class TeamService {
         throw new TeamError(409, "delivery-reconciliation-required", "A different delivery attempt is unresolved; inspect the remote pull request before continuing.");
       await assertMemberReadOnly(stored.run.workspace, member.baseCommit, this.config.teams?.commandPrefix, undefined, "integration");
       stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: member.baseCommit };
+      if (stored.run.deliveryRecovery && ["planning", "replanning"].includes(stored.run.deliveryRecovery.status)) {
+        stored.run.deliveryRecovery.revision = member.revision;
+        stored.run.deliveryRecovery.headCommit = member.baseCommit;
+        stored.run.deliveryRecovery.policyHash = digest(stored.run.delivery!);
+        stored.run.deliveryRecovery.sourceMemberId = member.memberId;
+        stored.run.deliveryRecovery.status = "planning";
+      }
       this.save(stored);
     }
     // All launch fields were persisted with the queued member before this call.
@@ -1860,7 +2144,7 @@ export class TeamService {
       const task = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId) : run.tasks.find(item => item.id === member.taskId); if (task) task.status = "waiting";
       run.status = "needs-input"; this.event(stored, `${member.title} requested a user decision.`); this.save(stored); return;
     }
-    const expected = member.role === "project-manager" ? ["plan", "explore", "no-change"] : member.role === "scout" ? ["findings"] : member.role === "reviewer" ? ["review"] : member.role === "delivery" ? ["delivery", "delivery-repair", "pull-request"] : member.role === "implementer" ? ["result", "escalate"] : ["result"];
+    const expected = member.role === "project-manager" ? ["plan", "explore", "no-change"] : member.role === "scout" ? ["findings"] : member.role === "reviewer" ? ["review"] : member.role === "delivery" ? ["delivery", "delivery-repair", "delivery-reconciliation", "pull-request"] : member.role === "implementer" ? ["result", "escalate"] : ["result"];
     if (!expected.includes(report.kind)) { this.block(stored, new TeamError(409, "wrong-agent-report", "An agent's report does not match its assigned role."), member); return; }
     if (report.kind === "no-change") {
       if (member.role !== "project-manager" || run.tasks.length || run.headCommit !== run.baseCommit) {
@@ -1871,8 +2155,9 @@ export class TeamService {
         await assertMemberReadOnly(run.workspace, run.headCommit!, this.config.teams?.commandPrefix, signal, "integration");
       }, () => {
         run.noChange = { summary: report.summary, evidence: report.evidence }; run.status = "no-change"; run.reason = undefined;
+        if (run.recovery) run.recovery.status = "complete";
         this.event(stored, "The coordinator reported no justified change and recorded its evidence. No implementation was started.");
-      }); return;
+      }, member); return;
     }
     if (report.kind === "explore") {
       if (run.discovery || run.tasks.length || !run.lineup) throw new TeamError(409, "discovery-already-used", "A team may request one read-only discovery batch before implementation planning.");
@@ -1885,7 +2170,7 @@ export class TeamService {
         run.discovery = { revision: run.revision, summary: report.summary, tasks: report.tasks.map(task => ({ ...task, status: "pending" })) };
         run.status = "discovering";
         this.event(stored, `The coordinator requested ${report.tasks.length} read-only discovery tasks.`);
-      }); return;
+      }, member); return;
     }
     if (report.kind === "findings") {
       const scout = run.discovery?.tasks.find(task => task.id === member.taskId && task.memberId === member.memberId);
@@ -1893,7 +2178,7 @@ export class TeamService {
       this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
         scout.status = "complete"; scout.summary = report.summary; scout.evidence = report.evidence;
         this.event(stored, `${member.title} returned evidence without changing its working copy.`);
-      }); return;
+      }, member); return;
     }
     if (report.kind === "escalate") {
       const task = run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId);
@@ -1907,7 +2192,7 @@ export class TeamService {
         run.members.push(next); task.memberId = next.memberId; task.status = "running";
         run.status = "implementing";
         this.event(stored, `${task.title} escalated to ${profile.label}; the stopped member's partial work was preserved.`);
-      }); return;
+      }, member); return;
     }
     if (report.kind === "plan") {
       validateTeamPlan(report.tasks);
@@ -1951,7 +2236,103 @@ export class TeamService {
         }
         run.status = "implementing";
         this.event(stored, `Project manager planned ${run.tasks.length} tasks.`);
-      }); return;
+      }, member); return;
+    }
+    if (report.kind === "delivery-reconciliation") {
+      const { run } = stored;
+      const attempt = stored.deliveryAttempt;
+      if (!run.delivery || report.repository !== run.delivery.repository || report.branch !== run.branch ||
+          report.headCommit !== run.headCommit || member.baseCommit !== run.headCommit || attempt?.memberId !== member.memberId ||
+          attempt.revision !== run.revision || attempt.headCommit !== run.headCommit ||
+          run.deliveryRecovery && (run.deliveryRecovery.status !== "planning" || run.deliveryRecovery.revision !== run.revision ||
+            run.deliveryRecovery.headCommit !== run.headCommit || run.deliveryRecovery.policyHash !== digest(run.delivery)))
+        throw new TeamError(409, "delivery-reconciliation-stale", "Structured delivery inspection must identify the current pinned repository, branch, and reviewed head for this attempt.");
+      this.assertDelivery(stored);
+      if (report.disposition === "no-publication" && (report.remoteHeadCommit !== undefined || report.pullRequestUrl !== undefined) ||
+          report.disposition === "owned-branch" && (report.remoteHeadCommit !== report.headCommit || report.pullRequestUrl !== undefined) ||
+          report.disposition === "pull-request" && (report.remoteHeadCommit !== report.headCommit || !report.pullRequestUrl))
+        throw new TeamError(409, "delivery-remote-head-mismatch", "The inspected remote branch or pull request does not identify the exact reviewed head.");
+      if (report.disposition === "pull-request") {
+        const reconciliationPullRequestUrl = report.pullRequestUrl;
+        if (!reconciliationPullRequestUrl) throw new TeamError(409, "delivery-target-mismatch", "The inspected pull request URL is missing.");
+        let url: URL;
+        try { url = new URL(reconciliationPullRequestUrl); } catch { throw new TeamError(409, "delivery-target-mismatch", "The inspected pull request URL is invalid."); }
+        const prefix = `/${run.delivery.repository}/pull/`.toLowerCase();
+        if (url.origin !== "https://github.com" || url.username || url.password || url.search || url.hash || !url.pathname.toLowerCase().startsWith(prefix) || !/^[1-9][0-9]*$/.test(url.pathname.slice(prefix.length)))
+          throw new TeamError(409, "delivery-target-mismatch", "The inspected pull request must belong to the configured repository.");
+      }
+      this.operation(stored, "result", async signal => {
+        await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+        await assertMemberReadOnly(run.workspace, member.baseCommit, this.config.teams?.commandPrefix, signal, "integration");
+        if (report.disposition !== "no-publication" || report.baseHeadCommit === run.baseCommit) return undefined;
+        if (run.goal || run.missionId || run.handoff)
+          throw new TeamError(409, "delivery-baseline-parent-owned", "A moved-base delivery recovery requires standalone ownership; preserve this parent branch for explicit reconciliation.");
+        const source = this.options?.source;
+        if (!source?.isGithub(run.projectId))
+          throw new TeamError(409, "delivery-baseline-source-unavailable", "The host cannot confirm the moved delivery base from its configured GitHub source.");
+        this.assertBudget(run, true);
+        const attempts = Math.max(run.deliveryRecovery?.attempts ?? 0, run.recovery?.attempts ?? 0);
+        if (attempts >= automaticRecoveryLimit)
+          throw new TeamError(409, "delivery-recovery-exhausted", "The team exhausted its automatic delivery recovery allowance. Its reviewed work and remote evidence remain retained.");
+        // A direct moved-base report can arrive without an earlier blocked report. Charge
+        // every fresh-base recovery before creating its copy, including later revisions.
+        run.deliveryRecovery = { ...run.deliveryRecovery, attempts: attempts + 1, status: "planning", revision: run.revision,
+          headCommit: report.headCommit, policyHash: digest(run.delivery!), sourceMemberId: member.memberId,
+          baseHeadCommit: report.baseHeadCommit, disposition: report.disposition };
+        run.recovery = { attempts: attempts + 1, status: "planning", source: { code: "delivery-baseline-conflict", memberId: member.memberId,
+          revision: run.revision, reportKind: report.kind, reason: report.summary, at: timestamp() } };
+        this.save(stored);
+        const refreshed = await this.startInProject(run.projectId, () => source.refresh(run.projectId, { maxAgeMs: 0, signal }));
+        if (refreshed.mode !== "github" || refreshed.repository !== run.delivery!.repository || refreshed.baseBranch !== run.delivery!.baseBranch ||
+            refreshed.pending?.reason === "fetch-failed" || refreshed.mirrorHead !== report.baseHeadCommit)
+          throw new TeamError(409, "delivery-baseline-source-mismatch", "The host could not confirm the exact reported base head from the pinned source repository and branch.");
+        const originalWorkspace = run.workspace;
+        const recovered = await prepareRecoveryWorkspaceFromSource(originalWorkspace, source.mirrorPath(run.projectId), randomUUID(), report.baseHeadCommit,
+          this.config.teams?.commandPrefix, signal, run.branch);
+        this.assertRunPath(stored, recovered.workspace);
+        await assertMemberReadOnly(recovered.workspace, report.baseHeadCommit, this.config.teams?.commandPrefix, signal, "integration");
+        if (await teamHead(originalWorkspace, this.config.teams?.commandPrefix, signal) !== report.headCommit)
+          throw new TeamError(409, "delivery-recovery-head-changed", "The original integration head changed while its fresh-base recovery copy was prepared.");
+        return { workspace: recovered.workspace, originalWorkspace, baseHeadCommit: report.baseHeadCommit };
+      }, result => {
+        if (report.disposition === "pull-request" && run.delivery?.mode === "pr") {
+          stored.deliveryAttempt = undefined;
+          run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl!, summary: report.summary, reportedAt: timestamp() };
+          run.status = "ready-for-review"; run.reason = undefined;
+          if (run.recovery) run.recovery.status = "complete";
+          if (run.deliveryRecovery) run.deliveryRecovery.status = "complete";
+          this.event(stored, "The delivery coordinator reported an existing pull request for the exact reviewed head. Its repository state remains agent evidence; the owner can review it on GitHub.");
+          return;
+        }
+        if (result) {
+          const previousRevision = run.revision, oldBase = run.baseCommit, oldHead = run.headCommit!;
+          const originalPath = relative(stored.root ?? this.config.teams?.workspaceDir ?? dirname(result.originalWorkspace), result.originalWorkspace).slice(0, 256);
+          run.continuations = [...(run.continuations ?? []), {
+            revision: previousRevision, requestId: randomUUID(), at: timestamp(),
+            reason: "The delivery coordinator reported no publication after the configured base moved; original implementation and review history are retained.",
+            baseCommit: oldBase, headCommit: oldHead, tasks: structuredClone(run.tasks), ...(run.review ? { review: structuredClone(run.review) } : {}),
+            ...(run.brief ? { brief: structuredClone(run.brief) } : {}),
+          }];
+          run.workspace = result.workspace; run.baseCommit = result.baseHeadCommit; run.headCommit = result.baseHeadCommit;
+          run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
+          run.brief = undefined; run.noChange = undefined; stored.deliveryAttempt = undefined;
+          const attempts = run.deliveryRecovery?.attempts ?? run.recovery?.attempts ?? 0;
+          run.deliveryRecovery = { attempts, status: "replanning", revision: run.revision, headCommit: run.headCommit,
+            policyHash: digest(run.delivery!), sourceMemberId: member.memberId, baseHeadCommit: result.baseHeadCommit, disposition: report.disposition };
+          run.recovery = { attempts, status: "planning", source: { code: "delivery-baseline-conflict", memberId: member.memberId, revision: previousRevision,
+            reportKind: report.kind, reason: report.summary, at: timestamp() } };
+          const feedback = [
+            "The delivery coordinator reported that nothing was published and the pinned base branch moved. The host refreshed the configured source and created this clean workspace at the exact reported base head.",
+            `The original integration copy is preserved at ${result.originalWorkspace} (workspace path ${originalPath}). Read its diff from ${oldBase} to ${oldHead} without changing it; the implementation and review were not carried into this new workspace automatically.`,
+            "Reconcile only the original approved changes into this workspace. Preserve both sides of any conflicting documentation or code rather than dropping either. Keep the existing objective and goal scope. Report only work actually applied; the host will capture and integrate it, then rerun configured checks and independent review before another delivery attempt.",
+          ].join("\n\n");
+          this.prepareMember(stored, "integrator", undefined, feedback);
+          run.status = "planning"; run.reason = undefined; run.blockCode = undefined;
+          this.event(stored, `The configured base moved to ${result.baseHeadCommit}; the old implementation copy remains preserved at ${originalPath}. An integrator must carry the authorized delta into the new base before checks and review run again.`);
+          return;
+        }
+        this.queueDeliveryRetryAfterEvidence(stored, member, report);
+      }, member); return;
     }
     if (report.kind === "delivery" || report.kind === "delivery-repair" || report.kind === "pull-request") {
       if ((report.kind === "delivery" && run.delivery?.mode !== "merge") || (report.kind === "pull-request" && run.delivery?.mode !== "pr"))
@@ -1959,6 +2340,9 @@ export class TeamService {
       this.assertDelivery(stored);
       if (report.headCommit !== run.headCommit || member.baseCommit !== run.headCommit || stored.deliveryAttempt?.memberId !== member.memberId)
         throw new TeamError(409, "stale-delivery", "Delivery evidence must name the checked and independently reviewed commit for this attempt.");
+      if (run.deliveryRecovery && (run.deliveryRecovery.status !== "planning" || run.deliveryRecovery.revision !== run.revision ||
+          run.deliveryRecovery.headCommit !== run.headCommit || run.deliveryRecovery.policyHash !== digest(run.delivery)))
+        throw new TeamError(409, "delivery-recovery-stale", "The active automatic recovery no longer matches the delivery policy, revision, and reviewed head.");
       if (report.kind === "delivery" || report.kind === "pull-request") {
         let url: URL;
         try { url = new URL(report.pullRequestUrl); } catch { throw new TeamError(409, "delivery-target-mismatch", "The delivery report must name a valid pull request URL."); }
@@ -1978,19 +2362,32 @@ export class TeamService {
           await captureDeliveryBaseline(run.workspace, member.cwd, member.baseCommit, report.mergeCommit, this.config.teams?.commandPrefix, signal);
         }
       }, () => {
-        stored.deliveryAttempt = undefined;
         if (report.kind === "delivery-repair") {
+          const recovery = run.deliveryRecovery;
+          const inspected = recovery?.lastEvidenceHash && run.members.some(prior => prior.role === "delivery" && prior.status === "stopped" &&
+            prior.revision === run.revision && prior.report?.kind === "delivery-reconciliation" && prior.report.headCommit === report.headCommit &&
+            prior.report.repository === run.delivery!.repository && prior.report.branch === run.branch &&
+            deliveryInspectionHash(prior.report) === recovery.lastEvidenceHash);
+          if (recovery && recovery.attempts > 0 && recovery.status !== "complete" && !inspected)
+            throw new TeamError(409, "delivery-reconciliation-required", "An automatic recovery requires structured remote evidence before a delivery repair can change the reviewed head.");
+          stored.deliveryAttempt = undefined;
           this.repair(stored, `Delivery requires a scoped repair before checks and independent review run again. No merge was reported.\n${report.summary}`);
         } else if (report.kind === "pull-request") {
+          stored.deliveryAttempt = undefined;
           run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, summary: report.summary, reportedAt: timestamp() };
           run.status = "ready-for-review"; run.reason = undefined;
+          if (run.recovery) run.recovery.status = "complete";
+          if (run.deliveryRecovery) run.deliveryRecovery.status = "complete";
           this.event(stored, "The delivery agent reported an open pull request for the reviewed commit. Review and merge it on GitHub; the host refreshes the project after the merge.");
         } else {
+          stored.deliveryAttempt = undefined;
           run.status = "merged"; run.reason = undefined;
+          if (run.recovery) run.recovery.status = "complete";
+          if (run.deliveryRecovery) run.deliveryRecovery.status = "complete";
           this.event(stored, "The delivery agent reported a merged pull request for the reviewed commit. This is agent-reported delivery evidence, not proof of product impact.");
           try { this.options?.onMerged?.(run.projectId); } catch { /* A refresh callback cannot undo a completed merge report. */ }
         }
-      }); return;
+      }, member); return;
     }
     if (report.kind === "review") {
       if (member.baseCommit !== run.headCommit || stored.checkHead !== run.headCommit) { this.block(stored, new TeamError(409, "stale-review", "The reviewer did not review the currently verified integration commit.")); return; }
@@ -2016,7 +2413,7 @@ export class TeamService {
           this.repair(stored, report.summary);
         }
         else run.status = "reviewing";
-      }); return;
+      }, member); return;
     }
     if (report.kind !== "result") throw new TeamError(409, "wrong-agent-report", "The member did not submit an implementation result.");
     const task = run.tasks.find(item => item.id === member.taskId);
@@ -2030,10 +2427,12 @@ export class TeamService {
       return { commit, head, diff: diff?.exitCode === 0 ? diff.stdout : undefined };
     }, ({ commit, head, diff }) => {
       run.headCommit = head; stored.checkHead = undefined; run.review = undefined;
+      if (member.role === "integrator" && run.deliveryRecovery?.status === "replanning" && run.deliveryRecovery.revision === run.revision)
+        run.deliveryRecovery.integratedHeadCommit = head;
       if (task) { task.status = "integrated"; task.commit = commit; task.summary = report.summary; task.diffStat = diffStat(diff); }
       this.event(stored, `${member.title} reported a result; its validated changes were integrated.`);
       run.status = "implementing";
-    });
+    }, member, "integration");
   }
   private repair(stored: Stored, feedback: string) {
     if (stored.halt || ["paused", "cancelled"].includes(stored.run.status)) return;

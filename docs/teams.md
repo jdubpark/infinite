@@ -294,6 +294,26 @@ Missing GitHub tools or authentication blocks delivery for review. It does not
 expand provider permissions, and a merge report does not establish human
 acceptance or product impact.
 
+For a stopped delivery that reports a routine capability or workflow failure,
+the host can queue a bounded same-run retry under the unchanged delivery policy.
+The strong coordinator first inspects the exact remote branch and pull request;
+it reuses matching work and does not create duplicates, rewrite an owned branch,
+force-push, or switch credentials or tools. At most two automatic recovery
+attempts run per team. Repeated identical failure evidence exhausts recovery.
+The host preserves each earlier attempt and its report. Remote observations
+remain agent evidence; they do not prove that a merge or pull request succeeded.
+
+When the configured base moved and the coordinator reports that nothing was
+published, it submits a structured `delivery-reconciliation` report naming the
+reviewed head, repository, branch, and observed base head. The host confirms
+that base head against its refreshed GitHub source mirror, then creates a clean
+recovery workspace at that commit and preserves the old integration workspace.
+An integrator must carry the approved changes forward from the preserved copy.
+The new head must pass configured checks and independent review before delivery
+can start again. This moved-base path currently requires standalone ownership;
+goal, mission, and handoff runs remain blocked for parent-directed reconciliation.
+An owned remote branch or pull request is never rewritten by this path.
+
 After an explicitly blocked delivery attempt, an owner can request a fresh
 strong-coordinator reconciliation through
 `POST /api/teams/:id/reconcile-delivery` with `requestId`, `revision`, and a
@@ -1171,6 +1191,18 @@ The run stays in planning while recovery is active, so a goal or mission keeps
 supervising it. A mission coordinator resolves remaining dependencies and
 ownership issues through its subteam controls.
 
+Settled local result failures can also enter this bounded PM diagnosis when the
+host has exact member provenance or a persisted failure marker. The host drains
+write-capable members and checks the recorded integration head. If that
+workspace is dirty at the same head, it creates a clean sibling and preserves
+the original copy and every report. The PM diagnoses the failure in a new
+revision; scope violations and rejected results are not accepted as success.
+Legacy blocked result intents are eligible only when their saved blocked state
+and failure code prove that the operation had settled. An obsolete
+permission-coordinator result with a terminal decision is ignored without
+answering or reapplying the permission report; unavailable session records
+remain visible.
+
 A project manager may explicitly report `no-change` with evidence when the
 request is already satisfied, no implementation tasks have been planned, and
 the integration head still equals the original source commit.
@@ -1179,10 +1211,11 @@ This ends the team with an agent finding, without declaring a product goal
 achieved or user acceptance complete.
 
 Recovery preserves the approved objective, required checks, independent review,
-permission decisions, and execution limits. It does not replay uncertain
-workspace or delivery operations, override scope violations, or resume an
-explicitly paused or cancelled run. A hard stop or exhausted recovery remains
-blocked and visible to the owner:
+permission decisions, and execution limits. An interrupted operation without
+settled-failure evidence remains fenced; it is never replayed after restart.
+Recovery does not accept a scope violation, override changed permissions, or
+resume an explicitly paused or cancelled run. A hard stop or exhausted recovery
+remains blocked and visible to the owner:
 
 * **Phone push.** With push enabled, the host announces new runs, completion,
   cancellation and runs that need the owner. Stuck events are high priority;
@@ -1251,9 +1284,11 @@ become success.
 Goal and team state, requirements, answers, outcomes, and receipts use the
 existing encrypted store. Detached member sessions survive API loss. After restart, the scheduler
 reconciles durable assignment identities instead of launching replacements for
-uncertain workers. Interrupted Git/check operations require reconciliation; they
-are not blindly replayed. Host reboot recovery is a separate limitation of the
-underlying session runtime.
+uncertain workers. Interrupted Git/check operations without a persisted settled
+failure require reconciliation; they are not blindly replayed. A narrowly
+matched obsolete permission-review report can be dispositioned without
+applying it. Host reboot recovery is a separate limitation of the underlying
+session runtime.
 
 Source copies, Git objects, dependency caches and provider histories are
 plaintext at runtime and require encrypted storage. Separate clones isolate

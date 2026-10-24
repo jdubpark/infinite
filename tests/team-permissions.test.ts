@@ -9,6 +9,7 @@ import type { TeamLineup } from "../packages/host/src/team-types.js";
 import { refusedBeforeSend } from "../packages/host/src/team-permissions.js";
 import { permissionEvidenceDigest } from "../packages/host/src/team-permission-evidence.js";
 import { ContentError } from "../packages/host/src/session-content.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
 
 const permissionLineup: TeamLineup = {
   ...limitLineup,
@@ -496,6 +497,54 @@ test("an owner answer supersedes a late permission report when the obsolete revi
     assert.equal(finished.permissionDecisions?.[0]?.status, "escalated");
     assert.equal(finished.permissionDecisions?.[0]?.receipt, undefined, "a late reviewer report cannot deliver a second answer");
     assert.deepEqual(finished.tasks.map(task => task.status), ["integrated", "integrated"]);
+
+    // Reproduce a legacy host record that stopped during a generic result operation after
+    // the permission coordinator and an implementation sibling had both reported. Without
+    // operation provenance, restart must retain both reports and ask the PM to reconcile
+    // them instead of either accepting one or leaving the same run wedged.
+    await f.host.stopApi();
+    const stateFile = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
+    const key = readFileSync(f.host.config.keyFile);
+    const stored = unseal<any>(key, `team:${finished.id}`, readFileSync(stateFile, "utf8"));
+    const priorReviewer = stored.run.members.find((member: any) => member.memberId === decision.coordinatorMemberId)!;
+    const sibling = stored.run.members.find((member: any) => member.revision === stored.run.revision && member.role === "implementer" && member.report?.kind === "result");
+    assert.ok(sibling, "the legacy intent overlaps a reported implementation sibling");
+    priorReviewer.status = "unavailable";
+    stored.run.status = "blocked";
+    stored.run.reason = "A team operation failed. Its workspaces and recorded evidence were preserved for inspection.";
+    stored.run.blockCode = undefined;
+    stored.pending = { id: randomUUID(), kind: "result", revision: stored.run.revision };
+    stored.run.recovery = { attempts: 1, status: "stopping", source: { code: "unattributed-result", memberId: "unattributed",
+      revision: stored.run.revision, reason: stored.run.reason, at: new Date().toISOString() } };
+    writeSealed(stateFile, key, `team:${finished.id}`, stored);
+
+    const firstRestore = await f.openTeamService({ start: false });
+    const firstRecovered = firstRestore.get(finished.id);
+    assert.equal(firstRecovered.recovery?.attempts, 1);
+    assert.equal(firstRecovered.recovery?.status, "stopping");
+    firstRestore.close(); await firstRestore.idle();
+    const secondRestore = await f.openTeamService({ start: false });
+    const secondRecovered = secondRestore.get(finished.id);
+    assert.equal(secondRecovered.recovery?.attempts, 1, "reopening before scheduling must not consume another reserved attempt");
+    assert.equal(secondRecovered.recovery?.source.memberId, "unattributed");
+    assert.ok(secondRecovered.events.some(event => /reservation was restored without consuming another attempt/i.test(event.text)));
+    secondRestore.close(); await secondRestore.idle();
+
+    await f.host.start();
+    const recovered = await waitFor(() => f.get(finished.id), run =>
+      run.members.some(member => member.role === "project-manager" && member.revision > finished.revision) || run.status === "blocked", 15000);
+    assert.notEqual(recovered.status, "blocked", JSON.stringify(recovered));
+    assert.equal(recovered.id, finished.id, "reconciliation continues the same durable run");
+    assert.equal(recovered.recovery?.source.memberId, "unattributed", "the generic legacy intent is resolved by bounded PM recovery");
+    assert.equal(recovered.recovery?.source.code, "unattributed-result");
+    assert.equal(recovered.recovery?.attempts, 1);
+    assert.ok(recovered.continuations?.some(item => item.revision === finished.revision), "the prior revision remains in run history");
+    assert.equal(recovered.permissionDecisions?.[0]?.status, "escalated");
+    assert.equal(recovered.permissionDecisions?.[0]?.receipt, undefined, "the retained reviewer report is never treated as an owner answer");
+    assert.equal(recovered.members.find(member => member.memberId === coordinator.memberId)?.status, "unavailable");
+    assert.equal(recovered.members.find(member => member.memberId === coordinator.memberId)?.report?.kind, "permission-decision");
+    assert.equal(recovered.members.find(member => member.memberId === sibling.memberId)?.report?.kind, "result", "the sibling implementation report remains evidence");
+    assert.ok(recovered.members.some(member => member.role === "project-manager" && member.revision > finished.revision), "PM diagnosis is scheduled in the same run");
   } finally {
     if (reviewerControl && reviewerSessionId) await f.host.fetchApi(`/sessions/${reviewerSessionId}/control`, "controller",
       { action: "release", leaseId: reviewerControl.lease.id }, reviewerControl.headers);
@@ -571,21 +620,31 @@ test("an answering decision is recovered as uncertain after an API restart", { t
     const recovered = await waitFor(() => f.get(answering.id), run => run.permissionDecisions?.[0]?.status === "uncertain", 10000);
     assert.equal(recovered.permissionDecisions[0].receipt, undefined);
     assert.equal(recovered.status, "blocked", "the in-flight operation remains subject to existing restart reconciliation");
+    const memberCount = recovered.members.length;
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    const stillUncertain = await f.get(answering.id);
+    assert.equal(stillUncertain.status, "blocked");
+    assert.equal(stillUncertain.permissionDecisions?.[0]?.status, "uncertain");
+    assert.equal(stillUncertain.recovery, undefined, "automatic recovery must not retry around an uncertain permission side effect");
+    assert.equal(stillUncertain.members.length, memberCount, "uncertain permission state does not launch another coordinator or worker");
   } finally { await f.close(); }
 });
 
-test("a cancelled team with an unresolved verification operation stays cancelled after restart", { timeout: 90000 }, async () => {
+for (const action of ["pause", "cancel"] as const)
+test(`a ${action} with an unresolved verification operation stays in force after restart`, { timeout: 90000 }, async () => {
   const f = await fixture("lifecycle");
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     const checking = await waitFor(() => f.get(created.body.id), run => run.status === "verifying" && run.checks.some(check => check.status === "running"), 30000);
-    const cancelled = await f.host.fetchApi(`/teams/${checking.id}/cancel`, "owner", { requestId: randomUUID(), revision: checking.revision });
-    assert.equal(cancelled.status, 200);
+    const result = await f.host.fetchApi(`/teams/${checking.id}/${action}`, "owner", { requestId: randomUUID(), revision: checking.revision });
+    assert.equal(result.status, 200);
     await f.host.stopApi();
     await f.host.start();
     const recovered = await f.get(checking.id);
-    assert.equal(recovered.status, "cancelled");
+    assert.equal(recovered.status, action === "pause" ? "paused" : "cancelled");
     assert.ok(recovered.checks.some(check => check.status === "interrupted"));
-    assert.equal((await f.host.fetchApi("/teams")).body.teams.find((team: { id: string }) => team.id === checking.id).status, "cancelled");
+    assert.equal(recovered.members.length, checking.members.length, "restart cannot launch recovery workers for a held or cancelled run");
+    assert.equal(recovered.recovery, undefined);
+    assert.equal((await f.host.fetchApi("/teams")).body.teams.find((team: { id: string }) => team.id === checking.id).status, recovered.status);
   } finally { await f.close(); }
 });

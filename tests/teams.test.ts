@@ -344,7 +344,7 @@ test("a blocked worker report is diagnosed by a bounded PM recovery while siblin
     const finished = await f.settled(created.body.id);
     assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
     assert.equal(finished.revision, stopping.revision + 1);
-    assert.equal(finished.recovery?.status, "planning");
+    assert.equal(finished.recovery?.status, "complete");
     assert.equal(finished.recovery?.attempts, 1);
     assert.equal(finished.recovery?.source.memberId, stopping.recovery?.source.memberId);
     assert.equal(finished.members.filter(member => member.role === "project-manager").length, 2);
@@ -358,19 +358,76 @@ test("a blocked worker report is diagnosed by a bounded PM recovery while siblin
   } finally { await f.close(); }
 });
 
+test("a transient result-operation failure resumes from the clean integration head in the same run", { timeout: 150000 }, async () => {
+  const f = await fixture("result-operation-fails-once", fallbackLineup, {}, { parallelism: 1 });
+  const id = f.create().requestId;
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", { ...f.create(), requestId: id });
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const ready = await waitFor(() => f.get(created.body.id), () => existsSync(join(f.receipts, "result-failure-ready.json")), 30000);
+    const report = JSON.parse(readFileSync(join(f.receipts, "result-failure-ready.json"), "utf8")) as { cwd: string; memberId: string };
+    writeFileSync(join(f.receipts, "result-failure-target.json"), JSON.stringify({ cwd: report.cwd }), { mode: 0o600 });
+    writeFileSync(join(f.receipts, "result-failure-report-release"), "release", { mode: 0o600 });
+    await waitFor(() => Promise.resolve(existsSync(join(f.receipts, "result-failure-started"))), Boolean, 30000);
+    writeFileSync(join(f.receipts, "result-failure-release"), "fail once", { mode: 0o600 });
+
+    const recovering = await waitFor(() => f.get(created.body.id), run =>
+      run.recovery?.source.memberId === report.memberId && run.recovery.status === "planning" || run.status === "blocked", 30000);
+    assert.equal(recovering.recovery?.source.code, "workspace-operation-failed", JSON.stringify(recovering));
+    assert.equal(recovering.recovery?.source.reportKind, "result");
+    assert.equal(recovering.recovery?.attempts, 1);
+    assert.ok(recovering.events.some(event => /bounded recovery attempt/i.test(event.text)), JSON.stringify(recovering.events));
+    assert.equal(git(recovering.workspace, "rev-parse", "HEAD"), recovering.headCommit,
+      "a failed member-local Git operation leaves the integration head unchanged");
+    assert.equal(git(recovering.workspace, "status", "--porcelain"), "",
+      "automatic planning starts from a clean integration workspace");
+
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.id, ready.id, "recovery continues the original durable run");
+    assert.equal(finished.revision, 2);
+    assert.equal(finished.recovery?.attempts, 1);
+    assert.equal(finished.continuations?.[0]?.revision, 1);
+    assert.equal(finished.continuations?.[0]?.headCommit, ready.headCommit);
+    assert.ok(finished.continuations?.[0]?.tasks.length, "the failed revision remains in run history");
+    assert.equal(finished.members.find(member => member.memberId === report.memberId)?.report?.kind, "result",
+      "the worker's report stays available as evidence without being accepted as integrated work");
+    assert.equal(finished.members.filter(member => member.role === "project-manager" && member.revision === 2).length, 1);
+    assert.equal(readFileSync(join(f.receipts, "result-failure-fired"), "utf8"), "failed once");
+  } finally {
+    writeFileSync(join(f.receipts, "result-failure-report-release"), "release", { mode: 0o600 });
+    writeFileSync(join(f.receipts, "result-failure-release"), "release", { mode: 0o600 });
+    await f.close();
+  }
+});
+
 test("automatic PM recovery stops after two attempts and retains each failed revision", { timeout: 150000 }, async () => {
   const f = await fixture("agent-blocked-twice");
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const firstRecovery = await waitFor(() => f.get(created.body.id), run =>
+      run.revision === 2 && run.recovery?.attempts === 1 && run.recovery.status === "planning", 60000);
+    assert.equal(firstRecovery.recovery?.attempts, 1);
+    assert.equal(firstRecovery.members.find(member => member.memberId === firstRecovery.recovery?.source.memberId)?.role, "implementer");
+    assert.equal(firstRecovery.continuations?.length, 1, "the first failed revision remains in the same run history");
     const blocked = await f.settled(created.body.id);
     assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
-    assert.equal(blocked.recovery?.status, "exhausted");
+    assert.equal(blocked.recovery?.status, "exhausted", JSON.stringify(blocked));
     assert.equal(blocked.recovery?.attempts, 2);
     assert.equal(blocked.blockCode, "agent-blocked");
     assert.equal(blocked.members.filter(member => member.role === "project-manager").length, 3, "There is one initial PM and exactly two recovery PM attempts");
     assert.equal(blocked.continuations?.length, 2, "Both prior revisions remain available as continuation evidence");
+    assert.deepEqual(blocked.continuations?.map(item => item.revision), [1, 2]);
     assert.equal(blocked.revision, 3);
+    await f.host.stopApi(); await f.host.start();
+    const restarted = await f.get(created.body.id);
+    assert.equal(restarted.id, created.body.id);
+    assert.equal(restarted.status, "blocked");
+    assert.equal(restarted.recovery?.status, "exhausted");
+    assert.equal(restarted.recovery?.attempts, 2, "restart must retain both consumed recovery attempts");
+    assert.equal(restarted.members.filter(member => member.role === "project-manager").length, 3, "restart must not schedule an extra PM attempt");
+    assert.deepEqual(restarted.continuations?.map(item => item.revision), [1, 2]);
   } finally { await f.close(); }
 });
 
@@ -1093,7 +1150,9 @@ test("task ownership preserves filename bytes and refuses an out-of-scope file b
     const blocked = await f.settled(created.body.id);
     assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
     assert.match(blocked.reason ?? "", /outside its assigned paths/);
-    assert.equal(blocked.recovery, undefined, "Scope violations remain hard blockers");
+    assert.equal(blocked.recovery?.status, "exhausted", "Repeated scope violations exhaust bounded PM diagnosis");
+    assert.equal(blocked.recovery?.attempts, 2);
+    assert.equal(existsSync(join(blocked.workspace, " a.txt")), false, "Rejected out-of-scope edits are never integrated");
     assert.equal(blocked.checks.length, 0, "The scope violation must be detected before verification can fail for a missing file");
     assert.notEqual(blocked.tasks.find(task => task.id === "a")?.status, "integrated");
     assert.equal(git(f.source, "status", "--porcelain"), "");

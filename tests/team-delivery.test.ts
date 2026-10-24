@@ -7,6 +7,7 @@ import { fixture, git, limitLineup } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
 import { TeamError } from "../packages/host/src/teams.js";
 import type { TeamMember, TeamReport, TeamRun } from "../packages/host/src/team-types.js";
+import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import { teamPrompt } from "../packages/host/src/team-prompts.js";
 
 async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: string) => void) {
@@ -177,6 +178,269 @@ test("an exited delivery without a receipt is not merged or replayed by steering
   } finally { await f.close(); }
 });
 
+test("a no-publication capability failure gets one bounded inspection and no duplicate pull request", { timeout: 120000 }, async () => {
+  const f = await fixture("delivery-capability-failure", limitLineup, {}, { deliveryMode: "pr" });
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const initial = await waitFor(() => f.get(created.body.id), run =>
+      run.status === "delivering" && existsSync(join(f.receipts, "delivery-started.json")), 90000);
+    writeFileSync(join(f.receipts, "delivery-branch"), initial.branch!, { mode: 0o600 });
+    writeFileSync(join(f.receipts, "delivery-base-head"), initial.baseCommit!, { mode: 0o600 });
+    writeFileSync(join(f.receipts, "delivery-release"), "release", { mode: 0o600 });
+
+    const blocked = await f.settled(initial.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.equal(blocked.id, initial.id, "the retry remains in the original run");
+    assert.equal(blocked.revision, initial.revision, "a capability failure does not create a new implementation revision");
+    assert.equal(blocked.deliveryRecovery?.status, "exhausted");
+    assert.equal(blocked.deliveryRecovery?.attempts, 2, "the bounded inspection and one retry consume at most two recovery attempts");
+    assert.equal(blocked.deliveryRecovery?.disposition, "no-publication");
+    assert.equal(blocked.deliveryRecovery?.headCommit, initial.headCommit);
+    assert.equal(blocked.deliveryRecovery?.baseHeadCommit, initial.baseCommit);
+    assert.equal(blocked.deliveryReceipt, undefined);
+    assert.equal(blocked.pullRequest, undefined);
+
+    const attempts = readFileSync(join(f.receipts, "delivery-attempts.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const inspections = readFileSync(join(f.receipts, "delivery-reconciliations.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(inspections.length, 1, "one exact remote inspection is recorded");
+    assert.deepEqual([inspections[0].headCommit, inspections[0].repository, inspections[0].branch, inspections[0].baseHeadCommit],
+      [initial.headCommit, "example/app", initial.branch, initial.baseCommit]);
+    assert.equal(inspections[0].disposition, "no-publication");
+    assert.equal(attempts.filter((item: { reconciling: boolean }) => item.reconciling).length, 1);
+    assert.equal(attempts.filter((item: { reconciling: boolean }) => !item.reconciling).length, 2,
+      "the same failed capability is retried once and does not create a duplicate PR attempt");
+    assert.equal(new Set(attempts.map((item: { head: string }) => item.head)).size, 1,
+      "both delivery attempts remain pinned to the same independently reviewed head");
+  } finally {
+    writeFileSync(join(f.receipts, "delivery-release"), "release", { mode: 0o600 });
+    await f.close();
+  }
+});
+
+test("a matching no-publication inspection allows same-head repair before checks, review, and one PR", { timeout: 150000 }, async () => {
+  const f = await fixture("delivery-capability-repair", limitLineup, {}, { deliveryMode: "pr" });
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const initial = await waitFor(() => f.get(created.body.id), run =>
+      run.status === "delivering" && existsSync(join(f.receipts, "delivery-started.json")), 90000);
+    writeFileSync(join(f.receipts, "delivery-branch"), initial.branch!, { mode: 0o600 });
+    writeFileSync(join(f.receipts, "delivery-base-head"), initial.baseCommit!, { mode: 0o600 });
+    writeFileSync(join(f.receipts, "delivery-release"), "release", { mode: 0o600 });
+
+    const finished = await f.settled(initial.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.id, initial.id, "inspection and repair stay in the original run");
+    assert.equal(finished.revision, initial.revision, "scoped repair rechecks the same work revision");
+    assert.notEqual(finished.headCommit, initial.headCommit, "the integrator repair is captured as a new checked head");
+    assert.equal(finished.pullRequest?.headCommit, finished.headCommit);
+    assert.equal(finished.deliveryReceipt, undefined, "PR mode never records a merge receipt");
+    assert.equal(finished.deliveryRecovery?.status, "complete");
+    assert.equal(finished.deliveryRecovery?.attempts, 2, "the inspection and same-head retry use the two recovery reservations");
+    assert.equal(finished.deliveryRecovery?.disposition, "no-publication");
+
+    const initialAttempt = finished.members.find(member => member.memberId === initial.members.find(item => item.role === "delivery")?.memberId);
+    assert.equal(initialAttempt?.report?.kind, "blocked");
+    const inspection = finished.members.find(member => member.report?.kind === "delivery-reconciliation");
+    assert.ok(inspection?.report?.kind === "delivery-reconciliation");
+    assert.equal(inspection.report.headCommit, initial.headCommit);
+    assert.equal(inspection.report.baseHeadCommit, initial.baseCommit);
+    assert.equal(inspection.report.disposition, "no-publication");
+    const repairAttempt = finished.members.find(member => member.report?.kind === "delivery-repair");
+    assert.ok(repairAttempt?.report?.kind === "delivery-repair");
+    assert.equal(repairAttempt.report.headCommit, initial.headCommit, "delivery repair is pinned to the inspected same head");
+    assert.equal(repairAttempt.baseCommit, initial.headCommit);
+    const integrator = finished.members.find(member => member.role === "integrator" && member.report?.kind === "result");
+    assert.ok(integrator);
+    assert.equal(integrator.baseCommit, initial.headCommit);
+    assert.match(integrator.report?.kind === "result" ? integrator.report.summary : "", /repair/i);
+    assert.equal(readFileSync(join(finished.workspace, "repair.txt"), "utf8"), `${integrator.memberId}\n`);
+
+    const checks = finished.checks.filter(check => check.revision === finished.revision && check.headCommit === finished.headCommit);
+    assert.ok(checks.length > 0 && checks.every(check => check.status === "passed" && check.headCommit === finished.headCommit),
+      "required checks pass against the repaired head");
+    assert.ok(finished.checks.some(check => check.revision === finished.revision && check.headCommit === initial.headCommit),
+      "the blocked delivery's original checked head remains in the run history");
+    const reviewer = finished.members.find(member => member.role === "reviewer" && member.revision === finished.revision && member.baseCommit === finished.headCommit);
+    assert.equal(reviewer?.modelProfile?.tier, "strong");
+    assert.equal(reviewer?.report?.kind, "review");
+    assert.ok(checks.every(check => Date.parse(check.finishedAt!) < Date.parse(reviewer!.startedAt!)), "checks finish before independent review starts");
+    const publisher = finished.members.find(member => member.role === "delivery" && member.report?.kind === "pull-request");
+    assert.equal(publisher?.modelProfile?.tier, "strong");
+    assert.equal(publisher?.baseCommit, finished.headCommit);
+    assert.equal(publisher?.report?.kind, "pull-request");
+    assert.ok(Date.parse(reviewer!.reportedAt!) < Date.parse(publisher!.startedAt!), "the final delivery starts after review evidence");
+    assert.equal(finished.members.filter(member => member.report?.kind === "pull-request").length, 1,
+      "exactly one publication outcome is reported for the repaired head");
+
+    const inspections = readFileSync(join(f.receipts, "delivery-reconciliations.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(inspections.length, 1);
+    assert.deepEqual([inspections[0].headCommit, inspections[0].repository, inspections[0].branch, inspections[0].baseHeadCommit, inspections[0].disposition],
+      [initial.headCommit, "example/app", initial.branch, initial.baseCommit, "no-publication"]);
+    const attempts = readFileSync(join(f.receipts, "delivery-attempts.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(attempts.filter((item: { reconciling: boolean }) => item.reconciling).length, 1);
+    assert.equal(attempts.length, 4, "one blocked attempt, one inspection, one same-head repair retry, and one final PR attempt");
+    assert.deepEqual(attempts.map((item: { head: string }) => item.head), [initial.headCommit, initial.headCommit, initial.headCommit, finished.headCommit]);
+  } finally {
+    writeFileSync(join(f.receipts, "delivery-release"), "release", { mode: 0o600 });
+    await f.close();
+  }
+});
+
+test("an existing matching pull request is reused for bounded merge-policy delivery", { timeout: 30000 }, async () => {
+  const h = await blockedDeliveryRecord();
+  try {
+    h.run.status = "delivering";
+    h.consume({ kind: "delivery-reconciliation", headCommit: h.headCommit, repository: "example/app", branch: h.run.branch!,
+      baseHeadCommit: h.run.baseCommit!, disposition: "pull-request", remoteHeadCommit: h.headCommit,
+      pullRequestUrl: "https://github.com/example/app/pull/1", summary: "The matching reviewed PR exists and has not merged." });
+    const next = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.members.length > 1 || run.status === "blocked", 15000);
+    assert.notEqual(next.status, "blocked", next.reason);
+    assert.equal(next.deliveryRecovery?.attempts, 1);
+    assert.equal(next.deliveryReceipt, undefined, "an open PR is not a merge receipt");
+    assert.equal(next.pullRequest, undefined, "merge policy still requires guarded merge delivery");
+    assert.equal(next.members.length, 2, "one coordinator continues the existing PR");
+    assert.equal(next.members[1].role, "delivery");
+    assert.equal(next.members[1].baseCommit, h.headCommit);
+  } finally { await h.f.close(); }
+});
+
+test("automatic delivery inspection stops on dirty integration", { timeout: 90000 }, async () => {
+  const f = await fixture("delivery-capability-failure", limitLineup, {}, { deliveryMode: "pr" });
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const initial = await waitFor(() => f.get(created.body.id), run =>
+      run.status === "delivering" && existsSync(join(f.receipts, "delivery-started.json")), 90000);
+    writeFileSync(join(initial.workspace, "untracked-delivery-change"), "preserve this change\n");
+    writeFileSync(join(f.receipts, "delivery-branch"), initial.branch!, { mode: 0o600 });
+    writeFileSync(join(f.receipts, "delivery-base-head"), initial.baseCommit!, { mode: 0o600 });
+    writeFileSync(join(f.receipts, "delivery-release"), "release", { mode: 0o600 });
+
+    const blocked = await f.settled(initial.id);
+    assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
+    assert.equal(blocked.id, initial.id);
+    assert.equal(blocked.members.filter(member => member.role === "delivery").length, 1, "no reconciliation or retry worker launches");
+    assert.equal(existsSync(join(f.receipts, "delivery-reconciliations.jsonl")), false, "no remote inspection is requested");
+    const attempts = readFileSync(join(f.receipts, "delivery-attempts.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(attempts.length, 1, "only the original publication attempt runs");
+    assert.equal(readFileSync(join(initial.workspace, "untracked-delivery-change"), "utf8"), "preserve this change\n");
+    assert.match(blocked.reason ?? "", /dirty|changed|read-only/i);
+  } finally {
+    writeFileSync(join(f.receipts, "delivery-release"), "release", { mode: 0o600 });
+    await f.close();
+  }
+});
+
+test("automatic delivery recovery refuses a changed publication policy", { timeout: 30000 }, async () => {
+  const h = await blockedDeliveryRecord();
+  try {
+    h.f.host.config.projects[0]!.team!.delivery!.repository = "example/changed";
+    const prior = { revision: h.run.revision, members: h.run.members.length, attempt: structuredClone(h.stored.deliveryAttempt), events: h.run.events.length };
+    h.consume({ kind: "blocked", summary: "The provider lacks the publication capability; no publication was attempted." });
+    assert.equal(h.run.status, "blocked");
+    assert.equal(h.run.revision, prior.revision);
+    assert.equal(h.run.members.length, prior.members, "a changed owner policy must not start a reconciliation member");
+    assert.deepEqual(h.stored.deliveryAttempt, prior.attempt);
+    assert.equal(h.run.deliveryRecovery, undefined);
+    assert.equal(h.run.events.length, prior.events + 1);
+  } finally { await h.f.close(); }
+});
+
+test("a moved README base with no publication is reconciled, rechecked, strongly reviewed, and published once", { timeout: 180000 }, async () => {
+  const f = await fixture("delivery-base-recovery", limitLineup, {}, { deliveryMode: "pr" });
+  let teams: Awaited<ReturnType<typeof f.openTeamService>> | undefined;
+  try {
+    const mirror = join(f.host.root, "source-mirror.git");
+    git(f.source, "clone", "--bare", f.source, mirror);
+    let sourceStatus: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: git(f.source, "rev-parse", "HEAD") };
+    const source: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> = {
+      refresh: async () => sourceStatus,
+      mirrorPath: () => mirror,
+      isGithub: projectId => projectId === "rehearsal",
+      status: () => sourceStatus,
+    };
+    teams = await f.openTeamService({ source });
+    const created = await teams.create(f.create());
+    const initial = await waitFor(() => Promise.resolve(teams!.get(created.id)), run =>
+      run.status === "blocked" || run.status === "delivering" && existsSync(join(f.receipts, "delivery-started.json")), 120000);
+    if (initial.status !== "delivering") {
+      const missing = await Promise.all(initial.members.filter(member => member.role === "implementer" && !member.report).map(async member =>
+        ({ memberId: member.memberId, status: member.status, session: (await f.host.fetchApi(`/sessions/${member.sessionId}`)).body })));
+      assert.equal(initial.status, "delivering", JSON.stringify({ run: initial, missing }));
+    }
+    const oldWorkspace = initial.workspace;
+    const oldHead = initial.headCommit;
+    const oldBase = initial.baseCommit;
+    assert.equal(git(oldWorkspace, "status", "--porcelain"), "");
+
+    writeFileSync(join(f.source, "README.md"), `${readFileSync(join(f.source, "README.md"), "utf8")}Upstream moved README footer\n`);
+    git(f.source, "add", "README.md");
+    git(f.source, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "Move the README base");
+    const movedBase = git(f.source, "rev-parse", "HEAD");
+    git(mirror, "fetch", "--no-tags", "--", f.source, "+refs/heads/main:refs/heads/main");
+    sourceStatus = { ...sourceStatus, mirrorHead: movedBase };
+    writeFileSync(join(f.receipts, "delivery-branch"), initial.branch!, { mode: 0o600 });
+    writeFileSync(join(f.receipts, "delivery-base-head"), movedBase, { mode: 0o600 });
+    writeFileSync(join(f.receipts, "delivery-release"), "release", { mode: 0o600 });
+
+    const finished = await waitFor(() => Promise.resolve(teams!.get(created.id)), run =>
+      run.status === "ready-for-review" || run.status === "blocked", 150000);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    assert.equal(finished.id, initial.id, "baseline recovery keeps one durable run");
+    assert.ok(finished.revision > initial.revision, "a moved baseline requires fresh implementation and review evidence");
+    assert.equal(finished.baseCommit, movedBase);
+    assert.notEqual(finished.headCommit, oldHead);
+    assert.equal(finished.branch, initial.branch);
+    assert.equal(finished.pullRequest?.headCommit, finished.headCommit);
+    assert.equal(finished.deliveryReceipt, undefined, "PR-only policy never records a merge claim");
+    assert.equal(finished.deliveryRecovery?.status, "complete");
+    assert.equal(finished.deliveryRecovery?.attempts, 2, "the initial remote inspection and fresh-base reconciliation consume the two recovery allowances");
+    assert.equal(finished.deliveryRecovery?.disposition, "no-publication");
+    assert.equal(finished.deliveryRecovery?.baseHeadCommit, movedBase);
+
+    const currentChecks = finished.checks.filter(check => check.revision === finished.revision);
+    assert.ok(currentChecks.length > 0 && currentChecks.every(check => check.status === "passed" && check.headCommit === finished.headCommit),
+      "all required checks pass against the new reviewed head");
+    const reviewer = finished.members.find(member => member.role === "reviewer" && member.revision === finished.revision);
+    const publisher = finished.members.find(member => member.role === "delivery" && member.report?.kind === "pull-request");
+    assert.equal(reviewer?.modelProfile?.tier, "strong");
+    assert.equal(reviewer?.baseCommit, finished.headCommit);
+    assert.equal(publisher?.modelProfile?.tier, "strong");
+    assert.equal(publisher?.baseCommit, finished.headCommit);
+    assert.equal(publisher?.report?.kind, "pull-request");
+
+    const readme = git(finished.workspace, "show", "HEAD:README.md");
+    assert.match(readme, /Upstream moved README footer/);
+    assert.match(readme, /Team update revision/);
+    assert.equal(finished.members.filter(member => member.revision === finished.revision && member.role === "project-manager").length, 0,
+      "validated baseline import proceeds to verification without planning unrelated replacement work");
+    for (const name of ["a.txt", "b.txt"])
+      assert.equal(readFileSync(join(finished.workspace, name), "utf8"), readFileSync(join(oldWorkspace, name), "utf8"),
+        `${name} retains the reviewed implementation after baseline reconciliation`);
+    const integrator = finished.members.find(member => member.role === "integrator" && member.revision === initial.revision + 1);
+    assert.equal(integrator?.report?.kind, "result");
+    for (const name of ["a.txt", "b.txt"])
+      assert.equal(readFileSync(join(integrator!.cwd, name), "utf8"), readFileSync(join(oldWorkspace, name), "utf8"),
+        `${name} is imported from the preserved integration workspace before new implementation starts`);
+    const importedReadme = readFileSync(join(integrator!.cwd, "README.md"), "utf8");
+    assert.match(importedReadme, /Upstream moved README footer/);
+    assert.match(importedReadme, /Team update revision/);
+    assert.match(git(oldWorkspace, "show", "HEAD:README.md"), /Team update revision/);
+    assert.ok(existsSync(oldWorkspace), "the original integration workspace remains available as recovery evidence");
+    assert.equal(git(oldWorkspace, "rev-parse", "HEAD"), oldHead, "automatic rebase preserves the old integration head");
+
+    const inspections = readFileSync(join(f.receipts, "delivery-reconciliations.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(inspections.length, 1);
+    assert.equal(inspections[0].headCommit, oldHead);
+    assert.equal(inspections[0].baseHeadCommit, movedBase);
+    assert.equal(inspections[0].disposition, "no-publication");
+    const finalDeliveries = finished.members.filter(member => member.report?.kind === "pull-request");
+    assert.equal(finalDeliveries.length, 1, "only one pull request is reported for the recovered reviewed head");
+  } finally {
+    writeFileSync(join(f.receipts, "delivery-release"), "release", { mode: 0o600 });
+    await f.close();
+  }
+});
+
 test("owner delivery reconciliation refuses unsafe prior attempts without changing team state", { timeout: 90000 }, async () => {
   const scenarios = ["dirty", "head-drift", "active-member", "uncertain-permission", "wrong-role"] as const;
   for (const scenario of scenarios) {
@@ -228,6 +492,32 @@ test("owner delivery reconciliation starts one strong worker at the pinned head 
     await h.teams.reconcileDelivery(h.id, request);
     assert.equal(h.run.members.length, 2, "an idempotent retry must not queue another delivery member");
     assert.equal(h.stored.deliveryAttempt?.memberId, fresh.memberId);
+  } finally { await h.f.close(); }
+});
+
+test("restart reserves a persisted blocked delivery attempt once without replaying its report", { timeout: 90000 }, async () => {
+  const h = await blockedDeliveryRecord();
+  try {
+    (h.teams as unknown as { save(stored: unknown): void }).save(h.stored);
+    h.teams.close(); await h.teams.idle();
+
+    const first = await h.f.openTeamService({ start: false });
+    const firstRestore = first.get(h.id);
+    assert.equal(firstRestore.status, "planning");
+    assert.equal(firstRestore.deliveryRecovery?.status, "stopping");
+    assert.equal(firstRestore.deliveryRecovery?.attempts, 1);
+    assert.equal(firstRestore.recovery?.attempts, 1);
+    assert.equal(firstRestore.members.filter(member => member.role === "delivery").length, 1);
+    first.close(); await first.idle();
+
+    const second = await h.f.openTeamService({ start: false });
+    const secondRestore = second.get(h.id);
+    assert.equal(secondRestore.status, "planning");
+    assert.equal(secondRestore.deliveryRecovery?.status, "stopping");
+    assert.equal(secondRestore.deliveryRecovery?.attempts, 1, "a second restart must not reserve another inspection attempt");
+    assert.equal(secondRestore.recovery?.attempts, 1);
+    assert.equal(secondRestore.members.filter(member => member.role === "delivery").length, 1, "the blocked delivery report remains historical evidence");
+    assert.equal(secondRestore.members[0]?.report?.kind, "blocked");
   } finally { await h.f.close(); }
 });
 

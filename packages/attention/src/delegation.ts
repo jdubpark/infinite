@@ -18,7 +18,8 @@ export function dialogCommand(prompt: Pick<Prompt, "title" | "detail">): string 
   if (starts.length !== 1) return undefined;
   const start = starts[0];
   const command = [lines[start].slice(2).trim(), ...lines.slice(start + 1)];
-  if (!command[0] || command.some(line => /(?:…|\.\.\.)$/.test(line))) return undefined;
+  // A line cut by the screen or by the parser's detail cap ("… [+N chars]") is not a complete command.
+  if (!command[0] || command.some(line => /(?:…|\.\.\.)(?:\s*\[\+\d+ chars\])?$/.test(line))) return undefined;
   return command.join("\n");
 }
 

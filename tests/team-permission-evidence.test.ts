@@ -145,3 +145,16 @@ test("accepts a literal scoped staging and conflict-check chain without requirin
     assert.deepEqual(result.files.map(file => file.path), ["scripts/run.mjs"]);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
+
+test("an emitted .js import specifier is read from its TypeScript source", () => {
+  const cwd = workspace();
+  try {
+    mkdirSync(join(cwd, "src"));
+    mkdirSync(join(cwd, "tests"));
+    writeFileSync(join(cwd, "tests/retire.test.ts"), 'import { stop } from "../src/retire.js";\nstop();\n');
+    writeFileSync(join(cwd, "src/retire.ts"), "export function stop() {}\n");
+    const snapshot = collectPermissionEvidence({ prompt: screen("node --import tsx --test tests/retire.test.ts"), cwd, changedPaths: ["tests/retire.test.ts"] });
+    assert.deepEqual(snapshot.files.map(file => file.path).sort(), ["src/retire.ts", "tests/retire.test.ts"]);
+    assert.ok(!snapshot.limitations.some(limitation => /retire/.test(limitation)), snapshot.limitations.join("\n"));
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});

@@ -5,7 +5,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { claimControl, waitFor } from "./helpers.js";
 import { fixture, git, limitLineup } from "./team-fixture.js";
-import type { TeamLineup } from "../packages/host/src/team-types.js";
+import { DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE, LEGACY_DEFAULT_PERMISSION_SCOPES, currentPermissions, type TeamLineup } from "../packages/host/src/team-types.js";
 import { refusedBeforeSend } from "../packages/host/src/team-permissions.js";
 import { permissionEvidenceDigest } from "../packages/host/src/team-permission-evidence.js";
 import { ContentError } from "../packages/host/src/session-content.js";
@@ -24,6 +24,17 @@ function addInspectableCheckPackage(f: Awaited<ReturnType<typeof fixture>>) {
   git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Add inspectable check script");
   return { packageManifest, checkSource: readFileSync(join(source, "check.mjs"), "utf8") };
 }
+
+test("a saved default policy follows the current default; an owner-written scope or lowered limit is kept", () => {
+  for (const scope of LEGACY_DEFAULT_PERMISSION_SCOPES) {
+    assert.deepEqual(currentPermissions({ mode: "coordinator", scope, maxDecisions: 10 }), { mode: "coordinator", scope: DEFAULT_PERMISSION_SCOPE, maxDecisions: DEFAULT_PERMISSION_LIMIT });
+    assert.deepEqual(currentPermissions({ mode: "coordinator", scope, maxDecisions: 3 }), { mode: "coordinator", scope: DEFAULT_PERMISSION_SCOPE, maxDecisions: 3 });
+  }
+  const custom = { mode: "coordinator" as const, scope: "Read files and run the configured check only.", maxDecisions: 10 };
+  assert.deepEqual(currentPermissions(custom), custom);
+  assert.match(DEFAULT_PERMISSION_SCOPE, /Escalate only production or staging actions such as deploy, promote, roll out, release or publish/);
+  assert.match(DEFAULT_PERMISSION_SCOPE, /may run outside the provider sandbox and use network access, local sockets, IPC/);
+});
 
 test("only a preflight or named worker refusal counts as an answer that sent nothing", () => {
   assert.equal(refusedBeforeSend(new ContentError("The assigned team member has no running managed terminal")), true);

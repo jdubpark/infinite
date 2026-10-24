@@ -7,7 +7,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
-import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery } from "./team-types.js";
+import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
 import { describeSource } from "./client.js";
 import type { ProjectSourceStatus } from "./project-source.js";
 import { captureWorkspace } from "./workspace-checkpoint.js";
@@ -620,8 +620,8 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       throw new Error("This host does not support delegated permissions. Upgrade it or use --permissions off before running repo init.");
     const permissions = permissionMode === "off" ? undefined : configureCoordinatorPermissions ? teamPermissionsSchema.parse({
       mode: "coordinator",
-      scope: String(options["--permission-scope"] ?? "Approve one-time development operations required by the accepted objective and assigned role, including repository inspection and fetch, scoped edits and staging, test planning, builds, tests and local browser checks. These may run outside the provider sandbox and use task-owned temporary files while preserving the assigned repository and path scope. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, persistent approvals, permission bypasses and unclear effects."),
-      maxDecisions: Number(options["--permission-limit"] ?? 10),
+      scope: String(options["--permission-scope"] ?? DEFAULT_PERMISSION_SCOPE),
+      maxDecisions: Number(options["--permission-limit"] ?? DEFAULT_PERMISSION_LIMIT),
     }) : target.team?.permissions;
 
     if (projectConfig.establishChecks && me.teams?.establishChecks !== 1)

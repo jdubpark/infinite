@@ -15,6 +15,7 @@ import type { Config } from "../packages/host/src/types.js";
 import { homedir, tmpdir } from "node:os";
 import { claimControl, startHost, waitFor } from "./helpers.js";
 import { fixture as teamFixture, mixedLineup } from "./team-fixture.js";
+import { DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE } from "../packages/host/src/team-types.js";
 
 const exec = promisify(execFile);
 const wait = async (predicate: () => boolean | Promise<boolean>, timeout = 10000) => {
@@ -1231,16 +1232,12 @@ test("repository CLI pins, preserves and removes owner permission delegation", {
   try {
     await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
     const first = JSON.parse((await enroll()).stdout);
-    assert.deepEqual(first.team.permissions, {
-      mode: "coordinator",
-      scope: "Approve one-time development operations required by the accepted objective and assigned role, including repository inspection and fetch, scoped edits and staging, test planning, builds, tests and local browser checks. These may run outside the provider sandbox and use task-owned temporary files while preserving the assigned repository and path scope. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, persistent approvals, permission bypasses and unclear effects.",
-      maxDecisions: 10,
-    });
+    assert.deepEqual(first.team.permissions, { mode: "coordinator", scope: DEFAULT_PERMISSION_SCOPE, maxDecisions: DEFAULT_PERMISSION_LIMIT });
     const delegated = JSON.parse((await enroll("--permissions", "coordinator", "--permission-scope", "Read files and run the configured check only.", "--permission-limit", "3")).stdout);
     assert.deepEqual(delegated.team.permissions, { mode: "coordinator", scope: "Read files and run the configured check only.", maxDecisions: 3 });
     const retained = JSON.parse((await enroll()).stdout);
     assert.deepEqual(retained.team.permissions, delegated.team.permissions);
-    await assert.rejects(enroll("--permissions", "coordinator", "--permission-limit", "21"));
+    await assert.rejects(enroll("--permissions", "coordinator", "--permission-limit", "51"));
     assert.deepEqual((await run.host.fetchApi("/projects/rehearsal/team")).body.team.permissions, delegated.team.permissions);
     const forbidden = await run.host.fetchApi("/projects/rehearsal/team", "controller", {
       requestId: randomUUID(), revision: retained.revision, team: { ...retained.team, permissions: { ...delegated.team.permissions, scope: "Broaden scope" } },

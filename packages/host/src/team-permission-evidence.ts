@@ -8,6 +8,8 @@ const MAX_FILES = 20;
 const MAX_FILE_BYTES = 16 * 1024;
 const MAX_TOTAL_BYTES = 36 * 1024;
 const EXCLUDED = /^(?:\.git|node_modules|.*\.env(?:\..*)?|\.npmrc|\.pypirc|\.netrc|credentials?(?:\..*)?|secrets?(?:\..*)?|private|\.local|id_rsa|id_ed25519|[^/]+\.(?:pem|key))$/i;
+/** Emitted JavaScript specifiers and the TypeScript sources they are compiled from. */
+const TYPESCRIPT_SOURCES: Record<string, string[]> = { ".js": [".ts", ".tsx"], ".mjs": [".mts"], ".cjs": [".cts"], ".jsx": [".tsx"] };
 const RELEVANT_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".sh", ".bash", ".py", ".json", ".yaml", ".yml", ".toml", ".mk"]);
 const SCRIPT_RUNNERS = new Set(["node", "tsx", "ts-node", "bun", "deno", "python", "python3", "sh", "bash"]);
 const SAFE_PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn"]);
@@ -394,6 +396,13 @@ function collectStaticLocalReferences(file: PermissionEvidenceFile, root: string
   const parent = scratchMatch ? join(scratchRoots[Number(scratchMatch[1])] ?? root, scratchMatch[2]) : join(root, file.path);
   for (const ref of refs) {
     let candidate = resolve(dirname(parent), ref);
+    // TypeScript ESM sources import each other by their emitted `.js` names; read the source that
+    // the test or script actually runs under a TypeScript loader when no emitted file exists.
+    const sourceExtensions = TYPESCRIPT_SOURCES[extname(candidate)];
+    if (sourceExtensions && !existsRegular(candidate)) {
+      const source = sourceExtensions.map(extension => candidate.slice(0, -extname(candidate).length) + extension).find(existsRegular);
+      if (source) candidate = source;
+    }
     if (!extname(candidate)) {
       const match = [".ts", ".tsx", ".js", ".mjs", ".cjs", ".sh", ".bash", ".py", ".json"].find(extension => existsRegular(candidate + extension));
       if (match) candidate += match;

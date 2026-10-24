@@ -1,4 +1,5 @@
 import test from "node:test";
+import type { Prompt } from "@infinite/attention";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -1836,7 +1837,11 @@ test("permission coordinator prompt reviews complete command evidence within the
   assert.match(prompt, /HEAD, local branch names, implicit refspecs and remote aliases do not bind publication/);
   assert.match(prompt, /Ordinary implementation and review roles must not push or publish/);
   assert.match(prompt, /A reviewer normally has targetTask null/);
-  assert.match(prompt, /Never approve package or tool installation\/download, deployment, credential access, global\/account-setting changes/);
+  assert.match(prompt, /Routine development operations are the owner's delegation to you: approve them by default/);
+  assert.match(prompt, /an uncollected repository file that the member did not change \(absent from feedback\.targetChangedPaths\) and that the visible command merely tests, builds or runs is a limitation to report, not a reason to escalate/);
+  assert.match(prompt, /Escalate when an uncollected or omitted file is an executable entrypoint, script or helper that the member changed/);
+  assert.match(prompt, /Escalate when the command is a production or staging action \(deploy, promote, roll out, release, publish\)/);
+  assert.match(prompt, /Never approve global tool installation, deployment, credential access, global\/account-setting changes/);
   assert.match(prompt, /Owner-authorized permission scope \(pinned for this run\):\nPinned one-time task scope/);
   assert.match(prompt, /host rechecks the exact prompt, evidence snapshot, and current authority and alone applies any answer/);
   assert.ok(prompt.includes(evidence));
@@ -2063,6 +2068,40 @@ test(`a ${refusal} pre-delivery refusal with ${protection} ${earlierStop ? "reta
       assert.equal(f.state.status, "running");
       assert.equal(teams.get(f.run.id).members.length, 1);
     }
+  } finally { f.close(); }
+});
+
+test("promptOwner says who a member's prompt waits on: the coordinator, the owner, or a review not yet started", async () => {
+  const f = schedulerFixture();
+  try {
+    const member = f.run.members[0];
+    const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" }] };
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+    f.writeTeam();
+    const teams = f.openTeam();
+    assert.equal(teams.promptOwner(member.sessionId, prompt), "undecided", "a delegated run may still start the review");
+    assert.equal(teams.promptOwner(randomUUID(), prompt), "user", "a session outside any run is the owner's");
+    assert.equal(teams.promptOwner(member.sessionId, { ...prompt, pinned: false }), "user", "incomplete one-shot evidence stays with the owner");
+    const decision = { id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: member.memberId, targetSessionId: member.sessionId,
+      targetCwd: member.cwd, promptId: 1, promptHash: prompt.hash!, evidenceHash: "c".repeat(64), option: 0, prompt,
+      expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), status: "reviewing" as const };
+    // "answering" is not observable through a reloaded service: restart recovery marks it uncertain, which is the owner's.
+    for (const [status, owner] of [["pending", "coordinator"], ["reviewing", "coordinator"], ["approved", "coordinator"], ["answering", "user"],
+      ["escalated", "user"], ["uncertain", "user"], ["answered", "user"], ["stale", "user"]] as const) {
+      f.run.permissionDecisions = [{ ...decision, status }];
+      f.writeTeam();
+      assert.equal(f.openTeam().promptOwner(member.sessionId, prompt), owner, status);
+    }
+    f.run.permissionDecisions = [{ ...decision, id: randomUUID(), promptId: 7, status: "answered" }, { ...decision, id: randomUUID(), promptId: 8, status: "answered" }];
+    f.writeTeam();
+    assert.equal(f.openTeam().promptOwner(member.sessionId, prompt), "user", "a run that spent its decisions cannot act");
+    f.run.permissionDecisions = [];
+    f.run.permissionsRevokedAt = new Date().toISOString();
+    f.writeTeam();
+    assert.equal(f.openTeam().promptOwner(member.sessionId, prompt), "user", "revoked delegation leaves the prompt with the owner");
   } finally { f.close(); }
 });
 

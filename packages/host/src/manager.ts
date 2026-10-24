@@ -29,6 +29,8 @@ import { ContentError } from "./session-content.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { teamModelProfileSchema, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
+import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
+import { TeamError } from "./team-workspace.js";
 import type {
   Config,
   Provider,
@@ -59,6 +61,19 @@ export interface CreateSession {
 interface StoredSession {
   session: Session;
   fingerprint: string;
+}
+interface StoredTeamRetirement {
+  state: "stopping" | "retired";
+  requestId: string;
+  identity: string;
+  sessionId: string;
+  seq: number;
+  agentUid: number | null;
+  known: RuntimeProcess[];
+  at: string;
+  stoppedAt?: string;
+  processes?: RuntimeProcess[];
+  unsignalable?: number[];
 }
 interface DeletedSessionReceipt {
   id: string;
@@ -342,6 +357,86 @@ export class Manager {
     const operation = this.serial.then(() => this.createOnce({ ...request, team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}) }, workspaceTrusted));
     this.serial = operation.catch(() => {});
     return operation;
+  }
+  async inspectTeamRuntime(sessionId: string, team: TeamAssignment): Promise<TeamRuntimeInspection> {
+    const stored = this.meta(sessionId).session;
+    const same = (left: TeamAssignment | undefined) => Boolean(left && left.runId === team.runId && left.memberId === team.memberId &&
+      left.revision === team.revision && left.role === team.role && left.taskId === team.taskId);
+    if (!same(stored.team)) throw new TeamError(403, "team-assignment-mismatch", "This session does not match the exact team assignment.");
+    const state = await this.state(sessionId);
+    if (state.control) throw new TeamError(409, "control-busy", "A person currently controls this session.");
+    if (state.status !== "recording-error") throw new TeamError(409, "runtime-not-retirable", "Only a runtime in recording-error can be retired.");
+    let sealed: WorkerState;
+    try { sealed = unseal<WorkerState>(this.key, `${sessionId}:status`, readFileSync(join(this.config.stateDir, "sessions", sessionId, "status.sealed"), "utf8")); }
+    catch { throw new TeamError(409, "runtime-identity-changed", "The sealed worker identity is unavailable."); }
+    const workerPid = sealed.workerPid;
+    if (!workerPid || !Number.isSafeInteger(workerPid) || workerPid <= 1) throw new TeamError(409, "runtime-identity-changed", "The sealed worker identity is invalid.");
+    const processes = await inventoryRuntimeProcesses();
+    const worker = processes.find(row => row.pid === workerPid);
+    if (!worker) throw new TeamError(409, "runtime-identity-changed", "The sealed worker process is no longer alive.");
+    const pid = state.pid ?? sealed.pid ?? null;
+    const pty = pid === null ? undefined : processes.find(row => row.pid === pid);
+    if (pid === null || !pty || pty.parent !== workerPid) throw new TeamError(409, "runtime-identity-changed", "The PTY process no longer belongs to the sealed worker.");
+    const selected = new Set([workerPid]);
+    for (;;) { const before = selected.size; for (const row of processes) if (selected.has(row.parent)) selected.add(row.pid); if (selected.size === before) break; }
+    const tree = processes.filter(row => selected.has(row.pid));
+    if (tree.some(row => row.pid === process.pid || row.pid <= 1)) throw new TeamError(409, "runtime-identity-changed", "The runtime tree contains an unsafe process identity.");
+    const boundary = this.config.teams?.commandPrefix ? agentBoundary(this.config.teams.commandPrefix, stored.cwd) : undefined;
+    const agentUid = boundary ? await boundary.uid() : null;
+    const identity = runtimeIdentity(sessionId, team, stored.runtime?.id ?? null, worker, pid, pty);
+    return { sessionId, status: "recording-error", runtimeId: stored.runtime?.id ?? null, workerPid, pid, seq: state.seq,
+      ...(state.attention?.since ? { since: state.attention.since } : {}), agentUid, processes: tree, identity };
+  }
+  retireTeamRuntime(sessionId: string, requestId: string, team: TeamAssignment, identity: string): Promise<TeamRuntimeRetirement> {
+    const operation = this.serial.then(() => this.retireTeamRuntimeOnce(sessionId, requestId, team, identity));
+    this.serial = operation.catch(() => {});
+    return operation;
+  }
+  private async retireTeamRuntimeOnce(sessionId: string, requestId: string, team: TeamAssignment, identity: string): Promise<TeamRuntimeRetirement> {
+    const stored = this.meta(sessionId).session;
+    const matches = stored.team && stored.team.runId === team.runId && stored.team.memberId === team.memberId &&
+      stored.team.revision === team.revision && stored.team.role === team.role && stored.team.taskId === team.taskId;
+    if (!matches) throw new TeamError(403, "team-assignment-mismatch", "This session does not match the exact team assignment.");
+    if (!/^[a-f0-9]{64}$/.test(identity) || !requestId) throw new TeamError(409, "retirement-conflict", "A valid retirement request and inspected identity are required.");
+    const file = join(this.config.stateDir, "sessions", sessionId, "retirement.sealed"), scope = `${sessionId}:retirement`;
+    let record: StoredTeamRetirement;
+    if (existsSync(file)) {
+      try { record = unseal<StoredTeamRetirement>(this.key, scope, readFileSync(file, "utf8")); }
+      catch { throw new TeamError(409, "retirement-conflict", "The existing runtime retirement record cannot be authenticated."); }
+      if (record.requestId !== requestId || record.identity !== identity || record.sessionId !== sessionId) throw new TeamError(409, "retirement-conflict", "A different runtime retirement already owns this session.");
+      if (record.state === "retired") return { state: "retired", requestId, identity, sessionId, seq: record.seq,
+        stoppedAt: record.stoppedAt!, processes: record.processes ?? record.known, unsignalable: record.unsignalable ?? [] };
+    } else {
+      const inspection = await this.inspectTeamRuntime(sessionId, team);
+      if (inspection.identity !== identity) throw new TeamError(409, "runtime-identity-changed", "The runtime identity changed before retirement began.");
+      // Establish the configured process boundary before sealing a record or signaling anything.
+      const boundary = this.config.teams?.commandPrefix ? agentBoundary(this.config.teams.commandPrefix, stored.cwd) : undefined;
+      const agentUid = boundary ? await boundary.uid() : null;
+      if (inspection.agentUid !== agentUid) throw new TeamError(409, "runtime-identity-changed", "The configured agent identity changed before retirement began.");
+      record = { state: "stopping", requestId, identity, sessionId, seq: inspection.seq, agentUid, known: inspection.processes, at: new Date().toISOString() };
+      writeSealed(file, this.key, scope, record);
+    }
+    const currentState = await this.state(sessionId);
+    if (currentState.control) throw new TeamError(409, "control-busy", "A person currently controls this session.");
+    if (currentState.status !== "recording-error") throw new TeamError(409, "runtime-not-retirable", "Only a runtime in recording-error can be retired.");
+    const boundary = this.config.teams?.commandPrefix ? agentBoundary(this.config.teams.commandPrefix, stored.cwd) : undefined;
+    const agentUid = boundary ? await boundary.uid() : null;
+    if (record.agentUid !== agentUid) throw new TeamError(409, "runtime-identity-changed", "The configured agent identity changed during retirement.");
+    const sealed = unseal<WorkerState>(this.key, `${sessionId}:status`, readFileSync(join(this.config.stateDir, "sessions", sessionId, "status.sealed"), "utf8"));
+    const workerPid = sealed.workerPid;
+    if (!workerPid || !record.known.some(row => row.pid === workerPid)) throw new TeamError(409, "runtime-identity-changed", "The recorded worker identity is unavailable.");
+    try {
+      const result = await stopRuntimeTree(record.known, workerPid, {
+        ...(boundary && agentUid !== null ? { agent: { uid: agentUid, signal: boundary.signal } } : {}),
+      });
+      const retired: StoredTeamRetirement = { ...record, state: "retired", stoppedAt: new Date().toISOString(), known: result.processes, processes: result.processes, unsignalable: result.unsignalable };
+      writeSealed(file, this.key, scope, retired);
+      return { state: "retired", requestId, identity, sessionId, seq: retired.seq, stoppedAt: retired.stoppedAt!, processes: retired.processes!, unsignalable: retired.unsignalable! };
+    } catch (error) {
+      const updated = (error as Error & { knownProcesses?: RuntimeProcess[] }).knownProcesses;
+      if (updated) { record.known = updated; writeSealed(file, this.key, scope, record); }
+      throw error;
+    }
   }
   /** A scheduler may stop only its own member and never take over an active human lease. */
   async stopTeamSession(sessionId: string, requestId: string, team: TeamAssignment): Promise<WorkerState> {

@@ -357,3 +357,87 @@ test("start() takes lifecycle baselines, so a change before the first poll is an
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("notifier holds a team member's prompt while its coordinator can decide and pushes once it is the owner's", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: { title: string; body: string }[][] = [];
+  const sender = async (messages: { title: string; body: string }[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const member = { id: "m1", title: "implementer: retire-member", provider: "codex", status: "running", attention: att("working") };
+  const solo = { id: "s1", title: "Retry logic", provider: "claude", status: "running", attention: att("working") };
+  const sessions = [member, solo];
+  const owners = new Map<string, "coordinator" | "user" | "undecided">();
+  const notifier = new Notifier(
+    { list: async () => sessions } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000, reviewGraceMs: 0, reviewHoldLimitMs: 100000 },
+    { statuses: () => [], promptOwner: (sessionId) => owners.get(sessionId) ?? "user" },
+  );
+  try {
+    await notifier.tick();
+    // The coordinator holds the prompt: no push while it reviews, none when it answers and the prompt closes.
+    owners.set("m1", "coordinator");
+    member.attention = att("needs-you", 1);
+    await notifier.tick();
+    await notifier.tick();
+    assert.equal(sent.length, 0, "a prompt under coordinator review is not the owner's yet");
+    member.attention = att("working");
+    await notifier.tick();
+    assert.equal(sent.length, 0, "an answered prompt never reaches the owner");
+
+    // The coordinator escalates: the owner hears about it exactly once.
+    owners.set("m1", "coordinator");
+    member.attention = att("needs-you", 2);
+    await notifier.tick();
+    owners.set("m1", "user");
+    await notifier.tick();
+    await notifier.tick();
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0][0].body, "Codex needs your approval in implementer: retire-member");
+
+    // A run that never starts a review within the grace period hands the prompt to the owner.
+    member.attention = att("needs-you", 3);
+    owners.set("m1", "undecided");
+    await notifier.tick();
+    assert.equal(sent.length, 1, "the run gets a grace period to start its review");
+    await notifier.tick();
+    assert.equal(sent.length, 2);
+
+    // A prompt without complete one-shot evidence, and any non-team session, push at once.
+    member.attention = att("needs-you", 4);
+    owners.set("m1", "user");
+    solo.attention = att("needs-you", 9);
+    await notifier.tick();
+    assert.equal(sent.length, 3);
+    assert.equal(sent[2].length, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a held prompt survives a session missing from one listing and still reaches the owner", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: unknown[][] = [];
+  const sender = async (messages: unknown[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const member = { id: "m1", title: "implementer: retire-member", provider: "codex", status: "running", attention: att("working") };
+  const sessions = [member];
+  let owner: "coordinator" | "user" = "coordinator";
+  const notifier = new Notifier(
+    { list: async () => sessions } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000, reviewGraceMs: 0, reviewHoldLimitMs: 100000 },
+    { statuses: () => [], promptOwner: () => owner },
+  );
+  try {
+    await notifier.tick();
+    member.attention = att("needs-you", 1);
+    await notifier.tick();
+    sessions.length = 0;               // the listing briefly omits the session
+    await notifier.tick();
+    sessions.push(member);
+    await notifier.tick();
+    assert.equal(sent.length, 0, "the unchanged prompt is still the coordinator's");
+    owner = "user";
+    await notifier.tick();
+    assert.equal(sent.length, 1, "the escalated prompt reaches the owner after the session returns");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

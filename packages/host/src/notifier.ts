@@ -1,12 +1,19 @@
-import { PROVIDER_NAMES, type Attention, type Provider } from "@infinite/attention";
+import { PROVIDER_NAMES, type Attention, type Prompt, type Provider } from "@infinite/attention";
 import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
 
 type Row = { id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } } };
 type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean };
+/** Who a team member's open prompt waits on: the run's delegated coordinator, the owner, or a review the run has not started yet. */
+export type PromptOwner = "coordinator" | "user" | "undecided";
+type Teams = { statuses(): TeamRow[]; promptOwner?(sessionId: string, prompt: Prompt): PromptOwner };
 type GoalRow = { id: string; title: string; status: string; reason?: string };
 type Lifecycle = { id: string; title: string; status: string; reason?: string; resumable?: boolean; kind: "goal" | "team"; event: string; titleText: string; body: string; priority: "default" | "high" };
 const PUSH_STATES = new Set(["needs-you", "turn-finished", "exited", "recording-error"]);
+/** How long a delegated run may take to pick a member's prompt up for review before the owner hears about it. */
+const REVIEW_START_GRACE_MS = 45_000;
+/** A review window is five minutes; a prompt held longer than this reaches the owner even if the run never settled it. */
+const REVIEW_HOLD_LIMIT_MS = 8 * 60_000;
 const REMOVED_LIMIT = 1024;
 const GOAL_EVENTS: Record<string, { event: string; title: string; body: string; priority: "default" | "high" }> = {
   achieved: { event: "goal-finished", title: "Goal finished", body: "finished", priority: "default" },
@@ -28,6 +35,8 @@ const TEAM_EVENTS: Record<string, { event: string; title: string; body: string; 
 
 export class Notifier {
   private seen = new Map<string, string>();
+  /** Needs-you prompts held back because the run's coordinator may answer them, by session id. */
+  private deferred = new Map<string, { key: string; since: number }>();
   private teamStatus = new Map<string, string>();
   private goalStatus = new Map<string, string>();
   private recentlyRemoved = new Map<string, string>();
@@ -39,8 +48,8 @@ export class Notifier {
     private readonly manager: Pick<Manager, "list">,
     private readonly store: PushStore,
     private readonly sender: PushSender,
-    private readonly options: { detail: "minimal" | "full"; events: string[]; intervalMs: number; machineId?: string },
-    private readonly teams?: { statuses(): TeamRow[] },
+    private readonly options: { detail: "minimal" | "full"; events: string[]; intervalMs: number; machineId?: string; reviewGraceMs?: number; reviewHoldLimitMs?: number },
+    private readonly teams?: Teams,
     private readonly goals?: { statuses(): GoalRow[] },
   ) {}
   /** Lifecycle baselines are taken now, synchronously, so a change during the first interval is not absorbed as startup state. */
@@ -50,13 +59,32 @@ export class Notifier {
     const due: Row[] = [];
     try {
       const rows = (await this.manager.list()) as unknown as Row[];
+      const now = Date.now();
       for (const row of rows) {
         const key = `${row.attention.state}:${row.attention.prompt?.id ?? ""}`;
         const previous = this.previous("session", row.id, this.seen);
         this.seen.set(row.id, key);
-        if (this.primed && previous !== key && PUSH_STATES.has(row.attention.state) && this.options.events.includes(row.attention.state)) due.push(row);
+        const held = this.deferred.get(row.id);
+        if (held && held.key !== key) this.deferred.delete(row.id);
+        if (this.primed && previous !== key && PUSH_STATES.has(row.attention.state) && this.options.events.includes(row.attention.state)) {
+          if (this.promptOwner(row) !== "user") { this.deferred.set(row.id, { key, since: now }); continue; }
+          due.push(row);
+        } else if (held && held.key === key) {
+          // A held prompt reaches the owner once it is theirs: the coordinator escalated it, the
+          // run never started a review in time, or the hold outlived any possible review.
+          const owner = this.promptOwner(row);
+          const heldFor = now - held.since;
+          if (owner === "user" || (owner === "undecided" && heldFor >= (this.options.reviewGraceMs ?? REVIEW_START_GRACE_MS)) ||
+              heldFor >= (this.options.reviewHoldLimitMs ?? REVIEW_HOLD_LIMIT_MS)) {
+            this.deferred.delete(row.id);
+            due.push(row);
+          }
+        }
       }
       this.prune("session", this.seen, new Set(rows.map(row => row.id)));
+      // A session missing from one listing keeps its hold, so a prompt that comes back unchanged
+      // can still reach the owner; the hold limit bounds how long an absent session is remembered.
+      for (const [id, held] of this.deferred) if (!this.seen.has(id) && now - held.since >= (this.options.reviewHoldLimitMs ?? REVIEW_HOLD_LIMIT_MS)) this.deferred.delete(id);
       this.primed = true;
     } catch {}
     const lifecycle = [...this.teamEvents(), ...this.goalEvents()];
@@ -81,6 +109,12 @@ export class Notifier {
       else failures.add(ticket.details?.error ?? ticket.message ?? "error");
     });
     if (failures.size) console.warn(`push: ${[...failures].join(", ")}`);
+  }
+  /** A team member's open permission prompt is the owner's unless its run can still decide it. Everything else is always the owner's. */
+  private promptOwner(row: Row): PromptOwner {
+    const prompt = row.attention.prompt;
+    if (row.attention.state !== "needs-you" || !prompt || !this.teams?.promptOwner) return "user";
+    try { return this.teams.promptOwner(row.id, prompt); } catch { return "user"; }
   }
   private teamEvents(): Lifecycle[] {
     if (!this.teams) return [];

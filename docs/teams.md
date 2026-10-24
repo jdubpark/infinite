@@ -984,22 +984,38 @@ The first repository enrollment enables delegation by default:
 infinite repo init
 ```
 
-This pins a repository scope and a limit of ten decisions to each new run. Later
-enrollments preserve the saved policy, including an explicit opt-out. To enable
-delegation on an existing enrollment, pass `--permissions coordinator`. Add
-`--permission-scope TEXT` or `--permission-limit N` to that explicit command to
-change the scope or set a limit from one to twenty. Existing runs remain unchanged.
-An older host without delegation support requires an upgrade or an explicit
-`--permissions off` choice.
+This pins a repository scope and a limit of twenty-five decisions to each new
+run. Later enrollments preserve the saved policy, including an explicit opt-out.
+To enable delegation on an existing enrollment, pass `--permissions coordinator`.
+Add `--permission-scope TEXT` or `--permission-limit N` to that explicit command
+to change the scope or set a limit from one to fifty. Existing runs remain
+unchanged. An older host without delegation support requires an upgrade or an
+explicit `--permissions off` choice.
 
-The default scope approves one-time development operations for the accepted
-objective and assigned role: repository inspection and fetch, scoped edits and
-staging, test planning, builds, tests and local browser checks. These may run
-outside the provider sandbox and use task-owned temporary files while preserving
-the assigned repository and path scope. It
-escalates new credentials, other repositories, global settings, deployment,
-destructive operations, persistent approvals, other permission bypasses and
-unclear effects. Delivery keeps its separate pinned policy.
+The default scope treats routine development work as the coordinator's to
+approve: repository inspection and fetch, scoped edits and staging, dependency
+installation from the repository's declared manifests and lockfiles, test
+planning, builds, tests, scripts, local listeners and local browser checks for
+the accepted objective and assigned role, inside the assigned workspace. These
+may run outside the provider sandbox and use network access, local sockets, IPC
+and task-owned temporary files while preserving the assigned repository and path
+scope. It escalates only production or staging actions (deploy, promote, roll
+out, release, publish), new or external credentials, other repositories, global
+or account settings, destructive operations outside the assigned workspace,
+persistent approvals, permission bypasses, and commands whose effect is
+unrelated to the task or appears malicious. Delivery keeps its separate pinned
+policy. An enrollment whose saved scope is exactly an earlier host default pins
+the current default scope on new runs, and a saved limit of ten (the earlier
+default) becomes the current default limit with it; the host cannot tell an
+explicit ten from the old default. Any other saved scope or limit is kept as
+saved. Re-enroll with `--permission-scope` or `--permission-limit` to pin an
+explicit policy.
+
+While a run's coordinator can still decide a member's prompt, the phone is not
+pushed for it. The push arrives only when the request becomes the owner's: the
+coordinator escalated it, the review window expired, the run spent its decision
+limit or cannot act, or the prompt lacks complete one-shot evidence. A run gets
+a short grace period to start the review before an unreviewed prompt is pushed.
 
 A current one-shot tool prompt can start a separate turn on the run's strong
 Claude coordinator profile. The coordinator receives the task, owner scope and exact

@@ -20,6 +20,13 @@ const OPTION = /^([❯›>]\s*)?(\d{1,2})\.\s+(.+?)$/;
 const RULE = /^[\s─━═│┃┌┐└┘├┤╭╮╰╯\-_=*·]*$/;
 const BOX_TOP = /[╭┌]/;
 const PERMISSION = /do you want to (proceed|make this edit|create|run)|would you like to (run|make)|approve network access|needs your approval|permission/i;
+/**
+ * A dialog whose title sits above its detail, as Codex draws its command and edit dialogs. The
+ * header is complete once this line is reached; whatever stands above it is transcript.
+ */
+const HEADER_TITLE = /^would you like to (run|make) .*\?$/i;
+const HEADER_LIMIT = 12;
+const DETAIL_LIMIT = 2000;
 const QUESTION_OPTION = /^(chat about this|other|skip|type something)/i;
 const MULTI = /a to select all|n to select none/i;
 const YES_NO = /(\[(y\/N|Y\/n|y\/n)\]|\((y\/n|yes\/no)\))\s*:?\s*$/i;
@@ -41,16 +48,24 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
   if (block) {
     const { start, end, options, highlighted } = block;
     const above: string[] = [];
-    for (let i = start - 1; i >= 0 && above.length < 6; i--) {
+    for (let i = start - 1; i >= 0 && above.length < HEADER_LIMIT; i--) {
       // A box's top edge ends the dialog: transcript lines above it are not its header.
       if (OPTION.test(clean[i]) || BOX_TOP.test(clean[i])) break;
       if (clean[i] === "" || RULE.test(clean[i])) continue;
       above.unshift(clean[i]);
+      if (HEADER_TITLE.test(clean[i])) break;
     }
-    const titleIndex = findLastIndex(above, (l) => l.endsWith("?"));
+    // The dialog's own title wins over a reason or description that happens to end with "?":
+    // a top-anchored title first, then the last permission question, then the last question.
+    const headerTitle = above.findIndex((l) => HEADER_TITLE.test(l));
+    const permissionQuestion = findLastIndex(above, (l) => l.endsWith("?") && PERMISSION.test(l));
+    const titleIndex = headerTitle >= 0 ? headerTitle : permissionQuestion >= 0 ? permissionQuestion : findLastIndex(above, (l) => l.endsWith("?"));
     const title = titleIndex >= 0 ? above[titleIndex] : above.at(-1) ?? "";
     const detailLines = above.filter((_, i) => i !== titleIndex && above[i] !== title);
-    const detail = detailLines.length ? detailLines.join("\n").slice(0, 2000) : undefined;
+    // A cut must be visible: delegation treats "… [+N chars]" as incomplete evidence, so a dialog
+    // whose command runs past the cap can never qualify as a complete one-shot request.
+    const joined = detailLines.join("\n");
+    const detail = !detailLines.length ? undefined : joined.length > DETAIL_LIMIT ? `${joined.slice(0, DETAIL_LIMIT)}… [+${joined.length - DETAIL_LIMIT} chars]` : joined;
     const footer = clean.slice(end + 1, end + 3).join(" ");
     const multiSelect = MULTI.test(footer);
     const pinned = clean.slice(end + 1).every((l) => l === "" || RULE.test(l) || KEY_HINT.test(l));

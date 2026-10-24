@@ -267,13 +267,31 @@ External scripts are collected only from the member's host-assigned scratch
 directory. A prompt naming an arbitrary temporary file does not establish
 ownership or authorize reading it.
 The host rechecks the changed paths and collected source snapshot before sending
-an answer. The coordinator assesses necessary development operations against
-the pinned scope and role, including scoped staging, test planning and local
-browser checks. Changed command definitions require inspection rather than
-automatic rejection. A reviewer without an implementation task uses its review
-assignment and the objective. Missing evidence that leaves a material effect or
-target unknown still escalates. Leaving the provider sandbox does not itself
-expand authority or require an owner decision.
+an answer. The coordinator approves routine development operations by default
+against the pinned scope and role, including scoped staging, dependency
+installation from declared manifests, test planning, scripts, local listeners
+and local browser checks. Changed command definitions require inspection rather
+than automatic rejection. A reviewer without an implementation task uses its
+review assignment and the objective. Missing evidence that leaves the command
+itself or its direct target unknown still escalates, as does an uncollected or
+omitted executable file the member changed; an uncollected unchanged repository
+file that the visible command merely tests, builds or runs is reported as a
+limitation. Production or staging actions, credentials, other repositories,
+global settings, destructive operations outside the workspace, persistent
+approvals, and malicious or unrelated commands always escalate. Leaving the
+provider sandbox, or needing network, sockets or IPC, does not itself expand
+authority or require an owner decision. Source collection maps emitted `.js`
+import specifiers to their TypeScript sources so the code a test runs under a
+TypeScript loader is in the evidence.
+
+The screen parser takes a Codex dialog's own title ("Would you like to run the
+following command?") as the prompt title even when the agent's reason below it
+is phrased as a question, and bounds the header at that title so transcript
+above it is not part of the dialog. Detail cut at the parser's length cap is
+marked "… [+N chars]", which delegation treats as incomplete evidence, so a
+dialog whose command runs past the cap never qualifies. Push notifications for a team member's
+prompt are held while the run's coordinator can still decide it and sent once
+the request is the owner's.
 
 Delivery-role requests may use the separate pinned delivery policy only when
 the reviewed head, branch, repository and passing checks match. The host

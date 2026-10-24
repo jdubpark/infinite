@@ -7,8 +7,8 @@ import type { Config, Provider } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
-import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile } from "./team-types.js";
+import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, currentPermissions } from "./team-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamContext, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
@@ -451,6 +451,28 @@ export class TeamService {
   }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state. */
   statuses() { return [...this.records.values()].map(stored => ({ id: stored.run.id, title: stored.run.title, status: stored.run.status, reason: stored.run.reason, resumable: this.canResume(stored) && !stored.run.goal && !stored.run.missionId, goal: Boolean(stored.run.goal), mission: Boolean(stored.run.missionId) })); }
+  /**
+   * Who a member session's open prompt waits on. "coordinator" while a delegated decision is live
+   * for it, "undecided" while the run could still start one, otherwise "user": the prompt stays
+   * with the owner because the run is not delegated, cannot act, has spent its decisions, or the
+   * prompt lacks complete one-shot evidence. Sessions outside any current run are the owner's.
+   */
+  promptOwner(sessionId: string, prompt: Prompt): "coordinator" | "user" | "undecided" {
+    for (const stored of this.records.values()) {
+      const run = stored.run;
+      const member = run.members.find(item => item.sessionId === sessionId && item.revision === run.revision);
+      if (!member) continue;
+      const decision = (run.permissionDecisions ?? []).filter(item => item.targetSessionId === sessionId && item.promptId === prompt.id &&
+        (!prompt.hash || item.promptHash === prompt.hash)).at(-1);
+      if (decision) return ["pending", "reviewing", "approved", "answering"].includes(decision.status) ? "coordinator" : "user";
+      if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status) ||
+          !activeMember(member) || member.role === "permission-coordinator" || !run.lineup || run.lineup.coordinator.tier !== "strong" ||
+          (run.permissionDecisions?.length ?? 0) >= run.permissions.maxDecisions || oneShotPermissionOption(prompt) === undefined)
+        return "user";
+      return "undecided";
+    }
+    return "user";
+  }
   /** Read mission ownership without building a view or updating external tracking. */
   missionIdOf(id: string): string | undefined { return this.record(id).run.missionId; }
   /** Restores the mission-authored size boundary for subteams persisted before ceilings were stored. */
@@ -599,7 +621,7 @@ export class TeamService {
       const initialParallelism = internal?.missionId ? parsed.parallelism : ceiling;
       if (initialParallelism > ceiling)
         throw new TeamError(409, "team-parallelism-limit", "The initial worker limit exceeds this run's capacity ceiling.");
-      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: structuredClone(project.team.permissions), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelismCeiling: ceiling, parallelism: initialParallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+      const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: currentPermissions(structuredClone(project.team.permissions)), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelismCeiling: ceiling, parallelism: initialParallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
       if (project.team.delivery) {
         if (!lineup || lineup.coordinator.tier !== "strong" || lineup.reviewer.tier !== "strong")
           throw new TeamError(409, "delivery-lineup-required", "Automatic delivery requires a configured strong coordinator and independent strong reviewer.");

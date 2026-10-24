@@ -121,3 +121,77 @@ test("dialog text printed in the transcript is never delegable", () => {
   assert.equal(aboveYesNo.pinned, false);
   assert.equal(oneShotPermissionOption(aboveYesNo), undefined);
 });
+
+const questionReasonDialog = [
+  "• Running node --import tsx --test tests/team-member-retire.test.ts",
+  "",
+  "  Would you like to run the following command?",
+  "",
+  "  Environment: local",
+  "",
+  "  Reason: May I rerun the focused retirement integration test outside the sandbox after correcting the async",
+  "  inspection route?",
+  "",
+  "  $ node --import tsx --test tests/team-member-retire.test.ts",
+  "",
+  "› 1. Yes, proceed (y)",
+  "  2. Yes, and don't ask again for commands that start with `node --import tsx --test` (p)",
+  "  3. No, and tell Codex what to do differently (esc)",
+  "",
+  "  Press enter to confirm or esc to cancel",
+];
+
+test("a Codex reason phrased as a question does not displace the dialog title", () => {
+  const prompt = screenPromptOf(questionReasonDialog)!;
+  assert.equal(prompt.title, "Would you like to run the following command?");
+  assert.equal(prompt.kind, "permission");
+  // The header starts at the title: the transcript line above it is not part of the dialog.
+  assert.doesNotMatch(prompt.detail ?? "", /• Running/);
+  assert.match(prompt.detail ?? "", /inspection route\?/);
+  assert.equal(prompt.pinned, true);
+  assert.equal(dialogCommand(prompt), "node --import tsx --test tests/team-member-retire.test.ts");
+  assert.equal(oneShotPermissionOption(prompt), 0);
+});
+
+test("a long wrapped reason keeps the title inside the dialog header", () => {
+  const reason = Array.from({ length: 7 }, (_, index) => `  reason line ${index + 1} of a long explanation that the terminal wrapped`);
+  const prompt = screenPromptOf([
+    "• Running npm run check", "", "  Would you like to run the following command?", "", "  Environment: local", "",
+    ...reason, "  so may I run it outside the sandbox?", "", "  $ npm run check", "",
+    "› 1. Yes, proceed (y)", "  2. Yes, and don't ask again for commands that start with `npm run check` (p)", "  3. No, and tell Codex what to do differently (esc)",
+    "", "  Press enter to confirm or esc to cancel",
+  ])!;
+  assert.equal(prompt.title, "Would you like to run the following command?");
+  assert.equal(dialogCommand(prompt), "npm run check");
+  assert.equal(oneShotPermissionOption(prompt), 0);
+});
+
+test("a Claude dialog still takes its bottom question as the title", () => {
+  const prompt = screenPromptOf([
+    "╭──────────────────────────────╮",
+    "│ Bash command                 │",
+    "│ npm test                     │",
+    "│ Does the suite pass locally? │",
+    "│ Do you want to proceed?      │",
+    "│ ❯ 1. Yes                     │",
+    "│   2. Yes, and don't ask again for similar commands in this project │",
+    "│   3. No, and tell Claude what to do differently (esc) │",
+    "╰──────────────────────────────╯",
+  ])!;
+  assert.equal(prompt.title, "Do you want to proceed?");
+  assert.match(prompt.detail ?? "", /Does the suite pass locally\?/);
+});
+
+test("a dialog whose detail runs past the parser's cap is marked truncated and never qualifies", () => {
+  const filler = Array.from({ length: 8 }, (_, index) => `  Reason line ${index + 1}: ${"x".repeat(230)}`);
+  const prompt = screenPromptOf([
+    "  Would you like to run the following command?", "", "  Environment: local", "", ...filler, "",
+    "  $ npm run check && npm run release:promote --tag production", "",
+    "› 1. Yes, proceed (y)", "  2. Yes, and don't ask again for commands that start with `npm run check` (p)", "  3. No, and tell Codex what to do differently (esc)",
+    "", "  Press enter to confirm or esc to cancel",
+  ])!;
+  assert.equal(prompt.title, "Would you like to run the following command?");
+  assert.match(prompt.detail ?? "", /… \[\+\d+ chars\]$/);
+  assert.equal(dialogCommand(prompt), undefined, "a cut command is not a complete command");
+  assert.equal(oneShotPermissionOption(prompt), undefined);
+});

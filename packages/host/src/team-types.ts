@@ -38,12 +38,29 @@ export const teamDeliverySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("pr"), repository: githubRepository, baseBranch: gitBranch }).strict(),
 ]);
 export type TeamDelivery = z.infer<typeof teamDeliverySchema>;
+/** The owner's default delegation: routine development work is the coordinator's to approve; release actions stay with the owner. */
+export const DEFAULT_PERMISSION_SCOPE = "Approve one-time development operations that an engineer would routinely run for the accepted objective and assigned role inside the assigned workspace: repository inspection and fetch, scoped edits and staging, dependency installation from the repository's declared manifests and lockfiles, test planning, builds, tests, scripts, local listeners and local browser checks. These may run outside the provider sandbox and use network access, local sockets, IPC and task-owned temporary files while preserving the assigned repository and path scope. Delivery operations require the run's separate pinned delivery policy. Escalate only production or staging actions such as deploy, promote, roll out, release or publish, new or external credentials, other repositories, global or account settings, destructive operations outside the assigned workspace, persistent approvals, permission bypasses, and commands whose effect is unrelated to the task or appears malicious.";
+export const DEFAULT_PERMISSION_LIMIT = 25;
+export const MAX_PERMISSION_LIMIT = 50;
+/** Earlier host defaults. A saved policy that still reads exactly like one was never customised by the owner. */
+export const LEGACY_DEFAULT_PERMISSION_SCOPES: readonly string[] = [
+  "Approve one-time repository read, edit, build and test operations required by the accepted task within its assigned workspace, including a one-time run of the task's tests or accepted checks outside the provider sandbox. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, persistent approvals, other permission bypasses and unclear effects.",
+  "Approve one-time development operations required by the accepted objective and assigned role, including repository inspection and fetch, scoped edits and staging, test planning, builds, tests and local browser checks. These may run outside the provider sandbox and use task-owned temporary files while preserving the assigned repository and path scope. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, persistent approvals, permission bypasses and unclear effects.",
+];
 export const teamPermissionsSchema = z.object({
   mode: z.literal("coordinator"),
   scope: z.string().trim().min(1).max(4000),
-  maxDecisions: z.number().int().min(1).max(20).default(10),
+  maxDecisions: z.number().int().min(1).max(MAX_PERMISSION_LIMIT).default(DEFAULT_PERMISSION_LIMIT),
 }).strict();
 export type TeamPermissions = z.infer<typeof teamPermissionsSchema>;
+/**
+ * The policy a new run pins. An enrollment saved with an earlier host default follows the current
+ * default scope and limit; a scope the owner wrote, or a limit the owner lowered, is kept as saved.
+ */
+export function currentPermissions(saved: TeamPermissions): TeamPermissions {
+  if (!LEGACY_DEFAULT_PERMISSION_SCOPES.includes(saved.scope)) return saved;
+  return { ...saved, scope: DEFAULT_PERMISSION_SCOPE, maxDecisions: saved.maxDecisions === 10 ? DEFAULT_PERMISSION_LIMIT : saved.maxDecisions };
+}
 export interface TeamPermissionDecision {
   id: string;
   revision: number;

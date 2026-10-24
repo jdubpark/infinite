@@ -121,7 +121,7 @@ process.exit(child.status ?? 1);
         ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
       ] }) } }],
     ...config,
-    teams: { workspaceDir: join(root, "teams"), ...(lineup ? { lineup } : {}), ...(options.trustWorkspaces ? { trustWorkspaces: true } : {}), ...(scenario === "success" ? {
+    teams: { workspaceDir: join(root, "teams"), ...(lineup ? { lineup } : {}), ...(options.trustWorkspaces ? { trustWorkspaces: true } : {}), ...(scenario === "success" || scenario === "reviewer-recording-error" ? {
       commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },
     } : scenario === "result-operation-fails-once" ? {
       commandPrefix: { command: process.execPath, args: ["-e", resultFailurePrefix, receipts] },

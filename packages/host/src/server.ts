@@ -31,7 +31,7 @@ import { UsageService } from "./usage-service.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
-import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamVerificationReconcileSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
+import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecard } from "./scorecard.js";
 import { GoalService } from "./goals.js";
 import { MissionService, missionBoard } from "./missions.js";
@@ -692,6 +692,10 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await teams.reconcileDelivery(standaloneTeam(req.params.id), teamMutationSchema.parse(req.body))));
   app.post("/api/teams/:id/reconcile-verification", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.reconcileVerification(standaloneTeam(req.params.id), teamVerificationReconcileSchema.parse(req.body))));
+  app.get("/api/teams/:id/members/:memberId/runtime", requireRole(["owner"]), async (req, res) =>
+    res.json(await teams.inspectMemberRuntime(standaloneTeam(req.params.id), id.parse(req.params.memberId))));
+  app.post("/api/teams/:id/members/:memberId/retire", requireRole(["owner"]), async (req, res) =>
+    res.json(await teams.retireMember(standaloneTeam(req.params.id), id.parse(req.params.memberId), teamMemberRetireSchema.parse(req.body))));
   app.post("/api/teams/:id/parallelism", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.setParallelism(id.parse(req.params.id), teamParallelismSchema.parse(req.body))));
   app.post("/api/teams/:id/decisions/:decisionId/answer", requireRole(["owner", "controller"]), async (req, res) => {

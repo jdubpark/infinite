@@ -8,7 +8,7 @@ import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamVerificationReconcileSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile } from "./team-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamContext, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
@@ -846,6 +846,47 @@ export class TeamService {
       return this.view(stored);
     });
   }
+  inspectMemberRuntime(id: string, memberId: string) {
+    const stored = this.record(id), run = stored.run;
+    const member = run.members.find(item => item.memberId === memberId && item.revision === run.revision);
+    if (!member) throw new TeamError(404, "member-not-found", "The current team revision has no such member.");
+    return this.manager.inspectTeamRuntime(member.sessionId, assignment(member));
+  }
+  retireMember(id: string, memberId: string, input: TeamMemberRetire) {
+    const body = teamMemberRetireSchema.parse(input);
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (this.replay(stored, "retire-member", body)) return this.view(stored);
+      if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before retiring a member.");
+      const member = run.members.find(item => item.memberId === memberId && item.revision === run.revision);
+      const unavailable = () => new TeamError(409, "member-retirement-unavailable", "Only an unreported current reviewer at the verified head can be retired under an unchanged, quiescent team state.");
+      if (run.status === "cancelled" || run.status === "paused" || stored.halt || !member || member.role !== "reviewer" || member.report ||
+          !["unavailable", "running"].includes(member.status) || member.sessionId !== body.sessionId || member.baseCommit !== run.headCommit ||
+          member.baseCommit !== stored.checkHead || stored.pending || this.commands.has(id) || stored.deliveryAttempt || run.deliveryReceipt ||
+          run.pullRequest || run.stopReason || (run.permissionDecisions ?? []).some(decision => decision.targetSessionId === body.sessionId &&
+            ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status))) throw unavailable();
+      this.assertBudget(run, true);
+      const revision = run.revision, sessionId = member.sessionId, baseCommit = member.baseCommit;
+      const retired = await this.manager.retireTeamRuntime(sessionId, body.requestId, assignment(member), body.identity);
+      if (run.revision !== revision || !run.members.includes(member) || member.sessionId !== sessionId || member.baseCommit !== baseCommit)
+        throw new TeamError(409, "member-retirement-unavailable", "The reviewer assignment changed while its runtime was being retired.");
+      const retirement = { requestId: body.requestId, at: retired.stoppedAt, identity: retired.identity, seq: retired.seq,
+        processes: retired.processes.length, unsignalable: retired.unsignalable.length };
+      try { await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix); }
+      catch (error) {
+        if (!this.mutation(stored, "retire-member", body)) return this.view(stored);
+        member.status = "stopped"; member.stoppedReason = "Recording failed; runtime retired after confirmed process exit"; member.retirement = retirement;
+        this.block(stored, error, member);
+        return this.view(stored);
+      }
+      if (!this.mutation(stored, "retire-member", body)) return this.view(stored);
+      member.status = "stopped"; member.stoppedReason = "Recording failed; runtime retired after confirmed process exit"; member.retirement = retirement;
+      if (run.reason === runtimeUnavailableReason) run.reason = undefined;
+      this.event(stored, `The owner authorized retirement of reviewer ${member.memberId} at ${member.baseCommit}. Operator claim, not host-verified: ${JSON.stringify(body.text.slice(0, 500))}. The original journal and reports are retained.`);
+      this.save(stored);
+      return this.view(stored);
+    });
+  }
   setParallelism(id: string, input: TeamParallelism) {
     teamParallelismSchema.parse(input);
     this.record(id);
@@ -1635,7 +1676,13 @@ export class TeamService {
       if (run.establishChecks && !run.verification?.checks.length)
         throw new TeamError(409, "verification-required", "Required verification commands have not been established; review cannot start.");
       if (stored.checkHead !== run.headCommit) { this.check(stored); return; }
-      if (!run.review || run.review.revision !== run.revision) { this.prepareMember(stored, "reviewer"); return; }
+      if (!run.review || run.review.revision !== run.revision) {
+        const reviewers = run.members.filter(member => member.revision === run.revision && member.role === "reviewer");
+        const retiredReviewers = reviewers.filter(member => member.retirement);
+        if (retiredReviewers.length && reviewers.length >= 2)
+          throw new TeamError(409, "member-retirement-replacement-exists", "A replacement reviewer already exists for this retired assignment.");
+        this.prepareMember(stored, "reviewer"); return;
+      }
       if (run.review.verdict === "approved") {
         await assertMemberReadOnly(run.workspace, run.headCommit!, this.config.teams?.commandPrefix, undefined, "integration");
         this.assertBudget(run);

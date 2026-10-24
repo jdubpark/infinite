@@ -75,6 +75,30 @@ interface StoredTeamRetirement {
   processes?: RuntimeProcess[];
   unsignalable?: number[];
 }
+function mergeRecordedRuntimeTree(known: RuntimeProcess[], current: RuntimeProcess[]): RuntimeProcess[] {
+  const prior = new Map(known.map(row => [row.pid, row]));
+  const observed = new Map(current.map(row => [row.pid, row]));
+  for (const row of known) {
+    const now = observed.get(row.pid);
+    if (now && now.born !== row.born) throw new TeamError(409, "runtime-identity-changed", "A recorded process ID now belongs to a different process.");
+  }
+  const roots = new Set(known.filter(row => {
+    const now = observed.get(row.pid);
+    return now?.born === row.born && !now.state.startsWith("Z");
+  }).map(row => row.pid));
+  for (;;) {
+    const before = roots.size;
+    for (const row of current) if (roots.has(row.parent)) roots.add(row.pid);
+    if (roots.size === before) break;
+  }
+  for (const row of current) if (roots.has(row.pid)) {
+    if (row.pid <= 1 || row.pid === process.pid) throw new TeamError(409, "runtime-identity-changed", "The runtime tree contains an unsafe process identity.");
+    const old = prior.get(row.pid);
+    if (old && old.born !== row.born) throw new TeamError(409, "runtime-identity-changed", "A discovered process ID now belongs to a different process.");
+    prior.set(row.pid, row);
+  }
+  return [...prior.values()];
+}
 interface DeletedSessionReceipt {
   id: string;
   fingerprint: string;
@@ -418,13 +442,19 @@ export class Manager {
     }
     const currentState = await this.state(sessionId);
     if (currentState.control) throw new TeamError(409, "control-busy", "A person currently controls this session.");
-    if (currentState.status !== "recording-error") throw new TeamError(409, "runtime-not-retirable", "Only a runtime in recording-error can be retired.");
+    if (currentState.status !== "recording-error" && !(record.state === "stopping" && ["unavailable", "exited"].includes(currentState.status)))
+      throw new TeamError(409, "runtime-not-retirable", "Only a runtime in recording-error, or its authenticated in-progress retirement, can be retired.");
     const boundary = this.config.teams?.commandPrefix ? agentBoundary(this.config.teams.commandPrefix, stored.cwd) : undefined;
     const agentUid = boundary ? await boundary.uid() : null;
     if (record.agentUid !== agentUid) throw new TeamError(409, "runtime-identity-changed", "The configured agent identity changed during retirement.");
     const sealed = unseal<WorkerState>(this.key, `${sessionId}:status`, readFileSync(join(this.config.stateDir, "sessions", sessionId, "status.sealed"), "utf8"));
     const workerPid = sealed.workerPid;
     if (!workerPid || !record.known.some(row => row.pid === workerPid)) throw new TeamError(409, "runtime-identity-changed", "The recorded worker identity is unavailable.");
+    // A prior attempt may have killed the worker but lost its acknowledgement. Rebuild only
+    // descendants of still-live, start-time-matched recorded processes and seal them before
+    // signaling so a later retry has the expanded identity set.
+    record.known = mergeRecordedRuntimeTree(record.known, await inventoryRuntimeProcesses());
+    writeSealed(file, this.key, scope, record);
     try {
       const result = await stopRuntimeTree(record.known, workerPid, {
         ...(boundary && agentUid !== null ? { agent: { uid: agentUid, signal: boundary.signal } } : {}),
@@ -434,7 +464,12 @@ export class Manager {
       return { state: "retired", requestId, identity, sessionId, seq: retired.seq, stoppedAt: retired.stoppedAt!, processes: retired.processes!, unsignalable: retired.unsignalable! };
     } catch (error) {
       const updated = (error as Error & { knownProcesses?: RuntimeProcess[] }).knownProcesses;
-      if (updated) { record.known = updated; writeSealed(file, this.key, scope, record); }
+      if (updated) record.known = mergeRecordedRuntimeTree(record.known, updated);
+      try { record.known = mergeRecordedRuntimeTree(record.known, await inventoryRuntimeProcesses()); }
+      catch (inventoryError) {
+        if ((inventoryError as { code?: string }).code === "runtime-identity-changed") throw inventoryError;
+      }
+      writeSealed(file, this.key, scope, record);
       throw error;
     }
   }

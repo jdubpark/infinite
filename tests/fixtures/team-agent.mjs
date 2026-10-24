@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 
 if (process.argv[2] === "--command-prefix") {
@@ -10,6 +10,31 @@ if (process.argv[2] === "--command-prefix") {
   const child = spawn(command, args, { stdio: "inherit", env: { ...process.env, INFINITE_TEST_COMMAND_IDENTITY: "team-prefix" } });
   child.once("error", () => process.exit(127));
   child.once("exit", code => process.exit(code ?? 128));
+  await new Promise(() => {});
+}
+if (process.argv[2] === "--retirement-fail-prefix") {
+  const [, receiptDir, workerPid, command, ...args] = process.argv.slice(2);
+  let input = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", chunk => input += chunk);
+  process.stdin.on("end", () => {
+    let request;
+    try { request = JSON.parse(input); } catch { process.exit(74); }
+    if (request.op === "signal") {
+      writeFileSync(join(receiptDir, "retirement-failed-after-worker-exit"), "failed once", { mode: 0o600 });
+      writeFileSync(join(receiptDir, "retirement-expand-tree"), "expand", { mode: 0o600 });
+      const deadline = Date.now() + 3000;
+      while (!existsSync(join(receiptDir, "retirement-discovered-pid.json")) && Date.now() < deadline)
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      try { process.kill(Number(workerPid), "SIGKILL"); } catch { /* Simulates a lost stop acknowledgement after worker exit. */ }
+      process.stderr.write("Injected a lost retirement acknowledgement after worker exit.\n");
+      process.exit(73);
+    }
+    const result = spawnSync(command, args, { input, encoding: "utf8", env: process.env });
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    process.exit(result.status ?? 128);
+  });
   await new Promise(() => {});
 }
 if (process.argv[2] === "--permission-setup") {
@@ -620,6 +645,14 @@ ${branch}`;
       pullRequestUrl: scenario === "delivery-foreign" ? "https://github.com/example/other/pull/1" : "https://github.com/example/app/pull/1",
       mergeCommit: scenario === "delivery-baseline-tree" ? execFileSync("git", ["rev-parse", `${head}^{tree}`], { encoding: "utf8" }).trim() : mergeCommit, summary: "Synthetic delivery report exercising host binding; no GitHub request was made." });
   } else if (assignment.role === "reviewer") {
+    if (scenario === "reviewer-recording-error" && !existsSync(join(receiptDir, "reviewer-recording-error-started"))) {
+      writeFileSync(join(receiptDir, "reviewer-recording-error-started"), "started", { mode: 0o600 });
+      const descendantScript = `const { existsSync, writeFileSync } = require('node:fs'); const { join } = require('node:path'); let child; process.on('SIGTERM',()=>{}); setInterval(() => { if (!child && existsSync(join(${JSON.stringify(receiptDir)}, 'retirement-expand-tree'))) { child = require('node:child_process').spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"], { detached:true, stdio:'ignore' }); writeFileSync(join(${JSON.stringify(receiptDir)}, 'retirement-discovered-pid.json'), JSON.stringify({ pid:child.pid }), { mode:0o600 }); } }, 50);`;
+      const descendant = spawn(process.execPath, ["-e", descendantScript],
+        { detached: true, stdio: "ignore" });
+      writeFileSync(join(receiptDir, "reviewer-hold.json"), JSON.stringify({ pid: process.pid, descendantPid: descendant.pid }), { mode: 0o600 });
+      for (;;) { process.stdout.write("recording-error reviewer remains active\n"); await new Promise(resolve => setTimeout(resolve, 100)); }
+    }
     for (const name of ["a.txt", "b.txt"])
       if (!readFileSync(name, "utf8").startsWith("revision ")) throw new Error("The review checkout lacks integrated work");
     if (scenario === "changed-after-check")

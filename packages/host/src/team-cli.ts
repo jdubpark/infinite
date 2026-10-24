@@ -969,6 +969,20 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       return true;
     } finally { rmSync(temporary, { recursive: true, force: true }); }
   }
+  if (subcommand === "retire-member") {
+    const [memberId, ...textParts] = rest, text = textParts.join(" ").trim();
+    const identity = String(options["--identity"] ?? "").trim();
+    if (!id || !memberId || !text || !identity || !/^[a-f0-9]{64}$/.test(identity))
+      throw new Error("Usage: infinite team retire-member ID MEMBER_ID TEXT... --identity HASH [--request-id UUID] [--json]");
+    const current = await api.json<any>(`/teams/${id}`);
+    const inspection = await api.json<any>(`/teams/${id}/members/${memberId}/runtime`);
+    if (inspection.identity !== identity) throw new Error("The inspected runtime identity changed. Inspect the member again before retiring it.");
+    const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
+    const endpoint = `/teams/${id}/members/${memberId}/retire`;
+    const body = { requestId, revision: current.revision, sessionId: inspection.sessionId, identity, text };
+    outputTeam(await postMutation(api, receiptsPath, `team-retire-member:${requestId}`, endpoint, body), Boolean(options["--json"]));
+    return true;
+  }
   if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions", "reconcile-verification"].includes(subcommand ?? "")) {
     if (!id) throw new Error(`Usage: infinite team ${subcommand} ID ...`);
     const current = await api.json<any>(`/teams/${id}`);
@@ -1032,5 +1046,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|reconcile-verification|cancel|revoke-permissions ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|reconcile-verification|retire-member|cancel|revoke-permissions ...");
 }

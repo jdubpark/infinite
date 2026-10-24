@@ -358,6 +358,31 @@ state. A different body with that ID is refused. Refusal codes include
 `verification-policy-changed`; a dirty integration workspace returns
 `integration-changed-files`.
 
+An owner can retire a current-revision reviewer whose report is missing and
+whose runtime is in `recording-error`, then let the scheduler start one fresh
+reviewer at the same verified head. First inspect
+`GET /api/teams/:id/members/:memberId/runtime`, verify the assignment and
+process identity, confirm no person controls the session, and establish that
+the integration head and member checkout are unchanged. Then POST
+`/api/teams/:id/members/:memberId/retire` with `requestId`, `revision`,
+`sessionId`, `identity`, and a short operator statement. The CLI form is
+`infinite team retire-member ID MEMBER_ID TEXT... --identity HASH
+[--request-id UUID] [--json]`.
+
+Retirement never sends `SIGCONT`. The host signals its own processes and the
+sudo launcher directly. Agent-owned descendants are signaled only through the
+configured team command boundary, after a per-process start-time recheck.
+Unknown owners are observed but never signaled; retirement remains blocked
+until they exit, then retry with the same request ID and inspected identity.
+The original session journal, recording-gap evidence, reports, and workspace
+remain available. Restoring recording is unsupported. The scheduler creates
+the replacement only after the full process tree has exited and the old
+checkout passes its read-only check. Refusal codes include
+`stale-team-revision`, `member-retirement-unavailable`,
+`runtime-identity-changed`, `retirement-processes-alive`,
+`retirement-boundary-unavailable`, `control-busy`, and
+`member-retirement-replacement-exists`.
+
 After the host records a `merge` report, it refreshes the project, so the merged
 commit reaches the host before the owner reads the result.
 

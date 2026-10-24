@@ -175,6 +175,9 @@ export const teamVerificationReconcileSchema = z.object({ requestId: z.uuid(), r
   headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
   attestation: z.object({ boundary: z.literal("check-only"), processesStopped: z.literal(true), text: z.string().trim().min(1).max(4000) }).strict() }).strict();
 export type TeamVerificationReconcile = z.infer<typeof teamVerificationReconcileSchema>;
+export const teamMemberRetireSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), sessionId: z.uuid(),
+  identity: z.string().regex(/^[a-f0-9]{64}$/), text: z.string().trim().min(1).max(4000) }).strict();
+export type TeamMemberRetire = z.infer<typeof teamMemberRetireSchema>;
 export const teamActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export const teamContinueSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000).optional() }).strict();
 export type TeamContinue = z.infer<typeof teamContinueSchema>;
@@ -270,6 +273,8 @@ export interface TeamMember extends TeamAssignment {
   stopRequestId: string;
   /** Why the host stopped this member without a report, such as a provider usage limit. */
   stoppedReason?: string;
+  /** Confirmed process retirement for a recording-failed reviewer; its original journal remains sealed. */
+  retirement?: { requestId: string; at: string; identity: string; seq: number; processes: number; unsignalable: number };
   /** Set only after stopped() confirms exit while the member waits for serialized integration. */
   exitConfirmedAt?: string;
   /** Computed on read for members whose provider reports usage; never stored. */

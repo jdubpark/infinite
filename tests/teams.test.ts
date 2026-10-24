@@ -1773,7 +1773,8 @@ test("permission coordinator prompt reviews complete command evidence within the
   assert.match(prompt, /A complete literal git staging\/conflict-check chain can be reviewed from its visible arguments/);
   assert.match(prompt, /feedback\.deliveryAuthority explicitly matches the pinned delivery policy, exact reviewed head, branch, repository target, and passing checks/);
   assert.match(prompt, /In pull-request-only mode, do not approve a merge/);
-  assert.match(prompt, /An unknown remote alias is insufficient unless the supplied delivery evidence resolves it/);
+  assert.match(prompt, /require the literal full reviewed commit SHA as the source and the exact pinned destination branch and repository URL/);
+  assert.match(prompt, /HEAD, local branch names, implicit refspecs and remote aliases do not bind publication/);
   assert.match(prompt, /Ordinary implementation and review roles must not push or publish/);
   assert.match(prompt, /A reviewer normally has targetTask null/);
   assert.match(prompt, /Never approve package or tool installation\/download, deployment, credential access, global\/account-setting changes/);
@@ -2045,6 +2046,14 @@ for (const [ending, minutes, event] of [
           title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
           options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" }] },
         expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: coordinator.memberId, answerRequestId: randomUUID(), status: "reviewing" }];
+      if (minutes > 0) {
+        // Keep the target request current so this case exercises review expiry rather than
+        // the earlier obsolete-request reconciliation.
+        const decision = f.run.permissionDecisions[0];
+        decision.targetMemberId = manager.memberId; decision.targetSessionId = manager.sessionId;
+        decision.evidenceHash = permissionEvidenceHash(decision.prompt);
+        f.state.attention.state = "needs-you"; f.state.attention.prompt = decision.prompt;
+      }
       // Its process keeps running after the host asks it to stop.
       f.manager.stopTeamSession = async () => f.manager.state();
       f.writeTeam();

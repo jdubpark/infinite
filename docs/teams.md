@@ -326,6 +326,38 @@ branches, pull requests and confirmed results before considering any new action.
 A changed baseline still needs a fresh implementation and review; this action
 does not waive checks, reconcile edited files, or expand provider access.
 
+### Restart-interrupted verification
+
+An owner can reconcile a check only when the team is blocked with the host's
+restart-interruption reason, the same check operation is still pending, every
+member is stopped, the exact integrated head is unchanged and clean, and the
+retained check records show that the final configured command was interrupted.
+Result, prepare, member, permission, and delivery uncertainty stays fenced.
+The operator must first establish that the old check processes have exited:
+the host cannot see check processes orphaned by a previous API process (for
+example, when `systemd` uses `KillMode=process` or a sudo command prefix is
+configured). Before attesting, confirm that no process from the interrupted
+check remains and that no process has a working directory under the team root.
+The attestation is an operator claim, not host verification.
+
+Use `POST /api/teams/:id/reconcile-verification` with `requestId`, `revision`,
+`pendingId`, `headCommit`, and `attestation: { boundary: "check-only",
+processesStopped: true, text }`. The CLI form is
+`infinite team reconcile-verification ID --pending PENDING_ID --head COMMIT
+--processes-stopped TEXT... [--request-id UUID] [--json]`.
+
+This clears only the interrupted check intent. It preserves the run, issue,
+revision, tasks, members, head, old check records, and workspace; the scheduler
+starts fresh verification in a new disposable workspace, followed by the
+normal independent review. Reusing the request ID and body returns the saved
+state. A different body with that ID is refused. Refusal codes include
+`stale-team-revision`, `team-cancelled`, `linear-reconciliation-required`,
+`verification-reconciliation-unavailable`,
+`verification-reconciliation-operation-changed`,
+`verification-reconciliation-head-changed`, and
+`verification-policy-changed`; a dirty integration workspace returns
+`integration-changed-files`.
+
 After the host records a `merge` report, it refreshes the project, so the merged
 commit reaches the host before the owner reads the result.
 

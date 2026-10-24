@@ -8,7 +8,7 @@ import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type SignalData } from "@infinite/attention";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView } from "./team-types.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamVerificationReconcileSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile } from "./team-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamContext, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import type { UsageService } from "./usage-service.js";
@@ -24,6 +24,7 @@ import { collectPermissionEvidence } from "./team-permission-evidence.js";
 export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
+type VerificationMutation = TeamVerificationReconcile;
 type Action = { requestId: string; revision: number };
 type LimitSwitch = LimitObservation & { at: string; seq: number };
 type StartInProject = <T>(projectId: string, start: () => Promise<T>) => Promise<T>;
@@ -415,7 +416,7 @@ export class TeamService {
     const ready = run.tasks.filter(task => task.status === "pending" && task.dependsOn.every(id => run.tasks.find(item => item.id === id)?.status === "integrated")).length +
       (run.discovery && run.discovery.revision === run.revision && !run.discovery.completedAt ? run.discovery.tasks.filter(task => task.status === "pending").length : 0);
     const workers = { limit: run.parallelism, max, running: members.filter(member => holdsWorkerSlot(member, run.revision)).length, ready };
-    return { ...safeRun, tasks: safeRun.tasks.map(task => { // Older records predate task.revision; steering clears the task list, so the retained run revision identifies their plan.
+    return { ...safeRun, ...(stored.pending ? { pendingOperation: { id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failed: Boolean(stored.pending.failure) } } : {}), tasks: safeRun.tasks.map(task => { // Older records predate task.revision; steering clears the task list, so the retained run revision identifies their plan.
       const revision = task.revision ?? safeRun.revision;
       const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
       const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
@@ -677,13 +678,13 @@ export class TeamService {
       return this.view(stored);
     });
   }
-  private replay(stored: Stored, operation: string, body: Action | Mutation | TeamContinue | TeamParallelism) {
+  private replay(stored: Stored, operation: string, body: Action | Mutation | TeamContinue | TeamParallelism | VerificationMutation) {
     const prior = stored.receipts[body.requestId];
     if (!prior) return false;
     if (prior !== digest({ operation, ...body })) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
     return true;
   }
-  private mutation(stored: Stored, operation: string, body: Action | Mutation | TeamContinue | TeamParallelism) {
+  private mutation(stored: Stored, operation: string, body: Action | Mutation | TeamContinue | TeamParallelism | VerificationMutation) {
     const fingerprint = digest({ operation, ...body });
     const prior = stored.receipts[body.requestId];
     if (prior) {
@@ -790,6 +791,58 @@ export class TeamService {
         run.reason = undefined; run.blockCode = undefined;
         this.event(stored, `Owner authorized a fresh delivery reconciliation at ${head} on ${run.branch}; prior attempt ${previous.memberId} and its blocked report remain in team history.`);
       });
+      return this.view(stored);
+    });
+  }
+  reconcileVerification(id: string, input: VerificationMutation) {
+    const body = teamVerificationReconcileSchema.parse(input);
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (this.replay(stored, "reconcile-verification", body)) return this.view(stored);
+      if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling verification.");
+      if (run.status === "cancelled") throw new TeamError(409, "team-cancelled", "This team has been cancelled.");
+      if (run.linearTracking || run.linear) {
+        const refreshed = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
+        const tracking = this.linear?.getTeam(run.id) ?? refreshed;
+        if (tracking && run.linear !== tracking) { run.linear = tracking; this.save(stored); }
+        if (!this.linear || tracking?.status !== "synced") throw new TeamError(409, "linear-reconciliation-required", "Linear has not confirmed the current issue and requirements. Refresh tracking before reconciling verification.");
+      }
+      const unavailable = (message: string) => new TeamError(409, "verification-reconciliation-unavailable", message);
+      const pending = stored.pending;
+      if (run.status !== "blocked" || stored.halt || !stored.prepared || run.reason !== interruptedOperationReason)
+        throw unavailable("Verification reconciliation requires a prepared blocked team with restart-interruption evidence and no active halt.");
+      if (!pending || pending.kind !== "check" || pending.failure || pending.revision !== run.revision)
+        throw unavailable("Only an unresolved restart-interrupted check can be reconciled; other uncertain operations remain fenced.");
+      if (pending.id !== body.pendingId) throw new TeamError(409, "verification-reconciliation-operation-changed", "The pending check changed. Refresh the team and inspect its evidence.");
+      if (this.commands.has(id) || stored.deliveryAttempt || run.deliveryReceipt || run.pullRequest || run.stopReason || run.permissionsRevokedAt ||
+          run.members.some(member => member.status !== "stopped") ||
+          (run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status)))
+        throw unavailable("Members, permission decisions, delivery state, or the operation are not fully quiescent for verification reconciliation.");
+      const head = run.headCommit;
+      if (!head || !commitId.test(head) || body.headCommit !== head || stored.checkHead === head)
+        throw new TeamError(409, "verification-reconciliation-head-changed", "The requested head is not the current unchecked integration commit.");
+      const attempt = run.checks.filter(check => check.revision === run.revision && check.round === run.round && check.headCommit === head);
+      if (!attempt.length || attempt.at(-1)?.status !== "interrupted" || attempt.slice(0, -1).some(check => check.status !== "passed") ||
+          run.checks.some(check => check.status === "running"))
+        throw unavailable("The retained check records do not prove a single interrupted final check attempt.");
+      const expected = this.verificationCommands(run);
+      if (attempt.length > expected.length || attempt.some((check, index) => check.command.command !== expected[index]?.command.command ||
+          JSON.stringify(check.command.args ?? []) !== JSON.stringify(expected[index]?.command.args ?? []) || (check.phase ?? "verification") !== (expected[index]?.phase ?? "verification")))
+        throw new TeamError(409, "verification-policy-changed", "The retained check commands do not match the current verification policy.");
+      this.assertBudget(run);
+      this.assertRunPath(stored, run.workspace);
+      if (await teamHead(run.workspace, this.config.teams?.commandPrefix) !== head)
+        throw new TeamError(409, "verification-reconciliation-head-changed", "The integration workspace no longer matches the recorded commit.");
+      await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, undefined, "integration");
+      if (!this.mutation(stored, "reconcile-verification", body)) return this.view(stored);
+      run.verificationReconciliations ??= [];
+      run.verificationReconciliations.push({ requestId: body.requestId, pendingId: pending.id, revision: run.revision, round: run.round, headCommit: head,
+        interruptedChecks: attempt.filter(check => check.status === "interrupted").length, attestation: body.attestation.text, at: timestamp() });
+      stored.pending = undefined;
+      delete stored.verificationRecovery;
+      run.status = "verifying"; run.reason = undefined; run.blockCode = undefined;
+      this.event(stored, `An operator attested that processes for the interrupted check had stopped. The ${head} integration and earlier evidence are retained; fresh verification will use a new disposable workspace. Operator claim, not host-verified: ${JSON.stringify(body.attestation.text.slice(0, 500))}`);
+      this.save(stored);
       return this.view(stored);
     });
   }
@@ -2444,16 +2497,21 @@ export class TeamService {
   private requiredChecks(run: TeamRun) {
     return run.establishChecks ? run.verification?.checks : run.handoff?.project.checks ?? this.config.projects.find(project => project.id === run.projectId)?.team?.checks;
   }
+  private verificationCommands(run: TeamRun) {
+    const required = this.requiredChecks(run);
+    if (!required?.length) return [];
+    const configuredProject = run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team;
+    const setup = run.establishChecks ? run.verification?.setup : configuredProject?.setup;
+    const commands: { command: { command: string; args: string[] }; phase?: "setup" }[] = [];
+    if (setup) commands.push({ command: setup, phase: "setup" });
+    commands.push(...required.map(command => ({ command })));
+    return commands;
+  }
   private check(stored: Stored) {
     const run = stored.run, revision = run.revision, head = run.headCommit!;
     const required = this.requiredChecks(run);
     if (!required?.length) throw new TeamError(409, "verification-required", "Required verification commands have not been established; the team cannot be ready for review.");
-    const configuredProject = run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team;
-    const setup = run.establishChecks ? run.verification?.setup : configuredProject?.setup;
-    const commands = [
-      ...(setup ? [{ command: setup, phase: "setup" as const, context: "setup" as const }] : []),
-      ...required.map(command => ({ command, context: "verification" as const })),
-    ];
+    const commands = this.verificationCommands(run).map((entry, index) => ({ ...entry, context: index === 0 && entry.phase === "setup" ? "setup" as const : "verification" as const }));
     run.status = "verifying";
     this.operation(stored, "check", async signal => {
       const results: typeof run.checks = [];

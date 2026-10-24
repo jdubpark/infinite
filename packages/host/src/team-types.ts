@@ -171,6 +171,10 @@ export const createTeamSchema = z.object({
 }).strict();
 export type CreateTeam = z.infer<typeof createTeamSchema>;
 export const teamMutationSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000) }).strict();
+export const teamVerificationReconcileSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), pendingId: z.uuid(),
+  headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
+  attestation: z.object({ boundary: z.literal("check-only"), processesStopped: z.literal(true), text: z.string().trim().min(1).max(4000) }).strict() }).strict();
+export type TeamVerificationReconcile = z.infer<typeof teamVerificationReconcileSchema>;
 export const teamActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export const teamContinueSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000).optional() }).strict();
 export type TeamContinue = z.infer<typeof teamContinueSchema>;
@@ -337,6 +341,7 @@ export interface TeamRun {
   verification?: TeamVerification;
   /** Revisions where an unauthorized verification plan already received its one correction. */
   verificationCorrections?: number[];
+  verificationReconciliations?: { requestId: string; pendingId: string; revision: number; round: number; headCommit: string; interruptedChecks: number; attestation: string; at: string }[];
   /** Owner-authorized repository delivery policy pinned when this run starts. */
   delivery?: TeamDelivery;
   /** Agent-reported delivery evidence; this is not independently verified by the host. */
@@ -412,6 +417,7 @@ export interface TeamRun {
 }
 /** `providerLimits` is the host's active limit memory at read time, shared by every run. */
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions"> & {
+  pendingOperation?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number; failed: boolean };
   members: Omit<TeamMember, "prompt" | "contextFeedback">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt">[];
   usage: UsageRollup;

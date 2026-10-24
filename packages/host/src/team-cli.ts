@@ -969,12 +969,19 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       return true;
     } finally { rmSync(temporary, { recursive: true, force: true }); }
   }
-  if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions"].includes(subcommand ?? "")) {
+  if (["steer", "answer", "pause", "resume", "cancel", "continue", "revoke-permissions", "reconcile-verification"].includes(subcommand ?? "")) {
     if (!id) throw new Error(`Usage: infinite team ${subcommand} ID ...`);
     const current = await api.json<any>(`/teams/${id}`);
     const requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
     let endpoint = subcommand === "revoke-permissions" ? `/teams/${id}/permissions/revoke` : `/teams/${id}/${subcommand}`, body: Record<string, unknown>;
-    if (subcommand === "continue") {
+    if (subcommand === "reconcile-verification") {
+      const pendingId = String(options["--pending"] ?? "").trim(), headCommit = String(options["--head"] ?? "").trim();
+      const attestationText = [options["--processes-stopped"], ...rest].filter(value => typeof value === "string").join(" ").trim();
+      if (!pendingId || !headCommit || options["--processes-stopped"] === undefined || !attestationText)
+        throw new Error("Usage: infinite team reconcile-verification ID --pending PENDING_ID --head COMMIT --processes-stopped TEXT... [--request-id UUID] [--json]");
+      endpoint = `/teams/${id}/reconcile-verification`;
+      body = { requestId, revision: current.revision, pendingId, headCommit, attestation: { boundary: "check-only", processesStopped: true, text: attestationText } };
+    } else if (subcommand === "continue") {
       const direction = rest.join(" ").trim();
       if (rest.length && !direction) throw new Error("Direction for continuation must contain non-whitespace text.");
       if (direction.length > 8000) throw new Error("Direction for continuation must be 8000 characters or fewer.");
@@ -1025,5 +1032,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|cancel|revoke-permissions ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|reconcile-verification|cancel|revoke-permissions ...");
 }

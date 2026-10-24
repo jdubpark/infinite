@@ -448,10 +448,11 @@ export async function prepareRecoveredWorkspace(workspace: string, id: string, b
 export async function prepareRecoveryWorkspaceFromSource(workspace: string, source: string, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal, branch?: string) {
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(baseCommit)) throw new TeamError(409, "invalid-workspace-baseline", "The copied workspace baseline is invalid.");
   const { destination } = ensureSiblingWorkspaceParent(workspace, "recovery", id);
-  if (await git(source, ["cat-file", "-t", baseCommit], prefix, 30000, signal) !== "commit")
-    throw new TeamError(409, "invalid-workspace-baseline", "The refreshed source must contain the recorded base commit.");
+  // The source mirror is only a clone argument: the restricted launcher allows no Git inspection inside it.
   await git(dirname(destination), ["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", source, destination], prefix, 120000, signal);
   await git(destination, ["remote", "remove", "origin"], prefix, 30000, signal);
+  if (await git(destination, ["cat-file", "-t", baseCommit], prefix, 30000, signal) !== "commit")
+    throw new TeamError(409, "invalid-workspace-baseline", "The refreshed source must contain the recorded base commit. The copy was preserved for inspection.");
   if (branch) {
     await git(destination, ["check-ref-format", "--branch", branch], prefix, 30000, signal);
     await git(destination, ["checkout", "-B", branch, baseCommit], prefix, 30000, signal);

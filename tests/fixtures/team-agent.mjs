@@ -20,6 +20,17 @@ if (process.argv[2] === "--retirement-fail-prefix") {
   process.stdin.on("end", () => {
     let request;
     try { request = JSON.parse(input); } catch { process.exit(74); }
+    if (request.op === "uid") {
+      const counter = join(receiptDir, "retirement-probe-count");
+      const count = existsSync(counter) ? Number(readFileSync(counter, "utf8")) + 1 : 1;
+      writeFileSync(counter, String(count));
+      if (count === 3) {
+        writeFileSync(join(receiptDir, "retirement-before-signals"), "ready");
+        const deadline = Date.now() + 5000;
+        while (!existsSync(join(receiptDir, "retirement-allow-signals")) && Date.now() < deadline)
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
+    }
     if (request.op === "signal") {
       writeFileSync(join(receiptDir, "retirement-failed-after-worker-exit"), "failed once", { mode: 0o600 });
       writeFileSync(join(receiptDir, "retirement-expand-tree"), "expand", { mode: 0o600 });
@@ -655,6 +666,11 @@ ${branch}`;
     }
     for (const name of ["a.txt", "b.txt"])
       if (!readFileSync(name, "utf8").startsWith("revision ")) throw new Error("The review checkout lacks integrated work");
+    if (scenario === "reviewer-recording-error" && !existsSync(join(receiptDir, "retirement-review-repair"))) {
+      writeFileSync(join(receiptDir, "retirement-review-repair"), "requested");
+      await report({ kind: "review", verdict: "changes-requested", summary: "Exercise a normal repair round after the replacement review." });
+      return;
+    }
     if (scenario === "changed-after-check")
       writeFileSync(join(process.cwd(), "..", "..", "integration", "a.txt"), "Changed after verification\n");
     await report({ kind: "review", verdict: "approved", summary: "Both requested files are present in the integrated checkout",

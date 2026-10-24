@@ -38,6 +38,8 @@ import type {
   WorkerState,
   Bootstrap,
   LaptopWorkspace,
+  WorkerRequest,
+  ControlLease,
 } from "./types.js";
 
 /** This stop attempt was refused before any worker RPC could deliver it. */
@@ -416,6 +418,16 @@ export class Manager {
     this.serial = operation.catch(() => {});
     return operation;
   }
+  controlSession(sessionId: string, request: Extract<WorkerRequest, { op: "control" }>): Promise<ControlLease | null> {
+    const operation = this.serial.then(async () => {
+      this.meta(sessionId);
+      if (request.action !== "release" && existsSync(join(this.config.stateDir, "sessions", sessionId, "retirement.sealed")))
+        throw new TeamError(409, "runtime-retiring", "This runtime is being retired; its retained journal remains available read-only.");
+      return workerCall<ControlLease | null>(this.config.runDir, sessionId, request);
+    });
+    this.serial = operation.catch(() => {});
+    return operation;
+  }
   private async retireTeamRuntimeOnce(sessionId: string, requestId: string, team: TeamAssignment, identity: string): Promise<TeamRuntimeRetirement> {
     const stored = this.meta(sessionId).session;
     const matches = stored.team && stored.team.runId === team.runId && stored.team.memberId === team.memberId &&
@@ -457,6 +469,7 @@ export class Manager {
     writeSealed(file, this.key, scope, record);
     try {
       const result = await stopRuntimeTree(record.known, workerPid, {
+        checkpoint: known => { record.known = known; writeSealed(file, this.key, scope, record); },
         ...(boundary && agentUid !== null ? { agent: { uid: agentUid, signal: boundary.signal } } : {}),
       });
       const retired: StoredTeamRetirement = { ...record, state: "retired", stoppedAt: new Date().toISOString(), known: result.processes, processes: result.processes, unsignalable: result.unsignalable };

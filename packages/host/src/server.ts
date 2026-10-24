@@ -1102,7 +1102,7 @@ export function createApp(config: Config, key: Buffer) {
     }).strict().parse(req.body);
     if (!(await manager.state(sessionId)).capabilities?.inputControl)
       return void res.status(409).json({ error: "This session uses an older worker without input control", code: "unsupported" });
-    res.json({ control: await workerCall(config.runDir, sessionId, { op: "control", ...body, actor: res.locals.actor }) });
+    res.json({ control: await manager.controlSession(sessionId, { op: "control", ...body, actor: res.locals.actor }) });
   });
   // Only a directly paired owner CLI can send terminal control bytes. Browser
   // cookies and controller/viewer keys retain their existing narrower inputs.

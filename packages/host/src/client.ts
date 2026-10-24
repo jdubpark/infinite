@@ -478,7 +478,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
-  const strings = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
+  const strings = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
   const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
   const option = () => {
     const name = args.shift()!;

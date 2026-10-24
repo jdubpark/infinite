@@ -66,7 +66,15 @@ test("an already-running recording-error reviewer can be retired and replaced on
     await f.host.stopApi();
     writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
     await f.host.start();
-    const interrupted = await f.host.fetchApi(`/teams/${id}/members/${firstReviewer.memberId}/retire`, "owner", body);
+    const retiring = f.host.fetchApi(`/teams/${id}/members/${firstReviewer.memberId}/retire`, "owner", body);
+    await waitFor(() => existsSync(join(f.receipts, "retirement-before-signals")), Boolean, 10000);
+    const concurrentClaim = f.host.fetchApi(`/sessions/${firstReviewer.sessionId}/control`, "owner", { action: "claim" });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    writeFileSync(join(f.receipts, "retirement-allow-signals"), "continue");
+    const interrupted = await retiring;
+    const claim = await concurrentClaim;
+    assert.equal(claim.status, 409, "a human claim cannot succeed while retirement owns the runtime");
+    assert.equal(claim.body.code, "runtime-retiring");
     assert.equal(interrupted.status, 409, JSON.stringify(interrupted.body));
     assert.equal(interrupted.body.code, "retirement-boundary-unavailable");
     await waitFor(async () => !alive(workerPid), Boolean, 5000);
@@ -90,7 +98,9 @@ test("an already-running recording-error reviewer can be retired and replaced on
     const finished = await f.settled(id);
     assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
     const reviewers = finished.members.filter((member: any) => member.role === "reviewer");
-    assert.equal(reviewers.length, 2);
+    assert.equal(reviewers.length, 3, "one replacement may request changes and a later repair round still receives a review");
+    assert.equal(reviewers.filter((member: any) => member.baseCommit === firstReviewer.baseCommit).length, 2,
+      "exactly one replacement reviewed the retired assignment's head");
     const retiredMember = reviewers.find((member: any) => member.memberId === firstReviewer.memberId);
     assert.equal(retiredMember.status, "stopped");
     assert.equal(retiredMember.report, undefined);
@@ -99,7 +109,7 @@ test("an already-running recording-error reviewer can be retired and replaced on
     assert.ok(retiredMember.retirement.processes >= 4, "the retry retained the newly discovered process identity");
     const replay = await f.host.fetchApi(`/teams/${id}/members/${firstReviewer.memberId}/retire`, "owner", body);
     assert.equal(replay.status, 200, JSON.stringify(replay.body));
-    assert.equal(replay.body.members.filter((member: any) => member.role === "reviewer").length, 2);
+    assert.equal(replay.body.members.filter((member: any) => member.role === "reviewer").length, 3);
     const second = await f.host.fetchApi(`/teams/${id}/members/${firstReviewer.memberId}/retire`, "owner", { ...body, requestId: randomUUID() });
     assert.equal(second.status, 409, JSON.stringify(second.body));
     assert.equal(second.body.code, "member-retirement-unavailable");

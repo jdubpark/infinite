@@ -369,19 +369,20 @@ the integration head and member checkout are unchanged. Then POST
 `infinite team retire-member ID MEMBER_ID TEXT... --identity HASH
 [--request-id UUID] [--json]`.
 
-Retirement never sends `SIGCONT`. The host signals its own processes and the
+Retirement freezes the recorded tree with `SIGSTOP`, rescans and records new
+descendants, then uses `SIGKILL` once the tree is quiescent. It never sends
+`SIGCONT` or runs termination handlers. The host signals its own processes and the
 sudo launcher directly. Agent-owned descendants are signaled only through the
 configured team command boundary, after a per-process start-time recheck.
 Unknown owners are observed but never signaled; retirement remains blocked
 until they exit, then retry with the same request ID and inspected identity.
 The original session journal, recording-gap evidence, reports, and workspace
 remain available. Restoring recording is unsupported. The scheduler creates
-the replacement only after the full process tree has exited and the old
+the replacement only after the recorded process tree has exited and the old
 checkout passes its read-only check. Refusal codes include
 `stale-team-revision`, `member-retirement-unavailable`,
 `runtime-identity-changed`, `retirement-processes-alive`,
-`retirement-boundary-unavailable`, `control-busy`, and
-`member-retirement-replacement-exists`.
+`retirement-boundary-unavailable`, `control-busy`, and `runtime-retiring`.
 
 After the host records a `merge` report, it refreshes the project, so the merged
 commit reaches the host before the owner reads the result.

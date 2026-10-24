@@ -1677,10 +1677,6 @@ export class TeamService {
         throw new TeamError(409, "verification-required", "Required verification commands have not been established; review cannot start.");
       if (stored.checkHead !== run.headCommit) { this.check(stored); return; }
       if (!run.review || run.review.revision !== run.revision) {
-        const reviewers = run.members.filter(member => member.revision === run.revision && member.role === "reviewer");
-        const retiredReviewers = reviewers.filter(member => member.retirement);
-        if (retiredReviewers.length && reviewers.length >= 2)
-          throw new TeamError(409, "member-retirement-replacement-exists", "A replacement reviewer already exists for this retired assignment.");
         this.prepareMember(stored, "reviewer"); return;
       }
       if (run.review.verdict === "approved") {

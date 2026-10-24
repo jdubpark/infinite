@@ -19,8 +19,9 @@ export interface TeamRuntimeRetirement {
   stoppedAt: string; processes: RuntimeProcess[]; unsignalable: number[];
 }
 export interface RetirementOptions {
-  graceMs?: number; timeoutMs?: number; signal?: (pid: number, signal: NodeJS.Signals) => void;
+  timeoutMs?: number; signal?: (pid: number, signal: NodeJS.Signals) => void;
   inventory?: () => Promise<RuntimeProcess[]>;
+  checkpoint?: (known: RuntimeProcess[]) => void | Promise<void>;
   agent?: { uid: number; signal(targets: { pid: number; born: string; signal: NodeJS.Signals }[]): Promise<Record<number, "signaled" | "exited" | "changed" | "denied">> };
 }
 
@@ -55,7 +56,7 @@ if (request.op === 'uid') {
   for (const target of request.targets) {
     const pid = target.pid;
     if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid || pid === process.ppid) throw new Error('unsafe pid');
-    if (target.signal !== 'SIGTERM' && target.signal !== 'SIGKILL') throw new Error('unsafe signal');
+    if (target.signal !== 'SIGSTOP' && target.signal !== 'SIGKILL') throw new Error('unsafe signal');
     let born;
     try { born = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' } }).trim(); }
     catch (error) {
@@ -110,7 +111,7 @@ const identityChanged = () => new TeamError(409, "runtime-identity-changed", "A 
 const aliveError = (rows: RuntimeProcess[], known: RuntimeProcess[]) => Object.assign(new TeamError(409, "retirement-processes-alive", `Runtime processes remain alive: ${rows.map(row => `${row.pid} (${row.born})`).join(", ")}`), { knownProcesses: known });
 
 export async function stopRuntimeTree(known: RuntimeProcess[], workerPid: number, options: RetirementOptions = {}): Promise<{ processes: RuntimeProcess[]; unsignalable: number[] }> {
-  const graceMs = options.graceMs ?? 3000, timeoutMs = options.timeoutMs ?? 10000;
+  const timeoutMs = options.timeoutMs ?? 10000;
   const inventory = options.inventory ?? inventoryRuntimeProcesses;
   const send = options.signal ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
   const hostUid = typeof process.getuid === "function" ? process.getuid() : -1;
@@ -121,8 +122,11 @@ export async function stopRuntimeTree(known: RuntimeProcess[], workerPid: number
   }
   if (!byPid.has(workerPid)) throw identityChanged();
   const unsignalable = new Set<number>(), signaled = new Set<string>();
-  const signalHost = (row: RuntimeProcess, signal: NodeJS.Signals) => {
+  const signalHost = async (row: RuntimeProcess, signal: NodeJS.Signals) => {
     const key = `${row.pid}:${signal}`; if (signaled.has(key)) return;
+    const now = (await inventory()).find(value => value.pid === row.pid);
+    if (!now || !live(now)) return;
+    if (now.born !== row.born) throw identityChanged();
     try { send(row.pid, signal); signaled.add(key); }
     catch (error) { const code = (error as NodeJS.ErrnoException).code; if (code === "ESRCH") return; if (code === "EPERM") { unsignalable.add(row.pid); return; } throw error; }
   };
@@ -139,7 +143,7 @@ export async function stopRuntimeTree(known: RuntimeProcess[], workerPid: number
       else if (result === "signaled") signaled.add(`${row.pid}:${signal}`);
     }
   };
-  const deadline = Date.now() + timeoutMs, graceAt = Date.now() + graceMs;
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     const rows = await inventory();
     if (!rows.some(row => row.pid === process.pid)) throw new Error("Runtime process inventory was incomplete");
@@ -152,17 +156,29 @@ export async function stopRuntimeTree(known: RuntimeProcess[], workerPid: number
     const roots = new Set([...byPid.values()].filter(prior => { const row = current.get(prior.pid); return row?.born === prior.born && live(row); }).map(row => row.pid));
     const tree = descendants(rows, roots).filter(row => row.pid !== process.pid);
     if (tree.some(row => row.pid <= 1)) throw identityChanged();
-    for (const row of tree) { const prior = byPid.get(row.pid); if (prior && prior.born !== row.born) throw identityChanged(); if (!prior) byPid.set(row.pid, row); }
+    let discovered = false;
+    for (const row of tree) { const prior = byPid.get(row.pid); if (prior && prior.born !== row.born) throw identityChanged(); if (!prior) { byPid.set(row.pid, row); discovered = true; } }
+    // Persist new identities before any signal can orphan them or lose its acknowledgement.
+    if (discovered) await options.checkpoint?.([...byPid.values()]);
     const alive = [...byPid.values()].filter(row => { const now = current.get(row.pid); return now?.born === row.born && live(now); });
     const agentRows = alive.filter(row => options.agent && row.ruid === options.agent.uid && row.euid === options.agent.uid && row.pid !== workerPid);
     const hostRows = alive.filter(row => row.pid === workerPid || (row.ruid === hostUid && row.pid !== workerPid));
     for (const row of alive) if (!agentRows.includes(row) && !hostRows.includes(row)) unsignalable.add(row.pid);
-    for (const row of agentRows) await signalAgent([row], row.state.startsWith("T") ? "SIGKILL" : Date.now() >= graceAt ? "SIGKILL" : "SIGTERM");
-    for (const row of hostRows.filter(row => row.pid !== workerPid)) signalHost(row, row.state.startsWith("T") ? "SIGKILL" : Date.now() >= graceAt ? "SIGKILL" : "SIGTERM");
-    const remainingDescendants = alive.filter(row => row.pid !== workerPid);
-    const worker = alive.find(row => row.pid === workerPid);
-    if (worker && (remainingDescendants.length === 0 || Date.now() >= graceAt)) signalHost(worker, Date.now() >= graceAt ? "SIGKILL" : "SIGTERM");
     if (alive.length === 0) return { processes: [...byPid.values()], unsignalable: [...unsignalable].sort((a, b) => a - b) };
+    // Freeze parents before children, then inspect again. No termination handler
+    // can fork an unobserved survivor after the whole known tree is stopped.
+    const stopped = (row: RuntimeProcess) => /^[Tt]/.test(row.state);
+    const signal: NodeJS.Signals = alive.every(stopped) ? "SIGKILL" : "SIGSTOP";
+    const depth = (row: RuntimeProcess) => {
+      const seen = new Set<number>();
+      while (current.has(row.parent) && !seen.has(row.parent)) { seen.add(row.parent); row = current.get(row.parent)!; }
+      return seen.size;
+    };
+    for (const row of [...alive].sort((a, b) => depth(a) - depth(b))) {
+      if (signal === "SIGSTOP" && stopped(row)) continue;
+      if (agentRows.includes(row)) await signalAgent([row], signal);
+      else if (hostRows.includes(row)) await signalHost(row, signal);
+    }
     if (Date.now() >= deadline) throw aliveError(alive, [...byPid.values()]);
     await new Promise(resolve => setTimeout(resolve, 50));
   }

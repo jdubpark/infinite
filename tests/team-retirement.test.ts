@@ -27,8 +27,8 @@ test("retirement signals the stopped launcher and detached agent descendants thr
   const spawnedPids = new Set<number>();
   try {
     const grandchildPath = join(root, "grandchild.cjs"), childPath = join(root, "child.cjs"), launcherPath = join(root, "launcher.cjs");
-    const childPidFile = join(root, "child.pid"), grandPidFile = join(root, "grand.pid");
-    writeFileSync(grandchildPath, "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);");
+    const childPidFile = join(root, "child.pid"), grandPidFile = join(root, "grand.pid"), orphanPidFile = join(root, "orphan.pid");
+    writeFileSync(grandchildPath, `process.on('SIGTERM',()=>{ const c=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'}); require('node:fs').writeFileSync(${JSON.stringify(orphanPidFile)},String(c.pid)); process.exit(0); }); setInterval(()=>{},1000);`);
     writeFileSync(childPath, "const {spawn}=require('node:child_process'); const fs=require('node:fs'); const g=spawn(process.execPath,[process.argv[2]],{detached:true,stdio:'ignore'}); fs.writeFileSync(process.argv[3],String(g.pid)); setInterval(()=>{},1000);");
     writeFileSync(launcherPath, "const {spawn}=require('node:child_process'); const fs=require('node:fs'); const c=spawn(process.execPath,[process.argv[2],process.argv[3],process.argv[4]],{stdio:'ignore'}); fs.writeFileSync(process.argv[5],String(c.pid)); setInterval(()=>{},1000);");
     launcher = spawn(process.execPath, [launcherPath, childPath, grandchildPath, grandPidFile, childPidFile], { stdio: "ignore" });
@@ -44,7 +44,7 @@ test("retirement signals the stopped launcher and detached agent descendants thr
     const agentPids = new Set([childPid, grandPid]);
     const hostSignals: Array<{ pid: number; signal: NodeJS.Signals }> = [];
     const result = await stopRuntimeTree(known, launcher.pid!, {
-      timeoutMs: 8000, graceMs: 250,
+      timeoutMs: 8000,
       inventory: async () => (await inventoryRuntimeProcesses()).map(row => agentPids.has(row.pid) || row.pid === unrelated!.pid
         ? { ...row, ruid: fakeAgentUid, euid: fakeAgentUid } : row),
       agent: { uid: fakeAgentUid, signal: boundary.signal },
@@ -54,6 +54,8 @@ test("retirement signals the stopped launcher and detached agent descendants thr
     const after = await inventoryRuntimeProcesses();
     for (const pid of [launcher.pid!, childPid, grandPid]) assert.ok(!after.some(row => row.pid === pid && !row.state.startsWith("Z")), `process ${pid} should exit`);
     assert.ok(after.some(row => row.pid === unrelated.pid && !row.state.startsWith("Z")), "unrelated agent process must survive");
+    if (existsSync(orphanPidFile)) spawnedPids.add(Number(readFileSync(orphanPidFile, "utf8")));
+    assert.equal(existsSync(orphanPidFile), false, "retirement quiesces the tree without running a termination handler that can fork an orphan");
     assert.ok(hostSignals.every(item => !agentPids.has(item.pid) && item.signal !== "SIGCONT"), JSON.stringify(hostSignals));
     const calls = readFileSync(join(receipts, "commands.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.ok(calls.some(call => call.command === process.execPath && call.args[0] === "-e"), "agent signal must use configured team command prefix");
@@ -72,7 +74,7 @@ test("unknown owners remain unsignaled and pid reuse is rejected", async () => {
   ];
   const signaled: number[] = [];
   await assert.rejects(stopRuntimeTree(rows.slice(1), 400001, {
-    timeoutMs: 100, graceMs: 25, inventory: async () => rows,
+    timeoutMs: 100, inventory: async () => rows,
     signal: pid => { signaled.push(pid); },
   }), (error: unknown) => (error as { code?: string; message?: string }).code === "retirement-processes-alive" && (error as Error).message.includes("400002"));
   assert.deepEqual([...new Set(signaled)], [400001]);
@@ -99,6 +101,42 @@ test("unknown owners remain unsignaled and pid reuse is rejected", async () => {
   }), (error: unknown) => (error as { code?: string }).code === "runtime-identity-changed");
 });
 
+test("new descendants are checkpointed before a signaling failure can orphan them", async () => {
+  const born = "Mon Jan 01 00:00:00 2024", hostUid = process.getuid?.() ?? 0;
+  const worker: RuntimeProcess = { pid: 400001, parent: 1, group: 400001, ruid: hostUid, euid: hostUid, born, state: "T" };
+  const child: RuntimeProcess = { pid: 400002, parent: worker.pid, group: 400002, ruid: 42, euid: 42, born, state: "S" };
+  let rows = [{ ...worker, pid: process.pid }, worker, child], persisted = [worker];
+  await assert.rejects(stopRuntimeTree(persisted, worker.pid, {
+    inventory: async () => rows,
+    checkpoint: known => { persisted = structuredClone(known); },
+    signal: () => assert.fail("the injected agent boundary fails before any host signal"),
+    agent: { uid: 42, signal: async () => {
+      rows = [{ ...worker, pid: process.pid }, { ...child, parent: 1 }];
+      throw new Error("injected boundary outage after parent exit");
+    } },
+  }), /injected boundary outage/);
+  assert.ok(persisted.some(row => row.pid === child.pid && row.born === child.born),
+    "a restart can recover the discovered child even after it is reparented");
+});
+
+test("host PID identity is rechecked after an awaited agent signal", async () => {
+  const born = "Mon Jan 01 00:00:00 2024", hostUid = process.getuid?.() ?? 0;
+  const worker: RuntimeProcess = { pid: 400001, parent: 1, group: 400001, ruid: hostUid, euid: hostUid, born, state: "T" };
+  const agent: RuntimeProcess = { ...worker, pid: 400002, parent: worker.pid, ruid: 42, euid: 42, state: "S" };
+  const launcher: RuntimeProcess = { ...worker, pid: 400003, parent: agent.pid, state: "S" };
+  let rows = [{ ...worker, pid: process.pid }, worker, agent, launcher];
+  const hostSignals: number[] = [];
+  await assert.rejects(stopRuntimeTree([worker, agent, launcher], worker.pid, {
+    inventory: async () => rows,
+    signal: pid => { hostSignals.push(pid); },
+    agent: { uid: 42, signal: async () => {
+      rows = rows.map(row => row.pid === launcher.pid ? { ...row, born: "Tue Jan 02 00:00:00 2024" } : row);
+      return { [agent.pid]: "signaled" };
+    } },
+  }), (error: unknown) => (error as { code?: string }).code === "runtime-identity-changed");
+  assert.deepEqual(hostSignals, [], "the changed host PID is never signaled");
+});
+
 test("multi-UID configured-boundary deployment probe", { skip: !process.env.INFINITE_RETIREMENT_PROBE_PREFIX || !process.env.INFINITE_RETIREMENT_PROBE_CWD ? "Set the deployment probe prefix and host-created team workspace to run the multi-UID probe" : false }, async t => {
   if (process.platform !== "linux" || typeof process.getuid !== "function") { t.skip("Requires Linux process credentials"); return; }
   const prefix = JSON.parse(process.env.INFINITE_RETIREMENT_PROBE_PREFIX!) as TeamCommand;
@@ -123,7 +161,7 @@ test("multi-UID configured-boundary deployment probe", { skip: !process.env.INFI
     const rows = await inventoryRuntimeProcesses(), selected = new Set([main.pid!, childPid, grandPid]);
     const known = rows.filter(row => selected.has(row.pid)); assert.equal(known.length, 3);
     cleanupTargets.push(...known.filter(row => row.ruid === uid && row.euid === uid).map(row => ({ pid: row.pid, born: row.born, signal: "SIGKILL" as const })));
-    const result = await stopRuntimeTree(known, main.pid!, { timeoutMs: 10000, graceMs: 250, agent: { uid, signal: boundary.signal } });
+    const result = await stopRuntimeTree(known, main.pid!, { timeoutMs: 10000, agent: { uid, signal: boundary.signal } });
     assert.equal(result.unsignalable.length, 0);
     const after = await inventoryRuntimeProcesses();
     for (const pid of selected) assert.ok(!after.some(row => row.pid === pid && !row.state.startsWith("Z")), `retired tree process ${pid} should exit`);

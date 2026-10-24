@@ -1,0 +1,71 @@
+services:
+  api:
+    image: ghcr.io/plastic-labs/honcho@sha256:6a8c74cf6cbd51a0e14e56b6b8503b4182f546059eb9d7d0190ac177cf075603
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    restart: "no"
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${HONCHO_PORT:-18080}:8000"
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@database:5432/postgres
+      CACHE_URL: redis://redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+      AUTH_USE_AUTH: "true"
+      AUTH_JWT_SECRET: ${HONCHO_JWT_SECRET:?HONCHO_JWT_SECRET is required}
+      LLM_OPENAI_API_KEY: ${HONCHO_DISABLED_MODEL_KEY:?HONCHO_DISABLED_MODEL_KEY is required}
+      TIKTOKEN_CACHE_DIR: /app/tiktoken-cache
+      DERIVER_ENABLED: "false"
+      EMBED_MESSAGES: "false"
+      SUMMARY_ENABLED: "false"
+      DREAM_ENABLED: "false"
+      TELEMETRY_ENABLED: "false"
+      SENTRY_ENABLED: "false"
+      API_WORKERS: "1"
+    env_file:
+      - ${HONCHO_ENV_FILE:?HONCHO_ENV_FILE must point to an ignored synthetic env file}
+    volumes:
+      - ${HONCHO_TIKTOKEN_CACHE:?HONCHO_TIKTOKEN_CACHE must point to the verified tokenizer cache}:/app/tiktoken-cache:ro
+    networks: [memory_private]
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  database:
+    image: pgvector/pgvector:pg15@sha256:47af0b65960b14f1c6945aa4ccae37836c632e9a6fe0eea9160936e616e5b2e9
+    restart: "no"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    tmpfs:
+      - /var/lib/postgresql/data:size=1073741824
+    networks: [memory_private]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:8.2@sha256:e5f23377739f95a2f530b9c99f93accb4f634577f09d00a7d8e0638f2fdf69e0
+    restart: "no"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    tmpfs:
+      - /data:size=67108864
+    networks: [memory_private]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+networks:
+  memory_private:
+    internal: true

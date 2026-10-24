@@ -444,6 +444,22 @@ export async function prepareRecoveredWorkspace(workspace: string, id: string, b
   const prepared = await preparePinnedWorkspaceClone(workspace, "recovery", id, baseCommit, prefix, signal, branch);
   return { workspace: prepared.workspace, ...(prepared.branch ? { branch: prepared.branch } : {}), baseCommit: prepared.baseCommit };
 }
+/** Create a clean sibling from a host-refreshed source mirror, preserving the old integration copy. */
+export async function prepareRecoveryWorkspaceFromSource(workspace: string, source: string, id: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal, branch?: string) {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(baseCommit)) throw new TeamError(409, "invalid-workspace-baseline", "The copied workspace baseline is invalid.");
+  const { destination } = ensureSiblingWorkspaceParent(workspace, "recovery", id);
+  if (await git(source, ["cat-file", "-t", baseCommit], prefix, 30000, signal) !== "commit")
+    throw new TeamError(409, "invalid-workspace-baseline", "The refreshed source must contain the recorded base commit.");
+  await git(dirname(destination), ["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", source, destination], prefix, 120000, signal);
+  await git(destination, ["remote", "remove", "origin"], prefix, 30000, signal);
+  if (branch) {
+    await git(destination, ["check-ref-format", "--branch", branch], prefix, 30000, signal);
+    await git(destination, ["checkout", "-B", branch, baseCommit], prefix, 30000, signal);
+  } else await git(destination, ["checkout", "--detach", baseCommit], prefix, 30000, signal);
+  if (await teamHead(destination, prefix, signal) !== baseCommit || await git(destination, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], prefix, 30000, signal))
+    throw new TeamError(409, "workspace-copy-changed", "The source recovery workspace did not match its requested clean baseline. The copy was preserved for inspection.");
+  return { workspace: realpathSync(destination), ...(branch ? { branch } : {}), baseCommit };
+}
 export function teamPathAllowed(path: string, allowed: string[]) { return allowed.some(prefix => prefix === "." || path === prefix || path.startsWith(`${prefix}/`)); }
 /** List all tracked, staged, and untracked paths changed from a member's base commit. */
 export async function memberChangedPaths(cwd: string, base: string, prefix?: TeamCommand, signal?: AbortSignal) {

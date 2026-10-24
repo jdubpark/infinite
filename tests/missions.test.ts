@@ -1420,7 +1420,7 @@ test("direction for a blocked subteam waits while the mission is paused, and is 
   } finally { h.close(); }
 });
 
-test("a mission blocked report waits for an active bounded subteam recovery without starting retry attempts", { timeout: 60000 }, async () => {
+for (const recoveryPhase of ["planning", "delivering"] as const) test(`a mission blocked report waits for bounded subteam recovery during ${recoveryPhase} without starting retry attempts`, { timeout: 60000 }, async () => {
   const h = scripted();
   try {
     const { id } = await h.create();
@@ -1429,7 +1429,7 @@ test("a mission blocked report waits for an active bounded subteam recovery with
     const decision = { id: randomUUID(), memberId: randomUUID(), revision: 1, question: "Should the API stay backward compatible?", options: ["Yes", "No"], createdAt: new Date().toISOString() };
     h.set(teamId, { status: "needs-input", decisions: [decision] });
     await h.attempt(2);
-    h.set(teamId, { status: "planning", recovery: { attempts: 1, status: "planning", source: {
+    h.set(teamId, { status: recoveryPhase, recovery: { attempts: 1, status: "planning", source: {
       code: "agent-blocked", memberId: decision.memberId, revision: 1, reportKind: "blocked", reason: "The worker found a routine implementation issue.", at: new Date().toISOString(),
     } } });
 
@@ -1437,7 +1437,7 @@ test("a mission blocked report waits for an active bounded subteam recovery with
     const deferred = await until(() => h.get(id), mission => mission.status === "blocked" || mission.events.some(event => /blocked report was deferred/.test(event.text)));
     assert.ok(deferred.events.some(event => /blocked report was deferred/.test(event.text)), "The active subteam recovery defers a stale mission-level blocker");
     assert.equal(deferred.status, "working");
-    assert.equal(h.runs.get(teamId)?.status, "planning", "The child remains supervised during its repair window");
+    assert.equal(h.runs.get(teamId)?.status, recoveryPhase, "The child remains supervised during its repair window");
     await new Promise(done => setTimeout(done, 1200));
     assert.equal(h.attempts(), 2, "A deferred report does not immediately wake the same coordinator into a refusal loop");
 

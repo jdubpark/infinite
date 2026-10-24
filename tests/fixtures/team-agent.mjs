@@ -222,7 +222,7 @@ async function main() {
       return;
     }
     const tasks = [
-      { id: "a", title: "Build the first file", instructions: "Write a.txt with the current revision", paths: ["a.txt"], dependsOn: [] },
+      { id: "a", title: "Build the first file", instructions: "Write a.txt with the current revision", paths: scenario === "delivery-base-recovery" ? ["a.txt", "README.md"] : ["a.txt"], dependsOn: [] },
       { id: "b", title: "Build the second file", instructions: "Write b.txt with the current revision", paths: ["b.txt"], dependsOn: [] },
     ];
     if (scenario === "mixed") tasks[1].dependsOn = ["a"];
@@ -234,7 +234,7 @@ async function main() {
     } else if (scenario === "mixed") {
       tasks[0].agentProfileId = "spark-high";
       tasks[1].agentProfileId = "astra-xhigh";
-    } else if (scenario.startsWith("permissions") || scenario.startsWith("delivery") || scenario === "integrator-limit") {
+    } else if (scenario.startsWith("permissions") || scenario.startsWith("delivery") || scenario === "integrator-limit" || scenario === "result-operation-fails-once") {
       tasks[0].agentProfileId = scenario.startsWith("permissions-codex") ? "codex-light" : "haiku";
       tasks[1].agentProfileId = scenario.startsWith("permissions-codex") ? "haiku" : "codex-light";
     } else if (scenario.startsWith("limit")) {
@@ -252,7 +252,7 @@ async function main() {
     if (scenario === "bootstrap-change" && assignment.revision > 2)
       verification.checks[0].args.push("--different");
     const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
-      ...(scenario === "live-limit" ? { parallelism: 1 } : {}),
+      ...(scenario === "live-limit" || scenario === "result-operation-fails-once" ? { parallelism: 1 } : {}),
       ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) };
     if (scenario === "bootstrap-override") {
       let rejection;
@@ -288,7 +288,7 @@ async function main() {
       verdict: scenario === "permissions-escalate" ? "escalate" : "approve-once",
       summary: "The request is limited to reading the assigned project file for the stated objective." });
   } else if (assignment.role === "implementer") {
-    if (scenario !== "live-limit" && scenario !== "mixed") await waitForPeer();
+    if (scenario !== "live-limit" && scenario !== "mixed" && scenario !== "result-operation-fails-once") await waitForPeer();
     const shouldBlock = scenario === "agent-blocked-once" && assignment.revision === 1 || scenario === "agent-blocked-twice" && assignment.revision <= 3;
     if (shouldBlock && assignment.taskId === "a") {
       if (scenario === "agent-blocked-once") {
@@ -454,6 +454,18 @@ async function main() {
     await new Promise(resolve => setTimeout(resolve, 150));
     const name = scenario === "scope-escape" && assignment.taskId === "a" ? " a.txt" : `${assignment.taskId}.txt`;
     writeFileSync(name, `revision ${assignment.revision}\n`);
+    if (scenario === "delivery-base-recovery" && assignment.taskId === "a") {
+      const readme = readFileSync("README.md", "utf8").trimEnd();
+      writeFileSync("README.md", `${readme}\nTeam update revision ${assignment.revision}\n`);
+    }
+    if (scenario === "result-operation-fails-once" && assignment.revision === 1 && assignment.taskId === "a") {
+      writeFileSync(join(receiptDir, "result-failure-ready.json"), JSON.stringify({ cwd: process.cwd(), memberId: assignment.memberId }), { mode: 0o600 });
+      const until = Date.now() + 30000;
+      while (!existsSync(join(receiptDir, "result-failure-report-release"))) {
+        if (Date.now() >= until) throw new Error("The test did not release the first result report");
+        await new Promise(resolve => setTimeout(resolve, 40));
+      }
+    }
     if (scenario === "rubric" && assignment.taskId === "a") {
       mkdirSync("docs", { recursive: true }); mkdirSync("tests", { recursive: true });
       writeFileSync("docs/x.md", "Documentation evidence.\n");
@@ -483,6 +495,21 @@ async function main() {
       await new Promise(resolve => setTimeout(resolve, 5000));
     }
   } else if (assignment.role === "integrator") {
+    if (scenario === "delivery-base-recovery") {
+      const launchPrompt = receipt.prompt ?? process.argv.at(-1) ?? "";
+      const originalWorkspace = /The original integration copy is preserved at ([^\r\n]+?) \(workspace path /.exec(launchPrompt)?.[1];
+      if (!originalWorkspace || !existsSync(join(originalWorkspace, "a.txt")) || !existsSync(join(originalWorkspace, "b.txt")))
+        throw new Error("The delivery recovery integrator could not read the preserved implementation workspace");
+      for (const name of ["a.txt", "b.txt"])
+        writeFileSync(name, readFileSync(join(originalWorkspace, name)));
+      const upstreamReadme = readFileSync("README.md", "utf8").trimEnd();
+      const priorReadme = readFileSync(join(originalWorkspace, "README.md"), "utf8");
+      const carriedLines = priorReadme.split(/\r?\n/).filter(line => /^Team update revision \d+$/.test(line));
+      if (carriedLines.length !== 1) throw new Error("The preserved implementation README change could not be identified");
+      writeFileSync("README.md", `${upstreamReadme}\n${carriedLines.join("\n")}\n`);
+      await report({ kind: "result", summary: "Imported both implementation files and reconciled the README change from the preserved workspace" });
+      return;
+    }
     if (scenario === "repeat-failed-check") {
       await report({ kind: "result", summary: "No implementation change is required for this verification result" });
       return;
@@ -504,6 +531,60 @@ async function main() {
   } else if (assignment.role === "delivery") {
     const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     const base = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim().split("\n")[0];
+    const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
+    const launchPrompt = receipt.prompt ?? process.argv.at(-1) ?? "";
+    const reconciling = /Automatic delivery reconciliation/i.test(launchPrompt);
+    const existingDeliveryMembers = readdirSync(receiptDir).filter(name => name.endsWith(".json"))
+      .map(name => JSON.parse(readFileSync(join(receiptDir, name), "utf8")))
+      .filter(value => value.runId === assignment.runId && value.role === "delivery");
+    appendFileSync(join(receiptDir, "delivery-attempts.jsonl"), JSON.stringify({ memberId: assignment.memberId, revision: assignment.revision,
+      head, reconciling, prompt: launchPrompt }) + "\n", { mode: 0o600 });
+    if (reconciling) {
+      const branch = readFileSync(join(receiptDir, "delivery-branch"), "utf8").trim();
+      const baseHeadCommit = existsSync(join(receiptDir, "delivery-base-head"))
+        ? readFileSync(join(receiptDir, "delivery-base-head"), "utf8").trim()
+        : context.baseCommit;
+      const reconciliation = { kind: "delivery-reconciliation", headCommit: context.headCommit,
+        repository: "example/app", branch, baseHeadCommit, disposition: "no-publication",
+        summary: "The configured branch has no pull request or publication; no remote write was made." };
+      appendFileSync(join(receiptDir, "delivery-reconciliations.jsonl"), JSON.stringify(reconciliation) + "\n", { mode: 0o600 });
+      await report(reconciliation);
+      return;
+    }
+    if (scenario === "delivery-capability-failure" || scenario === "delivery-capability-repair") {
+      const failure = { kind: "blocked", summary: "The existing provider lacks the required publication capability; no publication was attempted." };
+      if (existingDeliveryMembers.length <= 1) {
+        writeFileSync(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }), { mode: 0o600 });
+        while (!existsSync(join(receiptDir, "delivery-release"))) await new Promise(resolve => setTimeout(resolve, 40));
+        if (scenario === "delivery-capability-repair") {
+          await report(failure);
+          return;
+        }
+      }
+      if (scenario === "delivery-capability-repair") {
+        if (existsSync("repair.txt")) {
+          await report({ kind: "pull-request", headCommit: context.headCommit, pullRequestUrl: "https://github.com/example/app/pull/1",
+            summary: "Published the repaired, checked, and independently reviewed head exactly once." });
+        } else {
+          await report({ kind: "delivery-repair", headCommit: context.headCommit,
+            summary: "The inspected no-publication attempt is blocked by CI; repair the reviewed change before another delivery." });
+        }
+        return;
+      }
+      await report(failure);
+      return;
+    }
+    if (scenario === "delivery-base-recovery") {
+      if (existingDeliveryMembers.length <= 1) {
+        writeFileSync(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }), { mode: 0o600 });
+        while (!existsSync(join(receiptDir, "delivery-release"))) await new Promise(resolve => setTimeout(resolve, 40));
+        await report({ kind: "blocked", summary: "The base branch moved while this reviewed README change conflicted; no pull request or publication was created." });
+        return;
+      }
+      await report({ kind: "pull-request", headCommit: context.headCommit, pullRequestUrl: "https://github.com/example/app/pull/1",
+        summary: "Opened one pull request for the newly checked and independently reviewed head." });
+      return;
+    }
     const mergeCommit = execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", `${scenario === "delivery-baseline-changed" ? base : head}^{tree}`, "-p", base, "-m", "Synthetic squash delivery"], { encoding: "utf8" }).trim();
     execFileSync("git", ["update-ref", "refs/heads/synthetic-merge", mergeCommit]);
     writeFileSync(join(receiptDir, "delivery-started.json"), JSON.stringify({ head, memberId: assignment.memberId }), { mode: 0o600 });

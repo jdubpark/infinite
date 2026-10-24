@@ -53,10 +53,36 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
   const claude = join(root, "claude");
   writeFileSync(claude, `#!/bin/sh\nexec ${[process.execPath, resolve("tests/fixtures/team-agent.mjs"), scenario, receipts, "--fixture-provider", "claude"].map(quote).join(" ")} "$@"\n`);
   chmodSync(claude, 0o700);
+  const resultFailurePrefix = `
+const { spawnSync } = require("node:child_process");
+const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+const { join } = require("node:path");
+const receiptDir = process.argv[1];
+const [command, ...args] = process.argv.slice(2);
+const targetFile = join(receiptDir, "result-failure-target.json");
+if (command === "git" && existsSync(targetFile)) {
+  const target = JSON.parse(readFileSync(targetFile, "utf8"));
+  const fired = join(receiptDir, "result-failure-fired");
+  if (process.cwd() === target.cwd && !existsSync(fired)) {
+    writeFileSync(join(receiptDir, "result-failure-started"), JSON.stringify({ cwd: process.cwd(), args }));
+    const until = Date.now() + 30000;
+    while (!existsSync(join(receiptDir, "result-failure-release")) && Date.now() < until)
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    if (!existsSync(join(receiptDir, "result-failure-release"))) process.exit(74);
+    writeFileSync(fired, "failed once");
+    process.stderr.write("The fixture injected one transient Git command failure.\\n");
+    process.exit(73);
+  }
+}
+const child = spawnSync(command, args, { stdio: "inherit" });
+process.exit(child.status ?? 1);
+`;
   git(source, "init", "--initial-branch=main");
   const bootstrap = scenario.startsWith("bootstrap");
   if (!bootstrap)
     writeFileSync(join(source, "original.txt"), "The configured project remains unchanged.\n");
+  if (scenario === "delivery-base-recovery")
+    writeFileSync(join(source, "README.md"), "Upstream README heading\nBase README body\n");
   if (!bootstrap) writeFileSync(join(source, "check.mjs"), [
     'import assert from "node:assert/strict";',
     'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
@@ -65,6 +91,7 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
     'if (process.argv.includes("--prefix")) assert.equal(process.env.INFINITE_TEST_COMMAND_IDENTITY, "team-prefix");',
     'if (process.argv.includes("--fail")) { console.error("Configured verification failed"); process.exit(17); }',
     ...(scenario === "mixed" || scenario === "integrator-limit" ? ['if (!existsSync("repair.txt")) { console.error("Integration repair required"); process.exit(18); }'] : []),
+    ...(scenario === "delivery-base-recovery" ? ['assert.match(readFileSync("README.md", "utf8"), /Team update revision/);'] : []),
     ...(scenario === "check-mutates" ? [
       `if (!existsSync(${JSON.stringify(join(receipts, "check-mutated"))})) {`,
       `  writeFileSync(${JSON.stringify(join(receipts, "check-mutated"))}, "done\\n");`,
@@ -74,7 +101,7 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
   ].join("\n"));
   if (bootstrap) {
     git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "Empty project");
-  } else git(source, "add", "original.txt", "check.mjs");
+  } else git(source, "add", "original.txt", "check.mjs", ...(scenario === "delivery-base-recovery" ? ["README.md"] : []));
   if (!bootstrap)
     git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
   const base = git(source, "rev-parse", "HEAD");
@@ -96,6 +123,8 @@ export async function fixture(scenario = "success", lineup?: TeamLineup, config:
     ...config,
     teams: { workspaceDir: join(root, "teams"), ...(lineup ? { lineup } : {}), ...(options.trustWorkspaces ? { trustWorkspaces: true } : {}), ...(scenario === "success" ? {
       commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },
+    } : scenario === "result-operation-fails-once" ? {
+      commandPrefix: { command: process.execPath, args: ["-e", resultFailurePrefix, receipts] },
     } : {}), ...config.teams },
   };
   let host: Host;

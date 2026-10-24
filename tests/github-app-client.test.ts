@@ -148,6 +148,32 @@ test("configured GitHub calls receive only the scoped app token from the canonic
   }
 });
 
+test("client accepts only the exact optional workflows permission in its repository-bound cache", () => {
+  const f = fixture();
+  writeCache(f, "acme/widget", { permissions: { ...permissions, workflows: "write" } });
+  const allowed = invoke(f, ["gh", "--", "pr", "list", "--repo=acme/widget"]);
+  assert.equal(allowed.status, 0, allowed.stderr);
+  assert.equal(captured(f).ghToken, appToken);
+
+  rmSync(f.capture, { force: true });
+  writeCache(f, "acme/widget", { permissions: { ...permissions, workflows: "read" } });
+  const wrongLevel = invoke(f, ["gh", "--", "pr", "list", "--repo=acme/widget"]);
+  assert.notEqual(wrongLevel.status, 0);
+  assert.equal(existsSync(f.capture), false, "invalid token permissions must not invoke the CLI");
+
+  rmSync(f.capture, { force: true });
+  writeCache(f, "acme/widget", { permissions: { ...permissions, workflows: "write", issues: "write" } });
+  const broad = invoke(f, ["gh", "--", "pr", "list", "--repo=acme/widget"]);
+  assert.notEqual(broad.status, 0);
+  assert.equal(existsSync(f.capture), false, "an extra permission must not invoke the CLI");
+
+  rmSync(f.capture, { force: true });
+  writeCache(f, "acme/widget", { repository: "acme/other", permissions: { ...permissions, workflows: "write" } });
+  const wrongRepository = invoke(f, ["gh", "--", "pr", "list", "--repo=acme/widget"]);
+  assert.notEqual(wrongRepository.status, 0);
+  assert.equal(existsSync(f.capture), false, "workflow permission must stay bound to its cache repository");
+});
+
 test("unconfigured repositories retain the original gh arguments and authentication environment", () => {
   const f = fixture();
   const args = ["gh", "--", "issue", "list", "--repo", "elsewhere/project"];

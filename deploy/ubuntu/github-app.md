@@ -22,11 +22,13 @@ Register a private GitHub App with these repository permissions:
 | Contents | Read and write |
 | Pull requests | Read and write |
 | Actions, Checks, Commit statuses, Metadata | Read |
+| Workflows | No access by default; grant write only for an explicitly opted-in repository |
 
 Keep webhooks, user OAuth, and account or organization permissions disabled.
 Install the app on **Only select repositories**, then select the repositories
-approved for delivery. This does not authorize changing workflow definitions,
-repository settings, secrets, or branch protections.
+approved for delivery. By default, minted installation tokens cannot change
+workflow definitions. Repository settings, secrets, and branch protections
+remain outside this token policy.
 
 Generate one app private key and transfer it privately to the server's encrypted
 storage. Keep the key and issuer configuration owned by root with mode `0600`,
@@ -82,6 +84,38 @@ entry with the same slug.
 }
 ```
 
+Workflow file changes need a separate, narrow opt-in. First grant the GitHub App
+Workflows repository permission with write access, then add only approved
+canonical repository names to `workflowRepositories` in `issuer.json`:
+
+```json
+{
+  "workflowRepositories": ["example/product"]
+}
+```
+
+This does not add repositories to the installation or token inventory. A listed
+repository receives `workflows: write` only when it is also present in the
+explicit repository configuration or the installation's current discovered
+inventory. Every other repository continues to receive the original exact
+permission set. The workflow capability is bound to that repository's token;
+it permits workflow definition changes and therefore expands what an authorized
+delivery can publish. Keep the list limited to repositories whose owner-approved
+delivery policy needs this capability.
+
+The client accepts only the original exact permission set or that set plus
+`workflows: write` in a cache whose repository identity matches the requested
+repository. Any other permission, or a workflow permission on a cache bound to a
+different repository, is invalid. After changing `workflowRepositories`, run a
+successful refresh before using the new policy. When a cached token's exact
+permissions no longer match the configured policy, the issuer removes that
+out-of-policy cache before requesting a replacement. If that policy-change
+refresh fails, the repository has no usable cached token until a later
+successful refresh. For an unchanged policy, a failed refresh preserves the
+prior cache. A token already copied outside the cache keeps its granted
+authority until it expires or is revoked, so an opt-out is not an immediate
+revocation.
+
 Create the non-secret `/etc/infinite-github/client.json`, owned by root with
 mode `0644`:
 
@@ -98,8 +132,10 @@ token cache as configured and lists those repositories in `status` output.
 
 Install `infinite-github-refresh.service` and `infinite-github-refresh.timer` from
 this directory into `/etc/systemd/system`. Run the service once before enabling
-the timer. A failed refresh preserves the prior cache; the client refuses it
-when expired. Service errors omit tokens, JWTs, keys, and GitHub response bodies.
+the timer. A failed same-policy refresh preserves the prior cache; a permission
+policy change invalidates an out-of-policy cache before replacement is
+requested. The client refuses expired tokens. Service errors omit tokens,
+JWTs, keys, and GitHub response bodies.
 
 ```sh
 systemctl daemon-reload

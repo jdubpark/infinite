@@ -207,6 +207,28 @@ export async function prepareMemberWorkspace(workspace: string, memberId: string
   await git(cwd, ["checkout", "--detach", baseCommit], prefix, 30000, signal);
   return realpathSync(cwd);
 }
+/** Assign scratch outside the Git checkout; prompt-supplied temporary paths never establish ownership. */
+export function prepareMemberScratch(workspace: string, memberId: string) {
+  safeWorkspaceId(memberId);
+  const anchor = dirname(realpathSync(workspace));
+  const parent = join(anchor, "scratch");
+  try { mkdirSync(parent, { mode: 0o750 }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  const parentInfo = lstatSync(parent);
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || !hostOwned(parentInfo) || (parentInfo.mode & 0o022) !== 0 || realpathSync(parent) !== parent)
+    throw unsafeTeamRoot();
+  // Preserve the run root's shared group for newly assigned child directories.
+  chmodDirectoryNoFollow(parent, 0o2750);
+  const target = join(parent, memberId);
+  try { mkdirSync(target, { mode: 0o700 }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  const info = lstatSync(target);
+  if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info) || realpathSync(target) !== target)
+    throw unsafeTeamRoot();
+  // Team roots carry the agent's shared group. Keep the parent host-owned and non-writable.
+  chmodDirectoryNoFollow(target, 0o2770);
+  return target;
+}
 const writeTeamContextScript = `
 const fs = require("node:fs");
 const path = require("node:path");

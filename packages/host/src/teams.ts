@@ -17,9 +17,10 @@ import { ProviderLimits, switchesMember, type LimitObservation } from "./provide
 import type { LinearService } from "./linear.js";
 import type { Readings } from "./readings.js";
 import type { ProjectSourceService } from "./project-source.js";
-import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { oneShotPermissionOption, permissionEvidenceHash, refusedBeforeSend } from "./team-permissions.js";
+import { collectPermissionEvidence } from "./team-permission-evidence.js";
 export { TeamError } from "./team-workspace.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
@@ -630,6 +631,71 @@ export class TeamService {
       return this.view(stored);
     });
   }
+  reconcileDelivery(id: string, input: Mutation) {
+    const body = teamMutationSchema.parse(input);
+    return this.enqueue(async () => {
+      const stored = this.record(id), run = stored.run;
+      if (this.replay(stored, "reconcile-delivery", body)) return this.view(stored);
+      if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling delivery.");
+      if (run.status === "cancelled") throw new TeamError(409, "team-cancelled", "This team has been cancelled.");
+      if (run.linearTracking || run.linear) {
+        const refreshed = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
+        const tracking = this.linear?.getTeam(run.id) ?? refreshed;
+        if (tracking && run.linear !== tracking) { run.linear = tracking; this.save(stored); }
+        if (!this.linear || tracking?.status !== "synced")
+          throw new TeamError(409, "linear-reconciliation-required", "Linear has not confirmed the current issue and requirements. Refresh tracking before delivery reconciliation.");
+      }
+      if (run.status !== "blocked" || !stored.prepared || stored.pending || this.commands.has(id) || stored.halt)
+        throw new TeamError(409, "delivery-reconciliation-unavailable", "Delivery reconciliation requires a blocked, prepared team with no pending operation or active halt.");
+      if (run.goal || run.missionId || run.handoff)
+        throw new TeamError(409, "delivery-reconciliation-unavailable", "Only standalone teams can reconcile a delivery attempt.");
+      if (run.stopReason || run.members.length >= 60)
+        throw new TeamError(409, "team-stopped-at-limit", "The team reached its execution limit and cannot retry delivery.");
+
+      const attempt = stored.deliveryAttempt;
+      const previous = attempt && run.members.find(member => member.memberId === attempt.memberId);
+      if (!attempt || !previous || previous.role !== "delivery" || previous.revision !== run.revision || previous.status !== "stopped" ||
+          previous.report?.kind !== "blocked" || attempt.revision !== run.revision || !run.headCommit ||
+          attempt.headCommit !== run.headCommit || previous.baseCommit !== run.headCommit || !run.branch)
+        throw new TeamError(409, "delivery-reconciliation-unavailable", "The recorded delivery attempt does not identify a stopped, blocked delivery report for the current reviewed head.");
+      if (run.deliveryReceipt || run.pullRequest)
+        throw new TeamError(409, "delivery-reconciliation-unavailable", "A recorded pull request or delivery receipt must be reconciled before starting another delivery attempt.");
+      if (run.members.some(member => member.status !== "stopped"))
+        throw new TeamError(409, "delivery-reconciliation-unavailable", "Every team member must be confirmed stopped before delivery reconciliation.");
+      if ((run.permissionDecisions ?? []).some(decision => ["pending", "reviewing", "approved", "answering", "uncertain"].includes(decision.status)))
+        throw new TeamError(409, "delivery-reconciliation-unavailable", "An unresolved permission decision must be reconciled before delivery can continue.");
+      if (!run.lineup?.coordinator || run.lineup.coordinator.tier !== "strong")
+        throw new TeamError(409, "delivery-lineup-required", "Delivery reconciliation requires the configured strong coordinator profile.");
+
+      this.assertBudget(run, true);
+      this.assertDelivery(stored);
+      const head = run.headCommit;
+      this.assertRunPath(stored, run.workspace);
+      this.assertRunPath(stored, previous.cwd);
+      if (await teamHead(run.workspace, this.config.teams?.commandPrefix) !== head)
+        throw new TeamError(409, "delivery-reconciliation-head-changed", "The integration workspace no longer matches the reviewed delivery head.");
+      await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, undefined, "integration");
+      await assertMemberReadOnly(previous.cwd, head, this.config.teams?.commandPrefix);
+
+      if (!this.mutation(stored, "reconcile-delivery", body)) return this.view(stored);
+      const priorAttempt = structuredClone(attempt);
+      const priorReport = structuredClone(previous.report);
+      const feedback = [
+        "Owner-authorized reconciliation of an interrupted delivery attempt.",
+        `Owner reconciliation instructions: ${body.text}`,
+        `Prior delivery member: ${previous.memberId}; prior revision: ${previous.revision}; pinned head: ${priorAttempt.headCommit}; branch: ${run.branch}.`,
+        `Prior blocked report (preserved verbatim in the original member record): ${JSON.stringify(priorReport)}`,
+        "Before any write or publication action, inspect the current remote branch, pull request, and CI state for this exact head. Reuse an existing branch or pull request and report completed work; never create a duplicate pull request.",
+        "Keep the pinned delivery policy, repository, branch, base branch, reviewed head, required checks, and review unchanged. Do not bypass a denied action by switching credentials, tools, or routes. If required capability is still missing, stop and report the blocker. The host has not authorized a new credential or a broader permission.",
+      ].join("\n\n");
+      this.prepareMember(stored, "delivery", undefined, feedback, member => {
+        stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: head };
+        run.reason = undefined; run.blockCode = undefined;
+        this.event(stored, `Owner authorized a fresh delivery reconciliation at ${head} on ${run.branch}; prior attempt ${previous.memberId} and its blocked report remain in team history.`);
+      });
+      return this.view(stored);
+    });
+  }
   setParallelism(id: string, input: TeamParallelism) {
     teamParallelismSchema.parse(input);
     this.record(id);
@@ -1135,6 +1201,9 @@ export class TeamService {
       if (["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status)) {
         await this.stopObsoletePermissionCoordinators(stored); return;
       }
+      // Reconcile one-shot reviews before consuming reports from their reviewer. The owner may
+      // have answered the target prompt since the previous pass, making that report obsolete.
+      await this.stopObsoletePermissionCoordinators(stored);
       if ([providerInputReason, permissionReviewReason, runtimeUnavailableReason].includes(run.reason ?? "")) {
         const observedMembers = run.members.filter(member => member.revision === run.revision && activeMember(member) && member.status !== "queued" && !member.report);
         const states = await Promise.all(observedMembers.map(member => this.manager.state(member.sessionId)));
@@ -1298,7 +1367,14 @@ export class TeamService {
     if (!run.permissions || run.permissionsRevokedAt || target.status !== "running" ||
         stored.halt || ["paused", "cancelled", "blocked"].includes(run.status) || target.revision !== run.revision)
       return false;
-    if (run.members.some(member => member.memberId !== target.memberId && member.revision === run.revision && member.role === "permission-coordinator" && activeMember(member))) return false;
+    if (run.members.some(member => {
+      if (member.memberId === target.memberId || member.revision !== run.revision || member.role !== "permission-coordinator" || !activeMember(member)) return false;
+      const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId && item.revision === member.revision);
+      // Keep unknown assignments and live/uncertain decisions fenced. A confirmed terminal
+      // decision cannot authorize another answer, so its unavailable report-only member must
+      // not hold up review of a later target prompt.
+      return !decision || !["answered", "escalated", "stale"].includes(decision.status);
+    })) return false;
     if (run.permissionDecisions?.length && run.permissionDecisions.length >= run.permissions.maxDecisions) return false;
 
     const state = await this.manager.state(target.sessionId, true);
@@ -1357,11 +1433,27 @@ export class TeamService {
       this.escalatePermissionDecision(stored, decision, "The target's changed files could not be listed for review.", "The permission request remains with the user because its changed files could not be listed for review.");
       return false;
     }
+    const permissionEvidence = collectPermissionEvidence({ prompt: decision.prompt, cwd: targetCwd, changedPaths,
+      approvedScratchRoots: target.scratchDirectory ? [target.scratchDirectory] : [] });
+    decision.workspaceEvidenceHash = digest({ changedPaths, evidence: permissionEvidence.digest });
+    let deliveryAuthority = null;
+    if (target.role === "delivery") {
+      try {
+        this.assertDelivery(stored);
+        await assertMemberReadOnly(targetCwd, run.headCommit!, this.config.teams?.commandPrefix);
+      }
+      catch {
+        this.escalatePermissionDecision(stored, decision, "The delivery policy, reviewed head, or required checks are no longer current.", "The delivery permission request could not be matched to current delivery authority.");
+        return false;
+      }
+      deliveryAuthority = { policy: run.delivery!, branch: run.branch, headCommit: run.headCommit!,
+        review: run.review!, checks: run.checks.filter(check => check.revision === run.revision).map(({ command, status, exitCode }) => ({ command, status, exitCode })) };
+    }
     // The prompt already includes the complete objective and pinned owner scope.
     const feedback = JSON.stringify({ decisionId: decision.id,
-      targetAssignment: assignment(target), targetCwd: decision.targetCwd, targetTask: task ?? null,
+      targetAssignment: assignment(target), targetCwd: decision.targetCwd, targetScratchDirectory: target.scratchDirectory ?? null, targetTask: task ?? null,
       targetChangedPaths: changedPaths.slice(0, 100), targetChangedPathCount: changedPaths.length,
-      acceptedChecks: this.requiredChecks(run) ?? null, prompt: decision.prompt });
+      acceptedChecks: this.requiredChecks(run) ?? null, permissionEvidence, deliveryAuthority, prompt: decision.prompt });
     let member: TeamMember;
     try {
       member = this.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, undefined, run.lineup.coordinator);
@@ -1416,6 +1508,17 @@ export class TeamService {
       const canonicalCwd = realpathSync(target.cwd);
       if (canonicalCwd !== decision.targetCwd) return "The target working directory changed.";
       this.assertRunPath(stored, canonicalCwd);
+      if (target.role === "delivery") {
+        this.assertDelivery(stored);
+        await assertMemberReadOnly(canonicalCwd, run.headCommit!, this.config.teams?.commandPrefix);
+      }
+      if (decision.workspaceEvidenceHash) {
+        const changedPaths = await memberChangedPaths(canonicalCwd, target.baseCommit, this.config.teams?.commandPrefix);
+        const evidence = collectPermissionEvidence({ prompt: decision.prompt, cwd: canonicalCwd, changedPaths,
+          approvedScratchRoots: target.scratchDirectory ? [target.scratchDirectory] : [] });
+        if (decision.workspaceEvidenceHash !== digest({ changedPaths, evidence: evidence.digest }))
+          return "The inspected command sources or changed paths changed during permission review. Nothing was sent.";
+      }
       const metadata = this.manager.meta(target.sessionId).session;
       const sessionAssignment = metadata.team;
       if (!sessionAssignment || sessionAssignment.runId !== run.id || sessionAssignment.memberId !== target.memberId ||
@@ -1436,6 +1539,11 @@ export class TeamService {
     const run = stored.run, report = member.report!;
     const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId && item.revision === member.revision);
     if (!decision) { this.block(stored, new TeamError(409, "invalid-permission-decision", "The permission coordinator has no recorded decision assignment.")); return; }
+    if (decision.status !== "reviewing") {
+      this.event(stored, "A late permission coordinator report was ignored because its one-shot review is no longer current.");
+      this.save(stored);
+      return;
+    }
     const verdict = report.kind === "permission-decision" && report.decisionId === decision.id ? report.verdict : "escalate";
     const summary = report.kind === "permission-decision" ? report.summary : report.kind === "blocked" ? report.summary
       : report.kind === "question" ? report.question : "The coordinator did not submit the assigned permission decision report.";
@@ -1659,7 +1767,7 @@ export class TeamService {
       this.event(stored, `${from.label} hit a ${name} ${kind}${resets ? ` (resets ${resets})` : ""}; ${task?.title ?? member.title} continues on ${fallback.label}${editing ? " with partial work preserved" : ""}.`);
     });
   }
-  private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string) {
+  private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, onPrepared?: (member: TeamMember) => void) {
     const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id);
     const continuationHead = role === "project-manager" && stored.continuationHead?.revision === run.revision
       ? structuredClone(stored.continuationHead) : undefined;
@@ -1690,6 +1798,7 @@ export class TeamService {
         delete stored.continuationHead;
       member.cwd = cwd; run.members.push(member);
       if (task) { task.status = "running"; task.memberId = member.memberId; }
+      onPrepared?.(member);
       this.event(stored, `${member.title} queued in an isolated working copy.`);
     });
   }
@@ -1716,8 +1825,13 @@ export class TeamService {
     }
     // All launch fields were persisted with the queued member before this call.
     if (!this.hasLaunch(member) && member.role !== "permission-coordinator") {
+      if (!member.scratchDirectory) {
+        member.scratchDirectory = prepareMemberScratch(stored.run.workspace, member.memberId);
+        member.prompt += `\n\nHost-assigned task scratch directory: ${member.scratchDirectory}. Use this directory for temporary scripts, browser probes, and generated check outputs. Keep repository files unchanged in read-only roles. This directory belongs only to your current assignment; do not read other members' scratch files.`;
+        this.save(stored);
+      }
       const configuredProject = stored.run.handoff?.project ?? this.config.projects.find(project => project.id === stored.run.projectId)?.team;
-      await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role), assignment: assignment(member), memberBaseCommit: member.baseCommit }, this.config.teams?.commandPrefix);
+      await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
     }
     let result;
     try { result = await this.startInProject(stored.run.projectId, () => this.manager.createTeamSession({ requestId: member.sessionId, provider: member.provider ?? stored.run.provider, projectId: stored.run.projectId, title: member.title, prompt: member.prompt }, assignment(member), member.cwd, member.modelProfile, stored.root, this.config.teams?.trustWorkspaces === true)); }

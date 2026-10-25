@@ -466,7 +466,8 @@ export class TeamService {
         (!prompt.hash || item.promptHash === prompt.hash)).at(-1);
       if (decision) return ["pending", "reviewing", "approved", "answering"].includes(decision.status) ? "coordinator" : "user";
       if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status) ||
-          !activeMember(member) || member.role === "permission-coordinator" || !run.lineup || run.lineup.coordinator.tier !== "strong" ||
+          !activeMember(member) || member.role === "permission-coordinator" || !run.lineup ||
+          !run.lineup.permissionReviewer && run.lineup.coordinator.tier !== "strong" ||
           (run.permissionDecisions?.length ?? 0) >= run.permissions.maxDecisions || oneShotPermissionOption(prompt) === undefined)
         return "user";
       return "undecided";
@@ -593,9 +594,9 @@ export class TeamService {
         try { teamModelLaunch(this.config.agents[selection.provider]!, selection); }
         catch { throw new TeamError(409, "team-model-profile-conflict", "Move model, effort, and fallback-model arguments from provider profiles into the team lineup before starting this team."); }
       }
-      if (project.team.permissions && (!lineup || lineup.coordinator.tier !== "strong" ||
-          lineup.coordinator.limitFallback !== undefined && lineupProfiles(lineup).find(profile => profile.id === lineup.coordinator.limitFallback)?.tier !== "strong"))
-        throw new TeamError(409, "permission-lineup-required", "Delegated permissions require a strong coordinator and any configured coordinator fallback must also be strong.");
+      if (project.team.permissions && (!lineup || !lineup.permissionReviewer && (lineup.coordinator.tier !== "strong" ||
+          lineup.coordinator.limitFallback !== undefined && lineupProfiles(lineup).find(profile => profile.id === lineup.coordinator.limitFallback)?.tier !== "strong")))
+        throw new TeamError(409, "permission-lineup-required", "Delegated permissions require a strong coordinator fallback unless a permission reviewer profile is configured.");
       const parentId = goal?.parentRunId ?? internal?.baseRunId;
       const parent = parentId ? this.record(parentId).run : undefined;
       if (parent && (goal
@@ -1798,11 +1799,13 @@ export class TeamService {
       decision.targetSessionId === target.sessionId && decision.promptId === prompt.id && decision.promptHash === prompt.hash &&
       decision.evidenceHash === evidenceHash);
     if (existing) return false;
-    if (!run.lineup || run.lineup.coordinator.tier !== "strong") return false;
+    const reviewer = this.reviewerProfile(run);
+    if (!reviewer || !run.lineup || !run.lineup.permissionReviewer && run.lineup.coordinator.tier !== "strong") return false;
     const makeDecision = (targetCwd: string): TeamPermissionDecision => ({
       id: randomUUID(), revision: run.revision, policyHash: digest(run.permissions!), targetMemberId: target.memberId,
       targetSessionId: target.sessionId, targetCwd, promptId: prompt.id, promptHash: prompt.hash!,
       evidenceHash, prompt: structuredClone(prompt), option: oneShotPermissionOption(prompt)!,
+      reviewerProfileId: reviewer.id, reviewerProfileHash: digest(reviewer),
       expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(), answerRequestId: randomUUID(), status: "pending",
     });
 
@@ -1823,8 +1826,8 @@ export class TeamService {
     }
     const decision = makeDecision(targetCwd);
     (run.permissionDecisions ??= []).push(decision);
-    if (!this.config.agents[run.lineup.coordinator.provider]) {
-      this.escalatePermissionDecision(stored, decision, "The pinned permission coordinator provider is not configured on this host.", "The permission request remains with the user because its pinned coordinator provider is not configured on this host.");
+    if (!this.config.agents[reviewer.provider]) {
+      this.escalatePermissionDecision(stored, decision, "The pinned permission reviewer provider is not configured on this host.", "The permission request remains with the user because its pinned permission reviewer provider is not configured on this host.");
       return false;
     }
     try { this.assertBudget(run, true); }
@@ -1834,8 +1837,8 @@ export class TeamService {
         "A permission request remains with the user because the team has no review budget.");
       return false;
     }
-    if (run.lineup.coordinator.provider !== "claude") {
-      this.escalatePermissionDecision(stored, decision, "The pinned permission coordinator provider is not qualified for report-only permission review.", "The permission request remains with the user because the selected coordinator provider is not qualified for report-only review.");
+    if (reviewer.provider !== "claude") {
+      this.escalatePermissionDecision(stored, decision, "The pinned permission reviewer provider is not qualified for report-only permission review.", "The permission request remains with the user because the selected permission reviewer provider is not qualified for report-only review.");
       return false;
     }
 
@@ -1869,25 +1872,25 @@ export class TeamService {
       acceptedChecks: this.requiredChecks(run) ?? null, permissionEvidence, deliveryAuthority, prompt: decision.prompt });
     let member: TeamMember;
     try {
-      member = this.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, undefined, run.lineup.coordinator);
+      member = this.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, undefined, reviewer);
       member.prompt = teamPrompt(run, "permission-coordinator", undefined, feedback, member.provider ?? run.provider, member.modelProfile);
     } catch (error) {
       if (!(error instanceof TeamError) || error.code !== "team-prompt-too-large") throw error;
-      this.escalatePermissionDecision(stored, decision, "The complete evidence exceeds the 80 KiB coordinator prompt limit and cannot be reviewed without truncation.", "The permission request remains with the user because its complete evidence exceeds the review limit.");
+      this.escalatePermissionDecision(stored, decision, "The complete evidence exceeds the 80 KiB permission reviewer prompt limit and cannot be reviewed without truncation.", "The permission request remains with the user because its complete evidence exceeds the review limit.");
       return false;
     }
     decision.coordinatorMemberId = member.memberId;
-    const selectedProfile = this.config.agents[member.provider ?? run.provider];
+    const selectedProfile = this.config.agents[reviewer.provider];
     if (member.provider !== "claude" || !selectedProfile) {
-      this.escalatePermissionDecision(stored, decision, "The selected permission coordinator provider is not qualified for report-only review.", "The permission request remains with the user because the selected coordinator provider is not qualified for report-only review.");
+      this.escalatePermissionDecision(stored, decision, "The selected permission reviewer provider is not qualified for report-only review.", "The permission request remains with the user because the selected permission reviewer provider is not qualified for report-only review.");
       return false;
     }
     try {
       permissionCoordinatorLaunch("claude", teamModelLaunch(selectedProfile, member.modelProfile!));
     } catch (error) {
       decision.status = "escalated";
-      decision.reason = error instanceof Error ? error.message : "The selected coordinator profile cannot launch in report-only mode.";
-      this.event(stored, "The permission request remains with the user because the pinned coordinator profile cannot launch safely in report-only mode.");
+      decision.reason = error instanceof Error ? error.message : "The selected permission reviewer profile cannot launch in report-only mode.";
+      this.event(stored, "The permission request remains with the user because the pinned permission reviewer profile cannot launch safely in report-only mode.");
       this.save(stored);
       return false;
     }
@@ -1899,7 +1902,7 @@ export class TeamService {
       return cwd;
     }, cwd => {
       member.cwd = cwd; run.members.push(member); decision.status = "reviewing";
-      this.event(stored, "A screen-verified one-shot permission request was assigned to the pinned strong coordinator for read-only review.");
+      this.event(stored, "A screen-verified one-shot permission request was assigned to the pinned permission reviewer for read-only review.");
     });
     return true;
   }
@@ -1912,7 +1915,11 @@ export class TeamService {
     if (decision.policyHash !== digest(run.permissions))
       return "The pinned permission policy no longer matches this decision.";
     if (Date.now() >= Date.parse(decision.expiresAt)) return "The five-minute permission review window expired.";
-    if (!run.lineup || run.lineup.coordinator.tier !== "strong") return "The pinned coordinator profile is no longer eligible.";
+    if (decision.reviewerProfileHash) {
+      const reviewer = this.reviewerProfile(run);
+      if (!reviewer || digest(reviewer) !== decision.reviewerProfileHash)
+        return "The permission reviewer profile changed since this decision was assigned.";
+    } else if (!run.lineup || run.lineup.coordinator.tier !== "strong") return "The pinned coordinator profile is no longer eligible.";
     try {
       this.assertBudget(run);
       const target = run.members.find(member => member.memberId === decision.targetMemberId && member.sessionId === decision.targetSessionId);
@@ -2014,12 +2021,16 @@ export class TeamService {
   }
   private memberProfile(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout): TeamModelProfile | undefined {
     if (!run.lineup) return undefined;
-    if (role === "project-manager" || role === "delivery" || role === "permission-coordinator") return run.lineup.coordinator;
+    if (role === "permission-coordinator") return this.reviewerProfile(run);
+    if (role === "project-manager" || role === "delivery") return run.lineup.coordinator;
     if (role === "integrator") return run.lineup.integrator;
     if (role === "reviewer") return run.lineup.reviewer;
     if (!task) throw new TeamError(409, "invalid-agent-profile", "An implementer requires an assigned task and allowed model profile.");
     this.taskProfiles(run, [task]);
     return run.lineup.implementers.find(profile => profile.id === task.agentProfileId)!;
+  }
+  private reviewerProfile(run: TeamRun): TeamModelProfile | undefined {
+    return run.lineup?.permissionReviewer ?? run.lineup?.coordinator;
   }
   private newMember(run: TeamRun, role: TeamMember["role"], cwd: string, baseCommit: string, taskId?: string, prompt?: string, pinnedProfile?: TeamModelProfile): TeamMember {
     this.assertBudget(run, true);

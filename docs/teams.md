@@ -99,7 +99,8 @@ repository, while the coordinator, workers, and reviewer come from the host's
 configured lineup. The host passes the selected project ID to Ubuntu provider
 wrappers as `INFINITE_PROJECT_ID`, which selects an optional project environment
 file on that host. First-time repository enrollment delegates current one-shot
-tool requests to the strong coordinator by default; `--permissions off` opts out.
+tool requests to the configured permission reviewer, using the strong coordinator
+when no reviewer profile is configured; `--permissions off` opts out.
 The repository policy bounds that authority; see
 [Delegating permission decisions](#delegating-permission-decisions).
 
@@ -897,11 +898,19 @@ configured lineup by default; a user can instead select one configured provider
 for all roles. Goals always use a recorded lineup and require both coordinator
 and reviewer profiles to have `tier: "strong"`.
 
-This starting configuration uses Opus 5.5 at `xhigh` for coordination and repair,
-Astra 6 at `high` for review, and Haiku 5.5 and GPT-6 Luna at `high` for ordinary
-worker tasks. Opus 5.5 `xhigh` and Astra 6 `xhigh` are available through the
-explicit escalation pool. Model IDs live in host configuration, rather than
-application routing code.
+This example uses Opus 5.5 at `xhigh` for coordination and repair, Astra 6 at
+`high` for review, and Haiku 5.5 and GPT-6 Luna at `high` for ordinary worker
+tasks. Opus 5.5 `xhigh` and Astra 6 `xhigh` are available through the explicit
+escalation pool. Model IDs live in host configuration, rather than application
+routing code.
+
+`permissionReviewer` is an optional Claude Code profile for read-only review of
+member permission prompts. When omitted, the coordinator is the fallback
+reviewer and must have `tier: "strong"`; configuring `permissionReviewer` removes
+that strong-tier requirement for this role. A light Claude profile at `high`
+effort fits this narrow, mechanical rule because the host rechecks the answer
+and applies it. The repository ships no default lineup, so add the profile to
+the deployment's host configuration to use it.
 
 ```json
 {
@@ -944,7 +953,12 @@ application routing code.
         "provider": "codex", "model": "gpt-6-astra", "effort": "xhigh",
         "tier": "strong", "dataUse": "standard"
       }
-    ]
+    ],
+    "permissionReviewer": {
+      "id": "haiku-permission-reviewer", "label": "Haiku 5.5 high",
+      "provider": "claude", "model": "claude-haiku-5-5", "effort": "high",
+      "tier": "light", "dataUse": "standard"
+    }
   }
 }
 ```
@@ -1054,8 +1068,9 @@ coordinator escalated it, the review window expired, the run spent its decision
 limit or cannot act, or the prompt lacks complete one-shot evidence. A run gets
 a short grace period to start the review before an unreviewed prompt is pushed.
 
-A current one-shot tool prompt can start a separate turn on the run's strong
-Claude coordinator profile. The coordinator receives the task, owner scope and exact
+A current one-shot tool prompt can start a separate turn on the pinned Claude
+permission reviewer profile, or on the strong coordinator when no reviewer
+profile is configured. The reviewer receives the task, owner scope and exact
 request, then reports approve-once or escalate. The host checks the assignment,
 workspace, prompt, policy, expiry and human input control before delivering the
 recorded choice. Workers cannot approve their own requests. The permission

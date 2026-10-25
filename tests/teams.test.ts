@@ -12,7 +12,7 @@ import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { TeamError, applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
-import { createTeamSchema, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamModelProfile, type TeamRun, type TeamView } from "../packages/host/src/team-types.js";
+import { createTeamSchema, lineupProfiles, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamModelProfile, type TeamRun, type TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import type { HandoffPolicy, TeamHandoffContext } from "../packages/host/src/handoff-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
@@ -1716,6 +1716,25 @@ const limitLineup: TeamLineup = {
   ],
   fallbacks: [{ id: "deepseek-light", label: "DeepSeek Flash", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light" }],
 };
+test("lineups accept only Claude permission reviewers and include them in profile resolution", () => {
+  const permissionReviewer: TeamModelProfile = { id: "permission-reviewer", label: "Permission reviewer", provider: "claude",
+    model: "claude-haiku-5-5", effort: "high", tier: "light" };
+  const parsed = teamLineupSchema.parse({ ...fallbackLineup, permissionReviewer });
+  assert.equal(lineupProfiles(parsed).at(-1)?.id, permissionReviewer.id);
+
+  for (const invalid of [
+    { ...permissionReviewer, provider: "codex", model: "gpt-6-astra" },
+    { id: "permission-reviewer", label: "Permission reviewer", provider: "opencode", model: "vendor/model", variant: "high" },
+  ]) {
+    const result = teamLineupSchema.safeParse({ ...fallbackLineup, permissionReviewer: invalid });
+    assert.equal(result.success, false);
+    if (!result.success) assert.ok(result.error.issues.some(issue => issue.message === "The permission reviewer profile must use Claude Code."));
+  }
+
+  const codexFallback = teamLineupSchema.safeParse({ ...fallbackLineup,
+    permissionReviewer: { ...permissionReviewer, limitFallback: "codex-light" } });
+  assert.equal(codexFallback.success, false, "A reviewer fallback cannot move review onto a non-Claude profile");
+});
 const readReceipts = (dir: string) => readdirSync(dir).filter(name => name.endsWith(".json")).map(name => JSON.parse(readFileSync(join(dir, name), "utf8")));
 const sessionEvents = async (host: Host, id: string, types: string) => (await host.fetchApi(`/sessions/${id}/events?types=${types}&after=0&limit=200`)).body.events as unknown[];
 
@@ -2085,6 +2104,10 @@ test("promptOwner says who a member's prompt waits on: the coordinator, the owne
     assert.equal(teams.promptOwner(member.sessionId, prompt), "undecided", "a delegated run may still start the review");
     assert.equal(teams.promptOwner(randomUUID(), prompt), "user", "a session outside any run is the owner's");
     assert.equal(teams.promptOwner(member.sessionId, { ...prompt, pinned: false }), "user", "incomplete one-shot evidence stays with the owner");
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, tier: "light" },
+      permissionReviewer: { id: "permission-reviewer", label: "Permission reviewer", provider: "claude", model: "claude-haiku-5-5", effort: "high", tier: "light" } };
+    f.writeTeam();
+    assert.equal(f.openTeam().promptOwner(member.sessionId, prompt), "undecided", "a configured reviewer does not require a strong coordinator fallback");
     const decision = { id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: member.memberId, targetSessionId: member.sessionId,
       targetCwd: member.cwd, promptId: 1, promptHash: prompt.hash!, evidenceHash: "c".repeat(64), option: 0, prompt,
       expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), status: "reviewing" as const };
@@ -2120,7 +2143,51 @@ test("a member back from an outage into a delegable prompt runs again and gets a
     const result = await waitFor(async () => teams.get(f.run.id), run => (run.permissionDecisions?.length ?? 0) > 0);
     assert.equal(result.members[0].status, "running");
     assert.equal(result.permissionDecisions?.[0].status, "escalated");
-    assert.match(result.permissionDecisions?.[0].reason ?? "", /coordinator provider is not configured/);
+    assert.match(result.permissionDecisions?.[0].reason ?? "", /permission reviewer provider is not configured/);
+  } finally { f.close(); }
+});
+
+test("a configured permission reviewer launches from its profile and a later profile change escalates its decision", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.members[0].status = "unavailable";
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
+    f.run.headCommit = f.run.baseCommit;
+    const reviewerProfile: TeamModelProfile = { id: "permission-reviewer", label: "Permission reviewer", provider: "claude",
+      model: "claude-haiku-5-5", effort: "high", tier: "light" };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, tier: "light" }, permissionReviewer: reviewerProfile };
+    f.config.agents.claude = { command: "claude", args: [] };
+    f.state.attention.state = "needs-you";
+    f.state.attention.prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" }] };
+    f.writeTeam();
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.status === "blocked" ||
+      run.permissionDecisions?.[0]?.status === "reviewing" && run.members.some(member => member.role === "permission-coordinator" && member.status === "running"));
+    if (assigned.status === "blocked") {
+      const failed = f.readRecord<{ pending?: { failure?: { reason?: string } } }>("team", f.run.id);
+      assert.fail(failed.pending?.failure?.reason ?? JSON.stringify(assigned));
+    }
+    const reviewer = assigned.members.find(member => member.role === "permission-coordinator")!;
+    const decision = assigned.permissionDecisions![0];
+    assert.equal(reviewer.modelProfile?.id, reviewerProfile.id);
+    assert.equal(decision.reviewerProfileId, reviewerProfile.id);
+    assert.equal(decision.reviewerProfileHash, createHash("sha256").update(JSON.stringify(reviewerProfile)).digest("hex"));
+    assert.equal(f.launches.find(launch => launch.requestId === reviewer.sessionId)?.profile?.id, reviewerProfile.id);
+
+    teams.close(); await teams.idle();
+    const stored = f.readRecord<{ run: TeamRun; [key: string]: unknown }>("team", f.run.id);
+    stored.run.lineup!.permissionReviewer = { ...reviewerProfile, id: "alternate-reviewer", model: "claude-sonnet-4-5" };
+    f.writeRecord("team", f.run.id, stored);
+
+    const restarted = f.openTeam();
+    f.report(reviewer.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: reviewer.memberId, revision: reviewer.revision,
+      report: { kind: "permission-decision", decisionId: decision.id, verdict: "approve-once", summary: "The one-shot request matches the assigned scope." } });
+    restarted.start();
+    const escalated = await waitFor(async () => restarted.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "escalated");
+    assert.equal(escalated.permissionDecisions?.[0].reason, "The permission reviewer profile changed since this decision was assigned.");
+    assert.equal(f.permissionAnswers(), 0, "A changed reviewer profile cannot authorize an answer to the target session");
   } finally { f.close(); }
 });
 

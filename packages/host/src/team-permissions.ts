@@ -23,6 +23,36 @@ export function permissionEvidenceHash(prompt: Prompt): string {
   return createHash("sha256").update(JSON.stringify(evidence)).digest("hex");
 }
 
+/** Hash the semantic authority for a one-shot request, excluding assignment and prompt identity. */
+export function permissionReuseKey(input: {
+  policyHash: string;
+  prompt: Prompt;
+  option: number;
+  targetTaskId?: string;
+  changedPaths: string[];
+  acceptedChecks: unknown;
+}): string {
+  const { prompt } = input;
+  const semantic = {
+    policyHash: input.policyHash,
+    prompt: {
+      kind: prompt.kind,
+      title: prompt.title,
+      detail: prompt.detail ?? null,
+      options: prompt.options.map(option => ({ index: option.index, label: option.label, role: option.role })),
+      acceptsText: prompt.acceptsText,
+      multiSelect: prompt.multiSelect ?? false,
+      destructive: prompt.destructive ?? null,
+      tool: prompt.tool ? { name: prompt.tool.name, input: prompt.tool.input, inputComplete: prompt.tool.inputComplete ?? false } : null,
+    },
+    option: input.option,
+    targetTaskId: input.targetTaskId ?? null,
+    changedPaths: [...new Set(input.changedPaths)].sort(),
+    acceptedChecks: input.acceptedChecks,
+  };
+  return createHash("sha256").update(JSON.stringify(semantic)).digest("hex");
+}
+
 /** Worker refusal codes. A delegated answer refused with one of these wrote no key. */
 const ANSWER_REFUSALS = new Set(["prompt-changed", "unsupported", "invalid-option", "text-not-accepted", "control-busy", "control-lost"]);
 

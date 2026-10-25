@@ -71,6 +71,10 @@ export interface TeamPermissionDecision {
   promptId: number;
   promptHash: string;
   evidenceHash: string;
+  /** Absent only when the target workspace or changed paths could not be inspected. */
+  reuseKey?: string;
+  reusedFromDecisionId?: string;
+  verdict?: "approve-once" | "escalate";
   /** Binds inspected command sources and changed paths to this exact review. */
   workspaceEvidenceHash?: string;
   prompt: Prompt;

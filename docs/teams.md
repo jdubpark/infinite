@@ -1064,6 +1064,15 @@ assignment's report tool allowed. It escalates when the supplied evidence is
 insufficient. Worker provider modes, global trust settings and credentials
 remain unchanged. Other coordinator providers are not yet supported for this role.
 
+Within the run's decision limit, an identical request can reuse a terminal
+reviewer's recorded verdict. The reuse key binds the pinned policy, semantic
+prompt and chosen option, task ID, changed paths, and accepted checks; it
+excludes prompt, session, and member identifiers. Reuse also requires the same
+run revision, assigned role, and inspected workspace evidence. A recorded
+approval is still rechecked against the current target session and delivered
+once. A recorded reviewer escalation remains with the owner. Reuse does not
+extend the run's decision limit or apply to host-side escalations.
+
 A request qualifies when its evidence is complete: hook tool input that storage
 did not truncate, or a Codex "Would you like to run the following command?"
 dialog that shows its whole `$` command. Codex hooks are off by default, so

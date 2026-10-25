@@ -19,7 +19,7 @@ import type { Readings } from "./readings.js";
 import type { ProjectSourceService } from "./project-source.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
-import { oneShotPermissionOption, permissionEvidenceHash, refusedBeforeSend } from "./team-permissions.js";
+import { oneShotPermissionOption, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
 import { collectPermissionEvidence } from "./team-permission-evidence.js";
 export { TeamError } from "./team-workspace.js";
 
@@ -1788,8 +1788,6 @@ export class TeamService {
       // not hold up review of a later target prompt.
       return !decision || !["answered", "escalated", "stale"].includes(decision.status);
     })) return false;
-    if (run.permissionDecisions?.length && run.permissionDecisions.length >= run.permissions.maxDecisions) return false;
-
     const state = await this.manager.state(target.sessionId, true);
     const prompt = state.attention.prompt;
     if (state.status !== "running" || state.attention.state !== "needs-you" || !prompt || oneShotPermissionOption(prompt) === undefined) return false;
@@ -1798,20 +1796,14 @@ export class TeamService {
       decision.targetSessionId === target.sessionId && decision.promptId === prompt.id && decision.promptHash === prompt.hash &&
       decision.evidenceHash === evidenceHash);
     if (existing) return false;
+    if (run.permissionDecisions?.length && run.permissionDecisions.length >= run.permissions.maxDecisions) return false;
     if (!run.lineup || run.lineup.coordinator.tier !== "strong") return false;
-    const makeDecision = (targetCwd: string): TeamPermissionDecision => ({
+    const makeDecision = (targetCwd: string, reuseKey?: string): TeamPermissionDecision => ({
       id: randomUUID(), revision: run.revision, policyHash: digest(run.permissions!), targetMemberId: target.memberId,
       targetSessionId: target.sessionId, targetCwd, promptId: prompt.id, promptHash: prompt.hash!,
-      evidenceHash, prompt: structuredClone(prompt), option: oneShotPermissionOption(prompt)!,
+      evidenceHash, ...(reuseKey ? { reuseKey } : {}), prompt: structuredClone(prompt), option: oneShotPermissionOption(prompt)!,
       expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(), answerRequestId: randomUUID(), status: "pending",
     });
-
-    if (target.role === "permission-coordinator") {
-      const decision = makeDecision(target.cwd);
-      (run.permissionDecisions ??= []).push(decision);
-      this.escalatePermissionDecision(stored, decision, "A permission request from the permission coordinator cannot be delegated again.", "The permission request remains with the user because it came from the permission coordinator.");
-      return false;
-    }
 
     let targetCwd: string;
     try { targetCwd = realpathSync(target.cwd); }
@@ -1821,7 +1813,51 @@ export class TeamService {
       this.escalatePermissionDecision(stored, decision, "The target workspace could not be resolved for permission review.", "The permission request remains with the user because its workspace could not be resolved for review.");
       return false;
     }
-    const decision = makeDecision(targetCwd);
+    const task = target.role === "scout" ? run.discovery?.tasks.find(item => item.id === target.taskId) : run.tasks.find(item => item.id === target.taskId);
+    let changedPaths: string[];
+    try { changedPaths = await memberChangedPaths(targetCwd, target.baseCommit, this.config.teams?.commandPrefix); }
+    catch {
+      const decision = makeDecision(targetCwd);
+      (run.permissionDecisions ??= []).push(decision);
+      this.escalatePermissionDecision(stored, decision, "The target's changed files could not be listed for review.", "The permission request remains with the user because its changed files could not be listed for review.");
+      return false;
+    }
+    const permissionEvidence = collectPermissionEvidence({ prompt, cwd: targetCwd, changedPaths,
+      approvedScratchRoots: target.scratchDirectory ? [target.scratchDirectory] : [] });
+    const workspaceEvidenceHash = digest({ changedPaths, evidence: permissionEvidence.digest });
+    const acceptedChecks = this.requiredChecks(run) ?? null;
+    const reuseKey = permissionReuseKey({ policyHash: digest(run.permissions!), prompt, option: oneShotPermissionOption(prompt)!,
+      targetTaskId: target.taskId, changedPaths, acceptedChecks });
+    const decision = makeDecision(targetCwd, reuseKey);
+    decision.workspaceEvidenceHash = workspaceEvidenceHash;
+    if (target.role === "permission-coordinator") {
+      (run.permissionDecisions ??= []).push(decision);
+      this.escalatePermissionDecision(stored, decision, "A permission request from the permission coordinator cannot be delegated again.", "The permission request remains with the user because it came from the permission coordinator.");
+      return false;
+    }
+    const earlier = [...(run.permissionDecisions ?? [])].reverse().find(item => {
+      const sourceTarget = run.members.find(member => member.memberId === item.targetMemberId && member.sessionId === item.targetSessionId);
+      return item.reuseKey === reuseKey && item.revision === run.revision && item.workspaceEvidenceHash === workspaceEvidenceHash &&
+        sourceTarget?.role === target.role && Boolean(item.coordinatorMemberId) &&
+        (item.status === "answered" && item.verdict === "approve-once" || item.status === "escalated" && item.verdict === "escalate");
+    });
+    if (earlier?.status === "answered" && earlier.verdict === "approve-once") {
+      decision.status = "approved";
+      decision.reusedFromDecisionId = earlier.id;
+      decision.reason = `Reused the recorded approve-once verdict from decision ${earlier.id}.`;
+      (run.permissionDecisions ??= []).push(decision);
+      this.event(stored, "An identical one-shot request was approved from the recorded review.");
+      this.save(stored);
+      await this.deliverApprovedDecision(stored, decision);
+      return true;
+    }
+    if (earlier?.status === "escalated" && earlier.verdict === "escalate") {
+      decision.reusedFromDecisionId = earlier.id;
+      (run.permissionDecisions ??= []).push(decision);
+      this.escalatePermissionDecision(stored, decision, `The identical request was already escalated by reviewer decision ${earlier.id}.`,
+        "An identical request was already escalated by the reviewer; it remains with the user.");
+      return false;
+    }
     (run.permissionDecisions ??= []).push(decision);
     if (!this.config.agents[run.lineup.coordinator.provider]) {
       this.escalatePermissionDecision(stored, decision, "The pinned permission coordinator provider is not configured on this host.", "The permission request remains with the user because its pinned coordinator provider is not configured on this host.");
@@ -1838,17 +1874,6 @@ export class TeamService {
       this.escalatePermissionDecision(stored, decision, "The pinned permission coordinator provider is not qualified for report-only permission review.", "The permission request remains with the user because the selected coordinator provider is not qualified for report-only review.");
       return false;
     }
-
-    const task = target.role === "scout" ? run.discovery?.tasks.find(item => item.id === target.taskId) : run.tasks.find(item => item.id === target.taskId);
-    let changedPaths: string[];
-    try { changedPaths = await memberChangedPaths(targetCwd, target.baseCommit, this.config.teams?.commandPrefix); }
-    catch {
-      this.escalatePermissionDecision(stored, decision, "The target's changed files could not be listed for review.", "The permission request remains with the user because its changed files could not be listed for review.");
-      return false;
-    }
-    const permissionEvidence = collectPermissionEvidence({ prompt: decision.prompt, cwd: targetCwd, changedPaths,
-      approvedScratchRoots: target.scratchDirectory ? [target.scratchDirectory] : [] });
-    decision.workspaceEvidenceHash = digest({ changedPaths, evidence: permissionEvidence.digest });
     let deliveryAuthority = null;
     if (target.role === "delivery") {
       try {
@@ -1866,7 +1891,7 @@ export class TeamService {
     const feedback = JSON.stringify({ decisionId: decision.id,
       targetAssignment: assignment(target), targetCwd: decision.targetCwd, targetScratchDirectory: target.scratchDirectory ?? null, targetTask: task ?? null,
       targetChangedPaths: changedPaths.slice(0, 100), targetChangedPathCount: changedPaths.length,
-      acceptedChecks: this.requiredChecks(run) ?? null, permissionEvidence, deliveryAuthority, prompt: decision.prompt });
+      acceptedChecks, permissionEvidence, deliveryAuthority, prompt: decision.prompt });
     let member: TeamMember;
     try {
       member = this.newMember(run, "permission-coordinator", "", run.headCommit!, undefined, undefined, run.lineup.coordinator);
@@ -1903,11 +1928,11 @@ export class TeamService {
     });
     return true;
   }
-  private async permissionAnswerInvalidReason(stored: Stored, decision: TeamPermissionDecision, coordinator: TeamMember) {
+  private async permissionAnswerInvalidReason(stored: Stored, decision: TeamPermissionDecision, coordinator?: TeamMember) {
     const run = stored.run;
     if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status)) return "The team is paused, stopped, blocked, or its permission policy was revoked.";
-    if (decision.status !== "approved" || decision.revision !== run.revision || coordinator.revision !== run.revision ||
-        decision.coordinatorMemberId !== coordinator.memberId || decision.targetMemberId === coordinator.memberId)
+    if (decision.status !== "approved" || decision.revision !== run.revision || coordinator &&
+        (coordinator.revision !== run.revision || decision.coordinatorMemberId !== coordinator.memberId || decision.targetMemberId === coordinator.memberId))
       return "The decision or coordinator assignment is no longer current.";
     if (decision.policyHash !== digest(run.permissions))
       return "The pinned permission policy no longer matches this decision.";
@@ -1957,28 +1982,57 @@ export class TeamService {
       this.save(stored);
       return;
     }
-    const verdict = report.kind === "permission-decision" && report.decisionId === decision.id ? report.verdict : "escalate";
+    const validDecisionReport = report.kind === "permission-decision" && report.decisionId === decision.id;
+    const verdict = validDecisionReport ? report.verdict as "approve-once" | "escalate" : "escalate";
+    if (validDecisionReport) decision.verdict = verdict;
     const summary = report.kind === "permission-decision" ? report.summary : report.kind === "blocked" ? report.summary
       : report.kind === "question" ? report.question : "The coordinator did not submit the assigned permission decision report.";
+    if (verdict === "approve-once") {
+      void this.deliverApprovedDecision(stored, decision, member, summary);
+      return;
+    }
     this.operation(stored, "result", async signal => {
       await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
-      if (verdict !== "approve-once") return { status: "escalated" as const, reason: summary };
-      decision.status = "approved";
-      decision.reason = summary;
-      this.save(stored);
-      const reason = await this.permissionAnswerInvalidReason(stored, decision, member);
+      return { status: "escalated" as const, reason: summary };
+    }, result => {
+      if (["reviewing", "approved", "answering"].includes(decision.status)) { decision.status = result.status; decision.reason = result.reason ?? summary; }
+      else decision.reason = "The decision changed while the answer was in flight. Inspect the target session before acting.";
+      member.status = "stopped";
+      this.event(stored, "The permission request remains with the user.");
+    }, member);
+  }
+  private async deliverApprovedDecision(stored: Stored, decision: TeamPermissionDecision, coordinator?: TeamMember, summary?: string) {
+    const run = stored.run;
+    this.operation(stored, "result", async signal => {
+      if (coordinator) await assertMemberReadOnly(coordinator.cwd, coordinator.baseCommit, this.config.teams?.commandPrefix, signal);
+      if (coordinator) {
+        decision.status = "approved";
+        decision.reason = summary;
+        this.save(stored);
+      }
+      const reason = await this.permissionAnswerInvalidReason(stored, decision, coordinator);
       if (reason) return { status: "escalated" as const, reason };
       if (decision.status !== "approved" || !run.permissions || run.permissionsRevokedAt || stored.halt ||
           ["paused", "cancelled", "blocked"].includes(run.status) || decision.revision !== run.revision ||
-          decision.coordinatorMemberId !== member.memberId || decision.policyHash !== digest(run.permissions) ||
+          (coordinator && decision.coordinatorMemberId !== coordinator.memberId) || decision.policyHash !== digest(run.permissions) ||
           Date.now() >= Date.parse(decision.expiresAt))
         return { status: "escalated" as const, reason: "The permission decision changed while the target session was being checked." };
       decision.status = "answering";
-      decision.reason = summary;
+      if (coordinator) decision.reason = summary;
       this.save(stored);
       try {
+        const target = run.members.find(member => member.memberId === decision.targetMemberId)!;
+        const sourceDecision = decision.reusedFromDecisionId ? run.permissionDecisions?.find(item => item.id === decision.reusedFromDecisionId) : undefined;
+        const sourceCoordinatorMemberId = sourceDecision?.coordinatorMemberId;
+        // A reused approval is delivered under the reviewer that produced the source verdict; the stored decision keeps
+        // none. A live view (not a copy) so the manager's final preflight still sees a status change made meanwhile.
+        const deliveryDecision = decision.coordinatorMemberId ? decision : sourceCoordinatorMemberId
+          ? new Proxy(decision, { get: (current, property, receiver) => property === "coordinatorMemberId"
+            ? sourceCoordinatorMemberId : Reflect.get(current, property, receiver) })
+          : undefined;
+        if (!deliveryDecision) return { status: "escalated" as const, reason: "The recorded reviewer assignment for this reused approval is unavailable. The request remains with the user." };
         const receipt = await this.manager.answerTeamPermission(decision.targetSessionId, decision.answerRequestId,
-          assignment(run.members.find(target => target.memberId === decision.targetMemberId)!), decision);
+          assignment(target), deliveryDecision);
         return receipt.state === "delivered" && receipt.result === "closed"
           ? { status: "answered" as const, receipt }
           : receipt.state === "uncertain" ? { status: "uncertain" as const, receipt, reason: "The host could not confirm whether the target prompt closed. Inspect the target session before acting." }
@@ -1989,12 +2043,12 @@ export class TeamService {
         return { status: "uncertain" as const, reason: "The host could not confirm whether the target prompt was answered. Inspect the target session before acting." };
       }
     }, result => {
-      if (["reviewing", "approved", "answering"].includes(decision.status)) { decision.status = result.status; decision.reason = result.reason ?? summary; }
+      if (["reviewing", "approved", "answering"].includes(decision.status)) { decision.status = result.status; decision.reason = result.reason ?? decision.reason; }
       else decision.reason = "The decision changed while the answer was in flight. Inspect the target session before acting.";
       if ("receipt" in result) decision.receipt = result.receipt;
-      member.status = "stopped";
+      if (coordinator) coordinator.status = "stopped";
       this.event(stored, result.status === "answered" ? "A one-shot permission option was delivered and the prompt closed." : "The permission request remains with the user.");
-    }, member);
+    }, coordinator);
   }
   private taskProfiles(run: TeamRun, tasks: { agentProfileId?: string }[]) {
     for (const task of tasks) {

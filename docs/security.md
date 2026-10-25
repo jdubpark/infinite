@@ -246,6 +246,14 @@ sibling-session control capability. The host applies only a current one-shot
 choice after verifying the target assignment, canonical workspace, prompt
 identity and evidence, owner policy, expiry and human control lease. It records
 intent before delivery and preserves uncertain acknowledgements without replay.
+Within the run's configured decision limit, the host can reuse a terminal
+reviewer's verdict only when the pinned policy, semantic prompt and option,
+task ID, changed paths, and accepted checks match. Prompt, session, and member
+IDs are excluded from the reuse key. Reuse also requires the same run revision,
+assigned role, and inspected workspace evidence. Reused approvals still pass
+every live authorization and prompt check and use the same single-delivery
+path; reviewer escalations remain with the owner, and host-side escalations
+are never reused.
 
 A Codex command dialog ("Would you like to run the following command?") runs its
 command once outside the provider sandbox, with network access and local

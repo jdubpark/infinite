@@ -37,7 +37,7 @@ export function schedulerFixture() {
   const journals = new Map([[sessionId, journal]]);
   const states = new Map([[sessionId, state]]);
   const sessions = new Map<string, { assignment: TeamAssignment; cwd: string; provider: string; title: string }>();
-  const launches: { requestId: string; provider: string; profile?: TeamModelProfile }[] = [];
+  const launches: { requestId: string; provider: string; prompt: string; continuation?: { mode: "start" | "resume"; nativeSessionId: string }; profile?: TeamModelProfile }[] = [];
   let permissionAnswers = 0;
   let reads = 0;
   const manager = {
@@ -64,8 +64,10 @@ export function schedulerFixture() {
       if (current) current.status = "exited";
       return manager.state(requestedId);
     },
-    createTeamSession: async (request: { requestId: string; provider: string; title: string }, assignment: TeamAssignment, cwd: string, profile?: TeamModelProfile) => {
-      launches.push({ requestId: request.requestId, provider: request.provider, ...(profile ? { profile: structuredClone(profile) } : {}) });
+    createTeamSession: async (request: { requestId: string; provider: string; title: string; prompt: string; continuation?: { mode: "start" | "resume"; nativeSessionId: string } }, assignment: TeamAssignment, cwd: string, profile?: TeamModelProfile) => {
+      launches.push({ requestId: request.requestId, provider: request.provider, prompt: request.prompt,
+        ...(request.continuation ? { continuation: structuredClone(request.continuation) } : {}),
+        ...(profile ? { profile: structuredClone(profile) } : {}) });
       const session = { assignment: structuredClone(assignment), cwd, provider: request.provider, title: request.title };
       sessions.set(request.requestId, session);
       journals.set(request.requestId, new Journal(join(config.stateDir, "events", request.requestId), key, request.requestId));
@@ -85,6 +87,17 @@ export function schedulerFixture() {
   const services: TeamService[] = [];
   return { config, key, run, state, journal, manager, writeRecord, readRecord, reads: () => reads,
     launches, permissionAnswers: () => permissionAnswers,
+    exposeNativeSession: (session: string, nativeSessionId: string) => {
+      const current = states.get(session);
+      assert.ok(current, "The native conversation belongs to a session launched by this fixture");
+      current.nativeSession = { id: nativeSessionId, source: "hook" };
+    },
+    exitWithoutNativeSession: (session: string) => {
+      const current = states.get(session);
+      assert.ok(current, "The exited session belongs to this fixture");
+      current.status = "exited";
+      delete current.nativeSession;
+    },
     report: (session: string, envelope: TeamReportEnvelope) => {
       const currentJournal = journals.get(session);
       assert.ok(currentJournal, "The report session was not launched by this fixture");

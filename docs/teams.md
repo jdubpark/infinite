@@ -1068,25 +1068,31 @@ coordinator escalated it, the review window expired, the run spent its decision
 limit or cannot act, or the prompt lacks complete one-shot evidence. A run gets
 a short grace period to start the review before an unreviewed prompt is pushed.
 
-A current one-shot tool prompt can start a separate turn on the pinned Claude
-permission reviewer profile, or on the strong coordinator when no reviewer
-profile is configured. The reviewer receives the task, owner scope and exact
-request, then reports approve-once or escalate. The host checks the assignment,
-workspace, prompt, policy, expiry and human input control before delivering the
-recorded choice. Workers cannot approve their own requests. The permission
-coordinator runs noninteractively with built-in tools disabled and only its
-assignment's report tool allowed. It escalates when the supplied evidence is
-insufficient. Worker provider modes, global trust settings and credentials
-remain unchanged. Other coordinator providers are not yet supported for this role.
+A run revision has one read-only permission reviewer: the pinned Claude
+permission reviewer profile, or the strong coordinator when no reviewer profile
+is configured. The reviewer receives the task, owner scope and assignment once.
+Each qualifying request is a turn that resumes the same native conversation and
+adds only that request's new evidence. The five-minute review window applies to
+each turn. If the conversation cannot be resumed, the host restarts it once with
+the full assignment and current request evidence. Between requests, the
+reviewer waits without a running process and holds no agent slot. It reports
+approve-once or escalate. The host checks the assignment, workspace, prompt,
+policy, expiry and human input control before delivering the recorded choice.
+Workers cannot approve their own requests. The permission reviewer runs
+noninteractively with built-in tools disabled and only its assignment's report
+tool allowed. It escalates when the supplied evidence is insufficient. Worker
+provider modes, global trust settings and credentials remain unchanged. Other
+coordinator providers are not yet supported for this role.
 
-Within the run's decision limit, an identical request can reuse a terminal
-reviewer's recorded verdict. The reuse key binds the pinned policy, semantic
-prompt and chosen option, task ID, changed paths, and accepted checks; it
-excludes prompt, session, and member identifiers. Reuse also requires the same
-run revision, assigned role, and inspected workspace evidence. A recorded
-approval is still rechecked against the current target session and delivered
-once. A recorded reviewer escalation remains with the owner. Reuse does not
-extend the run's decision limit or apply to host-side escalations.
+Within the run revision's decision limit, an identical request can reuse a
+terminal reviewer's recorded verdict without another turn. The reuse key binds
+the pinned policy, semantic prompt and chosen option, task ID, changed paths,
+and accepted checks; it excludes prompt, session, and member identifiers. Reuse
+also requires the same run revision, assigned role, and inspected workspace
+evidence. A recorded approval is still rechecked against the current target
+session and delivered once. A recorded reviewer escalation remains with the
+owner. Reuse does not extend the run's decision limit or apply to host-side
+escalations.
 
 A request qualifies when its evidence is complete: hook tool input that storage
 did not truncate, or a Codex "Would you like to run the following command?"

@@ -89,6 +89,8 @@ export interface TeamPermissionDecision {
   option: number;
   expiresAt: string;
   coordinatorMemberId?: string;
+  /** Host session that handled this decision on a sticky reviewer member. */
+  coordinatorSessionId?: string;
   answerRequestId: string;
   status: "pending" | "reviewing" | "approved" | "answering" | "answered" | "escalated" | "stale" | "uncertain";
   reason?: string;
@@ -301,6 +303,14 @@ export interface TeamMember extends TeamAssignment {
   provider?: Provider;
   modelProfile?: TeamModelProfile;
   sessionId: string;
+  /** Claude conversation resumed for successive permission review turns. */
+  nativeSessionId?: string;
+  /** Native conversation launch used for the current or most recent turn. */
+  continuation?: NativeContinuation;
+  /** Permission decisions handled by this reviewer member, in order. */
+  turns?: { sessionId: string; decisionId: string; startedAt: string; mode: "start" | "resume" }[];
+  /** Full evidence for rebuilding the original prompt if native resume fails. */
+  pendingFeedback?: string;
   title: string;
   status: "queued" | "running" | "waiting" | "reported" | "stopped" | "unavailable";
   cwd: string;
@@ -479,8 +489,8 @@ export interface TeamRun {
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions"> & {
   pendingOperation?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number; failed: boolean;
     failureCode?: string; sourceMemberId?: string; sourceRole?: TeamMember["role"] };
-  members: Omit<TeamMember, "prompt" | "contextFeedback">[];
-  permissionDecisions?: Omit<TeamPermissionDecision, "prompt">[];
+  members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback">[];
+  permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];
   usage: UsageRollup;
   providerLimits: ProviderLimit[];
   workers: { limit: number; max: number; running: number; ready: number };

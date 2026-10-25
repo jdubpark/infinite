@@ -2394,6 +2394,182 @@ test("a configured permission reviewer launches from its profile and a later pro
   } finally { f.close(); }
 });
 
+function configurePermissionReviewFixture(f: ReturnType<typeof schedulerFixture>) {
+  f.run.members[0].status = "unavailable";
+  f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+  f.run.headCommit = f.run.baseCommit;
+  const profile: TeamModelProfile = { id: "permission-reviewer", label: "Permission reviewer", provider: "claude", model: "claude-haiku-5-5", effort: "high", tier: "light" };
+  f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, tier: "light" }, permissionReviewer: profile };
+  f.config.agents.claude = { command: "claude", args: [] };
+  const prompt = (id: number, command: string): Prompt => ({ id, kind: "permission", source: "screen", hash: String.fromCharCode(96 + id).repeat(64), pinned: true, acceptsText: false,
+    title: "Would you like to run the following command?", detail: `Environment: local\n$ ${command}`,
+    options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] });
+  f.state.attention.state = "needs-you";
+  f.state.attention.prompt = prompt(1, "npm test");
+  f.writeTeam();
+  return prompt;
+}
+
+test("sequential permission prompts reuse one reviewer and resume its observed native session", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    const prompt = configurePermissionReviewFixture(f);
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "reviewing" &&
+      run.members.some(member => member.role === "permission-coordinator" && member.status === "running") && f.launches.length > 0);
+    const reviewer = assigned.members.find(member => member.role === "permission-coordinator")!;
+    const firstDecision = assigned.permissionDecisions![0];
+    assert.equal(f.launches.length, 1);
+    assert.equal(f.launches[0].continuation?.mode ?? "start", "start");
+
+    const firstNativeId = f.launches[0].continuation!.nativeSessionId;
+    f.exposeNativeSession(reviewer.sessionId, firstNativeId);
+    f.report(reviewer.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: reviewer.memberId, revision: reviewer.revision,
+      report: { kind: "permission-decision", decisionId: firstDecision.id, verdict: "escalate", summary: "The command is outside the approved scope." } });
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "escalated" && run.members.some(member => member.memberId === reviewer.memberId && member.status === "waiting"));
+
+    f.state.attention.prompt = prompt(2, "npm run build");
+    const launchesBefore = f.launches.length;
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.length === 2 && f.launches.length > launchesBefore);
+
+    const result = teams.get(f.run.id);
+    const persisted = f.readRecord<{ run: TeamRun }>("team", f.run.id).run;
+    const secondDecision = persisted.permissionDecisions![1];
+    const sameReviewer = persisted.members.find(member => member.memberId === reviewer.memberId)!;
+    assert.equal(result.members.filter(member => member.role === "permission-coordinator" && member.revision === 1).length, 1);
+    assert.equal(secondDecision.coordinatorMemberId, reviewer.memberId);
+    assert.equal(secondDecision.coordinatorSessionId, f.launches.at(-1)!.requestId);
+    assert.equal(f.launches.at(-1)!.continuation?.mode, "resume");
+    assert.equal(f.launches.at(-1)!.continuation?.nativeSessionId, firstNativeId);
+    assert.match(f.launches.at(-1)!.prompt, /npm run build/);
+    assert.match(f.launches.at(-1)!.prompt, /continuing the same assignment/);
+    assert.doesNotMatch(f.launches.at(-1)!.prompt, /Owner-authorized permission scope/);
+    assert.doesNotMatch(f.launches.at(-1)!.prompt, /npm test/);
+    assert.doesNotMatch(f.launches.at(-1)!.prompt, /Codex sandbox guidance/);
+    assert.ok(f.launches.at(-1)!.prompt.length < f.launches[0].prompt.length, "A resumed turn receives a short follow-up prompt");
+    assert.equal(sameReviewer.turns?.length, 2);
+    assert.deepEqual(sameReviewer.turns?.map(turn => turn.decisionId), [firstDecision.id, secondDecision.id]);
+    assert.deepEqual(sameReviewer.turns?.map(turn => turn.mode), ["start", "resume"]);
+    assert.ok(sameReviewer.turns?.every(turn => turn.sessionId && Number.isFinite(Date.parse(turn.startedAt))));
+  } finally { f.close(); }
+});
+
+test("a delivered permission decision returns its reviewer to waiting", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    configurePermissionReviewFixture(f);
+    const target = f.run.members[0], meta = f.manager.meta;
+    f.manager.meta = (sessionId => sessionId === target.sessionId ? { session: { team: {
+      runId: target.runId, memberId: target.memberId, revision: target.revision, role: target.role,
+    }, cwd: target.cwd } } : meta(sessionId)) as typeof f.manager.meta;
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "reviewing" &&
+      run.members.some(member => member.role === "permission-coordinator" && member.status === "running") && f.launches.length > 0);
+    const reviewer = assigned.members.find(member => member.role === "permission-coordinator")!;
+    f.exposeNativeSession(reviewer.sessionId, f.launches[0].continuation!.nativeSessionId);
+    f.report(reviewer.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: reviewer.memberId, revision: reviewer.revision,
+      report: { kind: "permission-decision", decisionId: assigned.permissionDecisions![0].id, verdict: "approve-once", summary: "The one-time check is in scope." } });
+
+    const delivered = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "answered" &&
+      run.members.some(member => member.memberId === reviewer.memberId && member.status === "waiting"));
+    assert.equal(f.permissionAnswers(), 1);
+    assert.equal(delivered.members.filter(member => member.role === "permission-coordinator").length, 1);
+  } finally { f.close(); }
+});
+
+test("a failed reviewer resume retries the same turn once with a fresh start and complete assignment", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    const prompt = configurePermissionReviewFixture(f);
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "reviewing" &&
+      run.members.some(member => member.role === "permission-coordinator" && member.status === "running") && f.launches.length > 0);
+    const reviewer = assigned.members.find(member => member.role === "permission-coordinator")!;
+    const firstDecision = assigned.permissionDecisions![0], nativeId = f.launches[0].continuation!.nativeSessionId;
+    f.exposeNativeSession(reviewer.sessionId, nativeId);
+    f.report(reviewer.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: reviewer.memberId, revision: reviewer.revision,
+      report: { kind: "permission-decision", decisionId: firstDecision.id, verdict: "escalate", summary: "Escalated to the owner." } });
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "escalated" && run.members.some(member => member.memberId === reviewer.memberId && member.status === "waiting"));
+    f.state.attention.prompt = prompt(2, "npm run build");
+
+    const before = f.launches.length;
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.length === 2 && f.launches.length >= before + 1);
+    const attempts = f.launches.slice(before);
+    assert.equal(attempts[0].continuation?.mode, "resume");
+    const resumedSessionId = attempts[0].requestId;
+    f.exitWithoutNativeSession(resumedSessionId);
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(async () => teams.get(f.run.id), run => f.launches.length >= before + 2 && f.launches.at(-1)?.continuation?.mode === "start");
+    const retried = f.launches.at(-1)!;
+    assert.notEqual(retried.continuation?.nativeSessionId, nativeId);
+    assert.match(retried.prompt, /targetAssignment/);
+    assert.match(retried.prompt, /npm run build/);
+    const persisted = f.readRecord<{ run: TeamRun }>("team", f.run.id).run;
+    assert.equal(persisted.permissionDecisions?.[1].coordinatorSessionId, retried.requestId);
+    assert.equal(persisted.permissionDecisions?.[1].status, "reviewing");
+    assert.equal(teams.get(f.run.id).members.filter(member => member.memberId === reviewer.memberId).length, 1);
+  } finally { f.close(); }
+});
+
+test("an expired reviewer turn waits, and the next qualifying prompt starts a new turn", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    const prompt = configurePermissionReviewFixture(f);
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "reviewing" &&
+      run.members.some(member => member.role === "permission-coordinator" && member.status === "running") && f.launches.length > 0);
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+    const stored = scheduler.record(f.run.id) as { run: TeamRun };
+    const reviewer = stored.run.members.find(member => member.role === "permission-coordinator")!;
+    const nativeSessionId = f.launches[0].continuation!.nativeSessionId;
+    f.exposeNativeSession(reviewer.sessionId, nativeSessionId);
+    reviewer.startedAt = new Date(Date.now() - 6 * 60_000).toISOString();
+    await scheduler.step(stored);
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "escalated" && run.members.some(member => member.memberId === reviewer.memberId && member.status === "waiting"));
+
+    f.state.attention.prompt = prompt(2, "npm run build");
+    const before = f.launches.length;
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.length === 2 && f.launches.length > before);
+    const persisted = f.readRecord<{ run: TeamRun }>("team", f.run.id).run;
+    const currentReviewer = persisted.members.find(member => member.memberId === reviewer.memberId)!;
+    const result = teams.get(f.run.id);
+    assert.equal(result.members.filter(member => member.role === "permission-coordinator" && member.revision === 1).length, 1);
+    assert.deepEqual(currentReviewer.turns?.map(turn => turn.mode), ["start", "resume"]);
+    assert.equal(currentReviewer.turns?.length, 2);
+    assert.equal(currentReviewer.turns?.[1].decisionId, persisted.permissionDecisions?.[1].id);
+    assert.equal(f.launches.at(-1)!.continuation?.mode, "resume");
+    assert.equal(f.launches.at(-1)!.continuation?.nativeSessionId, nativeSessionId);
+  } finally { f.close(); }
+});
+
+test("a run revision change stops its prior reviewer and assigns a fresh reviewer", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    const prompt = configurePermissionReviewFixture(f);
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "reviewing" &&
+      run.members.some(member => member.role === "permission-coordinator" && member.status === "running") && f.launches.length > 0);
+    const prior = assigned.members.find(member => member.role === "permission-coordinator")!;
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+
+    const stored = scheduler.record(f.run.id) as { run: TeamRun };
+    stored.run.revision = 2;
+    stored.run.members[0].revision = 2;
+    f.state.attention.prompt = prompt(2, "npm run build");
+    await scheduler.step(stored);
+    await waitFor(async () => teams.get(f.run.id), run => run.members.some(member => member.role === "permission-coordinator" && member.revision === 2 && member.memberId !== prior.memberId));
+    const result = teams.get(f.run.id);
+    assert.equal(result.members.find(member => member.memberId === prior.memberId)!.status, "stopped");
+    assert.equal(result.members.filter(member => member.role === "permission-coordinator" && member.revision === 2).length, 1);
+    assert.equal(f.launches.at(-1)!.continuation?.mode ?? "start", "start");
+  } finally { f.close(); }
+});
+
 for (const [ending, minutes, event] of [
   ["its request is obsolete", 0, /could not be confirmed stopped/],
   ["its review window expires", 6, /exceeded its review window/],

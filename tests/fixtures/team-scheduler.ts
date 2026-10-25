@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { initialAttention } from "@infinite/attention";
 import type { Manager } from "../../packages/host/src/manager.js";
 import type { Config, WorkerState } from "../../packages/host/src/types.js";
-import type { TeamRun } from "../../packages/host/src/team-types.js";
+import type { TeamAssignment, TeamModelProfile, TeamReportEnvelope, TeamRun } from "../../packages/host/src/team-types.js";
 import { TeamService } from "../../packages/host/src/teams.js";
 import { Journal, readEvents, unseal, writeSealed } from "../../packages/host/src/vault.js";
 
@@ -34,20 +34,45 @@ export function schedulerFixture() {
     projects: [{ id: "fixture", name: "Fixture", path: workspace }], agents: {}, teams: { workspaceDir, stallMinutes: 5 } };
   const journal = new Journal(join(config.stateDir, "events"), key, sessionId);
   const state: WorkerState = { status: "running", seq: 0, screen: "", attention: initialAttention(quietAt, true) };
+  const journals = new Map([[sessionId, journal]]);
+  const states = new Map([[sessionId, state]]);
+  const sessions = new Map<string, { assignment: TeamAssignment; cwd: string; provider: string; title: string }>();
+  const launches: { requestId: string; provider: string; profile?: TeamModelProfile }[] = [];
+  let permissionAnswers = 0;
   let reads = 0;
   const manager = {
     list: async () => [],
     meta: (requestedId: string) => {
       if (requestedId === sessionId) return {};
+      const session = sessions.get(requestedId);
+      if (session) return { session: { team: session.assignment, cwd: session.cwd, provider: session.provider, title: session.title } };
       throw Object.assign(new Error("Session metadata is unavailable."), { code: "ENOENT" });
     },
-    state: async () => structuredClone({ ...state, seq: journal.seq }),
-    events: (requestedId: string, after: number, limit: number, types?: Set<string>) => {
-      assert.equal(requestedId, sessionId);
-      reads++;
-      return readEvents(journal.directory, key, sessionId, after, limit, types);
+    state: async (requestedId = sessionId) => {
+      const current = states.get(requestedId), currentJournal = journals.get(requestedId);
+      if (!current || !currentJournal) throw Object.assign(new Error("Session state is unavailable."), { code: "ENOENT" });
+      return structuredClone({ ...current, seq: currentJournal.seq });
     },
-    stopTeamSession: async () => { state.status = "exited"; return manager.state(); },
+    events: (requestedId: string, after: number, limit: number, types?: Set<string>) => {
+      const currentJournal = journals.get(requestedId);
+      assert.ok(currentJournal, "The scheduler requested events for a session it did not launch");
+      reads++;
+      return readEvents(currentJournal.directory, key, requestedId, after, limit, types);
+    },
+    stopTeamSession: async (requestedId = sessionId) => {
+      const current = states.get(requestedId);
+      if (current) current.status = "exited";
+      return manager.state(requestedId);
+    },
+    createTeamSession: async (request: { requestId: string; provider: string; title: string }, assignment: TeamAssignment, cwd: string, profile?: TeamModelProfile) => {
+      launches.push({ requestId: request.requestId, provider: request.provider, ...(profile ? { profile: structuredClone(profile) } : {}) });
+      const session = { assignment: structuredClone(assignment), cwd, provider: request.provider, title: request.title };
+      sessions.set(request.requestId, session);
+      journals.set(request.requestId, new Journal(join(config.stateDir, "events", request.requestId), key, request.requestId));
+      states.set(request.requestId, { status: "running", seq: 0, screen: "", attention: initialAttention(quietAt, true) });
+      return { status: "running" };
+    },
+    answerTeamPermission: async () => { permissionAnswers++; return { state: "delivered", result: "closed" }; },
   };
   function writeRecord(kind: "team" | "goal", recordId: string, value: unknown) {
     const directory = join(config.stateDir, `${kind}s`);
@@ -59,6 +84,12 @@ export function schedulerFixture() {
   }
   const services: TeamService[] = [];
   return { config, key, run, state, journal, manager, writeRecord, readRecord, reads: () => reads,
+    launches, permissionAnswers: () => permissionAnswers,
+    report: (session: string, envelope: TeamReportEnvelope) => {
+      const currentJournal = journals.get(session);
+      assert.ok(currentJournal, "The report session was not launched by this fixture");
+      return currentJournal.append("team-report", envelope);
+    },
     blockRecordWrites: (kind: "team" | "goal", recordId: string) => {
       const file = join(config.stateDir, `${kind}s`, `${recordId}.sealed`), backup = `${file}.saved`;
       renameSync(file, backup); mkdirSync(file);

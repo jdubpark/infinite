@@ -166,6 +166,11 @@ as usual and is not counted as missing. The next attempt starts with a
 refusal that says so, together with every message that arrived meanwhile.
 Three missed or refused reports in a row block the mission.
 
+After the first attempt, the coordinator resumes its confirmed conversation
+and receives only the current mission state and new messages. The first attempt
+and any attempt after a failed resume receive the full prompt; a failed resume
+does not count as a missed report.
+
 Size rules: a `solo` subtask starts a subteam with parallelism 1, and a `team`
 subtask starts with its coordinator-selected `parallelism` (1–4). The subteam
 PM can select capacity in its plan or discovery report, and the mission

@@ -34,6 +34,7 @@ const componentInput = z.object({ repositoryIds: idList, name: label(120), descr
   redirectTo: componentId.nullable(), pinned: z.boolean() }).strict();
 const policyInput = z.object({ enabled: z.boolean(), synthesis: z.boolean(), delivery: z.boolean(),
   intervalMinutes: z.number().int().min(1).max(1440), dailyJobLimit: z.number().int().min(1).max(1000) }).strict();
+const policySchema = policyInput.extend({ editedAt: z.string().datetime({ offset: true }).nullable().optional(), editedBy: z.enum(["owner", "migration"]).nullable().optional() }).strict();
 const envelope = z.object({ requestId: z.uuid(), revision: z.number().int().nonnegative(), action: z.enum(["create", "update", "archive"]), value: z.unknown().optional() }).strict();
 const historySchema = z.array(z.object({ revision: z.number().int().positive(), at: z.string().datetime({ offset: true }), summary: z.string().min(1).max(500) }).strict()).max(MAX_HISTORY);
 const projectSchema = z.object({ id, revision: z.number().int().positive(), name: label(120), description: z.string().max(4000), repositoryIds: idList,
@@ -47,7 +48,7 @@ const planSchema = z.object({ id, revision: z.number().int().positive(), compone
 const overrideSchema = z.object({ id: componentId, revision: z.number().int().positive(), repositoryIds: idList, name: label(120), description: z.string().max(understandingCatalogLimits.componentDescription),
   redirectTo: componentId.nullable(), pinned: z.boolean(), updatedAt: z.string().datetime({ offset: true }) }).strict();
 const catalogSchema = z.object({ revision: z.number().int().nonnegative(), projects: z.array(projectSchema).max(MAX_ENTITIES), features: z.array(featureSchema).max(MAX_ENTITIES),
-  plans: z.array(planSchema).max(MAX_ENTITIES), componentOverrides: z.array(overrideSchema).max(MAX_ENTITIES), policy: policyInput,
+  plans: z.array(planSchema).max(MAX_ENTITIES), componentOverrides: z.array(overrideSchema).max(MAX_ENTITIES), policy: policySchema,
   coverage: z.array(z.string().max(500)).max(64) }).strict();
 const bindingEntrySchema = z.object({ projectId: id, path: z.string().min(1).max(4096), device: z.string().max(80), inode: z.string().max(80), identity: z.string().regex(/^[a-f0-9]{64}$/),
   repositoryIdentity: z.string().regex(/^[a-f0-9]{64}$/), primaryProjectId: id }).strict();
@@ -56,7 +57,7 @@ const storedSchema = z.object({ version: z.literal(1), workspaceId: id,
   policyBinding: z.array(bindingEntrySchema).max(512),
   catalog: catalogSchema, receipts: z.record(z.uuid(), z.object({ fingerprint: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).refine(value => Object.keys(value).length <= MAX_RECEIPTS),
   usedIds: z.array(id).max(MAX_IDS).refine(value => new Set(value).size === value.length) }).strict();
-const defaults: KnowledgePolicy = { enabled: false, synthesis: false, delivery: false, intervalMinutes: 15, dailyJobLimit: 24 };
+const defaults: KnowledgePolicy = { enabled: true, synthesis: true, delivery: true, intervalMinutes: 15, dailyJobLimit: 24 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
   : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)])) : value;
@@ -72,7 +73,7 @@ export class CatalogError extends Error {
 }
 
 function emptyCatalog(): KnowledgeCatalog {
-  return { revision: 0, projects: [], features: [], plans: [], componentOverrides: [], policy: { ...defaults }, coverage: [] };
+  return { revision: 0, projects: [], features: [], plans: [], componentOverrides: [], policy: { ...defaults, editedAt: null, editedBy: null }, coverage: [] };
 }
 
 /** Encrypted owner knowledge, bound to one exact enrolled repository group. */
@@ -135,6 +136,11 @@ export class UnderstandingCatalog {
       if (Buffer.byteLength(raw) > MAX_BYTES) throw new Error("catalog-too-large");
       const value = storedSchema.parse(unseal<unknown>(this.sources.key, `understanding-catalog:${workspaceId}`, raw)) as Stored;
       if (value.workspaceId !== workspaceId) throw new Error("catalog-workspace-mismatch");
+      if (value.catalog.policy.editedAt === undefined) {
+        // One-time migration: records saved before edits were stamped lack the key and carry the old disabled defaults.
+        value.catalog.policy = { ...defaults, editedAt: new Date().toISOString(), editedBy: "migration" };
+        try { this.persist(workspaceId, value); } catch { /* keep the migrated policy in memory; it retries on the next load */ }
+      }
       this.states.set(workspaceId, value);
       return value;
     } catch (error) {
@@ -331,7 +337,7 @@ export class UnderstandingCatalog {
     const candidate = structuredClone(state);
     const at = new Date().toISOString();
     if (collection === "policy") {
-      candidate.catalog.policy = this.validateReferences(collection, request.value, state, members, context, current.entries) as KnowledgePolicy;
+      candidate.catalog.policy = { ...this.validateReferences(collection, request.value, state, members, context, current.entries) as KnowledgePolicy, editedAt: at, editedBy: "owner" };
       candidate.policyBinding = current.entries;
     } else {
       const rows = this.listFor(candidate, collection);

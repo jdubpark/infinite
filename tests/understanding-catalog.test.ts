@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { writeSealed } from "../packages/host/src/vault.js";
 import type { KnowledgeMutationContext } from "@infinite/remote";
 import { UnderstandingCatalog, CatalogError } from "../packages/host/src/understanding-catalog.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -30,7 +31,15 @@ function fixture() {
   const key = Buffer.alloc(32, 7);
   const groups = { get: (id: string) => { if (id !== group.id) throw new Error("missing"); return group; }, list: () => ({ groups: [group], suggestions: [] }) };
   const make = () => new UnderstandingCatalog({ config, key, groups });
-  return { root, checkout, config, group, make, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  const file = join(config.stateDir, "understanding", "catalogs", "workspace.sealed");
+  const reopen = make;
+  // Seals a stored catalog whose policy is the given legacy object, bypassing the catalog's own writes.
+  const writeStoredPolicy = (policy: Record<string, unknown>) => {
+    const stored = { version: 1, workspaceId: "workspace", binding: [], scopes: {}, policyBinding: [], receipts: {}, usedIds: [],
+      catalog: { revision: 0, projects: [], features: [], plans: [], componentOverrides: [], policy, coverage: [] } };
+    writeSealed(file, key, "understanding-catalog:workspace", stored);
+  };
+  return { root, checkout, config, group, make, reopen, writeStoredPolicy, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test("catalog writes are sealed, globally CASed, replay-safe, and survive restart", () => {
@@ -245,5 +254,33 @@ test("an unpersistable component reference is rejected before acknowledging or r
     assert.equal(readFileSync(file, "utf8"), before);
     assert.deepEqual(catalog.read("workspace"), created);
     assert.deepEqual(f.make().read("workspace"), created);
+  } finally { f.cleanup(); }
+});
+
+test("new workspaces are enabled by default and owner edits stamp editedAt", () => {
+  const f = fixture();
+  try {
+    const catalog = f.make();
+    const policy = catalog.read("workspace").policy;
+    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit], [true, true, true, 15, 24]);
+    assert.equal(policy.editedAt, null);
+    catalog.mutate("workspace", "policy", undefined, request(0, "update", { enabled: false, synthesis: false, delivery: false, intervalMinutes: 30, dailyJobLimit: 10 }), emptyContext);
+    const edited = catalog.read("workspace").policy;
+    assert.equal(edited.enabled, false);
+    assert.equal(edited.editedBy, "owner");
+    assert.match(edited.editedAt ?? "", /^\d{4}-/);
+  } finally { f.cleanup(); }
+});
+
+test("a stored policy without editedAt migrates to enabled once; an owner-disabled policy survives restart", () => {
+  const f = fixture();
+  try {
+    f.writeStoredPolicy({ enabled: false, synthesis: false, delivery: false, intervalMinutes: 15, dailyJobLimit: 24 });
+    const migrated = f.reopen().read("workspace");
+    assert.equal(migrated.policy.enabled, true);
+    assert.equal(migrated.policy.editedBy, "migration");
+    assert.equal(migrated.revision, 0);
+    f.reopen().mutate("workspace", "policy", undefined, request(0, "update", { enabled: false, synthesis: false, delivery: false, intervalMinutes: 15, dailyJobLimit: 24 }), emptyContext);
+    assert.equal(f.reopen().read("workspace").policy.enabled, false);
   } finally { f.cleanup(); }
 });

@@ -36,6 +36,8 @@ export interface KnowledgePolicy {
   /** Models run only when enabled here and a host writer is configured. */
   synthesis: boolean;
   delivery: boolean; intervalMinutes: number; dailyJobLimit: number;
+  /** Set when the owner edits the policy or the one-time migration applies the defaults. */
+  editedAt?: string | null; editedBy?: "owner" | "migration" | null;
 }
 export interface KnowledgeCatalog {
   revision: number; projects: KnowledgeProject[]; features: KnowledgeFeature[]; plans: KnowledgePlan[];

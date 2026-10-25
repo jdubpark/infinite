@@ -11,7 +11,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
-import { TeamError, applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
+import { TeamError, applyTeamBriefTitle, changeIndex, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
 import { createTeamSchema, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamModelProfile, type TeamRun, type TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import type { HandoffPolicy, TeamHandoffContext } from "../packages/host/src/handoff-types.js";
@@ -840,6 +840,29 @@ test("a team builds concurrently in isolated copies and produces checked, review
   } finally { owner.close(); viewer.close(); await f.close(); }
 });
 
+test("changeIndex parses name-status and numstat -z records with statuses, counts, and binary nulls", () => {
+  const nameStatus = ["A", "a.txt", "M", "src/b.ts", "D", "gone.md", "R100", "old/c.ts", "new/c.ts", "", ""].join("\0");
+  const numstat = ["1\t0\ta.txt", "3\t2\tsrc/b.ts", "0\t4\tgone.md", "2\t1\t", "old/c.ts", "new/c.ts", "-\t-\tlogo.png", ""].join("\0");
+  const index = changeIndex(nameStatus, numstat, "a".repeat(40), "2026-10-25T00:00:00.000Z");
+  assert.deepEqual(index, {
+    headCommit: "a".repeat(40), recordedAt: "2026-10-25T00:00:00.000Z", truncated: false,
+    files: [
+      { path: "a.txt", status: "added", added: 1, removed: 0 },
+      { path: "src/b.ts", status: "modified", added: 3, removed: 2 },
+      { path: "gone.md", status: "removed", added: 0, removed: 4 },
+      { path: "new/c.ts", status: "renamed", added: 2, removed: 1 },
+    ],
+  });
+  assert.equal(changeIndex(undefined, numstat, "a".repeat(40), "2026-10-25T00:00:00.000Z"), undefined);
+  const binary = changeIndex("M\0logo.png\0", "-\t-\tlogo.png\0", "b".repeat(40), "2026-10-25T00:00:00.000Z");
+  assert.deepEqual(binary?.files, [{ path: "logo.png", status: "modified", added: null, removed: null }]);
+  const unknown = changeIndex("A\0new.txt\0", undefined, "b".repeat(40), "2026-10-25T00:00:00.000Z");
+  assert.deepEqual(unknown?.files, [{ path: "new.txt", status: "added", added: null, removed: null }]);
+  const many = changeIndex(Array.from({ length: 401 }, (_, n) => `A\0f${n}.txt\0`).join(""), undefined, "b".repeat(40), "2026-10-25T00:00:00.000Z");
+  assert.equal(many?.files.length, 400);
+  assert.equal(many?.truncated, true);
+});
+
 test("review rubrics drop self-grading, integration records docs/tests, and owner ratings are idempotent", { timeout: 120000 }, async () => {
   const { limitFallback: _limitFallback, ...implementerProfile } = fallbackLineup.implementers[0];
   const reviewerProfile = { ...implementerProfile, id: "rubric-reviewer", label: "Rubric reviewer", tier: "strong" as const };
@@ -856,6 +879,12 @@ test("review rubrics drop self-grading, integration records docs/tests, and owne
     assert.equal(taskB.rubric?.reviewerProfileId, reviewerProfile.id);
     assert.equal(taskA.diffStat?.docs, true);
     assert.equal(taskA.diffStat?.tests, true);
+    // The fixture's implementers write a.txt and b.txt; task a also writes docs/x.md and tests/y.test.ts.
+    assert.deepEqual(finished.changes?.files.map(file => `${file.path}:${file.status}`).sort(), ["a.txt:added", "b.txt:added", "docs/x.md:added", "tests/y.test.ts:added"]);
+    assert.equal(finished.changes?.headCommit, finished.headCommit);
+    assert.equal(finished.changes?.truncated, false);
+    assert.ok(taskA.changedPaths && taskA.changedPaths.paths.length > 0, JSON.stringify(taskA.changedPaths));
+    assert.equal(taskA.changedPaths?.truncated, false);
     assert.ok(finished.events.some(event => /rubric for task a was dropped/.test(event.text)));
 
     const path = `/teams/${finished.id}/tasks/a/rating`, requestId = randomUUID();

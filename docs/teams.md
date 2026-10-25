@@ -263,6 +263,8 @@ parent's head and differs from it, the continuation records
 `baseBehind: { mirrorHead }`, so the coordinator can rebase early instead of at
 delivery.
 
+Each integration records what changed. The run's `changes` lists the files changed from its base to its recorded head, each with a status of added, modified, removed, or renamed and its line counts (`null` for binary files). It holds up to 400 files and sets `truncated` when more changed. Each integrated task's `changedPaths` lists the paths its own change touched, up to 200, with its own `truncated` flag. Git reads for these fields are best-effort: if Git refuses or fails a read, the field is absent and integration still succeeds.
+
 ## Optional provider-side delivery
 
 Repositories remain review-only until an owner configures delivery once during

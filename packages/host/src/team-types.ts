@@ -313,6 +313,8 @@ export interface TeamTask extends TeamTaskPlan {
   rubric?: { version: 1; correctness: { score: number; why: string }; cleanliness: { score: number; why: string }; extensibility: { score: number; why: string }; docs: { score: number; why: string }; reviewerProfileId: string };
   ownerRating?: { score: 1 | 2 | 3 | 4 | 5; note?: string; at: string };
   diffStat?: { added: number; removed: number; files: number; docs: boolean; tests: boolean };
+  /** Paths this task's own member diff touched (base to its commit), bounded to 200; absent when Git refused the read. */
+  changedPaths?: { paths: string[]; truncated: boolean };
   reviewRounds?: number;
   escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string };
   /** Each provider-limit switch of this task's member; a replacement can itself be switched. */
@@ -370,6 +372,8 @@ export interface TeamRun {
   /** Revisions where an unauthorized verification plan already received its one correction. */
   verificationCorrections?: number[];
   verificationReconciliations?: { requestId: string; pendingId: string; revision: number; round: number; headCommit: string; interruptedChecks: number; attestation: string; at: string }[];
+  /** Changed files from the run's base to its recorded head, bounded to 400; absent when Git refused the read. */
+  changes?: { headCommit: string; recordedAt: string; files: { path: string; status: "added" | "modified" | "removed" | "renamed"; added: number | null; removed: number | null }[]; truncated: boolean };
   /** Owner-authorized repository delivery policy pinned when this run starts. */
   delivery?: TeamDelivery;
   /** Agent-reported delivery evidence; this is not independently verified by the host. */

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { componentGraph, diagramFromMermaid, linkDiagramNodes, parseMermaidFlowchart } from "../packages/host/src/understanding-diagrams.js";
+import { componentGraph, diagramFromMermaid, diagramGraphSchema, linkDiagramNodes, parseMermaidFlowchart } from "../packages/host/src/understanding-diagrams.js";
 
 test("parses the flowchart subset with groups, labeled edges and chains", () => {
   const result = parseMermaidFlowchart(`flowchart TD\n%% comment\nsubgraph api [API]\n  a[\"Auth &amp; tokens\"]\n  b(Store)\nend\nc((Worker))\na -->|verifies| b --> c\nc -. retry .-> a\nclassDef x fill:#fff`);
@@ -40,4 +40,11 @@ test("links diagram nodes to components by id, then by unique case-insensitive n
   const graph = diagramFromMermaid({ id: "d", title: "t", kind: "system", mermaid: "flowchart LR\ncmp_a --> store[Store] --> other[Other]", repositoryId: "repo", head: null, observedAt: "2026-10-25T00:00:00.000Z" });
   const linked = linkDiagramNodes(graph, [{ id: "cmp_a", name: "Auth" }, { id: "cmp_s", name: "store" }, { id: "cmp_o1", name: "Other" }, { id: "cmp_o2", name: "other" }]);
   assert.deepEqual(linked.nodes.map(n => n.componentId), ["cmp_a", "cmp_s", null]);
+});
+
+test("stored component graphs validate beyond the parser node limit", () => {
+  const components = Array.from({ length: 201 }, (_, i) => ({ id: `cmp_${i}`, name: `C${i}`, paths: [{ repositoryId: "repo", path: `src/c${i}` }], retired: false }));
+  const graph = componentGraph({ repositoryId: "repo", head: null, observedAt: "2026-10-25T00:00:00.000Z", components, relationships: [] });
+  assert.equal(graph.nodes.length, 201);
+  assert.equal(diagramGraphSchema.safeParse(graph).success, true);
 });

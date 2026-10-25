@@ -14,6 +14,10 @@ const MAX_EDGES = 400;
 const MAX_LABEL = 200;
 const MAX_SOURCE = 3000;
 const MAX_ERROR_LINE = 120;
+// Stored graphs carry component maps, which can exceed the Mermaid parser limits.
+const SCHEMA_MAX_NODES = 2000;
+const SCHEMA_MAX_GROUPS = 200;
+const SCHEMA_MAX_EDGES = 4000;
 const ID = /^[A-Za-z0-9_.-]+$/;
 const NODE_ID = /^[A-Za-z0-9_.-]+/;
 const SHAPES: [string, string][] = [["((", "))"], ["[[", "]]"], ["[", "]"], ["(", ")"], ["{", "}"], [">", "]"]];
@@ -259,7 +263,7 @@ const edgeSchema = z.object({ from: text(200), to: text(200), label: text(MAX_LA
 
 export const diagramGraphSchema: z.ZodType<DiagramGraph> = z.object({
   id: text(200), title: text(120), kind: z.enum(["system", "change", "components"]), direction: z.enum(["LR", "TB"]),
-  nodes: z.array(nodeSchema).max(MAX_NODES), groups: z.array(groupSchema).max(MAX_GROUPS), edges: z.array(edgeSchema).max(MAX_EDGES),
+  nodes: z.array(nodeSchema).max(SCHEMA_MAX_NODES), groups: z.array(groupSchema).max(SCHEMA_MAX_GROUPS), edges: z.array(edgeSchema).max(SCHEMA_MAX_EDGES),
   source: z.enum(["mermaid", "components"]), sourceText: z.string().max(MAX_SOURCE).nullable(),
   parseError: z.string().max(300).nullable(), repositoryId: text(200), head: z.string().max(80).nullable(),
   observedAt: z.string().max(64),

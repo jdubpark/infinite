@@ -12,6 +12,7 @@ export type {
 } from "./understanding.js";
 export type * from "./understanding-knowledge.js";
 export type * from "./understanding-behavior.js";
+export type * from "./understanding-work.js";
 export * from "./memory.js";
 
 /** A Cloudflare Access service token; Cloudflare checks it before the connection reaches the relay. */
@@ -291,3 +292,6 @@ export function createRemoteClient(connection: RemoteConnection, options: Remote
     close() { stopped = true; disconnect(new RemoteError("Machine connection closed", 0, undefined, "closed")); key.fill(0); },
   };
 }
+export { parseMarkdown } from "./markdown.js";
+export { parseMermaid, type ParsedMermaid } from "./mermaid.js";
+export { layoutDiagram, type DiagramLayout, NODE_W, NODE_H, LAYER_GAP, NODE_GAP, GROUP_PAD } from "./diagram-layout.js";

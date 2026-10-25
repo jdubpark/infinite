@@ -1,3 +1,4 @@
+import type { DiagramGraph } from "./understanding-diagrams.js";
 import type { UnderstandingBrief, UnderstandingWork } from "./understanding.js";
 
 /** Source observations never confer completion or delivery authority. */
@@ -84,9 +85,16 @@ export interface KnowledgeMaintenance {
   jobsToday: number; dailyJobLimit: number; message: string | null;
   lastFailure?: { at: string; reason: string } | null;
 }
+/** Whole-repository brief at the tracked head; `base` is the prior head the changes section compares against. */
+export interface KnowledgeRepositoryBrief {
+  repositoryId: string; head: string | null; base: string | null; generatedAt: string; observedAt: string;
+  state: "ready" | "stale"; brief: UnderstandingBrief; diagrams: DiagramGraph[];
+  evidence: { source: string; line: number; text: string }[]; coverage: string[];
+}
 export interface WorkspaceKnowledge {
   schemaVersion: 1; catalog: KnowledgeCatalog; components: KnowledgeComponent[];
   relationships: KnowledgeRelationship[]; delivery: KnowledgeDelivery[]; maintenance: KnowledgeMaintenance; coverage: string[];
+  briefs?: KnowledgeRepositoryBrief[]; diagrams?: DiagramGraph[];
 }
 
 /** Caller UUID plus catalog revision protects mutations against replay and races. */

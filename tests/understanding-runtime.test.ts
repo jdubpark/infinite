@@ -23,7 +23,7 @@ const sampleContext = (root: string): RepoContext => {
       { id: "unstable-b", path: "src/b.ts", name: "B", files: 1, examples: ["src/b.ts"], entryPoints: [], incoming: 1, outgoing: 0, changed: 0 },
     ], edges: [{ from: "unstable-a", to: "unstable-b", count: 1, examples: ["src/a.ts → src/b.ts"] }], limitations: ["Static imports cover JavaScript and TypeScript only."] };
 };
-function setup(t: test.TestContext, options: { adapter?: UnderstandingAdapter; processFixture?: boolean; multiRepo?: boolean } = {}) {
+function setup(t: test.TestContext, options: { adapter?: UnderstandingAdapter; processFixture?: boolean; multiRepo?: boolean; briefProcess?: boolean; fixtureMode?: string } = {}) {
   const base = mkdtempSync(join(tmpdir(), "understanding-runtime-")), root = join(base, "repo"), stateDir = join(base, "state");
   mkdirSync(join(root, "src"), { recursive: true }); mkdirSync(stateDir, { recursive: true });
   writeFileSync(join(root, "src", "a.ts"), "export const a = 1;\n"); writeFileSync(join(root, "src", "b.ts"), "export const b = 2;\n");
@@ -38,8 +38,8 @@ function setup(t: test.TestContext, options: { adapter?: UnderstandingAdapter; p
   const group: ProjectGroup = { id: "workspace", name: "Workspace", kind: "owner", hidden: false, repos: repoRows, implicit: false, revision: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
   const groups = { list: () => ({ groups: [group], suggestions: [] }), get: () => group };
   let currentCatalog = catalog();
-  const config = { stateDir, projects: [{ id: "repo", name: "Repository", path: root }, ...(options.multiRepo ? [{ id: "repo-two", name: "Repository Two", path: secondRoot }] : [])], ...(options.processFixture ? { repositoryBriefings: { command: process.execPath, args: [join(process.cwd(), "tests/fixtures/jevcode-context.mjs")], automatic: false, intervalMs: 10000, cooldownMs: 0, timeoutMs: 10000 } } : {}) } as Config;
-  const runtime = new UnderstandingRuntime({ config, key: Buffer.alloc(32, 7), groups, catalog: { read: () => currentCatalog }, ...(options.adapter ? { adapter: options.adapter } : {}) });
+  const config = { stateDir, projects: [{ id: "repo", name: "Repository", path: root }, ...(options.multiRepo ? [{ id: "repo-two", name: "Repository Two", path: secondRoot }] : [])], ...(options.processFixture || options.briefProcess ? { repositoryBriefings: { command: process.execPath, args: options.briefProcess ? [join(process.cwd(), "tests/fixtures/understanding-process.mjs"), options.fixtureMode ?? "ok"] : [join(process.cwd(), "tests/fixtures/jevcode-context.mjs")], automatic: false, intervalMs: 10000, cooldownMs: 0, timeoutMs: 10000 } } : {}) } as Config;
+  const runtime = new UnderstandingRuntime({ config, key: Buffer.alloc(32, 7), groups, catalog: { read: () => currentCatalog }, ...(options.adapter ? { adapter: options.adapter } : options.briefProcess ? { adapter: createUnderstandingAdapter(config) } : {}) });
   t.after(async () => { await runtime.close(); rmSync(base, { recursive: true, force: true }); });
   return { runtime, root, secondRoot, stateDir, group, config, setCatalog(value: KnowledgeCatalog) { currentCatalog = value; } };
 }
@@ -493,4 +493,36 @@ test("retiring a component preserves bounded evidence through repeated refresh a
   const resumed = new UnderstandingRuntime({ config: s.config, key: Buffer.alloc(32, 7), groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: catalog } });
   try { assert.deepEqual(resumed.read("workspace").components.map(component => component.coverage), result.components.map(component => component.coverage)); }
   finally { await resumed.close(); }
+});
+
+test("maintenance publishes a repository brief with parsed diagrams, a component map, and a changes watermark", { timeout: 30000 }, async t => {
+  const s = setup(t, { briefProcess: true });
+  s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => (s.runtime.read("workspace").briefs?.length ?? 0) === 1);
+  const first = s.runtime.read("workspace");
+  assert.equal(first.briefs![0].state, "ready");
+  assert.equal(first.briefs![0].base, null);
+  assert.equal(first.briefs![0].diagrams[0].nodes.map(n => n.componentId).filter(Boolean).length, 0, "fixture node ids are not component ids");
+  assert.equal(first.diagrams![0].kind, "components");
+  assert.equal(first.diagrams![0].nodes.length, 2);
+  await waitUntil(() => s.runtime.read("workspace").maintenance.state === "idle");
+  const head = execFileSync("git", ["-C", s.root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  writeFileSync(join(s.root, "src", "a.ts"), "export const a = 10;\n");
+  execFileSync("git", ["-C", s.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "change"]);
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").briefs?.[0]?.base === head);
+  assert.match(s.runtime.read("workspace").briefs![0].brief.changes[0].text, /^Changed since/);
+});
+
+test("a failing brief step keeps the source map and records the brief reason", { timeout: 30000 }, async t => {
+  const s = setup(t, { briefProcess: true, fixtureMode: "brief-fail" });
+  s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").maintenance.state === "failed");
+  const read = s.runtime.read("workspace");
+  assert.equal(read.components.length, 2);
+  assert.equal(read.briefs?.length ?? 0, 0);
+  assert.equal(read.diagrams![0].kind, "components");
+  assert.match(read.maintenance.message ?? "", /brief unavailable: exit 1/);
 });

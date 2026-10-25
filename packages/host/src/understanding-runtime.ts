@@ -3,11 +3,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
-import type { KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeMaintenance, KnowledgePlan, KnowledgeRelationship, KnowledgeSource, WorkspaceKnowledge } from "@infinite/remote";
+import type { DiagramGraph, KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeMaintenance, KnowledgePlan, KnowledgeRelationship, KnowledgeRepositoryBrief, KnowledgeSource, UnderstandingBrief, WorkspaceKnowledge } from "@infinite/remote";
 import type { Config } from "./types.js";
 import type { ProjectGroup, ProjectGroupList, ProjectGroupRepo } from "./project-group-types.js";
 import { captureIdentity, readGit } from "./checkout-identity.js";
 import { failureReason } from "./failure-reason.js";
+import { componentGraph, diagramFromMermaid, diagramGraphSchema, linkDiagramNodes } from "./understanding-diagrams.js";
 import { seal, unseal, writeSealed } from "./vault.js";
 import { CatalogError, understandingCatalogLimits } from "./understanding-catalog.js";
 
@@ -22,6 +23,8 @@ const MAX_EDGES = 20000;
 const MAX_QUEUE = 32;
 const MAX_HISTORY = 12;
 const MAX_HOOK_COMPONENTS = 2;
+const MAX_EVIDENCE = 40;
+const MAX_EVIDENCE_TEXT = 2000;
 const MAX_PLANS_PER_COMPONENT = 100;
 const MAX_ATTEMPT_MS = 10 * 60_000;
 const STATE_SCOPE = "understanding-runtime";
@@ -44,9 +47,15 @@ export interface UnderstandingSynthesisInput {
   workspaceId: string; root: string; repositoryId: string; context: RepoContext;
   components: KnowledgeComponent[]; plans: KnowledgePlan[];
 }
+export interface RepositoryBriefOutput {
+  head: string | null; base: string | null; generatedAt: string; brief: UnderstandingBrief;
+  diagrams: { title: string; kind: "system" | "change"; mermaid: string }[];
+  evidence: { source: string; line: number; text: string }[]; coverage: string[];
+}
 export interface UnderstandingAdapter {
   context?(root: string, options: UnderstandingAdapterOptions): Promise<RepoContext>;
   synthesize?(input: UnderstandingSynthesisInput, options: UnderstandingAdapterOptions): Promise<{ components: KnowledgeComponent[]; coverage: string[] }>;
+  brief?(input: { workspaceId: string; root: string; repositoryId: string; context: RepoContext; base: string | null; components: Pick<KnowledgeComponent, "id" | "name">[] }, options: UnderstandingAdapterOptions): Promise<RepositoryBriefOutput>;
   delivery?(input: { workspaceId: string; root: string; repositoryId: string; head: string | null }, options: UnderstandingAdapterOptions): Promise<KnowledgeDelivery>;
 }
 export function createContextAdapter(config: Config): UnderstandingAdapter {
@@ -79,7 +88,9 @@ type StoredRepository = {
   context: RepoContext; components: KnowledgeComponent[]; relationships: KnowledgeRelationship[]; delivery: KnowledgeDelivery;
   synthesisCoverage: string[]; completedPlanRevisions: Record<string, string>; history: Record<string, { snapshotId: string; at: string; summary: string }[]>;
   completedSourceFingerprints: Record<string, string>;
+  brief: StoredBrief | null; briefFingerprint: string | null; briefFailure: string | null; previousHead: string | null; componentDiagram: DiagramGraph | null;
 };
+type StoredBrief = Omit<KnowledgeRepositoryBrief, "state" | "repositoryId">;
 type RuntimeState = {
   version: 1; day: string; workspaces: Record<string, { jobsToday: number; failureCount: number; synthesisCursor: string | null; repositories: Record<string, StoredRepository>; maintenance: KnowledgeMaintenance; updatedAt: string | null }>;
 };
@@ -104,6 +115,12 @@ const briefClaimSchema = z.object({ text: z.string().min(1).max(900), citations:
 const briefSchema = z.object({ summary: z.string().min(1).max(600), architecture: z.array(briefClaimSchema).max(6), changes: z.array(briefClaimSchema).max(6), checks: z.array(briefClaimSchema).max(4),
   review: z.array(z.object({ priority: z.enum(["high", "medium"]), area: z.string().max(150), why: z.string().max(900), question: z.string().max(900), citations: z.array(citationSchema).max(6) }).strict()).max(5),
   guidance: z.array(z.object({ text: z.string().max(900), basis: z.enum(["documented", "proposed"]), citations: z.array(citationSchema).max(6) }).strict()).max(4), unknowns: z.array(z.string().max(900)).max(8) }).strict();
+const storedBriefSchema = z.object({
+  head: z.string().nullable(), base: z.string().nullable(), generatedAt: z.string().datetime({ offset: true }), observedAt: z.string().datetime({ offset: true }),
+  brief: briefSchema, diagrams: z.array(diagramGraphSchema).max(2),
+  evidence: z.array(z.object({ source: z.string().max(1024), line: z.number().int().positive(), text: z.string().max(MAX_EVIDENCE_TEXT) }).strict()).max(MAX_EVIDENCE),
+  coverage: z.array(z.string().max(1000)).max(100),
+}).strict();
 const differenceSchema = z.object({ state: z.enum(["unverified", "review-needed", "aligned"]), summary: z.string().max(understandingOutputLimits.differenceSummary), claims: z.array(knowledgeClaimSchema).max(100), planRevisions: z.array(z.object({ id: z.string(), revision: z.number().int().positive() }).strict()).max(1000), snapshotId: z.string().nullable(), generatedAt: z.string().datetime({ offset: true }).nullable() }).strict();
 const deliverySchema = z.object({ repositoryId: z.string().max(80), state: z.enum(["ready", "unavailable", "failed", "stale"]), observedAt: z.string().datetime({ offset: true }).nullable(),
   pullRequests: z.array(z.object({ repositoryId: z.string(), number: z.number().int().positive(), title: z.string().max(understandingOutputLimits.pullRequestTitle), url: z.string().max(understandingOutputLimits.url), state: z.enum(["open", "closed", "merged"]), head: z.string().max(128), mergeCommit: z.string().nullable(), observedAt: z.string().datetime({ offset: true }), checks: z.array(z.object({ name: z.string().max(200), status: z.string().max(100), conclusion: z.string().max(100).nullable(), url: z.string().max(understandingOutputLimits.url).nullable() }).strict()).max(100) }).strict()).max(100),
@@ -121,6 +138,7 @@ const storedRepositorySchema = z.object({
   repositoryKey: z.string().min(1).max(500), repositoryIds: z.array(z.string()).max(64), rootIdentity: z.string().regex(/^[a-f0-9]{64}$/), observedAt: z.string().datetime({ offset: true }), fingerprint: z.string().regex(/^[a-f0-9]{64}$/), head: z.string().nullable(),
   context: repoContextSchema, components: z.array(knowledgeComponentStateSchema).max(MAX_COMPONENTS), relationships: z.array(relationshipSchema).max(MAX_EDGES), delivery: deliverySchema,
   synthesisCoverage: z.array(z.string().max(1000)).max(100), completedPlanRevisions: record, completedSourceFingerprints: record, history: z.record(z.string(), z.array(z.object({ snapshotId: z.string(), at: z.string().datetime({ offset: true }), summary: z.string().max(4000) }).strict()).max(MAX_HISTORY)),
+  brief: storedBriefSchema.nullable().default(null), briefFingerprint: z.string().nullable().default(null), briefFailure: z.string().max(400).nullable().default(null), previousHead: z.string().nullable().default(null), componentDiagram: diagramGraphSchema.nullable().default(null),
 }).strict().superRefine((value, context) => {
   for (const [key, revision] of Object.entries(value.completedPlanRevisions)) if (typeof revision !== "string") context.addIssue({ code: "custom", path: ["completedPlanRevisions", key], message: "invalid plan watermark" });
   for (const [key, fingerprint] of Object.entries(value.completedSourceFingerprints)) if (typeof fingerprint !== "string") context.addIssue({ code: "custom", path: ["completedSourceFingerprints", key], message: "invalid source watermark" });
@@ -206,15 +224,16 @@ export class UnderstandingRuntime {
     try {
       const catalog = this.options.catalog.read(workspaceId);
       const saved = this.state.workspaces[workspaceId];
-      const repos = group.repos.map(repo => {
+      const entries = group.repos.map((repo): { projectId: string; stored: StoredRepository; currentHead: string | undefined } | undefined => {
         const stored = saved?.repositories[repo.projectId];
         if (!stored) return undefined;
         const binding = this.binding(repo, group);
         if (binding.rootIdentity !== stored.rootIdentity) return undefined;
         const currentHead = readGit(binding.root, ["rev-parse", "HEAD"]);
-        if (currentHead && currentHead === stored.head) return stored;
-        return { ...stored, components: stored.components.map(component => ({ ...component, current: { ...component.current, state: "stale" as const, summary: "Repository HEAD changed since this source map was observed." }, coverage: [...component.coverage, "Repository HEAD differs from the latest observed source map."] })) };
-      }).filter((value): value is StoredRepository => Boolean(value));
+        if (currentHead && currentHead === stored.head) return { projectId: repo.projectId, stored, currentHead };
+        return { projectId: repo.projectId, currentHead, stored: { ...stored, components: stored.components.map(component => ({ ...component, current: { ...component.current, state: "stale" as const, summary: "Repository HEAD changed since this source map was observed." }, coverage: [...component.coverage, "Repository HEAD differs from the latest observed source map."] })) } };
+      }).filter(value => value !== undefined);
+      const repos = entries.map(entry => entry.stored);
       const components = repos.flatMap(repo => repo.components.map(component => this.enrich(component, repo, catalog)));
       const relationships = repos.flatMap(repo => repo.relationships);
       const delivery = repos.map(repo => repo.delivery);
@@ -222,7 +241,9 @@ export class UnderstandingRuntime {
       let maintenance = saved?.maintenance ?? emptyMaintenance(catalog.policy);
       maintenance = { ...maintenance, dailyJobLimit: catalog.policy.dailyJobLimit, jobsToday: this.dailyJobs(workspaceId) };
       if (this.loadFailed) maintenance = { ...maintenance, state: "unavailable", message: "Encrypted maintenance state failed validation; the host will not overwrite it or start jobs until explicit recovery." };
-      return { components, relationships, delivery, maintenance, coverage };
+      const briefs: KnowledgeRepositoryBrief[] = entries.flatMap(({ projectId, stored, currentHead }) => stored.brief ? [{ repositoryId: projectId, ...stored.brief, state: currentHead && currentHead === stored.brief.head ? "ready" as const : "stale" as const }] : []);
+      const diagrams = [...repos.flatMap(repo => repo.componentDiagram ? [repo.componentDiagram] : []), ...briefs.flatMap(brief => brief.diagrams)];
+      return { components, relationships, delivery, maintenance, coverage, briefs, diagrams };
     } catch {
       return { components: [], relationships: [], delivery: [], maintenance: { ...emptyMaintenance({ enabled: false, synthesis: false, delivery: false, intervalMinutes: 60, dailyJobLimit: 0 }), state: "unavailable", message: "Workspace sources are unavailable or changed." }, coverage: ["Workspace source or catalog could not be read safely."] };
     }
@@ -346,6 +367,30 @@ export class UnderstandingRuntime {
     const hookedRepos = new Set<string>();
     const currentPolicy = this.options.catalog.read(workspaceId).policy;
     let nextSynthesisCursor = workspaceState.synthesisCursor;
+    if (currentPolicy.synthesis && this.adapter.brief) {
+      for (const binding of bindings) {
+        const observation = repos[binding.repo.projectId];
+        if (!observation || !capturedRepositories.has(binding.repo.projectId) || observation.briefFingerprint === observation.fingerprint) continue;
+        const components = observation.components.filter(component => !component.retired);
+        hookedRepos.add(binding.repo.projectId);
+        try {
+          if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-before-brief");
+          const result = await this.invoke(binding.root, options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.previousHead, components: components.map(({ id, name }) => ({ id, name })) }, options));
+          if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-after-brief");
+          const observedAt = new Date().toISOString();
+          const stored = storedBriefSchema.parse({
+            head: result.head, base: result.base, generatedAt: result.generatedAt, observedAt, brief: result.brief,
+            diagrams: result.diagrams.map((diagram, index) => linkDiagramNodes(diagramFromMermaid({ id: `${binding.repo.projectId}:${index}`, title: diagram.title, kind: diagram.kind, mermaid: diagram.mermaid, repositoryId: binding.repo.projectId, head: result.head, observedAt }), components)),
+            evidence: result.evidence.slice(0, MAX_EVIDENCE).map(item => ({ ...item, text: item.text.slice(0, MAX_EVIDENCE_TEXT) })), coverage: result.coverage,
+          });
+          observation.brief = stored; observation.briefFingerprint = observation.fingerprint; observation.briefFailure = null;
+        } catch (error) {
+          if (this.closed) throw error;
+          observation.briefFailure = failureReason(error);
+          partial.push(`Repository ${binding.repo.name}: brief unavailable: ${observation.briefFailure}`);
+        }
+      }
+    }
     if (currentPolicy.synthesis && this.adapter.synthesize) {
       const pending: { key: string; binding: SourceBinding; observation: StoredRepository; component: KnowledgeComponent; plans: KnowledgePlan[] }[] = [];
       for (const binding of bindings) {
@@ -475,7 +520,9 @@ export class UnderstandingRuntime {
     const delivery = old?.delivery ?? emptyDelivery(binding.repo.projectId);
     const history: StoredRepository["history"] = { ...(old?.history ?? {}) };
     if (old && old.fingerprint !== fingerprint) for (const component of old.components) history[component.id] = [...(history[component.id] ?? []), { snapshotId: old.fingerprint, at: old.observedAt, summary: component.current.summary }].slice(-MAX_HISTORY);
-    return { repositoryKey: key, repositoryIds: binding.projects, rootIdentity: binding.rootIdentity, observedAt: source.observedAt, fingerprint, head: parsed.head, context: parsed, components, relationships, delivery, synthesisCoverage: old?.synthesisCoverage ?? [], completedPlanRevisions: old?.completedPlanRevisions ?? {}, completedSourceFingerprints: old?.completedSourceFingerprints ?? {}, history };
+    return { repositoryKey: key, repositoryIds: binding.projects, rootIdentity: binding.rootIdentity, observedAt: source.observedAt, fingerprint, head: parsed.head, context: parsed, components, relationships, delivery, synthesisCoverage: old?.synthesisCoverage ?? [], completedPlanRevisions: old?.completedPlanRevisions ?? {}, completedSourceFingerprints: old?.completedSourceFingerprints ?? {}, history,
+      brief: old?.brief ?? null, briefFingerprint: old?.briefFingerprint ?? null, briefFailure: old?.briefFailure ?? null, previousHead: old && old.fingerprint !== fingerprint ? old.head : old?.previousHead ?? null,
+      componentDiagram: componentGraph({ repositoryId: binding.repo.projectId, head: parsed.head, observedAt: source.observedAt, components, relationships }) };
   }
 
   private mapComponents(binding: SourceBinding, context: RepoContext, source: KnowledgeSource, key: string, catalog: KnowledgeCatalog) {

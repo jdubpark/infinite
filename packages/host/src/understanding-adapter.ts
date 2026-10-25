@@ -3,9 +3,9 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative, sep } from "node:path";
 import { z } from "zod";
-import type { KnowledgeClaim, KnowledgeComponent, KnowledgeDelivery, KnowledgeEnvironment, KnowledgePlan, KnowledgePullRequest } from "@infinite/remote";
+import type { UnderstandingBrief, KnowledgeClaim, KnowledgeComponent, KnowledgeDelivery, KnowledgeEnvironment, KnowledgePlan, KnowledgePullRequest } from "@infinite/remote";
 import { captureIdentity, normalizeRemote, readGit } from "./checkout-identity.js";
-import { createContextAdapter, understandingOutputLimits, type RepoContext, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
+import { createContextAdapter, understandingOutputLimits, type RepoContext, type RepositoryBriefOutput, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
 import type { Config } from "./types.js";
 
 const MAX_STDOUT = 1024 * 1024;
@@ -13,10 +13,11 @@ const hash = (value: unknown) => createHash("sha1").update(JSON.stringify(value)
 const citationSchema = z.object({ source: z.string().min(1).max(1024), line: z.number().int().positive() }).strict();
 const claimSchema = z.object({ text: z.string().min(1).max(900), citations: z.array(citationSchema).min(1).max(6) }).strict();
 const reviewSchema = z.object({ priority: z.enum(["high", "medium"]), area: z.string().min(1).max(150), why: z.string().min(1).max(900), question: z.string().min(1).max(900), citations: z.array(citationSchema).max(6) }).strict();
+const diagramSchema = z.object({ title: z.string().min(1).max(120), kind: z.enum(["system", "change"]), mermaid: z.string().min(1).max(3000), citations: z.array(citationSchema).max(6) }).strict();
 const briefSchema = z.object({
   summary: z.string().min(1).max(600), architecture: z.array(claimSchema).max(6), changes: z.array(claimSchema).max(6), checks: z.array(claimSchema).max(4),
   review: z.array(reviewSchema).max(5), guidance: z.array(z.object({ text: z.string().min(1).max(900), basis: z.enum(["documented", "proposed"]), citations: z.array(citationSchema).max(6) }).strict()).max(4),
-  unknowns: z.array(z.string().min(1).max(900)).max(8), diagrams: z.array(z.unknown()).max(2).optional(),
+  unknowns: z.array(z.string().min(1).max(900)).max(8), diagrams: z.array(diagramSchema).max(2).optional(),
 }).strict();
 const outputSchema = z.object({
   repo: z.string().min(1).max(4096), head: z.string().regex(/^[a-f0-9]{40,64}$/).nullable(), base: z.string().regex(/^[a-f0-9]{40,64}$/).nullable(),
@@ -73,7 +74,7 @@ function run(command: string, args: string[], options: UnderstandingAdapterOptio
     const finish = () => {
       if (settled || closed === undefined || (reason && !escalated)) return;
       settled = true; clearTimeout(timer); options.signal.removeEventListener("abort", abort);
-      if (reason || closed !== 0) rejectPromise(new Error(reason ?? "understanding-process-failed")); else resolvePromise(output.toString("utf8"));
+      if (reason || closed !== 0) rejectPromise(new Error(reason ?? `exit ${closed}`)); else resolvePromise(output.toString("utf8"));
     };
     const stop = (why: string) => {
       if (reason) return; reason = why;
@@ -93,6 +94,14 @@ function run(command: string, args: string[], options: UnderstandingAdapterOptio
     child.on("close", code => { closed = code; if (!reason) clearTimeout(timer); finish(); });
     if (options.signal.aborted) abort();
   });
+}
+
+function writerArgs(config: NonNullable<Config["repositoryBriefings"]>) {
+  return [...(config.runner ? ["--runner", config.runner] : []), ...(config.model ? ["--model", config.model] : []), "--timeout", String(Math.min(1800, Math.max(10, Math.ceil(config.timeoutMs / 1000))))];
+}
+function repositoryQuestion(components: Pick<KnowledgeComponent, "id" | "name">[]): string {
+  const question = `Explain the whole repository for its owner. In diagrams, use these component ids as node ids when a node describes that component: ${components.map(component => `${component.id} (${component.name})`).join(", ")}`;
+  return question.slice(0, 7900);
 }
 
 function briefQuestion(component: KnowledgeComponent, plans: KnowledgePlan[]): string {
@@ -154,8 +163,7 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
         try {
           const briefConfig = config.repositoryBriefings;
           if (!briefConfig) throw new Error("repository-briefings-unavailable");
-          const writerArgs = [...(briefConfig.runner ? ["--runner", briefConfig.runner] : []), ...(briefConfig.model ? ["--model", briefConfig.model] : []), "--timeout", String(Math.min(1800, Math.max(10, Math.ceil(briefConfig.timeoutMs / 1000))))];
-          const raw = await run(briefConfig.command, [...briefConfig.args, ...writerArgs, "brief", "--repo", input.root, "--focus", component.paths[0]?.path ?? "", "--question", briefQuestion(component, plans), "--format", "json", "--no-state"], { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
+                    const raw = await run(briefConfig.command, [...briefConfig.args, ...writerArgs(briefConfig), "brief", "--repo", input.root, "--focus", component.paths[0]?.path ?? "", "--question", briefQuestion(component, plans), "--format", "json", "--no-state"], { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
           if (Buffer.byteLength(raw) > Math.min(options.maxBytes, MAX_STDOUT)) throw new Error("understanding-output-too-large");
           const parsed = validateBrief(JSON.parse(raw), input.root, input.context);
           components.push(synthesized(component, parsed, plans, input.repositoryId));
@@ -166,6 +174,20 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
         }
       }
       return { components, coverage: coverage.slice(0, 100) };
+    } } : {}),
+    ...(config.repositoryBriefings ? { brief: async (input, options) => {
+      const briefConfig = config.repositoryBriefings;
+      if (!briefConfig) throw new Error("repository-briefings-unavailable");
+      const args = [...briefConfig.args, ...writerArgs(briefConfig), "brief", "--repo", input.root, "--format", "json", "--no-state", ...(input.base ? ["--base", input.base] : []), "--question", repositoryQuestion(input.components)];
+      const raw = await run(briefConfig.command, args, { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
+      const parsed = validateBrief(JSON.parse(raw), input.root, input.context);
+      const { diagrams = [], ...brief } = parsed.brief;
+      const output: RepositoryBriefOutput = {
+        head: parsed.head, base: parsed.base, generatedAt: parsed.generatedAt, brief: brief satisfies UnderstandingBrief,
+        diagrams: diagrams.map(({ title, kind, mermaid }) => ({ title, kind, mermaid })),
+        evidence: parsed.evidence.map(({ source, line, text }) => ({ source, line, text })), coverage: parsed.coverage,
+      };
+      return output;
     } } : {}),
     delivery: async (input, options) => {
       const identity = githubRepository(config, input.repositoryId, input.root);

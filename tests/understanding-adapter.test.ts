@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,7 +10,7 @@ import type { KnowledgeComponent, KnowledgePlan } from "@infinite/remote";
 import type { RepoContext } from "../packages/host/src/understanding-runtime.js";
 import type { Config } from "../packages/host/src/types.js";
 
-function setup(t: test.TestContext, fixtureMode = "valid") {
+function setup(t: test.TestContext, fixtureMode = "valid", receipt = false) {
   const base = mkdtempSync(join(tmpdir(), "understanding-adapter-")), root = join(base, "repo");
   mkdirSync(join(root, "src"), { recursive: true });
   writeFileSync(join(root, "src/a.ts"), "export const value = 1;\n");
@@ -29,8 +29,9 @@ function setup(t: test.TestContext, fixtureMode = "valid") {
     planned: [], difference: { state: "unverified", summary: "No plan alignment has been verified.", claims: [], planRevisions: [], snapshotId: null, generatedAt: null }, featureIds: [], history: [], coverage: [],
   };
   const plan: KnowledgePlan = { id: "plan-id", revision: 4, componentId: component.id, repositoryIds: ["repo"], title: "Keep public export", text: "Preserve the exported value", status: "accepted", sourceUrl: null, workId: null, archived: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), history: [] };
-  const config = { projects: [], repositoryBriefings: { command: process.execPath, args: [join(process.cwd(), "tests/fixtures/understanding-brief.mjs"), fixtureMode], runner: "deepseek", model: "fixture/model", automatic: false, intervalMs: 1000, cooldownMs: 0, timeoutMs: 10000 } } as Config;
-  return { root, context, component, plan, adapter: createUnderstandingAdapter(config) };
+  const config = { projects: [], repositoryBriefings: { command: process.execPath, args: [join(process.cwd(), "tests/fixtures/understanding-brief.mjs"), fixtureMode, ...(receipt ? [join(base, "receipt.jsonl")] : [])], runner: "deepseek", model: "fixture/model", automatic: false, intervalMs: 1000, cooldownMs: 0, timeoutMs: 10000 } } as Config;
+  const lastReceipt = () => JSON.parse(readFileSync(join(base, "receipt.jsonl"), "utf8").trim().split("\n").at(-1)!) as { args: string[] };
+  return { root, context, component, plan, adapter: createUnderstandingAdapter(config), lastReceipt };
 }
 
 const options = (): { signal: AbortSignal; timeoutMs: number; maxBytes: number } => ({ signal: new AbortController().signal, timeoutMs: 10000, maxBytes: 1024 * 1024 });
@@ -135,4 +136,23 @@ if (process.argv[2] === "pr") {
   assert.equal(result.environments[0]?.status, "inactive");
   assert.notEqual(result.environments[0]?.observedAt, "2026-10-21T10:01:00Z");
   assert.ok(result.coverage.some(text => /no live probe was performed/.test(text)));
+});
+
+test("brief adapter asks the engine for a repository brief with component ids and keeps diagrams", async t => {
+  const s = setup(t, "valid", true);
+  const output = await s.adapter.brief!({ workspaceId: "workspace", root: s.root, repositoryId: "repo", context: s.context, base: null, components: [{ id: "cmp_a", name: "A" }] }, options());
+  assert.equal(output.diagrams.length, 1);
+  assert.match(output.diagrams[0].mermaid, /^flowchart LR/);
+  const { args } = s.lastReceipt();
+  assert.ok(args.includes("brief") && args.includes("--no-state"));
+  assert.ok(!args.includes("--focus") && !args.includes("--base"));
+  assert.match(args[args.indexOf("--question") + 1], /cmp_a \(A\)/);
+});
+
+test("brief adapter passes the previous head as the base and returns a changes claim", async t => {
+  const s = setup(t, "valid", true);
+  const output = await s.adapter.brief!({ workspaceId: "workspace", root: s.root, repositoryId: "repo", context: s.context, base: "b".repeat(40), components: [] }, options());
+  assert.equal(output.base, "b".repeat(40));
+  assert.equal(output.brief.changes[0].text, "Changed since bbbbbbb");
+  assert.equal(s.lastReceipt().args[s.lastReceipt().args.indexOf("--base") + 1], "b".repeat(40));
 });

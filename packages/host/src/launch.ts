@@ -96,7 +96,7 @@ export function permissionCoordinatorLaunch(provider: Provider, profile: AgentPr
     "--mcp-config", "--plugin-dir", "--settings", "--setting-sources", "--agents",
     "--permission-prompt-tool", "--permission-prompts",
     "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
-    "--resume", "--session-id", "--continue", "-c", "--bare", "--safe-mode",
+    "--resume", "-r", "--session-id", "--continue", "-c", "--bare", "--safe-mode",
   ]);
 
   for (let index = 0; index < providerArgs.length; index++) {
@@ -161,7 +161,7 @@ export function missionCoordinatorLaunch(provider: Provider, profile: AgentProfi
     const listFlags = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools", "--mcp-config"]);
     for (let index = 0; index < profile.args.length; index++) {
       const arg = profile.args[index], flag = arg.split("=")[0];
-      if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--session-id", "--resume", "--continue", "-c"].includes(flag))
+      if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--session-id", "--resume", "-r", "--continue", "-c"].includes(flag))
         throw new Error(`Mission coordinator profile cannot configure ${flag}.`);
       if (arg.startsWith("-c") && arg !== "--" && !arg.startsWith("--"))
         throw new Error("Mission coordinator profile cannot configure -c.");

@@ -163,7 +163,7 @@ test("permission coordinator rejects conflicting Claude permission and tool sett
     ["--chrome"],
     ["--dangerously-skip-permissions"],
   ]) assert.throws(() => permissionCoordinatorLaunch("claude", { command: "claude", args }), /Permission coordinator/);
-  for (const flag of ["--session-id", "--resume"])
+  for (const flag of ["--session-id", "--resume", "-r"])
     assert.throws(() => permissionCoordinatorLaunch("claude", { command: "claude", args: [flag, "native-session"] }), /Permission coordinator/);
   assert.throws(() => permissionCoordinatorLaunch("codex", { command: "codex", args: [] }), /Claude Code/);
 });
@@ -178,7 +178,7 @@ test("mission coordinators can only read repositories and report, and only on Cl
   const wrapped = missionCoordinatorLaunch("claude", { command: "/usr/bin/sudo", args: ["-n", "-u", "agent", "--", "/usr/local/libexec/infinite/claude", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Edit"] });
   assert.ok(!wrapped.args.includes("acceptEdits") && !wrapped.args.includes("Bash") && !wrapped.args.includes("Edit"));
   assert.throws(() => missionCoordinatorLaunch("claude", { command: "claude", args: ["--dangerously-skip-permissions"] }), /cannot configure/);
-  for (const flag of ["--session-id", "--resume", "--continue", "-c"])
+  for (const flag of ["--session-id", "--resume", "-r", "--continue", "-c"])
     assert.throws(() => missionCoordinatorLaunch("claude", { command: "claude", args: [flag, "native-session"] }), /cannot configure/);
   assert.ok(!claude.args.some(arg => /dangerously-skip|permission-mode.*acceptEdits|mcp__infinite_team__report/.test(arg)));
 

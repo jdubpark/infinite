@@ -5,15 +5,16 @@ import { writeSealed, unseal } from "./vault.js";
 import { TeamService, TeamError, providerInputReason } from "./teams.js";
 import type { Manager } from "./manager.js";
 import type { Config } from "./types.js";
-import type { CreateTeam, TeamAssignment, TeamView } from "./team-types.js";
+import type { CreateTeam, NativeContinuation, TeamAssignment, TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
-import { missionPromptWithMessageCount, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
+import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
 import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory } from "./team-workspace.js";
+import { resumeFailed } from "./native-continuation.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -21,6 +22,11 @@ export type ProjectGroupLookup = { get(id: string): ProjectGroup };
 type Action = { requestId: string; revision: number };
 /** One coordinator session. Like a team member, it ends with one report; the host starts the next attempt when needed. */
 type Attempt = { memberId: string; sessionId: string; revision: number; prompt: string; cursor: number; stopRequestId: string; status: "queued" | "running" | "reported" | "stopped"; report?: MissionReport; startedAt?: string;
+  continuation?: NativeContinuation;
+  nativeConfirmed?: boolean;
+  resumeFailed?: boolean;
+  consumedInbox?: MissionMessage[];
+  consumedNotes?: MissionMessage[];
   /** The owner input count when this attempt's prompt was built; a result from an attempt that missed later input is not applied. */
   ownerInputs?: number;
   /** The session ended its turn or went quiet without a report; it is stopped and the next attempt is told why. */
@@ -609,7 +615,7 @@ export class MissionService {
     const mission = stored.mission;
     try {
       const session = await this.manager.createTeamSession({ requestId: attempt.sessionId, provider: mission.lineup.coordinator.provider, projectId: mission.repoProjectIds[0],
-        title: `Mission coordinator: ${mission.title}`.slice(0, 100), prompt: attempt.prompt }, this.assignment(stored, attempt), stored.folder, mission.lineup.coordinator,
+        title: `Mission coordinator: ${mission.title}`.slice(0, 100), prompt: attempt.prompt, ...(attempt.continuation ? { continuation: attempt.continuation } : {}) }, this.assignment(stored, attempt), stored.folder, mission.lineup.coordinator,
       this.config.teams?.workspaceDir, this.config.teams?.trustWorkspaces === true);
       if (this.closed) return;
       attempt.status = "running"; attempt.startedAt ??= now();
@@ -633,6 +639,7 @@ export class MissionService {
       this.readReport(stored, attempt);
       if (attempt.status === "running" && !attempt.missedReport && live.has(mission.status)) {
         const state = await this.manager.state(attempt.sessionId);
+        if (attempt.continuation && state.nativeSession?.id === attempt.continuation.nativeSessionId) attempt.nativeConfirmed = true;
         // A coordinator that ends its turn without a report, or goes quiet, would otherwise hold the attempt open
         // while subteam and owner messages wait behind it. A provider prompt waiting on the owner is not quiet.
         const quiet = state.attention.state !== "needs-you" &&
@@ -641,6 +648,10 @@ export class MissionService {
         if (state.status !== "exited" && !ended && !quiet) { this.save(stored); return; }
         this.readReport(stored, attempt);
         if (attempt.status === "running" && state.status === "exited") {
+          if (!attempt.report && resumeFailed(state, attempt.continuation)) {
+            this.failResume(stored, attempt);
+            this.save(stored); return;
+          }
           attempt.status = "stopped";
           this.stop(stored, "blocked", "The mission coordinator exited without a valid structured report. Subteam workspaces remain available.");
           this.event(stored, stored.mission.reason!); this.save(stored); return;
@@ -652,9 +663,14 @@ export class MissionService {
     let state;
     try { state = await this.manager.stopTeamSession(attempt.sessionId, attempt.stopRequestId, this.assignment(stored, attempt)); }
     catch { this.save(stored); return; }
+    if (attempt.continuation && state.nativeSession?.id === attempt.continuation.nativeSessionId) attempt.nativeConfirmed = true;
     if (this.closed || state.status !== "exited") { this.save(stored); return; }
     // The session can no longer write, so this read is the last chance for a report filed before the stop.
     if (attempt.status === "running") this.readReport(stored, attempt);
+    if (!attempt.report && resumeFailed(state, attempt.continuation)) {
+      this.failResume(stored, attempt);
+      this.save(stored); return;
+    }
     attempt.status = "stopped";
     if (attempt.report) {
       if (live.has(mission.status)) this.consume(stored, attempt.report, attempt);
@@ -662,6 +678,14 @@ export class MissionService {
     } else if (attempt.missedReport && live.has(mission.status))
       this.refuse(stored, "missing", "Your previous attempt ended without a mission report. File exactly one report in every attempt; report wait when nothing needs a decision.");
     this.save(stored);
+  }
+  private failResume(stored: Stored, attempt: Attempt) {
+    attempt.resumeFailed = true;
+    attempt.missedReport = false;
+    attempt.status = "stopped";
+    stored.inbox = [...(attempt.consumedInbox ?? []), ...stored.inbox];
+    stored.notes = [...(attempt.consumedNotes ?? []), ...stored.notes];
+    this.event(stored, "The coordinator's conversation could not be resumed; a fresh attempt starts with the full mission state.");
   }
   /** Starts the next coordinator attempt once the previous one stopped and a message needs it. */
   private async wake(stored: Stored) {
@@ -672,14 +696,27 @@ export class MissionService {
       this.event(stored, mission.reason!); this.save(stored); return;
     }
     const revision = stored.attempts.length + 1, profile = mission.lineup.coordinator;
+    let continuation: NativeContinuation | undefined;
+    if (profile.provider === "claude") {
+      for (let index = stored.attempts.length - 1; index >= 0; index--) {
+        const previous = stored.attempts[index], nativeSessionId = previous.continuation?.nativeSessionId;
+        if (!previous.nativeConfirmed || !nativeSessionId) continue;
+        const failedLater = stored.attempts.slice(index + 1).some(attempt => attempt.resumeFailed && attempt.continuation?.nativeSessionId === nativeSessionId);
+        if (!failedLater) { continuation = { mode: "resume", nativeSessionId }; break; }
+      }
+      continuation ??= { mode: "start", nativeSessionId: randomUUID() };
+    }
     // Messages that need the coordinator go first; any beyond the limit wait for the next attempt rather than being dropped.
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     // The prompt keeps a byte budget by leaving trailing messages queued, so inbox messages lead and notes are deferred first.
-    const built = missionPromptWithMessageCount(mission, stored.repos, [...inbox, ...notes], revision, profile.provider, profile, { openChildDecisions: this.openChildDecisions(stored), waiting });
+    const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting };
+    const built = continuation?.mode === "resume"
+      ? missionFollowUpPromptWithMessageCount(mission, stored.repos, messages, revision, profile.provider, profile, context)
+      : missionPromptWithMessageCount(mission, stored.repos, messages, revision, profile.provider, profile, context);
     const fromInbox = Math.min(built.includedMessageCount, inbox.length), fromNotes = built.includedMessageCount - fromInbox;
     const attempt: Attempt = { memberId: randomUUID(), sessionId: randomUUID(), revision, cursor: 0, stopRequestId: randomUUID(), status: "queued", ownerInputs: stored.ownerInputs ?? 0,
-      prompt: built.prompt };
+      prompt: built.prompt, ...(continuation ? { continuation } : {}), consumedInbox: inbox.slice(0, fromInbox), consumedNotes: notes.slice(0, fromNotes) };
     stored.attempts.push(attempt); stored.inbox = stored.inbox.slice(fromInbox); stored.notes = stored.notes.slice(fromNotes);
     this.save(stored);
     await this.launch(stored, attempt);

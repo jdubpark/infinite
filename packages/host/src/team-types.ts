@@ -38,6 +38,11 @@ export const teamDeliverySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("pr"), repository: githubRepository, baseBranch: gitBranch }).strict(),
 ]);
 export type TeamDelivery = z.infer<typeof teamDeliverySchema>;
+export const nativeContinuationSchema = z.object({
+  nativeSessionId: z.string().uuid(),
+  mode: z.enum(["start", "resume"]),
+}).strict();
+export type NativeContinuation = z.infer<typeof nativeContinuationSchema>;
 /** The owner's default delegation: routine development work is the coordinator's to approve; release actions stay with the owner. */
 export const DEFAULT_PERMISSION_SCOPE = "Approve one-time development operations that an engineer would routinely run for the accepted objective and assigned role inside the assigned workspace: repository inspection and fetch, scoped edits and staging, dependency installation from the repository's declared manifests and lockfiles, test planning, builds, tests, scripts, local listeners and local browser checks. These may run outside the provider sandbox and use network access, local sockets, IPC and task-owned temporary files while preserving the assigned repository and path scope. Delivery operations require the run's separate pinned delivery policy. Escalate only production or staging actions such as deploy, promote, roll out, release or publish, new or external credentials, other repositories, global or account settings, destructive operations outside the assigned workspace, persistent approvals, permission bypasses, and commands whose effect is unrelated to the task or appears malicious.";
 export const DEFAULT_PERMISSION_LIMIT = 25;

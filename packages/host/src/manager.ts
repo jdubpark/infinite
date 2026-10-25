@@ -27,8 +27,9 @@ import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
-import { teamModelProfileSchema, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
+import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
+import { withNativeContinuation } from "./native-continuation.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
 import type {
@@ -59,6 +60,7 @@ export interface CreateSession {
   workspace?: LaptopWorkspace & { token: string };
   resumedFrom?: string;
   resumeNativeSession?: { id: string; source: "hook" | "protocol" };
+  continuation?: NativeContinuation;
 }
 interface StoredSession {
   session: Session;
@@ -365,6 +367,8 @@ export class Manager {
     return new ProjectContexts(this.config, this.key).setContext(projectId, text, expectedVersion);
   }
   create(request: CreateSession): Promise<Session & WorkerState> {
+    if (request.continuation !== undefined)
+      throw new ContentError("Native continuation is only available for managed coordinator team sessions", 400);
     const operation = this.serial.then(() => this.createOnce(request));
     this.serial = operation.catch(() => {});
     return operation;
@@ -373,6 +377,15 @@ export class Manager {
   createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
+    let continuation: NativeContinuation | undefined;
+    if (request.continuation !== undefined) {
+      const parsed = nativeContinuationSchema.safeParse(request.continuation);
+      if (!parsed.success) throw new ContentError("Native continuation must include a valid Claude session ID and start or resume mode", 400);
+      continuation = parsed.data;
+      if (request.provider !== "claude") throw new ContentError("Native continuation is only supported for Claude Code team sessions", 400);
+      if (team.role !== "permission-coordinator" && team.role !== "mission-coordinator")
+        throw new ContentError("Native continuation is only supported for permission or mission coordinators", 400);
+    }
     const selection = modelProfile ? teamModelProfileSchema.parse(modelProfile) : undefined;
     if (selection && selection.provider !== request.provider) throw new ContentError("The team model profile does not match its assigned provider", 400);
     const root = realpathSync(workspaceRoot ?? this.config.teams.workspaceDir);
@@ -380,7 +393,7 @@ export class Manager {
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
     // Trust is outside the request fingerprint: a replay returns the session as first created.
-    const operation = this.serial.then(() => this.createOnce({ ...request, team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}) }, workspaceTrusted));
+    const operation = this.serial.then(() => this.createOnce({ ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}) }, workspaceTrusted));
     this.serial = operation.catch(() => {});
     return operation;
   }
@@ -697,6 +710,7 @@ export class Manager {
     let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
     if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
     if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(request.provider, profile);
+    if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
     const context = new ProjectContexts(this.config, this.key).snapshot(request.projectId);
     const session: Session = {
       id,

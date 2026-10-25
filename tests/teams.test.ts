@@ -25,6 +25,24 @@ import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { Manager } from "../packages/host/src/manager.js";
 
+test("team session creation refuses native continuation for other providers or roles", () => {
+  const manager = Object.create(Manager.prototype) as Manager;
+  Object.defineProperty(manager, "config", { value: { teams: {} } });
+  const request = {
+    requestId: randomUUID(),
+    provider: "codex" as const,
+    projectId: "project",
+    title: "Coordinator",
+    prompt: "Continue",
+    continuation: { nativeSessionId: randomUUID(), mode: "resume" as const },
+  };
+  const assignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "permission-coordinator" as const };
+  assert.throws(() => manager.createTeamSession(request, assignment, "workspace"), error =>
+    error instanceof Error && error.message.includes("only supported for Claude Code") && (error as Error & { status?: number }).status === 400);
+  assert.throws(() => manager.createTeamSession({ ...request, provider: "claude" }, { ...assignment, role: "implementer" }, "workspace"), error =>
+    error instanceof Error && error.message.includes("only supported for permission or mission coordinators") && (error as Error & { status?: number }).status === 400);
+});
+
 test("a GitHub project run clones the mirror head without reading the project tree", { timeout: 90000 }, async () => {
   const f = await fixture("success", undefined, {}, { noServer: true });
   try {

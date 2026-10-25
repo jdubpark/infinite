@@ -325,7 +325,7 @@ export class UnderstandingService {
         }
         return bindings.get(key)!;
       }).map(entry => entry.artifact).sort((a, b) => b.retainedAt.localeCompare(a.retainedAt) || a.id.localeCompare(b.id));
-      const activeStates: string[] = [];
+      const activeStates: string[] = [], failedReasons: string[] = [];
       for (const [sessionId, state] of briefingStates) {
         if (!["pending", "running", "failed"].includes(state.state)) continue;
         if (state.state === "failed" && current.length && state.updatedAt <= Date.parse(current[0]!.retainedAt)) continue;
@@ -334,13 +334,14 @@ export class UnderstandingService {
           if (!checkouts.has(session.projectId)) continue;
           if (session.team && !this.ownedTeamSession(session)) continue;
           activeStates.push(state.state);
+          if (state.state === "failed") failedReasons.push(state.error?.split("Reason: ").slice(1).join("Reason: ") || state.error || "unknown");
         } catch { /* closed or unavailable sessions do not alter retained artifact visibility */ }
       }
       const planned: UnderstandingPlan[] = currentWork.filter(work => work.repositoryIds.some(projectId => checkouts.has(projectId))).map(work => ({
         workId: work.id, kind: work.kind, title: work.title, text: work.objective ?? "", status: work.status, updatedAt: work.updatedAt, source: "request" as const,
       })).filter(item => item.text.length > 0);
       const warnings = this.storageError ? [this.storageError] : [];
-      if (activeStates.includes("failed")) warnings.push("The latest recorded briefing attempt failed; retained snapshots remain source-labeled.");
+      if (activeStates.includes("failed")) warnings.push(`The latest brief attempt failed: ${failedReasons[0]}`);
       const state: UnderstandingRepository["state"] = activeStates.includes("pending") || activeStates.includes("running") ? "updating" : activeStates.includes("failed") ? "failed" : this.storageError && !current.length ? "unavailable" : current.length ? "ready" : "empty";
       return { id: repo.projectId, name: repo.name, checkoutIds, state, current, planned, warnings, coverage: [] };
     });

@@ -80,6 +80,7 @@ export interface KnowledgeMaintenance {
   state: "disabled" | "idle" | "queued" | "running" | "failed" | "budget-limited" | "unavailable";
   lastObservedAt: string | null; lastPublishedAt: string | null; nextAttemptAt: string | null;
   jobsToday: number; dailyJobLimit: number; message: string | null;
+  lastFailure?: { at: string; reason: string } | null;
 }
 export interface WorkspaceKnowledge {
   schemaVersion: 1; catalog: KnowledgeCatalog; components: KnowledgeComponent[];

@@ -105,6 +105,20 @@ test("failed or invalid context capture retains the previous encrypted generatio
   assert.ok(readFileSync(join(s.stateDir, "understanding", "runtime.sealed"), "utf8").length > 0);
 });
 
+test("a failed job records a readable reason and clears it on the next success", { timeout: 20000 }, async t => {
+  let fail = true;
+  const s = setup(t, { adapter: { context: async root => { if (fail) throw new Error("engine exploded"); return sampleContext(root); } } });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").maintenance.state === "failed");
+  const failed = s.runtime.read("workspace").maintenance;
+  assert.match(failed.message ?? "", /^Last attempt failed at \d{4}-.*: Repository Repository: engine exploded\.$/);
+  assert.equal(failed.lastFailure?.reason, "Repository Repository: engine exploded");
+  fail = false;
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").components.length === 2);
+  assert.equal(s.runtime.read("workspace").maintenance.lastFailure, null);
+});
+
 for (const { configuredMs, expectedBudgets } of [
   { configuredMs: 180_000, expectedBudgets: [180_000, 60_000] },
   { configuredMs: 600_000, expectedBudgets: [600_000, 480_000] },

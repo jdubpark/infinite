@@ -251,7 +251,7 @@ test("a failed automatic repository brief is safe and does not retry the same ch
     const control = await claimControl(host, id, "owner");
     await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
     const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "failed", 20000);
-    assert.equal(status.body.error, "Repository brief could not be generated. Check the configured briefing wrapper.");
+    assert.equal(status.body.error, "Repository brief could not be generated. Check the configured briefing wrapper. Reason: exit 1");
     const stop = await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() }, control.headers);
     assert.equal(stop.status, 200);
     const exited = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "exited", 15000);
@@ -260,7 +260,7 @@ test("a failed automatic repository brief is safe and does not retry the same ch
     const exitAttempt = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "pending", 15000);
     assert.equal(exitAttempt.body.state, "pending");
     const settled = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "failed", 15000);
-    assert.equal(settled.body.error, "Repository brief could not be generated. Check the configured briefing wrapper.");
+    assert.equal(settled.body.error, "Repository brief could not be generated. Check the configured briefing wrapper. Reason: exit 1");
     const settledCount = readFileSync(receipt, "utf8").trim().split("\n").length;
     assert.equal(settledCount, 2, "the initial failure and one exit checkpoint each run once");
     for (let poll = 0; poll < 4; poll++) {

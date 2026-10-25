@@ -7,6 +7,7 @@ import type { KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, Knowledge
 import type { Config } from "./types.js";
 import type { ProjectGroup, ProjectGroupList, ProjectGroupRepo } from "./project-group-types.js";
 import { captureIdentity, readGit } from "./checkout-identity.js";
+import { failureReason } from "./failure-reason.js";
 import { seal, unseal, writeSealed } from "./vault.js";
 import { CatalogError, understandingCatalogLimits } from "./understanding-catalog.js";
 
@@ -125,7 +126,7 @@ const storedRepositorySchema = z.object({
   for (const [key, fingerprint] of Object.entries(value.completedSourceFingerprints)) if (typeof fingerprint !== "string") context.addIssue({ code: "custom", path: ["completedSourceFingerprints", key], message: "invalid source watermark" });
 });
 const runtimeStateSchema = z.object({ version: z.literal(1), day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), workspaces: z.record(z.string(), z.object({
-  jobsToday: z.number().int().nonnegative().max(1_000_000), failureCount: z.number().int().nonnegative().max(20), synthesisCursor: z.string().max(400).nullable(), repositories: z.record(z.string(), storedRepositorySchema), maintenance: z.object({ state: z.enum(["disabled", "idle", "queued", "running", "failed", "budget-limited", "unavailable"]), lastObservedAt: z.string().nullable(), lastPublishedAt: z.string().nullable(), nextAttemptAt: z.string().nullable(), jobsToday: z.number().int().nonnegative(), dailyJobLimit: z.number().int().nonnegative(), message: z.string().nullable() }).strict(), updatedAt: z.string().datetime({ offset: true }).nullable(),
+  jobsToday: z.number().int().nonnegative().max(1_000_000), failureCount: z.number().int().nonnegative().max(20), synthesisCursor: z.string().max(400).nullable(), repositories: z.record(z.string(), storedRepositorySchema), maintenance: z.object({ state: z.enum(["disabled", "idle", "queued", "running", "failed", "budget-limited", "unavailable"]), lastObservedAt: z.string().nullable(), lastPublishedAt: z.string().nullable(), nextAttemptAt: z.string().nullable(), jobsToday: z.number().int().nonnegative(), dailyJobLimit: z.number().int().nonnegative(), message: z.string().nullable(), lastFailure: z.object({ at: z.string(), reason: z.string().max(400) }).strict().nullable().optional() }).strict(), updatedAt: z.string().datetime({ offset: true }).nullable(),
 }).strict()) }).strict();
 function parseRepoContext(value: unknown): RepoContext {
   const parsed = repoContextSchema.parse(value);
@@ -310,7 +311,7 @@ export class UnderstandingRuntime {
         const configured = this.options.config.repositoryBriefings?.timeoutMs ?? 30_000;
         this.activeDeadline = Date.now() + Math.min(MAX_ATTEMPT_MS, Math.max(1000, configured));
         try { await this.runWorkspace(id); }
-        catch { this.failWorkspace(id); }
+        catch (error) { this.failWorkspace(id, error); }
         finally { this.activeDeadline = 0; }
       }
     } finally { this.running = false; }
@@ -339,7 +340,7 @@ export class UnderstandingRuntime {
         const observation = await this.capture(workspaceId, binding, catalogAtStart);
         repos[binding.repo.projectId] = observation;
         capturedRepositories.add(binding.repo.projectId);
-      } catch { partial.push(`Repository ${binding.repo.name}: source capture unavailable or changed.`); }
+      } catch (error) { partial.push(`Repository ${binding.repo.name}: ${failureReason(error)}`); }
     }
     if (!this.membershipStillCurrent(workspaceId, groupAtStart, bindings)) throw new Error("workspace-rebound");
     const hookedRepos = new Set<string>();
@@ -444,7 +445,8 @@ export class UnderstandingRuntime {
     if (!this.membershipStillCurrent(workspaceId, groupAtStart, bindings)) throw new Error("workspace-rebound-at-publish");
     const failedAttempts = partial.length ? Math.min(20, workspaceState.failureCount + 1) : 0;
     const retryDelay = this.backoff(workspaceId, 60_000);
-    const next: RuntimeState = { ...this.state, workspaces: { ...this.state.workspaces, [workspaceId]: { ...workspaceState, failureCount: failedAttempts, synthesisCursor: nextSynthesisCursor, repositories: repos, maintenance: { ...workspaceState.maintenance, state: partial.length ? "failed" : "idle", lastPublishedAt: new Date().toISOString(), nextAttemptAt: partial.length ? new Date(Date.now() + retryDelay).toISOString() : null, jobsToday: workspaceState.jobsToday, dailyJobLimit: currentPolicy.dailyJobLimit, message: partial.length ? "Some repository observations were unavailable; successful observations were published and prior maps remain for failed repositories." : null }, updatedAt: new Date().toISOString() } } };
+    const publishedAt = new Date().toISOString(), failure = failureReason(partial.join("; "));
+    const next: RuntimeState = { ...this.state, workspaces: { ...this.state.workspaces, [workspaceId]: { ...workspaceState, failureCount: failedAttempts, synthesisCursor: nextSynthesisCursor, repositories: repos, maintenance: { ...workspaceState.maintenance, state: partial.length ? "failed" : "idle", lastPublishedAt: publishedAt, nextAttemptAt: partial.length ? new Date(Date.now() + retryDelay).toISOString() : null, jobsToday: workspaceState.jobsToday, dailyJobLimit: currentPolicy.dailyJobLimit, message: partial.length ? `Last attempt failed at ${publishedAt}: ${failure}.` : null, lastFailure: partial.length ? { at: publishedAt, reason: failure } : null }, updatedAt: new Date().toISOString() } } };
     const before = this.state; this.state = next; this.persist();
     if (this.storageUnavailable) { this.state = before; throw new Error("runtime-store-full"); }
   }
@@ -619,11 +621,13 @@ export class UnderstandingRuntime {
       return digest(latest.repos.map(repo => [repo.projectId, repo.key, repo.checkouts.map(item => item.projectId).sort()]).sort()) === digest(group.repos.map(repo => [repo.projectId, repo.key, repo.checkouts.map(item => item.projectId).sort()]).sort()) && bindings.every(binding => this.boundStillCurrent(workspaceId, latest, binding));
     } catch { return false; }
   }
-  private failWorkspace(workspaceId: string) {
+  private failWorkspace(workspaceId: string, error: unknown) {
+    const reason = failureReason(error), at = new Date().toISOString();
+    console.error(`[Infinite] Understanding maintenance failed · workspace ${workspaceId} · ${reason}`);
     const old = this.workspace(workspaceId);
     old.failureCount = Math.min(20, old.failureCount + 1);
     const delay = this.backoff(workspaceId, 60_000);
-    this.setMaintenance(workspaceId, { ...old.maintenance, state: "failed", nextAttemptAt: new Date(Date.now() + delay).toISOString(), jobsToday: this.dailyJobs(workspaceId), message: "Maintenance failed or its source changed; the last good maps were retained." });
+    this.setMaintenance(workspaceId, { ...old.maintenance, state: "failed", nextAttemptAt: new Date(Date.now() + delay).toISOString(), jobsToday: this.dailyJobs(workspaceId), message: `Last attempt failed at ${at}: ${reason}.`, lastFailure: { at, reason } });
   }
 }
 

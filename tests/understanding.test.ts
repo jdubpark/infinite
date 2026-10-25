@@ -101,6 +101,7 @@ test("unavailable brief storage leaves the host and Work readable and cannot ack
     await waitFor(() => host.fetchApi(`/sessions/${sessionId}/summary?status=1`, "viewer"), result => result.body.state === "failed", 15000);
     const failed = await host.fetchApi(await understandingPath(host), "viewer");
     assert.equal(failed.body.repositories[0].state, "failed");
+    assert.match(failed.body.repositories[0].warnings.join("\n"), /^The latest brief attempt failed: \S/m);
     assert.deepEqual(failed.body.repositories[0].current, []);
     assert.equal(failed.body.work[0].sourceId, goal.id);
   } finally { await host.stop(); }

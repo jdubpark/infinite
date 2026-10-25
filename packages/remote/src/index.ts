@@ -11,6 +11,7 @@ export type {
   UnderstandingCitation, UnderstandingLink,
 } from "./understanding.js";
 export type * from "./understanding-knowledge.js";
+export type * from "./understanding-diagrams.js";
 export type * from "./understanding-behavior.js";
 export * from "./memory.js";
 

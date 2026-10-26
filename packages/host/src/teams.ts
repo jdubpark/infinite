@@ -1844,12 +1844,15 @@ export class TeamService {
     }
   }
   private async membersSettled(stored: Stored) {
-    if (stored.pending || this.commands.has(stored.run.id)) return false;
-    for (const member of stored.run.members) {
+    const { run } = stored;
+    if (this.commands.has(run.id)) return false;
+    // A terminal run's interrupted operation is never replayed, so it does not keep the run's clones alive.
+    if (stored.pending && !["cancelled", "merged", "no-change"].includes(run.status)) return false;
+    for (const member of run.members) {
       if (member.status === "stopped") continue;
-      if (member.status !== "unavailable" && member.status !== "reported") return false;
+      // Whatever the recorded member status, a session that has exited or no longer exists has nothing left to stop.
       try { if ((await this.manager.state(member.sessionId)).status !== "exited") return false; }
-      catch { return false; }
+      catch { continue; }
     }
     return true;
   }

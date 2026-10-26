@@ -300,6 +300,16 @@ test("Understanding is a read-only scoped API and its source-bound brief survive
     assert.ok(afterRestart.body.repositories[0].current.some((artifact: any) => artifact.id === artifactId), "a corrupt generation cannot hide an older valid generation");
     assert.ok(afterRestart.body.repositories[0].current.every((artifact: any) => artifact.id !== secondArtifact.id));
     assert.match(afterRestart.body.repositories[0].warnings.join(" "), /corrupt/);
+    const restoredArtifact = afterRestart.body.repositories[0].current.find((artifact: any) => artifact.id === artifactId);
+    assert.equal(restoredArtifact.brief.diagrams.length, 2, "retained artifacts carry the parsed brief diagrams");
+    const [parsedDiagram, brokenDiagram] = restoredArtifact.brief.diagrams;
+    assert.deepEqual(parsedDiagram.nodes.map((node: any) => node.id), ["API", "Policy"]);
+    assert.equal(parsedDiagram.edges.length, 1);
+    assert.equal(parsedDiagram.id, `${artifactId}:0`);
+    assert.equal(parsedDiagram.basis, "model");
+    assert.equal(brokenDiagram.parseError !== undefined, true, "an unsupported Mermaid construct is kept as source with a parse error");
+    assert.equal(brokenDiagram.sourceText, "flowchart LR\n  A --> B\n  style A fill:#f00");
+    assert.equal(brokenDiagram.nodes.length, 0);
 
     const movedGroup = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Moved workspace", repos: ["rehearsal"] });
     assert.equal(movedGroup.status, 200);

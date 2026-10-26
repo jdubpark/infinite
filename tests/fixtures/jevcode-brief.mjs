@@ -44,7 +44,10 @@ process.stdout.write(JSON.stringify({
   base,
   generatedAt: new Date().toISOString(),
   fingerprint: "a".repeat(40),
-  brief: { summary: mode === "invalid" ? "" : marker < 0 ? "Fixture repository brief." : `Fixture repository brief includes ${activity[marker].text}.`, architecture: [], review: [], changes: [], checks: [], guidance: [], unknowns: [], diagrams: [] },
+  brief: { summary: mode === "invalid" ? "" : marker < 0 ? "Fixture repository brief." : `Fixture repository brief includes ${activity[marker].text}.`, architecture: [], review: [], changes: [], checks: [], guidance: [], unknowns: [], diagrams: [
+    { title: "Request path", kind: "system", mermaid: "flowchart LR\n  API --> Policy", citations: [] },
+    { title: "Broken", kind: "change", mermaid: "flowchart LR\n  A --> B\n  style A fill:#f00", citations: [] },
+  ] },
   evidence,
   coverage: ["fixture repository"]
 }));

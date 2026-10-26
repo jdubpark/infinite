@@ -62,6 +62,14 @@ export const teamDeliverySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("pr"), repository: githubRepository, baseBranch: gitBranch }).strict(),
 ]);
 export type TeamDelivery = z.infer<typeof teamDeliverySchema>;
+export type TeamPublicationCategory = "auth" | "network" | "not-found" | "rejected" | "other";
+export type TeamPublication = {
+  repository: string;
+  branch: string;
+  commit?: string;
+  publishedAt?: string;
+  failure?: { commit: string; category: TeamPublicationCategory; attempts: number; at: string; retryAt: string };
+};
 export const nativeContinuationSchema = z.object({
   nativeSessionId: z.string().uuid(),
   mode: z.enum(["start", "resume"]),
@@ -499,6 +507,8 @@ export interface TeamRun {
   verificationReconciliations?: { requestId: string; pendingId: string; revision: number; round: number; headCommit: string; interruptedChecks: number; attestation: string; at: string }[];
   /** Owner-authorized repository delivery policy pinned when this run starts. */
   delivery?: TeamDelivery;
+  /** Host publication state for the current integration head. */
+  publication?: TeamPublication;
   /** Agent-reported delivery evidence; this is not independently verified by the host. */
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
   /** Agent-reported open pull request for a `pr` delivery; the owner merges it on GitHub. Not host verification. */

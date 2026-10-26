@@ -4,7 +4,8 @@ import { constants } from "node:fs";
 import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync } from "node:fs";
 import { rm as rmAsync } from "node:fs/promises";
 import { basename, dirname, join, resolve, relative, isAbsolute, parse, sep } from "node:path";
-import type { TeamCommand, TeamTaskPlan } from "./team-types.js";
+import type { TeamCommand, TeamPublicationCategory, TeamTaskPlan } from "./team-types.js";
+import { fetchCategory } from "./project-source.js";
 
 export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
@@ -57,6 +58,16 @@ export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSig
     child.once("error", () => { if (settled) return; settled = true; finish(); reject(new TeamError(409, "command-unavailable", "A configured team command could not be started.")); });
     child.once("close", exitCode => { if (settled) return; settled = true; finish(); resolveResult({ exitCode, output, stdout, interrupted, truncated }); });
   });
+}
+export async function publishTeamHead(workspace: string, remoteUrl: string, commit: string, branch: string, prefix?: TeamCommand, signal?: AbortSignal): Promise<{ published: true } | { published: false; category: TeamPublicationCategory }> {
+  try {
+    const result = await teamCommand({ command: "git", args: teamGitArgs(workspace, ["push", remoteUrl, `${commit}:refs/heads/${branch}`]) }, workspace, signal, 120000, prefix);
+    if (result.exitCode === 0 && !result.interrupted && !result.truncated) return { published: true };
+    // Only Git's own ref status line marks divergence; a branch name or remote hook text must not route the head to a sibling.
+    return { published: false, category: /^\s*!\s+\[rejected\]\s.*\((?:non-fast-forward|fetch first)\)\s*$/m.test(result.output) ? "rejected" : fetchCategory(result.output) };
+  } catch {
+    return { published: false, category: "other" };
+  }
 }
 /** Streams a full bundle of one branch on stdout, with the same restricted Git invocation as other team operations. */
 export function spawnTeamBundle(workspace: string, branch: string, prefix?: TeamCommand) {

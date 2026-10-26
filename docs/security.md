@@ -233,6 +233,12 @@ same prompt-injection risk as any checked-out file. The GitHub App mints tokens 
 every repository it is installed on, not a hand-kept list, so a new installation
 widens token issuance. See [GitHub App setup](../deploy/ubuntu/github-app.md).
 
+The host also pushes team heads to GitHub through `teams.commandPrefix`, with the
+repository-scoped App credential. The refspec is an exact commit SHA to
+`refs/heads/infinite/team-*`. The host never forces or deletes a remote branch. The
+point is durability: work survives workspace removal and loss of the host disk. See
+[Head publication](teams.md#head-publication).
+
 ## Dependency audit
 
 The current lockfile's production host dependency audit reports zero known advisories. The full workspace audit reports 29 findings (19 high, 10 moderate), propagated from four transitive packages in the Expo 57 dependency tree: `braces`, `node-forge`, `uuid`, and `decode-uri-component`. Most are in build tooling; the Router URI decoder also requires review before native release. At the time of the check, the registry's latest `braces` and `node-forge` versions remained affected. A forced audit fix proposed incompatible SDK changes, so it was not applied. These findings remain open; the mobile debug build is not a security-reviewed release.

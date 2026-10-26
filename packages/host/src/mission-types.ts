@@ -59,7 +59,7 @@ export interface MissionSubtask extends MissionSubtaskPlan {
   /** Last observed child status; refreshed by the host, never reported by an agent. */
   teamStatus?: TeamStatus;
   /** Small host-observed record retained after a cancelled subteam is deleted. */
-  finalEvidence?: { reason?: string; headCommit?: string };
+  finalEvidence?: { reason?: string; headCommit?: string; usage?: UsageRollup };
 }
 export interface MissionDecision {
   id: string;

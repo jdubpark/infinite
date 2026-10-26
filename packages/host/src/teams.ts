@@ -1,6 +1,6 @@
 import type { HandoffPolicy, TeamHandoffContext } from "./handoff-types.js";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { rm as rmAsync } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep, basename } from "node:path";
@@ -100,6 +100,14 @@ function retentionEventAt(run: TeamRun) {
 function teamRunDirectory(workspace: string) {
   const parent = dirname(workspace);
   return ["recovery", "verification"].includes(basename(parent)) ? dirname(parent) : parent;
+}
+function pathStrictlyInside(root: string, target: string) {
+  const rel = relative(resolve(root), resolve(target));
+  return Boolean(rel) && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+function filesystemEntryExists(path: string) {
+  try { lstatSync(path); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
 }
 function diffStat(output?: string) {
   if (output === undefined) return undefined;
@@ -266,12 +274,17 @@ const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runI
 /** Durable orchestration; reports describe agent claims, configured checks describe host evidence. */
 export class TeamService {
   private readonly records = new Map<string, Stored>();
+  private readonly retiredRunIds = new Set<string>();
   private serial: Promise<unknown> = Promise.resolve();
   private timer?: NodeJS.Timeout;
   private running = false;
   private closed = false;
   private tickQueued = false;
   private readonly commands = new Map<string, AbortController>();
+  private readonly removingRuns = new Set<string>();
+  private readonly removalTasks = new Set<Promise<void>>();
+  private readonly removalWaiters: Array<() => void> = [];
+  private activeRemovals = 0;
   private readonly permissionPromptFirstSeen = new Map<string, number>();
   private readonly directory: string;
   private usage?: UsageService;
@@ -282,6 +295,18 @@ export class TeamService {
     this.directory = join(config.stateDir, "teams");
     this.limits = new ProviderLimits(join(config.stateDir, "provider-limits.sealed"), key);
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    const retiredPath = join(this.directory, "retired.sealed");
+    try {
+      const retired = unseal<unknown>(key, "team:retired", readFileSync(retiredPath, "utf8"));
+      if (!Array.isArray(retired) || retired.some(id => typeof id !== "string" || !/^[a-f0-9-]{36}$/i.test(id)))
+        throw new TeamError(409, "invalid-team-retired", "The team deletion history cannot be authenticated.");
+      for (const id of retired.slice(-2000)) this.retiredRunIds.add(id);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        if (error instanceof TeamError) throw error;
+        throw new TeamError(409, "invalid-team-retired", "The team deletion history cannot be authenticated.");
+      }
+    }
     for (const file of readdirSync(this.directory).filter(name => /^[a-f0-9-]{36}\.sealed$/.test(name))) {
       const id = file.slice(0, -7);
       const stored = unseal<Stored>(key, `team:${id}`, readFileSync(join(this.directory, file), "utf8"));
@@ -613,8 +638,62 @@ export class TeamService {
     if (!root) throw new TeamError(409, "invalid-workspace", "The team workspace is outside its configured root.");
     return stored.anchor ? ensureHostDirectory(stored.anchor, root, 0o750, false) : ensureDefaultTeamRoot(root, false);
   }
+  private ownerPreventsRemoval(run: TeamRun) {
+    return Boolean(run.goal || run.missionId || run.handoff) && (this.options?.ownerActive?.(run) ?? true);
+  }
+  private hasPendingPreparationFrom(stored: Stored) {
+    const runDirectory = teamRunDirectory(stored.run.workspace);
+    for (const candidate of this.records.values()) {
+      if (candidate.run.id === stored.run.id || candidate.pending?.kind !== "prepare" || !candidate.source?.path) continue;
+      if (pathStrictlyInside(runDirectory, candidate.source.path)) return true;
+    }
+    return false;
+  }
+  private assertRunRetentionSafe(stored: Stored) {
+    if (this.ownerPreventsRemoval(stored.run))
+      throw new TeamError(409, "team-retained", "A live goal, mission or handoff still uses this run as its source; it is removed when that owner finishes.");
+    if (this.hasPendingPreparationFrom(stored))
+      throw new TeamError(409, "team-in-use", "Another run is preparing from this run's workspace; retry removal after preparation settles.");
+  }
+  private persistRetiredRunId(id: string) {
+    const ids = [...this.retiredRunIds].filter(item => item !== id);
+    ids.push(id);
+    if (ids.length > 2000) ids.splice(0, ids.length - 2000);
+    writeSealed(join(this.directory, "retired.sealed"), this.key, "team:retired", ids);
+    this.retiredRunIds.clear();
+    for (const item of ids) this.retiredRunIds.add(item);
+  }
+  private async withRemovalSlot<T>(operation: () => Promise<T>) {
+    if (this.activeRemovals >= 2) await new Promise<void>(resolve => this.removalWaiters.push(resolve));
+    else this.activeRemovals++;
+    try { return await operation(); }
+    finally {
+      const next = this.removalWaiters.shift();
+      if (next) next();
+      else this.activeRemovals--;
+    }
+  }
+  /** Filesystem cleanup runs outside the serialized team mutation queue; only its result is enqueued. */
+  private removeOutsideQueue(stored: Stored, remove: () => Promise<unknown>, completed: (result: unknown) => void | Promise<void>, failed: (error: unknown) => void | Promise<void>) {
+    const id = stored.run.id;
+    if (this.removingRuns.has(id)) return false;
+    this.removingRuns.add(id);
+    let task: Promise<void>;
+    task = (async () => {
+      let didFail = false, failure: unknown, result: unknown;
+      try { result = await this.withRemovalSlot(remove); }
+      catch (error) { didFail = true; failure = error; }
+      try { await this.enqueue(() => didFail ? failed(failure) : completed(result)); }
+      catch (error) { console.warn("Could not record the result of a background team workspace removal.", error); }
+      finally { this.removingRuns.delete(id); }
+    })().finally(() => this.removalTasks.delete(task));
+    this.removalTasks.add(task);
+    return true;
+  }
   private async deleteRecord(stored: Stored) {
     const finalView = this.view(stored);
+    try { this.persistRetiredRunId(stored.run.id); }
+    catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
     try { await rmAsync(join(this.directory, `${stored.run.id}.sealed`), { force: true }); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's record could not be removed."); }
     this.commands.get(stored.run.id)?.abort();
@@ -625,12 +704,14 @@ export class TeamService {
   removeRun(id: string): Promise<TeamView> {
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
+      if (this.removingRuns.has(id)) throw new TeamError(409, "team-operation-running", "A background workspace removal is still running. Retry deletion after it settles.");
+      this.assertRunRetentionSafe(stored);
       if (!(["cancelled", "merged", "no-change"].includes(run.status) && await this.membersSettled(stored)))
         throw new TeamError(409, "team-active", "Only a settled cancelled, merged or no-change run can be removed.");
-      if (!run.workspaceRemovedAt) {
+      if (!run.workspaceRemovedAt || filesystemEntryExists(teamRunDirectory(run.workspace))) {
         this.assertRunPath(stored, run.workspace);
         await removeTeamWorkspace(teamRunDirectory(run.workspace), this.config.teams?.commandPrefix, undefined, this.teamRoot(stored));
-        run.workspaceRemovedAt = this.retentionNow();
+        run.workspaceRemovedAt ??= this.retentionNow();
         for (const member of run.members) member.workspaceRemovedAt ??= run.workspaceRemovedAt;
         this.event(stored, "Workspaces removed by the owner through removeRun after the run settled.");
         this.save(stored);
@@ -716,6 +797,8 @@ export class TeamService {
         if (internal?.missionId) this.ensureMissionCapacityCeiling(parsed.requestId, internal.missionId, internal.parallelismCeiling ?? 4);
         return this.view(prior);
       }
+      if (this.retiredRunIds.has(parsed.requestId))
+        throw new TeamError(409, "team-deleted", "This request's run was deleted under the retention policy. Start a new run with a new request id.");
       const project = this.config.projects.find(item => item.id === parsed.projectId);
       if (!project) throw new TeamError(404, "unknown-project", "The selected project is not configured.");
       const reservedBy = this.missionReservations?.(parsed.projectId, internal?.missionId);
@@ -745,6 +828,8 @@ export class TeamService {
         throw new TeamError(409, "permission-lineup-required", "Delegated permissions require a strong coordinator and any configured coordinator fallback must also be strong.");
       const parentId = goal?.parentRunId ?? internal?.baseRunId;
       const parent = parentId ? this.record(parentId).run : undefined;
+      if (parent?.workspaceRemovedAt || parent && this.removingRuns.has(parent.id))
+        throw new TeamError(409, "team-workspace-removed", "This run's workspaces are being removed under the retention policy; start a new run.");
       if (parent && (goal
         ? parent.goal?.id !== goal.id || parent.projectId !== parsed.projectId || !["ready-for-review", "merged"].includes(parent.status) || !parent.headCommit
         : parent.projectId !== parsed.projectId || parent.missionId !== internal?.missionId || !["ready-for-review", "merged", "no-change"].includes(parent.status) || !parent.headCommit))
@@ -760,12 +845,17 @@ export class TeamService {
       // The `infinite/team-` prefix keeps constrained launchers that allow only team branches working.
       const branch = `infinite/team-${slug}-${suffix}`;
       const root = project.teamworkDir ?? this.config.teams.workspaceDir;
-      let usage: VolumeUsage | undefined;
-      try { usage = await (this.options?.volumeUsage ?? volumeUsage)(root); } catch { /* A filesystem stat failure must not prevent admission. */ }
-      if (usage) {
-        const reason = storageShortfall(usage, this.config.teams.storageFloor ?? DEFAULT_STORAGE_FLOOR);
-        if (reason) throw new TeamError(507, "host-storage-low", reason);
+      let samplePath = resolve(root);
+      while (!existsSync(samplePath)) {
+        const ancestor = dirname(samplePath);
+        if (ancestor === samplePath) throw new TeamError(507, "host-storage-unavailable", "The host could not measure free space for the team workspace volume.");
+        samplePath = ancestor;
       }
+      let usage: VolumeUsage;
+      try { usage = await (this.options?.volumeUsage ?? volumeUsage)(samplePath); }
+      catch { throw new TeamError(507, "host-storage-unavailable", "The host could not measure free space for the team workspace volume."); }
+      const reason = storageShortfall(usage, this.config.teams.storageFloor ?? DEFAULT_STORAGE_FLOOR);
+      if (reason) throw new TeamError(507, "host-storage-low", reason);
       const fallbackTitle = parsed.objective.trim().split("\n")[0]!.slice(0, 100).trim();
       const titleSource = !internal?.goal && !internal?.handoff && !internal?.missionId && parsed.title === fallbackTitle ? "request" as const : undefined;
       const ceiling = internal?.parallelismCeiling ?? (internal?.handoff ? 2 : 4);
@@ -795,7 +885,7 @@ export class TeamService {
       if (run.titleSource === "request" && this.titler) void this.nameRequest(run.id, parsed.objective).catch(error => console.warn("Best-effort team naming failed.", error));
       this.operation(stored, "prepare", async signal => {
         const assertParent = () => {
-          if (parent && (!["ready-for-review", "merged", "no-change"].includes(parent.status) || parent.revision !== parentRevision || parent.headCommit !== source.head))
+          if (parent && (parent.workspaceRemovedAt || !["ready-for-review", "merged", "no-change"].includes(parent.status) || parent.revision !== parentRevision || parent.headCommit !== source.head))
             throw new TeamError(409, "parent-workspace-changed", "The predecessor run changed while its continuation was being prepared.");
         };
         assertParent();
@@ -1361,7 +1451,15 @@ export class TeamService {
   }
   close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const controller of this.commands.values()) controller.abort(); }
   /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
-  idle() { return this.serial.then(() => undefined); }
+  async idle() {
+    await this.serial;
+    // Drain a bounded number of removal generations; retries queued by later ticks are not "work queued before now".
+    for (let pass = 0; pass < 5 && this.removalTasks.size; pass++) {
+      await Promise.allSettled([...this.removalTasks]);
+      await this.serial;
+    }
+    await this.serial;
+  }
   private stallWindow() { return (this.config.teams?.stallMinutes ?? 30) * 60000; }
   /**
    * Extends a deadline only under the owner's recorded policy, and only while an active member of this
@@ -1784,8 +1882,7 @@ export class TeamService {
   private async retire(stored: Stored) {
     try {
       const { run } = stored, retention = this.retentionState(stored), policy = this.config.teams?.retention ?? DEFAULT_TEAM_RETENTION;
-      const ownedActive = Boolean(run.goal || run.missionId || run.handoff) && (this.options?.ownerActive?.(run) ?? true);
-      if (ownedActive && ["merged", "no-change", "ready-for-review"].includes(run.status)) return;
+      if (this.removingRuns.has(run.id) || this.ownerPreventsRemoval(run) || this.hasPendingPreparationFrom(stored)) return;
       const runDirectory = teamRunDirectory(run.workspace);
       const now = this.options?.now?.() ?? Date.now();
       const elapsed = Math.max(0, now - Date.parse(retention.statusAt));
@@ -1793,27 +1890,86 @@ export class TeamService {
         : run.status === "cancelled" ? policy.cancelledMinutes * 60000
           : run.status === "ready-for-review" ? policy.reviewHours * 3600000
             : run.status === "blocked" ? policy.blockedHours * 3600000 : undefined;
+      const removeRunInBackground = (startedAt: string) => this.removeOutsideQueue(stored,
+        () => removeTeamWorkspace(runDirectory, this.config.teams?.commandPrefix, undefined, this.teamRoot(stored)),
+        async () => {
+          if (this.records.get(run.id) !== stored) return;
+          for (const member of run.members) member.workspaceRemovedAt ??= startedAt;
+          if (!run.events.some(event => event.text.startsWith("Workspaces removed under the retention policy after this ")))
+            this.event(stored, `Workspaces removed under the retention policy after this ${run.status} run settled. See docs/teams.md.`);
+          try { this.save(stored); } catch (error) { console.warn("Could not persist a removed team workspace marker.", error); }
+          if (run.status === "cancelled" && !run.goal && !run.missionId && !this.ownerPreventsRemoval(run) && !this.hasPendingPreparationFrom(stored) && await this.membersSettled(stored)) {
+            try { await this.deleteRecord(stored); }
+            catch (error) { await this.reportRemovalFailure(stored, "record", error); }
+          }
+        },
+        async error => {
+          if (this.records.get(run.id) !== stored) return;
+          // The removal intent stays durable: a partially removed tree must never be resumed, and a later tick retries while the directory exists.
+          await this.reportRemovalFailure(stored, "workspaces", error);
+        });
 
       if (!run.workspaceRemovedAt && !["cancelled", "merged", "no-change", "ready-for-review", "blocked"].includes(run.status)) {
         const memberRetentionMs = policy.memberMinutes * 60000;
-        for (const [index, member] of run.members.entries()) {
-          const newerMemberSharesWorkspace = run.members.slice(index + 1).some(candidate => candidate.cwd === member.cwd);
-          if (member.workspaceRemovedAt || stored.pending?.source?.cwd === member.cwd || newerMemberSharesWorkspace) continue;
-          const integratedAt = this.memberIntegratedAt(stored, member);
-          if (!integratedAt || now - Date.parse(integratedAt) < memberRetentionMs) continue;
-          try {
-            await removeMemberWorkspace(runDirectory, member.memberId, this.config.teams?.commandPrefix, undefined, this.teamRoot(stored));
-          } catch (error) {
-            await this.reportRemovalFailure(stored, `member:${member.memberId}`, error);
+        for (const member of run.members) {
+          const anotherMemberSharesWorkspace = run.members.some(candidate => candidate !== member && candidate.cwd === member.cwd);
+          if (stored.pending?.source?.cwd === member.cwd || anotherMemberSharesWorkspace) continue;
+          if (!member.workspaceRemovedAt) {
+            const integratedAt = this.memberIntegratedAt(stored, member);
+            if (!integratedAt || now - Date.parse(integratedAt) < memberRetentionMs) continue;
+            if (!filesystemEntryExists(member.cwd)) {
+              member.workspaceRemovedAt = this.retentionNow();
+              try { this.save(stored); }
+              catch (error) { member.workspaceRemovedAt = undefined; console.warn("Could not persist a missing member workspace marker.", error); }
+              continue;
+            }
+            member.workspaceRemovedAt = this.retentionNow();
+            const previousEvents = run.events.slice();
+            this.event(stored, "Member workspace removal under the retention policy started.");
+            try { this.save(stored); }
+            catch (error) {
+              member.workspaceRemovedAt = undefined;
+              run.events = previousEvents;
+              console.warn("Could not persist a started member workspace removal.", error);
+              continue;
+            }
+          } else if (!filesystemEntryExists(member.cwd)) {
             continue;
           }
-          member.workspaceRemovedAt = this.retentionNow();
-          this.event(stored, `Member workspace removed under the retention policy after its integrated result was consumed. See docs/teams.md.`);
-          try { this.save(stored); } catch (error) { console.warn("Could not persist a removed member workspace marker.", error); }
+          this.removeOutsideQueue(stored,
+            () => removeMemberWorkspace(runDirectory, member.cwd, this.config.teams?.commandPrefix, undefined, this.teamRoot(stored)),
+            async removed => {
+              if (this.records.get(run.id) !== stored) return;
+              const removedEvent = `Member workspace removed under the retention policy after its integrated result was consumed (member ${member.memberId}). See docs/teams.md.`;
+              if (removed && !run.events.some(event => event.text === removedEvent)) this.event(stored, removedEvent);
+              try { this.save(stored); } catch (error) { console.warn("Could not persist a removed member workspace marker.", error); }
+            },
+            async error => {
+              if (this.records.get(run.id) !== stored) return;
+              // Keep the member's removal marker: the clone may be partially removed and is retried while it exists.
+              await this.reportRemovalFailure(stored, `member:${member.memberId}`, error);
+            });
+          return;
         }
       }
 
       if (run.workspaceRemovedAt) {
+        if (filesystemEntryExists(runDirectory)) {
+          removeRunInBackground(run.workspaceRemovedAt);
+          return;
+        }
+        let completionChanged = false;
+        for (const member of run.members) if (!member.workspaceRemovedAt) {
+          member.workspaceRemovedAt = run.workspaceRemovedAt;
+          completionChanged = true;
+        }
+        const started = run.events.some(event => event.text === "Workspace removal under the retention policy started.");
+        const completed = run.events.some(event => event.text.startsWith("Workspaces removed under the retention policy after this "));
+        if (started && !completed) {
+          this.event(stored, `Workspaces removed under the retention policy after this ${run.status} run settled. See docs/teams.md.`);
+          completionChanged = true;
+        }
+        if (completionChanged) try { this.save(stored); } catch (error) { console.warn("Could not persist a completed team workspace removal.", error); }
         if (run.status === "cancelled" && !run.goal && !run.missionId && retentionMs !== undefined && elapsed >= retentionMs && await this.membersSettled(stored)) {
           try { await this.deleteRecord(stored); }
           catch (error) { await this.reportRemovalFailure(stored, "record", error); }
@@ -1822,17 +1978,17 @@ export class TeamService {
       }
       if (retentionMs === undefined || elapsed < retentionMs || !(await this.membersSettled(stored))) return;
 
-      try { await removeTeamWorkspace(runDirectory, this.config.teams?.commandPrefix, undefined, this.teamRoot(stored)); }
-      catch (error) { await this.reportRemovalFailure(stored, "workspaces", error); return; }
       run.workspaceRemovedAt = this.retentionNow();
-      for (const member of run.members) member.workspaceRemovedAt ??= run.workspaceRemovedAt;
-      this.event(stored, `Workspaces removed under the retention policy after this ${run.status} run settled. See docs/teams.md.`);
+      const startedAt = run.workspaceRemovedAt, previousEvents = run.events.slice();
+      this.event(stored, "Workspace removal under the retention policy started.");
       try { this.save(stored); }
-      catch (error) { console.warn("Could not persist a removed team workspace marker.", error); }
-      if (run.status === "cancelled" && !run.goal && !run.missionId) {
-        try { await this.deleteRecord(stored); }
-        catch (error) { await this.reportRemovalFailure(stored, "record", error); }
+      catch (error) {
+        run.workspaceRemovedAt = undefined;
+        run.events = previousEvents;
+        console.warn("Could not persist a started team workspace removal.", error);
+        return;
       }
+      removeRunInBackground(startedAt);
     } catch (error) {
       console.warn("Team workspace retention could not be evaluated; the run was left unchanged.", error);
     }

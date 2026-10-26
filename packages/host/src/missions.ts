@@ -158,8 +158,10 @@ export class MissionService {
   private view(stored: Stored): Mission {
     const mission = structuredClone(stored.mission), profile = mission.lineup.coordinator;
     const coordinator = teamUsage(stored.attempts.map(attempt => ({ sessionId: attempt.sessionId, provider: profile.provider, modelProfile: profile })), profile.provider, this.usage).rollup;
-    const subteams = mission.subtasks.filter(subtask => subtask.teamId).map(subtask => {
-      try { return this.teams.get(subtask.teamId!).usage; } catch (error) { if (notFound(error)) return emptyRollup(); throw error; }
+    const subteams = mission.subtasks.flatMap(subtask => {
+      if (!subtask.teamId) return subtask.finalEvidence?.usage ? [subtask.finalEvidence.usage] : [];
+      try { return [this.teams.get(subtask.teamId).usage]; }
+      catch (error) { if (notFound(error)) return [subtask.finalEvidence?.usage ?? emptyRollup()]; throw error; }
     });
     mission.usage = addRollups([coordinator, ...subteams]);
     return mission;
@@ -530,7 +532,7 @@ export class MissionService {
       if (!stored.ops.some(op => op.kind === "parallelism" && op.teamId === team.id)) subtask.parallelism = team.parallelism;
       const status = subtaskStatus(team.status), changed = status !== subtask.status;
       subtask.status = status;
-      if (status === "cancelled") subtask.finalEvidence = { ...(team.reason ? { reason: team.reason } : {}), ...(team.headCommit ? { headCommit: team.headCommit } : {}) };
+      if (status === "cancelled") subtask.finalEvidence = { ...(team.reason ? { reason: team.reason } : {}), ...(team.headCommit ? { headCommit: team.headCommit } : {}), usage: team.usage };
       if (changed && status !== "running") this.event(stored, `Subtask ${subtask.id} is ${status} (subteam ${team.status}).`);
       if (live.has(mission.status) && status !== "running")
         this.message(stored, `${team.id}:${status === "cancelled" ? "cancelled" : `${status}:${team.revision}`}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status,

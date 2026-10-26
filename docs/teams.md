@@ -282,12 +282,26 @@ directory.
 
 The run record, events, reports, and receipts remain after merged, no-change,
 ready-for-review, and blocked workspaces are removed. Cancelled runs are deleted
-whole after their settle window. Every cleanup is recorded as a host event and a
-failed removal is retried on later scheduler ticks. A blocked run whose workspace
+whole after their settle window. Started and completed removals are recorded as
+host events, and a failed removal is retried on later scheduler ticks. A blocked run whose workspace
 was removed cannot resume, continue, or be steered; pause and cancel remain
 available. `DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
-cancelled, merged, or no-change run (clones and record) immediately; an active
-run, or the active run of a live goal or mission, is refused.
+cancelled, merged, or no-change run (clones and record) immediately. A live
+goal, mission, or handoff that still uses the run as its source receives
+`team-retained`; `team-in-use` means another run has a pending preparation that
+clones from this workspace. Both removals can be retried once the reference
+settles. Deleted request IDs are kept in the sealed `retired.sealed` tombstone,
+up to 2,000 IDs with the oldest dropped. Replaying one returns `team-deleted`;
+start another run with a new request ID.
+
+Retention marks a workspace removal as started in the run record, then removes
+the tree outside the serialized team mutation queue. At most two background
+removals run at once. Completion and distinct failures are recorded as host
+events; failures clear the removal marker and retry on a later scheduler tick.
+After a restart, a surviving path with a persisted removal marker is retried;
+cancelled records are deleted only after the run directory is gone.
+`idle()` waits for background removals in tests and shutdown tooling; `close()`
+does not wait for them. An active team cannot be deleted.
 
 When storage falls below `teams.storageFloor`, new runs are refused before their
 workspaces are created. See the configured reason in the API response and free

@@ -458,9 +458,18 @@ async function clearTerminalTeamStartReceipt(api: Api, path: string, request: an
     const team = await api.json<any>(`/teams/${prior[1].requestId}`);
     if (!["cancelled", "merged", "no-change", "ready-for-review", "blocked"].includes(team.status)) return;
   } catch (error) {
-    if ((error as { status?: number })?.status !== 404) return;
+    const failure = error as { status?: number; code?: string };
+    if (failure?.status !== 404 && !(failure?.status === 409 && failure.code === "team-deleted")) return;
   }
   delete records[prior[0]];
+  privateJson(path, records);
+}
+function clearDeletedTeamStartReceipt(path: string, requestId: string) {
+  const records = readPrivateJson(path, {}) as Record<string, any>;
+  const key = `team-start:${requestId}`;
+  const receipt = records[key];
+  if (receipt?.requestId !== requestId || receipt.endpoint !== "/teams" || receipt.method !== "POST") return;
+  delete records[key];
   privateJson(path, records);
 }
 async function postMutation(api: Api, receiptPath: string, key: string, endpoint: string, body: Record<string, unknown>, method = "POST", logRequest = true) {
@@ -786,7 +795,17 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     if (options["--request-id"] !== undefined)
       await clearTerminalTeamStartReceipt(api, receiptsPath, body, body.requestId);
     requestId = body.requestId = resumePendingIntent(receiptsPath, "team-start:", "/teams", prior => prior.projectId === body.projectId && prior.provider === body.provider && prior.useConfiguredLineup === body.useConfiguredLineup && prior.title === body.title && prior.objective === body.objective, requestId, options["--request-id"] !== undefined, rawArgs);
-    const team = await postMutation(api, receiptsPath, `team-start:${requestId}`, "/teams", body);
+    let team: any;
+    try {
+      team = await postMutation(api, receiptsPath, `team-start:${requestId}`, "/teams", body);
+    } catch (error) {
+      const failure = error as { status?: number; code?: string };
+      if (failure?.status === 409 && failure.code === "team-deleted") {
+        clearDeletedTeamStartReceipt(receiptsPath, requestId);
+        throw new Error("This team-start request was already deleted and retained as a tombstone. Use a new request ID to start another team.");
+      }
+      throw error;
+    }
     outputTeam(team, Boolean(options["--json"])); return true;
   }
   if (subcommand === "delete") {

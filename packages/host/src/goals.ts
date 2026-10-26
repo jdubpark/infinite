@@ -6,7 +6,7 @@ import { TeamService, TeamError } from "./teams.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, type CreateGoal, type ProductGoal } from "./goal-types.js";
 import type { Config } from "./types.js";
 import type { CreateTeam, TeamGoalContext, TeamView } from "./team-types.js";
-import { addRollups, emptyRollup } from "./team-usage.js";
+import { addRollups, emptyRollup, type UsageRollup } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
 
 type Action = { requestId: string; revision: number };
@@ -28,6 +28,8 @@ const timeLimitReason = "The approved time limit has expired.";
 const maxExtensionFailures = 3;
 /** Goals created before ceilings existed use their original creation-time budget. */
 const ceilingOf = (goal: ProductGoal) => goal.ceilingAt ?? new Date(Date.parse(goal.createdAt) + (goal.maxTotalMinutes ?? goal.maxMinutes) * 60000).toISOString();
+/** Flatten totals for existing cycle displays while retaining the complete rollup for parent aggregation. */
+const cycleUsageSnapshot = (usage: UsageRollup) => ({ ...usage.total, ...usage });
 
 /** Goals select bounded work; the Team executor owns every agent and Git operation. */
 export class GoalService {
@@ -106,10 +108,20 @@ export class GoalService {
         const team = this.teams.get(cycle.teamId), { usage } = team;
         for (const task of team.tasks) tasks.push({ teamId: cycle.teamId, taskId: task.id, title: task.title, ...((task as typeof task & { usage?: import("./usage-api.js").TaskUsage }).usage ? { usage: (task as typeof task & { usage?: import("./usage-api.js").TaskUsage }).usage } : {}) });
         // A cycle whose members are all unmeasured has no figure; a zero total would read as measured and free.
-        if (usage.total.messages > 0 || usage.unmeasuredMembers === 0) cycle.usage = usage.total;
+        if (usage.total.messages > 0 || usage.unmeasuredMembers === 0) cycle.usage = cycleUsageSnapshot(usage);
         else delete cycle.usage;
         return usage;
-      } catch (error) { if (error instanceof TeamError && error.code === "team-not-found") { delete cycle.usage; return emptyRollup(cycle.memberCount); } throw error; }
+      } catch (error) {
+        if (error instanceof TeamError && error.code === "team-not-found") {
+          const snapshot = cycle.usage;
+          if (snapshot?.total && snapshot.byProfile && snapshot.byProvider && Number.isInteger(snapshot.unmeasuredMembers))
+            return { total: snapshot.total, byProfile: snapshot.byProfile, byProvider: snapshot.byProvider, unmeasuredMembers: snapshot.unmeasuredMembers };
+          const rollup = emptyRollup(cycle.memberCount);
+          if (snapshot) rollup.total = snapshot;
+          return rollup;
+        }
+        throw error;
+      }
     });
     goal.usage = addRollups(rollups);
     return { ...goal, tasks };
@@ -351,6 +363,8 @@ export class GoalService {
   private refresh(stored: Stored, team: TeamView) {
     const cycle = stored.goal.cycles.find(value => value.teamId === team.id)!;
     Object.assign(cycle, { status: team.status, memberCount: team.members.length, baseCommit: team.baseCommit, headCommit: team.headCommit, branch: team.branch, workspace: team.workspace, brief: team.brief, reason: team.reason });
+    if (team.usage.total.messages > 0 || team.usage.unmeasuredMembers === 0) cycle.usage = cycleUsageSnapshot(team.usage);
+    else delete cycle.usage;
     if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) cycle.finishedAt ??= now();
     stored.goal.memberCount = stored.goal.cycles.reduce((sum, value) => sum + value.memberCount, 0);
   }

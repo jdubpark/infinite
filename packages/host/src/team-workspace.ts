@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync } from "node:fs";
 import { rm as rmAsync } from "node:fs/promises";
 import { basename, dirname, join, resolve, relative, isAbsolute, parse, sep } from "node:path";
 import type { TeamCommand, TeamTaskPlan } from "./team-types.js";
@@ -96,38 +96,64 @@ function removalFailed(result: CommandResult) {
   if (result.exitCode === 0 && !result.interrupted && !result.truncated) return;
   throw new TeamError(409, "workspace-removal-failed", "The host could not remove the agent-owned team workspace through its configured command prefix.");
 }
+function safeRemovalName(name: string) {
+  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\") || basename(name) !== name || isAbsolute(name))
+    throw new TeamError(409, "team-root-unsafe", "Team workspace removal found an unsafe top-level entry name.");
+  return name;
+}
 /** Remove both team clones, then the host-owned run directory. `configuredRoot` is required to fail closed. */
 export async function removeTeamWorkspace(runDirectory: string, prefix?: TeamCommand, signal?: AbortSignal, configuredRoot?: string) {
   if (!configuredRoot) throw new TeamError(409, "team-root-unsafe", "Team workspace removal requires its configured team root.");
   const safe = checkedRemovalDirectory(runDirectory, configuredRoot);
   if (!safe) return;
   if (prefix) {
-    const result = await teamCommand({ command: "rm", args: ["-rf", "--", "integration", "members"] }, safe.target, signal, 600000, prefix);
-    removalFailed(result);
+    const entries = readdirSync(safe.target).map(safeRemovalName);
+    if (entries.length) {
+      const result = await teamCommand({ command: "rm", args: ["-rf", "--", ...entries] }, safe.target, signal, 600000, prefix);
+      removalFailed(result);
+    }
   } else {
     await rmAsync(join(safe.target, "integration"), { recursive: true, force: true });
     await rmAsync(join(safe.target, "members"), { recursive: true, force: true });
   }
   await rmAsync(safe.target, { recursive: true, force: true });
 }
-/** Remove one member clone without following a redirected run or members directory. */
-export async function removeMemberWorkspace(runDirectory: string, memberId: string, prefix?: TeamCommand, signal?: AbortSignal, configuredRoot?: string) {
+/** Remove the recorded member clone without following a redirected run or parent directory. */
+export async function removeMemberWorkspace(runDirectory: string, memberCwd: string, prefix?: TeamCommand, signal?: AbortSignal, configuredRoot?: string): Promise<boolean> {
   if (!configuredRoot) throw new TeamError(409, "team-root-unsafe", "Member workspace removal requires its configured team root.");
-  safeWorkspaceId(memberId);
   const safe = checkedRemovalDirectory(runDirectory, configuredRoot);
-  if (!safe) return;
-  const members = join(safe.target, "members");
-  let info: ReturnType<typeof lstatSync>;
-  try { info = lstatSync(members); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-  if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info)) throw unsafeTeamRoot();
-  let canonicalMembers: string;
-  try { canonicalMembers = realpathSync(members); } catch { throw unsafeTeamRoot(); }
-  if (!strictlyInside(safe.target, canonicalMembers) || !strictlyInside(safe.root, join(canonicalMembers, memberId))) throw unsafeTeamRoot();
+  if (!safe) return false;
+  const target = resolve(memberCwd), rel = relative(safe.target, target), parts = rel.split(sep);
+  if (!strictlyInside(safe.target, target) || !parts.every(part => safeRemovalName(part))) throw unsafeTeamRoot();
+  const allowedLayout = (parts.length === 2 && parts[0] === "members") ||
+    (parts.length === 3 && parts[0] === "recovery" && parts[1] === "members") ||
+    (parts.length === 4 && parts[0] === "recovery" && parts[2] === "members");
+  if (!allowedLayout) throw unsafeTeamRoot();
+  if (parts[0] === "recovery" && parts.length === 4) safeWorkspaceId(parts[1]!);
+  safeWorkspaceId(parts.at(-1)!);
+  const parent = dirname(target);
+  let current = safe.target;
+  for (const part of parts.slice(0, -1)) {
+    current = join(current, part);
+    let info: ReturnType<typeof lstatSync>;
+    try { info = lstatSync(current); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+    if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info)) throw unsafeTeamRoot();
+    let canonical: string;
+    try { canonical = realpathSync(current); } catch { throw unsafeTeamRoot(); }
+    if (canonical !== current || !strictlyInside(safe.root, canonical)) throw unsafeTeamRoot();
+  }
+  if (current !== parent) throw unsafeTeamRoot();
+  const memberName = safeRemovalName(basename(target));
+  let memberInfo: ReturnType<typeof lstatSync>;
+  try { memberInfo = lstatSync(target); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+  if (!memberInfo.isDirectory() || memberInfo.isSymbolicLink() || !prefix && !hostOwned(memberInfo)) throw unsafeTeamRoot();
   if (prefix) {
-    const result = await teamCommand({ command: "rm", args: ["-rf", "--", memberId] }, canonicalMembers, signal, 600000, prefix);
+    const result = await teamCommand({ command: "rm", args: ["-rf", "--", memberName] }, parent, signal, 600000, prefix);
     removalFailed(result);
-  } else await rmAsync(join(canonicalMembers, memberId), { recursive: true, force: true });
+  } else await rmAsync(join(parent, memberName), { recursive: true, force: true });
+  return true;
 }
 const hostOwned = (stat: ReturnType<typeof lstatSync>) => {
   if (!stat) return false;

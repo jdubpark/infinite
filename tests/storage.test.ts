@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sampleVolumes } from "../packages/host/src/desktop.js";
@@ -18,10 +18,14 @@ test("volumeUsage reports byte and inode capacity for the filesystem containing 
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("sampleVolumes includes configured roots and deduplicates a shared filesystem", async () => {
+test("sampleVolumes includes configured roots and deduplicates roots on the same filesystem", async () => {
   const directory = await mkdtemp(join(tmpdir(), "inf-storage-"));
+  const workspace = join(directory, "workspaces");
   try {
-    const volumes = await sampleVolumes({ stateDir: directory, teams: { workspaceDir: directory } });
+    await mkdir(workspace);
+    const [stateInfo, workspaceInfo] = await Promise.all([stat(directory), stat(workspace)]);
+    assert.equal(stateInfo.dev, workspaceInfo.dev);
+    const volumes = await sampleVolumes({ stateDir: directory, teams: { workspaceDir: workspace } });
     assert.equal(volumes.length, 1);
     assert.equal(volumes[0].label, "state");
     assert.equal(volumes[0].path, directory);

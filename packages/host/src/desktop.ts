@@ -1,5 +1,5 @@
 import { constants, type Stats } from "node:fs";
-import { chmod, copyFile, link, lstat, mkdir, open, opendir, readFile, realpath, rename, rm, unlink } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, open, opendir, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { cpus, freemem, loadavg, platform, totalmem, uptime } from "node:os";
@@ -269,24 +269,26 @@ export type HostVolume = {
 export async function sampleVolumes(config: Pick<Config, "stateDir" | "teams">): Promise<HostVolume[]> {
   const roots: { label: HostVolume["label"]; path: string }[] = [{ label: "state", path: config.stateDir }];
   if (config.teams?.workspaceDir) roots.push({ label: "workspaces", path: config.teams.workspaceDir });
-  const sampled = await Promise.all(roots.map(async ({ label, path }): Promise<HostVolume> => {
-    try {
-      const usage = await volumeUsage(path);
+  const sampled = await Promise.all(roots.map(async ({ label, path }) => {
+    const [usage, info] = await Promise.all([
+      volumeUsage(path).catch(() => undefined),
+      stat(path).catch(() => undefined),
+    ]);
+    let volume: HostVolume;
+    if (usage) {
       const bytes = usage.totalBytes > 0 ? 1 - usage.availableBytes / usage.totalBytes : 0;
       const inodes = usage.totalInodes > 0 ? 1 - usage.availableInodes / usage.totalInodes : 0;
-      return { label, path, totalBytes: usage.totalBytes, availableBytes: usage.availableBytes, totalInodes: usage.totalInodes, availableInodes: usage.availableInodes, fullness: volumeFullness(usage), fullnessBy: inodes >= bytes ? "inodes" : "bytes" };
-    } catch {
-      return { label, path, totalBytes: null, availableBytes: null, totalInodes: null, availableInodes: null, fullness: null, fullnessBy: null };
-    }
+      volume = { label, path, totalBytes: usage.totalBytes, availableBytes: usage.availableBytes, totalInodes: usage.totalInodes, availableInodes: usage.availableInodes, fullness: volumeFullness(usage), fullnessBy: inodes >= bytes ? "inodes" : "bytes" };
+    } else volume = { label, path, totalBytes: null, availableBytes: null, totalInodes: null, availableInodes: null, fullness: null, fullnessBy: null };
+    return { volume, device: info?.dev };
   }));
-  const filesystems = new Set<string>();
-  return sampled.filter(volume => {
-    if (volume.totalBytes === null || volume.totalInodes === null) return true;
-    const identity = `${volume.totalBytes}:${volume.totalInodes}`;
-    if (filesystems.has(identity)) return false;
-    filesystems.add(identity);
+  const devices = new Set<number>();
+  return sampled.filter(({ device }) => {
+    if (device === undefined) return true;
+    if (devices.has(device)) return false;
+    devices.add(device);
     return true;
-  });
+  }).map(({ volume }) => volume);
 }
 /** Host-wide sampling is shared across clients; unsupported values stay null. */
 export class DesktopResources {

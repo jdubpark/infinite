@@ -400,7 +400,7 @@ const shown = (category: string, included: number, total: number) => `${category
 
 /** One first-come budget, spent in a fixed order on whole records. Anything left out is
  * reachable through the paged detail endpoints, and the catalog is never emptied. */
-function boundedResponse(value: WorkspaceUnderstanding): WorkspaceUnderstanding {
+export function boundedResponse(value: WorkspaceUnderstanding): WorkspaceUnderstanding {
   const bytes = (item: unknown) => Buffer.byteLength(JSON.stringify(item)) + 1;
   let remaining = MAX_RESPONSE_BYTES - 64 * 1024;
   const take = (item: unknown) => { const size = bytes(item); if (size > remaining) return false; remaining -= size; return true; };
@@ -429,12 +429,17 @@ function boundedResponse(value: WorkspaceUnderstanding): WorkspaceUnderstanding 
   for (const repo of repositories) for (const plan of sourceOf(repo).planned) if (take(plan)) repo.planned.push(plan);
 
   if (knowledge && result) {
-    for (const key of ["components", "relationships", "delivery", "briefs", "diagrams"] as const) {
-      const all = (knowledge[key] ?? []) as any[], ids = new Set(result.components.map(component => component.id));
-      const chosen = all.filter(item => (key !== "relationships" || (ids.has(item.from) && ids.has(item.to))) && take(item));
-      (result as any)[key] = chosen;
-      if (chosen.length < all.length) result.coverage.push(shown(key[0]!.toUpperCase() + key.slice(1), chosen.length, all.length));
-    }
+    const takeAll = <T>(items: T[] | undefined, label: string, keep: (item: T) => boolean = () => true): T[] => {
+      const all = items ?? [], chosen = all.filter(item => keep(item) && take(item));
+      if (chosen.length < all.length) result.coverage.push(shown(label, chosen.length, all.length));
+      return chosen;
+    };
+    result.components = takeAll(knowledge.components, "Components");
+    const kept = new Set(result.components.map(component => component.id));
+    result.relationships = takeAll(knowledge.relationships, "Relationships", edge => kept.has(edge.from) && kept.has(edge.to));
+    result.delivery = takeAll(knowledge.delivery, "Delivery");
+    result.briefs = takeAll(knowledge.briefs, "Briefs");
+    result.diagrams = takeAll(knowledge.diagrams, "Diagrams");
   }
 
   for (const repo of repositories) for (const source of sourceOf(repo).current.slice(1)) addArtifact(repo, source);

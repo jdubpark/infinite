@@ -134,6 +134,51 @@ function diffStat(output?: string) {
     tests: rows.some(row => /(^|\/)(tests?|__tests__)(\/|$)|\.(test|spec)\./i.test(row.path)) };
 }
 
+const maxRunChangeFiles = 400;
+const maxTaskChangedPaths = 200;
+
+/**
+ * Parses `git diff --name-status -z -M` (STATUS NUL path NUL, or R/C NUL old NUL new NUL) and the matching
+ * `--numstat -z -M` output into the bounded run change index. A missing numstat leaves counts null; a missing
+ * name-status read yields no index at all.
+ */
+export function changeIndex(nameStatus: string | undefined, numstat: string | undefined, headCommit: string, at: string): TeamRun["changes"] | undefined {
+  if (nameStatus === undefined) return undefined;
+  const counts = new Map<string, { added: number | null; removed: number | null }>();
+  if (numstat !== undefined) {
+    const tokens = numstat.split("\0");
+    for (let i = 0; i < tokens.length; i++) {
+      if (!tokens[i]) continue;
+      const [added, removed, ...rest] = tokens[i].split("\t");
+      // Renames under -z emit "added\tremoved\t" with an empty path, then the old and new paths as separate NUL fields.
+      let path = rest.join("\t");
+      if (path === "") { path = tokens[i + 2] ?? ""; i += 2; }
+      if (path) counts.set(path, { added: added === "-" ? null : Number(added), removed: removed === "-" ? null : Number(removed) });
+    }
+  }
+  const tokens = nameStatus.split("\0");
+  const entries: NonNullable<TeamRun["changes"]>["files"] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const code = tokens[i];
+    if (!code) continue;
+    const pairedPath = /^[RC]/.test(code);
+    const path = pairedPath ? tokens[i + 2] : tokens[i + 1];
+    if (pairedPath) i += 2; else i += 1;
+    if (!path) continue;
+    const letter = code[0];
+    const status = letter === "A" || letter === "C" ? "added" : letter === "D" ? "removed" : letter === "R" ? "renamed" : "modified";
+    entries.push({ path, status, ...(counts.get(path) ?? { added: null, removed: null }) });
+  }
+  return { headCommit, recordedAt: at, files: entries.slice(0, maxRunChangeFiles), truncated: entries.length > maxRunChangeFiles };
+}
+
+/** Bounded path list from `git diff --name-only -z`; the NUL-separated paths are kept verbatim. */
+function changedPathList(output: string | undefined): TeamTask["changedPaths"] | undefined {
+  if (output === undefined) return undefined;
+  const paths = output.split("\0").filter(Boolean);
+  return { paths: paths.slice(0, maxTaskChangedPaths), truncated: paths.length > maxTaskChangedPaths };
+}
+
 /** Written by hosts before stall detection; still resumable. */
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
 export const memberStallReason = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
@@ -608,6 +653,7 @@ export class TeamService {
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   /** Persisted team records for the read-only Understanding view; performs no tracker or usage refresh. */
   understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.run)); }
+  pendingOperation(runId: string): boolean { return Boolean(this.records.get(runId)?.pending); }
   understandingOwnsSession(runId: string, memberId: string, sessionId: string, projectId: string): boolean {
     const stored = this.records.get(runId);
     return Boolean(stored && stored.run.projectId === projectId && stored.run.members.some(member =>
@@ -3854,6 +3900,9 @@ export class TeamService {
         if (result) {
           const previousRevision = run.revision, oldBase = run.baseCommit, oldHead = run.headCommit!;
           const originalPath = relative(stored.root ?? this.config.teams?.workspaceDir ?? dirname(result.originalWorkspace), result.originalWorkspace).slice(0, 256);
+          delete run.changes;
+          for (const task of run.tasks) delete task.changedPaths;
+          for (const continuation of run.continuations ?? []) for (const task of continuation.tasks) delete task.changedPaths;
           run.continuations = [...(run.continuations ?? []), {
             revision: previousRevision, requestId: randomUUID(), at: timestamp(),
             reason: "The delivery coordinator reported no publication after the configured base moved; original implementation and review history are retained.",
@@ -3971,12 +4020,27 @@ export class TeamService {
       const head = commit ? await integrateMemberResult(run.workspace, member.cwd, commit, this.config.teams?.commandPrefix, signal) : run.headCommit!;
       // Diff stats are scorecard evidence only: a launcher that refuses the command must not block integration.
       const diff = commit ? await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--no-renames", "-z", member.baseCommit, commit, "--"]) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix).catch(() => undefined) : undefined;
-      return { commit, head, diff: diff?.exitCode === 0 ? diff.stdout : undefined };
-    }, ({ commit, head, diff }) => {
+      // Change evidence is best-effort too: a refused or truncated read leaves the field absent and never fails integration.
+      const gitRead = (args: string[]) => teamCommand({ command: "git", args: teamGitArgs(run.workspace, args) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix)
+        .then(result => result.exitCode === 0 && !result.interrupted && !result.truncated ? result.stdout : undefined, () => undefined);
+      const change = commit ? {
+        nameStatus: await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-M", "-z", run.baseCommit, head, "--"]),
+        numstat: await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-M", "-z", run.baseCommit, head, "--"]),
+        taskPaths: task ? await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", member.baseCommit, commit, "--"]) : undefined,
+      } : undefined;
+      return { commit, head, diff: diff?.exitCode === 0 ? diff.stdout : undefined,
+        changes: change ? changeIndex(change.nameStatus, change.numstat, head, timestamp()) : undefined,
+        changedPaths: change?.taskPaths !== undefined ? changedPathList(change.taskPaths) : undefined };
+    }, ({ commit, head, diff, changes, changedPaths }) => {
       run.headCommit = head; stored.checkHead = undefined; run.review = undefined;
+      // Only a new commit moves the range; a no-change result keeps the index it already recorded.
+      if (commit) { if (changes) run.changes = changes; else delete run.changes; }
       if (member.role === "integrator" && run.deliveryRecovery?.status === "replanning" && run.deliveryRecovery.revision === run.revision)
         run.deliveryRecovery.integratedHeadCommit = head;
-      if (task) { task.status = "integrated"; task.commit = commit; task.summary = report.summary; task.diffStat = diffStat(diff); }
+      if (task) {
+        task.status = "integrated"; task.commit = commit; task.summary = report.summary; task.diffStat = diffStat(diff);
+        if (changedPaths) task.changedPaths = changedPaths; else delete task.changedPaths;
+      }
       if (member.role === "implementer" || member.role === "integrator") this.retentionState(stored).integratedAt[member.memberId] = this.retentionNow();
       this.event(stored, `${member.title} reported a result; its validated changes were integrated.`);
       run.status = "implementing";

@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rename
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { claimControl, startHost, waitFor } from "./helpers.js";
-import { UnderstandingService } from "../packages/host/src/understanding.js";
+import { retainedDiagrams, UnderstandingService } from "../packages/host/src/understanding.js";
 import { writeSealed } from "../packages/host/src/vault.js";
 import { createRemoteClient, type GeneratedCatalogPage, type WorkspaceUnderstanding } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
@@ -14,6 +14,21 @@ import { createGoalSchema, type ProductGoal } from "../packages/host/src/goal-ty
 import { RepositoryBriefings } from "../packages/host/src/repository-briefings.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
+
+test("retained diagrams fall back to source when a parsed graph violates the retained schema", () => {
+  const mermaid = `flowchart LR\n  API[${"x".repeat(201)}] --> Store`;
+  const retained = retainedDiagrams("a".repeat(36), [{ title: "Oversized node", kind: "system", mermaid, citations: [] }]);
+  const diagram = retained.diagrams[0];
+
+  assert.equal(diagram?.sourceText, mermaid);
+  assert.ok(diagram?.parseError);
+  assert.equal(diagram?.nodes.length, 0);
+  assert.deepEqual(retained.coverage, []);
+
+  const invalidFallback = retainedDiagrams("a".repeat(36), [{ title: "x".repeat(121), kind: "system", mermaid: "flowchart LR\n  A --> B", citations: [] }]);
+  assert.deepEqual(invalidFallback.diagrams, []);
+  assert.equal(invalidFallback.coverage.length, 1, "a diagram that cannot fit even as source is reported without aborting artifact retention");
+});
 
 function initializeRepo(path: string) {
   execFileSync("git", ["init", "-q"], { cwd: path });
@@ -339,6 +354,16 @@ test("Understanding is a read-only scoped API and its source-bound brief survive
     assert.ok(afterRestart.body.repositories[0].current.some((artifact: any) => artifact.id === artifactId), "a corrupt generation cannot hide an older valid generation");
     assert.ok(afterRestart.body.repositories[0].current.every((artifact: any) => artifact.id !== secondArtifact.id));
     assert.match(afterRestart.body.repositories[0].warnings.join(" "), /corrupt/);
+    const restoredArtifact = afterRestart.body.repositories[0].current.find((artifact: any) => artifact.id === artifactId);
+    assert.equal(restoredArtifact.brief.diagrams.length, 2, "retained artifacts carry the parsed brief diagrams");
+    const [parsedDiagram, brokenDiagram] = restoredArtifact.brief.diagrams;
+    assert.deepEqual(parsedDiagram.nodes.map((node: any) => node.id), ["API", "Policy"]);
+    assert.equal(parsedDiagram.edges.length, 1);
+    assert.equal(parsedDiagram.id, `${artifactId}:0`);
+    assert.equal(parsedDiagram.basis, "model");
+    assert.equal(brokenDiagram.parseError !== undefined, true, "an unsupported Mermaid construct is kept as source with a parse error");
+    assert.equal(brokenDiagram.sourceText, "flowchart LR\n  A --> B\n  style A fill:#f00");
+    assert.equal(brokenDiagram.nodes.length, 0);
 
     const movedGroup = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Moved workspace", repos: ["rehearsal"] });
     assert.equal(movedGroup.status, 200);

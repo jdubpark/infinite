@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { ApiError, api, connectionKey, type Connection, type ProjectGroupList } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
@@ -22,7 +22,7 @@ const views: SegmentOption<ViewMode>[] = [
 /** Read-only Work and System views for one explicitly grouped workspace. */
 export function UnderstandingWorkspace({ connection, workspaceId }: { connection: Connection; workspaceId: string }) {
   const router = useRouter();
-  const params = useLocalSearchParams<{ machine?: string }>();
+  const params = useLocalSearchParams<{ machine?: string; view?: string; component?: string }>();
   // Keep credential changes inside the in-memory poll scope so stale responses cannot cross pairings.
   const key = `${connectionKey(connection)}|${connection.url}|${connection.relay?.machineId ?? "direct"}|${connection.token}|${connection.access?.clientId ?? ""}|${connection.access?.clientSecret ?? ""}`;
   const scope = `${key}\u0000${workspaceId}`;
@@ -30,7 +30,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   const content = useRef<View>(null);
   const stopped = useRef("");
   const last = useRef<ReadResult | null>(null);
-  const [view, setView] = useState<ViewMode>("work");
+  const [view, setView] = useState<ViewMode>(params.view === "system" ? "system" : "work");
 
   const poll = usePoll(async () => {
     if (stopped.current === scope && last.current?.scope === scope) return last.current;
@@ -117,7 +117,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
       {data && (result?.cachedAt || !poll.online) ? <Text style={s.notice}>{result?.cachedAt ? `Offline · cached overview from ${date(result.cachedAt)}. Only workspace and repository labels and state are available.` : `Offline · showing the last response received for this workspace at ${date(data.observedAt)}.`}</Text> : null}
       {data ? view === "work"
         ? <WorkView data={data} repoById={repoById} onOpenRepo={openRepo} connection={connection} workspaceId={workspaceId} readGeneration={`${poll.seen}|${data.observedAt}/${data.workspace.revision}`} offline={!poll.online || Boolean(result?.cachedAt)} onComponentNavigate={revealKnowledge} />
-        : <SystemView data={data} connection={connection} workspaceId={workspaceId} readGeneration={`${poll.seen}|${data.observedAt}/${data.workspace.revision}`} offline={!poll.online || Boolean(result?.cachedAt)} onComponentNavigate={revealKnowledge} />
+        : <SystemView data={data} connection={connection} workspaceId={workspaceId} readGeneration={`${poll.seen}|${data.observedAt}/${data.workspace.revision}`} offline={!poll.online || Boolean(result?.cachedAt)} onComponentNavigate={revealKnowledge} initialComponent={params.component} />
         : null}
       </View>
     </ScrollView>
@@ -136,14 +136,13 @@ function WorkView({ data, repoById, onOpenRepo, connection, workspaceId, readGen
 }) {
   const anchor = useRef<View>(null);
   const router = useRouter();
+  const openWork = (id: string) => router.push({ pathname: "/understanding/work", params: { workspace: workspaceId, work: id, machine: connectionKey(connection) } });
   return <View style={s.stack}>
     <Text style={s.intro}>Work recorded for this workspace, with the repositories each item names.</Text>
     <MembershipMap workspace={data.workspace.name} repositories={data.repositories} onPress={onOpenRepo} />
     <Text style={s.heading}>Work <Text style={s.count}>{data.work.length}</Text></Text>
     {!data.work.length ? <Text style={s.note}>No work records are available for this workspace.</Text> : null}
-    {data.work.map(item => <WorkCard key={item.id} item={item} repoById={repoById}
-      onOpen={(kind, id) => router.push({ pathname: routeFor(kind), params: { id, machine: connectionKey(connection) } })}
-      onOpenRepo={onOpenRepo} />)}
+    {data.work.map(item => <WorkCard key={item.id} item={item} repoById={repoById} onOpen={() => openWork(item.id)} onOpenRepo={onOpenRepo} />)}
     <View ref={anchor}><KnowledgePanel onComponentNavigate={() => onComponentNavigate(anchor.current)} key={`${connectionKey(connection)}|${connection.url}|${connection.token}|${workspaceId}`} connection={connection} workspaceId={workspaceId} knowledge={data.knowledge} readGeneration={readGeneration} defaultArea="catalog" repositories={data.repositories} work={data.work} offline={offline} /></View>
     {data.coverage.map((line, index) => <Text key={`coverage-${index}`} style={s.note}>{line}</Text>)}
   </View>;
@@ -152,49 +151,20 @@ function WorkView({ data, repoById, onOpenRepo, connection, workspaceId, readGen
 function WorkCard({ item, repoById, onOpen, onOpenRepo }: {
   item: UnderstandingWork;
   repoById: Map<string, UnderstandingRepository>;
-  onOpen: (kind: UnderstandingWork["kind"], id: string) => void;
+  onOpen: () => void;
   onOpenRepo: (id: string) => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const [linkError, setLinkError] = useState("");
   const repoNames = item.repositoryIds.map(id => repoById.get(id)).filter((repo): repo is UnderstandingRepository => Boolean(repo));
-  const openLink = async (value: string) => {
-    try {
-      const url = new URL(value);
-      if (url.protocol !== "https:" || url.username || url.password) throw new Error("Only secure web links can be opened.");
-      await Linking.openURL(url.toString());
-      setLinkError("");
-    } catch (error) {
-      setLinkError(error instanceof Error ? error.message : "This link could not be opened.");
-    }
-  };
   return <View style={s.card}>
-    <Pressable accessibilityRole="button" accessibilityState={{ expanded }} onPress={() => setExpanded(value => !value)} style={s.workHead}>
+    <Pressable accessibilityRole="button" accessibilityLabel={`Open work brief for ${item.title}`} onPress={onOpen} style={({ pressed }) => [s.workHead, pressed && s.pressed]}>
       <View style={s.workMain}>
         <Text style={s.workTitle}>{item.title}</Text>
         <Text style={s.meta}>{kindLabel(item.kind)} · {item.status} · updated {date(item.updatedAt)}</Text>
       </View>
-      <Glyph name={expanded ? "down" : "forward"} size={13} color={theme.colors.mutedInk} />
+      <Glyph name="forward" size={13} color={theme.colors.mutedInk} />
     </Pressable>
     {item.scope === "partial" ? <Text style={s.notice}>Partial association · some request or report details are withheld because the work spans other workspaces.</Text> : null}
-    {expanded ? <View style={s.detail}>
-      {item.objective ? <LabeledText title="Recorded request" text={item.objective} /> : null}
-      {item.reportedSummary ? <LabeledText title="Reported result" text={item.reportedSummary} /> : null}
-      <Text style={s.meta}>Execution status: {item.status}. {date(item.updatedAt)}</Text>
-      <Text style={s.label}>Recorded repository association</Text>
-      {repoNames.length ? <View style={s.association}>
-        <View style={s.workNode}><Text style={s.workNodeText}>Work</Text></View>
-        <Text style={s.associationArrow}>→</Text>
-        <View style={s.chips}>{repoNames.map(repo => <Chip key={repo.id} label={repo.name} onPress={() => onOpenRepo(repo.id)} accessibilityLabel={`Open associated repository ${repo.name} in System`} />)}</View>
-      </View> : <Text style={s.note}>No repository association is available.</Text>}
-      <View style={s.chips}>
-        <Pressable accessibilityRole="link" onPress={() => onOpen(item.kind, item.sourceId)} style={s.linkButton}><Text style={s.linkText}>Open {kindLabel(item.kind).toLowerCase()}</Text><Glyph name="forward" size={12} color={theme.colors.forest} /></Pressable>
-        {item.links.map((link, index) => <Pressable key={`${link.kind}/${index}`} accessibilityRole="link" onPress={() => void openLink(link.url)} style={s.linkButton}>
-          <Text style={s.linkText}>{link.kind === "pr" ? "Pull request" : "Issue"}: {link.label}</Text><Glyph name="forward" size={12} color={theme.colors.forest} />
-        </Pressable>)}
-      </View>
-      {linkError ? <Text accessibilityRole="alert" style={s.linkError}>{linkError}</Text> : null}
-    </View> : null}
+    {repoNames.length ? <View style={s.chips}>{repoNames.map(repo => <Chip key={repo.id} label={repo.name} onPress={() => onOpenRepo(repo.id)} accessibilityLabel={`Open associated repository ${repo.name} in System`} />)}</View> : null}
   </View>;
 }
 
@@ -219,9 +189,10 @@ function MembershipMap({ workspace, repositories, onPress }: { workspace: string
   </View>;
 }
 
-function SystemView({ data, connection, workspaceId, readGeneration, offline, onComponentNavigate }: { data: WorkspaceUnderstanding; connection: Connection; workspaceId: string; readGeneration: string; offline: boolean; onComponentNavigate: (anchor: View | null) => void }) {
+function SystemView({ data, connection, workspaceId, readGeneration, offline, onComponentNavigate, initialComponent }: { data: WorkspaceUnderstanding; connection: Connection; workspaceId: string; readGeneration: string; offline: boolean; onComponentNavigate: (anchor: View | null) => void; initialComponent?: string }) {
   const anchor = useRef<View>(null);
-  const [open, setOpen] = useState({ id: "", nonce: 0 });
+  // A `component` route param (from a work brief) opens that component once, when the view mounts.
+  const [open, setOpen] = useState({ id: initialComponent ?? "", nonce: initialComponent ? 1 : 0 });
   return <View style={s.stack}>
     <SystemOverview connection={connection} workspaceId={workspaceId} data={data} offline={offline}
       onOpenComponent={id => { setOpen(previous => ({ id, nonce: previous.nonce + 1 })); onComponentNavigate(anchor.current); }} />
@@ -232,13 +203,6 @@ function SystemView({ data, connection, workspaceId, readGeneration, offline, on
   </View>;
 }
 
-function LabeledText({ title, text }: { title: string; text: string }) {
-  return <View style={s.section}><Text style={s.label}>{title}</Text><Text selectable style={s.body}>{text}</Text></View>;
-}
-
-function routeFor(kind: UnderstandingWork["kind"]): "/mission/[id]" | "/team/[id]" | "/goal/[id]" {
-  return kind === "mission" ? "/mission/[id]" : kind === "team" ? "/team/[id]" : "/goal/[id]";
-}
 function kindLabel(kind: UnderstandingWork["kind"]) { return kind === "team" ? "Teamwork" : kind === "goal" ? "Goal" : "Mission"; }
 function date(value: string) { const parsed = new Date(value); return Number.isNaN(parsed.getTime()) ? "time not recorded" : parsed.toLocaleString(); }
 
@@ -270,13 +234,6 @@ const s = StyleSheet.create({
   label: { fontSize: 11, lineHeight: 16, fontWeight: "700", color: theme.colors.secondaryInk },
   body: { fontSize: 13, lineHeight: 19, color: theme.colors.ink, flexShrink: 1 },
   chips: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 7 },
-  association: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 7, paddingVertical: 5 },
-  workNode: { minHeight: 28, justifyContent: "center", paddingHorizontal: 8, borderRadius: theme.radius.card, borderWidth: 1, borderColor: theme.colors.fieldRule, backgroundColor: theme.colors.secondarySurface },
-  workNodeText: { fontSize: 11, fontWeight: "700", color: theme.colors.secondaryInk },
-  associationArrow: { color: theme.colors.mutedInk, fontSize: 14 },
-  linkButton: { minHeight: 34, flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 9, borderRadius: theme.radius.capsule, backgroundColor: theme.colors.secondarySurface },
-  linkText: { fontSize: 12, fontWeight: "600", color: theme.colors.forest, flexShrink: 1 },
-  linkError: { fontSize: 12, lineHeight: 18, color: theme.colors.error },
   notice: { fontSize: 12, lineHeight: 18, color: theme.colors.warningInk, backgroundColor: theme.colors.warningSurface, padding: 9, borderRadius: theme.radius.card },
   note: { fontSize: 12, lineHeight: 18, color: theme.colors.mutedInk },
   empty: { paddingVertical: 42, gap: 8, alignItems: "center" },

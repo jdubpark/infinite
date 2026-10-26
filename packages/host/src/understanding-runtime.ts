@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
-import type { DiagramGraph, KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeMaintenance, KnowledgePlan, KnowledgeRelationship, KnowledgeRepositoryBrief, KnowledgeSource, UnderstandingBrief, WorkspaceKnowledge } from "@infinite/remote";
+import type { Diagram, DiagramGraph, KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeMaintenance, KnowledgePlan, KnowledgeRelationship, KnowledgeRepositoryBrief, KnowledgeSource, UnderstandingBrief, WorkspaceKnowledge } from "@infinite/remote";
 import type { Config } from "./types.js";
 import type { ProjectGroup, ProjectGroupList, ProjectGroupRepo } from "./project-group-types.js";
 import { captureIdentity, readGit } from "./checkout-identity.js";
@@ -62,6 +62,8 @@ export interface UnderstandingAdapter {
   synthesize?(input: UnderstandingSynthesisInput, options: UnderstandingAdapterOptions): Promise<{ components: KnowledgeComponent[]; coverage: string[] }>;
   brief?(input: { workspaceId: string; root: string; repositoryId: string; context: RepoContext; base: string | null; components: Pick<KnowledgeComponent, "id" | "name">[] }, options: UnderstandingAdapterOptions): Promise<RepositoryBriefOutput>;
   delivery?(input: { workspaceId: string; root: string; repositoryId: string; head: string | null }, options: UnderstandingAdapterOptions): Promise<KnowledgeDelivery>;
+  /** Writes one work narrative for a recorded range; only an explicit refresh calls it. */
+  explainWork?(input: { root: string; baseCommit: string; question: string }, options: UnderstandingAdapterOptions): Promise<{ brief: UnderstandingBrief; diagrams: Diagram[]; engine: string; model: string; generatedAt: string; coverage: string[] }>;
 }
 export function createContextAdapter(config: Config): UnderstandingAdapter {
   return config.repositoryBriefings ? { context: (root, options) => runRepositoryContext(config, root, options) } : {};
@@ -243,16 +245,21 @@ export class UnderstandingRuntime {
     return next;
   }
 
-  read(workspaceId: string): ReadKnowledge {
+  read(workspaceId: string): ReadKnowledge { return this.readWithContexts(workspaceId).knowledge; }
+
+  /** Knowledge plus the accepted repositories' stored contexts from the same validated pass, so provenance never outlives a rejected binding. */
+  readWithContexts(workspaceId: string): { knowledge: ReadKnowledge; contexts: Record<string, RepoContext> } {
     const group = this.group(workspaceId);
     try {
       const catalog = this.options.catalog.read(workspaceId);
       const saved = this.state.workspaces[workspaceId];
+      const contexts: Record<string, RepoContext> = {};
       const entries = group.repos.map((repo): { projectId: string; stored: StoredRepository; currentHead: string | undefined } | undefined => {
         const stored = saved?.repositories[repo.projectId];
         if (!stored) return undefined;
         const binding = this.binding(repo, group);
         if (binding.rootIdentity !== stored.rootIdentity) return undefined;
+        contexts[repo.projectId] = stored.context;
         const currentHead = readGit(binding.root, ["rev-parse", "HEAD"]);
         if (currentHead && currentHead === stored.head) return { projectId: repo.projectId, stored, currentHead };
         return { projectId: repo.projectId, currentHead, stored: { ...stored, components: stored.components.map(component => ({ ...component, current: { ...component.current, state: "stale" as const, summary: "Repository HEAD changed since this source map was observed." }, coverage: [...component.coverage, "Repository HEAD differs from the latest observed source map."] })) } };
@@ -270,9 +277,9 @@ export class UnderstandingRuntime {
       if (this.loadFailed) maintenance = { ...maintenance, state: "unavailable", message: "Encrypted maintenance state failed validation; the host will not overwrite it or start jobs until explicit recovery." };
       const briefs: KnowledgeRepositoryBrief[] = entries.flatMap(({ projectId, stored, currentHead }) => stored.brief ? [{ repositoryId: projectId, ...stored.brief, state: currentHead && currentHead === stored.brief.head ? "ready" as const : "stale" as const }] : []);
       const diagrams = [...repos.flatMap(repo => repo.componentDiagram ? [repo.componentDiagram] : []), ...briefs.flatMap(brief => brief.diagrams)];
-      return { components, relationships, delivery, maintenance, coverage, briefs, diagrams };
+      return { knowledge: { components, relationships, delivery, maintenance, coverage, briefs, diagrams }, contexts };
     } catch {
-      return { components: [], relationships: [], delivery: [], maintenance: { ...emptyMaintenance({ enabled: false, synthesis: false, delivery: false, intervalMinutes: 60, dailyJobLimit: 0 }), state: "unavailable", message: "Workspace sources are unavailable or changed." }, coverage: ["Workspace source or catalog could not be read safely."] };
+      return { knowledge: { components: [], relationships: [], delivery: [], maintenance: { ...emptyMaintenance({ enabled: false, synthesis: false, delivery: false, intervalMinutes: 60, dailyJobLimit: 0 }), state: "unavailable", message: "Workspace sources are unavailable or changed." }, coverage: ["Workspace source or catalog could not be read safely."] }, contexts: {} };
     }
   }
 
@@ -780,7 +787,7 @@ export class UnderstandingRuntime {
   }
 }
 
-function runRepositoryContext(config: Config, root: string, options: UnderstandingAdapterOptions, onChild: (child: ChildProcess) => void = () => {}, onDone: (child: ChildProcess) => void = () => {}, stop: (child: ChildProcess) => void = stopContextChild): Promise<RepoContext> {
+export function runRepositoryContext(config: Config, root: string, options: UnderstandingAdapterOptions, onChild: (child: ChildProcess) => void = () => {}, onDone: (child: ChildProcess) => void = () => {}, stop: (child: ChildProcess) => void = stopContextChild): Promise<RepoContext> {
   const briefing = config.repositoryBriefings;
   if (!briefing) return Promise.reject(new Error("repository-briefings-unavailable"));
   const commandArgs = [...briefing.args, "context", "--repo", root];

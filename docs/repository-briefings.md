@@ -190,6 +190,66 @@ read one. Catalog, component, policy and mutation commands are documented in
 Hosts predating the optional knowledge contract retain the original reading
 experience and require an upgrade for the additional controls.
 
+### Work briefs
+
+A **work brief** explains one recorded work item (a team run, a mission or a
+goal) as sections of typed blocks instead of raw request and report text.
+`GET /work/:workId` returns `schemaVersion: 1`, the work identity and source
+revision, a `narrative` status and `sections`. `workId` is the same
+`team:<id>`, `mission:<id>` or `goal:<id>` key the understanding response
+lists; a subteam of a mission or goal can be opened by its own `team:` key.
+Work outside the workspace, or a partial association, returns `404` with code
+`understanding-work`. A read never starts a writer or any other model process; it
+only consults recorded state and the same bounded Git freshness checks the
+knowledge read already performs. `POST /work/:workId/refresh`
+with an empty object asks for a model narrative and is limited to owner and
+controller; viewers receive `403`. It returns `202` when a job was queued and
+`200` otherwise, with the resulting `narrative` status in both cases.
+
+The deterministic part is assembled at read time from recorded data. Each
+section has a kind, and empty kinds are omitted: `overview` (facts and a
+summary), `changes` (components added, modified or removed), `diagram`,
+`narrative`, `tasks`, `checks`, `decisions`, `review`, `delivery`, `request`
+(the owner's request as rich text), `report` (dated agent reports) and
+`evidence` (commits, map observation, citations and coverage). Every block of
+text carries a basis: `source` is an observation of the recorded range or
+checkout, `agent` an agent's report, `owner` text the owner wrote, `model`
+writer output with citations and `host` the host's own record. Statuses are
+quoted verbatim from the source; a brief never infers completion, delivery or
+deployment.
+
+Team integration records a change index (`run.changes`, up to 400 files) and
+each task's changed paths (up to 200). Component changes map those paths onto
+the workspace's component map; paths outside any component fall back to a
+folder unit. A component is `added` when every recorded file in it was added
+and the map lists no other file, `removed` when every file was removed, and
+`modified` otherwise. The change map diagram is built from these units and
+their recorded relationships, capped at 24 nodes, with basis `source`.
+Runs integrated before this index existed show a note that changed paths were
+not recorded. Writer diagrams in Mermaid are parsed into node and edge data at
+persist time; unsupported constructs keep the source text and a parse error
+and are never rendered as markup.
+
+Narratives are optional model output and exist only for team runs. A narrative
+is keyed by work ID, base commit and head commit; a cached narrative for a
+different head is reported as `stale`, never as current. A refresh runs only
+when a summary writer is configured, the run has no pending operation and a
+settled status, and its recorded integration workspace is still checked out at
+the recorded head. Once workspace retention (see [teams](teams.md)) starts
+removing a run's workspace, no new narrative can be generated for it; an
+already generated narrative stays readable. The writer runs `context` and then `brief --repo <workspace>
+--base <baseCommit> --format json --no-state` with a work question. Each
+workspace may start 48 narrative jobs per UTC day, a failed job blocks further
+attempts for 10 minutes, and the sealed store keeps 64 records and 4 MiB per
+workspace. Narrative states are `ready`, `pending`, `stale`, `failed` and
+`unavailable` with a reason.
+
+Response bounds: 12 sections, 40 blocks and 4000 rich-text nodes per brief,
+4 diagrams of at most 48 nodes and 120 edges, 60 components and 400 files per
+components block, 2000 characters of check output and 24 citations per block.
+When a brief exceeds the response size, `overview` and `request` are kept
+first and a coverage line records the truncation.
+
 ## Session summary
 
 When `repositoryBriefings` is absent, `GET /api/sessions/:id/summary` keeps its

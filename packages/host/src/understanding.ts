@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, type Stats } from "node:fs";
 import { isAbsolute, relative, resolve, sep, join } from "node:path";
 import { z } from "zod";
-import type { GeneratedCatalogPage, GeneratedPlan, GeneratedProject, UnderstandingArtifact, UnderstandingLink, UnderstandingPlan, UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding, WorkspaceKnowledge } from "@infinite/remote";
+import { parseMermaid } from "@infinite/remote";
+import type { Diagram, GeneratedCatalogPage, GeneratedPlan, GeneratedProject, UnderstandingArtifact, UnderstandingLink, UnderstandingPlan, UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding, WorkspaceKnowledge } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
 import { captureIdentity, readGit } from "./checkout-identity.js";
 import type { RepositorySummary, RepositoryBriefings } from "./repository-briefings.js";
@@ -26,11 +27,29 @@ const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(va
 const projectIdSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
 const citationSchema = z.object({ source: z.string().min(1).max(1024), line: z.number().int().positive() }).strict();
 const claimSchema = z.object({ text: z.string().min(1).max(900), citations: z.array(citationSchema).max(6) }).strict();
+const MAX_DIAGRAM_NODES = 48, MAX_DIAGRAM_EDGES = 120;
+const idText = z.string().min(1).max(120);
+const diagramSchema = z.object({
+  id: idText, title: z.string().min(1).max(120), kind: z.enum(["change-map", "system", "change", "sequence"]),
+  basis: z.enum(["source", "agent", "owner", "model", "host"]), direction: z.enum(["LR", "TD"]),
+  nodes: z.array(z.object({ id: idText, label: z.string().max(200), shape: z.enum(["box", "round", "diamond", "cylinder", "pill"]),
+    change: z.enum(["added", "modified", "removed"]).optional(), componentId: z.string().max(200).optional(), group: z.string().max(200).optional() }).strict()).max(MAX_DIAGRAM_NODES),
+  edges: z.array(z.object({ from: idText, to: idText, label: z.string().max(200).optional(), style: z.enum(["solid", "dashed", "thick"]),
+    kind: z.enum(["imports", "calls", "publishes", "consumes", "stores", "implements"]).optional() }).strict()).max(MAX_DIAGRAM_EDGES),
+  groups: z.array(z.object({ id: idText, label: z.string().max(200) }).strict()).max(MAX_DIAGRAM_NODES),
+  sequence: z.object({
+    participants: z.array(z.object({ id: idText, label: z.string().max(200) }).strict()).max(MAX_DIAGRAM_NODES),
+    messages: z.array(z.object({ from: idText, to: idText, text: z.string().max(300), style: z.enum(["solid", "dashed"]) }).strict()).max(MAX_DIAGRAM_EDGES),
+  }).strict().optional(),
+  sourceText: z.string().max(3000).optional(), parseError: z.string().max(500).optional(),
+  citations: z.array(citationSchema).max(24), coverage: z.array(z.string().max(500)).max(20),
+}).strict();
 const briefSchema = z.object({
   summary: z.string().min(1).max(600), architecture: z.array(claimSchema).max(6), changes: z.array(claimSchema).max(6), checks: z.array(claimSchema).max(4),
   review: z.array(z.object({ priority: z.enum(["high", "medium"]), area: z.string().min(1).max(150), why: z.string().min(1).max(900), question: z.string().min(1).max(900), citations: z.array(citationSchema).max(6) }).strict()).max(5),
   guidance: z.array(z.object({ text: z.string().min(1).max(900), basis: z.enum(["documented", "proposed"]), citations: z.array(citationSchema).max(6) }).strict()).max(4),
   unknowns: z.array(z.string().min(1).max(900)).max(8),
+  diagrams: z.array(diagramSchema).max(4).default([]),
 }).strict();
 const evidenceSchema = z.array(z.object({ source: z.string().min(1).max(1024), line: z.number().int().positive(), text: z.string().max(12000) }).strict()).max(200);
 const artifactSchema = z.object({
@@ -173,11 +192,14 @@ export class UnderstandingService {
     const current = await this.capture(session, root);
     if (digest(capture) !== digest(current)) throw new Error("The enrolled source changed while its brief was generated.");
     const brief = summary.repository.brief;
+    const artifactId = randomUUID();
+    const retained = retainedDiagrams(artifactId, brief.diagrams);
     const artifact: UnderstandingArtifact = artifactSchema.parse({
-      id: randomUUID(), sourceProjectId: session.projectId, sessionId: session.id, sourceKind: capture.binding.sourceKind,
+      id: artifactId, sourceProjectId: session.projectId, sessionId: session.id, sourceKind: capture.binding.sourceKind,
       head: summary.repository.head, base: summary.repository.base, fingerprint: summary.repository.fingerprint,
-      generatedAt: summary.repository.generatedAt, retainedAt: new Date().toISOString(), coverage: summary.repository.coverage,
-      brief: { summary: brief.summary, architecture: brief.architecture, changes: brief.changes, checks: brief.checks, review: brief.review, guidance: brief.guidance, unknowns: brief.unknowns },
+      generatedAt: summary.repository.generatedAt, retainedAt: new Date().toISOString(),
+      coverage: [...summary.repository.coverage.slice(0, Math.max(0, 100 - retained.coverage.length)), ...retained.coverage],
+      brief: { summary: brief.summary, architecture: brief.architecture, changes: brief.changes, checks: brief.checks, review: brief.review, guidance: brief.guidance, unknowns: brief.unknowns, diagrams: retained.diagrams },
       evidence: summary.repository.evidence.map(item => ({ source: item.source, line: item.line, text: item.text })),
     });
     const entry = entrySchema.parse({ binding: capture.binding, artifact });
@@ -396,6 +418,31 @@ export class UnderstandingService {
     const page = pageOf(plans, cursor, plan => plan.id);
     return { projects, plans: page.items, next: page.next, coverage: ["From work: derived from recorded team, mission and goal requests. Status is the run's own status."] };
   }
+}
+
+/** Parse and validate writer diagrams at persist time; retain source when the parsed graph is outside the artifact schema. */
+export function retainedDiagrams(artifactId: string, sources: { title: string; kind: "system" | "change"; mermaid: string; citations: { source: string; line: number }[] }[]): { diagrams: Diagram[]; coverage: string[] } {
+  const diagrams: Diagram[] = [], coverage: string[] = [];
+  sources.forEach((source, index) => {
+    const base = { id: `${artifactId}:${index}`, title: source.title, kind: source.kind, basis: "model" as const, citations: source.citations };
+    const parsed = parseMermaid(source.mermaid);
+    const candidate = parsed.ok && parsed.diagram.nodes.length <= MAX_DIAGRAM_NODES && parsed.diagram.edges.length <= MAX_DIAGRAM_EDGES
+      ? { ...base, direction: parsed.diagram.direction, nodes: parsed.diagram.nodes, edges: parsed.diagram.edges, groups: parsed.diagram.groups,
+        ...(parsed.diagram.sequence ? { sequence: parsed.diagram.sequence } : {}), coverage: parsed.coverage }
+      : undefined;
+    if (candidate) {
+      const validated = diagramSchema.safeParse(candidate);
+      if (validated.success) { diagrams.push(validated.data); return; }
+    }
+    const parseError = candidate
+      ? "The parsed diagram exceeds the retained schema limits."
+      : parsed.ok ? "The diagram exceeds the retained node or edge limit." : parsed.error;
+    const fallback = { ...base, direction: "LR" as const, nodes: [], edges: [], groups: [], sourceText: source.mermaid, parseError, coverage: [] };
+    const validatedFallback = diagramSchema.safeParse(fallback);
+    if (validatedFallback.success) diagrams.push(validatedFallback.data);
+    else coverage.push("A diagram was omitted because its parsed graph and source fallback failed retained schema validation.");
+  });
+  return { diagrams, coverage };
 }
 
 function retainedGenerations(entries: Entry[], sizes: Map<string, number>): Entry[] {

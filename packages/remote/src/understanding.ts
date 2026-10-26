@@ -1,4 +1,5 @@
 import type { WorkspaceKnowledge } from "./understanding-knowledge.js";
+import type { Diagram } from "./understanding-work.js";
 
 /** Read-only workspace knowledge. A generated brief does not certify completion or deployment. */
 export interface UnderstandingCitation { source: string; line: number }
@@ -11,6 +12,8 @@ export interface UnderstandingBrief {
   review: { priority: "high" | "medium"; area: string; why: string; question: string; citations: UnderstandingCitation[] }[];
   guidance: { text: string; basis: "documented" | "proposed"; citations: UnderstandingCitation[] }[];
   unknowns: string[];
+  /** Parsed from the writer's Mermaid diagrams at persist time; absent on older artifacts. */
+  diagrams?: Diagram[];
 }
 export interface UnderstandingArtifact {
   id: string;

@@ -3,13 +3,14 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative, sep } from "node:path";
 import { z } from "zod";
-import type { UnderstandingBrief, KnowledgeClaim, KnowledgeComponent, KnowledgeDelivery, KnowledgeEnvironment, KnowledgePlan, KnowledgePullRequest } from "@infinite/remote";
+import { parseMermaid, type Diagram, type UnderstandingBrief, type KnowledgeClaim, type KnowledgeComponent, type KnowledgeDelivery, type KnowledgeEnvironment, type KnowledgePlan, type KnowledgePullRequest } from "@infinite/remote";
 import { captureIdentity, normalizeRemote, readGit } from "./checkout-identity.js";
 import { failureReason } from "./failure-reason.js";
-import { createContextAdapter, understandingOutputLimits, type RepoContext, type RepositoryBriefOutput, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
+import { createContextAdapter, runRepositoryContext, understandingOutputLimits, type RepoContext, type RepositoryBriefOutput, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
 import type { Config } from "./types.js";
 
 const MAX_STDOUT = 1024 * 1024;
+
 const hash = (value: unknown) => createHash("sha1").update(JSON.stringify(value)).digest("hex");
 const citationSchema = z.object({ source: z.string().min(1).max(1024), line: z.number().int().positive() }).strict();
 const claimSchema = z.object({ text: z.string().min(1).max(900), citations: z.array(citationSchema).min(1).max(6) }).strict();
@@ -32,7 +33,7 @@ function fingerprint(context: RepoContext) { return hash([context.head, Object.e
 function asClaim(item: { text: string; citations: { source: string; line: number }[] }, repositoryId: string): KnowledgeClaim {
   return { text: item.text, basis: "agent", evidence: item.citations.map(citation => ({ repositoryId, source: citation.source, line: citation.line })) };
 }
-function validateBrief(value: unknown, root: string, context: RepoContext): BriefOutput {
+export function validateBrief(value: unknown, root: string, context: RepoContext): BriefOutput {
   const parsed = outputSchema.parse(value);
   if (realpathSync(parsed.repo) !== realpathSync(root) || parsed.head !== context.head || parsed.fingerprint !== fingerprint(context)) throw new Error("understanding-brief-source-mismatch");
   const files = context.files;
@@ -62,7 +63,7 @@ function validateBrief(value: unknown, root: string, context: RepoContext): Brie
   return {
     ...parsed, evidence,
     brief: { ...parsed.brief, architecture: claims(parsed.brief.architecture), changes: claims(parsed.brief.changes), checks: claims(parsed.brief.checks), review, guidance },
-    coverage: [...parsed.coverage, ...(omitted ? [`Omitted ${omitted} claim, citation, or evidence item without a matching in-bounds source reference.`] : [])].slice(0, 100),
+    coverage: [...parsed.coverage, ...(omitted ? [`Omitted ${omitted} claim, citation, or evidence item without a matching in-bounds source reference.`] : [])].slice(-100),
   };
 }
 
@@ -161,6 +162,36 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
   const contextAdapter = createContextAdapter(config);
   return {
     ...contextAdapter,
+    ...(config.repositoryBriefings ? { explainWork: async (input, options) => {
+      const briefing = config.repositoryBriefings;
+      if (!briefing) throw new Error("repository-briefings-unavailable");
+      const context = await runRepositoryContext(config, input.root, options);
+      const writerArgs = [...(briefing.runner ? ["--runner", briefing.runner] : []), ...(briefing.model ? ["--model", briefing.model] : []), "--timeout", String(Math.min(1800, Math.max(10, Math.ceil(briefing.timeoutMs / 1000))))];
+      const raw = await run(briefing.command, [...briefing.args, ...writerArgs, "brief", "--repo", input.root, "--base", input.baseCommit, "--format", "json", "--no-state", "--question", input.question], { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
+      if (Buffer.byteLength(raw) > Math.min(options.maxBytes, MAX_STDOUT)) throw new Error("understanding-output-too-large");
+      const parsed = validateBrief(JSON.parse(raw), input.root, context);
+      if (parsed.base !== input.baseCommit) throw new Error("understanding-brief-base-mismatch");
+      const diagrams: Diagram[] = [];
+      let droppedDiagramCitations = 0;
+      const sources = z.array(z.object({ title: z.string().min(1).max(200), kind: z.enum(["system", "change"]), mermaid: z.string().max(3000), citations: z.array(citationSchema).max(24) }).strict()).max(2).parse(parsed.brief.diagrams ?? []);
+      sources.forEach((source, index) => {
+        const citations = source.citations.filter(citation => relativePath(citation.source) && Boolean(context.files[citation.source]) && citation.line <= context.files[citation.source]!.lines);
+        droppedDiagramCitations += source.citations.length - citations.length;
+        const base = { id: `narrative:${index}`, title: source.title, kind: source.kind, basis: "model" as const, citations };
+        const result = parseMermaid(source.mermaid);
+        if (result.ok && result.diagram.nodes.length <= 48 && result.diagram.edges.length <= 120) {
+          diagrams.push({ ...base, direction: result.diagram.direction, nodes: result.diagram.nodes, edges: result.diagram.edges, groups: result.diagram.groups, ...(result.diagram.sequence ? { sequence: result.diagram.sequence } : {}), coverage: result.coverage });
+        } else {
+          diagrams.push({ ...base, direction: "LR", nodes: [], edges: [], groups: [], sourceText: source.mermaid, parseError: result.ok ? "The diagram exceeds the retained node or edge limit." : result.error, coverage: [] });
+        }
+      });
+      const brief: UnderstandingBrief = { ...parsed.brief, diagrams };
+      const coverage = [
+        ...parsed.coverage,
+        ...(droppedDiagramCitations ? [`Omitted ${droppedDiagramCitations} diagram citation${droppedDiagramCitations === 1 ? "" : "s"} without a matching in-bounds source reference.`] : []),
+      ].slice(-100);
+      return { brief, diagrams, engine: briefing.runner ?? "configured", model: briefing.model ?? briefing.runner ?? "configured", generatedAt: parsed.generatedAt, coverage };
+    } } : {}),
     ...(config.repositoryBriefings ? { synthesize: async (input, options) => {
       const components: KnowledgeComponent[] = [], coverage: string[] = [];
       for (const component of input.components) {

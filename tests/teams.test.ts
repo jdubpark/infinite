@@ -11,8 +11,8 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
-import { TeamError, applyTeamBriefTitle, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
-import { createTeamSchema, lineupProfiles, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamModelProfile, type TeamRun, type TeamView } from "../packages/host/src/team-types.js";
+import { TeamError, applyTeamBriefTitle, changeIndex, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
+import { createTeamSchema, lineupProfiles, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamTask, type TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import type { HandoffPolicy, TeamHandoffContext } from "../packages/host/src/handoff-types.js";
 import { permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
@@ -90,6 +90,75 @@ test("a GitHub project blocks when its first refresh has no mirror head", { time
     const created = await teams.create(f.create());
     const blocked = await waitFor(() => Promise.resolve(teams.get(created.id)), current => current.status === "blocked", 30000);
     assert.match(blocked.reason ?? "", /no copy of this repository from GitHub yet/);
+  } finally { await f.close(); }
+});
+
+test("moved-base delivery recovery clears change summaries tied to the previous head", { timeout: 90000 }, async () => {
+  const f = await fixture("delivery-fast", fallbackLineup, {}, { deliveryMode: "pr", noServer: true });
+  try {
+    const mirror = join(f.host.root, "source-mirror.git");
+    git(f.source, "clone", "--bare", f.source, mirror);
+    const branch = "infinite/team-delivery-recovery-test";
+    const id = randomUUID(), memberId = randomUUID(), at = new Date().toISOString();
+    const runRoot = join(f.host.config.teams!.workspaceDir, id);
+    const workspace = join(runRoot, "integration");
+    mkdirSync(dirname(workspace), { recursive: true, mode: 0o700 });
+    git(f.source, "clone", "--no-hardlinks", f.source, workspace);
+    git(workspace, "remote", "remove", "origin");
+    git(workspace, "checkout", "-b", branch);
+    const headCommit = git(workspace, "rev-parse", "HEAD");
+    const cwd = join(runRoot, "members", memberId);
+    mkdirSync(dirname(cwd), { recursive: true, mode: 0o700 });
+    git(workspace, "clone", "--no-hardlinks", workspace, cwd);
+    git(cwd, "remote", "remove", "origin");
+
+    git(f.source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null",
+      "commit", "--allow-empty", "-m", "Move the base");
+    const movedBase = git(f.source, "rev-parse", "HEAD");
+    git(mirror, "fetch", "--no-tags", "--", f.source, "+refs/heads/main:refs/heads/main");
+    const sourceStatus: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: movedBase };
+    const source: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> = {
+      refresh: async () => sourceStatus,
+      mirrorPath: () => mirror,
+      isGithub: () => true,
+      status: () => sourceStatus,
+    };
+    const teams = await f.openTeamService({ source, start: false });
+    const delivery = structuredClone(f.host.config.projects.find(project => project.id === "rehearsal")!.team!.delivery!);
+    const member: TeamMember = { runId: id, memberId, revision: 1, role: "delivery", provider: "codex", sessionId: randomUUID(),
+      title: "delivery: Inspect publication state", status: "reported", cwd, baseCommit: headCommit, prompt: "", cursor: 0,
+      stopRequestId: randomUUID(), startedAt: at,
+      report: { kind: "delivery-reconciliation", headCommit, repository: "example/app", branch, baseHeadCommit: movedBase,
+        disposition: "no-publication", summary: "No publication exists and the base moved." } };
+    const task: TeamTask = { id: "readme", title: "Update the README", instructions: "Update the README.", paths: ["README.md"], dependsOn: [],
+      revision: 1, status: "integrated", changedPaths: { paths: ["README.md"], truncated: false } };
+    const priorTask: TeamTask = { id: "prior-readme", title: "Earlier README update", instructions: "Update the README.", paths: ["README.md"], dependsOn: [],
+      revision: 0, status: "integrated", changedPaths: { paths: ["README.md"], truncated: false } };
+    const run: TeamRun = { id, projectId: "rehearsal", provider: "codex", title: "Update the README", objective: "Update the README safely.",
+      parallelism: 1, parallelismCeiling: 4, revision: 1, status: "delivering", createdAt: at, updatedAt: at, workspace, branch,
+      baseCommit: f.base, headCommit, tasks: [task], members: [member], decisions: [], checks: [], steering: [], events: [], round: 0,
+      continuations: [{ revision: 0, requestId: randomUUID(), at, reason: "Earlier implementation round.", baseCommit: f.base, headCommit: f.base, tasks: [priorTask] }],
+      lineup: structuredClone(fallbackLineup), delivery, review: { verdict: "approved", summary: "Reviewed the recorded head.", revision: 1 },
+      changes: { headCommit, recordedAt: at, files: [{ path: "README.md", status: "modified", added: 1, removed: 0 }], truncated: false } };
+    const stored = { run, fingerprint: "fixture", receipts: {}, prepared: true, root: f.host.config.teams!.workspaceDir,
+      checkHead: headCommit, deliveryAttempt: { memberId, revision: 1, headCommit } };
+    const internals = teams as unknown as { records: Map<string, typeof stored>; consume(stored: typeof stored, member: TeamMember): void };
+    internals.records.set(id, stored);
+    internals.consume(stored, member);
+
+    const rebased = await waitFor(() => Promise.resolve(teams.get(id)), view => view.revision === 2 && view.deliveryRecovery?.status === "replanning" &&
+      view.members.some(current => current.role === "integrator") && !view.pendingOperation, 30000);
+    assert.equal(rebased.baseCommit, movedBase);
+    assert.equal(rebased.headCommit, movedBase);
+    assert.equal(rebased.changes, undefined, "the previous base-to-head summary is not shown for the fresh baseline");
+    assert.ok(rebased.continuations?.flatMap(continuation => continuation.tasks).every(previous => previous.changedPaths === undefined),
+      "task path summaries from the replaced range are cleared from current and retained continuation tasks");
+
+    const persisted = unseal<typeof stored>(readFileSync(f.host.config.keyFile), `team:${id}`,
+      readFileSync(join(f.host.config.stateDir, "teams", `${id}.sealed`), "utf8"));
+    assert.equal(persisted.run.changes, undefined);
+    assert.ok(persisted.run.continuations?.flatMap(continuation => continuation.tasks).every(previous => previous.changedPaths === undefined));
+    assert.equal(persisted.run.deliveryRecovery?.status, "replanning");
   } finally { await f.close(); }
 });
 
@@ -864,6 +933,29 @@ test("a team builds concurrently in isolated copies and produces checked, review
   } finally { owner.close(); viewer.close(); await f.close(); }
 });
 
+test("changeIndex parses name-status and numstat -z records with statuses, counts, and binary nulls", () => {
+  const nameStatus = ["A", "a.txt", "M", "src/b.ts", "D", "gone.md", "R100", "old/c.ts", "new/c.ts", "", ""].join("\0");
+  const numstat = ["1\t0\ta.txt", "3\t2\tsrc/b.ts", "0\t4\tgone.md", "2\t1\t", "old/c.ts", "new/c.ts", "-\t-\tlogo.png", ""].join("\0");
+  const index = changeIndex(nameStatus, numstat, "a".repeat(40), "2026-10-25T00:00:00.000Z");
+  assert.deepEqual(index, {
+    headCommit: "a".repeat(40), recordedAt: "2026-10-25T00:00:00.000Z", truncated: false,
+    files: [
+      { path: "a.txt", status: "added", added: 1, removed: 0 },
+      { path: "src/b.ts", status: "modified", added: 3, removed: 2 },
+      { path: "gone.md", status: "removed", added: 0, removed: 4 },
+      { path: "new/c.ts", status: "renamed", added: 2, removed: 1 },
+    ],
+  });
+  assert.equal(changeIndex(undefined, numstat, "a".repeat(40), "2026-10-25T00:00:00.000Z"), undefined);
+  const binary = changeIndex("M\0logo.png\0", "-\t-\tlogo.png\0", "b".repeat(40), "2026-10-25T00:00:00.000Z");
+  assert.deepEqual(binary?.files, [{ path: "logo.png", status: "modified", added: null, removed: null }]);
+  const unknown = changeIndex("A\0new.txt\0", undefined, "b".repeat(40), "2026-10-25T00:00:00.000Z");
+  assert.deepEqual(unknown?.files, [{ path: "new.txt", status: "added", added: null, removed: null }]);
+  const many = changeIndex(Array.from({ length: 401 }, (_, n) => `A\0f${n}.txt\0`).join(""), undefined, "b".repeat(40), "2026-10-25T00:00:00.000Z");
+  assert.equal(many?.files.length, 400);
+  assert.equal(many?.truncated, true);
+});
+
 test("review rubrics drop self-grading, integration records docs/tests, and owner ratings are idempotent", { timeout: 120000 }, async () => {
   const { limitFallback: _limitFallback, ...implementerProfile } = fallbackLineup.implementers[0];
   const reviewerProfile = { ...implementerProfile, id: "rubric-reviewer", label: "Rubric reviewer", tier: "strong" as const };
@@ -880,6 +972,12 @@ test("review rubrics drop self-grading, integration records docs/tests, and owne
     assert.equal(taskB.rubric?.reviewerProfileId, reviewerProfile.id);
     assert.equal(taskA.diffStat?.docs, true);
     assert.equal(taskA.diffStat?.tests, true);
+    // The fixture's implementers write a.txt and b.txt; task a also writes docs/x.md and tests/y.test.ts.
+    assert.deepEqual(finished.changes?.files.map(file => `${file.path}:${file.status}`).sort(), ["a.txt:added", "b.txt:added", "docs/x.md:added", "tests/y.test.ts:added"]);
+    assert.equal(finished.changes?.headCommit, finished.headCommit);
+    assert.equal(finished.changes?.truncated, false);
+    assert.ok(taskA.changedPaths && taskA.changedPaths.paths.length > 0, JSON.stringify(taskA.changedPaths));
+    assert.equal(taskA.changedPaths?.truncated, false);
     assert.ok(finished.events.some(event => /rubric for task a was dropped/.test(event.text)));
 
     const path = `/teams/${finished.id}/tasks/a/rating`, requestId = randomUUID();

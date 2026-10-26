@@ -67,8 +67,9 @@ function fixture(options: { prefix?: boolean; sharedGroup?: boolean; environment
     prefixReceipts,
     commitA,
     config,
-    service: (running: (projectId: string) => Promise<boolean> = idle) => new ProjectSourceService(config, {
+    service: (running: (projectId: string) => Promise<boolean> = idle, onApplied?: (projectId: string, head: string) => void) => new ProjectSourceService(config, {
       running,
+      ...(onApplied ? { onApplied } : {}),
       ...(options.prefix ? { prefix: config.teams?.commandPrefix } : {}),
     }),
     push: (content: string, message: string) => {
@@ -91,10 +92,12 @@ test("first refresh creates the mirror and fast-forwards the detached checkout t
     mkdirSync(join(f.projectPath, "node_modules"));
     writeFileSync(join(f.projectPath, "node_modules", "x"), "keep\n");
 
-    const service = f.service();
+    const applied: Array<[string, string]> = [];
+    const service = f.service(undefined, (id, head) => applied.push([id, head]));
     const status = await service.refresh("example");
     assert.equal(status.mirrorHead, commitB, JSON.stringify(status));
     assert.equal(status.appliedHead, commitB);
+    assert.deepEqual(applied, [["example", commitB]]);
     assert.equal(git(f.projectPath, "rev-parse", "HEAD"), commitB);
     assert.equal(readFileSync(join(f.projectPath, "node_modules", "x"), "utf8"), "keep\n");
     assert.equal(statSync(join(f.root, "mirrors")).mode & 0o7777, 0o750);
@@ -106,6 +109,8 @@ test("first refresh creates the mirror and fast-forwards the detached checkout t
     assert.equal(commands.length, 9, "each host Git operation, including init, fetch, and root validation, crosses the prefix");
     assert.ok(commands.every(command => command.command === "git"));
     assert.ok(commands.some(command => command.args.includes("fetch")));
+    await service.refresh("example");
+    assert.equal(applied.length, 1, "a refresh that finds nothing new does not report applied work");
   } finally { f.close(); }
 });
 

@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { claimControl, startHost, waitFor } from "./helpers.js";
 import { retainedDiagrams, UnderstandingService } from "../packages/host/src/understanding.js";
 import { writeSealed } from "../packages/host/src/vault.js";
-import { createRemoteClient, type WorkspaceUnderstanding } from "@infinite/remote";
+import { createRemoteClient, type GeneratedCatalogPage, type WorkspaceUnderstanding } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
 import { createGoalSchema, type ProductGoal } from "../packages/host/src/goal-types.js";
 import { RepositoryBriefings } from "../packages/host/src/repository-briefings.js";
@@ -85,7 +85,7 @@ test("catalog edits cross encrypted transport only for owners and preserve revis
     const refresh = await owner.request<{ state: string }>(`${path}/refresh`, { body: {} });
     assert.equal(refresh.state, "unavailable", "an unconfigured collector cannot start a writer");
     assert.equal((await viewer.request<WorkspaceUnderstanding>(path)).knowledge?.maintenance.jobsToday, 0);
-  } finally { owner.close(); viewer.close(); await host.stop(); }
+  } finally { owner.close(); viewer?.close(); await host.stop(); }
 });
 
 test("unavailable brief storage leaves the host and Work readable and cannot acknowledge a later write", { timeout: 40000 }, async () => {
@@ -116,6 +116,7 @@ test("unavailable brief storage leaves the host and Work readable and cannot ack
     await waitFor(() => host.fetchApi(`/sessions/${sessionId}/summary?status=1`, "viewer"), result => result.body.state === "failed", 15000);
     const failed = await host.fetchApi(await understandingPath(host), "viewer");
     assert.equal(failed.body.repositories[0].state, "failed");
+    assert.match(failed.body.repositories[0].warnings.join("\n"), /^The latest brief attempt failed: \S/m);
     assert.deepEqual(failed.body.repositories[0].current, []);
     assert.equal(failed.body.work[0].sourceId, goal.id);
   } finally { await host.stop(); }
@@ -159,10 +160,12 @@ test("encrypted Understanding bounds its response and turns over a full retained
     assert.equal(value.repositories[0].current[0].id, artifacts.at(-1)!.id, "the latest source snapshot is prioritized");
     assert.equal(value.repositories[0].current[0].brief.architecture[0].text, "Complete source claim");
     assert.equal(value.work[0].sourceId, goals.at(-1)!.id, "the latest work remains useful");
-    assert.ok(value.work.length > 0 && value.work.length < goals.length);
+    assert.equal(value.work.length, goals.length, "the single budget keeps every work record before spending on evidence");
     assert.equal(value.work[0].objective, goals.at(-1)!.objective, "an included request is never silently cut mid-text");
-    assert.match(value.coverage.join(" "), /work.*omitted/i);
-    assert.match([...value.repositories[0].coverage, ...value.repositories[0].current.flatMap(item => item.coverage)].join(" "), /omitted/i);
+    assert.equal(value.repositories[0].current.length, artifacts.length, "older snapshots are kept without evidence before evidence is spent");
+    const lines = [...value.coverage, ...value.repositories[0].coverage, ...value.repositories[0].current.flatMap(item => item.coverage)];
+    assert.match(lines.join(" "), /Evidence excerpts: \d+ of 50 shown here; the rest are available on the detail pages\./);
+    assert.doesNotMatch(lines.join(" "), /byte|omit/i);
     assert.equal(readdirSync(join(host.config.stateDir, "understanding", "artifacts")).filter(name => name.endsWith(".sealed")).length, artifacts.length, "response limits never prune stored generations");
     const again = await remote.request<WorkspaceUnderstanding>(await understandingPath(host));
     assert.deepEqual(again.work.map(item => item.id), value.work.map(item => item.id));
@@ -226,6 +229,42 @@ test("encrypted Understanding bounds its response and turns over a full retained
     assert.ok(files.reduce((size, name) => size + statSync(join(directory, name)).size, 0) <= 8 * 1024 * 1024);
     assert.ok(!files.includes(`${artifacts[0].id}.sealed`), "successful publication evicts the oldest superseded generation");
   } finally { remote?.close(); await host.stop(); }
+});
+
+test("planned requests are complete across the overview excerpt and the planned page", { timeout: 60000 }, async () => {
+  let viewer: ReturnType<typeof createRemoteClient> | undefined;
+  const host = await startHost({ config: { remote: { enabled: true } } });
+  try {
+    initializeRepo(host.config.projects[0].path);
+    await host.stopApi();
+    for (let index = 0; index < 13; index++) retainGoal(host, index, "o".repeat(12_000));
+    await host.start();
+    viewer = createRemoteClient({ url: host.origin, token: host.tokens.viewer });
+    const path = await understandingPath(host);
+    const overview = await viewer.request<WorkspaceUnderstanding>(path);
+    const repo = overview.repositories[0];
+    assert.equal(repo.planned.length, 13);
+    assert.ok(repo.planned.every(plan => plan.text.length === 600 && plan.excerpt === true));
+    assert.equal(repo.coverage.length, 0);
+    let cursor: string | undefined;
+    const all: string[] = [];
+    do {
+      const page = await viewer.request<{ items: { workId: string; text: string }[]; next: string | null }>(`${path}/planned?repository=${repo.id}${cursor ? `&cursor=${cursor}` : ""}`);
+      all.push(...page.items.map(item => item.text)); cursor = page.next ?? undefined;
+    } while (cursor);
+    assert.equal(all.length, 13);
+    assert.ok(all.every(text => text.length === 12_000));
+  } finally { viewer?.close(); await host.stop(); }
+});
+
+test("the diagram and brief routes answer with 404 before any observation", { timeout: 40000 }, async () => {
+  const host = await startHost();
+  try {
+    const path = await understandingPath(host);
+    assert.equal((await host.fetchApi(`${path}/diagrams/components:rehearsal`, "viewer")).status, 404);
+    assert.equal((await host.fetchApi(`${path}/brief?repository=rehearsal`, "viewer")).status, 404);
+    assert.equal((await host.fetchApi(`${path}/work`, "viewer")).status, 200);
+  } finally { await host.stop(); }
 });
 
 test("Understanding is a read-only scoped API and its source-bound brief survives API restart", { timeout: 60000 }, async () => {
@@ -424,6 +463,78 @@ test("work scope uses pinned membership, folds alternate checkouts, and omits ma
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });
 
+function teamFixture(temp: string) {
+  const repo = join(temp, "repo"); mkdirSync(repo); initializeRepo(repo);
+  const project = { id: "repo", name: "Repo", path: repo };
+  const root = realpathSync(repo), stat = statSync(root), runId = randomUUID(), memberId = randomUUID();
+  const identity = `root:${execFileSync("git", ["-C", repo, "rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim()}`;
+  const key = Buffer.alloc(32, 1), stateDir = join(temp, "state"), artifactDir = join(stateDir, "understanding", "artifacts");
+  mkdirSync(artifactDir, { recursive: true });
+  const member = join(temp, "member"); mkdirSync(member);
+  const memberReal = realpathSync(member), memberStat = statSync(memberReal);
+  const binding = { projectId: "repo", sourceKind: "team", enrolledPath: root, root: memberReal, sourceCwd: memberReal, projectDevice: String(stat.dev), projectInode: String(stat.ino),
+    rootDevice: String(memberStat.dev), rootInode: String(memberStat.ino), sourceCwdDevice: String(memberStat.dev), sourceCwdInode: String(memberStat.ino),
+    repoIdentity: createHash("sha256").update(JSON.stringify(identity)).digest("hex"), runId, memberId };
+  const seal = (summary: string, extra: { head?: string | null; binding?: object } = {}) => {
+    const id = randomUUID(), sessionId = randomUUID();
+    const artifact = { id, sourceProjectId: "repo", sessionId, sourceKind: "team", head: "head" in extra ? extra.head : "a".repeat(40), base: null, fingerprint: "b".repeat(40), generatedAt: "2026-10-21T00:00:00.000Z", retainedAt: "2026-10-21T00:00:00.000Z", coverage: [], brief: { summary, architecture: [], changes: [], checks: [], review: [], guidance: [], unknowns: [] }, evidence: [] };
+    writeSealed(join(artifactDir, `${id}.sealed`), key, "understanding-artifact", { binding: { ...binding, ...extra.binding }, artifact });
+    return sessionId;
+  };
+  const group: any = { id: "repo", name: "Repo", kind: "implicit", hidden: false, implicit: true, revision: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", repos: [{ projectId: "repo", name: "Repo", path: root, key: identity, checkouts: [{ projectId: "repo", name: "Repo", path: root, primary: true, teamReady: true }] }] };
+  const service = (manager: object, runs: object[] = []) => new UnderstandingService({ config: { stateDir, projects: [project] } as never, key, manager: manager as never,
+    groups: { list: () => ({ groups: [group], suggestions: [] }), get: () => group }, missions: { understandingRecords: () => [], understandingOwnsSession: () => false } as never,
+    teams: { understandingRecords: () => runs, understandingOwnsSession: () => false } as never, goals: { understandingRecords: () => [] } as never });
+  return { member, seal, service, artifactDir, key, binding };
+}
+
+test("team briefs stay visible after their session and member workspace are removed, unless the repository binding changed", () => {
+  const temp = mkdtempSync("/tmp/inf-understanding-team-cleanup-");
+  try {
+    const fixture = teamFixture(temp);
+    fixture.seal("Kept after cleanup");
+    fixture.seal("No recorded head", { head: null });
+    fixture.seal("Other repository", { binding: { repoIdentity: "f".repeat(64) } });
+    fixture.seal("Other checkout", { binding: { projectInode: "1" } });
+    rmSync(fixture.member, { recursive: true, force: true });
+    const service = fixture.service({ meta: () => { throw new Error("unknown session"); } });
+    assert.deepEqual(service.get("repo").repositories[0]!.current.map(item => item.brief.summary), ["Kept after cleanup"]);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("a team brief whose session is still available keeps the ownership check after cleanup", () => {
+  const temp = mkdtempSync("/tmp/inf-understanding-team-owned-");
+  try {
+    const fixture = teamFixture(temp);
+    const sessionId = fixture.seal("Needs ownership");
+    rmSync(fixture.member, { recursive: true, force: true });
+    const session = { id: sessionId, projectId: "repo", cwd: fixture.member, team: { runId: fixture.binding.runId, memberId: fixture.binding.memberId, revision: 1, role: "implementer" } };
+    const service = fixture.service({ meta: () => ({ session }) }, [{ id: fixture.binding.runId, members: [{ memberId: fixture.binding.memberId, sessionId, cwd: fixture.member }] }]);
+    assert.deepEqual(service.get("repo").repositories[0]!.current, [], "the host does not own this session as part of the run");
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("retention keeps the newest sixteen generations per repository instead of a global cap", () => {
+  const temp = mkdtempSync("/tmp/inf-understanding-retention-");
+  try {
+    const key = Buffer.alloc(32, 1), stateDir = join(temp, "state"), artifactDir = join(stateDir, "understanding", "artifacts");
+    mkdirSync(artifactDir, { recursive: true });
+    const binding = (projectId: string) => ({ projectId, sourceKind: "project", enrolledPath: temp, root: temp, sourceCwd: temp, projectDevice: "1", projectInode: "1", rootDevice: "1", rootInode: "1", sourceCwdDevice: "1", sourceCwdInode: "1", repoIdentity: "c".repeat(64) });
+    const seal = (projectId: string, index: number) => {
+      const id = randomUUID(), at = new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString();
+      const artifact = { id, sourceProjectId: projectId, sessionId: randomUUID(), sourceKind: "project", head: "a".repeat(40), base: null, fingerprint: "b".repeat(40), generatedAt: at, retainedAt: at, coverage: [], brief: { summary: `${projectId} ${index}`, architecture: [], changes: [], checks: [], review: [], guidance: [], unknowns: [] }, evidence: [] };
+      writeSealed(join(artifactDir, `${id}.sealed`), key, "understanding-artifact", { binding: binding(projectId), artifact });
+    };
+    for (let index = 0; index < 20; index++) seal("repo-a", index);
+    for (let index = 0; index < 5; index++) seal("repo-b", index);
+    const service = new UnderstandingService({ config: { stateDir, projects: [] } as never, key, manager: {} as never, groups: {} as never, missions: {} as never, teams: {} as never, goals: {} as never });
+    const kept = (service as any).state.generations.map((entry: any) => entry.artifact.brief.summary as string);
+    assert.equal(kept.filter((summary: string) => summary.startsWith("repo-a ")).length, 16);
+    assert.ok(!kept.includes("repo-a 3") && kept.includes("repo-a 4"), "the oldest generations of the busy repository are the ones dropped");
+    assert.equal(kept.filter((summary: string) => summary.startsWith("repo-b ")).length, 5);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
 test("retained team sources require ownership, bounded validation, and exclude mission coordinators", async t => {
   const temp = mkdtempSync("/tmp/inf-understanding-team-binding-");
   try {
@@ -435,7 +546,7 @@ test("retained team sources require ownership, bounded validation, and exclude m
     const binding = { projectId: "repo", sourceKind: "team", enrolledPath: root, root, sourceCwd: root, projectDevice: String(stat.dev), projectInode: String(stat.ino), rootDevice: String(stat.dev), rootInode: String(stat.ino), sourceCwdDevice: String(stat.dev), sourceCwdInode: String(stat.ino), repoIdentity: createHash("sha256").update(JSON.stringify(`root:${execFileSync("git", ["-C", repo, "rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim()}`)).digest("hex"), runId, memberId };
     mkdirSync(artifactDir, { recursive: true });
     writeSealed(join(artifactDir, `${artifactId}.sealed`), key, "understanding-artifact", { binding, artifact });
-    for (let index = 1; index < 64; index++) {
+    for (let index = 1; index < 20; index++) {
       const id = randomUUID();
       writeSealed(join(artifactDir, `${id}.sealed`), key, "understanding-artifact", { binding, artifact: { ...artifact, id } });
     }
@@ -457,13 +568,13 @@ test("retained team sources require ownership, bounded validation, and exclude m
       let value: WorkspaceUnderstanding;
       try { value = service.get("repo"); }
       finally { if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT; else process.env.GIT_TRACE2_EVENT = previousTrace; }
-      assert.equal(value.repositories[0].current.length, 64);
+      assert.equal(value.repositories[0].current.length, 16);
       assert.equal(groupReads, 1, "retained generations use one workspace membership snapshot");
       assert.ok(readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(event => event.event === "start").length <= 2, "Git subprocess work depends on checkout count, not generation count");
       execFileSync("git", ["-C", repo, "config", "remote.origin.url", "https://example.invalid/rebound.git"]);
       assert.deepEqual(service.get("repo").repositories[0].current, [], "a later read must notice changed Git identity");
       execFileSync("git", ["-C", repo, "config", "--unset", "remote.origin.url"]);
-      assert.equal(service.get("repo").repositories[0].current.length, 64);
+      assert.equal(service.get("repo").repositories[0].current.length, 16);
     });
     await t.test("a generated team snapshot is withheld after ownership or cwd changes", async () => {
       const summary = await briefings.summarize(session, "0");
@@ -477,7 +588,7 @@ test("retained team sources require ownership, bounded validation, and exclude m
       session.cwd = memberCwd;
       assert.equal(service.get("repo").repositories[0].current.length, 0, "moving both live and recorded cwd cannot reuse the old artifact binding");
       memberCwd = root; session.cwd = root;
-      assert.equal(service.get("repo").repositories[0].current.length, 64);
+      assert.equal(service.get("repo").repositories[0].current.length, 16);
     });
     session.team.role = "mission-coordinator";
     await t.test("previously retained mission-coordinator content is withheld", () => {
@@ -486,8 +597,71 @@ test("retained team sources require ownership, bounded validation, and exclude m
     await t.test("the runtime refuses to retain a new mission-coordinator brief", async () => {
       session.id = randomUUID();
       await assert.rejects(briefings.summarize(session, "0"));
-      assert.equal(readdirSync(artifactDir).filter(file => file.endsWith(".sealed")).length, 64);
+      assert.equal(readdirSync(artifactDir).filter(file => file.endsWith(".sealed")).length, 16);
     });
     await briefings.close();
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("generated plans and projects derive from recorded work without touching the catalog", { timeout: 40000 }, async () => {
+  let viewer: ReturnType<typeof createRemoteClient> | undefined;
+  const host = await startHost({ config: { remote: { enabled: true } } });
+  try {
+    initializeRepo(host.config.projects[0].path);
+    await host.stopApi();
+    retainGoal(host, 1, "Build the thing");
+    await host.start();
+    viewer = createRemoteClient({ url: host.origin, token: host.tokens.viewer });
+    const path = await understandingPath(host);
+    const page = await viewer.request<GeneratedCatalogPage>(`${path}/generated`);
+    assert.equal(page.plans.length, 1);
+    assert.equal(page.plans[0].basis, "work");
+    assert.equal(page.plans[0].objective, "Build the thing");
+    assert.equal(page.plans[0].status, "cancelled");
+    assert.deepEqual(page.projects.map(project => project.planIds), [[page.plans[0].id]]);
+    assert.equal((await viewer.request<WorkspaceUnderstanding>(path)).knowledge?.catalog.revision, 0);
+  } finally { viewer?.close(); await host.stop(); }
+});
+
+test("generated plans skip partial and empty work, link to repositories, and page while projects stay complete", () => {
+  const temp = mkdtempSync("/tmp/inf-understanding-generated-");
+  try {
+    const checkout = (id: string) => ({ projectId: id, name: id, path: `/workspace/${id}`, primary: true, teamReady: true });
+    const group: any = { id: "workspace", name: "Workspace", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", repos: [
+      { projectId: "primary", name: "Primary", path: "/workspace/primary", checkouts: [checkout("primary"), { ...checkout("alternate"), primary: false }] },
+      { projectId: "other", name: "Other", path: "/workspace/other", checkouts: [checkout("other")] },
+    ] };
+    let records: object[] = [];
+    const mission = (id: string, repoProjectIds: string[], objective = "full request", index = 0) => ({ id, repoProjectIds, title: `Mission ${id}`, objective, result: { summary: `outcome ${id}` }, status: "cancelled", updatedAt: new Date(Date.UTC(2026, 9, 21, 0, 0, index)).toISOString() });
+    const service = new UnderstandingService({ config: { stateDir: join(temp, "state"), projects: [] } as never, key: Buffer.alloc(32), manager: {} as never,
+      groups: { list: () => ({ groups: [group], suggestions: [] }), get: () => group }, missions: { understandingRecords: () => records, understandingOwnsSession: () => false } as never,
+      teams: { understandingRecords: () => [], understandingOwnsSession: () => false } as never, goals: { understandingRecords: () => [] } as never });
+    const coverage = ["From work: derived from recorded team, mission and goal requests. Status is the run's own status."];
+
+    records = [mission("kept", ["alternate", "other"]), mission("partial", ["primary", "outside"]), mission("empty", ["primary"], ""), mission("primary-only", ["primary"], "primary request", 1)];
+    const page = service.generatedPage("workspace");
+    assert.deepEqual(page.plans.map(plan => plan.id).sort(), ["plan:mission:kept", "plan:mission:primary-only"], "partial and empty-objective rows produce no plan");
+    const kept = page.plans.find(plan => plan.workId === "mission:kept")!;
+    assert.deepEqual({ objective: kept.objective, outcome: kept.outcome, basis: kept.basis, status: kept.status, repositoryIds: kept.repositoryIds }, { objective: "full request", outcome: "outcome kept", basis: "work", status: "cancelled", repositoryIds: ["primary", "other"] });
+    assert.deepEqual(page.projects.map(project => [project.id, project.name, project.repositoryIds, [...project.planIds].sort()]), [
+      ["project:primary", "Primary", ["primary"], ["plan:mission:kept", "plan:mission:primary-only"]],
+      ["project:other", "Other", ["other"], ["plan:mission:kept"]],
+    ]);
+    assert.deepEqual(page.coverage, coverage);
+    assert.equal(page.next, null);
+
+    records = Array.from({ length: 60 }, (_, index) => mission(`m${String(index).padStart(2, "0")}`, ["primary"], "request", index));
+    const first = service.generatedPage("workspace");
+    assert.equal(first.plans.length, 50);
+    assert.ok(first.next);
+    const second = service.generatedPage("workspace", first.next!);
+    assert.equal(second.plans.length, 10);
+    assert.equal(second.next, null);
+    assert.equal(new Set([...first.plans, ...second.plans].map(plan => plan.id)).size, 60);
+    for (const part of [first, second]) {
+      assert.equal(part.projects.length, 2);
+      assert.equal(part.projects[0]!.planIds.length, 60);
+      assert.deepEqual(part.coverage, coverage);
+    }
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });

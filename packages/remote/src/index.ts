@@ -8,12 +8,14 @@ import {
 export type {
   WorkspaceUnderstanding, UnderstandingRepository, UnderstandingWork, UnderstandingWorkKind,
   UnderstandingPlan, UnderstandingArtifact, UnderstandingBrief, UnderstandingClaim,
-  UnderstandingCitation, UnderstandingLink,
+  UnderstandingCitation, UnderstandingLink, GeneratedPlan, GeneratedProject, GeneratedCatalogPage,
 } from "./understanding.js";
 export type * from "./understanding-knowledge.js";
+export type * from "./understanding-diagrams.js";
 export type * from "./understanding-behavior.js";
 export type * from "./understanding-work.js";
 export * from "./memory.js";
+export * from "./diagram-layout.js";
 
 /** A Cloudflare Access service token; Cloudflare checks it before the connection reaches the relay. */
 export interface RemoteAccessToken { clientId: string; clientSecret: string }
@@ -294,4 +296,4 @@ export function createRemoteClient(connection: RemoteConnection, options: Remote
 }
 export { parseMarkdown } from "./markdown.js";
 export { parseMermaid, type ParsedMermaid } from "./mermaid.js";
-export { layoutDiagram, type DiagramLayout, NODE_W, NODE_H, LAYER_GAP, NODE_GAP, GROUP_PAD } from "./diagram-layout.js";
+export { layoutDiagram, type DiagramLayout, NODE_W, NODE_H, LAYER_GAP, NODE_GAP, GROUP_PAD } from "./work-diagram-layout.js";

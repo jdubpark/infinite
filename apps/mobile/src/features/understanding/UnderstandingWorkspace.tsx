@@ -5,12 +5,10 @@ import { ApiError, api, connectionKey, type Connection, type ProjectGroupList } 
 import { usePoll } from "../../api/usePoll";
 import { Chip, LiveStatus, Segmented, type SegmentOption, TopBar } from "../../components/Glass";
 import { Glyph } from "../../components/Icon";
-import { parseMarkdown, type UnderstandingCitation, type UnderstandingRepository, type UnderstandingWork, type WorkspaceUnderstanding } from "@infinite/remote";
+import type { UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding } from "@infinite/remote";
 import { theme } from "../../theme";
-import { Disclosure } from "../teams/parts";
-import { RichText } from "./blocks";
-import { DiagramView } from "./diagram/DiagramView";
 import { KnowledgePanel } from "./KnowledgePanel";
+import { SystemOverview } from "./SystemOverview";
 import { clearUnderstandingSummary, readUnderstandingSummary, saveUnderstandingSummary } from "./offline-cache";
 
 type ViewMode = "work" | "system";
@@ -33,7 +31,6 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   const stopped = useRef("");
   const last = useRef<ReadResult | null>(null);
   const [view, setView] = useState<ViewMode>(params.view === "system" ? "system" : "work");
-  const [selectedRepo, setSelectedRepo] = useState("");
 
   const poll = usePoll(async () => {
     if (stopped.current === scope && last.current?.scope === scope) return last.current;
@@ -100,7 +97,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
       anchor.measureLayout(content.current, (_x, y) => scroll.current?.scrollTo({ y, animated: false }), () => {});
     });
   };
-  const openRepo = (id: string) => { setSelectedRepo(id); setView("system"); };
+  const openRepo = (_id: string) => setView("system");
 
   return <View style={s.fill}>
     <TopBar backLabel="Understand" onBack={back} title={groupName} right={<LiveStatus online={poll.online && result?.state === "ready" && !result.cachedAt} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />
@@ -120,7 +117,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
       {data && (result?.cachedAt || !poll.online) ? <Text style={s.notice}>{result?.cachedAt ? `Offline · cached overview from ${date(result.cachedAt)}. Only workspace and repository labels and state are available.` : `Offline · showing the last response received for this workspace at ${date(data.observedAt)}.`}</Text> : null}
       {data ? view === "work"
         ? <WorkView data={data} repoById={repoById} onOpenRepo={openRepo} connection={connection} workspaceId={workspaceId} readGeneration={`${poll.seen}|${data.observedAt}/${data.workspace.revision}`} offline={!poll.online || Boolean(result?.cachedAt)} onComponentNavigate={revealKnowledge} />
-        : <SystemView data={data} selectedRepo={selectedRepo} onSelectRepo={setSelectedRepo} connection={connection} workspaceId={workspaceId} readGeneration={`${poll.seen}|${data.observedAt}/${data.workspace.revision}`} offline={!poll.online || Boolean(result?.cachedAt)} onComponentNavigate={revealKnowledge} initialComponent={params.component} />
+        : <SystemView data={data} connection={connection} workspaceId={workspaceId} readGeneration={`${poll.seen}|${data.observedAt}/${data.workspace.revision}`} offline={!poll.online || Boolean(result?.cachedAt)} onComponentNavigate={revealKnowledge} initialComponent={params.component} />
         : null}
       </View>
     </ScrollView>
@@ -192,91 +189,22 @@ function MembershipMap({ workspace, repositories, onPress }: { workspace: string
   </View>;
 }
 
-function SystemView({ data, selectedRepo, onSelectRepo, connection, workspaceId, readGeneration, offline, onComponentNavigate, initialComponent }: { data: WorkspaceUnderstanding; selectedRepo: string; onSelectRepo: (id: string) => void; connection: Connection; workspaceId: string; readGeneration: string; offline: boolean; onComponentNavigate: (anchor: View | null) => void; initialComponent?: string }) {
+function SystemView({ data, connection, workspaceId, readGeneration, offline, onComponentNavigate, initialComponent }: { data: WorkspaceUnderstanding; connection: Connection; workspaceId: string; readGeneration: string; offline: boolean; onComponentNavigate: (anchor: View | null) => void; initialComponent?: string }) {
   const anchor = useRef<View>(null);
+  // A `component` route param (from a work brief) opens that component once, when the view mounts.
+  const [open, setOpen] = useState({ id: initialComponent ?? "", nonce: initialComponent ? 1 : 0 });
   return <View style={s.stack}>
-    <Text style={s.intro}>Current is a retained source snapshot. Planned contains recorded requests only. Neither means deployed.</Text>
-    <Text style={s.heading}>Current and Planned</Text>
-    {data.repositories.map(repo => <RepositoryCard key={repo.id} repo={repo} selected={selectedRepo === repo.id} onSelect={() => onSelectRepo(selectedRepo === repo.id ? "" : repo.id)} />)}
-    <View ref={anchor}><KnowledgePanel onComponentNavigate={() => onComponentNavigate(anchor.current)} key={`${connectionKey(connection)}|${connection.url}|${connection.token}|${workspaceId}`} connection={connection} workspaceId={workspaceId} knowledge={data.knowledge} readGeneration={readGeneration} defaultArea="components" repositories={data.repositories} work={data.work} offline={offline} initialComponent={initialComponent} /></View>
-    {data.coverage.map((line, index) => <Text key={`coverage-${index}`} style={s.note}>{line}</Text>)}
-  </View>;
-}
-
-function RepositoryCard({ repo, selected, onSelect }: { repo: UnderstandingRepository; selected: boolean; onSelect: () => void }) {
-  const current = repo.current;
-  return <View style={s.card}>
-    <Pressable accessibilityRole="button" accessibilityState={{ expanded: selected }} onPress={onSelect} style={s.workHead}>
-      <View style={s.workMain}>
-        <Text style={s.workTitle}>{repo.name}</Text>
-        <Text style={s.meta}>{repo.checkoutIds.length} {repo.checkoutIds.length === 1 ? "checkout" : "checkouts"} · {stateLabel(repo.state)}</Text>
-      </View>
-      <Glyph name={selected ? "down" : "forward"} size={13} color={theme.colors.mutedInk} />
-    </Pressable>
-    {!current.length ? <Text style={s.note}>{repo.state === "empty" ? "No retained brief is available yet." : repo.state === "unavailable" ? "The source is unavailable." : repo.state === "failed" ? "The latest refresh failed; no retained brief is available." : "A brief is not available yet."}</Text> : null}
-    {selected ? <View style={s.detail}>
-      {current.map(artifact => <View key={artifact.id} style={s.section}>
-        <Text style={s.sectionTitle}>Current · {artifact.sourceKind === "team" ? "team-worktree snapshot" : "repository snapshot"}</Text>
-        <Text style={s.meta}>Source project: {artifact.sourceProjectId}</Text>
-        <Text style={s.meta}>Source revision: {artifact.head ? shortRevision(artifact.head) : "not recorded"}{artifact.base ? ` · compared with ${shortRevision(artifact.base)}` : ""}</Text>
-        <Text style={s.meta}>Generated {date(artifact.generatedAt)} · retained {date(artifact.retainedAt)}</Text>
-        <RichText nodes={parseMarkdown(artifact.brief.summary).nodes} basis="model" />
-        {artifact.brief.diagrams?.map(diagram => <DiagramView key={diagram.id} diagram={diagram} />)}
-        {artifact.brief.changes.map((claim, index) => <EvidenceLine key={`change-${index}`} title="Reported change" text={claim.text} citations={claim.citations} />)}
-        {artifact.brief.checks.map((claim, index) => <EvidenceLine key={`check-${index}`} title="Reported check evidence" text={claim.text} citations={claim.citations} />)}
-        {artifact.brief.unknowns.map((unknown, index) => <EvidenceLine key={`unknown-${index}`} title="Gap" text={unknown} />)}
-        <Disclosure title={`System shape · ${artifact.brief.architecture.length}`}>
-          {artifact.brief.architecture.length ? artifact.brief.architecture.map((claim, index) => <EvidenceLine key={`architecture-${index}`} title="Architecture" text={claim.text} citations={claim.citations} />) : <Text style={s.note}>No architecture claims are included in this brief.</Text>}
-        </Disclosure>
-        <Disclosure title={`Review questions · ${artifact.brief.review.length}`}>
-          {artifact.brief.review.length ? artifact.brief.review.map((question, index) => <View key={`review-${index}`} style={s.review}>
-            <Text style={s.label}>{question.area} · {question.priority} priority</Text>
-            {question.why ? <Text style={s.body}>{question.why}</Text> : null}
-            <Text selectable style={s.body}>{question.question}</Text>
-            {question.citations.length ? <Text selectable style={s.evidence}>Sources: {question.citations.map(citation => `${citation.source}:${citation.line}`).join(" · ")}</Text> : null}
-          </View>) : <Text style={s.note}>No review questions are included in this brief.</Text>}
-        </Disclosure>
-        <Disclosure title={`Guidance · ${artifact.brief.guidance.length}`}>
-          {artifact.brief.guidance.length ? artifact.brief.guidance.map((guidance, index) => <View key={`guidance-${index}`} style={s.review}>
-            <Text style={s.label}>{guidance.basis === "documented" ? "Documented" : "Proposed"} guidance</Text>
-            <Text selectable style={s.body}>{guidance.text}</Text>
-            {guidance.citations.length ? <Text selectable style={s.evidence}>Sources: {guidance.citations.map(citation => `${citation.source}:${citation.line}`).join(" · ")}</Text> : null}
-          </View>) : <Text style={s.note}>No agent guidance is included in this brief.</Text>}
-        </Disclosure>
-        <Disclosure title="Revision details">
-          <Text selectable style={s.evidence}>Source project: {artifact.sourceProjectId}</Text>
-          <Text selectable style={s.evidence}>Head: {artifact.head || "not recorded"}</Text>
-          <Text selectable style={s.evidence}>Comparison base: {artifact.base || "not recorded"}</Text>
-        </Disclosure>
-        {artifact.coverage.map((line, index) => <Text key={`artifact-coverage-${index}`} style={s.note}>{line}</Text>)}
-        {artifact.evidence.length ? <Text style={s.label}>Source evidence</Text> : null}
-        {artifact.evidence.map((entry, index) => <Text selectable key={`evidence-${index}`} style={s.evidence}>{entry.source}:{entry.line} · {entry.text}</Text>)}
-      </View>)}
-      <Text style={s.sectionTitle}>Planned · recorded requests</Text>
-      {repo.planned.length ? repo.planned.map((plan, index) => <View key={`${plan.workId}/${index}`} style={s.plan}>
-        <Text style={s.workTitle}>{plan.title}</Text>
-        <Text style={s.meta}>{kindLabel(plan.kind)} · {plan.status} · recorded {date(plan.updatedAt)}</Text>
-        <Text selectable style={s.body}>{plan.text}</Text>
-        <Text style={s.note}>Original request · {plan.workId}</Text>
-      </View>) : <Text style={s.note}>No recorded request is available for this repository.</Text>}
-      {repo.warnings.map((line, index) => <Text key={`warning-${index}`} style={s.notice}>{line}</Text>)}
-      {repo.state === "updating" && current.length ? <Text style={s.notice}>Updating · showing the last retained brief.</Text> : null}
-      {repo.state === "failed" && current.length ? <Text style={s.notice}>Refresh failed · showing the last retained brief.</Text> : null}
-      {repo.coverage.map((line, index) => <Text key={`repo-coverage-${index}`} style={s.note}>{line}</Text>)}
-    </View> : null}
-  </View>;
-}
-
-function EvidenceLine({ title, text, citations = [] }: { title: string; text: string; citations?: UnderstandingCitation[] }) {
-  return <View style={s.evidenceLine}><Text style={s.label}>{title}</Text><RichText nodes={parseMarkdown(text).nodes} compact />
-    {citations.length ? <Text selectable style={s.evidence}>Sources: {citations.map(citation => `${citation.source}:${citation.line}`).join(" · ")}</Text> : null}
+    <SystemOverview connection={connection} workspaceId={workspaceId} data={data} offline={offline}
+      onOpenComponent={id => { setOpen(previous => ({ id, nonce: previous.nonce + 1 })); onComponentNavigate(anchor.current); }} />
+    <View ref={anchor}><KnowledgePanel onComponentNavigate={() => onComponentNavigate(anchor.current)} key={`${connectionKey(connection)}|${connection.url}|${connection.token}|${workspaceId}`} connection={connection} workspaceId={workspaceId} knowledge={data.knowledge} readGeneration={readGeneration} defaultArea="components" openComponentId={open.id} openComponentNonce={open.nonce} repositories={data.repositories} work={data.work} offline={offline} /></View>
+    {/* Only the pointers to the detail pages; the source-separation sentences belong to the Work tab. */}
+    {data.coverage.filter(line => line.includes("shown here")).map((line, index) => <Text key={`coverage-${index}`} style={s.note}>{line}</Text>)}
+    <Text style={s.note}>Generated from the code and the work records. It does not mean anything is deployed or approved.</Text>
   </View>;
 }
 
 function kindLabel(kind: UnderstandingWork["kind"]) { return kind === "team" ? "Teamwork" : kind === "goal" ? "Goal" : "Mission"; }
-function stateLabel(state: UnderstandingRepository["state"]) { return state === "updating" ? "updating" : state === "ready" ? "available" : state; }
 function date(value: string) { const parsed = new Date(value); return Number.isNaN(parsed.getTime()) ? "time not recorded" : parsed.toLocaleString(); }
-function shortRevision(value: string) { return value.length > 12 ? `${value.slice(0, 12)}…` : value; }
 
 const s = StyleSheet.create({
   fill: { flex: 1, backgroundColor: theme.colors.paper },
@@ -303,13 +231,8 @@ const s = StyleSheet.create({
   meta: { fontSize: 11, lineHeight: 16, color: theme.colors.mutedInk },
   detail: { paddingTop: 10, gap: 10 },
   section: { gap: 5, paddingTop: 4 },
-  sectionTitle: { fontSize: 14, lineHeight: 20, fontWeight: "700", color: theme.colors.ink },
   label: { fontSize: 11, lineHeight: 16, fontWeight: "700", color: theme.colors.secondaryInk },
   body: { fontSize: 13, lineHeight: 19, color: theme.colors.ink, flexShrink: 1 },
-  evidence: { fontSize: 11, lineHeight: 16, color: theme.colors.secondaryInk, paddingLeft: 8 },
-  evidenceLine: { gap: 3, paddingTop: 5 },
-  review: { gap: 5, paddingVertical: 7, borderTopWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },
-  plan: { gap: 5, paddingVertical: 8, borderTopWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },
   chips: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 7 },
   notice: { fontSize: 12, lineHeight: 18, color: theme.colors.warningInk, backgroundColor: theme.colors.warningSurface, padding: 9, borderRadius: theme.radius.card },
   note: { fontSize: 12, lineHeight: 18, color: theme.colors.mutedInk },

@@ -130,6 +130,8 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
   const receipt = join(root, "calls.jsonl");
   const fixture = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
   const commandArgs = [fixture, receipt];
+  // Workspace maintenance may also invoke the engine (`context`, `brief`); count only the session-briefing `auto` runs.
+  const autoReceipts = () => readFileSync(receipt, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)).filter((call: { args: string[] }) => call.args.includes("auto"));
   const host = await startHost({ config: { attention, repositoryBriefings: {
     command: process.execPath, args: commandArgs, model: "gpt-6-luna", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 10000,
   } } });
@@ -155,7 +157,7 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
     assert.equal(status.body.summary.engine, "jevcode");
     assert.equal(status.body.summary.repository.base, execFileSync("git", ["-C", host.config.projects[0].path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
     assert.match(status.body.summary.text, /Fixture repository brief/);
-    const firstReceipt = readFileSync(receipt, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const firstReceipt = autoReceipts();
     assert.equal(firstReceipt.length, 1, "the turn-end event must trigger generation without a manual summary request");
     assert.deepEqual(firstReceipt[0].input.split("\n").filter(Boolean).map((line: string) => JSON.parse(line).role), ["user", "assistant", "tool", "assistant"]);
     assert.ok(firstReceipt[0].args.includes("--activity-stdin"));
@@ -167,7 +169,7 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
     const cached = await host.fetchApi(`/sessions/${id}/summary`, "viewer");
     assert.equal(cached.body.engine, "jevcode");
     assert.equal(cached.body.repository.fingerprint, status.body.summary.repository.fingerprint);
-    assert.equal(readFileSync(receipt, "utf8").trim().split("\n").length, 1, `explicit reads reuse the generated transcript range ${status.body.summary.from}-${status.body.summary.to}`);
+    assert.equal(autoReceipts().length, 1, `explicit reads reuse the generated transcript range ${status.body.summary.from}-${status.body.summary.to}`);
     assert.equal((await host.fetchApi(`/sessions/${id}/summary?status=1`, null)).status, 401);
 
     const empty = await host.fetchApi(`/sessions/${id}/summary?after=${status.body.summary.to}`, "viewer");
@@ -178,12 +180,12 @@ test("repository briefings run automatically after a turn end, reuse the snapsho
     assert.equal(empty.body.from, status.body.summary.to);
     assert.equal(empty.body.messages, 0);
     assert.ok(Number.isFinite(Date.parse(empty.body.at)));
-    assert.equal(readFileSync(receipt, "utf8").trim().split("\n").length, 1, "an empty cursor range returns the summary contract without invoking the runner");
+    assert.equal(autoReceipts().length, 1, "an empty cursor range returns the summary contract without invoking the runner");
 
     await host.stopApi();
     await host.start();
     await new Promise(resolve => setTimeout(resolve, 500));
-    assert.equal(readFileSync(receipt, "utf8").trim().split("\n").length, 1, "startup only primes journal cursors; it does not backfill historical turns");
+    assert.equal(autoReceipts().length, 1, "startup only primes journal cursors; it does not backfill historical turns");
   } finally {
     await host.stop();
     rmSync(root, { recursive: true, force: true });
@@ -251,7 +253,7 @@ test("a failed automatic repository brief is safe and does not retry the same ch
     const control = await claimControl(host, id, "owner");
     await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
     const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "failed", 20000);
-    assert.equal(status.body.error, "Repository brief could not be generated. Check the configured briefing wrapper.");
+    assert.equal(status.body.error, "Repository brief could not be generated. Check the configured briefing wrapper. Reason: exit 1");
     const stop = await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() }, control.headers);
     assert.equal(stop.status, 200);
     const exited = await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "exited", 15000);
@@ -260,7 +262,7 @@ test("a failed automatic repository brief is safe and does not retry the same ch
     const exitAttempt = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "pending", 15000);
     assert.equal(exitAttempt.body.state, "pending");
     const settled = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "failed", 15000);
-    assert.equal(settled.body.error, "Repository brief could not be generated. Check the configured briefing wrapper.");
+    assert.equal(settled.body.error, "Repository brief could not be generated. Check the configured briefing wrapper. Reason: exit 1");
     const settledCount = readFileSync(receipt, "utf8").trim().split("\n").length;
     assert.equal(settledCount, 2, "the initial failure and one exit checkpoint each run once");
     for (let poll = 0; poll < 4; poll++) {

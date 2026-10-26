@@ -1,83 +1,129 @@
-import assert from "node:assert/strict";
 import test from "node:test";
-import { LAYER_GAP, NODE_H, NODE_W, layoutDiagram } from "../packages/remote/src/diagram-layout.js";
-import type { Diagram } from "../packages/remote/src/understanding-work.js";
+import assert from "node:assert/strict";
+import { layoutGraph } from "../packages/remote/src/diagram-layout.js";
 
-function flow(direction: Diagram["direction"], ids: string[], pairs: [string, string][]): Pick<Diagram, "direction" | "nodes" | "edges" | "groups" | "sequence"> {
-  return {
-    direction,
-    nodes: ids.map(id => ({ id, label: id, shape: "box" })),
-    edges: pairs.map(([from, to]) => ({ from, to, style: "solid" })),
-    groups: [],
-  };
+const n = (ids: string[]) => ids.map(id => ({ id, label: id, group: null, componentId: null }));
+const e = (from: string, to: string) => ({ from, to, label: null });
+
+test("layers a chain left to right and keeps a back edge", () => {
+  const layout = layoutGraph({ direction: "LR", groups: [], nodes: n(["a", "b", "c"]), edges: [e("a", "b"), e("b", "c"), e("c", "a")] });
+  assert.deepEqual(layout.nodes.map(x => x.layer), [0, 1, 2]);
+  assert.ok(layout.nodes[0].x < layout.nodes[1].x && layout.nodes[1].x < layout.nodes[2].x);
+  assert.deepEqual(layout.edges.map(x => x.back), [false, false, true]);
+  assert.equal(layout.width, 3 * 150 + 2 * 48 + 2 * 12);
+});
+
+test("layers top to bottom and places siblings apart", () => {
+  const layout = layoutGraph({ direction: "TB", groups: [], nodes: n(["root", "x", "y"]), edges: [e("root", "x"), e("root", "y")] });
+  const [root, x, y] = layout.nodes;
+  assert.ok(root.y < x.y && x.y === y.y && x.x !== y.x);
+});
+
+test("group boxes enclose their members with exact padding", () => {
+  const layout = layoutGraph({ direction: "LR", groups: [{ id: "g", label: "G" }], nodes: [{ id: "a", label: "a", group: "g", componentId: null }, { id: "b", label: "b", group: "g", componentId: null }], edges: [e("a", "b")] });
+  const g = layout.groups[0];
+  const minX = Math.min(...layout.nodes.map(node => node.x));
+  const maxX = Math.max(...layout.nodes.map(node => node.x + node.width));
+  assert.equal(g.x, minX - 12);
+  assert.equal(g.width, maxX - minX + 24);
+  for (const node of layout.nodes) { assert.ok(node.x >= g.x + 12 && node.x + node.width <= g.x + g.width - 12); }
+});
+
+test("is deterministic and drops edges to unknown nodes", () => {
+  const graph = { direction: "LR" as const, groups: [], nodes: n(["a", "b"]), edges: [e("a", "b"), e("a", "zzz")] };
+  assert.deepEqual(layoutGraph(graph), layoutGraph(graph));
+  assert.equal(layoutGraph(graph).edges.length, 1);
+});
+
+test("sweeps reorder a layer so it matches the order of the layer before it", () => {
+  const layout = layoutGraph({ direction: "LR", groups: [], nodes: n(["a", "b", "c", "d"]), edges: [e("a", "d"), e("b", "c")] });
+  const at = (id: string) => layout.nodes.find(node => node.id === id)!;
+  assert.deepEqual([at("a").layer, at("b").layer, at("c").layer, at("d").layer], [0, 0, 1, 1]);
+  assert.equal(at("d").y, at("a").y);
+  assert.equal(at("c").y, at("b").y);
+  assert.ok(at("d").y < at("c").y);
+});
+
+test("LR forward edge runs from the source right edge to the target left edge", () => {
+  const layout = layoutGraph({ direction: "LR", groups: [], nodes: n(["a", "b"]), edges: [e("a", "b")] });
+  const [a, b] = layout.nodes;
+  const edge = layout.edges[0];
+  assert.equal(edge.back, false);
+  assert.deepEqual(edge.points, [{ x: a.x + a.width, y: a.y + a.height / 2 }, { x: b.x, y: b.y + b.height / 2 }]);
+});
+
+test("LR back edge runs from the source left edge to the target right edge", () => {
+  const layout = layoutGraph({ direction: "LR", groups: [], nodes: n(["a", "b", "c"]), edges: [e("a", "b"), e("b", "c"), e("c", "a")] });
+  const at = (id: string) => layout.nodes.find(node => node.id === id)!;
+  const [a, , c] = [at("a"), at("b"), at("c")];
+  const back = layout.edges[2];
+  assert.equal(back.back, true);
+  assert.deepEqual(back.points, [{ x: c.x, y: c.y + c.height / 2 }, { x: a.x + a.width, y: a.y + a.height / 2 }]);
+});
+
+test("TB forward edge runs from the source bottom edge to the target top edge", () => {
+  const layout = layoutGraph({ direction: "TB", groups: [], nodes: n(["a", "b"]), edges: [e("a", "b")] });
+  const [a, b] = layout.nodes;
+  assert.deepEqual(layout.edges[0].points, [{ x: a.x + a.width / 2, y: a.y + a.height }, { x: b.x + b.width / 2, y: b.y }]);
+});
+
+test("an empty graph has no nodes or edges and is sized by padding alone", () => {
+  const layout = layoutGraph({ direction: "LR", groups: [], nodes: [], edges: [] });
+  assert.deepEqual([layout.nodes, layout.edges, layout.groups], [[], [], []]);
+  assert.equal(layout.width, 24);
+  assert.equal(layout.height, 24);
+});
+
+test("a self-loop is a back edge and leaves its node in layer 0", () => {
+  const layout = layoutGraph({ direction: "LR", groups: [], nodes: n(["a"]), edges: [e("a", "a")] });
+  assert.equal(layout.nodes[0].layer, 0);
+  assert.equal(layout.edges[0].back, true);
+});
+
+test("option overrides change the width by the overridden rules", () => {
+  const layout = layoutGraph({ direction: "LR", groups: [], nodes: n(["a", "b", "c"]), edges: [e("a", "b"), e("b", "c")] }, { nodeWidth: 100, gapX: 10 });
+  assert.equal(layout.width, 3 * 100 + 2 * 10 + 2 * 12);
+});
+
+type Box = { x: number; y: number; width: number; height: number };
+const inside = (node: Box, box: Box) => node.x >= box.x && node.y >= box.y && node.x + node.width <= box.x + box.width && node.y + node.height <= box.y + box.height;
+const overlap = (a: Box, b: Box) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+const grouped = (members: [string, string][]) => members.map(([id, group]) => ({ id, label: id, group, componentId: null }));
+function assertHonestBoxes(layout: ReturnType<typeof layoutGraph>, nodes: { id: string; group: string | null }[]) {
+  const groupOf = new Map(nodes.map(node => [node.id, node.group]));
+  for (const box of layout.groups) {
+    const members = layout.nodes.filter(node => groupOf.get(node.id) === box.id);
+    assert.ok(members.every(node => inside(node, box)), `${box.id} encloses its members`);
+    assert.deepEqual(layout.nodes.filter(node => groupOf.get(node.id) !== box.id && overlap(node, box)).map(node => node.id), [], `${box.id} holds no other group's node`);
+    assert.ok(Math.min(...members.map(node => node.y)) - box.y >= 16, `${box.id} leaves room for its label`);
+    assert.ok(box.y >= 0, `${box.id} stays on the canvas`);
+  }
+  for (const a of layout.groups) for (const b of layout.groups) if (a.id < b.id) assert.equal(overlap(a, b), false, `${a.id} and ${b.id} do not overlap`);
 }
 
-test("longest-path layering and deterministic positions", () => {
-  const a = layoutDiagram(flow("LR", ["A", "B", "C", "D"], [["A", "B"], ["B", "C"], ["A", "C"], ["C", "D"]]));
-  const x = Object.fromEntries(a.nodes.map(n => [n.id, n.x]));
-  assert.ok(x.A < x.B && x.B < x.C && x.C < x.D);
-  assert.deepEqual(a, layoutDiagram(flow("LR", ["A", "B", "C", "D"], [["A", "B"], ["B", "C"], ["A", "C"], ["C", "D"]])));
-  const td = layoutDiagram(flow("TD", ["A", "B"], [["A", "B"]]));
-  assert.ok(td.nodes[0]!.y < td.nodes[1]!.y && td.nodes[0]!.x === td.nodes[1]!.x);
-
-  const lrFanout = layoutDiagram(flow("LR", ["A", "B", "C"], [["A", "B"], ["A", "C"]]));
-  const lrPoints = lrFanout.edges[0]!.points;
-  assert.equal(lrPoints[1]![0], lrPoints[0]![0] + (lrPoints[3]![0] - lrPoints[0]![0]) / 3);
-  assert.equal(lrPoints[2]![0], lrPoints[0]![0] + (lrPoints[3]![0] - lrPoints[0]![0]) * 2 / 3);
-  assert.equal(lrPoints[1]![1], lrPoints[0]![1]); assert.equal(lrPoints[2]![1], lrPoints[3]![1]);
-
-  const tdFanout = layoutDiagram(flow("TD", ["A", "B", "C"], [["A", "B"], ["A", "C"]]));
-  const tdPoints = tdFanout.edges[0]!.points;
-  assert.equal(tdPoints[1]![1], tdPoints[0]![1] + (tdPoints[3]![1] - tdPoints[0]![1]) / 3);
-  assert.equal(tdPoints[2]![1], tdPoints[0]![1] + (tdPoints[3]![1] - tdPoints[0]![1]) * 2 / 3);
-  assert.equal(tdPoints[1]![0], tdPoints[0]![0]); assert.equal(tdPoints[2]![0], tdPoints[3]![0]);
+test("five nodes in three groups sharing a layer get contiguous boxes that hold no foreign node", () => {
+  const nodes = grouped([["a1", "a"], ["b1", "b"], ["a2", "a"], ["c1", "c"], ["b2", "b"]]);
+  const layout = layoutGraph({ direction: "LR", groups: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }], nodes, edges: [] });
+  assert.deepEqual(layout.groups.map(group => group.id), ["a", "b", "c"]);
+  const order = [...layout.nodes].sort((x, y) => x.y - y.y).map(node => node.id);
+  assert.deepEqual(order, ["a1", "a2", "b1", "b2", "c1"]);
+  assertHonestBoxes(layout, nodes);
 });
 
-test("cycles terminate and every node is placed", () => {
-  const l = layoutDiagram(flow("LR", ["A", "B", "C"], [["A", "B"], ["B", "A"], ["B", "C"]]));
-  assert.equal(l.nodes.length, 3); assert.ok(l.width > 0 && l.height > 0);
+test("a component-map shape across layers keeps boxes honest and labelled", () => {
+  const nodes = grouped([["web", "apps"], ["mobile", "apps"], ["host", "packages"], ["remote", "packages"], ["readme", "root"]]);
+  const layout = layoutGraph({ direction: "LR", groups: [{ id: "apps", label: "apps" }, { id: "packages", label: "packages" }, { id: "root", label: "root" }], nodes,
+    edges: [e("web", "remote"), e("mobile", "remote"), e("host", "remote"), e("readme", "host")] });
+  assert.equal(layout.groups.length, 3);
+  assertHonestBoxes(layout, nodes);
+  const tb = layoutGraph({ direction: "TB", groups: [{ id: "apps", label: "apps" }, { id: "packages", label: "packages" }, { id: "root", label: "root" }], nodes,
+    edges: [e("web", "remote"), e("mobile", "remote"), e("host", "remote"), e("readme", "host")] });
+  assertHonestBoxes(tb, nodes);
 });
 
-test("groups bound their members and labels wrap", () => {
-  const d = flow("LR", ["A", "B", "C"], [["A", "B"], ["B", "C"]]); d.nodes[0]!.group = "G"; d.nodes[1]!.group = "G"; d.groups = [{ id: "G", label: "Group" }];
-  d.nodes[2]!.label = "A very long component label that needs wrapping badly";
-  const l = layoutDiagram(d); const g = l.groups[0]!; const inside = l.nodes.filter(n => ["A", "B"].includes(n.id));
-  assert.ok(inside.every(n => n.x >= g.x && n.y >= g.y && n.x + n.w <= g.x + g.w && n.y + n.h <= g.y + g.h));
-  assert.equal(l.nodes.find(n => n.id === "C")!.lines.length, 2); assert.ok(l.nodes.find(n => n.id === "C")!.lines[1]!.endsWith("…"));
-});
-
-test("members of other groups stay outside each group box", () => {
-  const d = flow("LR", ["A", "B", "C"], []);
-  d.nodes[0]!.group = "G"; d.nodes[1]!.group = "H"; d.nodes[2]!.group = "G";
-  d.groups = [{ id: "G", label: "Group G" }, { id: "H", label: "Group H" }];
-  const l = layoutDiagram(d);
-  const groupByNode = new Map(d.nodes.map(node => [node.id, node.group]));
-  for (const group of l.groups) {
-    const nonMembers = l.nodes.filter(node => groupByNode.get(node.id) !== group.id);
-    assert.ok(nonMembers.every(node => node.y + node.h <= group.y || node.y >= group.y + group.h));
-  }
-});
-
-test("a group moved past another box stays outside earlier boxes", () => {
-  const d = flow("LR", ["I0", "I1", "I2", "A0", "A1", "H", "G", "B1", "B2"], [
-    ["I0", "I1"], ["I1", "I2"], ["A0", "A1"], ["A1", "H"], ["G", "B1"], ["B1", "B2"],
-  ]);
-  d.nodes[0]!.group = "I"; d.nodes[2]!.group = "I"; d.nodes[5]!.group = "H"; d.nodes[6]!.group = "G";
-  d.groups = [{ id: "G", label: "Group G" }, { id: "H", label: "Group H" }, { id: "I", label: "Group I" }];
-  const l = layoutDiagram(d);
-  const groupByNode = new Map(d.nodes.map(node => [node.id, node.group]));
-  for (const group of l.groups) {
-    const nonMembers = l.nodes.filter(node => groupByNode.get(node.id) !== group.id);
-    assert.ok(nonMembers.every(node =>
-      node.x + node.w <= group.x || node.x >= group.x + group.w || node.y + node.h <= group.y || node.y >= group.y + group.h,
-    ));
-  }
-});
-
-test("sequence layout gives lanes and ordered message rows", () => {
-  const l = layoutDiagram({ direction: "LR", nodes: [], edges: [], groups: [], sequence: { participants: [{ id: "A", label: "API" }, { id: "B", label: "B" }], messages: [{ from: "A", to: "B", text: "req", style: "solid" }, { from: "B", to: "A", text: "rep", style: "dashed" }] } });
-  assert.equal(l.lanes?.length, 2); assert.equal(l.edges.length, 2); assert.ok(l.edges[0]!.points[0]![1] < l.edges[1]!.points[0]![1]);
-  assert.deepEqual(l.lanes?.map(lane => lane.x), [0, NODE_W + LAYER_GAP]);
-  assert.equal(l.edges[0]!.points[0]![1], NODE_H + 36);
-  assert.equal(l.edges[1]!.points[0]![1], NODE_H + 72);
+test("a group whose members surround another node across layers draws no box", () => {
+  const nodes = grouped([["a1", "a"], ["x", "b"], ["a2", "a"]]);
+  const layout = layoutGraph({ direction: "LR", groups: [{ id: "a", label: "A" }, { id: "b", label: "B" }], nodes, edges: [e("a1", "x"), e("x", "a2")] });
+  assert.deepEqual(layout.groups.map(group => group.id), ["b"]);
+  assertHonestBoxes(layout, nodes);
 });

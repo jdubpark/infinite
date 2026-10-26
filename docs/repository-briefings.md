@@ -20,6 +20,14 @@ repository permissions or execution identity. `GET
 identity/revision, observation time, recorded work, retained repository briefs
 and optional `knowledge`. Older clients can keep reading the original fields.
 
+The overview spends one first-come budget across its categories rather than
+fixed fractions. Planned-request excerpts are 600 characters, and an excerpt
+that was cut carries `excerpt: true`. When something is left out, the overview
+says `<category>: N of M shown here; the rest are available on the detail
+pages.` Generated plans and projects are derived at read time from work records
+with `basis: "work"` or `basis: "repository"`. They are never stored in the
+catalog.
+
 Work preserves missions, standalone teams and goals with their original
 execution statuses, requests, reports and links. Managed child runs remain
 associated with their parent. A work item spanning repositories now assigned
@@ -56,6 +64,16 @@ The following paths are relative to `/api/project-groups/:id/understanding`:
 | `POST /catalog/:collection` | Create a project, feature or plan; update policy. |
 | `POST /catalog/:collection/:entityId` | Update or archive a record; set a component override. |
 | `POST /refresh` | Queue a bounded observation, returning maintenance status. |
+| `GET /briefs?repository=ID&cursor=` | Retained repository briefs for one repository. |
+| `GET /planned?repository=ID&cursor=` | Planned requests for one repository. |
+| `GET /work?cursor=` | Recorded work. |
+| `GET /generated?cursor=` | Plans and projects derived from work records. |
+| `GET /brief?repository=ID` | The latest brief for one repository. |
+| `GET /diagrams/:diagramId` | One diagram as graph data. |
+
+Paged reads return at most 50 records or 512 KiB per page. Each page carries a
+`next` cursor, which is null on the last page. Pass the cursor back unchanged
+to read the following page.
 
 Read roles are owner, controller and viewer. Mutations require owner role.
 Collections are `projects`, `features`, `plans`, `components` and `policy`.
@@ -76,11 +94,19 @@ bounded revision history. Storage errors remain explicit.
 ### Host maintenance
 
 Workspace maintenance is independent of an active session and continues while
-clients are closed. Its policy defaults to disabled, with synthesis and delivery
-observations disabled, a 15-minute interval and 24 jobs per workspace per UTC
-day. Owner policy edits enable these capabilities independently. An explicit
+clients are closed. Its policy defaults to enabled, with `enabled`, `synthesis` and `delivery`
+set to true, a 15-minute interval and 24 jobs per workspace per UTC day. A
+stored policy without `editedAt` is migrated once: its three switches turn on,
+its interval and daily limit stay, and it records `editedBy: "migration"`. An
+owner edit stamps `editedBy: "owner"` and keeps the owner's chosen values; an
+owner-disabled policy is never re-enabled. When the workspace's repository set
+changes, an owner-edited policy is kept as it is, and any other policy turns
+off with its interval and limit kept until the owner sets it again. Owner
+policy edits can still switch each capability off independently. An explicit
 refresh can collect a source map while scheduling is disabled; model synthesis
-still requires its own enabled policy and a configured writer.
+still requires its own enabled policy and a configured writer. A host without
+a configured engine reports maintenance as unavailable with the message "No
+summary writer is configured on this host."
 
 The configured engine's `context --repo` command supplies deterministic source
 maps without a model call. Source fingerprints suppress synthesis for unchanged
@@ -89,18 +115,54 @@ briefs per workspace job, rotates pending components, applies daily admission
 limits and backs off failed attempts. A workspace attempt has an overall time
 limit capped at ten minutes. Each selected component gets a separate bounded
 synthesis invocation; every invocation shares the remaining workspace deadline.
-Collection and synthesis also have process, output and storage bounds. Current source and plan bindings are rechecked
-before publishing generated comparisons. Failed attempts retain the previous
-usable source observations with failure and freshness metadata.
+Engine steps leave a reserve for the final source re-check: twice the capture
+time, and at least five seconds or a fifth of the attempt, whichever is
+smaller. Collection and synthesis also have process, output and storage
+bounds. Current source and plan bindings are rechecked before publishing
+generated comparisons. Failed attempts retain the previous usable source
+observations with failure and freshness metadata.
+
+A job runs the repository-level `brief --repo` at the tracked head only when
+synthesis is enabled and the repository's source fingerprint changed since its
+last stored brief. A brief gets at most half of the time left after the
+re-check reserve. Its comparison base is the head of the last successful brief,
+so the first brief has no changes section. The host parses up to two Mermaid
+flowchart diagrams into graph data, a strict subset of the syntax. A diagram
+outside that subset keeps its source text and a `parseError`. A deterministic
+component map is published with every captured source map, even when the brief
+fails or an engine step runs out of time. It draws at most 2,000 components,
+200 groups and 4,000 connections, and a coverage line says how many were drawn.
+`knowledge.briefs` and `knowledge.diagrams` expose both. A job whose engine
+output fails validation, or whose source or plans change while it runs,
+publishes nothing and keeps the previous generation.
+
+A brief, synthesis or delivery step that runs out of time becomes a partial
+line, `Repository <name>: <step> unavailable: <reason>`, and the job still
+publishes the source map, the component diagram and any stored brief. A
+re-check that runs out of time drops only that repository's unconfirmed engine
+output.
+
+An interval tick admits a job only when a bound repository's HEAD differs from
+its stored observation or the repository was never observed; a failed attempt
+retries on its backoff. A merged team run, a GitHub source fast-forward and an
+owner refresh do not wait for a HEAD change; they still count against the
+daily limit. While the daily limit is spent, ticks do not rewrite the store. A
+change that lands during a running job requeues one more run. Maintenance
+keeps `lastFailure: { at, reason }`, and its message reads `Last attempt failed
+at <time>: <reason>.` A reason carries the engine's last stderr line when the
+engine exited with an error. Reasons are bounded to 400 characters with long
+tokens redacted.
 
 The maintenance store has an 8 MiB encrypted budget. Legacy session briefs use
-a separate rolling store of at most 64 generations within 8 MiB. Those briefs
+a separate rolling store of at most 16 generations per project within 8 MiB.
+Team briefs stay visible after their member workspace is cleaned up, as long as
+the repository binding still matches and a head is recorded. Those briefs
 retain checkout/session provenance and generation/retention times. Mission
 coordinator briefs are withheld from that single-repository artifact store
 until complete multi-repository provenance is available; mission work remains
 readable. Read responses stay below the encrypted transport limit and disclose
-omitted records. Use the catalog and component detail endpoints for content
-omitted from the overview. Response omission never deletes stored content.
+omitted records. Use the paged detail routes above, and the catalog and component detail
+endpoints, for content omitted from the overview. Response omission never deletes stored content.
 
 Reading Understanding never schedules a model job, changes execution status or
 writes to a tracker. Observation time, generation time, provider report time and
@@ -218,7 +280,8 @@ activity when a queued job starts. The comparison base is the checkout's HEAD
 when the runtime first observes the session, which may be later than the task
 started. The session report cache lives in memory and is lost when the API
 restarts; the retained Workspace Understanding artifacts and Jevcode's
-checkpoint are not. Restart does not backfill historical sessions.
+checkpoint are not. Restart does not backfill historical sessions. A failed briefing reports
+`Reason: <reason>`, bounded to 400 characters with long tokens redacted.
 
 The report describes the source snapshot collected at `generatedAt`; it does not
 claim that the checkout still has that content when a person reads it. The

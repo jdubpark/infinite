@@ -56,6 +56,8 @@ export interface UnderstandingPlan {
   status: string;
   updatedAt: string;
   source: "request";
+  /** True when `text` was cut to 600 characters; absent on older hosts. */
+  excerpt?: boolean;
 }
 export interface UnderstandingRepository {
   /** Primary enrolled project ID, matching the workspace's folded repository. */
@@ -79,3 +81,7 @@ export interface WorkspaceUnderstanding {
   /** Optional for compatibility with hosts and clients predating workspace maintenance. */
   knowledge?: WorkspaceKnowledge;
 }
+
+export interface GeneratedPlan { id: string; workId: string; kind: UnderstandingWorkKind; title: string; objective: string; repositoryIds: string[]; status: string; column: UnderstandingWork["column"]; outcome: string | null; links: UnderstandingLink[]; updatedAt: string; basis: "work" }
+export interface GeneratedProject { id: string; name: string; repositoryIds: string[]; planIds: string[]; basis: "repository" }
+export interface GeneratedCatalogPage { projects: GeneratedProject[]; plans: GeneratedPlan[]; next: string | null; coverage: string[] }

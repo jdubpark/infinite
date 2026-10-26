@@ -25,7 +25,7 @@ const areas: SegmentOption<Area>[] = [
 ];
 
 /** Catalog editing and live component knowledge for the selected workspace. */
-export function KnowledgePanel({ connection, workspaceId, knowledge, readGeneration, defaultArea, repositories, work, offline, onComponentNavigate }: { connection: Connection; workspaceId: string; knowledge?: WorkspaceKnowledge; readGeneration: string; defaultArea: Area; repositories: UnderstandingRepository[]; work: UnderstandingWork[]; offline: boolean; onComponentNavigate?: () => void }) {
+export function KnowledgePanel({ connection, workspaceId, knowledge, readGeneration, defaultArea, openComponentId, repositories, work, offline, onComponentNavigate }: { connection: Connection; workspaceId: string; knowledge?: WorkspaceKnowledge; readGeneration: string; defaultArea: Area; openComponentId?: string; repositories: UnderstandingRepository[]; work: UnderstandingWork[]; offline: boolean; onComponentNavigate?: () => void }) {
   const router = useRouter();
   const [area, setArea] = useState<Area>(defaultArea);
   const [catalog, setCatalog] = useState<KnowledgeCatalog | null>(knowledge?.catalog ?? null);
@@ -184,6 +184,13 @@ export function KnowledgePanel({ connection, workspaceId, knowledge, readGenerat
     pendingComponentNavigation.current = id && (id !== selectedComponent || area !== "components") ? id : null;
     setSelectedComponent(id); setArea("components"); onComponentNavigate?.();
   };
+  const openRequested = useRef("");
+  useEffect(() => {
+    if (!openComponentId || openRequested.current === openComponentId) return;
+    openRequested.current = openComponentId;
+    navigateComponent(openComponentId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- run only when the requested component changes.
+  }, [openComponentId]);
   const componentDetailDidLayout = (id: string) => {
     if (pendingComponentNavigation.current !== id) return;
     pendingComponentNavigation.current = null;

@@ -351,6 +351,21 @@ test("a legacy record nobody edited migrates to the default-on policy and stays 
   } finally { f.cleanup(); }
 });
 
+test("a record the first default-on build stamped as migrated, with the owner's old policy binding, stays on across a repository set change", () => {
+  const f = fixture();
+  try {
+    // The owner's edit under the old build wrote the binding; the first stamped build then turned the switches on and stamped "migration".
+    f.make().mutate("workspace", "policy", undefined, request(0, "update", { enabled: true, synthesis: false, delivery: false, intervalMinutes: 15, dailyJobLimit: 24 }), emptyContext);
+    const stored = unseal<{ policyBinding: unknown[]; catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
+    assert.ok(stored.policyBinding.length > 0);
+    stored.catalog.policy = { ...stored.catalog.policy, enabled: true, synthesis: true, delivery: true, editedAt: new Date().toISOString(), editedBy: "migration" };
+    writeSealed(f.file, f.key, "understanding-catalog:workspace", stored);
+    addRepository(f);
+    const policy = f.reopen().read("workspace").policy;
+    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.editedBy], [true, true, true, "migration"]);
+  } finally { f.cleanup(); }
+});
+
 test("a GitHub-tracked checkout without a remote binds by its source record", () => {
   const f = fixture();
   try {

@@ -898,6 +898,36 @@ overlapping ownership between independent tasks. Dependent tasks wait for their
 prerequisites to be integrated. Independent workers run in parallel; integration
 is serialized.
 
+### Blocked reports and lessons
+
+A blocked report from a team member or the mission coordinator may add an
+optional `blocker` object. The host stores it as agent-reported evidence. A
+summary-only blocked report stays valid.
+
+| Field | Limit |
+| --- | --- |
+| `cause` | `status` is `observed`, `hypothesis`, or `unknown`; `detail` up to 1,200 characters |
+| `issueRefs` | Optional, up to 8 entries of 300 characters |
+| `sourceRefs` | Optional, up to 12 entries of 500 characters |
+| `attemptedFixes` | Optional, up to 8 `{fix, outcome}` entries, each field up to 800 characters |
+| `proposedRecovery` | Up to 1,200 characters |
+| `prevention` | Up to 1,200 characters |
+| `validationEvidence` | 1–8 `{sourceRef, observation}` entries of up to 500 and 1,000 characters |
+
+The whole object is capped at 12 KiB of UTF-8 JSON and rejects unknown fields.
+
+Before planning or choosing a recovery, the project-manager and reviewer prompts
+search the repository's registered shared-knowledge scope with task and blocker
+keywords when that workflow is available. Without it, they use current sources
+and report the gap. Retrieved lessons are checked against current source and
+checks. A candidate lesson needs source or check evidence and review by a
+different strong reviewer through the configured single-writer workflow. A
+report, a continuation, or a claimed fix is not a verified resolution.
+
+The host does not verify the cause, resolve the blocker, or publish a lesson.
+Lessons stay advisory: they never grant permissions, mark work resolved, weaken
+checks, or publish themselves.
+
 ### Worker scaling
 
 The worker limit caps how many scouts and implementers run at once. The host

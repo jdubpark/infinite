@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import type { Diagram, DiagramGraph, KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeMaintenance, KnowledgePlan, KnowledgeRelationship, KnowledgeRepositoryBrief, KnowledgeSource, UnderstandingBrief, WorkspaceKnowledge } from "@infinite/remote";
@@ -12,7 +12,10 @@ import { componentGraph, diagramFromMermaid, diagramGraphSchema, linkDiagramNode
 import { seal, unseal, writeSealed } from "./vault.js";
 import { CatalogError, understandingCatalogLimits } from "./understanding-catalog.js";
 
-const MAX_STORE_BYTES = 8 * 1024 * 1024;
+/** Each workspace keeps its own encrypted store; a store written before the split is read once and migrated. */
+const MAX_WORKSPACE_STORE_BYTES = 16 * 1024 * 1024;
+const MAX_LEGACY_STORE_BYTES = 64 * 1024 * 1024;
+const WORKSPACE_FILE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/;
 const MAX_CONTEXT_BYTES = 4 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_FILES = 30000;
@@ -26,7 +29,8 @@ const MAX_HOOK_COMPONENTS = 2;
 const MAX_EVIDENCE = 40;
 const MAX_EVIDENCE_TEXT = 2000;
 const MAX_PLANS_PER_COMPONENT = 100;
-const MAX_ATTEMPT_MS = 10 * 60_000;
+/** Ceiling of one attempt: the configured timeout for the capture plus one more per repository brief that is due. */
+const MAX_ATTEMPT_MS = 30 * 60_000;
 /** Floor of the time an attempt keeps for the final source re-check; at most a fifth of the attempt. */
 const RECHECK_RESERVE_MS = 5000;
 const STATE_SCOPE = "understanding-runtime";
@@ -163,9 +167,11 @@ const storedRepositorySchema = z.object({
   for (const [key, revision] of Object.entries(value.completedPlanRevisions)) if (typeof revision !== "string") context.addIssue({ code: "custom", path: ["completedPlanRevisions", key], message: "invalid plan watermark" });
   for (const [key, fingerprint] of Object.entries(value.completedSourceFingerprints)) if (typeof fingerprint !== "string") context.addIssue({ code: "custom", path: ["completedSourceFingerprints", key], message: "invalid source watermark" });
 });
-const runtimeStateSchema = z.object({ version: z.literal(1), day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), workspaces: z.record(z.string(), z.object({
+const workspaceStateSchema = z.object({
   jobsToday: z.number().int().nonnegative().max(1_000_000), failureCount: z.number().int().nonnegative().max(20), synthesisCursor: z.string().max(400).nullable(), repositories: z.record(z.string(), storedRepositorySchema), maintenance: z.object({ state: z.enum(["disabled", "idle", "queued", "running", "failed", "budget-limited", "unavailable"]), lastObservedAt: z.string().nullable(), lastPublishedAt: z.string().nullable(), nextAttemptAt: z.string().nullable(), jobsToday: z.number().int().nonnegative(), dailyJobLimit: z.number().int().nonnegative(), message: z.string().nullable(), lastFailure: z.object({ at: z.string(), reason: z.string().max(400) }).strict().nullable().optional() }).strict(), updatedAt: z.string().datetime({ offset: true }).nullable(),
-}).strict()) }).strict();
+}).strict();
+const runtimeStateSchema = z.object({ version: z.literal(1), day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), workspaces: z.record(z.string(), workspaceStateSchema) }).strict();
+const workspaceFileSchema = z.object({ version: z.literal(1), day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), workspace: workspaceStateSchema }).strict();
 function parseRepoContext(value: unknown): RepoContext {
   const parsed = repoContextSchema.parse(value);
   const rawKeys = value && typeof value === "object" ? Object.keys(value) : [];
@@ -180,6 +186,10 @@ function parseRepoContext(value: unknown): RepoContext {
 /** Bounded, encrypted deterministic map and opt-in maintenance queue. Reads never enqueue work. */
 export class UnderstandingRuntime {
   private readonly stateFile: string;
+  private readonly stateDir: string;
+  /** Serialized form of each workspace as last written, so a persist touches only the files that changed. */
+  private readonly written = new Map<string, string>();
+  private attemptStartedAt = 0;
   private readonly adapter: UnderstandingAdapter;
   private readonly hasConfiguredContext: boolean;
   private state: RuntimeState = { version: 1, day: new Date().toISOString().slice(0, 10), workspaces: {} };
@@ -198,6 +208,7 @@ export class UnderstandingRuntime {
 
   constructor(private readonly options: UnderstandingRuntimeOptions) {
     this.stateFile = resolve(options.config.stateDir, "understanding", "runtime.sealed");
+    this.stateDir = resolve(options.config.stateDir, "understanding", "runtime");
     this.hasConfiguredContext = Boolean(options.adapter?.context || options.config.repositoryBriefings);
     this.adapter = options.adapter ?? (options.config.repositoryBriefings ? { context: (root, runOptions) => this.runContext(root, runOptions) } : {});
     this.load();
@@ -292,11 +303,31 @@ export class UnderstandingRuntime {
 
   private load() {
     try {
-      if (!existsSync(this.stateFile)) return;
-      const raw = readFileSync(this.stateFile, "utf8");
-      if (Buffer.byteLength(raw) > MAX_STORE_BYTES) throw new Error("store-too-large");
-      const value = runtimeStateSchema.parse(unseal<unknown>(this.options.key, STATE_SCOPE, raw));
-      this.state = value as RuntimeState;
+      const today = new Date().toISOString().slice(0, 10);
+      if (existsSync(this.stateFile)) {
+        // One store for every workspace, from before the split: read it once, write one file per workspace, keep it beside
+        // them. It stays authoritative until every file is written, so a split that stopped halfway is redone, not trusted.
+        const raw = readFileSync(this.stateFile, "utf8");
+        if (Buffer.byteLength(raw) > MAX_LEGACY_STORE_BYTES) throw new Error("store-too-large");
+        this.state = runtimeStateSchema.parse(unseal<unknown>(this.options.key, STATE_SCOPE, raw)) as RuntimeState;
+        this.dailyJobs();
+        this.written.clear();
+        if (this.persist().size) throw new Error("store-migration-failed");
+        renameSync(this.stateFile, `${this.stateFile}.migrated`);
+      } else if (existsSync(this.stateDir)) {
+        for (const name of readdirSync(this.stateDir).sort()) {
+          const match = /^(.+)\.sealed$/.exec(name);
+          if (!match || !WORKSPACE_FILE_ID.test(match[1]!)) continue;
+          const id = match[1]!, raw = readFileSync(join(this.stateDir, name), "utf8");
+          if (Buffer.byteLength(raw) > MAX_WORKSPACE_STORE_BYTES) throw new Error("store-too-large");
+          const value = workspaceFileSchema.parse(unseal<unknown>(this.options.key, `${STATE_SCOPE}:${id}`, raw));
+          const workspace = value.workspace as RuntimeState["workspaces"][string];
+          if (value.day === today) this.written.set(id, JSON.stringify(workspace));
+          else { workspace.jobsToday = 0; workspace.maintenance.jobsToday = 0; }
+          this.state.workspaces[id] = workspace;
+        }
+        this.state.day = today;
+      }
       this.dailyJobs();
       let recovered = false;
       for (const [id, workspace] of Object.entries(this.state.workspaces)) {
@@ -310,16 +341,26 @@ export class UnderstandingRuntime {
     } catch { this.storageUnavailable = true; this.loadFailed = true; }
   }
 
-  private persist() {
-    if (this.loadFailed) { this.storageUnavailable = true; return; }
-    try {
-      runtimeStateSchema.parse(this.state);
-      const raw = JSON.stringify(this.state);
-      if (Buffer.byteLength(raw) > MAX_STORE_BYTES) throw new Error("store-too-large");
-      if (Buffer.byteLength(seal(this.options.key, STATE_SCOPE, this.state)) > MAX_STORE_BYTES) throw new Error("sealed-store-too-large");
-      writeSealed(this.stateFile, this.options.key, STATE_SCOPE, this.state);
-      this.storageUnavailable = false;
-    } catch { this.storageUnavailable = true; }
+  /** Writes every workspace whose state changed to its own file; returns the ids whose file could not be written. */
+  private persist(): Set<string> {
+    if (this.loadFailed) { this.storageUnavailable = true; return new Set(Object.keys(this.state.workspaces)); }
+    const failed = new Set<string>();
+    for (const [id, workspace] of Object.entries(this.state.workspaces)) {
+      try {
+        const raw = JSON.stringify(workspace);
+        if (this.written.get(id) === raw) continue;
+        if (!WORKSPACE_FILE_ID.test(id)) throw new Error("workspace-id-unsafe");
+        workspaceStateSchema.parse(workspace);
+        if (Buffer.byteLength(raw) > MAX_WORKSPACE_STORE_BYTES) throw new Error("store-too-large");
+        const value = { version: 1, day: this.state.day, workspace };
+        if (Buffer.byteLength(seal(this.options.key, `${STATE_SCOPE}:${id}`, value)) > MAX_WORKSPACE_STORE_BYTES) throw new Error("sealed-store-too-large");
+        mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
+        writeSealed(join(this.stateDir, `${id}.sealed`), this.options.key, `${STATE_SCOPE}:${id}`, value);
+        this.written.set(id, raw);
+      } catch { failed.add(id); }
+    }
+    this.storageUnavailable = false;
+    return failed;
   }
 
   private dailyJobs(workspaceId?: string) {
@@ -384,7 +425,7 @@ export class UnderstandingRuntime {
     try {
       while (!this.closed && this.queue.length) {
         const id = this.queue.shift()!; this.queued.delete(id);
-        this.activeDeadline = Date.now() + this.attemptMs();
+        this.attemptStartedAt = Date.now(); this.activeDeadline = this.attemptStartedAt + this.attemptMs();
         try { await this.runWorkspace(id); }
         catch (error) { this.failWorkspace(id, error); }
         finally { this.activeDeadline = 0; }
@@ -400,8 +441,7 @@ export class UnderstandingRuntime {
     }
     const workspaceState = this.workspace(workspaceId);
     workspaceState.jobsToday += 1; // Persist admission before source capture or any writer hook.
-    this.persist();
-    if (this.storageUnavailable) throw new Error("runtime-budget-watermark-not-durable");
+    if (this.persist().has(workspaceId)) throw new Error("runtime-budget-watermark-not-durable");
     const attempt = new Date().toISOString();
     this.setMaintenance(workspaceId, { ...workspaceState.maintenance, state: "running", lastObservedAt: attempt, dailyJobLimit: policy.dailyJobLimit, jobsToday: workspaceState.jobsToday, message: null });
     const catalogAtStart = this.options.catalog.read(workspaceId);
@@ -565,8 +605,8 @@ export class UnderstandingRuntime {
     const retryDelay = this.backoff(workspaceId, 60_000);
     const publishedAt = new Date().toISOString(), failure = failureReason(partial.join("; "));
     const next: RuntimeState = { ...this.state, workspaces: { ...this.state.workspaces, [workspaceId]: { ...workspaceState, failureCount: failedAttempts, synthesisCursor: nextSynthesisCursor, repositories: repos, maintenance: { ...workspaceState.maintenance, state: partial.length ? "failed" : "idle", lastPublishedAt: publishedAt, nextAttemptAt: partial.length ? new Date(Date.now() + retryDelay).toISOString() : null, jobsToday: workspaceState.jobsToday, dailyJobLimit: currentPolicy.dailyJobLimit, message: partial.length ? `Last attempt failed at ${publishedAt}: ${failure}.` : null, lastFailure: partial.length ? { at: publishedAt, reason: failure } : null }, updatedAt: new Date().toISOString() } } };
-    const before = this.state; this.state = next; this.persist();
-    if (this.storageUnavailable) { this.state = before; throw new Error("runtime-store-full"); }
+    const before = this.state; this.state = next;
+    if (this.persist().has(workspaceId)) { this.state = before; this.written.delete(workspaceId); throw new Error("runtime-store-full"); }
   }
 
   /**
@@ -575,14 +615,18 @@ export class UnderstandingRuntime {
    */
   private async briefRepositories(attempt: Attempt): Promise<void> {
     const { workspaceId, group, bindings, repos, captured, hooked, partial, reserveMs } = attempt;
+    const due = (binding: SourceBinding) => { const observation = repos[binding.repo.projectId]; return Boolean(observation && captured.has(binding.repo.projectId) && observation.briefFingerprint !== observation.fingerprint); };
+    // A brief is a model run over the whole repository: each one due extends the attempt by the configured timeout.
+    const briefs = bindings.filter(due).length;
+    if (briefs) this.activeDeadline = Math.min(this.attemptStartedAt + MAX_ATTEMPT_MS, this.activeDeadline + briefs * this.attemptMs());
     for (const binding of bindings) {
       const observation = repos[binding.repo.projectId];
-      if (!observation || !captured.has(binding.repo.projectId) || observation.briefFingerprint === observation.fingerprint) continue;
+      if (!observation || !due(binding)) continue;
       const components = observation.components.filter(component => !component.retired);
       try {
         if (!this.boundStillCurrent(workspaceId, group, binding)) throw new Error("source-rebound-before-brief");
-        // Each brief gets at most half of the time left after the re-check reserve, so later steps keep a share.
-        const result = await this.invoke(binding.root, options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.brief?.head ?? null, components: components.map(({ id, name }) => ({ id, name })) }, options), MAX_OUTPUT_BYTES, { reserveMs, share: 0.5 });
+        // Each brief may use the configured timeout; the extension above keeps the later steps their own time.
+        const result = await this.invoke(binding.root, options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.brief?.head ?? null, components: components.map(({ id, name }) => ({ id, name })) }, options), MAX_OUTPUT_BYTES, { reserveMs });
         if (!this.boundStillCurrent(workspaceId, group, binding)) throw new Error("source-rebound-after-brief");
         const observedAt = new Date().toISOString();
         const stored = storedBriefSchema.parse({

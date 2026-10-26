@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -121,7 +121,7 @@ test("failed or invalid context capture retains the previous encrypted generatio
   s.runtime.refresh("workspace");
   await waitUntil(() => s.runtime.read("workspace").maintenance.state === "failed");
   assert.deepEqual(s.runtime.read("workspace").components.map(component => component.id), before);
-  assert.ok(readFileSync(join(s.stateDir, "understanding", "runtime.sealed"), "utf8").length > 0);
+  assert.ok(readFileSync(join(s.stateDir, "understanding", "runtime", "workspace.sealed"), "utf8").length > 0);
 });
 
 test("a failed job records a readable reason and clears it on the next success", { timeout: 20000 }, async t => {
@@ -620,13 +620,13 @@ test("sealed state from before the repository brief, with a legacy previousHead 
   s.runtime.refresh("workspace");
   await waitUntil(() => s.runtime.read("workspace").components.length === 2);
   await s.runtime.close();
-  const file = join(s.stateDir, "understanding", "runtime.sealed"), key = Buffer.alloc(32, 7);
-  const state = unseal<{ workspaces: Record<string, { repositories: Record<string, Record<string, unknown>> }> }>(key, "understanding-runtime", readFileSync(file, "utf8"));
-  for (const repository of Object.values(state.workspaces.workspace.repositories)) {
+  const file = join(s.stateDir, "understanding", "runtime", "workspace.sealed"), key = Buffer.alloc(32, 7);
+  const state = unseal<{ workspace: { repositories: Record<string, Record<string, unknown>> } }>(key, "understanding-runtime:workspace", readFileSync(file, "utf8"));
+  for (const repository of Object.values(state.workspace.repositories)) {
     for (const field of ["brief", "briefFingerprint", "briefFailure", "componentDiagram"]) delete repository[field];
     repository.previousHead = "a".repeat(40);
   }
-  writeSealed(file, key, "understanding-runtime", state);
+  writeSealed(file, key, "understanding-runtime:workspace", state);
   const resumed = new UnderstandingRuntime({ config: s.config, key, groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() } });
   try {
     const read = resumed.read("workspace");
@@ -711,7 +711,7 @@ test("a spent daily budget is recorded once and later ticks leave the store alon
   commit(s.root, 6);
   tick();
   assert.equal(s.runtime.read("workspace").maintenance.state, "budget-limited");
-  const file = join(s.stateDir, "understanding", "runtime.sealed"), sealed = readFileSync(file, "utf8");
+  const file = join(s.stateDir, "understanding", "runtime", "workspace.sealed"), sealed = readFileSync(file, "utf8");
   tick(); tick();
   assert.equal(readFileSync(file, "utf8"), sealed, "budget-limited ticks do not rewrite the encrypted store");
   assert.equal(s.runtime.read("workspace").maintenance.state, "budget-limited");
@@ -762,4 +762,41 @@ test("a GitHub-tracked checkout without a remote binds by its source record; a m
   s.runtime.refresh("workspace");
   await waitUntil(() => s.runtime.read("workspace").components.length === 2);
   assert.equal(s.runtime.read("workspace").maintenance.state, "idle");
+});
+
+test("a store from before the per-workspace split is read once, written as one file per workspace, and kept beside them", { timeout: 20000 }, async t => {
+  const s = setup(t, { processFixture: true });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").components.length === 2);
+  await s.runtime.close();
+  const key = Buffer.alloc(32, 7), dir = join(s.stateDir, "understanding", "runtime"), legacy = join(s.stateDir, "understanding", "runtime.sealed");
+  const file = unseal<{ day: string; workspace: Record<string, unknown> }>(key, "understanding-runtime:workspace", readFileSync(join(dir, "workspace.sealed"), "utf8"));
+  writeSealed(legacy, key, "understanding-runtime", { version: 1, day: file.day, workspaces: { workspace: file.workspace } });
+  rmSync(dir, { recursive: true, force: true });
+  const resumed = new UnderstandingRuntime({ config: s.config, key, groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() } });
+  try {
+    assert.equal(resumed.read("workspace").components.length, 2);
+    assert.equal(resumed.read("workspace").maintenance.jobsToday, 1);
+    assert.ok(readFileSync(join(dir, "workspace.sealed"), "utf8").length > 0, "the workspace has its own file again");
+    assert.ok(!existsSync(legacy) && existsSync(`${legacy}.migrated`), "the old store is kept under a new name");
+  } finally { await resumed.close(); }
+});
+
+test("a split that stopped halfway is redone from the old store on the next start", { timeout: 20000 }, async t => {
+  const s = setup(t, { processFixture: true });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").components.length === 2);
+  await s.runtime.close();
+  const key = Buffer.alloc(32, 7), dir = join(s.stateDir, "understanding", "runtime"), legacy = join(s.stateDir, "understanding", "runtime.sealed");
+  const file = unseal<{ day: string; workspace: Record<string, unknown> }>(key, "understanding-runtime:workspace", readFileSync(join(dir, "workspace.sealed"), "utf8"));
+  writeSealed(legacy, key, "understanding-runtime", { version: 1, day: file.day, workspaces: { workspace: file.workspace } });
+  // The directory exists with a half-written file, as after a crash between two workspace writes.
+  writeFileSync(join(dir, "workspace.sealed"), "half-written");
+  const resumed = new UnderstandingRuntime({ config: s.config, key, groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() } });
+  try {
+    assert.equal(resumed.read("workspace").maintenance.state, "idle");
+    assert.equal(resumed.read("workspace").components.length, 2);
+    assert.ok(!existsSync(legacy) && existsSync(`${legacy}.migrated`));
+    assert.deepEqual(unseal<{ workspace: Record<string, unknown> }>(key, "understanding-runtime:workspace", readFileSync(join(dir, "workspace.sealed"), "utf8")).workspace.repositories !== undefined, true);
+  } finally { await resumed.close(); }
 });

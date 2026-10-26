@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, type Stats } from "node:fs";
 import { isAbsolute, relative, resolve, sep, join } from "node:path";
 import { z } from "zod";
-import type { UnderstandingArtifact, UnderstandingLink, UnderstandingPlan, UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding, WorkspaceKnowledge } from "@infinite/remote";
+import type { GeneratedCatalogPage, GeneratedPlan, GeneratedProject, UnderstandingArtifact, UnderstandingLink, UnderstandingPlan, UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding, WorkspaceKnowledge } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
 import { captureIdentity, readGit } from "./checkout-identity.js";
 import type { RepositorySummary, RepositoryBriefings } from "./repository-briefings.js";
@@ -378,6 +378,23 @@ export class UnderstandingService {
 
   workPage(workspaceId: string, cursor?: string) {
     return pageOf(this.build(workspaceId).work, cursor, item => item.id);
+  }
+
+  /** Derived at read time from recorded work. Never stored, so the owner catalog revision is untouched. */
+  generatedPage(workspaceId: string, cursor?: string): GeneratedCatalogPage {
+    const group = this.workspace(workspaceId);
+    const repositoryOf = new Map(group.repos.flatMap(repo => repo.checkouts.map(checkout => [checkout.projectId, repo.projectId] as const)));
+    const plans: GeneratedPlan[] = this.workRows(group).filter(work => work.scope === "complete" && work.objective).map(work => ({
+      id: `plan:${work.id}`, workId: work.id, kind: work.kind, title: work.title, objective: work.objective!,
+      repositoryIds: [...new Set(work.repositoryIds.flatMap(id => repositoryOf.get(id) ?? []))], status: work.status, column: work.column,
+      outcome: work.reportedSummary, links: work.links, updatedAt: work.updatedAt, basis: "work" as const,
+    }));
+    const projects: GeneratedProject[] = group.repos.map(repo => ({
+      id: `project:${repo.projectId}`, name: repo.name, repositoryIds: [repo.projectId],
+      planIds: plans.filter(plan => plan.repositoryIds.includes(repo.projectId)).map(plan => plan.id), basis: "repository" as const,
+    }));
+    const page = pageOf(plans, cursor, plan => plan.id);
+    return { projects, plans: page.items, next: page.next, coverage: ["From work: derived from recorded team, mission and goal requests. Status is the run's own status."] };
   }
 }
 

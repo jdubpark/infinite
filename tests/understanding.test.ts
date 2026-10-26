@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { claimControl, startHost, waitFor } from "./helpers.js";
 import { UnderstandingService } from "../packages/host/src/understanding.js";
 import { writeSealed } from "../packages/host/src/vault.js";
-import { createRemoteClient, type WorkspaceUnderstanding } from "@infinite/remote";
+import { createRemoteClient, type GeneratedCatalogPage, type WorkspaceUnderstanding } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
 import { createGoalSchema, type ProductGoal } from "../packages/host/src/goal-types.js";
 import { RepositoryBriefings } from "../packages/host/src/repository-briefings.js";
@@ -576,4 +576,24 @@ test("retained team sources require ownership, bounded validation, and exclude m
     });
     await briefings.close();
   } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("generated plans and projects derive from recorded work without touching the catalog", { timeout: 40000 }, async () => {
+  let viewer: ReturnType<typeof createRemoteClient> | undefined;
+  const host = await startHost({ config: { remote: { enabled: true } } });
+  try {
+    initializeRepo(host.config.projects[0].path);
+    await host.stopApi();
+    retainGoal(host, 1, "Build the thing");
+    await host.start();
+    viewer = createRemoteClient({ url: host.origin, token: host.tokens.viewer });
+    const path = await understandingPath(host);
+    const page = await viewer.request<GeneratedCatalogPage>(`${path}/generated`);
+    assert.equal(page.plans.length, 1);
+    assert.equal(page.plans[0].basis, "work");
+    assert.equal(page.plans[0].objective, "Build the thing");
+    assert.equal(page.plans[0].status, "cancelled");
+    assert.deepEqual(page.projects.map(project => project.planIds), [[page.plans[0].id]]);
+    assert.equal((await viewer.request<WorkspaceUnderstanding>(path)).knowledge?.catalog.revision, 0);
+  } finally { viewer?.close(); await host.stop(); }
 });

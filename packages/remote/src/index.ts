@@ -8,7 +8,7 @@ import {
 export type {
   WorkspaceUnderstanding, UnderstandingRepository, UnderstandingWork, UnderstandingWorkKind,
   UnderstandingPlan, UnderstandingArtifact, UnderstandingBrief, UnderstandingClaim,
-  UnderstandingCitation, UnderstandingLink,
+  UnderstandingCitation, UnderstandingLink, GeneratedPlan, GeneratedProject, GeneratedCatalogPage,
 } from "./understanding.js";
 export type * from "./understanding-knowledge.js";
 export type * from "./understanding-diagrams.js";

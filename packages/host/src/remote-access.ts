@@ -43,7 +43,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (["GET", "POST"].includes(method) && url.pathname === "/api/project-groups") return true;
   if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding$/.test(url.pathname)) return true;
   if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding\/(?:catalog|components(?:\/[A-Za-z0-9_-]{1,160})?)$/.test(url.pathname)) return true;
-  if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding\/(?:briefs|planned|work|brief|diagrams\/[A-Za-z0-9_:.-]{1,200})$/.test(url.pathname)) return true;
+  if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding\/(?:briefs|planned|work|generated|brief|diagrams\/[A-Za-z0-9_:.-]{1,200})$/.test(url.pathname)) return true;
   const behavior = /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding\/behaviors(?:\/([A-Za-z][A-Za-z0-9_.:-]{0,79})(?:\/(suite|run))?)?$/.exec(url.pathname);
   if (behavior) {
     if (method === "GET") return behavior[1] === undefined || (behavior[2] === undefined || behavior[2] === "suite");

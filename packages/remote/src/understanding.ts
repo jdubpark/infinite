@@ -78,3 +78,7 @@ export interface WorkspaceUnderstanding {
   /** Optional for compatibility with hosts and clients predating workspace maintenance. */
   knowledge?: WorkspaceKnowledge;
 }
+
+export interface GeneratedPlan { id: string; workId: string; kind: UnderstandingWorkKind; title: string; objective: string; repositoryIds: string[]; status: string; column: UnderstandingWork["column"]; outcome: string | null; links: UnderstandingLink[]; updatedAt: string; basis: "work" }
+export interface GeneratedProject { id: string; name: string; repositoryIds: string[]; planIds: string[]; basis: "repository" }
+export interface GeneratedCatalogPage { projects: GeneratedProject[]; plans: GeneratedPlan[]; next: string | null; coverage: string[] }

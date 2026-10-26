@@ -580,6 +580,10 @@ export function createApp(config: Config, key: Buffer) {
     const query = pageQuery.pick({ cursor: true }).strict().parse(req.query);
     return res.json(understanding.workPage(projectGroupIdSchema.parse(req.params.id), query.cursor));
   });
+  app.get("/api/project-groups/:id/understanding/generated", readRoles, (req, res) => {
+    const query = pageQuery.pick({ cursor: true }).strict().parse(req.query);
+    return res.json(understanding.generatedPage(projectGroupIdSchema.parse(req.params.id), query.cursor));
+  });
   app.get("/api/project-groups/:id/understanding/diagrams/:diagramId", readRoles, (req, res) => {
     const diagramId = z.string().regex(/^[A-Za-z0-9_:.-]{1,200}$/).parse(req.params.diagramId);
     const diagram = understandingRuntime.read(projectGroupIdSchema.parse(req.params.id)).diagrams?.find(item => item.id === diagramId);

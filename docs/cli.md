@@ -49,6 +49,7 @@ infinite understand catalog --workspace WORKSPACE_ID [--json]
 infinite understand components --workspace WORKSPACE_ID [--json]
 infinite understand component COMPONENT_ID --workspace WORKSPACE_ID [--json]
 infinite understand policy --workspace WORKSPACE_ID [--json]
+infinite understand generated --workspace WORKSPACE_ID [--json]
 infinite understand refresh --workspace WORKSPACE_ID
 infinite understand create projects|features|plans --workspace WORKSPACE_ID --revision N --request-id UUID --file INPUT.json
 infinite understand update projects|features|plans|components ENTITY_ID --workspace WORKSPACE_ID --revision N --request-id UUID --file INPUT.json
@@ -61,7 +62,11 @@ project-group IDs. A selected workspace shows Work and repository-level System
 knowledge. Current briefs describe retained source snapshots; Planned content
 quotes recorded requests. The report preserves source status, revision,
 generation time, and coverage. It does not infer completion or deployment.
-`--json` returns the versioned response for tools. These reads start no analysis
+`understand` also prints each repository brief with its diagrams as edge lists
+and fetches complete planned requests by following page cursors until the host
+reports no more pages. `generated` lists the generated projects and plans the
+same way. `--json` returns the versioned response for tools, plus the assembled
+`briefs`, `planned`, and `generated` pages. These reads start no analysis
 job and change no work status. `catalog`, `components`, and `component ID` read
 the complete owner catalog, component index, and one component's detail. The
 `policy` read shows maintenance controls; passing `--file`, `--revision`, and

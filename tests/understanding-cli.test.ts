@@ -81,14 +81,66 @@ test("CLI rejects a missing workspace selector and mismatched or unsupported hos
   await assert.rejects(Promise.resolve().then(() => renderUnderstanding({ ...value, schemaVersion: 2 } as never)), /unsupported Understanding response/);
 });
 
-test("JSON mode emits the validated workspace DTO without reshaping its source facts", async () => {
-  let printed = "";
+const root = "/project-groups/w/understanding";
+function fakeApi(routes: Record<string, unknown>) {
+  const calls: string[] = [];
+  return { calls, json: async (path: string) => { calls.push(path); if (!(path in routes)) throw new Error(`unexpected request ${path}`); return routes[path]; } } as { calls: string[]; json: <T>(path: string) => Promise<T> };
+}
+async function runUnderstand(api: ReturnType<typeof fakeApi>, options: Record<string, string | boolean>, positional: string[] = []) {
+  const lines: string[] = [];
   const log = console.log;
-  console.log = value => { printed = String(value); };
-  try {
-    await handleUnderstandingCommand([], { "--workspace": "sample", "--json": true, "--client-config": "client.json" }, { json: async () => value });
-  } finally { console.log = log; }
-  assert.deepEqual(JSON.parse(printed), value);
+  console.log = (line: unknown) => { lines.push(String(line)); };
+  try { await handleUnderstandingCommand(positional, options, api); } finally { console.log = log; }
+  return lines.join("\n");
+}
+const fullPlan = (id: string) => ({ workId: id, kind: "mission", title: id, text: `${id} full text`, status: "ready-for-review", updatedAt: "2026-10-21T11:00:00.000Z", source: "request", excerpt: false });
+const diagram = (title: string, edges: [string, string][]) => ({ id: "d", title, kind: "system", direction: "LR", nodes: [...new Set(edges.flat())].map(id => ({ id, label: id, group: null, componentId: null })), groups: [], edges: edges.map(([from, to]) => ({ from, to, label: null })), source: "mermaid", sourceText: null, parseError: null, repositoryId: "repo", head: null, observedAt: "2026-10-21T12:00:00.000Z" });
+const briefWith = (...diagrams: unknown[]) => ({ repositoryId: "repo", head: "a".repeat(40), base: null, generatedAt: "2026-10-21T11:00:00.000Z", observedAt: "2026-10-21T12:00:00.000Z", state: "ready", brief: { summary: "Repo summary", architecture: [], changes: [], checks: [], review: [], guidance: [], unknowns: [] }, diagrams, evidence: [], coverage: [] });
+const withBriefs = (briefs: unknown[]) => ({ ...value, workspace: { ...value.workspace, id: "w" }, knowledge: { schemaVersion: 1, catalog: { revision: 1, policy: { enabled: false, synthesis: false, delivery: false, intervalMinutes: 15, dailyJobLimit: 24 }, projects: [], features: [], plans: [], componentOverrides: [], coverage: [] }, components: [], relationships: [], delivery: [], maintenance: { state: "idle", message: null }, coverage: [], briefs } });
+
+test("understand follows planned cursors and prints diagram edges", async () => {
+  const api = fakeApi({ [root]: withBriefs([briefWith(diagram("System shape", [["a", "b"]]))]),
+    [`${root}/planned?repository=repo`]: { items: [fullPlan("p1")], next: "c2" },
+    [`${root}/planned?repository=repo&cursor=c2`]: { items: [fullPlan("p2")], next: null } });
+  const out = await runUnderstand(api, { "--workspace": "w" });
+  assert.match(out, /Repository brief repo · ready · head a+\n\s*Repo summary/);
+  assert.match(out, /Diagram System shape \(2 nodes, 1 edges\)\n\s*a -> b/);
+  assert.match(out, /p1 full text/);
+  assert.match(out, /p2 full text/);
+});
+
+test("understand reports an unparsed diagram instead of edges", async () => {
+  const broken = { ...diagram("Broken", []), parseError: "unexpected token" };
+  const api = fakeApi({ [root]: withBriefs([briefWith(broken)]), [`${root}/planned?repository=repo`]: { items: [], next: null } });
+  assert.match(await runUnderstand(api, { "--workspace": "w" }), /Diagram Broken \(0 nodes, 0 edges\)\n\s*diagram not parsed: unexpected token/);
+});
+
+test("a repeating planned cursor stops the read with an error", async () => {
+  const api = fakeApi({ [root]: withBriefs([]), [`${root}/planned?repository=repo`]: { items: [], next: "c" }, [`${root}/planned?repository=repo&cursor=c`]: { items: [], next: "c" } });
+  await assert.rejects(runUnderstand(api, { "--workspace": "w" }), /repeating page cursor/);
+});
+
+test("JSON mode emits the overview plus briefs, complete planned pages and the generated catalog", async () => {
+  const overview = withBriefs([briefWith(diagram("S", [["a", "b"]]))]);
+  const api = fakeApi({ [root]: overview,
+    [`${root}/planned?repository=repo`]: { items: [fullPlan("p1")], next: null },
+    [`${root}/generated`]: { projects: [{ id: "g1", name: "G", repositoryIds: ["repo"], planIds: [], basis: "repository" }], plans: [], next: "g2", coverage: ["c"] },
+    [`${root}/generated?cursor=g2`]: { projects: [], plans: [], next: null, coverage: ["c"] } });
+  const printed = JSON.parse(await runUnderstand(api, { "--workspace": "w", "--json": true }));
+  assert.deepEqual(printed.planned, { repo: [fullPlan("p1")] });
+  assert.deepEqual(printed.briefs, overview.knowledge.briefs);
+  assert.equal(printed.generated.projects[0].id, "g1");
+  assert.equal(printed.generated.next, null);
+  assert.deepEqual(printed.generated.coverage, ["c"]);
+  assert.deepEqual(printed.workspace, overview.workspace);
+});
+
+test("understand generated follows cursors and lists projects and plans", async () => {
+  const api = fakeApi({ [`${root}/generated`]: { projects: [{ id: "g1", name: "Gen", repositoryIds: ["repo"], planIds: ["x"], basis: "repository" }], plans: [], next: "n", coverage: [] },
+    [`${root}/generated?cursor=n`]: { projects: [], plans: [{ id: "x", workId: "m", kind: "mission", title: "Plan X", objective: "", repositoryIds: ["repo"], status: "ready", column: "review", outcome: null, links: [], updatedAt: "t", basis: "work" }], next: null, coverage: [] } });
+  const out = await runUnderstand(api, { "--workspace": "w" }, ["generated"]);
+  assert.match(out, /Project g1 · Gen/);
+  assert.match(out, /Plan x · review\/ready · Plan X/);
 });
 
 test("catalog mutation reads a JSON value file and sends one explicit revisioned request", async () => {

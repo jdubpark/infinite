@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import type { BehaviorCheckResult, BehaviorDefinition, BehaviorList, BehaviorModel, BehaviorPropertyResult, BehaviorRun, BehaviorSuite, KnowledgeBehavior, KnowledgeCatalog, KnowledgeClaim, KnowledgeComponent, KnowledgeMaintenance, KnowledgeRelationship, WorkspaceKnowledge } from "@infinite/remote";
 import type { ProjectGroupList } from "./project-group-types.js";
-import type { WorkspaceUnderstanding, UnderstandingArtifact, UnderstandingWork } from "@infinite/remote";
+import type { DiagramGraph, GeneratedCatalogPage, KnowledgeRepositoryBrief, WorkspaceUnderstanding, UnderstandingArtifact, UnderstandingPlan, UnderstandingWork } from "@infinite/remote";
 import { behaviorDefinitionHash, validateBehaviorDefinition, checkBehaviorModel } from "./behavior-checker.js";
 
 type Options = Record<string, string | boolean>;
@@ -40,7 +40,56 @@ function workLines(work: UnderstandingWork): string[] {
   return rows;
 }
 
-export function renderUnderstanding(value: WorkspaceUnderstanding): string[] {
+type PlannedByRepository = Record<string, UnderstandingPlan[]>;
+const maxPages = 200;
+
+/** Follows `next` cursors until null; a repeated cursor or more than 200 pages is an error, not a silent truncation. */
+async function allPages<T extends { next: string | null }>(api: Api, path: string, merge: (page: T) => void) {
+  const seen = new Set<string>();
+  let cursor: string | null = null;
+  for (let pages = 0; pages < maxPages; pages++) {
+    const page: T = await api.json<T>(cursor ? `${path}${path.includes("?") ? "&" : "?"}cursor=${encodeURIComponent(cursor)}` : path);
+    merge(page);
+    if (!page.next) return;
+    if (seen.has(page.next)) throw new Error("The host returned a repeating page cursor; the list may be incomplete.");
+    seen.add(page.next);
+    cursor = page.next;
+  }
+  throw new Error(`The host returned more than ${maxPages} pages; the list may be incomplete.`);
+}
+async function fetchPlanned(api: Api, workspace: string, repositoryId: string): Promise<UnderstandingPlan[]> {
+  const items: UnderstandingPlan[] = [];
+  await allPages<{ items: UnderstandingPlan[]; next: string | null }>(api, route(workspace, `/planned?repository=${encodeURIComponent(repositoryId)}`), page => items.push(...page.items));
+  return items;
+}
+async function fetchGenerated(api: Api, workspace: string): Promise<GeneratedCatalogPage> {
+  const result: GeneratedCatalogPage = { projects: [], plans: [], next: null, coverage: [] };
+  await allPages<GeneratedCatalogPage>(api, route(workspace, "/generated"), page => {
+    result.projects.push(...page.projects); result.plans.push(...page.plans);
+    for (const line of page.coverage) if (!result.coverage.includes(line)) result.coverage.push(line);
+  });
+  return result;
+}
+function diagramLines(diagram: DiagramGraph): string[] {
+  const lines = [`    Diagram ${diagram.title} (${diagram.nodes.length} nodes, ${diagram.edges.length} edges)`];
+  if (diagram.parseError) lines.push(`      diagram not parsed: ${diagram.parseError}`);
+  else for (const edge of diagram.edges) lines.push(`      ${edge.from} -> ${edge.to}${edge.label ? ` (${edge.label})` : ""}`);
+  return lines;
+}
+function briefLines(entry: KnowledgeRepositoryBrief): string[] {
+  const lines = [`  Repository brief ${entry.repositoryId} · ${entry.state} · head ${entry.head ?? "unborn"}`, `    ${entry.brief.summary}`];
+  for (const diagram of entry.diagrams) lines.push(...diagramLines(diagram));
+  return lines;
+}
+function renderGenerated(value: GeneratedCatalogPage): string[] {
+  const lines = ["Generated catalog"];
+  for (const project of value.projects) lines.push(`  Project ${project.id} · ${project.name} · repositories ${listed(project.repositoryIds)} · plans ${listed(project.planIds)}`);
+  for (const plan of value.plans) lines.push(`  Plan ${plan.id} · ${plan.column}/${plan.status} · ${plan.title} · repositories ${listed(plan.repositoryIds)}`);
+  for (const coverage of value.coverage) lines.push(`  Coverage: ${coverage}`);
+  return lines;
+}
+
+export function renderUnderstanding(value: WorkspaceUnderstanding, planned?: PlannedByRepository): string[] {
   if (value.schemaVersion !== 1) throw new Error("This host returned an unsupported Understanding response");
   if (!value.workspace?.id || !value.work || !value.repositories) throw new Error("This host returned a mismatched Understanding response");
   const lines = [`Understanding · ${value.workspace.name} (${value.workspace.id}) · revision ${value.workspace.revision} · observed ${value.observedAt}`, "Work"];
@@ -51,12 +100,13 @@ export function renderUnderstanding(value: WorkspaceUnderstanding): string[] {
   for (const repo of value.repositories) {
     lines.push(`  ${repo.name} (${repo.id}) · ${repo.state} · checkouts ${listed(repo.checkoutIds)}`);
     for (const artifact of repo.current) lines.push(...artifactLines(artifact));
-    for (const plan of repo.planned) lines.push(`    Planned: ${plan.title} · ${plan.status} · ${plan.text}`);
+    for (const plan of planned?.[repo.id] ?? repo.planned) lines.push(`    Planned: ${plan.title} · ${plan.status} · ${plan.text}`);
     for (const warning of repo.warnings) lines.push(`    Warning: ${warning}`);
     for (const coverage of repo.coverage) lines.push(`    Coverage: ${coverage}`);
   }
   for (const coverage of value.coverage) lines.push(`Coverage: ${coverage}`);
   if (value.knowledge) lines.push(...renderKnowledgeIndex(value.knowledge));
+  for (const entry of value.knowledge?.briefs ?? []) lines.push(...briefLines(entry));
   return lines.map(line => clean(line));
 }
 
@@ -280,7 +330,12 @@ export async function handleUnderstandingCommand(positional: string[], options: 
     try {
       const value = await api.json<WorkspaceUnderstanding>(route(id, ""));
       if (value.workspace?.id !== id) throw new Error("This host returned a mismatched Understanding response");
-      printJsonOrLines(value, renderUnderstanding(value), Boolean(options["--json"]));
+      const planned: PlannedByRepository = {};
+      for (const repo of value.repositories ?? []) planned[repo.id] = await fetchPlanned(api, id, repo.id);
+      if (options["--json"]) {
+        const generated = await fetchGenerated(api, id);
+        printJsonOrLines({ ...value, briefs: value.knowledge?.briefs ?? [], planned, generated }, [], true);
+      } else printJsonOrLines(value, renderUnderstanding(value, planned), false);
     } catch (error) {
       if ((error as { status?: number }).status === 404) throw new Error("Workspace Understanding requires a newer host or a valid workspace ID.");
       throw error;
@@ -288,6 +343,13 @@ export async function handleUnderstandingCommand(positional: string[], options: 
     return true;
   }
   const id = workspaceId(options);
+  if (command === "generated") {
+    if (arg || extra) throw new Error("Usage: infinite understand generated --workspace ID [--json]");
+    requireOptions(options, ["--workspace", "--json"]);
+    const value = await fetchGenerated(api, id);
+    printJsonOrLines(value, renderGenerated(value), Boolean(options["--json"]));
+    return true;
+  }
   if (["catalog", "components", "component", "refresh", "policy", "behaviors", "behavior", "behavior-save", "behavior-run", "behavior-suite"].includes(command)) {
     if (command === "component" && (!arg || extra || !validId.test(arg))) throw new Error("Usage: infinite understand component COMPONENT_ID --workspace ID [--json]");
     if (["behavior", "behavior-run", "behavior-suite"].includes(command) && (!arg || extra || !validBehaviorId.test(arg))) throw new Error(`Usage: infinite understand ${command} BEHAVIOR_ID --workspace ID [--json]`);

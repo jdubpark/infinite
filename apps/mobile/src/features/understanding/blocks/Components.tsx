@@ -26,8 +26,13 @@ export function Components({ items, onOpenComponent }: { items: ComponentChange[
 function ComponentCard({ item, onOpenComponent }: { item: ComponentChange; onOpenComponent?: (componentId: string) => void }) {
   const [open, setOpen] = useState(false);
   const change = CHANGE[item.change];
-  const added = sumCounts(item.files.map(file => file.added));
-  const removed = sumCounts(item.files.map(file => file.removed));
+  const counted = item.files.filter(file => file.added !== null && file.removed !== null);
+  const added = sumCounts(counted.map(file => file.added));
+  const removed = sumCounts(counted.map(file => file.removed));
+  const uncounted = item.files.length - counted.length;
+  const partial = item.filesTotal > item.files.length;
+  const lines = counted.length === 0 ? "line counts not recorded"
+    : `+${added} −${removed}${partial ? ` in the ${item.files.length} listed files` : ""}${uncounted ? ` · ${uncounted} without line counts` : ""}`;
   const componentId = item.componentId;
   return <View style={styles.card}>
     <View style={[styles.pill, { backgroundColor: change.surface }]}>
@@ -35,7 +40,7 @@ function ComponentCard({ item, onOpenComponent }: { item: ComponentChange; onOpe
     </View>
     <Text style={[styles.title, item.change === "removed" ? styles.struck : null]}>{item.name}</Text>
     <Text selectable style={styles.mono}>{item.path}</Text>
-    <Text style={styles.meta}>{`${item.filesTotal} ${item.filesTotal === 1 ? "file" : "files"} · +${added} −${removed}`}</Text>
+    <Text style={styles.meta}>{`${item.filesTotal} ${item.filesTotal === 1 ? "file" : "files"} · ${lines}`}</Text>
     {item.taskIds.length ? <View style={styles.row}>
       {item.taskIds.map(id => <Chip key={id} label={id} />)}
     </View> : null}

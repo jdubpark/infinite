@@ -24,6 +24,14 @@ function describeDiagram(diagram: Diagram): string {
   return `${title}: ${count} components, ${changes.modified} modified, ${changes.added} added, ${changes.removed} removed; ${relationships} relationships`;
 }
 
+/** A cheap stable identity for diagram content, so a changed diagram redraws on the remount-only runtime. */
+function contentKey(diagram: Diagram): string {
+  const text = JSON.stringify([diagram.id, diagram.direction, diagram.nodes, diagram.edges, diagram.groups, diagram.sequence ?? null]);
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index++) hash = Math.imul(hash ^ text.charCodeAt(index), 16777619);
+  return (hash >>> 0).toString(36);
+}
+
 function curve(points: [number, number][]): string {
   const [start, controlA, controlB, end] = points;
   return `M${start![0]},${start![1]} C${controlA![0]},${controlA![1]} ${controlB![0]},${controlB![1]} ${end![0]},${end![1]}`;
@@ -40,6 +48,7 @@ function DiagramCanvas({ diagram, layout, height, onOpenComponent, onExpand }: {
   const [frameWidth, setFrameWidth] = useState(0);
   const [frameOrigin, setFrameOrigin] = useState({ x: 0, y: 0 });
   const [selectedId, setSelectedId] = useState<string | undefined>();
+  const svgKey = useMemo(() => `${contentKey(diagram)}|${selectedId === undefined ? "-" : `sel:${selectedId}`}`, [diagram, selectedId]);
   const gestures = useCanvasGestures({
     contentWidth: layout.width,
     contentHeight: layout.height,
@@ -88,8 +97,8 @@ function DiagramCanvas({ diagram, layout, height, onOpenComponent, onExpand }: {
         transform: gestures.transform,
         transformOrigin: [0, 0, 0],
       }]}>
-      {/* Keyed on the selection: react-native-svg 15 on this runtime does not apply prop updates to mounted nodes, so a remount is the reliable way to redraw. */}
-      <Svg key={selectedId ?? "none"} width={layout.width} height={layout.height} viewBox={`0 0 ${layout.width} ${layout.height}`}>
+      {/* Keyed on content and selection: react-native-svg 15 on this runtime does not apply prop updates to mounted nodes, so a remount is the reliable way to redraw. */}
+      <Svg key={svgKey} width={layout.width} height={layout.height} viewBox={`0 0 ${layout.width} ${layout.height}`}>
         <ArrowMarker />
         <Rect x={0} y={0} width={layout.width} height={layout.height} fill="transparent" onPress={() => setSelectedId(undefined)} />
         {diagram.sequence ? layout.lanes?.map(lane => {

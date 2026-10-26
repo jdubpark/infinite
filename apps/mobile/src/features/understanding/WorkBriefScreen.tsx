@@ -92,7 +92,7 @@ function SectionCard({ section, onLayout, onOpenComponent, onOpenWork }: {
   </View>;
 }
 
-/** Shows narrative state in words. Only a `ready` narrative shows nothing, and no line claims more than the host recorded. */
+/** Shows narrative state in words. Only a `ready` narrative shows nothing, and no line claims more than the host recorded. Eligible readers can ask again; the host answers with the reason when it cannot run. */
 function NarrativeLine({ narrative, canRefresh, refreshState, onRefresh }: {
   narrative: WorkNarrativeStatus;
   canRefresh: boolean;
@@ -121,7 +121,10 @@ function NarrativeLine({ narrative, canRefresh, refreshState, onRefresh }: {
       </>;
       break;
     case "unavailable":
-      line = <Text style={s.narrativeText}>{narrative.reason}</Text>;
+      line = <>
+        <Text style={s.narrativeText}>{narrative.reason}</Text>
+        {refresh}
+      </>;
       break;
     case "ready":
       break;

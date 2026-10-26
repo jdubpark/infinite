@@ -137,7 +137,9 @@ revision, a `narrative` status and `sections`. `workId` is the same
 `team:<id>`, `mission:<id>` or `goal:<id>` key the understanding response
 lists; a subteam of a mission or goal can be opened by its own `team:` key.
 Work outside the workspace, or a partial association, returns `404` with code
-`understanding-work`. Reads never spawn a process. `POST /work/:workId/refresh`
+`understanding-work`. A read never starts a writer or any other model process; it
+only consults recorded state and the same bounded Git freshness checks the
+knowledge read already performs. `POST /work/:workId/refresh`
 with an empty object asks for a model narrative and is limited to owner and
 controller; viewers receive `403`. It returns `202` when a job was queued and
 `200` otherwise, with the resulting `narrative` status in both cases.

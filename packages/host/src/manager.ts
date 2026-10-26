@@ -26,7 +26,7 @@ import { DEFAULT_HOOKS } from "./config.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
-import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
+import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
 import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
@@ -41,6 +41,8 @@ import type {
   LaptopWorkspace,
   WorkerRequest,
   ControlLease,
+  Receipt,
+  TeamPermissionExpansionExpectation,
 } from "./types.js";
 
 /** This stop attempt was refused before any worker RPC could deliver it. */
@@ -78,6 +80,17 @@ interface StoredTeamRetirement {
   stoppedAt?: string;
   processes?: RuntimeProcess[];
   unsignalable?: number[];
+}
+interface StoredTeamPermissionExpansion {
+  digest: string;
+  promptKey: string;
+  receipt: Receipt;
+  at: string;
+}
+interface TeamPermissionExpansionLedger {
+  version: 1;
+  requests: Record<string, StoredTeamPermissionExpansion>;
+  prompts: Record<string, string>;
 }
 function mergeRecordedRuntimeTree(known: RuntimeProcess[], current: RuntimeProcess[]): RuntimeProcess[] {
   const prior = new Map(known.map(row => [row.pid, row]));
@@ -509,6 +522,152 @@ export class Manager {
     if (state.status !== "running") throw new TeamStopRefused("The team member has not confirmed a controllable runtime");
     await workerCall(this.config.runDir, sessionId, { op: "stop", requestId });
     return this.state(sessionId);
+  }
+  /** Expand the visible command text for one exact collapsed Codex prompt, without answering it. */
+  expandTeamPermission(
+    sessionId: string,
+    requestId: string,
+    team: TeamAssignment,
+    expected: TeamPermissionExpansionExpectation,
+  ): Promise<Receipt> {
+    const operation = this.serial.then(() => this.expandTeamPermissionOnce(sessionId, requestId, team, expected));
+    this.serial = operation.catch(() => {});
+    return operation;
+  }
+  private async expandTeamPermissionOnce(
+    sessionId: string,
+    requestId: string,
+    team: TeamAssignment,
+    expected: TeamPermissionExpansionExpectation,
+  ): Promise<Receipt> {
+    const session = this.meta(sessionId).session;
+    const stored = session.team;
+    const validAssignment = (value: unknown): value is TeamAssignment => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const candidate = value as Partial<TeamAssignment>;
+      return typeof candidate.runId === "string" && typeof candidate.memberId === "string" &&
+        Number.isInteger(candidate.revision) &&
+        ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"].includes(candidate.role ?? "") &&
+        (candidate.taskId === undefined || typeof candidate.taskId === "string");
+    };
+    const sameAssignment = (left: TeamAssignment | undefined, right: TeamAssignment) =>
+      Boolean(left && left.runId === right.runId && left.memberId === right.memberId &&
+        left.revision === right.revision && left.role === right.role && left.taskId === right.taskId);
+    if (!validAssignment(team) || !/^[a-f0-9-]{36}$/i.test(requestId) || !expected ||
+        !Number.isInteger(expected.promptId) || expected.promptId < 1 ||
+        !/^[a-f0-9]{64}$/i.test(expected.promptHash) || !/^[a-f0-9]{64}$/i.test(expected.evidenceHash) ||
+        typeof expected.targetCwd !== "string" || expected.targetCwd.length < 1 || expected.targetCwd.length > 4096 ||
+        typeof expected.expiresAt !== "string" || !Number.isFinite(Date.parse(expected.expiresAt)))
+      throw new ContentError("The collapsed permission expansion request is incomplete or does not match the team assignment", 403);
+
+    const requestIdentity = {
+      sessionId,
+      requestId,
+      assignment: { runId: team.runId, memberId: team.memberId, revision: team.revision, role: team.role, taskId: team.taskId ?? null },
+      expected: {
+        promptId: expected.promptId, promptHash: expected.promptHash, evidenceHash: expected.evidenceHash,
+        targetCwd: expected.targetCwd, expiresAt: expected.expiresAt,
+      },
+    };
+    const digest = createHash("sha256").update(JSON.stringify(requestIdentity)).digest("hex");
+    const promptKey = createHash("sha256").update(JSON.stringify({
+      promptId: expected.promptId, promptHash: expected.promptHash, evidenceHash: expected.evidenceHash,
+    })).digest("hex");
+    const file = join(this.config.stateDir, "sessions", sessionId, "team-permission-expansions.sealed");
+    const scope = `${sessionId}:team-permission-expansions`;
+    let ledger: TeamPermissionExpansionLedger = { version: 1, requests: {}, prompts: {} };
+    if (existsSync(file)) {
+      try {
+        const saved = unseal<TeamPermissionExpansionLedger>(this.key, scope, readFileSync(file, "utf8"));
+        if (!saved || saved.version !== 1 || !saved.requests || typeof saved.requests !== "object" ||
+            Array.isArray(saved.requests) || !saved.prompts || typeof saved.prompts !== "object" || Array.isArray(saved.prompts))
+          throw new Error("Invalid expansion ledger");
+        ledger = saved;
+      } catch {
+        throw new ContentError("The existing permission expansion receipt cannot be authenticated", 409);
+      }
+    }
+    const previous = ledger.requests[requestId];
+    if (previous) {
+      if (previous.digest !== digest || previous.promptKey !== promptKey)
+        throw new ContentError("Request ID already belongs to different permission expansion arguments", 409);
+      return { ...previous.receipt };
+    }
+    const promptOwner = ledger.prompts[promptKey];
+    if (promptOwner) throw new ContentError("This collapsed prompt already has a permission expansion request", 409);
+    if (!stored || !sameAssignment(stored, team))
+      throw new ContentError("The permission expansion does not match the current team assignment", 403);
+
+    const assertEligible = (state: WorkerState, leaseId?: string) => {
+      if (Date.parse(expected.expiresAt) <= Date.now())
+        throw new ContentError("The permission expansion request expired");
+      if (session.provider !== "codex" || session.runtime?.transport !== "pty" || session.runtime.nativeUi ||
+          state.status !== "running" || state.runtime?.transport !== "pty" || state.runtime.nativeUi)
+        throw new ContentError("The assigned team member has no running managed Codex terminal");
+      if (state.control && (!leaseId || state.control.id !== leaseId))
+        throw new ContentError("A person currently controls this session", 409);
+      const prompt = state.attention.prompt;
+      if (state.attention.state !== "needs-you" || !prompt || prompt.id !== expected.promptId ||
+          prompt.hash !== expected.promptHash || permissionEvidenceHash(prompt) !== expected.evidenceHash ||
+          !isCollapsedPermissionPrompt(prompt))
+        throw new ContentError("The assigned Codex prompt is no longer the expected collapsed command", 409);
+    };
+
+    let canonicalCwd: string;
+    try { canonicalCwd = realpathSync(session.cwd); }
+    catch { throw new ContentError("The assigned team working directory is unavailable"); }
+    if (expected.targetCwd !== canonicalCwd)
+      throw new ContentError("The permission expansion targets a different working directory", 403);
+    assertEligible(await this.state(sessionId));
+
+    const actor = { id: `team-permission-expand:${requestId}`, label: "Team permission display expansion" };
+    let lease: ControlLease | undefined;
+    try {
+      lease = await workerCall<ControlLease>(this.config.runDir, sessionId, {
+        op: "control", action: "claim", actor,
+      });
+      const controlled = await this.state(sessionId);
+      if (!lease?.id || controlled.control?.id !== lease.id)
+        throw new ContentError("The team member control lease changed before display expansion", 409);
+      assertEligible(controlled, lease.id);
+
+      // Seal the at-most-once intent before the worker can send the toggle key. A
+      // host crash or lost acknowledgement leaves an uncertain receipt that is
+      // replayed as-is and never dispatched again.
+      const receipt: Receipt = { requestId, state: "uncertain", seq: controlled.seq };
+      ledger.requests[requestId] = { digest, promptKey, receipt, at: new Date().toISOString() };
+      ledger.prompts[promptKey] = requestId;
+      writeSealed(file, this.key, scope, ledger);
+
+      try {
+        const result = await workerCall<Receipt>(this.config.runDir, sessionId, {
+          op: "team-permission-expand", requestId, targetSessionId: sessionId, assignment: stored,
+          expected: requestIdentity.expected, actor, leaseId: lease.id,
+        }, 12000);
+        if (result?.requestId === requestId && (result.state === "delivered" || result.state === "uncertain") &&
+            Number.isSafeInteger(result.seq) && result.seq >= 0) {
+          ledger.requests[requestId].receipt = { ...result };
+          writeSealed(file, this.key, scope, ledger);
+          return { ...result };
+        }
+        return { ...receipt };
+      } catch (error) {
+        const code = (error as { code?: unknown }).code;
+        if (typeof code === "string" && ["unsupported", "prompt-changed", "control-busy", "control-lost"].includes(code)) {
+          // A named worker refusal is guaranteed to precede its Ctrl+A write.
+          delete ledger.requests[requestId];
+          if (ledger.prompts[promptKey] === requestId) delete ledger.prompts[promptKey];
+          writeSealed(file, this.key, scope, ledger);
+          throw error;
+        }
+        return { ...receipt };
+      }
+    } finally {
+      if (lease) {
+        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        catch { /* the next state read reports an expired or lost lease */ }
+      }
+    }
   }
   /** Apply only the persisted, one-shot approval for this exact assigned member and prompt. */
   async answerTeamPermission(

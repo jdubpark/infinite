@@ -61,6 +61,9 @@ export class HandoffService {
     const canonical = project ? realpathSync(project.path) : undefined;
     return [...this.records.values()].some(record => (record.projectId === projectId || (canonical && handoffPathsOverlap(record.policy.path, canonical))) && !["started", "blocked"].includes(record.status));
   }
+  ownsActiveTeam(teamId: string) {
+    return [...this.records.values()].some(record => record.teamId === teamId && !["started", "blocked"].includes(record.status));
+  }
   start() {
     if (this.running) return;
     this.running = true;

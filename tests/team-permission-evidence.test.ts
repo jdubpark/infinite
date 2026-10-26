@@ -158,3 +158,115 @@ test("an emitted .js import specifier is read from its TypeScript source", () =>
     assert.ok(!snapshot.limitations.some(limitation => /retire/.test(limitation)), snapshot.limitations.join("\n"));
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
+
+test("collects the config and test behind a literal environment assignment and package runner", () => {
+  const cwd = workspace();
+  try {
+    mkdirSync(join(cwd, "tests"));
+    writeFileSync(join(cwd, "playwright.config.ts"), "export default {};\n");
+    writeFileSync(join(cwd, "tests/capture.spec.ts"), 'test("capture", () => {});\n');
+    for (const command of [
+      "E2E_CAPTURE=1 npx playwright test --config=playwright.config.ts tests/capture.spec.ts",
+      "E2E_CAPTURE=1 npm exec -- playwright test --config=playwright.config.ts tests/capture.spec.ts",
+    ]) {
+      const result = collectPermissionEvidence({ prompt: screen(command), cwd, changedPaths: [] });
+      assert.deepEqual(result.files.map(file => file.path), ["playwright.config.ts", "tests/capture.spec.ts"]);
+      assert.deepEqual(result.limitations, [], command);
+    }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("does not map package aliases or npm exec package-selection options", () => {
+  const cwd = workspace();
+  try {
+    writeFileSync(join(cwd, "a.spec.ts"), 'test("capture", () => {});\n');
+    const commands = [
+      "npx @alternate/playwright test a.spec.ts",
+      "npx ./node_modules/.bin/playwright test a.spec.ts",
+      "npm --package=alternate-runner exec -- playwright test a.spec.ts",
+      "npm exec --package=alternate-runner -- playwright test a.spec.ts",
+      "npm exec -- ./node_modules/.bin/playwright test a.spec.ts",
+    ];
+    for (const command of commands) {
+      const result = collectPermissionEvidence({ prompt: screen(command), cwd, changedPaths: [] });
+      assert.deepEqual(result.files, [], command);
+      assert.ok(result.limitations.length > 0, command);
+    }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("does not treat quoted or escaped assignment-like words as environment assignments", () => {
+  const cwd = workspace();
+  try {
+    writeFileSync(join(cwd, "a.spec.ts"), 'test("capture", () => {});\n');
+    for (const command of [
+      '"E2E_CAPTURE=1" npx playwright test a.spec.ts',
+      "E2E_CAPTURE\\=1 npx playwright test a.spec.ts",
+    ]) {
+      const result = collectPermissionEvidence({ prompt: screen(command), cwd, changedPaths: [] });
+      assert.deepEqual(result.files, [], command);
+      assert.match(result.limitations.join("\n"), /No supported static source mapping/);
+    }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("keeps semantic newlines in a wrapped screen command incomplete", () => {
+  const cwd = workspace();
+  try {
+    writeFileSync(join(cwd, "capture.spec.ts"), 'test("capture", () => {});\n');
+    const result = collectPermissionEvidence({
+      prompt: screen("npx playwright test capture.spec.ts\ngit status"), cwd, changedPaths: [],
+    });
+    assert.deepEqual(result.files, []);
+    assert.match(result.limitations.join("\n"), /multiple lines/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("collects coordinator-requested paths with complete content and binds drift into the digest", () => {
+  const cwd = workspace();
+  try {
+    mkdirSync(join(cwd, "src"));
+    const path = "src/requested.ts";
+    const content = "export const requested = 'complete source';\n";
+    writeFileSync(join(cwd, path), content);
+    const input = { prompt: screen("git status"), cwd, changedPaths: [], requestedPaths: [path] };
+    const first = collectPermissionEvidence(input);
+    assert.deepEqual(first.files.map(file => file.path), [path]);
+    assert.equal(first.files[0]?.content, content);
+    assert.deepEqual(first.limitations, []);
+    writeFileSync(join(cwd, path), "export const requested = 'changed source';\n");
+    const second = collectPermissionEvidence(input);
+    assert.notEqual(first.digest, second.digest, "requested source drift changes the answer-time evidence digest");
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("bounds coordinator-requested paths and refuses paths outside safe roots", () => {
+  const cwd = workspace();
+  try {
+    mkdirSync(join(cwd, "src"));
+    for (let index = 0; index < 9; index++) writeFileSync(join(cwd, `src/requested-${index}.ts`), `export const value = ${index};\n`);
+    writeFileSync(join(cwd, "src/other.ts"), "export const other = true;\n");
+    const prefix = Array.from({ length: 8 }, (_, index) => `src/requested-${index}.ts`);
+    const bounded = collectPermissionEvidence({
+      prompt: screen("git status"), cwd, changedPaths: [], requestedPaths: [...prefix, "src/requested-8.ts"],
+    });
+    assert.equal(bounded.files.length, 8);
+    assert.match(bounded.limitations.join("\n"), /8-path limit/);
+    const differentOmission = collectPermissionEvidence({
+      prompt: screen("git status"), cwd, changedPaths: [], requestedPaths: [...prefix, "src/other.ts"],
+    });
+    assert.notEqual(bounded.digest, differentOmission.digest, "the digest binds paths omitted by the request cap");
+
+    writeFileSync(join(cwd, "src/safe.ts"), "export const safe = true;\n");
+    symlinkSync(join(cwd, "src/safe.ts"), join(cwd, "src/alias.ts"));
+    writeFileSync(join(cwd, ".env.local"), "placeholder=value\n");
+    const refused = collectPermissionEvidence({
+      prompt: screen("git status"), cwd, changedPaths: [],
+      requestedPaths: ["../outside.ts", ".env.local", "src/alias.ts"],
+    });
+    assert.deepEqual(refused.files, []);
+    assert.match(refused.limitations.join("\n"), /outside the repository/);
+    assert.match(refused.limitations.join("\n"), /excluded or unsafe/);
+    assert.match(refused.limitations.join("\n"), /traverses a symlink/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});

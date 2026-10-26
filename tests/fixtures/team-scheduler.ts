@@ -43,7 +43,11 @@ export function schedulerFixture() {
   const manager = {
     list: async () => [],
     meta: (requestedId: string) => {
-      if (requestedId === sessionId) return {};
+      // The base member's session carries its assignment like a real team session, so pre-review live checks pass.
+      if (requestedId === sessionId) {
+        const base = run.members.find(member => member.sessionId === sessionId)!;
+        return { session: { team: { runId: run.id, memberId: base.memberId, revision: base.revision, role: base.role }, cwd: base.cwd, provider: "demo", title: base.title } };
+      }
       const session = sessions.get(requestedId);
       if (session) return { session: { team: session.assignment, cwd: session.cwd, provider: session.provider, title: session.title } };
       throw Object.assign(new Error("Session metadata is unavailable."), { code: "ENOENT" });

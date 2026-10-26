@@ -20,7 +20,7 @@ import { createInterface } from "node:readline";
 import type { Config, Session } from "../packages/host/src/types.js";
 import type { CreateTeam, NativeContinuation, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { CreateMission, Mission, MissionReport } from "../packages/host/src/mission-types.js";
-import { emptyRollup } from "../packages/host/src/team-usage.js";
+import { emptyRollup, emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
 import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -698,6 +698,7 @@ test("a mission coordinator reports through its own MCP tool and envelope, separ
 });
 
 type FakeRun = { id: string; projectId: string; missionId: string; status: TeamView["status"]; revision: number; updatedAt: string; parallelism?: number; parallelismCeiling?: number;
+  usage?: UsageRollup; workspaceRemovedAt?: string;
   recovery?: { attempts: number; status: "stopping" | "planning" | "exhausted"; source: { code: string; memberId: string; revision: number; reportKind?: string; reason: string; at: string } };
   decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string }[] };
 
@@ -766,7 +767,7 @@ function scripted() {
   const steerReceipts = new Map<string, string>();
   let steerLimit: boolean | Set<string> = false, steerBusy = false, loseSteerReply = false;
   const key = randomBytes(32);
-  const view = (run: FakeRun) => ({ ...structuredClone(run), title: run.id, tasks: [], usage: emptyRollup() }) as unknown as TeamView;
+  const view = (run: FakeRun) => ({ ...structuredClone(run), title: run.id, tasks: [], usage: run.usage ?? emptyRollup() }) as unknown as TeamView;
   const run = (id: string) => { const value = runs.get(id); if (!value) throw new TeamError(404, "team-not-found", "This team does not exist."); return value; };
   const set = (id: string, patch: Partial<FakeRun>) => Object.assign(run(id), patch, { updatedAt: new Date().toISOString() });
   const teams = {
@@ -829,6 +830,7 @@ function scripted() {
       return view(set(id, { status: "implementing" }));
     },
     async cancel(id: string) { return view(set(id, { status: "cancelled" })); },
+    async removeRun(id: string) { runs.delete(id); },
     activeForProject: (projectId: string) => standalone.has(projectId) ||
       [...runs.values()].some(item => item.projectId === projectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(item.status)),
   };
@@ -909,6 +911,64 @@ const plan = (id: string, repoProjectId: string, dependsOn: string[] = []) =>
 const teamPlan = (id: string, repoProjectId: string, parallelism = 1, dependsOn: string[] = []) =>
   ({ id, repoProjectId, title: `Subtask ${id}`, objective: `Do ${id}`, size: "team" as const, parallelism, dependsOn });
 const teamOf = (mission: Mission, subtaskId: string) => mission.subtasks.find(item => item.id === subtaskId)?.teamId;
+
+test("permission recovery wakes the mission once with bounded observations and permits a scoped correction", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = (await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")))).subtasks[0].teamId!;
+    const outcomeId = randomUUID();
+    const recovery = { outcomes: [{ id: outcomeId, decisionId: randomUUID(), revision: 1, promptId: 1,
+      status: "exhausted" as const, cause: "Missing executable evidence", action: "Read requested files",
+      decision: "Cannot approve the unread command", consequence: "界".repeat(4000), execution: "unknown" as const,
+      at: new Date().toISOString() }] };
+    Object.assign(h.runs.get(teamId)!, { permissionRecovery: recovery });
+    const delivered = (await h.messages(2)).filter((message: MissionMessage) => message.type === "permission-recovery");
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].outcomeId, outcomeId);
+    assert.equal(delivered[0].execution, "unknown");
+    assert.ok(Buffer.byteLength(JSON.stringify(delivered[0])) < 2000);
+    assert.equal(h.get(id).decisions.length, 0, "A diagnostic outcome does not create an owner question");
+    await h.report(2, { kind: "steer-subtask", subtaskId: "a", text: "Keep the approved check; place its helper in the assigned scratch directory so it can be inspected." });
+    await waitFor(async () => h.steers.length, count => count === 1, 10000);
+    // A later independent event wakes another attempt; the same terminal observation must not recur.
+    h.set(teamId, { status: "ready-for-review" });
+    const later = await h.messages(3);
+    assert.equal(later.filter((message: MissionMessage) => message.type === "permission-recovery").length, 0);
+    assert.equal(h.answers.length, 0, "The mission's correction does not answer a provider permission");
+  } finally { h.close(); }
+});
+
+for (const scenario of [
+  { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23800, summary: "One API change", held: false },
+  { name: "a full mission holds recovery evidence without empty attempts or child cancellation", objectiveLength: 24000, summary: "S".repeat(900), held: true },
+]) test(scenario.name, { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create("界".repeat(scenario.objectiveLength));
+    await h.report(1, { kind: "dispatch", summary: scenario.summary, subtasks: [plan("a", "api")] });
+    const teamId = (await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")))).subtasks[0].teamId!;
+    const outcomeId = randomUUID();
+    Object.assign(h.runs.get(teamId)!, { permissionRecovery: { outcomes: [{ id: outcomeId, revision: 1, promptId: 1,
+      status: "exhausted", cause: "界".repeat(400), action: "界".repeat(400), decision: "界".repeat(400),
+      consequence: "界".repeat(400), execution: "unknown", at: new Date().toISOString() }] } });
+    if (scenario.held) {
+      await until(() => h.get(id), mission => /evidence remains queued/.test(mission.reason ?? ""), 10000);
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      assert.equal(h.get(id).status, "working");
+      assert.equal(h.attempts(), 1, "An undeliverable notification must not spend coordinator attempts");
+      assert.equal(h.get(id).events.filter(event => /evidence remains queued/.test(event.text)).length, 1);
+    } else {
+      const messages = await h.messages(2);
+      assert.equal(messages.length, 1);
+      assert.equal(messages[0].outcomeId, outcomeId);
+      assert.equal(messages[0].cause, "See the subteam permissionRecovery outcome.");
+      assert.equal(h.attempts(), 2);
+    }
+    assert.equal(h.runs.get(teamId)!.status, "implementing");
+  } finally { h.close(); }
+});
 
 test("mission restore adopts a legacy pending solo launch and persists capacity once", () => {
   const root = realpathSync(mkdtempSync("/tmp/inf-mission-capacity-restore-"));
@@ -1069,6 +1129,28 @@ test("a result waits until blocked and stranded subtasks are cancelled, and each
     await h.report(5, { kind: "result", summary: "The API change is ready; the web change was cancelled" });
     const ready = await until(() => h.get(id), mission => mission.status === "ready-for-review", 20000);
     assert.deepEqual(ready.subtasks.map(subtask => subtask.status), ["done", "cancelled", "cancelled"]);
+  } finally { h.close(); }
+});
+
+test("a deleted cancelled mission child keeps its measured usage in the mission rollup", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const running = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
+    const childId = teamOf(running, "a")!;
+    const total = { ...emptyUsage(), cost: 0.0123, tokens: { input: 10, output: 20, reasoning: 3, cacheRead: 4, cacheWrite: 5 }, messages: 2,
+      pricing: { configured: 0, catalog: 2, provider: 0, unknown: 0 } };
+    const usage: UsageRollup = { total, byProfile: { light: total }, byProvider: { codex: total }, unmeasuredMembers: 2 };
+    h.set(childId, { status: "cancelled", workspaceRemovedAt: new Date().toISOString(), usage });
+    const cancelled = await h.missions.cancel(id, { requestId: randomUUID(), revision: running.revision });
+    assert.equal(cancelled.status, "cancelled");
+
+    const deleted = await until(() => h.get(id), mission => !mission.subtasks[0].teamId, 20000);
+    assert.deepEqual(deleted.subtasks[0].finalEvidence?.usage, usage);
+    assert.deepEqual(deleted.usage?.total, total);
+    assert.equal(deleted.usage?.unmeasuredMembers, h.attempts() + usage.unmeasuredMembers,
+      "Deleting the child must preserve its unmeasured member count as well as measured totals");
   } finally { h.close(); }
 });
 

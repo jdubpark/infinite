@@ -12,6 +12,30 @@ export const teamCommandSchema = z.object({
   args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]),
 }).strict();
 export type TeamCommand = z.infer<typeof teamCommandSchema>;
+
+/** How long finished work keeps its clones. Records and events outlive every workspace; cancelled runs are deleted whole. */
+export const teamRetentionSchema = z.object({
+  /** Minutes after a run reaches merged or no-change, with every member stopped, before its clones are removed. Runs owned by a live goal, mission or handoff wait for that owner to finish. */
+  finishedMinutes: z.number().int().min(0).max(10080).default(60),
+  /** Minutes after a run is cancelled and its members have stopped before its clones and its record are deleted. */
+  cancelledMinutes: z.number().int().min(0).max(10080).default(60),
+  /** Hours a ready-for-review run keeps its clones; the reviewed branch is already published for review. */
+  reviewHours: z.number().int().min(1).max(720).default(24),
+  /** Hours a blocked run keeps its clones; after removal the run stays blocked and cannot resume. */
+  blockedHours: z.number().int().min(1).max(720).default(72),
+  /** Minutes a stopped member whose result was integrated keeps its clone while the run continues; recovery briefs list these clones for read-only inspection. */
+  memberMinutes: z.number().int().min(0).max(10080).default(60),
+}).strict();
+export type TeamRetention = z.infer<typeof teamRetentionSchema>;
+export const DEFAULT_TEAM_RETENTION: TeamRetention = teamRetentionSchema.parse({});
+
+/** Free space the workspace volume must keep for a new run to start. */
+export const storageFloorSchema = z.object({
+  inodes: z.number().int().min(0).default(300_000),
+  bytes: z.number().int().min(0).default(2 * 1024 ** 3),
+}).strict();
+export type StorageFloor = z.infer<typeof storageFloorSchema>;
+export const DEFAULT_STORAGE_FLOOR: StorageFloor = storageFloorSchema.parse({});
 export const githubRepositorySchema = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/);
 const githubRepository = githubRepositorySchema;
 export const gitBranchSchema = z.string().min(1).max(255).refine(value =>
@@ -94,10 +118,65 @@ export interface TeamPermissionDecision {
   /** Host session that handled this decision on a sticky reviewer member. */
   coordinatorSessionId?: string;
   answerRequestId: string;
+  /** Absent on old records; diagnostic reviews can request evidence but can never answer a prompt. */
+  purpose?: "answer" | "diagnose";
+  recoveryRequestId?: string;
+  requestedPaths?: string[];
   status: "pending" | "reviewing" | "approved" | "answering" | "answered" | "escalated" | "stale" | "uncertain";
   reason?: string;
   receipt?: Receipt & { result?: AnswerResult };
 }
+export interface TeamPermissionRecoveryStep {
+  id: string;
+  requestId: string;
+  decisionId?: string;
+  at: string;
+  cause: string;
+  action: string;
+  decision: string;
+  consequence: string;
+  execution: "unknown";
+  receipt?: Receipt;
+}
+export interface TeamPermissionRecoveryOutcome {
+  id: string;
+  requestId: string;
+  decisionId?: string;
+  revision: number;
+  promptId: number;
+  status: "complete" | "exhausted" | "interrupted";
+  cause: string;
+  action: string;
+  decision: string;
+  consequence: string;
+  execution: "unknown";
+  at: string;
+}
+export interface TeamPermissionRecoveryRequest {
+  id: string;
+  revision: number;
+  targetMemberId: string;
+  targetSessionId: string;
+  promptId: number;
+  promptHash: string;
+  evidenceHash: string;
+  targetCwd: string;
+  policyHash: string;
+  expiresAt: string;
+  status: "expanding" | "diagnosing" | "reviewing-evidence" | "complete" | "exhausted" | "interrupted";
+  rounds: number;
+  latestDecisionId?: string;
+  requestedPaths?: string[];
+  /** Persisted before Ctrl+A is sent; an unresolved intent is never replayed after restart. */
+  expansion?: { requestId: string; promptId: number; promptHash: string; status: "intent" | "expanded" | "uncertain" | "refused"; at: string;
+    observedPromptId?: number; observedPromptHash?: string; rereads?: number; receipt?: Receipt };
+}
+export interface TeamPermissionRecoveryState {
+  requests: TeamPermissionRecoveryRequest[];
+  steps: TeamPermissionRecoveryStep[];
+  outcomes: TeamPermissionRecoveryOutcome[];
+}
+export type TeamPermissionRecoveryView = Omit<TeamPermissionRecoveryOutcome, "requestId">;
 export const teamProjectSchema = z.object({
   handoff: z.enum(["auto", "off"]).optional(),
   setup: teamCommandSchema.optional(),
@@ -276,7 +355,12 @@ export const teamTaskPlanSchema = z.object({
 }).strict();
 export type TeamTaskPlan = z.infer<typeof teamTaskPlanSchema>;
 export const teamReportSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("permission-decision"), decisionId: z.uuid(), verdict: z.enum(["approve-once", "escalate"]), summary: z.string().trim().min(1).max(2000) }).strict(),
+  z.object({ kind: z.literal("permission-decision"), decisionId: z.uuid(), verdict: z.enum(["approve-once", "request-evidence", "escalate"]), summary: z.string().trim().min(1).max(2000), requestedPaths: z.array(z.string().trim().min(1).max(512)).max(8).optional() }).strict().superRefine((report, context) => {
+    if (report.verdict === "request-evidence" && !report.requestedPaths?.length)
+      context.addIssue({ code: "custom", path: ["requestedPaths"], message: "Request evidence with at least one repository-relative or approved scratch path." });
+    if (report.verdict !== "request-evidence" && report.requestedPaths !== undefined)
+      context.addIssue({ code: "custom", path: ["requestedPaths"], message: "Only an evidence request may name paths." });
+  }),
   z.object({ kind: z.literal("plan"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), brief: teamBriefSchema.optional(), tasks: z.array(teamTaskPlanSchema).min(1).max(12), verification: teamVerificationSchema.optional() }).strict(),
   z.object({ kind: z.literal("explore"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), tasks: z.array(teamScoutPlanSchema).min(1).max(3) }).strict(),
   z.object({ kind: z.literal("findings"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
@@ -335,6 +419,8 @@ export interface TeamMember extends TeamAssignment {
   stopRequestId: string;
   /** Why the host stopped this member without a report, such as a provider usage limit. */
   stoppedReason?: string;
+  /** The member clone was removed under the retention policy after its result was integrated or its run settled. */
+  workspaceRemovedAt?: string;
   /** Confirmed process retirement for a recording-failed reviewer; its original journal remains sealed. */
   retirement?: { requestId: string; at: string; identity: string; seq: number; processes: number; unsignalable: number };
   /** Set only after stopped() confirms exit while the member waits for serialized integration. */
@@ -403,6 +489,8 @@ export interface TeamRun {
   permissions?: TeamPermissions;
   permissionsRevokedAt?: string;
   permissionDecisions?: TeamPermissionDecision[];
+  /** Bounded diagnostic recovery records. These never confer permission authority. */
+  permissionRecovery?: TeamPermissionRecoveryState;
   /** Owner opt-in is pinned at creation; accepted commands cannot change within this run. */
   establishChecks?: true;
   verification?: TeamVerification;
@@ -456,6 +544,8 @@ export interface TeamRun {
   goal?: TeamGoalContext;
   /** Set when a mission started this run as one of its subteams; the board shows it only inside that mission. */
   missionId?: string;
+  /** The integration and member clones were removed under the retention policy; the record, events and evidence remain. */
+  workspaceRemovedAt?: string;
   handoff?: import("./handoff-types.js").TeamHandoffContext;
   brief?: TeamBrief;
   discovery?: { revision: number; summary: string; tasks: TeamScout[]; completedAt?: string };
@@ -488,11 +578,12 @@ export interface TeamRun {
   round: number;
 }
 /** `providerLimits` is the host's active limit memory at read time, shared by every run. */
-export type TeamView = Omit<TeamRun, "members" | "permissionDecisions"> & {
+export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
   pendingOperation?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number; failed: boolean;
     failureCode?: string; sourceMemberId?: string; sourceRole?: TeamMember["role"] };
   members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];
+  permissionRecovery?: { outcomes: TeamPermissionRecoveryView[] };
   usage: UsageRollup;
   providerLimits: ProviderLimit[];
   workers: { limit: number; max: number; running: number; ready: number };

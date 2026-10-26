@@ -49,8 +49,8 @@ export interface GoalCycle {
   brief?: TeamBrief;
   reason?: string;
   memberCount: number;
-  /** Computed on read from the cycle's team; never stored. */
-  usage?: UsageTotals;
+  /** Retained cycle rollup plus flattened totals for existing display clients. */
+  usage?: UsageTotals & UsageRollup;
 }
 export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
   linearTracking?: boolean;

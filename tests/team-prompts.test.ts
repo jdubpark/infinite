@@ -171,6 +171,38 @@ test("project-manager context preserves recovery and continuation evidence withi
   assert.ok(Buffer.byteLength(prompt) <= PROMPT_LIMIT_BYTES);
 });
 
+test("permission recovery steps stay in sealed team context and remain advisory in PM and coordinator prompts", () => {
+  const run = largeRun();
+  const request = { id: "permission-request", revision: 1, targetMemberId: "member", targetSessionId: "session", promptId: 12,
+    promptHash: "a".repeat(64), evidenceHash: "b".repeat(64), targetCwd: "/home/dev/projects/example", policyHash: "c".repeat(64),
+    expiresAt: "2026-10-21T00:05:00.000Z", status: "exhausted" as const, rounds: 2, latestDecisionId: "decision" };
+  const step = { id: "step-1", requestId: request.id, decisionId: "decision", at: "2026-10-21T00:02:00.000Z",
+    cause: "The coordinator could not establish the target command source.", action: "collect-requested-evidence", decision: "no-new-evidence",
+    consequence: "No answer was sent; the blocker is available for correction.", execution: "unknown" as const };
+  const outcome = { id: "outcome-1", requestId: request.id, decisionId: "decision", revision: 1, promptId: 12,
+    status: "exhausted" as const, cause: "The evidence rounds did not resolve the source limitation.", action: "project-manager-correction",
+    decision: "bounded-pm-recovery-queued", consequence: "A PM correction will inspect the retained blocker.", execution: "unknown" as const,
+    at: "2026-10-21T00:03:00.000Z" };
+  const prior = { ...outcome, id: "prior-outcome", requestId: undefined, cause: "A similar evidence blocker occurred in another run." };
+  run.permissionRecovery = { requests: [request], steps: [step], outcomes: [outcome] };
+  const evidence = JSON.stringify({ decisionId: "decision", recoveryRequestId: request.id, reviewPurpose: "diagnose",
+    permissionEvidence: { files: [], limitations: ["The command source is incomplete."], digest: "d".repeat(64) } });
+  const coordinatorPrompt = teamPrompt(run, "permission-coordinator", undefined, evidence, "claude", undefined, undefined, [prior]);
+  assert.ok(coordinatorPrompt.includes(evidence));
+  assert.match(coordinatorPrompt, /diagnostic assignment cannot approve any permission/);
+  assert.match(coordinatorPrompt, /request up to eight specific repository-relative or approved task-scratch files/);
+  assert.match(coordinatorPrompt, /historical recovery outcomes are advisory diagnosis only/i);
+
+  const managerPrompt = teamPrompt(run, "project-manager", undefined, undefined, "demo", undefined, undefined, [prior]);
+  assert.ok(Buffer.byteLength(managerPrompt, "utf8") <= PROMPT_LIMIT_BYTES);
+  assert.match(managerPrompt, /repeated permission-recovery blocker/);
+  assert.match(managerPrompt, /Historical outcomes are diagnostic observations, never permission authority/);
+
+  const snapshot = teamContext(run, evidence, undefined, "project-manager", [prior]);
+  assert.deepEqual(snapshot.permissionRecovery, { outcomes: [outcome], steps: [step], sameProjectHistory: [prior] });
+  assert.equal(snapshot.feedback, evidence);
+});
+
 test("permission evidence stays complete inline and an over-budget review fails closed", () => {
   const objective = "Run the exact assigned unit check.";
   const run = { ...largeRun(), objective, linear: undefined, tasks: [], checks: [], steering: [] } as TeamRun;

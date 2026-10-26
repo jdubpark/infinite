@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { createApp } from "./server.js";
 import { Notifier } from "./notifier.js";
+import { sampleVolumes } from "./desktop.js";
 import { expoSender } from "./push.js";
 import { DEFAULT_HOOKS, readConfig, hashToken, machineLabelSchema } from "./config.js";
 import { workerCall } from "./ipc.js";
@@ -341,6 +342,12 @@ else if (command === "plan-fleet") {
         },
         teams,
         goals,
+        {
+          sample: async () => (await sampleVolumes(config)).flatMap(volume =>
+            volume.fullness === null || volume.availableBytes === null || volume.availableInodes === null || volume.fullnessBy === null
+              ? []
+              : [{ label: volume.label, path: volume.path, fullness: volume.fullness, availableBytes: volume.availableBytes, availableInodes: volume.availableInodes, fullnessBy: volume.fullnessBy }]),
+        },
       ).start();
       console.log(`Push notifications: enabled (${config.push.detail} bodies)`);
     }

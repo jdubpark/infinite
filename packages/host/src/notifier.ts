@@ -9,6 +9,9 @@ export type PromptOwner = "coordinator" | "user" | "undecided";
 type Teams = { statuses(): TeamRow[]; promptOwner?(sessionId: string, prompt: Prompt): PromptOwner };
 type GoalRow = { id: string; title: string; status: string; reason?: string };
 type Lifecycle = { id: string; title: string; status: string; reason?: string; resumable?: boolean; kind: "goal" | "team"; event: string; titleText: string; body: string; priority: "default" | "high" };
+type StorageVolume = { label: string; path: string; fullness: number; availableInodes: number; availableBytes: number; fullnessBy?: "bytes" | "inodes" };
+type StorageAlert = { label: string; fullness: number; availableInodes: number; availableBytes: number; fullnessBy: "bytes" | "inodes"; critical: boolean };
+type StorageCrossing = { previous: number; warningArmed: boolean; criticalArmed: boolean };
 const PUSH_STATES = new Set(["needs-you", "turn-finished", "exited", "recording-error"]);
 /** How long a delegated run may take to pick a member's prompt up for review before the owner hears about it. */
 const REVIEW_START_GRACE_MS = 45_000;
@@ -43,6 +46,8 @@ export class Notifier {
   private primed = false;
   private teamsPrimed = false;
   private goalsPrimed = false;
+  private storageStatus = new Map<string, StorageCrossing>();
+  private lastStorageEvaluationAt?: number;
   private timer?: ReturnType<typeof setInterval>;
   constructor(
     private readonly manager: Pick<Manager, "list">,
@@ -51,6 +56,7 @@ export class Notifier {
     private readonly options: { detail: "minimal" | "full"; events: string[]; intervalMs: number; machineId?: string; reviewGraceMs?: number; reviewHoldLimitMs?: number },
     private readonly teams?: Teams,
     private readonly goals?: { statuses(): GoalRow[] },
+    private readonly storage?: { sample(): Promise<StorageVolume[]> },
   ) {}
   /** Lifecycle baselines are taken now, synchronously, so a change during the first interval is not absorbed as startup state. */
   start() { this.teamEvents(); this.goalEvents(); this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
@@ -88,12 +94,14 @@ export class Notifier {
       this.primed = true;
     } catch {}
     const lifecycle = [...this.teamEvents(), ...this.goalEvents()];
-    if (!due.length && !lifecycle.length) return;
+    const storageDue = await this.storageEvents(Date.now());
+    if (!due.length && !lifecycle.length && !storageDue.length) return;
     const devices = this.store.list();
     if (!devices.length) return;
     const messages = [
       ...due.flatMap((row) => devices.map((d) => this.message(row, d.token))),
       ...lifecycle.flatMap((item) => devices.map((d) => this.lifecycleMessage(item, d.token))),
+      ...storageDue.flatMap((item) => devices.map((d) => this.storageMessage(item, d.token))),
     ];
     let tickets: Awaited<ReturnType<PushSender>>;
     try {
@@ -109,6 +117,47 @@ export class Notifier {
       else failures.add(ticket.details?.error ?? ticket.message ?? "error");
     });
     if (failures.size) console.warn(`push: ${[...failures].join(", ")}`);
+  }
+  private async storageEvents(now: number): Promise<StorageAlert[]> {
+    if (!this.storage || !this.enabled("host-storage") || (this.lastStorageEvaluationAt !== undefined && now - this.lastStorageEvaluationAt < 60_000)) return [];
+    this.lastStorageEvaluationAt = now;
+    let volumes: StorageVolume[];
+    try { volumes = await this.storage.sample(); } catch { return []; }
+    const due: StorageAlert[] = [];
+    for (const volume of volumes) {
+      if (![volume.fullness, volume.availableInodes, volume.availableBytes].every(Number.isFinite)) continue;
+      const fullnessBy = volume.fullnessBy ?? "inodes";
+      const previous = this.storageStatus.get(volume.label);
+      if (!previous) {
+        // Tell the owner once at startup when a volume is already high; choose its current severity and do not emit both crossings.
+        const critical = volume.fullness >= 0.95;
+        if (critical || volume.fullness >= 0.85) due.push({ ...volume, fullnessBy, critical });
+        this.storageStatus.set(volume.label, { previous: volume.fullness, warningArmed: volume.fullness < 0.85, criticalArmed: volume.fullness < 0.95 });
+        continue;
+      }
+      let { warningArmed, criticalArmed } = previous;
+      if (volume.fullness < 0.80) { warningArmed = true; criticalArmed = true; }
+      else {
+        if (warningArmed && previous.previous < 0.85 && volume.fullness >= 0.85) {
+          due.push({ ...volume, fullnessBy, critical: false }); warningArmed = false;
+        }
+        if (criticalArmed && previous.previous < 0.95 && volume.fullness >= 0.95) {
+          due.push({ ...volume, fullnessBy, critical: true }); criticalArmed = false;
+        }
+      }
+      this.storageStatus.set(volume.label, { previous: volume.fullness, warningArmed, criticalArmed });
+    }
+    return due;
+  }
+  private storageMessage(item: StorageAlert, to: string) {
+    const count = (value: number) => value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M` : value >= 1_000 ? `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}K` : String(Math.round(value));
+    const gigabytes = (value: number) => `${(value / 1024 ** 3).toFixed(0)} GB`;
+    return {
+      to, title: item.critical ? "Host storage critical" : "Host storage low",
+      body: `${item.label} volume is ${Math.round(item.fullness * 100)}% full by ${item.fullnessBy}; ${count(item.availableInodes)} inodes and ${gigabytes(item.availableBytes)} free. New runs stop at the floor.`,
+      data: { url: "/machine", ...(this.options.machineId ? { machineId: this.options.machineId } : {}) },
+      channelId: "attention" as const, priority: item.critical ? "high" as const : "default" as const, collapseId: `storage:${item.label}`,
+    };
   }
   /** A team member's open permission prompt is the owner's unless its run can still decide it. Everything else is always the owner's. */
   private promptOwner(row: Row): PromptOwner {

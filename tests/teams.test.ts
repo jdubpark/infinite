@@ -1890,6 +1890,38 @@ test("permission coordinator prompt reviews complete command evidence within the
   assert.ok(prompt.includes(evidence));
 });
 
+test("diagnostic evidence requests produce fresh immutable snapshots, then queue bounded PM correction", { timeout: 120000 }, async () => {
+  const lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude" as const,
+    model: "claude-opus-5-5", effort: "xhigh" as const, tier: "strong" as const } };
+  const f = await fixture("permissions-codex-diagnostic-evidence", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const run = await waitFor(() => f.get(created.body.id), current => (current.permissionDecisions?.length ?? 0) >= 3 &&
+      current.permissionRecovery?.outcomes.some(outcome => outcome.status === "exhausted") === true &&
+      current.recovery?.source.code === "permission-recovery", 60000);
+    const [initial, firstRefresh, secondRefresh] = run.permissionDecisions!;
+    assert.equal(run.permissionDecisions!.length, 3);
+    assert.ok([initial, firstRefresh, secondRefresh].every(decision => decision.purpose === "diagnose" && decision.option === -1 && decision.status === "escalated"));
+    assert.deepEqual(new Set(run.permissionDecisions!.map(decision => `${decision.promptId}:${decision.promptHash}`)).size, 1,
+      "evidence refreshes retain the exact unrecognized prompt identity");
+    assert.equal(new Set(run.permissionDecisions!.map(decision => decision.workspaceEvidenceHash)).size, 3,
+      "each evidence refresh launches a distinct complete snapshot review");
+    assert.deepEqual(firstRefresh.requestedPaths, ["a.txt"]);
+    assert.deepEqual(secondRefresh.requestedPaths, ["a.txt", "original.txt"]);
+    assert.equal(initial.recoveryRequestId, firstRefresh.recoveryRequestId, "fresh reports remain attached to the same bounded request");
+    assert.equal(initial.requestedPaths, undefined, "the original report keeps its original evidence request identity");
+    assert.equal(firstRefresh.recoveryRequestId, secondRefresh.recoveryRequestId);
+    assert.equal(run.recovery?.source.memberId, secondRefresh.coordinatorMemberId, "PM correction cites the actual reporting coordinator");
+    const outcome = run.permissionRecovery?.outcomes.at(-1);
+    assert.equal(outcome?.status, "exhausted");
+    assert.equal(outcome?.execution, "unknown");
+    assert.equal(outcome?.action, "project-manager-correction");
+    assert.ok(run.permissionDecisions!.every(decision => !decision.receipt), "a diagnostic conclusion never sends a provider answer");
+    assert.equal(existsSync(join(f.receipts, `${run.id}.permission-answer`)), false);
+  } finally { await f.close(); }
+});
+
 test("Codex sandbox guidance covers members but excludes the permission coordinator", () => {
   const run = { provider: "codex", revision: 1, objective: "Run task checks", projectId: "project", permissions: { mode: "coordinator", scope: "Pinned scope" }, steering: [], tasks: [], checks: [] } as unknown as TeamRun;
   const member = teamPrompt(run, "implementer", undefined, undefined, "codex", limitLineup.implementers[1]);
@@ -2689,6 +2721,8 @@ test("a run revision change stops its prior reviewer and assigns a fresh reviewe
     const stored = scheduler.record(f.run.id) as { run: TeamRun };
     stored.run.revision = 2;
     stored.run.members[0].revision = 2;
+    const target = stored.run.members[0];
+    (f.manager as any).meta = () => ({ session: { cwd: target.cwd, team: { runId: f.run.id, memberId: target.memberId, revision: 2, role: target.role } } });
     f.state.attention.prompt = prompt(2, "npm run build");
     await scheduler.step(stored);
     await waitFor(async () => teams.get(f.run.id), run => run.members.some(member => member.role === "permission-coordinator" && member.revision === 2 && member.memberId !== prior.memberId));

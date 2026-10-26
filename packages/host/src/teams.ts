@@ -489,6 +489,7 @@ export class TeamService {
   list(): TeamView[] { return [...this.records.values()].map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   /** Persisted team records for the read-only Understanding view; performs no tracker or usage refresh. */
   understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.run)); }
+  pendingOperation(runId: string): boolean { return Boolean(this.records.get(runId)?.pending); }
   understandingOwnsSession(runId: string, memberId: string, sessionId: string, projectId: string): boolean {
     const stored = this.records.get(runId);
     return Boolean(stored && stored.run.projectId === projectId && stored.run.members.some(member =>

@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
-import type { KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeMaintenance, KnowledgePlan, KnowledgeRelationship, KnowledgeSource, WorkspaceKnowledge } from "@infinite/remote";
+import type { Diagram, KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeMaintenance, KnowledgePlan, KnowledgeRelationship, KnowledgeSource, UnderstandingBrief, WorkspaceKnowledge } from "@infinite/remote";
 import type { Config } from "./types.js";
 import type { ProjectGroup, ProjectGroupList, ProjectGroupRepo } from "./project-group-types.js";
 import { captureIdentity, readGit } from "./checkout-identity.js";
@@ -47,6 +47,8 @@ export interface UnderstandingAdapter {
   context?(root: string, options: UnderstandingAdapterOptions): Promise<RepoContext>;
   synthesize?(input: UnderstandingSynthesisInput, options: UnderstandingAdapterOptions): Promise<{ components: KnowledgeComponent[]; coverage: string[] }>;
   delivery?(input: { workspaceId: string; root: string; repositoryId: string; head: string | null }, options: UnderstandingAdapterOptions): Promise<KnowledgeDelivery>;
+  /** Writes one work narrative for a recorded range; only an explicit refresh calls it. */
+  explainWork?(input: { root: string; baseCommit: string; question: string }, options: UnderstandingAdapterOptions): Promise<{ brief: UnderstandingBrief; diagrams: Diagram[]; engine: string; model: string; generatedAt: string }>;
 }
 export function createContextAdapter(config: Config): UnderstandingAdapter {
   return config.repositoryBriefings ? { context: (root, options) => runRepositoryContext(config, root, options) } : {};
@@ -627,7 +629,7 @@ export class UnderstandingRuntime {
   }
 }
 
-function runRepositoryContext(config: Config, root: string, options: UnderstandingAdapterOptions, onChild: (child: ChildProcess) => void = () => {}, onDone: (child: ChildProcess) => void = () => {}, stop: (child: ChildProcess) => void = stopContextChild): Promise<RepoContext> {
+export function runRepositoryContext(config: Config, root: string, options: UnderstandingAdapterOptions, onChild: (child: ChildProcess) => void = () => {}, onDone: (child: ChildProcess) => void = () => {}, stop: (child: ChildProcess) => void = stopContextChild): Promise<RepoContext> {
   const briefing = config.repositoryBriefings;
   if (!briefing) return Promise.reject(new Error("repository-briefings-unavailable"));
   const commandArgs = [...briefing.args, "context", "--repo", root];

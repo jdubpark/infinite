@@ -8,11 +8,13 @@ import {
 export type {
   WorkspaceUnderstanding, UnderstandingRepository, UnderstandingWork, UnderstandingWorkKind,
   UnderstandingPlan, UnderstandingArtifact, UnderstandingBrief, UnderstandingClaim,
-  UnderstandingCitation, UnderstandingLink,
+  UnderstandingCitation, UnderstandingLink, GeneratedPlan, GeneratedProject, GeneratedCatalogPage,
 } from "./understanding.js";
 export type * from "./understanding-knowledge.js";
+export type * from "./understanding-diagrams.js";
 export type * from "./understanding-behavior.js";
 export * from "./memory.js";
+export * from "./diagram-layout.js";
 
 /** A Cloudflare Access service token; Cloudflare checks it before the connection reaches the relay. */
 export interface RemoteAccessToken { clientId: string; clientSecret: string }

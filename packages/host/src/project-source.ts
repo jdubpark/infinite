@@ -61,6 +61,8 @@ export interface ProjectSourceOptions {
   /** Whether a cloud session is running or starting in the project directory. Teams, goals and handoffs do not count. */
   running: (projectId: string) => Promise<boolean>;
   prefix?: TeamCommand;
+  /** Called after a refresh moved the project working tree to a new HEAD. */
+  onApplied?: (projectId: string, head: string) => void;
 }
 
 export class ProjectSourceError extends Error {
@@ -254,6 +256,7 @@ export class ProjectSourceService {
     if (await this.isRunning(projectId)) return this.savePending(projectId, status, { reason: "session-running" }, source);
 
     this.changing.add(projectId);
+    let moved = false;
     try {
       if (await this.isRunning(projectId)) return this.savePending(projectId, status, { reason: "session-running" }, source);
       if (!this.sourceMatches(projectId, source)) return this.status(projectId);
@@ -295,12 +298,14 @@ export class ProjectSourceService {
       await this.git(project.path, ["checkout", "--detach", fetchedHead], options?.signal);
       const applied: ProjectSourceStatus = { ...withoutPending(status), appliedHead: fetchedHead, appliedAt: new Date().toISOString() };
       this.writeStatus(projectId, applied, source);
+      moved = treeHead !== fetchedHead;
       return applied;
     } catch (error) {
       const failure = syncFailure(error, project.path);
       return this.savePending(projectId, status, { reason: "apply-failed", ...failure }, source);
     } finally {
       this.changing.delete(projectId);
+      if (moved) try { this.options.onApplied?.(projectId, fetchedHead); } catch { /* A listener failure must not fail the refresh. */ }
     }
   }
   /** True only while the working tree is being fast-forwarded; new sessions in the project wait for it. */

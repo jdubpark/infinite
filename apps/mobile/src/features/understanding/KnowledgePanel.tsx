@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, Alert, Linking, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import * as Crypto from "expo-crypto";
-import type { KnowledgeBehavior, KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeFeature, KnowledgeFeatureInput, KnowledgeMaintenance, KnowledgePlan, KnowledgePlanInput, KnowledgePolicy, KnowledgeProject, KnowledgeProjectInput, KnowledgeRelationship, UnderstandingRepository, UnderstandingWork, WorkspaceKnowledge } from "@infinite/remote";
+import type { GeneratedCatalogPage, GeneratedPlan, GeneratedProject, KnowledgeBehavior, KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeFeature, KnowledgeFeatureInput, KnowledgeMaintenance, KnowledgePlan, KnowledgePlanInput, KnowledgePolicy, KnowledgeProject, KnowledgeProjectInput, KnowledgeRelationship, UnderstandingRepository, UnderstandingWork, WorkspaceKnowledge } from "@infinite/remote";
 import { useRouter } from "expo-router";
 import { ApiError, api, connectionKey, type Connection, type Me } from "../../api/client";
 import { Button } from "../../components/Button";
@@ -15,6 +15,7 @@ type CatalogTab = "projects" | "features" | "plans";
 type Mutation = { collection: string; id?: string; requestId: string; revision: number; action: "create" | "update" | "archive"; value?: unknown };
 type ComponentsIndex = { components: Pick<KnowledgeComponent, "id" | "name" | "description" | "repositoryIds" | "pinned" | "retired" | "redirectTo">[]; coverage: string[] };
 type ComponentDetail = { component: KnowledgeComponent; relationships: KnowledgeRelationship[]; coverage: string[]; behaviors?: KnowledgeBehavior[] };
+type GeneratedFromWork = Pick<GeneratedCatalogPage, "projects" | "plans" | "coverage"> & { note?: string };
 type ComponentDisclosureState = { expanded: Record<string, boolean>; toggle: (id: string) => void };
 
 const areas: SegmentOption<Area>[] = [
@@ -25,12 +26,14 @@ const areas: SegmentOption<Area>[] = [
 ];
 
 /** Catalog editing and live component knowledge for the selected workspace. */
-export function KnowledgePanel({ connection, workspaceId, knowledge, readGeneration, defaultArea, repositories, work, offline, onComponentNavigate }: { connection: Connection; workspaceId: string; knowledge?: WorkspaceKnowledge; readGeneration: string; defaultArea: Area; repositories: UnderstandingRepository[]; work: UnderstandingWork[]; offline: boolean; onComponentNavigate?: () => void }) {
+export function KnowledgePanel({ connection, workspaceId, knowledge, readGeneration, defaultArea, openComponentId, openComponentNonce, repositories, work, offline, onComponentNavigate }: { connection: Connection; workspaceId: string; knowledge?: WorkspaceKnowledge; readGeneration: string; defaultArea: Area; openComponentId?: string; openComponentNonce?: number; repositories: UnderstandingRepository[]; work: UnderstandingWork[]; offline: boolean; onComponentNavigate?: () => void }) {
   const router = useRouter();
   const [area, setArea] = useState<Area>(defaultArea);
   const [catalog, setCatalog] = useState<KnowledgeCatalog | null>(knowledge?.catalog ?? null);
   const [maintenance, setMaintenance] = useState<KnowledgeMaintenance | null>(knowledge?.maintenance ?? null);
   const [index, setIndex] = useState<ComponentsIndex | null>(null);
+  const [generated, setGenerated] = useState<GeneratedFromWork | null>(null);
+  const [generatedError, setGeneratedError] = useState("");
   const [detail, setDetail] = useState<ComponentDetail | null>(null);
   const [detailGeneration, setDetailGeneration] = useState("");
   const [role, setRole] = useState<Me["role"] | null>(null);
@@ -51,7 +54,7 @@ export function KnowledgePanel({ connection, workspaceId, knowledge, readGenerat
   const base = `/project-groups/${encodeURIComponent(workspaceId)}/understanding`;
   const clearDeniedState = useCallback(() => {
     invalidateReads();
-    setCatalog(null); setIndex(null); setDetail(null); setDetailGeneration(""); setMaintenance(null); setRole(null);
+    setCatalog(null); setIndex(null); setGenerated(null); setGeneratedError(""); setDetail(null); setDetailGeneration(""); setMaintenance(null); setRole(null);
     setPending(null); setConflict(false); setLatestRevision(null); setEditor(null);
     setReadError("");
     setError("This device no longer has access to workspace knowledge.");
@@ -60,14 +63,17 @@ export function KnowledgePanel({ connection, workspaceId, knowledge, readGenerat
   const refreshReads = useCallback(async () => {
     const sequence = ++readSequence.current;
     try {
-      const [nextCatalog, nextIndex, me] = await Promise.all([
+      const [nextCatalog, nextIndex, me, nextGenerated] = await Promise.all([
         api<KnowledgeCatalog>(connection, `${base}/catalog`),
         api<ComponentsIndex>(connection, `${base}/components`),
         api<Me>(connection, "/me"),
+        loadGenerated(connection, base),
       ]);
       if (sequence !== readSequence.current) return;
       setCatalog(nextCatalog);
       setIndex(nextIndex);
+      if (nextGenerated.data) { setGenerated(nextGenerated.data); setGeneratedError(""); }
+      else setGeneratedError(`From work could not be refreshed: ${nextGenerated.error}`);
       setRole(me.role);
       setReadError("");
       if (conflict) setLatestRevision(nextCatalog.revision);
@@ -184,6 +190,13 @@ export function KnowledgePanel({ connection, workspaceId, knowledge, readGenerat
     pendingComponentNavigation.current = id && (id !== selectedComponent || area !== "components") ? id : null;
     setSelectedComponent(id); setArea("components"); onComponentNavigate?.();
   };
+  useEffect(() => {
+    if (!openComponentId) return;
+    let current = true;
+    void Promise.resolve().then(() => { if (current) navigateComponent(openComponentId); });
+    return () => { current = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- run once per request; the nonce makes repeat taps of one component new requests.
+  }, [openComponentId, openComponentNonce]);
   const componentDetailDidLayout = (id: string) => {
     if (pendingComponentNavigation.current !== id) return;
     pendingComponentNavigation.current = null;
@@ -195,9 +208,9 @@ export function KnowledgePanel({ connection, workspaceId, knowledge, readGenerat
     void submit(editor.collection, action, editor.id, value, editor.baseRevision);
   };
   const catalogOptions: SegmentOption<CatalogTab>[] = [
-    { value: "projects", label: "Projects", count: catalog?.projects.filter(item => !item.archived).length },
+    { value: "projects", label: "Projects", count: (catalog?.projects.filter(item => !item.archived).length ?? 0) + (generated?.projects.length ?? 0) },
     { value: "features", label: "Features", count: catalog?.features.filter(item => !item.archived).length },
-    { value: "plans", label: "Component plans", count: catalog?.plans.filter(item => !item.archived).length },
+    { value: "plans", label: "Component plans", count: (catalog?.plans.filter(item => !item.archived).length ?? 0) + (generated?.plans.length ?? 0) },
   ];
 
   return <View style={k.wrap}>
@@ -218,16 +231,67 @@ export function KnowledgePanel({ connection, workspaceId, knowledge, readGenerat
     {area === "catalog" ? <>
       <Text style={k.intro}>Projects, features, and component plans are owner-maintained records. Feature status is an explicit owner assessment.</Text>
       <Segmented options={catalogOptions} value={catalogTab} onChange={setCatalogTab} style={k.subtabs} />
-      {catalogTab === "projects" ? <ProjectList items={catalog?.projects ?? []} repositories={repositories} selected={selectedProject} canEdit={canEdit} onSelect={id => { setSelectedProject(id); setCatalogTab("features"); }} onCreate={() => openEditor("projects")} onEdit={item => openEditor("projects", item.id, item)} onArchive={item => confirmArchive(item.name, () => void submit("projects", "archive", item.id))} /> : null}
+      {catalogTab === "projects" ? <><GeneratedProjects note={generatedError || generated?.note} items={generated?.projects ?? []} plans={generated?.plans ?? []} repositories={repositories} /><Text style={k.heading}>Owner records</Text><ProjectList items={catalog?.projects ?? []} repositories={repositories} selected={selectedProject} canEdit={canEdit} onSelect={id => { setSelectedProject(id); setCatalogTab("features"); }} onCreate={() => openEditor("projects")} onEdit={item => openEditor("projects", item.id, item)} onArchive={item => confirmArchive(item.name, () => void submit("projects", "archive", item.id))} /></> : null}
       {catalogTab === "features" ? <FeatureList items={catalog?.features ?? []} catalog={catalog} work={work} components={index?.components ?? []} projectId={selectedProject} onClearProject={() => setSelectedProject("")} onOpenComponent={navigateComponent} canEdit={canEdit} onOpenWork={item => router.push({ pathname: item.kind === "mission" ? "/mission/[id]" : item.kind === "team" ? "/team/[id]" : "/goal/[id]", params: { id: item.sourceId, machine: connectionKey(connection) } })} onCreate={() => openEditor("features")} onEdit={item => openEditor("features", item.id, item)} onArchive={item => confirmArchive(item.title, () => void submit("features", "archive", item.id))} /> : null}
-      {catalogTab === "plans" ? <PlanList items={catalog?.plans ?? []} canEdit={canEdit} onCreate={() => openEditor("plans")} onEdit={item => openEditor("plans", item.id, item)} onArchive={item => confirmArchive(item.title, () => void submit("plans", "archive", item.id))} /> : null}
-      <Coverage lines={catalog?.coverage ?? []} />
+      {catalogTab === "plans" ? <><GeneratedPlans note={generatedError || generated?.note} items={generated?.plans ?? []} canEdit={canEdit} onPromote={plan => openEditor("plans", undefined, { title: plan.title, text: plan.objective, repositoryIds: plan.repositoryIds, workId: plan.workId, status: "proposed" })} /><Text style={k.heading}>Owner records</Text><PlanList items={catalog?.plans ?? []} canEdit={canEdit} onCreate={() => openEditor("plans")} onEdit={item => openEditor("plans", item.id, item)} onArchive={item => confirmArchive(item.title, () => void submit("plans", "archive", item.id))} /></> : null}
+      <Coverage lines={[...(catalog?.coverage ?? []), ...(generated?.coverage ?? [])]} />
     </> : null}
     {area === "components" ? <ComponentArea index={index} detail={visibleDetail} selected={selectedComponent} onSelect={navigateComponent} onDetailLayout={componentDetailDidLayout} onRefresh={refreshReads} canEdit={canEdit} onAccessDenied={clearDeniedState} connection={connection} workspaceId={workspaceId} onEdit={item => openEditor("components", item.id, item)} /> : null}
     {area === "delivery" ? <DeliveryArea delivery={knowledge?.delivery ?? []} /> : null}
-    {area === "maintenance" ? <MaintenanceArea knowledge={knowledge} maintenance={maintenance} catalog={catalog} canEdit={canEdit} owner={owner} busy={busy} onRefresh={refreshSources} onEditPolicy={() => openEditor("policy", undefined, catalog?.policy)} /> : null}
+    {area === "maintenance" ? <MaintenanceArea knowledge={knowledge} maintenance={maintenance} catalog={catalog} canEdit={canEdit} owner={owner} busy={busy} onRefresh={refreshSources} onToggleUpdates={policy => void submit("policy", "update", undefined, { enabled: !policy.enabled, synthesis: policy.synthesis, delivery: policy.delivery, intervalMinutes: policy.intervalMinutes, dailyJobLimit: policy.dailyJobLimit } satisfies Pick<KnowledgePolicy, "enabled" | "synthesis" | "delivery" | "intervalMinutes" | "dailyJobLimit">)} onEditPolicy={() => openEditor("policy", undefined, catalog?.policy)} /> : null}
     {editor ? <CatalogEditor key={`${editor.collection}/${editor.id ?? "new"}`} collection={editor.collection} id={editor.id} initial={editor.value} catalog={catalog} repositories={repositories} components={index?.components ?? []} work={work} onCancel={() => setEditor(null)} onSave={submitEditor} busy={busy} locked={Boolean(pending)} /> : null}
     {!catalog && !error && !readError ? <ActivityIndicator color={theme.colors.forest} style={{ marginTop: 16 }} /> : null}
+  </View>;
+}
+
+/** Follows cursors; keeps pages already loaded when a later page fails or the page cap is hit. Auth errors throw. */
+async function loadGenerated(connection: Connection, base: string): Promise<{ data: GeneratedFromWork; error?: undefined } | { data: null; error: string }> {
+  const found: GeneratedFromWork = { projects: [], plans: [], coverage: [] };
+  let cursor: string | null = null;
+  for (let page = 0; page < 50; page++) {
+    try {
+      const result: GeneratedCatalogPage = await api<GeneratedCatalogPage>(connection, `${base}/generated${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`);
+      found.projects.push(...result.projects); found.plans.push(...result.plans);
+      found.coverage = [...new Set([...found.coverage, ...result.coverage])];
+      cursor = result.next;
+    } catch (cause) {
+      if (cause instanceof ApiError && [401, 403].includes(cause.status)) throw cause;
+      if (page === 0) return { data: null, error: cause instanceof Error ? cause.message : "unavailable" };
+      found.note = "Some plans could not be loaded.";
+      return { data: found };
+    }
+    if (!cursor) return { data: found };
+  }
+  found.note = "Showing the first 50 pages of plans.";
+  return { data: found };
+}
+
+function GeneratedProjects({ note, items, plans, repositories }: { note?: string; items: GeneratedProject[]; plans: GeneratedPlan[]; repositories: UnderstandingRepository[] }) {
+  return <View style={k.stack}>
+    <Text style={k.heading}>From work · {items.length}</Text>
+    {note ? <Text style={k.note}>{note}</Text> : null}
+    {items.map(item => <View key={item.id} style={k.card}>
+      <Text style={k.title}>{item.name}</Text>
+      <Text style={k.meta}>Repositories: {item.repositoryIds.length ? item.repositoryIds.map(id => repositories.find(repo => repo.id === id)?.name ?? id).join(", ") : "none"}</Text>
+      <Text style={k.meta}>{item.planIds.length} {item.planIds.length === 1 ? "plan" : "plans"} from work{item.planIds.length ? `: ${item.planIds.map(id => plans.find(plan => plan.id === id)?.title ?? id).join(", ")}` : ""}</Text>
+    </View>)}
+    {!items.length ? <Text style={k.note}>No projects have been found from work yet.</Text> : null}
+  </View>;
+}
+
+function GeneratedPlans({ note, items, canEdit, onPromote }: { note?: string; items: GeneratedPlan[]; canEdit: boolean; onPromote: (item: GeneratedPlan) => void }) {
+  return <View style={k.stack}>
+    <Text style={k.heading}>From work · {items.length}</Text>
+    {note ? <Text style={k.note}>{note}</Text> : null}
+    {items.map(item => <View key={item.id} style={k.card}>
+      <Text style={k.title}>{item.title}</Text>
+      <Text style={k.meta}>{item.kind} · {item.status}</Text>
+      {item.objective ? <Text selectable style={k.body}>{item.objective.length > 200 ? `${item.objective.slice(0, 200)}…` : item.objective}</Text> : null}
+      {item.links.map((link, i) => <SafeLink key={`${link.kind}/${i}`} label={`${link.kind === "pr" ? "Pull request" : "Issue"} · ${link.label}`} url={link.url} />)}
+      <Text style={k.note}>Planned vs current: not compared; promote this plan to an owner record to compare it.</Text>
+      <View style={k.actions}><Button compact secondary title="Promote to owner record" disabled={!canEdit} onPress={() => onPromote(item)} /></View>
+    </View>)}
+    {!items.length ? <Text style={k.note}>No plans have been found from work yet.</Text> : null}
   </View>;
 }
 
@@ -308,7 +372,7 @@ function ComponentArea({ index, detail, selected, onSelect, onDetailLayout, onRe
       <View style={{ flex: 1, gap: 4 }}><Text style={k.title}>{item.name || "Component"}{item.pinned ? " · Pinned" : ""}{item.retired ? " · Retired" : ""}</Text>{componentDescription(item.description) ? <Text numberOfLines={2} style={k.meta}>{componentDescription(item.description)}</Text> : null}<Text style={k.meta}>{item.repositoryIds.length} {item.repositoryIds.length === 1 ? "repository" : "repositories"}</Text></View>
       <Text style={k.selectMark}>Open</Text>
     </Pressable>)}
-    {!entries.length ? <Text style={k.note}>No components are mapped yet. Refresh sources to request a new observation.</Text> : null}
+    {!entries.length ? <Text style={k.note}>No components are mapped yet. Use Refresh now in Maintenance to request a new observation.</Text> : null}
     {index?.coverage.length ? <KnowledgeDisclosure title="Source coverage"><Coverage lines={index.coverage} /></KnowledgeDisclosure> : null}
   </View>;
 }
@@ -335,7 +399,7 @@ function ComponentDetailView({ detail, components, disclosureState, canEdit, onA
     </View>
     <BehaviorPanel key={`${component.id}:${(detail.behaviors ?? []).map(item => `${item.id}:${item.revision}`).join("|")}`} connection={connection} workspaceId={workspaceId} componentId={component.id} currentSourceSnapshotId={component.current.snapshotId} currentSourceState={component.current.state} behaviors={detail.behaviors} canRun={canEdit} onAccessDenied={onAccessDenied} />
     <View style={k.group}>
-      <Text style={k.sectionTitle}>Difference · {component.difference.state}</Text>
+      <Text style={k.sectionTitle}>Planned vs current · {component.difference.state}</Text>
       <Text selectable style={k.body}>{component.difference.summary}</Text>
       <Text style={k.meta}>Compared {component.difference.planRevisions.length} {component.difference.planRevisions.length === 1 ? "plan" : "plans"} · generated {date(component.difference.generatedAt ?? "")}</Text>
     </View>
@@ -366,19 +430,19 @@ function ComponentDetailView({ detail, components, disclosureState, canEdit, onA
       {component.current.claims.map((claim, i) => <EvidenceClaim key={`current-${i}`} title={`Current · ${claim.basis}`} text={claim.text} evidence={claim.evidence} />)}
       {component.current.brief ? <View style={k.group}>{component.current.brief.summary !== component.current.summary ? <Text selectable style={k.body}>{component.current.brief.summary}</Text> : null}{component.current.brief.changes.map((claim, i) => <EvidenceClaim key={`change-${i}`} title="Reported change" text={claim.text} evidence={claim.citations.map(c => ({ repositoryId: "", source: c.source, line: c.line, text: undefined }))} />)}{component.current.brief.unknowns.map((line, i) => <Text key={i} style={k.note}>Gap · {line}</Text>)}</View> : null}
     </KnowledgeDisclosure> : null}
-    {component.difference.claims.length ? <KnowledgeDisclosure state={disclosureState} title="Comparison evidence">{component.difference.claims.map((claim, i) => <EvidenceClaim key={`difference-${i}`} title={`Difference · ${claim.basis}`} text={claim.text} evidence={claim.evidence} />)}</KnowledgeDisclosure> : null}
+    {component.difference.claims.length ? <KnowledgeDisclosure state={disclosureState} title="Comparison evidence">{component.difference.claims.map((claim, i) => <EvidenceClaim key={`difference-${i}`} title={`Planned vs current · ${claim.basis}`} text={claim.text} evidence={claim.evidence} />)}</KnowledgeDisclosure> : null}
     <KnowledgeDisclosure state={disclosureState} disclosureId="files" title={`Observed files · ${component.files.length}`}>
       {component.files.length ? component.files.map((file, i) => <Text selectable key={i} style={k.evidence}>{file.repositoryId} / {file.path} · {file.lines} lines · fingerprint {file.hash}</Text>) : <Text style={k.note}>No file inventory was recorded.</Text>}
     </KnowledgeDisclosure>
     <KnowledgeDisclosure state={disclosureState} title="Source details">
       <Text selectable style={k.evidence}>Component ID · {component.id}</Text>
-      <Text selectable style={k.evidence}>Current snapshot · {component.current.snapshotId || "not recorded"}</Text>
+      <Text selectable style={k.evidence}>Current record · {component.current.snapshotId || "not recorded"}</Text>
       {component.current.sources.map((source, i) => <Text selectable key={i} style={k.evidence}>{source.repositoryId} · revision {source.head || "unavailable"} · fingerprint {source.fingerprint} · observed {date(source.observedAt)}</Text>)}
       {component.paths.map((path, i) => <Text selectable key={`path-${i}`} style={k.evidence}>Source path · {path.repositoryId} / {path.path}</Text>)}
-      <Text selectable style={k.evidence}>Compared snapshot · {component.difference.snapshotId || "not recorded"}</Text>
+      <Text selectable style={k.evidence}>Compared record · {component.difference.snapshotId || "not recorded"}</Text>
       <Text selectable style={k.evidence}>Compared plan revisions · {component.difference.planRevisions.map(plan => `${plan.id} r${plan.revision}`).join(", ") || "none"}</Text>
     </KnowledgeDisclosure>
-    {component.history.length ? <KnowledgeDisclosure state={disclosureState} disclosureId="history" title={`History · ${component.history.length}`}>{component.history.map((item, i) => <View key={i} style={k.group}><Text style={k.meta}>{date(item.at)}</Text><Text selectable style={k.body}>{item.summary}</Text><Text selectable style={k.evidence}>Snapshot · {item.snapshotId}</Text></View>)}</KnowledgeDisclosure> : null}
+    {component.history.length ? <KnowledgeDisclosure state={disclosureState} disclosureId="history" title={`History · ${component.history.length}`}>{component.history.map((item, i) => <View key={i} style={k.group}><Text style={k.meta}>{date(item.at)}</Text><Text selectable style={k.body}>{item.summary}</Text><Text selectable style={k.evidence}>Record · {item.snapshotId}</Text></View>)}</KnowledgeDisclosure> : null}
     {coverage.length ? <KnowledgeDisclosure state={disclosureState} title="Source coverage"><Coverage lines={coverage} /></KnowledgeDisclosure> : null}
   </View>;
 }
@@ -400,38 +464,63 @@ function componentDescription(description: string) {
 
 function DeliveryArea({ delivery }: { delivery: KnowledgeDelivery[] }) {
   return <View style={k.stack}>
-    <Text style={k.intro}>Pull requests and provider environments are separate observations. A merged change does not prove deployment.</Text>
+    <Text style={k.intro}>How a change reaches users, as observed on GitHub. A merged pull request is not a deployment; environment status is what GitHub reported.</Text>
     {!delivery.length ? <Text style={k.note}>Delivery data is unavailable for this host or workspace.</Text> : null}
     {delivery.map((item, i) => <View key={`${item.repositoryId}/${i}`} style={k.card}>
-      <Text style={k.title}>{item.repositoryId} · {item.state}</Text><Text style={k.meta}>Observed {date(item.observedAt ?? "")}</Text>
-      {item.pullRequests.map(pr => <View key={`${pr.repositoryId}/${pr.number}`} style={k.plan}><SafeLink label={`PR #${pr.number} · ${pr.title} · ${pr.state}`} url={pr.url} /><Text style={k.meta}>Head {pr.head || "not recorded"} · observed {date(pr.observedAt)}</Text>{pr.checks.map((check, j) => <View key={j} style={k.edge}><Text style={k.label}>{check.name} · {check.status}{check.conclusion ? ` · ${check.conclusion}` : ""}</Text>{check.url ? <SafeLink label="Open check" url={check.url} /> : null}</View>)}</View>)}
-      {item.environments.map((env, j) => <View key={`${env.environment}/${j}`} style={k.plan}><Text style={k.label}>Provider environment · {env.environment}</Text><Text style={k.meta}>Status {env.status} · revision {env.revision} · observed {date(env.observedAt)}</Text>{env.url ? <SafeLink label="Open environment" url={env.url} /> : null}</View>)}
-      {!item.pullRequests.length && !item.environments.length ? <Text style={k.note}>No provider observations are available.</Text> : null}<Coverage lines={item.coverage} />
+      <Text style={k.title}>{item.repositoryId}</Text>
+      {item.state === "unavailable" ? <>
+        <Text style={k.body}>No delivery observations yet.</Text>
+        <Coverage lines={item.coverage.slice(0, 1)} />
+      </> : <>
+        {/* Counts the host's observed pull request list (newest 20 by state); no extra time window is applied to "recently". */}
+        <Text style={k.body}>Open pull requests {item.pullRequests.filter(pr => pr.state === "open").length} · merged recently {item.pullRequests.filter(pr => pr.state === "merged").length}</Text>
+        <Text style={k.meta}>Observed {date(item.observedAt ?? "")}</Text>
+        {item.pullRequests.map(pr => <View key={`${pr.repositoryId}/${pr.number}`} style={k.plan}><SafeLink label={`#${pr.number} ${pr.title} · ${pr.state} · checks ${pr.checks.filter(check => check.conclusion === "success").length}/${pr.checks.length}`} url={pr.url} />{pr.checks.map((check, j) => <View key={j} style={k.edge}><Text style={k.label}>{check.name} · {check.status}{check.conclusion ? ` · ${check.conclusion}` : ""}</Text>{check.url ? <SafeLink label="Open check" url={check.url} /> : null}</View>)}</View>)}
+        {item.environments.map((env, j) => <View key={`${env.environment}/${j}`} style={k.plan}><Text style={k.label}>{env.environment}: {env.status} at {env.revision.slice(0, 7)}</Text>{env.url ? <SafeLink label="Open environment" url={env.url} /> : null}</View>)}
+        {!item.pullRequests.length && !item.environments.length ? <Text style={k.note}>No pull requests or environments were reported.</Text> : null}
+        <Coverage lines={item.coverage} />
+      </>}
     </View>)}
   </View>;
 }
 
-function MaintenanceArea({ knowledge, maintenance, catalog, canEdit, owner, busy, onRefresh, onEditPolicy }: { knowledge?: WorkspaceKnowledge; maintenance: KnowledgeMaintenance | null; catalog: KnowledgeCatalog | null; canEdit: boolean; owner: boolean; busy: boolean; onRefresh: () => void; onEditPolicy: () => void }) {
+function maintenanceStatus(maintenance: KnowledgeMaintenance | undefined): string {
+  if (!maintenance) return "The host did not provide maintenance details.";
+  switch (maintenance.state) {
+    case "idle": return "Up to date";
+    case "queued": return "Refresh queued";
+    case "running": return "Refreshing now";
+    case "budget-limited": return `Daily refresh limit reached (${maintenance.dailyJobLimit}). Resumes at 00:00 UTC.`;
+    case "disabled": return "Automatic updates are off for this workspace.";
+    default: return maintenance.message ?? "The host did not provide maintenance details.";
+  }
+}
+
+function MaintenanceArea({ knowledge, maintenance, catalog, canEdit, owner, busy, onRefresh, onToggleUpdates, onEditPolicy }: { knowledge?: WorkspaceKnowledge; maintenance: KnowledgeMaintenance | null; catalog: KnowledgeCatalog | null; canEdit: boolean; owner: boolean; busy: boolean; onRefresh: () => void; onToggleUpdates: (policy: KnowledgePolicy) => void; onEditPolicy: () => void }) {
   const currentMaintenance = maintenance ?? knowledge?.maintenance;
   const policy = catalog?.policy;
   return <View style={k.stack}>
-    <Text style={k.intro}>Model work runs only under the saved owner policy and when a host writer is configured.</Text>
+    <Text style={k.intro}>Automatic updates observe the code, write the explanation, and read delivery status.</Text>
     <View style={k.card}>
       <Text style={k.title}>Saved policy</Text>
       {policy ? <>
-        <Text style={k.body}>Knowledge {policy.enabled ? "enabled" : "disabled"} · synthesis {policy.synthesis ? "enabled" : "disabled"} · delivery {policy.delivery ? "enabled" : "disabled"}</Text>
-        <Text style={k.meta}>Interval {policy.intervalMinutes} minutes · daily job limit {policy.dailyJobLimit}</Text>
+        <Text style={k.body}>Automatic updates {policy.enabled ? "on" : "off"} · explanations {policy.synthesis ? "on" : "off"} · delivery status {policy.delivery ? "on" : "off"}</Text>
+        <Text style={k.meta}>Every {policy.intervalMinutes} minutes · up to {policy.dailyJobLimit} refreshes a day</Text>
+        {policy.editedAt ? <Text style={k.meta}>Edited {date(policy.editedAt)}{policy.editedBy === "owner" ? " by an owner" : policy.editedBy === "migration" ? " by a migration" : ""}</Text> : null}
       </> : <Text style={k.note}>Policy is unavailable.</Text>}
-      <Button compact title="Edit saved policy" disabled={!canEdit} onPress={onEditPolicy} />
+      {policy ? <Pressable disabled={!canEdit} accessibilityRole="switch" accessibilityLabel="Automatic updates" accessibilityState={{ checked: policy.enabled, disabled: !canEdit }} onPress={() => onToggleUpdates(policy)} style={k.toggle}><Text style={k.toggleCheck}>{policy.enabled ? "✓" : "○"}</Text><Text style={k.body}>Automatic updates</Text></Pressable> : null}
+      <Button compact secondary title="Edit saved policy" disabled={!canEdit} onPress={onEditPolicy} />
       {!owner ? <Text style={k.note}>{catalog ? "Only workspace owners can change policy." : "Policy is read-only until the workspace is available."}</Text> : null}
     </View>
     <View style={k.card}>
-      <Text style={k.title}>Maintenance status · {currentMaintenance?.state ?? "unavailable"}</Text>
-      <Text style={k.body}>{currentMaintenance?.message ?? "The host did not provide maintenance details."}</Text>
-      <Text style={k.meta}>Last observed {date(currentMaintenance?.lastObservedAt ?? "")} · last published {date(currentMaintenance?.lastPublishedAt ?? "")}</Text>
-      <Text style={k.meta}>Next attempt {date(currentMaintenance?.nextAttemptAt ?? "")} · jobs today {currentMaintenance?.jobsToday ?? 0} of {currentMaintenance?.dailyJobLimit ?? "unknown"}</Text>
-      <Button compact secondary title={busy ? "Requesting…" : "Refresh sources"} disabled={!canEdit || busy} onPress={onRefresh} />
-      {!owner ? <Text style={k.note}>Only owners can request a source refresh.</Text> : null}
+      <Text style={k.title}>Status</Text>
+      <Text style={k.body}>{maintenanceStatus(currentMaintenance)}</Text>
+      <Text style={k.meta}>Last observed {date(currentMaintenance?.lastObservedAt ?? "")} · last explained {date(currentMaintenance?.lastPublishedAt ?? "")}</Text>
+      {currentMaintenance?.nextAttemptAt ? <Text style={k.meta}>Next attempt {date(currentMaintenance.nextAttemptAt)}</Text> : null}
+      <Text style={k.meta}>Refreshes used today {currentMaintenance?.jobsToday ?? 0} of {currentMaintenance?.dailyJobLimit ?? "unknown"}</Text>
+      <Text style={k.meta}>Refreshes run {policy ? `every ${policy.intervalMinutes} minutes` : "on a schedule"}, after a merge, and when the GitHub source moves.</Text>
+      <Button compact title={busy ? "Requesting…" : "Refresh now"} disabled={!canEdit || busy} onPress={onRefresh} />
+      {!owner ? <Text style={k.note}>Only owners can request a refresh.</Text> : null}
     </View>
     <Coverage lines={knowledge?.coverage ?? []} />
   </View>;
@@ -463,7 +552,7 @@ function CatalogEditor({ collection, id, initial, catalog, repositories, compone
   return <View style={k.editor}>
     <Text style={k.sectionTitle}>{editorTitle(collection, Boolean(id))}</Text>
     {collection === "policy" ? <>
-      {toggle("enabled", "Enable Understanding maintenance")}{toggle("synthesis", "Allow model synthesis")}{toggle("delivery", "Allow delivery observations")}
+      {toggle("enabled", "Automatic updates")}{toggle("synthesis", "Write explanations with the summary writer")}{toggle("delivery", "Read pull requests and deployments")}
       {field("intervalMinutes", "Refresh interval in minutes")}{field("dailyJobLimit", "Daily job limit")}
     </> : collection === "projects" ? <>{field("name", "Project name")}{field("description", "Description", true)}{choose("repositoryIds", "Repositories · choose from this workspace", repositoryChoices)}</>
       : collection === "features" ? <>{field("title", "Feature name")}{field("description", "Description", true)}{chooseOne("projectId", "Project", [{ id: "", label: "No project" }, ...projectChoices])}{chooseOne("status", "Owner assessment", ["planned", "active", "blocked", "completed", "cancelled", "failed"].map(value => ({ id: value, label: featureStatus(value as KnowledgeFeature["status"]) })))}{choose("repositoryIds", "Repositories", repositoryChoices)}{choose("workIds", "Related work records", workChoices)}{choose("componentIds", "Related components", componentChoices)}{field("sourceUrl", "Feature source URL")}</>

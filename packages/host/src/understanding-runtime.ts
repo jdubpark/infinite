@@ -3,10 +3,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
-import type { KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeMaintenance, KnowledgePlan, KnowledgeRelationship, KnowledgeSource, WorkspaceKnowledge } from "@infinite/remote";
+import type { DiagramGraph, KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeMaintenance, KnowledgePlan, KnowledgeRelationship, KnowledgeRepositoryBrief, KnowledgeSource, UnderstandingBrief, WorkspaceKnowledge } from "@infinite/remote";
 import type { Config } from "./types.js";
 import type { ProjectGroup, ProjectGroupList, ProjectGroupRepo } from "./project-group-types.js";
 import { captureIdentity, readGit } from "./checkout-identity.js";
+import { failureReason } from "./failure-reason.js";
+import { componentGraph, diagramFromMermaid, diagramGraphSchema, linkDiagramNodes } from "./understanding-diagrams.js";
 import { seal, unseal, writeSealed } from "./vault.js";
 import { CatalogError, understandingCatalogLimits } from "./understanding-catalog.js";
 
@@ -21,9 +23,16 @@ const MAX_EDGES = 20000;
 const MAX_QUEUE = 32;
 const MAX_HISTORY = 12;
 const MAX_HOOK_COMPONENTS = 2;
+const MAX_EVIDENCE = 40;
+const MAX_EVIDENCE_TEXT = 2000;
 const MAX_PLANS_PER_COMPONENT = 100;
 const MAX_ATTEMPT_MS = 10 * 60_000;
+/** Floor of the time an attempt keeps for the final source re-check; at most a fifth of the attempt. */
+const RECHECK_RESERVE_MS = 5000;
 const STATE_SCOPE = "understanding-runtime";
+const NO_WRITER = "No summary writer is configured on this host.";
+/** Errors that mean an engine call ran out of time rather than produced a wrong answer. */
+const isDeadline = (error: unknown) => error instanceof Error && /^(?:understanding-attempt-deadline|understanding-timeout|understanding-process-timeout)(?:\s|$)/.test(error.message);
 export const understandingOutputLimits = { differenceSummary: 5000, pullRequestTitle: 2000, environment: 200, url: 2048 } as const;
 
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -43,9 +52,15 @@ export interface UnderstandingSynthesisInput {
   workspaceId: string; root: string; repositoryId: string; context: RepoContext;
   components: KnowledgeComponent[]; plans: KnowledgePlan[];
 }
+export interface RepositoryBriefOutput {
+  head: string | null; base: string | null; generatedAt: string; brief: UnderstandingBrief;
+  diagrams: { title: string; kind: "system" | "change"; mermaid: string }[];
+  evidence: { source: string; line: number; text: string }[]; coverage: string[];
+}
 export interface UnderstandingAdapter {
   context?(root: string, options: UnderstandingAdapterOptions): Promise<RepoContext>;
   synthesize?(input: UnderstandingSynthesisInput, options: UnderstandingAdapterOptions): Promise<{ components: KnowledgeComponent[]; coverage: string[] }>;
+  brief?(input: { workspaceId: string; root: string; repositoryId: string; context: RepoContext; base: string | null; components: Pick<KnowledgeComponent, "id" | "name">[] }, options: UnderstandingAdapterOptions): Promise<RepositoryBriefOutput>;
   delivery?(input: { workspaceId: string; root: string; repositoryId: string; head: string | null }, options: UnderstandingAdapterOptions): Promise<KnowledgeDelivery>;
 }
 export function createContextAdapter(config: Config): UnderstandingAdapter {
@@ -78,11 +93,18 @@ type StoredRepository = {
   context: RepoContext; components: KnowledgeComponent[]; relationships: KnowledgeRelationship[]; delivery: KnowledgeDelivery;
   synthesisCoverage: string[]; completedPlanRevisions: Record<string, string>; history: Record<string, { snapshotId: string; at: string; summary: string }[]>;
   completedSourceFingerprints: Record<string, string>;
+  brief: StoredBrief | null; briefFingerprint: string | null; briefFailure: string | null; componentDiagram: DiagramGraph | null;
 };
+type StoredBrief = Omit<KnowledgeRepositoryBrief, "state" | "repositoryId">;
 type RuntimeState = {
   version: 1; day: string; workspaces: Record<string, { jobsToday: number; failureCount: number; synthesisCursor: string | null; repositories: Record<string, StoredRepository>; maintenance: KnowledgeMaintenance; updatedAt: string | null }>;
 };
 type SourceBinding = { group: ProjectGroup; repo: ProjectGroupRepo; root: string; rootIdentity: string; membership: string; projects: string[] };
+/** One maintenance attempt's working set, shared by its steps. `hooked` repositories hold engine output that the final re-check must confirm. */
+type Attempt = {
+  workspaceId: string; group: ProjectGroup; bindings: SourceBinding[]; repos: Record<string, StoredRepository>;
+  captured: Set<string>; hooked: Set<string>; partial: string[]; reserveMs: number;
+};
 
 function emptyDelivery(repositoryId: string): KnowledgeDelivery {
   return { repositoryId, state: "unavailable", observedAt: null, pullRequests: [], environments: [], coverage: ["Provider delivery data is not configured."] };
@@ -103,6 +125,12 @@ const briefClaimSchema = z.object({ text: z.string().min(1).max(900), citations:
 const briefSchema = z.object({ summary: z.string().min(1).max(600), architecture: z.array(briefClaimSchema).max(6), changes: z.array(briefClaimSchema).max(6), checks: z.array(briefClaimSchema).max(4),
   review: z.array(z.object({ priority: z.enum(["high", "medium"]), area: z.string().max(150), why: z.string().max(900), question: z.string().max(900), citations: z.array(citationSchema).max(6) }).strict()).max(5),
   guidance: z.array(z.object({ text: z.string().max(900), basis: z.enum(["documented", "proposed"]), citations: z.array(citationSchema).max(6) }).strict()).max(4), unknowns: z.array(z.string().max(900)).max(8) }).strict();
+const storedBriefSchema = z.object({
+  head: z.string().nullable(), base: z.string().nullable(), generatedAt: z.string().datetime({ offset: true }), observedAt: z.string().datetime({ offset: true }),
+  brief: briefSchema, diagrams: z.array(diagramGraphSchema).max(2),
+  evidence: z.array(z.object({ source: z.string().max(1024), line: z.number().int().positive(), text: z.string().max(MAX_EVIDENCE_TEXT) }).strict()).max(MAX_EVIDENCE),
+  coverage: z.array(z.string().max(1000)).max(100),
+}).strict();
 const differenceSchema = z.object({ state: z.enum(["unverified", "review-needed", "aligned"]), summary: z.string().max(understandingOutputLimits.differenceSummary), claims: z.array(knowledgeClaimSchema).max(100), planRevisions: z.array(z.object({ id: z.string(), revision: z.number().int().positive() }).strict()).max(1000), snapshotId: z.string().nullable(), generatedAt: z.string().datetime({ offset: true }).nullable() }).strict();
 const deliverySchema = z.object({ repositoryId: z.string().max(80), state: z.enum(["ready", "unavailable", "failed", "stale"]), observedAt: z.string().datetime({ offset: true }).nullable(),
   pullRequests: z.array(z.object({ repositoryId: z.string(), number: z.number().int().positive(), title: z.string().max(understandingOutputLimits.pullRequestTitle), url: z.string().max(understandingOutputLimits.url), state: z.enum(["open", "closed", "merged"]), head: z.string().max(128), mergeCommit: z.string().nullable(), observedAt: z.string().datetime({ offset: true }), checks: z.array(z.object({ name: z.string().max(200), status: z.string().max(100), conclusion: z.string().max(100).nullable(), url: z.string().max(understandingOutputLimits.url).nullable() }).strict()).max(100) }).strict()).max(100),
@@ -120,12 +148,14 @@ const storedRepositorySchema = z.object({
   repositoryKey: z.string().min(1).max(500), repositoryIds: z.array(z.string()).max(64), rootIdentity: z.string().regex(/^[a-f0-9]{64}$/), observedAt: z.string().datetime({ offset: true }), fingerprint: z.string().regex(/^[a-f0-9]{64}$/), head: z.string().nullable(),
   context: repoContextSchema, components: z.array(knowledgeComponentStateSchema).max(MAX_COMPONENTS), relationships: z.array(relationshipSchema).max(MAX_EDGES), delivery: deliverySchema,
   synthesisCoverage: z.array(z.string().max(1000)).max(100), completedPlanRevisions: record, completedSourceFingerprints: record, history: z.record(z.string(), z.array(z.object({ snapshotId: z.string(), at: z.string().datetime({ offset: true }), summary: z.string().max(4000) }).strict()).max(MAX_HISTORY)),
+  brief: storedBriefSchema.nullable().default(null), briefFingerprint: z.string().nullable().default(null), briefFailure: z.string().max(400).nullable().default(null), componentDiagram: diagramGraphSchema.nullable().default(null),
+  previousHead: z.string().nullable().optional(), // Legacy key from an earlier build; accepted and ignored.
 }).strict().superRefine((value, context) => {
   for (const [key, revision] of Object.entries(value.completedPlanRevisions)) if (typeof revision !== "string") context.addIssue({ code: "custom", path: ["completedPlanRevisions", key], message: "invalid plan watermark" });
   for (const [key, fingerprint] of Object.entries(value.completedSourceFingerprints)) if (typeof fingerprint !== "string") context.addIssue({ code: "custom", path: ["completedSourceFingerprints", key], message: "invalid source watermark" });
 });
 const runtimeStateSchema = z.object({ version: z.literal(1), day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), workspaces: z.record(z.string(), z.object({
-  jobsToday: z.number().int().nonnegative().max(1_000_000), failureCount: z.number().int().nonnegative().max(20), synthesisCursor: z.string().max(400).nullable(), repositories: z.record(z.string(), storedRepositorySchema), maintenance: z.object({ state: z.enum(["disabled", "idle", "queued", "running", "failed", "budget-limited", "unavailable"]), lastObservedAt: z.string().nullable(), lastPublishedAt: z.string().nullable(), nextAttemptAt: z.string().nullable(), jobsToday: z.number().int().nonnegative(), dailyJobLimit: z.number().int().nonnegative(), message: z.string().nullable() }).strict(), updatedAt: z.string().datetime({ offset: true }).nullable(),
+  jobsToday: z.number().int().nonnegative().max(1_000_000), failureCount: z.number().int().nonnegative().max(20), synthesisCursor: z.string().max(400).nullable(), repositories: z.record(z.string(), storedRepositorySchema), maintenance: z.object({ state: z.enum(["disabled", "idle", "queued", "running", "failed", "budget-limited", "unavailable"]), lastObservedAt: z.string().nullable(), lastPublishedAt: z.string().nullable(), nextAttemptAt: z.string().nullable(), jobsToday: z.number().int().nonnegative(), dailyJobLimit: z.number().int().nonnegative(), message: z.string().nullable(), lastFailure: z.object({ at: z.string(), reason: z.string().max(400) }).strict().nullable().optional() }).strict(), updatedAt: z.string().datetime({ offset: true }).nullable(),
 }).strict()) }).strict();
 function parseRepoContext(value: unknown): RepoContext {
   const parsed = repoContextSchema.parse(value);
@@ -146,6 +176,8 @@ export class UnderstandingRuntime {
   private state: RuntimeState = { version: 1, day: new Date().toISOString().slice(0, 10), workspaces: {} };
   private queue: string[] = [];
   private queued = new Set<string>();
+  /** Workspaces that were asked to refresh while their job was running; they run once more afterwards. */
+  private dirty = new Set<string>();
   private running = false;
   private closed = false;
   private activeDeadline = 0;
@@ -184,14 +216,25 @@ export class UnderstandingRuntime {
     });
   }
 
+  /** Queues a refresh for each enabled workspace containing the checkout after new work reached its working tree. */
+  sourceChanged(projectId: string): void {
+    let list: ReturnType<UnderstandingRuntimeOptions["groups"]["list"]>;
+    try { list = this.options.groups.list(); } catch { return; }
+    for (const group of list.groups) {
+      if (!group.repos.some(repo => repo.projectId === projectId || repo.checkouts.some(checkout => checkout.projectId === projectId))) continue;
+      try { if (this.options.catalog.read(group.id).policy.enabled) this.refresh(group.id); } catch { /* A workspace that cannot refresh now is picked up by the timer. */ }
+    }
+  }
+
   refresh(workspaceId: string): KnowledgeMaintenanceResult {
     this.group(workspaceId);
     const maintenance = this.workspace(workspaceId).maintenance;
     if (this.closed) return { ...maintenance, state: "unavailable", message: "Understanding maintenance is shutting down." };
+    if (maintenance.state === "running") this.dirty.add(workspaceId);
     if (maintenance.state === "running" || this.queued.has(workspaceId)) return { ...maintenance, state: "queued", message: "A refresh is already queued for this workspace." };
     const policy = this.options.catalog.read(workspaceId).policy;
     if (this.storageUnavailable) return { ...maintenance, state: "unavailable", message: "Encrypted maintenance state is unavailable; new work is refused until its durable watermark can be loaded." };
-    if (!this.hasConfiguredContext) return { ...maintenance, state: "unavailable", message: "Repository context collection is not configured." };
+    if (!this.hasConfiguredContext) return { ...maintenance, state: "unavailable", message: NO_WRITER };
     if (this.queue.length >= MAX_QUEUE) return { ...maintenance, state: "unavailable", message: "The bounded maintenance queue is full." };
     if (this.dailyJobs(workspaceId) >= policy.dailyJobLimit) return this.setMaintenance(workspaceId, { ...maintenance, state: "budget-limited", jobsToday: this.dailyJobs(workspaceId), dailyJobLimit: policy.dailyJobLimit, message: "The daily maintenance job limit has been reached." });
     this.queue.push(workspaceId); this.queued.add(workspaceId);
@@ -205,23 +248,29 @@ export class UnderstandingRuntime {
     try {
       const catalog = this.options.catalog.read(workspaceId);
       const saved = this.state.workspaces[workspaceId];
-      const repos = group.repos.map(repo => {
+      const entries = group.repos.map((repo): { projectId: string; stored: StoredRepository; currentHead: string | undefined } | undefined => {
         const stored = saved?.repositories[repo.projectId];
         if (!stored) return undefined;
         const binding = this.binding(repo, group);
         if (binding.rootIdentity !== stored.rootIdentity) return undefined;
         const currentHead = readGit(binding.root, ["rev-parse", "HEAD"]);
-        if (currentHead && currentHead === stored.head) return stored;
-        return { ...stored, components: stored.components.map(component => ({ ...component, current: { ...component.current, state: "stale" as const, summary: "Repository HEAD changed since this source map was observed." }, coverage: [...component.coverage, "Repository HEAD differs from the latest observed source map."] })) };
-      }).filter((value): value is StoredRepository => Boolean(value));
+        if (currentHead && currentHead === stored.head) return { projectId: repo.projectId, stored, currentHead };
+        return { projectId: repo.projectId, currentHead, stored: { ...stored, components: stored.components.map(component => ({ ...component, current: { ...component.current, state: "stale" as const, summary: "Repository HEAD changed since this source map was observed." }, coverage: [...component.coverage, "Repository HEAD differs from the latest observed source map."] })) } };
+      }).filter(value => value !== undefined);
+      const repos = entries.map(entry => entry.stored);
       const components = repos.flatMap(repo => repo.components.map(component => this.enrich(component, repo, catalog)));
       const relationships = repos.flatMap(repo => repo.relationships);
       const delivery = repos.map(repo => repo.delivery);
       const coverage = [...new Set([...catalog.coverage, ...repos.flatMap(repo => repo.context.limitations), ...repos.flatMap(repo => repo.synthesisCoverage), ...(saved?.maintenance.state === "failed" && saved.maintenance.message ? [saved.maintenance.message] : []), ...(this.storageUnavailable ? ["Encrypted runtime state could not be loaded or saved; current deterministic data may be unavailable."] : [])])].slice(0, 200);
       let maintenance = saved?.maintenance ?? emptyMaintenance(catalog.policy);
       maintenance = { ...maintenance, dailyJobLimit: catalog.policy.dailyJobLimit, jobsToday: this.dailyJobs(workspaceId) };
+      // Ticks no longer clear the limit state after midnight when nothing moved, so the read does.
+      if (maintenance.state === "budget-limited" && maintenance.jobsToday < maintenance.dailyJobLimit) maintenance = { ...maintenance, state: "idle", message: null };
+      if (!this.hasConfiguredContext) maintenance = { ...maintenance, state: "unavailable", message: NO_WRITER };
       if (this.loadFailed) maintenance = { ...maintenance, state: "unavailable", message: "Encrypted maintenance state failed validation; the host will not overwrite it or start jobs until explicit recovery." };
-      return { components, relationships, delivery, maintenance, coverage };
+      const briefs: KnowledgeRepositoryBrief[] = entries.flatMap(({ projectId, stored, currentHead }) => stored.brief ? [{ repositoryId: projectId, ...stored.brief, state: currentHead && currentHead === stored.brief.head ? "ready" as const : "stale" as const }] : []);
+      const diagrams = [...repos.flatMap(repo => repo.componentDiagram ? [repo.componentDiagram] : []), ...briefs.flatMap(brief => brief.diagrams)];
+      return { components, relationships, delivery, maintenance, coverage, briefs, diagrams };
     } catch {
       return { components: [], relationships: [], delivery: [], maintenance: { ...emptyMaintenance({ enabled: false, synthesis: false, delivery: false, intervalMinutes: 60, dailyJobLimit: 0 }), state: "unavailable", message: "Workspace sources are unavailable or changed." }, coverage: ["Workspace source or catalog could not be read safely."] };
     }
@@ -295,9 +344,23 @@ export class UnderstandingRuntime {
         const delay = this.backoff(group.id, policy.intervalMinutes * 60_000);
         const retryAt = Date.parse(state.maintenance.nextAttemptAt ?? "");
         const isBackoff = state.maintenance.state === "failed";
-        if ((!Number.isFinite(retryAt) || Date.now() >= retryAt) && (isBackoff || !Number.isFinite(last) || Date.now() - last >= delay)) this.refresh(group.id);
+        const due = (!Number.isFinite(retryAt) || Date.now() >= retryAt) && (isBackoff || !Number.isFinite(last) || Date.now() - last >= delay);
+        if (!due) continue;
+        // The limit is recorded once; later ticks leave the store alone until the day rolls over.
+        if (state.maintenance.state === "budget-limited" && this.dailyJobs(group.id) >= policy.dailyJobLimit) continue;
+        // A failed attempt retries on its backoff, as its "next attempt" time promises; an ordinary tick runs only when a repository moved.
+        if (!isBackoff && !this.sourceMoved(group, state.repositories)) continue;
+        this.refresh(group.id);
       } catch { /* A concurrently removed group is skipped until the next reconciliation. */ }
     }
+  }
+  /** True when a bound repository's HEAD differs from its stored observation or it was never observed. Reads Git only; no engine call. */
+  private sourceMoved(group: ProjectGroup, repositories: Record<string, StoredRepository>): boolean {
+    return group.repos.some(repo => {
+      const stored = repositories[repo.projectId];
+      if (!stored) return true;
+      try { return readGit(realpathSync(repo.path), ["rev-parse", "HEAD"]) !== stored.head; } catch { return true; }
+    });
   }
   private backoff(id: string, interval: number) { const attempts = this.state.workspaces[id]?.failureCount ?? 0; return Math.max(interval, Math.min(24 * 60 * 60_000, interval * (2 ** Math.min(Math.max(0, attempts - 1), 8)))); }
 
@@ -307,11 +370,11 @@ export class UnderstandingRuntime {
     try {
       while (!this.closed && this.queue.length) {
         const id = this.queue.shift()!; this.queued.delete(id);
-        const configured = this.options.config.repositoryBriefings?.timeoutMs ?? 30_000;
-        this.activeDeadline = Date.now() + Math.min(MAX_ATTEMPT_MS, Math.max(1000, configured));
+        this.activeDeadline = Date.now() + this.attemptMs();
         try { await this.runWorkspace(id); }
-        catch { this.failWorkspace(id); }
+        catch (error) { this.failWorkspace(id, error); }
         finally { this.activeDeadline = 0; }
+        if (this.dirty.delete(id) && !this.closed) this.refresh(id);
       }
     } finally { this.running = false; }
   }
@@ -333,18 +396,25 @@ export class UnderstandingRuntime {
     const repos: Record<string, StoredRepository> = structuredClone(workspaceState.repositories);
     const partial: string[] = [];
     const capturedRepositories = new Set<string>();
+    const captureStarted = Date.now();
     for (const binding of bindings) {
       if (this.closed) throw new Error("closed");
       try {
         const observation = await this.capture(workspaceId, binding, catalogAtStart);
         repos[binding.repo.projectId] = observation;
         capturedRepositories.add(binding.repo.projectId);
-      } catch { partial.push(`Repository ${binding.repo.name}: source capture unavailable or changed.`); }
+      } catch (error) { partial.push(`Repository ${binding.repo.name}: ${failureReason(error)}`); }
     }
     if (!this.membershipStillCurrent(workspaceId, groupAtStart, bindings)) throw new Error("workspace-rebound");
+    // The final re-check repeats each capture, so engine steps leave it about twice the capture time.
+    const reserveMs = Math.max(2 * (Date.now() - captureStarted), Math.min(RECHECK_RESERVE_MS, Math.floor(this.attemptMs() / 5)));
     const hookedRepos = new Set<string>();
+    const job: Attempt = { workspaceId, group: groupAtStart, bindings, repos, captured: capturedRepositories, hooked: hookedRepos, partial, reserveMs };
+    // The captured source maps without this attempt's engine output; a repository that cannot be re-checked publishes this.
+    const beforeHooks = new Map([...capturedRepositories].map(id => [id, structuredClone(repos[id])]));
     const currentPolicy = this.options.catalog.read(workspaceId).policy;
     let nextSynthesisCursor = workspaceState.synthesisCursor;
+    if (currentPolicy.synthesis && this.adapter.brief) await this.briefRepositories(job);
     if (currentPolicy.synthesis && this.adapter.synthesize) {
       const pending: { key: string; binding: SourceBinding; observation: StoredRepository; component: KnowledgeComponent; plans: KnowledgePlan[] }[] = [];
       for (const binding of bindings) {
@@ -356,7 +426,10 @@ export class UnderstandingRuntime {
       const start = pending.findIndex(item => item.key > (workspaceState.synthesisCursor ?? ""));
       const ordered = start < 0 ? pending : [...pending.slice(start), ...pending.slice(0, start)];
       const selected = ordered.slice(0, MAX_HOOK_COMPONENTS);
+      /** Key of the first component refused for lack of time; the cursor stops before it so the next job resumes there. */
+      let interrupted: string | undefined;
       for (const entry of selected) {
+        if (interrupted) break;
         const { binding, observation } = entry;
         const sameRepository = selected.filter(item => item.binding.repo.projectId === binding.repo.projectId);
         if (sameRepository[0] !== entry) continue;
@@ -373,18 +446,29 @@ export class UnderstandingRuntime {
         const output: { components: KnowledgeComponent[]; coverage: string[] } = { components: [], coverage: [] };
         for (const component of selectedComponents) {
           if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-before-synthesis");
-          const result = await this.invoke(binding.root, options => this.adapter.synthesize!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, components: [component], plans: entry.plans.filter(plan => plan.componentId === component.id) }, options));
+          let result: { components: KnowledgeComponent[]; coverage: string[] };
+          try {
+            result = await this.invoke(binding.root, options => this.adapter.synthesize!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, components: [component], plans: entry.plans.filter(plan => plan.componentId === component.id) }, options), MAX_OUTPUT_BYTES, { reserveMs });
+          } catch (error) {
+            if (this.closed || !isDeadline(error)) throw error;
+            // Out of time: keep the components already explained and publish the source map.
+            partial.push(`Repository ${binding.repo.name}: synthesis unavailable: ${failureReason(error)}`);
+            interrupted = `${binding.repo.projectId}:${component.id}`;
+            break;
+          }
           if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-after-synthesis");
           z.array(z.string().max(1000)).max(100).parse(result.coverage);
           if (result.components.length !== 1 || result.components[0].id !== component.id) throw new Error("incomplete-synthesis");
           output.components.push(...result.components);
           output.coverage = [...new Set([...output.coverage, ...result.coverage])].slice(0, 100);
         }
+        if (!output.components.length) continue;
         if (Buffer.byteLength(JSON.stringify(output)) > MAX_OUTPUT_BYTES) throw new Error("synthesis-output-too-large");
         hookedRepos.add(binding.repo.projectId);
         const returned = new Map(output.components.map(component => [component.id, component]));
         for (const component of selectedComponents) {
-          const synthesized = returned.get(component.id)!;
+          const synthesized = returned.get(component.id);
+          if (!synthesized) continue; // Refused for lack of time; it stays pending.
           const expectedPlanRevisions = component.planned.map(plan => ({ id: plan.id, revision: plan.revision })).sort((a, b) => a.id.localeCompare(b.id));
           const returnedPlanRevisions = synthesized.difference.planRevisions.map(plan => ({ id: plan.id, revision: plan.revision })).sort((a, b) => a.id.localeCompare(b.id));
           const generatedAt = synthesized.current.generatedAt ? Date.parse(synthesized.current.generatedAt) : Number.NaN;
@@ -408,12 +492,22 @@ export class UnderstandingRuntime {
       if (pending.length > selected.length) {
         for (const entry of pending) entry.observation.synthesisCoverage = [...new Set([...entry.observation.synthesisCoverage, `Synthesis is pending for additional components; this workspace refresh admits at most ${MAX_HOOK_COMPONENTS} component briefs.`])].slice(0, 100);
       }
-      if (selected.length) nextSynthesisCursor = selected.at(-1)!.key;
+      if (interrupted) {
+        const at = selected.findIndex(item => item.key === interrupted);
+        if (at > 0) nextSynthesisCursor = selected[at - 1].key;
+      } else if (selected.length) nextSynthesisCursor = selected.at(-1)!.key;
     }
     if (currentPolicy.delivery && this.adapter.delivery) {
       for (const binding of bindings) {
         const observation = repos[binding.repo.projectId]; if (!observation || !this.boundStillCurrent(workspaceId, groupAtStart, binding)) continue;
-        const value = await this.invoke(binding.root, options => this.adapter.delivery!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, head: observation.head }, options));
+        let value: KnowledgeDelivery;
+        try {
+          value = await this.invoke(binding.root, options => this.adapter.delivery!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, head: observation.head }, options), MAX_OUTPUT_BYTES, { reserveMs });
+        } catch (error) {
+          if (this.closed || !isDeadline(error)) throw error;
+          partial.push(`Repository ${binding.repo.name}: delivery unavailable: ${failureReason(error)}`);
+          continue;
+        }
         hookedRepos.add(binding.repo.projectId);
         if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-after-delivery");
         if (value.repositoryId !== binding.repo.projectId) throw new Error("delivery-repository-mismatch");
@@ -424,7 +518,18 @@ export class UnderstandingRuntime {
       if (!this.adapter.context) throw new Error("source-revalidation-unavailable");
       for (const binding of bindings.filter(item => hookedRepos.has(item.repo.projectId))) {
         const observation = repos[binding.repo.projectId]; if (!observation) continue;
-        const fresh = parseRepoContext(await this.invoke(binding.root, options => this.adapter.context!(binding.root, options), MAX_CONTEXT_BYTES));
+        let fresh: RepoContext;
+        try {
+          fresh = parseRepoContext(await this.invoke(binding.root, options => this.adapter.context!(binding.root, options), MAX_CONTEXT_BYTES));
+        } catch (error) {
+          const before = beforeHooks.get(binding.repo.projectId);
+          if (this.closed || !isDeadline(error) || !before) throw error;
+          // Unconfirmed engine output is dropped; the captured source map still publishes.
+          repos[binding.repo.projectId] = before;
+          hookedRepos.delete(binding.repo.projectId);
+          partial.push(`Repository ${binding.repo.name}: source re-check unavailable: ${failureReason(error)}`);
+          continue;
+        }
         const freshFingerprint = digest({ head: fresh.head, files: Object.entries(fresh.files).sort(([a], [b]) => a.localeCompare(b)) });
         if (realpathSync(fresh.repo) !== binding.root || freshFingerprint !== observation.fingerprint || fresh.head !== observation.head || !this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-generation-changed-during-hook");
       }
@@ -444,9 +549,41 @@ export class UnderstandingRuntime {
     if (!this.membershipStillCurrent(workspaceId, groupAtStart, bindings)) throw new Error("workspace-rebound-at-publish");
     const failedAttempts = partial.length ? Math.min(20, workspaceState.failureCount + 1) : 0;
     const retryDelay = this.backoff(workspaceId, 60_000);
-    const next: RuntimeState = { ...this.state, workspaces: { ...this.state.workspaces, [workspaceId]: { ...workspaceState, failureCount: failedAttempts, synthesisCursor: nextSynthesisCursor, repositories: repos, maintenance: { ...workspaceState.maintenance, state: partial.length ? "failed" : "idle", lastPublishedAt: new Date().toISOString(), nextAttemptAt: partial.length ? new Date(Date.now() + retryDelay).toISOString() : null, jobsToday: workspaceState.jobsToday, dailyJobLimit: currentPolicy.dailyJobLimit, message: partial.length ? "Some repository observations were unavailable; successful observations were published and prior maps remain for failed repositories." : null }, updatedAt: new Date().toISOString() } } };
+    const publishedAt = new Date().toISOString(), failure = failureReason(partial.join("; "));
+    const next: RuntimeState = { ...this.state, workspaces: { ...this.state.workspaces, [workspaceId]: { ...workspaceState, failureCount: failedAttempts, synthesisCursor: nextSynthesisCursor, repositories: repos, maintenance: { ...workspaceState.maintenance, state: partial.length ? "failed" : "idle", lastPublishedAt: publishedAt, nextAttemptAt: partial.length ? new Date(Date.now() + retryDelay).toISOString() : null, jobsToday: workspaceState.jobsToday, dailyJobLimit: currentPolicy.dailyJobLimit, message: partial.length ? `Last attempt failed at ${publishedAt}: ${failure}.` : null, lastFailure: partial.length ? { at: publishedAt, reason: failure } : null }, updatedAt: new Date().toISOString() } } };
     const before = this.state; this.state = next; this.persist();
     if (this.storageUnavailable) { this.state = before; throw new Error("runtime-store-full"); }
+  }
+
+  /**
+   * Briefs each captured repository whose fingerprint moved since its stored brief. A failure, including running
+   * out of time, becomes a partial line and keeps the source map; only a stored brief needs the final re-check.
+   */
+  private async briefRepositories(attempt: Attempt): Promise<void> {
+    const { workspaceId, group, bindings, repos, captured, hooked, partial, reserveMs } = attempt;
+    for (const binding of bindings) {
+      const observation = repos[binding.repo.projectId];
+      if (!observation || !captured.has(binding.repo.projectId) || observation.briefFingerprint === observation.fingerprint) continue;
+      const components = observation.components.filter(component => !component.retired);
+      try {
+        if (!this.boundStillCurrent(workspaceId, group, binding)) throw new Error("source-rebound-before-brief");
+        // Each brief gets at most half of the time left after the re-check reserve, so later steps keep a share.
+        const result = await this.invoke(binding.root, options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.brief?.head ?? null, components: components.map(({ id, name }) => ({ id, name })) }, options), MAX_OUTPUT_BYTES, { reserveMs, share: 0.5 });
+        if (!this.boundStillCurrent(workspaceId, group, binding)) throw new Error("source-rebound-after-brief");
+        const observedAt = new Date().toISOString();
+        const stored = storedBriefSchema.parse({
+          head: result.head, base: result.base, generatedAt: result.generatedAt, observedAt, brief: result.brief,
+          diagrams: result.diagrams.map((diagram, index) => linkDiagramNodes(diagramFromMermaid({ id: `${binding.repo.projectId}:${index}`, title: diagram.title, kind: diagram.kind, mermaid: diagram.mermaid, repositoryId: binding.repo.projectId, head: result.head, observedAt }), components)),
+          evidence: result.evidence.slice(0, MAX_EVIDENCE).map(item => ({ ...item, text: item.text.slice(0, MAX_EVIDENCE_TEXT) })), coverage: result.coverage,
+        });
+        observation.brief = stored; observation.briefFingerprint = observation.fingerprint; observation.briefFailure = null;
+        hooked.add(binding.repo.projectId);
+      } catch (error) {
+        if (this.closed) throw error;
+        observation.briefFailure = failureReason(error);
+        partial.push(`Repository ${binding.repo.name}: brief unavailable: ${observation.briefFailure}`);
+      }
+    }
   }
 
   private async capture(workspaceId: string, binding: SourceBinding, catalog: KnowledgeCatalog): Promise<StoredRepository> {
@@ -473,7 +610,12 @@ export class UnderstandingRuntime {
     const delivery = old?.delivery ?? emptyDelivery(binding.repo.projectId);
     const history: StoredRepository["history"] = { ...(old?.history ?? {}) };
     if (old && old.fingerprint !== fingerprint) for (const component of old.components) history[component.id] = [...(history[component.id] ?? []), { snapshotId: old.fingerprint, at: old.observedAt, summary: component.current.summary }].slice(-MAX_HISTORY);
-    return { repositoryKey: key, repositoryIds: binding.projects, rootIdentity: binding.rootIdentity, observedAt: source.observedAt, fingerprint, head: parsed.head, context: parsed, components, relationships, delivery, synthesisCoverage: old?.synthesisCoverage ?? [], completedPlanRevisions: old?.completedPlanRevisions ?? {}, completedSourceFingerprints: old?.completedSourceFingerprints ?? {}, history };
+    const map = componentGraph({ repositoryId: binding.repo.projectId, head: parsed.head, observedAt: source.observedAt, components, relationships });
+    // The map's own coverage is recomputed with each capture, so it travels with this observation's limitations.
+    const observed = { ...parsed, limitations: [...map.coverage, ...parsed.limitations].slice(0, 100) };
+    return { repositoryKey: key, repositoryIds: binding.projects, rootIdentity: binding.rootIdentity, observedAt: source.observedAt, fingerprint, head: parsed.head, context: observed, components, relationships, delivery, synthesisCoverage: old?.synthesisCoverage ?? [], completedPlanRevisions: old?.completedPlanRevisions ?? {}, completedSourceFingerprints: old?.completedSourceFingerprints ?? {}, history,
+      brief: old?.brief ?? null, briefFingerprint: old?.briefFingerprint ?? null, briefFailure: old?.briefFailure ?? null,
+      componentDiagram: map.graph };
   }
 
   private mapComponents(binding: SourceBinding, context: RepoContext, source: KnowledgeSource, key: string, catalog: KnowledgeCatalog) {
@@ -563,15 +705,24 @@ export class UnderstandingRuntime {
     return knowledgeComponentStateSchema.parse({ ...value, pinned: original.pinned, retired: original.retired, redirectTo: original.redirectTo, planned: original.planned, featureIds: original.featureIds, history: original.history }) as KnowledgeComponent;
   }
 
-  private async invoke<T>(root: string, callback: (options: UnderstandingAdapterOptions) => Promise<T>, maxBytes = MAX_OUTPUT_BYTES): Promise<T> {
-    const configured = Math.min(MAX_ATTEMPT_MS, Math.max(1000, this.options.config.repositoryBriefings?.timeoutMs ?? 30_000));
+  /** One attempt's whole time budget; a single engine call is also capped by it. */
+  private attemptMs() { return Math.min(MAX_ATTEMPT_MS, Math.max(1000, this.options.config.repositoryBriefings?.timeoutMs ?? 30_000)); }
+
+  /**
+   * Runs one engine call inside the attempt deadline. `reserveMs` is kept back for the final re-check and
+   * `share` limits the call to that fraction of what is left after the reserve.
+   */
+  private async invoke<T>(root: string, callback: (options: UnderstandingAdapterOptions) => Promise<T>, maxBytes = MAX_OUTPUT_BYTES, window: { reserveMs?: number; share?: number } = {}): Promise<T> {
+    const configured = this.attemptMs();
     const remaining = this.activeDeadline ? this.activeDeadline - Date.now() : configured;
-    if (remaining <= 0) throw new Error("understanding-attempt-deadline");
+    const available = Math.floor((remaining - (window.reserveMs ?? 0)) * (window.share ?? 1));
+    if (available <= 0) throw new Error("understanding-attempt-deadline");
     const controller = new AbortController(); this.controllers.add(controller);
-    const timeoutMs = Math.min(configured, remaining);
+    const timeoutMs = Math.min(configured, available);
     let timer: NodeJS.Timeout | undefined;
     try {
-      const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("understanding-timeout")); }, timeoutMs); timer.unref(); });
+      // Reject before aborting: an adapter that rejects on abort must not replace the timeout as the reason.
+      const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { reject(new Error("understanding-timeout")); controller.abort(); }, timeoutMs); timer.unref(); });
       const result = await Promise.race([callback({ signal: controller.signal, timeoutMs, maxBytes }), timeout]);
       if (Buffer.byteLength(JSON.stringify(result)) > maxBytes) throw new Error("understanding-output-too-large");
       return result;
@@ -619,11 +770,13 @@ export class UnderstandingRuntime {
       return digest(latest.repos.map(repo => [repo.projectId, repo.key, repo.checkouts.map(item => item.projectId).sort()]).sort()) === digest(group.repos.map(repo => [repo.projectId, repo.key, repo.checkouts.map(item => item.projectId).sort()]).sort()) && bindings.every(binding => this.boundStillCurrent(workspaceId, latest, binding));
     } catch { return false; }
   }
-  private failWorkspace(workspaceId: string) {
+  private failWorkspace(workspaceId: string, error: unknown) {
+    const reason = failureReason(error), at = new Date().toISOString();
+    console.error(`[Infinite] Understanding maintenance failed · workspace ${workspaceId} · ${reason}`);
     const old = this.workspace(workspaceId);
     old.failureCount = Math.min(20, old.failureCount + 1);
     const delay = this.backoff(workspaceId, 60_000);
-    this.setMaintenance(workspaceId, { ...old.maintenance, state: "failed", nextAttemptAt: new Date(Date.now() + delay).toISOString(), jobsToday: this.dailyJobs(workspaceId), message: "Maintenance failed or its source changed; the last good maps were retained." });
+    this.setMaintenance(workspaceId, { ...old.maintenance, state: "failed", nextAttemptAt: new Date(Date.now() + delay).toISOString(), jobsToday: this.dailyJobs(workspaceId), message: `Last attempt failed at ${at}: ${reason}.`, lastFailure: { at, reason } });
   }
 }
 
@@ -633,24 +786,27 @@ function runRepositoryContext(config: Config, root: string, options: Understandi
   const commandArgs = [...briefing.args, "context", "--repo", root];
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    try { child = spawn(briefing.command, commandArgs, { cwd: root, stdio: ["ignore", "pipe", "ignore"], detached: process.platform !== "win32" }); }
+    try { child = spawn(briefing.command, commandArgs, { cwd: root, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("context-spawn-failed")); return; }
     onChild(child);
-    let out = Buffer.alloc(0), settled = false;
+    let out = Buffer.alloc(0), stderrTail = Buffer.alloc(0), settled = false;
+    // A failed exit or a stop for time carries the engine's last stderr line.
+    const failed = (name: string) => new Error(failureReason(new Error(name), stderrTail.toString("utf8")));
     const finish = (error?: Error) => {
       if (settled) return; settled = true; options.signal.removeEventListener("abort", abort); onDone(child);
       if (error) { rejectPromise(error); return; }
       try { resolvePromise(parseRepoContext(JSON.parse(out.toString("utf8")))); }
       catch (error) { rejectPromise(new Error(`context-output-invalid: ${error instanceof Error ? error.message : "invalid context"}`)); }
     };
-    const abort = () => { stop(child); finish(new Error("context-aborted")); };
+    const abort = () => { stop(child); finish(failed("context-aborted")); };
     options.signal.addEventListener("abort", abort, { once: true });
     child.stdout?.on("data", (chunk: Buffer) => {
       out = Buffer.concat([out, chunk]);
       if (out.length > Math.min(options.maxBytes, MAX_CONTEXT_BYTES)) { stop(child); finish(new Error("context-output-too-large")); }
     });
+    child.stderr?.on("data", (chunk: Buffer) => { stderrTail = Buffer.concat([stderrTail, chunk]).subarray(-2048); });
     child.once("error", () => finish(new Error("context-process-error")));
-    child.once("close", code => { if (code !== 0) finish(new Error("context-process-failed")); else finish(); });
+    child.once("close", code => { if (code !== 0) finish(failed("context-process-failed")); else finish(); });
   });
 }
 function stopContextChild(child: ChildProcess) {

@@ -1,3 +1,4 @@
+import type { DiagramGraph } from "./understanding-diagrams.js";
 import type { UnderstandingBrief, UnderstandingWork } from "./understanding.js";
 
 /** Source observations never confer completion or delivery authority. */
@@ -36,6 +37,8 @@ export interface KnowledgePolicy {
   /** Models run only when enabled here and a host writer is configured. */
   synthesis: boolean;
   delivery: boolean; intervalMinutes: number; dailyJobLimit: number;
+  /** Set when the owner edits the policy or the one-time migration applies the defaults. */
+  editedAt?: string | null; editedBy?: "owner" | "migration" | null;
 }
 export interface KnowledgeCatalog {
   revision: number; projects: KnowledgeProject[]; features: KnowledgeFeature[]; plans: KnowledgePlan[];
@@ -80,10 +83,18 @@ export interface KnowledgeMaintenance {
   state: "disabled" | "idle" | "queued" | "running" | "failed" | "budget-limited" | "unavailable";
   lastObservedAt: string | null; lastPublishedAt: string | null; nextAttemptAt: string | null;
   jobsToday: number; dailyJobLimit: number; message: string | null;
+  lastFailure?: { at: string; reason: string } | null;
+}
+/** Whole-repository brief at the tracked head; `base` is the prior head the changes section compares against. */
+export interface KnowledgeRepositoryBrief {
+  repositoryId: string; head: string | null; base: string | null; generatedAt: string; observedAt: string;
+  state: "ready" | "stale"; brief: UnderstandingBrief; diagrams: DiagramGraph[];
+  evidence: { source: string; line: number; text: string }[]; coverage: string[];
 }
 export interface WorkspaceKnowledge {
   schemaVersion: 1; catalog: KnowledgeCatalog; components: KnowledgeComponent[];
   relationships: KnowledgeRelationship[]; delivery: KnowledgeDelivery[]; maintenance: KnowledgeMaintenance; coverage: string[];
+  briefs?: KnowledgeRepositoryBrief[]; diagrams?: DiagramGraph[];
 }
 
 /** Caller UUID plus catalog revision protects mutations against replay and races. */

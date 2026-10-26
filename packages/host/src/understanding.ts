@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, type Stats } from "node:fs";
 import { isAbsolute, relative, resolve, sep, join } from "node:path";
 import { z } from "zod";
-import type { UnderstandingArtifact, UnderstandingLink, UnderstandingPlan, UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding, WorkspaceKnowledge } from "@infinite/remote";
+import type { GeneratedCatalogPage, GeneratedPlan, GeneratedProject, UnderstandingArtifact, UnderstandingLink, UnderstandingPlan, UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding, WorkspaceKnowledge } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
 import { captureIdentity, readGit } from "./checkout-identity.js";
 import type { RepositorySummary, RepositoryBriefings } from "./repository-briefings.js";
@@ -14,8 +14,9 @@ import type { TeamService } from "./teams.js";
 import type { GoalService } from "./goals.js";
 import { writeSealed, unseal } from "./vault.js";
 import { CatalogError } from "./understanding-catalog.js";
+import { pageOf } from "./understanding-pages.js";
 
-const MAX_GENERATIONS = 64;
+const MAX_GENERATIONS_PER_PROJECT = 16;
 const MAX_STORE_BYTES = 8 * 1024 * 1024;
 // Runtime output is capped at 1 MiB before sealing. Keep one bounded generation
 // of publication headroom so a full store can advance without deleting evidence first.
@@ -239,18 +240,26 @@ export class UnderstandingService {
         project.enrolledPath !== expected.enrolledPath || project.projectDevice !== expected.projectDevice ||
         project.projectInode !== expected.projectInode || project.repoIdentity !== expected.repoIdentity) return false;
     let cwd = expected.sourceCwd;
+    // Team member workspaces are deleted after a run. When the session record or run membership is gone,
+    // or the workspace paths no longer resolve, the matching repository binding and a recorded head suffice.
+    const retained = !!entry.artifact.head;
     if (expected.sourceKind === "team") {
-      const session = this.sources.manager.meta(entry.artifact.sessionId).session;
+      let session: Session | undefined;
+      try { session = this.sources.manager.meta(entry.artifact.sessionId).session; } catch { session = undefined; }
+      if (!session) return retained;
       if (session.team?.role === "mission-coordinator") return false;
       if (session.projectId !== expected.projectId || !session.team || session.team.runId !== expected.runId || session.team.memberId !== expected.memberId) return false;
       const owner = this.ownedTeamSession(session);
       if (!owner || owner.runId !== expected.runId || owner.memberId !== expected.memberId) return false;
       const run = this.sources.teams.understandingRecords().find(item => item.id === owner.runId);
       const member = run?.members.find(item => item.memberId === owner.memberId && item.sessionId === session.id);
-      if (!member || resolve(member.cwd) !== resolve(session.cwd)) return false;
+      if (!member) return retained;
+      if (resolve(member.cwd) !== resolve(session.cwd)) return false;
       cwd = session.cwd;
     }
-    const root = realpathSync(expected.root), sourceCwd = realpathSync(cwd), rootStat = statSync(root), cwdStat = statSync(sourceCwd);
+    let root: string, sourceCwd: string, rootStat: Stats, cwdStat: Stats;
+    try { root = realpathSync(expected.root); sourceCwd = realpathSync(cwd); rootStat = statSync(root); cwdStat = statSync(sourceCwd); }
+    catch (error) { if (expected.sourceKind === "team") return retained; throw error; }
     if (!this.inside(root, sourceCwd) || (expected.sourceKind === "project" && !this.inside(project.enrolledPath, root))) return false;
     return root === expected.root && String(rootStat.dev) === expected.rootDevice && String(rootStat.ino) === expected.rootInode &&
       sourceCwd === expected.sourceCwd && String(cwdStat.dev) === expected.sourceCwdDevice && String(cwdStat.ino) === expected.sourceCwdInode;
@@ -301,7 +310,8 @@ export class UnderstandingService {
     return this.workRows(this.workspace(id));
   }
 
-  get(id: string): WorkspaceUnderstanding {
+  /** Unbounded read: complete request text and every retained snapshot. Overview and pages both derive from it. */
+  private build(id: string): WorkspaceUnderstanding {
     const group = this.workspace(id);
     // One membership snapshot and one Git capture per checkout per request. Never reuse
     // these across reads: a rebind or same-path replacement must invalidate the next read.
@@ -325,7 +335,7 @@ export class UnderstandingService {
         }
         return bindings.get(key)!;
       }).map(entry => entry.artifact).sort((a, b) => b.retainedAt.localeCompare(a.retainedAt) || a.id.localeCompare(b.id));
-      const activeStates: string[] = [];
+      const activeStates: string[] = [], failedReasons: string[] = [];
       for (const [sessionId, state] of briefingStates) {
         if (!["pending", "running", "failed"].includes(state.state)) continue;
         if (state.state === "failed" && current.length && state.updatedAt <= Date.parse(current[0]!.retainedAt)) continue;
@@ -334,119 +344,141 @@ export class UnderstandingService {
           if (!checkouts.has(session.projectId)) continue;
           if (session.team && !this.ownedTeamSession(session)) continue;
           activeStates.push(state.state);
+          if (state.state === "failed") failedReasons.push(state.error?.split("Reason: ").slice(1).join("Reason: ") || state.error || "unknown");
         } catch { /* closed or unavailable sessions do not alter retained artifact visibility */ }
       }
       const planned: UnderstandingPlan[] = currentWork.filter(work => work.repositoryIds.some(projectId => checkouts.has(projectId))).map(work => ({
-        workId: work.id, kind: work.kind, title: work.title, text: work.objective ?? "", status: work.status, updatedAt: work.updatedAt, source: "request" as const,
+        workId: work.id, kind: work.kind, title: work.title, text: work.objective ?? "", status: work.status, updatedAt: work.updatedAt, source: "request" as const, excerpt: false,
       })).filter(item => item.text.length > 0);
       const warnings = this.storageError ? [this.storageError] : [];
-      if (activeStates.includes("failed")) warnings.push("The latest recorded briefing attempt failed; retained snapshots remain source-labeled.");
+      if (activeStates.includes("failed")) warnings.push(`The latest brief attempt failed: ${failedReasons[0]}`);
       const state: UnderstandingRepository["state"] = activeStates.includes("pending") || activeStates.includes("running") ? "updating" : activeStates.includes("failed") ? "failed" : this.storageError && !current.length ? "unavailable" : current.length ? "ready" : "empty";
       return { id: repo.projectId, name: repo.name, checkoutIds, state, current, planned, warnings, coverage: [] };
     });
     const work = rows.map(item => ({ ...item, briefIds: [] }));
-    return boundedResponse({ schemaVersion: 1, workspace: { id: group.id, name: group.name, revision: group.revision }, observedAt: new Date().toISOString(), work, repositories,
+    return { schemaVersion: 1, workspace: { id: group.id, name: group.name, revision: group.revision }, observedAt: new Date().toISOString(), work, repositories,
       ...(this.sources.knowledge ? { knowledge: this.sources.knowledge.read(id) } : {}),
-      coverage: ["Work execution, owner feature assessments, agent reports and provider delivery observations are separate sources. Repository briefs describe their labeled source snapshots.", "Repository briefs are not linked to individual work items unless an explicit association is recorded." ] });
+      coverage: ["Work records, owner assessments, agent reports and GitHub observations are separate sources.", "Briefs are not linked to individual work items unless an association is recorded."] };
+  }
+
+  get(id: string): WorkspaceUnderstanding {
+    const value = this.build(id);
+    return boundedResponse({ ...value, repositories: value.repositories.map(repo => ({ ...repo, planned: repo.planned.map(excerptOf) })) });
+  }
+
+  briefsPage(workspaceId: string, repositoryId: string, cursor?: string) {
+    const repo = this.build(workspaceId).repositories.find(item => item.id === repositoryId);
+    return pageOf(repo?.current ?? [], cursor, item => item.id);
+  }
+
+  plannedPage(workspaceId: string, repositoryId: string, cursor?: string) {
+    const repo = this.build(workspaceId).repositories.find(item => item.id === repositoryId);
+    return pageOf((repo?.planned ?? []).map(plan => ({ ...plan, excerpt: false })), cursor, item => item.workId);
+  }
+
+  workPage(workspaceId: string, cursor?: string) {
+    return pageOf(this.build(workspaceId).work, cursor, item => item.id);
+  }
+
+  /** Derived at read time from recorded work. Never stored, so the owner catalog revision is untouched. */
+  generatedPage(workspaceId: string, cursor?: string): GeneratedCatalogPage {
+    const group = this.workspace(workspaceId);
+    const repositoryOf = new Map(group.repos.flatMap(repo => repo.checkouts.map(checkout => [checkout.projectId, repo.projectId] as const)));
+    const plans: GeneratedPlan[] = this.workRows(group).filter(work => work.scope === "complete" && work.objective).map(work => ({
+      id: `plan:${work.id}`, workId: work.id, kind: work.kind, title: work.title, objective: work.objective!,
+      repositoryIds: [...new Set(work.repositoryIds.flatMap(id => repositoryOf.get(id) ?? []))], status: work.status, column: work.column,
+      outcome: work.reportedSummary, links: work.links, updatedAt: work.updatedAt, basis: "work" as const,
+    }));
+    const projects: GeneratedProject[] = group.repos.map(repo => ({
+      id: `project:${repo.projectId}`, name: repo.name, repositoryIds: [repo.projectId],
+      planIds: plans.filter(plan => plan.repositoryIds.includes(repo.projectId)).map(plan => plan.id), basis: "repository" as const,
+    }));
+    const page = pageOf(plans, cursor, plan => plan.id);
+    return { projects, plans: page.items, next: page.next, coverage: ["From work: derived from recorded team, mission and goal requests. Status is the run's own status."] };
   }
 }
 
 function retainedGenerations(entries: Entry[], sizes: Map<string, number>): Entry[] {
-  let remaining = MAX_STORE_BYTES, count = 0;
+  let remaining = MAX_STORE_BYTES;
+  const perProject = new Map<string, number>();
   return [...entries].sort((a, b) => b.artifact.retainedAt.localeCompare(a.artifact.retainedAt) || a.artifact.id.localeCompare(b.artifact.id)).filter(entry => {
-    const size = sizes.get(entry.artifact.id) ?? Infinity;
-    if (count >= MAX_GENERATIONS || size > remaining) return false;
-    count++; remaining -= size; return true;
+    const size = sizes.get(entry.artifact.id) ?? Infinity, count = perProject.get(entry.artifact.sourceProjectId) ?? 0;
+    if (count >= MAX_GENERATIONS_PER_PROJECT || size > remaining) return false;
+    perProject.set(entry.artifact.sourceProjectId, count + 1); remaining -= size; return true;
   });
 }
 
-/** Bound complete records rather than cutting source claims or request text. The
- * category budgets leave room for metadata, coverage and encrypted framing. */
-function boundedResponse(value: WorkspaceUnderstanding): WorkspaceUnderstanding {
-  const knowledge = value.knowledge ? boundedKnowledge(value.knowledge) : undefined;
-  const responseBudget = knowledge ? MAX_RESPONSE_BYTES * 5 / 16 : MAX_RESPONSE_BYTES;
-  const bytes = (item: unknown) => Buffer.byteLength(JSON.stringify(item)) + 1;
-  const select = <T>(items: T[], budget: number) => {
-    let used = 0;
-    return items.filter(item => { const size = bytes(item); if (used + size > budget) return false; used += size; return true; });
-  };
-  const work = select(value.work, responseBudget * 3 / 16);
-  const coverage = [...value.coverage];
-  if (work.length < value.work.length) coverage.push(`Work records: ${work.length} of ${value.work.length} included; ${value.work.length - work.length} omitted from this response to fit its byte limit. Newest records are prioritized; source records remain available in their work views.`);
-  const repositories: UnderstandingRepository[] = [];
-  const sources = new Map<string, UnderstandingRepository>();
-  let metadataBytes = bytes({ ...value, knowledge: undefined, work: [], repositories: [], coverage }) + 1024;
-  for (const source of value.repositories) {
-    const repository: UnderstandingRepository = { ...source, current: [], planned: [], coverage: [] };
-    const size = bytes(repository) + 1024;
-    if (metadataBytes + size > responseBudget / 32) continue;
-    metadataBytes += size; repositories.push(repository); sources.set(repository.id, source);
-  }
-  if (repositories.length < value.repositories.length) coverage.push(`Repositories: ${repositories.length} of ${value.repositories.length} included; ${value.repositories.length - repositories.length} omitted from this response to fit its byte limit. Omission does not mean those repositories have no work or snapshots.`);
+const PLAN_EXCERPT_CHARS = 600;
+function excerptOf(plan: UnderstandingPlan): UnderstandingPlan {
+  return plan.text.length > PLAN_EXCERPT_CHARS ? { ...plan, text: plan.text.slice(0, PLAN_EXCERPT_CHARS), excerpt: true } : plan;
+}
 
-  // Select brief bodies first so large evidence excerpts cannot crowd out the
-  // latest source-labeled explanation from another session or repository.
-  const candidates = repositories.flatMap(repo => sources.get(repo.id)!.current.map(artifact => ({ repo, artifact })))
-    .sort((a, b) => b.artifact.retainedAt.localeCompare(a.artifact.retainedAt) || a.artifact.id.localeCompare(b.artifact.id));
-  const seen = new Set<string>(), latest: typeof candidates = [], older: typeof candidates = [];
-  for (const item of candidates) {
-    const key = `${item.artifact.sourceProjectId}:${item.artifact.sessionId}`;
-    (seen.has(key) ? older : latest).push(item); seen.add(key);
-  }
-  let remaining = responseBudget * 5 / 8;
+const shown = (category: string, included: number, total: number) => `${category}: ${included} of ${total} shown here; the rest are available on the detail pages.`;
+
+/** One first-come budget, spent in a fixed order on whole records. Anything left out is
+ * reachable through the paged detail endpoints, and the catalog is never emptied. */
+export function boundedResponse(value: WorkspaceUnderstanding): WorkspaceUnderstanding {
+  const bytes = (item: unknown) => Buffer.byteLength(JSON.stringify(item)) + 1;
+  let remaining = MAX_RESPONSE_BYTES - 64 * 1024;
+  const take = (item: unknown) => { const size = bytes(item); if (size > remaining) return false; remaining -= size; return true; };
+  const coverage = [...value.coverage];
+  remaining -= bytes({ ...value, knowledge: undefined, work: [], repositories: [], coverage }) + 8192; // Room for the omission lines.
+
+  const repositories = value.repositories.map(source => ({ ...source, current: [], planned: [], coverage: [] }) as UnderstandingRepository);
+  for (const repo of repositories) remaining -= bytes(repo);
+  const knowledge = value.knowledge;
+  const result: WorkspaceKnowledge | undefined = knowledge && { ...knowledge, briefs: [], diagrams: [], components: [], relationships: [], delivery: [], coverage: [...knowledge.coverage] };
+  if (result) remaining -= bytes(result);
+
   const selected: { source: UnderstandingArtifact; artifact: UnderstandingArtifact }[] = [];
-  for (const { repo, artifact: source } of [...latest, ...older]) {
+  const addArtifact = (repo: UnderstandingRepository, source: UnderstandingArtifact) => {
     const artifact: UnderstandingArtifact = { ...source, coverage: [...source.coverage], evidence: [] };
-    const size = bytes(artifact) + 256; // Reserve the evidence-omission disclosure.
-    if (size > remaining) continue;
-    remaining -= size; repo.current.push(artifact); selected.push({ source, artifact });
+    if (!take(artifact)) return;
+    remaining -= 256; // Reserve the evidence line.
+    repo.current.push(artifact); selected.push({ source, artifact });
+  };
+  const sourceOf = (repo: UnderstandingRepository) => value.repositories.find(item => item.id === repo.id)!;
+  for (const repo of repositories) { const [newest] = sourceOf(repo).current; if (newest) addArtifact(repo, newest); }
+
+  const work: UnderstandingWork[] = [];
+  for (const item of value.work) if (take(item)) work.push(item);
+
+  for (const repo of repositories) for (const plan of sourceOf(repo).planned) if (take(plan)) repo.planned.push(plan);
+
+  if (knowledge && result) {
+    const takeAll = <T>(items: T[] | undefined, label: string, keep: (item: T) => boolean = () => true): T[] => {
+      const all = items ?? [], chosen = all.filter(item => keep(item) && take(item));
+      if (chosen.length < all.length) result.coverage.push(shown(label, chosen.length, all.length));
+      return chosen;
+    };
+    result.components = takeAll(knowledge.components, "Components");
+    const kept = new Set(result.components.map(component => component.id));
+    result.relationships = takeAll(knowledge.relationships, "Relationships", edge => kept.has(edge.from) && kept.has(edge.to));
+    result.delivery = takeAll(knowledge.delivery, "Delivery");
+    result.briefs = takeAll(knowledge.briefs, "Briefs");
+    result.diagrams = takeAll(knowledge.diagrams, "Diagrams");
   }
+
+  for (const repo of repositories) for (const source of sourceOf(repo).current.slice(1)) addArtifact(repo, source);
   for (const { source, artifact } of selected) {
     for (const excerpt of source.evidence) {
-      const size = bytes(excerpt);
-      if (size > remaining) break;
-      remaining -= size; artifact.evidence.push(excerpt);
+      if (!take(excerpt)) break;
+      artifact.evidence.push(excerpt);
     }
-    if (artifact.evidence.length < source.evidence.length) artifact.coverage.push(`Evidence excerpts: ${artifact.evidence.length} of ${source.evidence.length} included; ${source.evidence.length - artifact.evidence.length} omitted from this response to fit its byte limit. Complete excerpts remain retained on the host.`);
+    if (artifact.evidence.length < source.evidence.length) artifact.coverage.push(shown("Evidence excerpts", artifact.evidence.length, source.evidence.length));
   }
-  let plannedRemaining = responseBudget / 16;
+
+  if (work.length < value.work.length) coverage.push(shown("Work", work.length, value.work.length));
   for (const repo of repositories) {
-    const source = sources.get(repo.id)!;
+    const source = sourceOf(repo);
     repo.current.sort((a, b) => b.retainedAt.localeCompare(a.retainedAt) || a.id.localeCompare(b.id));
     if (repo.current.length < source.current.length) {
-      repo.coverage.push(`Retained snapshots: ${repo.current.length} of ${source.current.length} included; ${source.current.length - repo.current.length} omitted from this response to fit its byte limit. Older generations remain retained on the host.`);
+      repo.coverage.push(shown("Retained snapshots", repo.current.length, source.current.length));
       if (!repo.current.length && repo.state === "ready") repo.state = "unavailable";
     }
-    repo.planned = select(source.planned, plannedRemaining);
-    plannedRemaining -= repo.planned.reduce((size, item) => size + bytes(item), 0);
-    if (repo.planned.length < source.planned.length) repo.coverage.push(`Planned requests: ${repo.planned.length} of ${source.planned.length} included; ${source.planned.length - repo.planned.length} omitted from this response to fit its byte limit. Complete requests remain in their source work records.`);
+    if (repo.planned.length < source.planned.length) repo.coverage.push(shown("Planned requests", repo.planned.length, source.planned.length));
   }
-  return { ...value, ...(knowledge ? { knowledge } : {}), work, repositories, coverage };
-}
-
-/** Keep the catalog whole for revisioned edits; complete component detail is also
- * available by ID. Omitted graph nodes never leave misleading dangling edges. */
-function boundedKnowledge(value: WorkspaceKnowledge): WorkspaceKnowledge {
-  const result: WorkspaceKnowledge = { ...value, components: [], relationships: [], delivery: [], coverage: [...value.coverage] };
-  const size = (item: unknown) => Buffer.byteLength(JSON.stringify(item));
-  const limit = MAX_RESPONSE_BYTES * 5 / 8;
-  if (size(result) > limit - 4096) {
-    result.catalog = { ...value.catalog, projects: [], features: [], plans: [], componentOverrides: [], coverage: [...value.catalog.coverage, "Catalog records omitted from the overview because they exceed its byte limit. Read the catalog endpoint for the complete revision."] };
-  }
-  let remaining = limit - size(result) - 4096;
-  for (const key of ["components", "delivery"] as const) {
-    const selected = value[key].filter(item => { const bytes = size(item) + 1; if (bytes > remaining) return false; remaining -= bytes; return true; });
-    if (key === "components") result.components = selected as WorkspaceKnowledge["components"];
-    else result.delivery = selected as WorkspaceKnowledge["delivery"];
-    if (selected.length < value[key].length) result.coverage.push(`${key}: ${selected.length} of ${value[key].length} included in this bounded overview. Component details remain available by ID.`);
-  }
-  const ids = new Set(result.components.map(component => component.id));
-  result.relationships = value.relationships.filter(edge => {
-    if (!ids.has(edge.from) || !ids.has(edge.to)) return false;
-    const bytes = size(edge) + 1; if (bytes > remaining) return false; remaining -= bytes; return true;
-  });
-  if (result.relationships.length < value.relationships.length) result.coverage.push(`Relationships: ${result.relationships.length} of ${value.relationships.length} included; omitted nodes and edges are not evidence of absent dependencies.`);
-  return result;
+  return { ...value, ...(result ? { knowledge: result } : {}), work, repositories, coverage };
 }
 
 function safeUrl(value: string | undefined): string | undefined {

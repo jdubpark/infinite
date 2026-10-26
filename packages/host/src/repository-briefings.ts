@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
+import { failureReason } from "./failure-reason.js";
 import type { Manager } from "./manager.js";
 import type { ChatMessage } from "./session-content.js";
 import type { Project, Session } from "./types.js";
@@ -169,16 +170,16 @@ function renderBrief(brief: z.infer<typeof briefSchema>) {
 async function collectProcess(command: string, args: string[], options: { cwd: string; input?: string; timeoutMs: number; maxBytes: number; signal?: AbortSignal }): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    try { child = spawn(command, args, { cwd: options.cwd, stdio: ["pipe", "pipe", "ignore"], detached: process.platform !== "win32" }); }
+    try { child = spawn(command, args, { cwd: options.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("spawn")); return; }
-    let stdout = Buffer.alloc(0), stopped: string | undefined;
+    let stdout = Buffer.alloc(0), stderrTail = Buffer.alloc(0), stopped: string | undefined;
     let closeCode: number | null | undefined, closeHandled = false, escalationDone = false;
     const finish = () => {
       if (closeHandled || closeCode === undefined || (stopped && !escalationDone)) return;
       closeHandled = true;
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", abort);
-      if (stopped || closeCode !== 0) rejectPromise(new Error(stopped ?? "exit"));
+      if (stopped || closeCode !== 0) rejectPromise(stopped ? new Error(stopped) : new Error(failureReason(new Error(`exit ${closeCode}`), stderrTail.toString("utf8"))));
       else resolvePromise(stdout.toString("utf8"));
     };
     const stop = (reason: string) => {
@@ -199,6 +200,7 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
       if (stdout.length + chunk.length > options.maxBytes) { stop("oversized"); return; }
       stdout = Buffer.concat([stdout, chunk]);
     });
+    child.stderr!.on("data", (chunk: Buffer) => { stderrTail = Buffer.concat([stderrTail, chunk]).subarray(-2048); });
     child.on("error", () => { stopped ??= "spawn"; escalationDone = true; });
     child.on("close", code => {
       closeCode = code;
@@ -485,7 +487,7 @@ export class RepositoryBriefings {
           this.inFlight.delete(ready.key);
           const notReady = error instanceof NotReady;
           const notOptedIn = error instanceof NotOptedIn;
-          const message = notOptedIn ? NOT_OPTED_IN_MESSAGE : notReady ? NOT_READY_MESSAGE : FAILED_MESSAGE;
+          const message = notOptedIn ? NOT_OPTED_IN_MESSAGE : notReady ? NOT_READY_MESSAGE : `${FAILED_MESSAGE} Reason: ${failureReason(error)}`;
           this.setStatus(ready.session.id, { state: notOptedIn ? "unavailable" : notReady ? "empty" : "failed", ...(this.latest.get(ready.session.id)?.summary ? { summary: this.latest.get(ready.session.id)!.summary } : {}), error: message });
           for (const waiter of ready.waiters) waiter.reject(new Error(message));
         }

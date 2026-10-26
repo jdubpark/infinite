@@ -1442,28 +1442,35 @@ export function createApp(config: Config, key: Buffer) {
     },
   );
   const server = createServer(app);
-  server.once("listening", () => linear.start());
-  server.once("listening", () => teams.start());
-  server.once("listening", () => goals.start());
-  server.once("listening", () => missions.start());
-  server.once("listening", () => handoffs.start());
-  server.once("listening", () => readings.start());
-  // The timer checks each tick which projects follow GitHub, so one enrolled while the server runs is picked up too.
-  server.once("listening", () => projectSource.start());
-  if (repositoryBriefings) server.once("listening", () => { void repositoryBriefings.start().catch(() => {}); });
-  server.once("listening", () => understandingRuntime.start());
-  server.once("listening", () => balances.start());
-  server.once("close", () => teams.close());
-  server.once("close", () => { usage.close(); balances.close(); });
-  server.once("close", () => goals.close());
-  server.once("close", () => missions.close());
-  server.once("close", () => repositoryBriefings?.close());
-  server.once("close", () => { void understandingRuntime.close(); });
-  server.once("close", () => { void understandingBehaviors.close(); });
-  server.once("close", () => linear.close());
-  server.once("close", () => handoffs.close());
-  server.once("close", () => readings.stop());
-  server.once("close", () => projectSource.stop());
+  // One listener per event: Node warns about a leak once more than ten listeners share one emitter,
+  // and the subsystems below plus the socket routes attached next crossed that limit.
+  server.once("listening", () => {
+    linear.start();
+    teams.start();
+    goals.start();
+    missions.start();
+    handoffs.start();
+    readings.start();
+    // The timer checks each tick which projects follow GitHub, so one enrolled while the server runs is picked up too.
+    projectSource.start();
+    void repositoryBriefings?.start().catch(() => {});
+    understandingRuntime.start();
+    balances.start();
+  });
+  server.once("close", () => {
+    teams.close();
+    usage.close();
+    balances.close();
+    goals.close();
+    missions.close();
+    repositoryBriefings?.close();
+    void understandingRuntime.close();
+    void understandingBehaviors.close();
+    linear.close();
+    handoffs.close();
+    readings.stop();
+    projectSource.stop();
+  });
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);

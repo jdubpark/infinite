@@ -20,6 +20,14 @@ repository permissions or execution identity. `GET
 identity/revision, observation time, recorded work, retained repository briefs
 and optional `knowledge`. Older clients can keep reading the original fields.
 
+The overview spends one first-come budget across its categories rather than
+fixed fractions. Planned-request excerpts are 600 characters, and an excerpt
+that was cut carries `excerpt: true`. When something is left out, the overview
+says `<category>: N of M shown here; the rest are available on the detail
+pages.` Generated plans and projects are derived at read time from work records
+with `basis: "work"` or `basis: "repository"`. They are never stored in the
+catalog.
+
 Work preserves missions, standalone teams and goals with their original
 execution statuses, requests, reports and links. Managed child runs remain
 associated with their parent. A work item spanning repositories now assigned
@@ -56,6 +64,16 @@ The following paths are relative to `/api/project-groups/:id/understanding`:
 | `POST /catalog/:collection` | Create a project, feature or plan; update policy. |
 | `POST /catalog/:collection/:entityId` | Update or archive a record; set a component override. |
 | `POST /refresh` | Queue a bounded observation, returning maintenance status. |
+| `GET /briefs?repository=ID&cursor=` | Retained repository briefs for one repository. |
+| `GET /planned?repository=ID&cursor=` | Planned requests for one repository. |
+| `GET /work?cursor=` | Recorded work. |
+| `GET /generated?cursor=` | Plans and projects derived from work records. |
+| `GET /brief?repository=ID` | The latest brief for one repository. |
+| `GET /diagrams/:diagramId` | One diagram as graph data. |
+
+Paged reads return at most 50 records or 512 KiB per page. Each page carries a
+`next` cursor, which is null on the last page. Pass the cursor back unchanged
+to read the following page.
 
 Read roles are owner, controller and viewer. Mutations require owner role.
 Collections are `projects`, `features`, `plans`, `components` and `policy`.
@@ -76,9 +94,12 @@ bounded revision history. Storage errors remain explicit.
 ### Host maintenance
 
 Workspace maintenance is independent of an active session and continues while
-clients are closed. Its policy defaults to disabled, with synthesis and delivery
-observations disabled, a 15-minute interval and 24 jobs per workspace per UTC
-day. Owner policy edits enable these capabilities independently. An explicit
+clients are closed. Its policy defaults to enabled, with `enabled`, `synthesis` and `delivery`
+set to true, a 15-minute interval and 24 jobs per workspace per UTC day. A
+stored policy without `editedAt` is migrated once to these defaults with
+`editedBy: "migration"`. An owner edit stamps `editedBy: "owner"`, keeps the
+owner's chosen values and is never re-enabled automatically. Owner policy
+edits can still switch each capability off independently. An explicit
 refresh can collect a source map while scheduling is disabled; model synthesis
 still requires its own enabled policy and a configured writer.
 
@@ -93,14 +114,29 @@ Collection and synthesis also have process, output and storage bounds. Current s
 before publishing generated comparisons. Failed attempts retain the previous
 usable source observations with failure and freshness metadata.
 
+Each job also runs a repository-level `brief --repo` at the tracked head. Its
+comparison base is the head of the last successful brief, so the first brief
+has no changes section. The host parses up to two Mermaid flowchart diagrams
+into graph data, a strict subset of the syntax. A diagram outside that subset
+keeps its source text and a `parseError`. A deterministic component map is
+always published. `knowledge.briefs` and `knowledge.diagrams` expose both.
+
+A job runs on the interval, after a merged team run, after a GitHub source
+fast-forward, and on an owner refresh. A change that lands during a running
+job requeues one more run. Maintenance keeps `lastFailure: { at, reason }`, and
+its message reads `Last attempt failed at <time>: <reason>.` Reasons are bounded
+to 400 characters with long tokens redacted.
+
 The maintenance store has an 8 MiB encrypted budget. Legacy session briefs use
-a separate rolling store of at most 16 generations per repository within 8 MiB. Those briefs
+a separate rolling store of at most 16 generations per project within 8 MiB.
+Team briefs stay visible after their member workspace is cleaned up, as long as
+the repository binding still matches and a head is recorded. Those briefs
 retain checkout/session provenance and generation/retention times. Mission
 coordinator briefs are withheld from that single-repository artifact store
 until complete multi-repository provenance is available; mission work remains
 readable. Read responses stay below the encrypted transport limit and disclose
-omitted records. Use the catalog and component detail endpoints for content
-omitted from the overview. Response omission never deletes stored content.
+omitted records. Use the paged detail routes above, and the catalog and component detail
+endpoints, for content omitted from the overview. Response omission never deletes stored content.
 
 Reading Understanding never schedules a model job, changes execution status or
 writes to a tracker. Observation time, generation time, provider report time and
@@ -158,7 +194,8 @@ activity when a queued job starts. The comparison base is the checkout's HEAD
 when the runtime first observes the session, which may be later than the task
 started. The session report cache lives in memory and is lost when the API
 restarts; the retained Workspace Understanding artifacts and Jevcode's
-checkpoint are not. Restart does not backfill historical sessions.
+checkpoint are not. Restart does not backfill historical sessions. A failed briefing reports
+`Reason: <reason>`, bounded to 400 characters with long tokens redacted.
 
 The report describes the source snapshot collected at `generatedAt`; it does not
 claim that the checkout still has that content when a person reads it. The

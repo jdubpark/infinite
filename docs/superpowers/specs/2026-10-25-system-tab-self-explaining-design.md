@@ -1,6 +1,6 @@
 # System tab that explains the workspace by itself
 
-Date: 2026-10-25. Status: approved by the owner on 2026-10-25.
+Date: 2026-10-25. Status: implemented on the phone; desktop and web follow.
 
 ## Intent
 

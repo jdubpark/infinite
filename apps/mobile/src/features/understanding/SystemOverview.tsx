@@ -40,7 +40,7 @@ function RepositorySections({ connection, workspaceId, repo, brief, componentMap
   const systemMap = brief?.diagrams.find(diagram => diagram.kind === "system");
   const covered = systemMap ? new Set(systemMap.nodes.map(node => node.componentId).filter(Boolean)).size : 0;
   const showComponentMap = Boolean(componentMap && componentMap.nodes.length && (!systemMap || covered < componentTotal));
-  const stateLine = repoStateLine(repo);
+  const stateLine = repoStateLine(repo, brief);
   const briefEvidence = brief ? evidenceLabel(brief.head, brief.observedAt) : undefined;
 
   return <View style={s.repo}>
@@ -49,6 +49,7 @@ function RepositorySections({ connection, workspaceId, repo, brief, componentMap
     <Section title="What this workspace is" evidence={briefEvidence ?? (fallback ? evidenceLabel(fallback.head, fallback.generatedAt) : NOT_OBSERVED)}>
       <Text selectable style={s.body}>{summary ?? "No explanation yet. The first observation runs within a few minutes of enrollment."}</Text>
     </Section>
+    {brief?.state === "stale" ? <Text style={s.note}>Explanation is from an earlier commit; a refresh will update it.</Text> : null}
 
     <Section title="Architecture" evidence={briefEvidence ?? NOT_OBSERVED}>
       {systemMap ? <DiagramView graph={systemMap} onOpenComponent={onOpenComponent} /> : null}
@@ -192,10 +193,11 @@ function newestBrief(briefs: KnowledgeRepositoryBrief[], repositoryId: string) {
   return briefs.filter(brief => brief.repositoryId === repositoryId).sort((a, b) => b.generatedAt.localeCompare(a.generatedAt))[0];
 }
 
-function repoStateLine(repo: UnderstandingRepository): string {
+/** The repository's work state; a stored repository brief means the first observation already happened. */
+function repoStateLine(repo: UnderstandingRepository, brief: KnowledgeRepositoryBrief | undefined): string {
   if (repo.state === "updating") return "Updating now";
   if (repo.state === "failed") return repo.warnings[0] ?? "The latest refresh failed";
-  if (repo.state === "empty") return "Waiting for the first observation";
+  if (repo.state === "empty") return brief ? "" : "Waiting for the first observation";
   if (repo.state === "unavailable") return "Source unavailable on the host";
   return "";
 }

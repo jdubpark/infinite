@@ -358,7 +358,7 @@ export class UnderstandingService {
     const work = rows.map(item => ({ ...item, briefIds: [] }));
     return { schemaVersion: 1, workspace: { id: group.id, name: group.name, revision: group.revision }, observedAt: new Date().toISOString(), work, repositories,
       ...(this.sources.knowledge ? { knowledge: this.sources.knowledge.read(id) } : {}),
-      coverage: ["Work execution, owner feature assessments, agent reports and provider delivery observations are separate sources. Repository briefs describe their labeled source snapshots.", "Repository briefs are not linked to individual work items unless an explicit association is recorded." ] };
+      coverage: ["Work records, owner assessments, agent reports and GitHub observations are separate sources.", "Briefs are not linked to individual work items unless an association is recorded."] };
   }
 
   get(id: string): WorkspaceUnderstanding {

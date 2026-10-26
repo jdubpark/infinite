@@ -226,7 +226,8 @@ function SystemView({ data, connection, workspaceId, readGeneration, offline, on
     <SystemOverview connection={connection} workspaceId={workspaceId} data={data} offline={offline}
       onOpenComponent={id => { setOpen(previous => ({ id, nonce: previous.nonce + 1 })); onComponentNavigate(anchor.current); }} />
     <View ref={anchor}><KnowledgePanel onComponentNavigate={() => onComponentNavigate(anchor.current)} key={`${connectionKey(connection)}|${connection.url}|${connection.token}|${workspaceId}`} connection={connection} workspaceId={workspaceId} knowledge={data.knowledge} readGeneration={readGeneration} defaultArea="components" openComponentId={open.id} openComponentNonce={open.nonce} repositories={data.repositories} work={data.work} offline={offline} /></View>
-    {data.coverage.map((line, index) => <Text key={`coverage-${index}`} style={s.note}>{line}</Text>)}
+    {/* Only the pointers to the detail pages; the source-separation sentences belong to the Work tab. */}
+    {data.coverage.filter(line => line.includes("shown here")).map((line, index) => <Text key={`coverage-${index}`} style={s.note}>{line}</Text>)}
     <Text style={s.note}>Generated from the code and the work records. It does not mean anything is deployed or approved.</Text>
   </View>;
 }

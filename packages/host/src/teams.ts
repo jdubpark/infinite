@@ -40,7 +40,9 @@ type TeamServiceOptions = {
   now?: () => number;
   volumeUsage?: (path: string) => Promise<VolumeUsage>;
 };
-type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]> };
+type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string> };
+/** How long a failed workspace removal waits before the scheduler tries it again. */
+const REMOVAL_RETRY_MS = 5 * 60_000;
 function deliveryInspectionHash(report: DeliveryReconciliationReport) {
   return digest({ headCommit: report.headCommit, repository: report.repository, branch: report.branch,
     baseHeadCommit: report.baseHeadCommit, disposition: report.disposition, remoteHeadCommit: report.remoteHeadCommit });
@@ -1921,6 +1923,7 @@ export class TeamService {
   }
   private async reportRemovalFailure(stored: Stored, scope: string, error: unknown) {
     const retention = this.retentionState(stored);
+    (retention.retryAt ??= {})[scope] = new Date((this.options?.now?.() ?? Date.now()) + REMOVAL_RETRY_MS).toISOString();
     const message = error instanceof Error ? error.message : String(error);
     const code = (error as NodeJS.ErrnoException)?.code ?? (error as { constructor?: { name?: string } })?.constructor?.name ?? "unknown";
     const fingerprint = digest({ code, message });
@@ -1935,6 +1938,11 @@ export class TeamService {
       stored.run.events = previousEvents;
       console.warn("Could not record a team workspace retention failure.", saveError);
     }
+  }
+  /** A failed removal waits out its backoff before the scheduler launches it again. */
+  private removalBackoffActive(retention: RetentionState, scope: string, now: number) {
+    const retryAt = retention.retryAt?.[scope];
+    return retryAt !== undefined && now < Date.parse(retryAt);
   }
   private async retire(stored: Stored) {
     try {
@@ -1990,7 +1998,7 @@ export class TeamService {
               console.warn("Could not persist a started member workspace removal.", error);
               continue;
             }
-          } else if (!filesystemEntryExists(member.cwd)) {
+          } else if (!filesystemEntryExists(member.cwd) || this.removalBackoffActive(retention, `member:${member.memberId}`, now)) {
             continue;
           }
           this.removeOutsideQueue(stored,
@@ -2012,7 +2020,7 @@ export class TeamService {
 
       if (run.workspaceRemovedAt) {
         if (filesystemEntryExists(runDirectory)) {
-          removeRunInBackground(run.workspaceRemovedAt);
+          if (!this.removalBackoffActive(retention, "workspaces", now)) removeRunInBackground(run.workspaceRemovedAt);
           return;
         }
         let completionChanged = false;

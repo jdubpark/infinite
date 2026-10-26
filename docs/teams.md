@@ -1051,18 +1051,35 @@ explicit policy.
 While a run's coordinator can still decide a member's prompt, the phone is not
 pushed for it. The push arrives only when the request becomes the owner's: the
 coordinator escalated it, the review window expired, the run spent its decision
-limit or cannot act, or the prompt lacks complete one-shot evidence. A run gets
+limit or cannot act, or bounded evidence recovery cannot establish a complete
+one-shot request. A run gets
 a short grace period to start the review before an unreviewed prompt is pushed.
 
 A current one-shot tool prompt can start a separate turn on the run's strong
 Claude coordinator profile. The coordinator receives the task, owner scope and exact
-request, then reports approve-once or escalate. The host checks the assignment,
+request, then reports approve-once, request-evidence, or escalate. The host checks the assignment,
 workspace, prompt, policy, expiry and human input control before delivering the
 recorded choice. Workers cannot approve their own requests. The permission
 coordinator runs noninteractively with built-in tools disabled and only its
-assignment's report tool allowed. It escalates when the supplied evidence is
-insufficient. Worker provider modes, global trust settings and credentials
+assignment's report tool allowed. It can request up to eight specific source
+paths for bounded read-only collection and a fresh review when evidence is
+missing. Worker provider modes, global trust settings and credentials
 remain unchanged. Other coordinator providers are not yet supported for this role.
+
+Permission recovery runs before owner escalation. A recognized collapsed Codex
+command may receive a guarded display-only Ctrl+A; this never accepts the
+command. Other incomplete permission dialogs go to the strong coordinator for diagnosis,
+with approval disabled until the ordinary one-shot checks qualify. Recovery
+retains its request identity, attempts, decisions, receipts and observed
+consequences in the sealed run record. An uncertain expansion is not replayed.
+
+PM and mission coordinators receive bounded recovery outcomes so they can make
+an in-scope correction through the existing team controls. Later reviews can
+consult relevant outcomes from the same project. These observations are
+advisory: they cannot grant permission, weaken checks or replace fresh source
+inspection. A delivered answer or expanded dialog does not prove the requested
+command succeeded; execution remains unknown until separate execution evidence
+establishes it.
 
 A request qualifies when its evidence is complete: hook tool input that storage
 did not truncate, or a Codex "Would you like to run the following command?"

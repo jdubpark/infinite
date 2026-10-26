@@ -187,6 +187,14 @@ export interface InputControl {
   actor?: ControlActor;
   leaseId?: string;
 }
+/** Exact screen and assignment identity for a display-only Codex prompt expansion. */
+export interface TeamPermissionExpansionExpectation {
+  promptId: number;
+  promptHash: string;
+  evidenceHash: string;
+  targetCwd: string;
+  expiresAt: string;
+}
 export type WorkerRequest =
   | { op: "state"; screen?: boolean }
   | { op: "native-info" }
@@ -240,6 +248,16 @@ export type WorkerRequest =
       promptHash: string;
       evidenceHash: string;
       option: number;
+      actor: ControlActor;
+      leaseId: string;
+    })
+  | ({
+      /** Host-only expansion of a verified, collapsed Codex command dialog; sends Ctrl+A only. */
+      op: "team-permission-expand";
+      requestId: string;
+      targetSessionId: string;
+      assignment: import("./team-types.js").TeamAssignment;
+      expected: TeamPermissionExpansionExpectation;
       actor: ControlActor;
       leaseId: string;
     })

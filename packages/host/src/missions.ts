@@ -65,6 +65,7 @@ const turnActivity = new Set(["turn-start", "tool-start", "tool-end", "prompt-op
 /** Messages delivered per coordinator attempt; the rest wait for the next attempt. */
 const messageLimit = 30;
 const timeLimitReason = "The approved time limit has expired. Active subteams were cancelled; their workspaces remain available.";
+const messageTooLargeReason = "The next coordinator message cannot fit with the mission state. Its evidence remains queued; no empty coordinator attempt was started.";
 const subtaskStatus = (status: TeamView["status"]) => teamDone.has(status) ? "done" as const : status === "blocked" ? "blocked" as const : status === "cancelled" ? "cancelled" as const : "running" as const;
 const notFound = (error: unknown) => error instanceof TeamError && error.code === "team-not-found";
 
@@ -509,6 +510,18 @@ export class MissionService {
         this.message(stored, `${team.id}:${status}:${team.revision}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status, ...(team.reason ? { reason: team.reason } : {}) });
       for (const decision of team.decisions.filter(item => item.revision === team.revision && !item.answer))
         this.message(stored, `${team.id}:${decision.id}`, { type: "child-decision", subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options });
+      // A permission diagnostic can finish without changing the team's phase. Wake its
+      // supervising coordinator once, with observations rather than approval authority.
+      for (const outcome of team.permissionRecovery?.outcomes ?? []) {
+        if (outcome.revision !== team.revision) continue;
+        const brief = (value: string) => value.slice(0, 240);
+        this.message(stored, `${team.id}:permission-recovery:${outcome.id}`, {
+          type: "permission-recovery", subtaskId: subtask.id, teamId: team.id,
+          outcomeId: outcome.id, status: outcome.status, cause: brief(outcome.cause),
+          action: brief(outcome.action), decision: brief(outcome.decision),
+          consequence: brief(outcome.consequence), execution: "unknown",
+        });
+      }
     }
   }
   private async applyOps(stored: Stored) {
@@ -676,7 +689,23 @@ export class MissionService {
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     // The prompt keeps a byte budget by leaving trailing messages queued, so inbox messages lead and notes are deferred first.
-    const built = missionPromptWithMessageCount(mission, stored.repos, [...inbox, ...notes], revision, profile.provider, profile, { openChildDecisions: this.openChildDecisions(stored), waiting });
+    const context = { openChildDecisions: this.openChildDecisions(stored), waiting };
+    let built = missionPromptWithMessageCount(mission, stored.repos, [...inbox, ...notes], revision, profile.provider, profile, context);
+    if (!built.includedMessageCount && inbox[0]?.type === "permission-recovery") {
+      // Keep the durable outcome in the team record. A large objective must not
+      // repeatedly spend coordinator attempts without delivering the leading message.
+      const first = inbox[0];
+      const compact: MissionMessage = { ...first, cause: "See the subteam permissionRecovery outcome.",
+        action: "", decision: "", consequence: "" };
+      built = missionPromptWithMessageCount(mission, stored.repos, [compact], revision, profile.provider, profile,
+        { ...context, waiting: stored.inbox.length + stored.notes.length - 1 });
+    }
+    if (!built.includedMessageCount) {
+      if (mission.reason !== messageTooLargeReason) this.event(stored, messageTooLargeReason);
+      mission.reason = messageTooLargeReason;
+      return;
+    }
+    if (mission.reason === messageTooLargeReason) mission.reason = undefined;
     const fromInbox = Math.min(built.includedMessageCount, inbox.length), fromNotes = built.includedMessageCount - fromInbox;
     const attempt: Attempt = { memberId: randomUUID(), sessionId: randomUUID(), revision, cursor: 0, stopRequestId: randomUUID(), status: "queued", ownerInputs: stored.ownerInputs ?? 0,
       prompt: built.prompt };

@@ -88,7 +88,8 @@ function DiagramCanvas({ diagram, layout, height, onOpenComponent, onExpand }: {
         transform: gestures.transform,
         transformOrigin: [0, 0, 0],
       }]}>
-      <Svg width={layout.width} height={layout.height} viewBox={`0 0 ${layout.width} ${layout.height}`}>
+      {/* Keyed on the selection: react-native-svg 15 on this runtime does not apply prop updates to mounted nodes, so a remount is the reliable way to redraw. */}
+      <Svg key={selectedId ?? "none"} width={layout.width} height={layout.height} viewBox={`0 0 ${layout.width} ${layout.height}`}>
         <ArrowMarker />
         <Rect x={0} y={0} width={layout.width} height={layout.height} fill="transparent" onPress={() => setSelectedId(undefined)} />
         {diagram.sequence ? layout.lanes?.map(lane => {
@@ -102,19 +103,20 @@ function DiagramCanvas({ diagram, layout, height, onOpenComponent, onExpand }: {
           return <G key={`lane-${lane.id}`}>
             <Line x1={x + w / 2} y1={y + h + 16} x2={x + w / 2} y2={layout.height - 8}
               stroke={theme.colors.rule} strokeWidth={StyleSheet.hairlineWidth} />
-            <G x={x} y={y} opacity={!selectedId || neighborIds.has(lane.id) ? 1 : EDGE_OPACITY} onPress={() => setSelectedId(lane.id)}>
-              <NodeShape shape="box" w={w} h={h} fill={theme.colors.white} stroke={theme.colors.fieldRule} />
-              {lines.map((line, index) => <SvgText key={`line-${index}`} x={w / 2} y={firstBaseline + index * 15}
+            <G x={x} y={y} onPress={() => setSelectedId(lane.id)}>
+              <NodeShape shape="box" w={w} h={h} fill={theme.colors.white} stroke={theme.colors.fieldRule} opacity={!selectedId || neighborIds.has(lane.id) ? 1 : EDGE_OPACITY} />
+              {lines.map((line, index) => <SvgText key={`line-${index}`} x={w / 2} y={firstBaseline + index * 15} opacity={!selectedId || neighborIds.has(lane.id) ? 1 : EDGE_OPACITY}
                 fill={theme.colors.ink} fontSize={12} textAnchor="middle">{line}</SvgText>)}
             </G>
           </G>;
         }) : null}
         {layout.groups.map(group => {
           const related = !selectedId || diagram.nodes.some(node => node.group === group.id && neighborIds.has(node.id));
-          return <G key={`group-${group.id}`} opacity={related ? 1 : EDGE_OPACITY}>
+          const groupOpacity = related ? 1 : EDGE_OPACITY;
+          return <G key={`group-${group.id}`}>
             <Rect x={group.x} y={group.y} width={group.w} height={group.h} rx={10} fill="none" stroke={theme.colors.fieldRule}
-              strokeWidth={1} strokeDasharray="5 4" />
-            <SvgText x={group.x + 9} y={group.y + 14} fill={theme.colors.mutedInk} fontSize={11}>{group.label}</SvgText>
+              strokeWidth={1} strokeDasharray="5 4" opacity={groupOpacity} />
+            <SvgText x={group.x + 9} y={group.y + 14} fill={theme.colors.mutedInk} fontSize={11} opacity={groupOpacity}>{group.label}</SvgText>
           </G>;
         })}
         {layout.edges.map((edge, index) => {
@@ -125,12 +127,12 @@ function DiagramCanvas({ diagram, layout, height, onOpenComponent, onExpand }: {
           const label = diagram.sequence ? `${index + 1}. ${message?.text ?? ""}` : edge.label;
           const labelWidth = label ? Math.max(26, Array.from(label).length * 6.5 + 12) : 0;
           const labelY = edge.labelAt[1] - (diagram.sequence ? 12 : 0);
-          return <G key={`edge-${edge.from}-${edge.to}-${index}`} opacity={opacity}>
-            <Path d={curve(edge.points)} fill="none" stroke={theme.colors.forest} strokeWidth={width}
+          return <G key={`edge-${edge.from}-${edge.to}-${index}`}>
+            <Path d={curve(edge.points)} fill="none" stroke={theme.colors.forest} strokeWidth={width} opacity={opacity}
               strokeDasharray={edge.style === "dashed" ? "6 4" : undefined} markerEnd="url(#arrow)" />
             {label ? <G>
-              <Rect x={edge.labelAt[0] - labelWidth / 2} y={labelY - 10} width={labelWidth} height={20} rx={8} fill={theme.colors.paper} />
-              <SvgText x={edge.labelAt[0]} y={labelY + 4} fill={theme.colors.secondaryInk} fontSize={10} textAnchor="middle">{label}</SvgText>
+              <Rect x={edge.labelAt[0] - labelWidth / 2} y={labelY - 10} width={labelWidth} height={20} rx={8} fill={theme.colors.paper} opacity={opacity} />
+              <SvgText x={edge.labelAt[0]} y={labelY + 4} fill={theme.colors.secondaryInk} fontSize={10} textAnchor="middle" opacity={opacity}>{label}</SvgText>
             </G> : null}
           </G>;
         })}
@@ -150,9 +152,10 @@ function DiagramCanvas({ diagram, layout, height, onOpenComponent, onExpand }: {
               : change === "removed" ? theme.colors.error : theme.colors.fieldRule;
           const lineHeight = 15;
           const firstBaseline = position.h / 2 + 4 - (position.lines.length - 1) * lineHeight / 2;
-          return <G key={`node-${node.id}`} x={position.x} y={position.y} opacity={dimmed ? EDGE_OPACITY : 1} onPress={() => setSelectedId(node.id)}>
-            <NodeShape shape={node.shape} w={position.w} h={position.h} fill={fill} stroke={stroke} dashed={change === "removed"} />
-            {position.lines.map((line, index) => <SvgText key={`line-${index}`} x={position.w / 2} y={firstBaseline + index * lineHeight}
+          const nodeOpacity = dimmed ? EDGE_OPACITY : 1;
+          return <G key={`node-${node.id}`} x={position.x} y={position.y} onPress={() => setSelectedId(node.id)}>
+            <NodeShape shape={node.shape} w={position.w} h={position.h} fill={fill} stroke={stroke} dashed={change === "removed"} opacity={nodeOpacity} />
+            {position.lines.map((line, index) => <SvgText key={`line-${index}`} x={position.w / 2} y={firstBaseline + index * lineHeight} opacity={nodeOpacity}
               fill={theme.colors.ink} fontSize={12} textAnchor="middle" textDecoration={change === "removed" ? "line-through" : "none"}>{line}</SvgText>)}
           </G>;
         })}

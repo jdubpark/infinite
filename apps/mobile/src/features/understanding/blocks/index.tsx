@@ -16,14 +16,13 @@ import { styles } from "./styles";
 
 export { RichText } from "./RichText";
 
-/** Basis for block kinds that carry no basis of their own. Kinds with per-item bases label each item instead. */
+/** Basis for block kinds that carry no basis of their own. Kinds whose items label themselves (facts, rich, links, tasks) are not listed. */
 const IMPLIED_BASIS: Partial<Record<WorkBlock["kind"], Basis>> = {
   components: "source",
-  tasks: "agent",
   checks: "host",
   decisions: "host",
   questions: "model",
-  citations: "model",
+  citations: "source",
 };
 
 /** Renders one block of a work brief. Each block shows its own basis labels. */

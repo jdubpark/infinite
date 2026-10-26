@@ -2,16 +2,18 @@ import { Defs, Ellipse, Marker, Path, Rect } from "react-native-svg";
 import type { DiagramNodeShape } from "@infinite/remote";
 import { theme } from "../../../theme";
 
-export function NodeShape({ shape, w, h, fill, stroke, dashed }: {
+export function NodeShape({ shape, w, h, fill, stroke, dashed, opacity = 1 }: {
   shape: DiagramNodeShape;
   w: number;
   h: number;
   fill: string;
   stroke: string;
   dashed?: boolean;
+  /** Applied per element: group opacity is not reliable across react-native-svg renderers. */
+  opacity?: number;
 }) {
   const strokeDasharray = dashed ? "6 4" : undefined;
-  const common = { fill, stroke, strokeWidth: 1.5, strokeDasharray };
+  const common = { fill, stroke, strokeWidth: 1.5, strokeDasharray, opacity };
 
   switch (shape) {
     case "round":

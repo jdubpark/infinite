@@ -158,7 +158,7 @@ export function createApp(config: Config, key: Buffer) {
   const readings = new Readings(config, key, manager, summarizer);
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
-    onMerged: id => { void projectSource.refresh(id).catch(() => {}); sourceChanged(id); },
+    onMerged: id => void projectSource.refresh(id).then(() => sourceChanged(id), () => sourceChanged(id)),
   });
   const usage = new UsageService(config, key, manager);
   const balances = new BalanceService(config.usage?.accounts ?? {});

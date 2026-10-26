@@ -571,3 +571,18 @@ test("sourceChanged queues a refresh only for enabled workspaces that contain th
   s.runtime.sourceChanged("repo");
   await waitUntil(() => s.runtime.read("workspace").components.length === 2);
 });
+
+test("a change that lands while a job runs queues one more refresh after it", { timeout: 20000 }, async t => {
+  let release: (() => void) | undefined, calls = 0;
+  const s = setup(t, { adapter: { context: async root => { calls++; const context = sampleContext(root); await new Promise<void>(resolvePromise => { release = resolvePromise; }); return context; } } });
+  s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true } });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").maintenance.state === "running" && Boolean(release));
+  s.runtime.sourceChanged("repo");
+  const first = release!; release = undefined; first();
+  await waitUntil(() => calls === 2 && Boolean(release));
+  release!();
+  await waitUntil(() => s.runtime.read("workspace").maintenance.state === "idle");
+  assert.equal(calls, 2);
+  assert.equal(s.runtime.read("workspace").maintenance.jobsToday, 2);
+});

@@ -166,6 +166,8 @@ export class UnderstandingRuntime {
   private state: RuntimeState = { version: 1, day: new Date().toISOString().slice(0, 10), workspaces: {} };
   private queue: string[] = [];
   private queued = new Set<string>();
+  /** Workspaces that were asked to refresh while their job was running; they run once more afterwards. */
+  private dirty = new Set<string>();
   private running = false;
   private closed = false;
   private activeDeadline = 0;
@@ -218,6 +220,7 @@ export class UnderstandingRuntime {
     this.group(workspaceId);
     const maintenance = this.workspace(workspaceId).maintenance;
     if (this.closed) return { ...maintenance, state: "unavailable", message: "Understanding maintenance is shutting down." };
+    if (maintenance.state === "running") this.dirty.add(workspaceId);
     if (maintenance.state === "running" || this.queued.has(workspaceId)) return { ...maintenance, state: "queued", message: "A refresh is already queued for this workspace." };
     const policy = this.options.catalog.read(workspaceId).policy;
     if (this.storageUnavailable) return { ...maintenance, state: "unavailable", message: "Encrypted maintenance state is unavailable; new work is refused until its durable watermark can be loaded." };
@@ -345,6 +348,7 @@ export class UnderstandingRuntime {
         try { await this.runWorkspace(id); }
         catch (error) { this.failWorkspace(id, error); }
         finally { this.activeDeadline = 0; }
+        if (this.dirty.delete(id) && !this.closed) this.refresh(id);
       }
     } finally { this.running = false; }
   }

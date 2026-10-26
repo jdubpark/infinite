@@ -78,7 +78,6 @@ export function repoNameFromPath(path: string): string {
   return parent || name;
 }
 
-/** Prefer the origin remote, then the repository's lowest root commit; nothing when Git cannot answer. */
 /** A GitHub-tracked project names its repository in its source record; the checkout needs no remote and no scan. */
 export function sourceIdentity(project: { id: string; source?: ProjectSource }, at = new Date().toISOString()): CheckoutIdentity | undefined {
   if (project.source?.mode !== "github") return undefined;
@@ -94,6 +93,7 @@ export function expectedIdentity(project: { id: string; path: string; source?: P
   return sourceIdentity(project, at) ?? captureIdentity(project, git, at);
 }
 
+/** Prefer the origin remote, then the repository's lowest root commit; nothing when Git cannot answer. */
 export function captureIdentity(project: { id: string; path: string }, git: GitReader, at = new Date().toISOString()): CheckoutIdentity | undefined {
   const remote = git(project.path, ["config", "--get", "remote.origin.url"]);
   const normalized = remote ? normalizeRemote(remote) : undefined;

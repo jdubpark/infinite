@@ -137,11 +137,11 @@ export class UnderstandingCatalog {
       const value = storedSchema.parse(unseal<unknown>(this.sources.key, `understanding-catalog:${workspaceId}`, raw)) as Stored;
       if (value.workspaceId !== workspaceId) throw new Error("catalog-workspace-mismatch");
       if (value.catalog.policy.editedAt === undefined) {
-        // One-time migration: records saved before edits were stamped lack the key. Maintenance was off by default then,
-        // so a stored policy that is on was the owner's doing and keeps its flags under the owner's stamp; any other
-        // policy takes the default-on switches. The owner's interval and daily limit stay either way.
-        const ownerEnabled = value.catalog.policy.enabled === true;
-        value.catalog.policy = ownerEnabled
+        // One-time migration: records saved before edits were stamped lack the key. Only an owner edit writes the policy
+        // binding, so a legacy record with one keeps its flags under the owner's stamp; any other record takes the
+        // default-on switches. The owner's interval and daily limit stay either way.
+        const ownerEdited = value.policyBinding.length > 0;
+        value.catalog.policy = ownerEdited
           ? { ...value.catalog.policy, editedAt: new Date().toISOString(), editedBy: "owner" }
           : { ...value.catalog.policy, enabled: defaults.enabled, synthesis: defaults.synthesis, delivery: defaults.delivery, editedAt: new Date().toISOString(), editedBy: "migration" };
         try { this.persist(workspaceId, value); } catch { /* keep the migrated policy in memory; it retries on the next load */ }

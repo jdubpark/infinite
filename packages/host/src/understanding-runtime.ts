@@ -786,7 +786,7 @@ export class UnderstandingRuntime {
     } catch { return false; }
   }
   private failWorkspace(workspaceId: string, error: unknown) {
-    const reason = (error instanceof Error && BINDING_REASONS[error.message]) || failureReason(error), at = new Date().toISOString();
+    const reason = (error instanceof Error && Object.hasOwn(BINDING_REASONS, error.message) && BINDING_REASONS[error.message]) || failureReason(error), at = new Date().toISOString();
     console.error(`[Infinite] Understanding maintenance failed · workspace ${workspaceId} · ${reason}`);
     const old = this.workspace(workspaceId);
     old.failureCount = Math.min(20, old.failureCount + 1);

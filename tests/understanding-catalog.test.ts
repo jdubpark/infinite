@@ -323,36 +323,31 @@ test("a repository set change keeps an owner's policy, disabled or enabled", () 
   }
 });
 
-test("a policy the owner turned on under the old disabled default migrates under the owner's stamp and survives a repository set change", () => {
-  const f = fixture();
-  try {
-    f.make().mutate("workspace", "policy", undefined, request(0, "update", { enabled: true, synthesis: true, delivery: false, intervalMinutes: 45, dailyJobLimit: 7 }), emptyContext);
-    // Strip the stamp as records saved before stamping looked; the next load migrates it and keeps the policy binding.
-    const stored = unseal<{ catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
-    delete stored.catalog.policy.editedAt; delete stored.catalog.policy.editedBy;
-    writeSealed(f.file, f.key, "understanding-catalog:workspace", stored);
-    addRepository(f);
-    const policy = f.reopen().read("workspace").policy;
-    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit, policy.editedBy], [true, true, false, 45, 7, "owner"]);
-    assert.match(policy.editedAt ?? "", /^\d{4}-/);
-  } finally { f.cleanup(); }
+test("a legacy record with a policy binding was an owner edit: it keeps its flags under the owner's stamp across a repository set change", () => {
+  for (const value of [{ enabled: true, synthesis: true, delivery: false, intervalMinutes: 45, dailyJobLimit: 7 }, { enabled: false, synthesis: false, delivery: false, intervalMinutes: 30, dailyJobLimit: 10 }]) {
+    const f = fixture();
+    try {
+      f.make().mutate("workspace", "policy", undefined, request(0, "update", value), emptyContext);
+      // Strip the stamp as records saved before stamping looked; the next load migrates it and keeps the policy binding.
+      const stored = unseal<{ catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
+      delete stored.catalog.policy.editedAt; delete stored.catalog.policy.editedBy;
+      writeSealed(f.file, f.key, "understanding-catalog:workspace", stored);
+      addRepository(f);
+      const policy = f.reopen().read("workspace").policy;
+      assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit, policy.editedBy], [value.enabled, value.synthesis, value.delivery, value.intervalMinutes, value.dailyJobLimit, "owner"]);
+      assert.match(policy.editedAt ?? "", /^\d{4}-/);
+    } finally { f.cleanup(); }
+  }
 });
 
-test("a policy the default-on migration stamped stays on across a repository set change; an unstamped policy turns off", () => {
+test("a legacy record nobody edited migrates to the default-on policy and stays on across a repository set change", () => {
   const f = fixture();
   try {
-    f.make().mutate("workspace", "policy", undefined, request(0, "update", { enabled: false, synthesis: false, delivery: false, intervalMinutes: 45, dailyJobLimit: 7 }), emptyContext);
-    const stored = unseal<{ catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
-    delete stored.catalog.policy.editedAt; delete stored.catalog.policy.editedBy;
-    writeSealed(f.file, f.key, "understanding-catalog:workspace", stored);
+    f.writeStoredPolicy({ enabled: false, synthesis: false, delivery: false, intervalMinutes: 45, dailyJobLimit: 7 });
+    assert.equal(f.reopen().read("workspace").policy.editedBy, "migration");
     addRepository(f);
-    const migrated = f.reopen().read("workspace").policy;
-    assert.deepEqual([migrated.enabled, migrated.synthesis, migrated.delivery, migrated.intervalMinutes, migrated.dailyJobLimit, migrated.editedBy], [true, true, true, 45, 7, "migration"]);
-    // A stamp of null is what a record looks like when no edit and no migration ever touched it.
-    const reread = unseal<{ catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
-    reread.catalog.policy = { ...reread.catalog.policy, enabled: true, editedAt: null, editedBy: null };
-    writeSealed(f.file, f.key, "understanding-catalog:workspace", reread);
-    assert.equal(f.reopen().read("workspace").policy.enabled, false);
+    const policy = f.reopen().read("workspace").policy;
+    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit, policy.editedBy], [true, true, true, 45, 7, "migration"]);
   } finally { f.cleanup(); }
 });
 

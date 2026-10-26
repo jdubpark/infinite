@@ -27,7 +27,11 @@ const MAX_EVIDENCE = 40;
 const MAX_EVIDENCE_TEXT = 2000;
 const MAX_PLANS_PER_COMPONENT = 100;
 const MAX_ATTEMPT_MS = 10 * 60_000;
+/** Floor of the time an attempt keeps for the final source re-check; at most a fifth of the attempt. */
+const RECHECK_RESERVE_MS = 5000;
 const STATE_SCOPE = "understanding-runtime";
+/** Errors that mean an engine call ran out of time rather than produced a wrong answer. */
+const isDeadline = (error: unknown) => error instanceof Error && /^(?:understanding-attempt-deadline|understanding-timeout|understanding-process-timeout)(?:\s|$)/.test(error.message);
 export const understandingOutputLimits = { differenceSummary: 5000, pullRequestTitle: 2000, environment: 200, url: 2048 } as const;
 
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -95,6 +99,11 @@ type RuntimeState = {
   version: 1; day: string; workspaces: Record<string, { jobsToday: number; failureCount: number; synthesisCursor: string | null; repositories: Record<string, StoredRepository>; maintenance: KnowledgeMaintenance; updatedAt: string | null }>;
 };
 type SourceBinding = { group: ProjectGroup; repo: ProjectGroupRepo; root: string; rootIdentity: string; membership: string; projects: string[] };
+/** One maintenance attempt's working set, shared by its steps. `hooked` repositories hold engine output that the final re-check must confirm. */
+type Attempt = {
+  workspaceId: string; group: ProjectGroup; bindings: SourceBinding[]; repos: Record<string, StoredRepository>;
+  captured: Set<string>; hooked: Set<string>; partial: string[]; reserveMs: number;
+};
 
 function emptyDelivery(repositoryId: string): KnowledgeDelivery {
   return { repositoryId, state: "unavailable", observedAt: null, pullRequests: [], environments: [], coverage: ["Provider delivery data is not configured."] };
@@ -343,8 +352,7 @@ export class UnderstandingRuntime {
     try {
       while (!this.closed && this.queue.length) {
         const id = this.queue.shift()!; this.queued.delete(id);
-        const configured = this.options.config.repositoryBriefings?.timeoutMs ?? 30_000;
-        this.activeDeadline = Date.now() + Math.min(MAX_ATTEMPT_MS, Math.max(1000, configured));
+        this.activeDeadline = Date.now() + this.attemptMs();
         try { await this.runWorkspace(id); }
         catch (error) { this.failWorkspace(id, error); }
         finally { this.activeDeadline = 0; }
@@ -370,6 +378,7 @@ export class UnderstandingRuntime {
     const repos: Record<string, StoredRepository> = structuredClone(workspaceState.repositories);
     const partial: string[] = [];
     const capturedRepositories = new Set<string>();
+    const captureStarted = Date.now();
     for (const binding of bindings) {
       if (this.closed) throw new Error("closed");
       try {
@@ -379,33 +388,15 @@ export class UnderstandingRuntime {
       } catch (error) { partial.push(`Repository ${binding.repo.name}: ${failureReason(error)}`); }
     }
     if (!this.membershipStillCurrent(workspaceId, groupAtStart, bindings)) throw new Error("workspace-rebound");
+    // The final re-check repeats each capture, so engine steps leave it about twice the capture time.
+    const reserveMs = Math.max(2 * (Date.now() - captureStarted), Math.min(RECHECK_RESERVE_MS, Math.floor(this.attemptMs() / 5)));
     const hookedRepos = new Set<string>();
+    const job: Attempt = { workspaceId, group: groupAtStart, bindings, repos, captured: capturedRepositories, hooked: hookedRepos, partial, reserveMs };
+    // The captured source maps without this attempt's engine output; a repository that cannot be re-checked publishes this.
+    const beforeHooks = new Map([...capturedRepositories].map(id => [id, structuredClone(repos[id])]));
     const currentPolicy = this.options.catalog.read(workspaceId).policy;
     let nextSynthesisCursor = workspaceState.synthesisCursor;
-    if (currentPolicy.synthesis && this.adapter.brief) {
-      for (const binding of bindings) {
-        const observation = repos[binding.repo.projectId];
-        if (!observation || !capturedRepositories.has(binding.repo.projectId) || observation.briefFingerprint === observation.fingerprint) continue;
-        const components = observation.components.filter(component => !component.retired);
-        hookedRepos.add(binding.repo.projectId);
-        try {
-          if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-before-brief");
-          const result = await this.invoke(binding.root, options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.brief?.head ?? null, components: components.map(({ id, name }) => ({ id, name })) }, options));
-          if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-after-brief");
-          const observedAt = new Date().toISOString();
-          const stored = storedBriefSchema.parse({
-            head: result.head, base: result.base, generatedAt: result.generatedAt, observedAt, brief: result.brief,
-            diagrams: result.diagrams.map((diagram, index) => linkDiagramNodes(diagramFromMermaid({ id: `${binding.repo.projectId}:${index}`, title: diagram.title, kind: diagram.kind, mermaid: diagram.mermaid, repositoryId: binding.repo.projectId, head: result.head, observedAt }), components)),
-            evidence: result.evidence.slice(0, MAX_EVIDENCE).map(item => ({ ...item, text: item.text.slice(0, MAX_EVIDENCE_TEXT) })), coverage: result.coverage,
-          });
-          observation.brief = stored; observation.briefFingerprint = observation.fingerprint; observation.briefFailure = null;
-        } catch (error) {
-          if (this.closed) throw error;
-          observation.briefFailure = failureReason(error);
-          partial.push(`Repository ${binding.repo.name}: brief unavailable: ${observation.briefFailure}`);
-        }
-      }
-    }
+    if (currentPolicy.synthesis && this.adapter.brief) await this.briefRepositories(job);
     if (currentPolicy.synthesis && this.adapter.synthesize) {
       const pending: { key: string; binding: SourceBinding; observation: StoredRepository; component: KnowledgeComponent; plans: KnowledgePlan[] }[] = [];
       for (const binding of bindings) {
@@ -417,7 +408,10 @@ export class UnderstandingRuntime {
       const start = pending.findIndex(item => item.key > (workspaceState.synthesisCursor ?? ""));
       const ordered = start < 0 ? pending : [...pending.slice(start), ...pending.slice(0, start)];
       const selected = ordered.slice(0, MAX_HOOK_COMPONENTS);
+      /** Key of the first component refused for lack of time; the cursor stops before it so the next job resumes there. */
+      let interrupted: string | undefined;
       for (const entry of selected) {
+        if (interrupted) break;
         const { binding, observation } = entry;
         const sameRepository = selected.filter(item => item.binding.repo.projectId === binding.repo.projectId);
         if (sameRepository[0] !== entry) continue;
@@ -434,18 +428,29 @@ export class UnderstandingRuntime {
         const output: { components: KnowledgeComponent[]; coverage: string[] } = { components: [], coverage: [] };
         for (const component of selectedComponents) {
           if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-before-synthesis");
-          const result = await this.invoke(binding.root, options => this.adapter.synthesize!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, components: [component], plans: entry.plans.filter(plan => plan.componentId === component.id) }, options));
+          let result: { components: KnowledgeComponent[]; coverage: string[] };
+          try {
+            result = await this.invoke(binding.root, options => this.adapter.synthesize!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, components: [component], plans: entry.plans.filter(plan => plan.componentId === component.id) }, options), MAX_OUTPUT_BYTES, { reserveMs });
+          } catch (error) {
+            if (this.closed || !isDeadline(error)) throw error;
+            // Out of time: keep the components already explained and publish the source map.
+            partial.push(`Repository ${binding.repo.name}: synthesis unavailable: ${failureReason(error)}`);
+            interrupted = `${binding.repo.projectId}:${component.id}`;
+            break;
+          }
           if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-after-synthesis");
           z.array(z.string().max(1000)).max(100).parse(result.coverage);
           if (result.components.length !== 1 || result.components[0].id !== component.id) throw new Error("incomplete-synthesis");
           output.components.push(...result.components);
           output.coverage = [...new Set([...output.coverage, ...result.coverage])].slice(0, 100);
         }
+        if (!output.components.length) continue;
         if (Buffer.byteLength(JSON.stringify(output)) > MAX_OUTPUT_BYTES) throw new Error("synthesis-output-too-large");
         hookedRepos.add(binding.repo.projectId);
         const returned = new Map(output.components.map(component => [component.id, component]));
         for (const component of selectedComponents) {
-          const synthesized = returned.get(component.id)!;
+          const synthesized = returned.get(component.id);
+          if (!synthesized) continue; // Refused for lack of time; it stays pending.
           const expectedPlanRevisions = component.planned.map(plan => ({ id: plan.id, revision: plan.revision })).sort((a, b) => a.id.localeCompare(b.id));
           const returnedPlanRevisions = synthesized.difference.planRevisions.map(plan => ({ id: plan.id, revision: plan.revision })).sort((a, b) => a.id.localeCompare(b.id));
           const generatedAt = synthesized.current.generatedAt ? Date.parse(synthesized.current.generatedAt) : Number.NaN;
@@ -469,12 +474,22 @@ export class UnderstandingRuntime {
       if (pending.length > selected.length) {
         for (const entry of pending) entry.observation.synthesisCoverage = [...new Set([...entry.observation.synthesisCoverage, `Synthesis is pending for additional components; this workspace refresh admits at most ${MAX_HOOK_COMPONENTS} component briefs.`])].slice(0, 100);
       }
-      if (selected.length) nextSynthesisCursor = selected.at(-1)!.key;
+      if (interrupted) {
+        const at = selected.findIndex(item => item.key === interrupted);
+        if (at > 0) nextSynthesisCursor = selected[at - 1].key;
+      } else if (selected.length) nextSynthesisCursor = selected.at(-1)!.key;
     }
     if (currentPolicy.delivery && this.adapter.delivery) {
       for (const binding of bindings) {
         const observation = repos[binding.repo.projectId]; if (!observation || !this.boundStillCurrent(workspaceId, groupAtStart, binding)) continue;
-        const value = await this.invoke(binding.root, options => this.adapter.delivery!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, head: observation.head }, options));
+        let value: KnowledgeDelivery;
+        try {
+          value = await this.invoke(binding.root, options => this.adapter.delivery!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, head: observation.head }, options), MAX_OUTPUT_BYTES, { reserveMs });
+        } catch (error) {
+          if (this.closed || !isDeadline(error)) throw error;
+          partial.push(`Repository ${binding.repo.name}: delivery unavailable: ${failureReason(error)}`);
+          continue;
+        }
         hookedRepos.add(binding.repo.projectId);
         if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-after-delivery");
         if (value.repositoryId !== binding.repo.projectId) throw new Error("delivery-repository-mismatch");
@@ -485,7 +500,18 @@ export class UnderstandingRuntime {
       if (!this.adapter.context) throw new Error("source-revalidation-unavailable");
       for (const binding of bindings.filter(item => hookedRepos.has(item.repo.projectId))) {
         const observation = repos[binding.repo.projectId]; if (!observation) continue;
-        const fresh = parseRepoContext(await this.invoke(binding.root, options => this.adapter.context!(binding.root, options), MAX_CONTEXT_BYTES));
+        let fresh: RepoContext;
+        try {
+          fresh = parseRepoContext(await this.invoke(binding.root, options => this.adapter.context!(binding.root, options), MAX_CONTEXT_BYTES));
+        } catch (error) {
+          const before = beforeHooks.get(binding.repo.projectId);
+          if (this.closed || !isDeadline(error) || !before) throw error;
+          // Unconfirmed engine output is dropped; the captured source map still publishes.
+          repos[binding.repo.projectId] = before;
+          hookedRepos.delete(binding.repo.projectId);
+          partial.push(`Repository ${binding.repo.name}: source re-check unavailable: ${failureReason(error)}`);
+          continue;
+        }
         const freshFingerprint = digest({ head: fresh.head, files: Object.entries(fresh.files).sort(([a], [b]) => a.localeCompare(b)) });
         if (realpathSync(fresh.repo) !== binding.root || freshFingerprint !== observation.fingerprint || fresh.head !== observation.head || !this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-generation-changed-during-hook");
       }
@@ -509,6 +535,37 @@ export class UnderstandingRuntime {
     const next: RuntimeState = { ...this.state, workspaces: { ...this.state.workspaces, [workspaceId]: { ...workspaceState, failureCount: failedAttempts, synthesisCursor: nextSynthesisCursor, repositories: repos, maintenance: { ...workspaceState.maintenance, state: partial.length ? "failed" : "idle", lastPublishedAt: publishedAt, nextAttemptAt: partial.length ? new Date(Date.now() + retryDelay).toISOString() : null, jobsToday: workspaceState.jobsToday, dailyJobLimit: currentPolicy.dailyJobLimit, message: partial.length ? `Last attempt failed at ${publishedAt}: ${failure}.` : null, lastFailure: partial.length ? { at: publishedAt, reason: failure } : null }, updatedAt: new Date().toISOString() } } };
     const before = this.state; this.state = next; this.persist();
     if (this.storageUnavailable) { this.state = before; throw new Error("runtime-store-full"); }
+  }
+
+  /**
+   * Briefs each captured repository whose fingerprint moved since its stored brief. A failure, including running
+   * out of time, becomes a partial line and keeps the source map; only a stored brief needs the final re-check.
+   */
+  private async briefRepositories(attempt: Attempt): Promise<void> {
+    const { workspaceId, group, bindings, repos, captured, hooked, partial, reserveMs } = attempt;
+    for (const binding of bindings) {
+      const observation = repos[binding.repo.projectId];
+      if (!observation || !captured.has(binding.repo.projectId) || observation.briefFingerprint === observation.fingerprint) continue;
+      const components = observation.components.filter(component => !component.retired);
+      try {
+        if (!this.boundStillCurrent(workspaceId, group, binding)) throw new Error("source-rebound-before-brief");
+        // Each brief gets at most half of the time left after the re-check reserve, so later steps keep a share.
+        const result = await this.invoke(binding.root, options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.brief?.head ?? null, components: components.map(({ id, name }) => ({ id, name })) }, options), MAX_OUTPUT_BYTES, { reserveMs, share: 0.5 });
+        if (!this.boundStillCurrent(workspaceId, group, binding)) throw new Error("source-rebound-after-brief");
+        const observedAt = new Date().toISOString();
+        const stored = storedBriefSchema.parse({
+          head: result.head, base: result.base, generatedAt: result.generatedAt, observedAt, brief: result.brief,
+          diagrams: result.diagrams.map((diagram, index) => linkDiagramNodes(diagramFromMermaid({ id: `${binding.repo.projectId}:${index}`, title: diagram.title, kind: diagram.kind, mermaid: diagram.mermaid, repositoryId: binding.repo.projectId, head: result.head, observedAt }), components)),
+          evidence: result.evidence.slice(0, MAX_EVIDENCE).map(item => ({ ...item, text: item.text.slice(0, MAX_EVIDENCE_TEXT) })), coverage: result.coverage,
+        });
+        observation.brief = stored; observation.briefFingerprint = observation.fingerprint; observation.briefFailure = null;
+        hooked.add(binding.repo.projectId);
+      } catch (error) {
+        if (this.closed) throw error;
+        observation.briefFailure = failureReason(error);
+        partial.push(`Repository ${binding.repo.name}: brief unavailable: ${observation.briefFailure}`);
+      }
+    }
   }
 
   private async capture(workspaceId: string, binding: SourceBinding, catalog: KnowledgeCatalog): Promise<StoredRepository> {
@@ -627,15 +684,24 @@ export class UnderstandingRuntime {
     return knowledgeComponentStateSchema.parse({ ...value, pinned: original.pinned, retired: original.retired, redirectTo: original.redirectTo, planned: original.planned, featureIds: original.featureIds, history: original.history }) as KnowledgeComponent;
   }
 
-  private async invoke<T>(root: string, callback: (options: UnderstandingAdapterOptions) => Promise<T>, maxBytes = MAX_OUTPUT_BYTES): Promise<T> {
-    const configured = Math.min(MAX_ATTEMPT_MS, Math.max(1000, this.options.config.repositoryBriefings?.timeoutMs ?? 30_000));
+  /** One attempt's whole time budget; a single engine call is also capped by it. */
+  private attemptMs() { return Math.min(MAX_ATTEMPT_MS, Math.max(1000, this.options.config.repositoryBriefings?.timeoutMs ?? 30_000)); }
+
+  /**
+   * Runs one engine call inside the attempt deadline. `reserveMs` is kept back for the final re-check and
+   * `share` limits the call to that fraction of what is left after the reserve.
+   */
+  private async invoke<T>(root: string, callback: (options: UnderstandingAdapterOptions) => Promise<T>, maxBytes = MAX_OUTPUT_BYTES, window: { reserveMs?: number; share?: number } = {}): Promise<T> {
+    const configured = this.attemptMs();
     const remaining = this.activeDeadline ? this.activeDeadline - Date.now() : configured;
-    if (remaining <= 0) throw new Error("understanding-attempt-deadline");
+    const available = Math.floor((remaining - (window.reserveMs ?? 0)) * (window.share ?? 1));
+    if (available <= 0) throw new Error("understanding-attempt-deadline");
     const controller = new AbortController(); this.controllers.add(controller);
-    const timeoutMs = Math.min(configured, remaining);
+    const timeoutMs = Math.min(configured, available);
     let timer: NodeJS.Timeout | undefined;
     try {
-      const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("understanding-timeout")); }, timeoutMs); timer.unref(); });
+      // Reject before aborting: an adapter that rejects on abort must not replace the timeout as the reason.
+      const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { reject(new Error("understanding-timeout")); controller.abort(); }, timeoutMs); timer.unref(); });
       const result = await Promise.race([callback({ signal: controller.signal, timeoutMs, maxBytes }), timeout]);
       if (Buffer.byteLength(JSON.stringify(result)) > maxBytes) throw new Error("understanding-output-too-large");
       return result;

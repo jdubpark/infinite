@@ -3,12 +3,14 @@ import { execFileSync } from "node:child_process";
 
 // Stands in for the Jevcode engine: answers `context` and `brief` for the runtime tests.
 // Mode "brief-fail" makes only the `brief` subcommand exit 1.
+// UNDERSTANDING_FIXTURE_BRIEF_SLEEP_MS makes `brief` wait that long first, so the host's deadline stops it.
 const args = process.argv.slice(2);
 const mode = args[0];
 const subcommand = args.find(arg => arg === "context" || arg === "brief");
 const repo = args[args.indexOf("--repo") + 1];
 if (!repo) process.exit(2);
 if (subcommand === "brief" && (mode === "brief-fail" || process.env.UNDERSTANDING_FIXTURE_BRIEF_FAIL)) process.exit(1);
+if (subcommand === "brief" && process.env.UNDERSTANDING_FIXTURE_BRIEF_SLEEP_MS) await new Promise(resolve => setTimeout(resolve, Number(process.env.UNDERSTANDING_FIXTURE_BRIEF_SLEEP_MS)));
 const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 const files = {
   "src/a.ts": { hash: "a".repeat(40), lines: 3 },

@@ -44,8 +44,8 @@ function setup(t: test.TestContext, options: { adapter?: UnderstandingAdapter; p
   t.after(async () => { await runtime.close(); rmSync(base, { recursive: true, force: true }); });
   return { runtime, root, secondRoot, stateDir, group, config, setCatalog(value: KnowledgeCatalog) { currentCatalog = value; } };
 }
-async function waitUntil(predicate: () => boolean) {
-  const end = Date.now() + 3000;
+async function waitUntil(predicate: () => boolean, ms = 3000) {
+  const end = Date.now() + ms;
   while (Date.now() < end) { if (predicate()) return; await new Promise(resolvePromise => setTimeout(resolvePromise, 10)); }
   assert.fail("timed out waiting for Understanding maintenance");
 }
@@ -121,8 +121,9 @@ test("a failed job records a readable reason and clears it on the next success",
 });
 
 for (const { configuredMs, expectedBudgets } of [
-  { configuredMs: 180_000, expectedBudgets: [180_000, 60_000] },
-  { configuredMs: 600_000, expectedBudgets: [600_000, 480_000] },
+  // Each engine call leaves the 5 s re-check reserve; the mocked clock makes the capture take no time.
+  { configuredMs: 180_000, expectedBudgets: [175_000, 55_000] },
+  { configuredMs: 600_000, expectedBudgets: [595_000, 475_000] },
 ]) test(`workspace synthesis shares the ${configuredMs}ms deadline between component invocations and rotates repositories`, { timeout: 30000 }, async t => {
   const calls: string[][] = [];
   const budgets: number[] = [];
@@ -168,7 +169,11 @@ for (const { configuredMs, expectedBudgets } of [
   assert.equal(exhausted.maintenance.state, "failed");
   assert.equal(exhausted.maintenance.jobsToday, 3);
   assert.equal(calls.length, 5, "the exhausted workspace deadline must refuse the next component callback");
-  assert.deepEqual(exhausted.components, published.components, "an exhausted attempt must not publish a partial generation");
+  assert.match(exhausted.maintenance.message ?? "", /Repository Repository: synthesis unavailable: understanding-attempt-deadline/);
+  const changed = exhausted.components.filter(component => component.repositoryIds.includes("repo"));
+  assert.deepEqual(changed.map(component => component.current.state).sort(), ["mapped", "ready"], "the explained component publishes; the refused one keeps the new source map");
+  assert.ok(changed.every(component => component.current.snapshotId !== published.components.find(item => item.id === component.id)!.current.snapshotId), "the new source map is published");
+  assert.deepEqual(exhausted.components.filter(component => component.repositoryIds.includes("repo-two")), published.components.filter(component => component.repositoryIds.includes("repo-two")));
 });
 
 test("a source fingerprint change during synthesis rejects the candidate generation", { timeout: 20000 }, async t => {
@@ -538,6 +543,58 @@ test("a failing brief step keeps the source map and records the brief reason", {
   assert.equal(read.briefs?.length ?? 0, 0);
   assert.equal(read.diagrams![0].kind, "components");
   assert.match(read.maintenance.message ?? "", /brief unavailable: exit 1/);
+});
+
+test("a brief that runs out of time keeps the source map and component diagram, and a later refresh publishes the brief", { timeout: 30000 }, async t => {
+  const s = setup(t, { briefProcess: true });
+  s.config.repositoryBriefings!.timeoutMs = 4000;
+  s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
+  process.env.UNDERSTANDING_FIXTURE_BRIEF_SLEEP_MS = "20000";
+  t.after(() => { delete process.env.UNDERSTANDING_FIXTURE_BRIEF_SLEEP_MS; });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").maintenance.state === "failed", 15000);
+  const failed = s.runtime.read("workspace");
+  assert.equal(failed.components.length, 2);
+  assert.ok(failed.diagrams?.some(diagram => diagram.id === "components:repo" && diagram.kind === "components"));
+  assert.equal(failed.briefs?.length ?? 0, 0);
+  assert.match(failed.maintenance.message ?? "", /Repository Repository: brief unavailable: understanding-timeout/);
+  delete process.env.UNDERSTANDING_FIXTURE_BRIEF_SLEEP_MS;
+  s.runtime.refresh("workspace");
+  await waitUntil(() => (s.runtime.read("workspace").briefs?.length ?? 0) === 1, 15000);
+  assert.equal(s.runtime.read("workspace").briefs![0].state, "ready");
+});
+
+const quickBrief: NonNullable<UnderstandingAdapter["brief"]> = async input => ({ head: input.context.head, base: null, generatedAt: new Date().toISOString(),
+  brief: { summary: "Fast brief.", architecture: [], changes: [], checks: [], review: [], guidance: [], unknowns: [] }, diagrams: [], evidence: [], coverage: [] });
+const untilAborted = <T>(options: { signal: AbortSignal }) => new Promise<T>((_, reject) => options.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+
+test("a stored brief and the source map publish when synthesis runs past the deadline", { timeout: 30000 }, async t => {
+  const s = setup(t, { processFixture: true, adapter: { context: async root => sampleContext(root), brief: quickBrief, synthesize: (_input, options) => untilAborted(options) } });
+  s.config.repositoryBriefings!.timeoutMs = 2000;
+  s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 10000);
+  const read = s.runtime.read("workspace");
+  assert.equal(read.maintenance.state, "failed");
+  assert.match(read.maintenance.message ?? "", /Repository Repository: synthesis unavailable: understanding-timeout/);
+  assert.deepEqual(read.briefs?.map(brief => brief.brief.summary), ["Fast brief."]);
+  assert.equal(read.components.length, 2);
+  assert.ok(read.diagrams?.some(diagram => diagram.id === "components:repo"));
+});
+
+test("a re-check that runs out of time publishes the source map without the unconfirmed brief", { timeout: 30000 }, async t => {
+  let captures = 0;
+  const s = setup(t, { processFixture: true, adapter: { context: async (root, options) => ++captures === 2 ? untilAborted(options) : sampleContext(root), brief: quickBrief } });
+  s.config.repositoryBriefings!.timeoutMs = 2000;
+  s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 10000);
+  const read = s.runtime.read("workspace");
+  assert.equal(captures, 2);
+  assert.equal(read.maintenance.state, "failed");
+  assert.match(read.maintenance.message ?? "", /Repository Repository: source re-check unavailable: understanding-timeout/);
+  assert.equal(read.briefs?.length ?? 0, 0);
+  assert.equal(read.components.length, 2);
 });
 
 test("sealed state from before the repository brief, with a legacy previousHead key, still loads", { timeout: 20000 }, async t => {

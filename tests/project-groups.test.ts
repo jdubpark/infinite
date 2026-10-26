@@ -548,6 +548,22 @@ test("a retired group id never aliases its replacement, and a prototype-named ch
   }
 });
 
+test("a scanned identity gives way to the source record once the project follows GitHub, and the group keeps its id", () => {
+  const f = fixture();
+  try {
+    const before = f.service().list().groups.find(group => group.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === "linear-one")))!;
+    assert.equal(before.repos[0]!.key, "root:aaaa");
+    f.config.projects.find(project => project.id === "linear-one")!.source = { mode: "github", repository: "example/linear", baseBranch: "main" };
+    const after = f.service().list().groups.find(group => group.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === "linear-one")))!;
+    assert.equal(after.id, before.id);
+    assert.equal(after.repos[0]!.key, "remote:github.com/example/linear");
+    assert.equal(after.repos[0]!.checkouts.find(checkout => checkout.projectId === "linear-one")?.identityFrom, "source");
+    assert.equal(f.service().list().groups.find(group => group.id === before.id)!.repos[0]!.key, "remote:github.com/example/linear", "the refreshed identity persists");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("a GitHub-tracked project takes its identity from the source record without scanning", () => {
   const f = fixture();
   try {

@@ -205,10 +205,13 @@ export class ProjectGroupService {
     const identities = { ...this.identities };
     const time = this.clock();
     for (const project of this.config.projects) {
-      if (own(identities, project.id)) continue;
+      const known = own(identities, project.id), source = this.sourceIdentity(project);
+      // A scanned identity gives way to the source record once the project follows GitHub: the record names the
+      // repository the host fetches, and the checkout's own metadata may carry no remote at all.
+      if (known && !(source && known.from === "host-scan" && known.key !== source.key)) continue;
       const attemptedAt = this.failedCaptureAt.get(project.id);
       if (attemptedAt !== undefined && time - attemptedAt < 60_000) continue;
-      const captured = this.sourceIdentity(project) ?? captureIdentity(project, this.git, this.timestamp());
+      const captured = source ?? captureIdentity(project, this.git, this.timestamp());
       if (captured) {
         identities[project.id] = captured;
         this.failedCaptureAt.delete(project.id);

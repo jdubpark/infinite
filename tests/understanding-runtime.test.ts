@@ -698,3 +698,16 @@ test("a spent daily budget is recorded once and later ticks leave the store alon
   assert.equal(readFileSync(file, "utf8"), sealed, "budget-limited ticks do not rewrite the encrypted store");
   assert.equal(s.runtime.read("workspace").maintenance.state, "budget-limited");
 });
+
+test("an engine that exits with an error line on stderr reports that line as the reason", { timeout: 30000 }, async t => {
+  for (const { mode, reason } of [
+    { mode: "brief-stderr", reason: "Repository Repository: brief unavailable: exit 1 · fixture writer: model quota exhausted" },
+    { mode: "context-stderr", reason: "Repository Repository: context-process-failed · fixture context: repository index is locked" },
+  ]) await t.test(mode, async t => {
+    const s = setup(t, { briefProcess: true, fixtureMode: mode });
+    s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
+    s.runtime.refresh("workspace");
+    await waitUntil(() => s.runtime.read("workspace").maintenance.state === "failed", 10000);
+    assert.ok(s.runtime.read("workspace").maintenance.lastFailure?.reason.includes(reason), s.runtime.read("workspace").maintenance.lastFailure?.reason);
+  });
+});

@@ -5,6 +5,7 @@ import { isAbsolute, relative, sep } from "node:path";
 import { z } from "zod";
 import type { UnderstandingBrief, KnowledgeClaim, KnowledgeComponent, KnowledgeDelivery, KnowledgeEnvironment, KnowledgePlan, KnowledgePullRequest } from "@infinite/remote";
 import { captureIdentity, normalizeRemote, readGit } from "./checkout-identity.js";
+import { failureReason } from "./failure-reason.js";
 import { createContextAdapter, understandingOutputLimits, type RepoContext, type RepositoryBriefOutput, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
 import type { Config } from "./types.js";
 
@@ -68,13 +69,16 @@ function validateBrief(value: unknown, root: string, context: RepoContext): Brie
 function run(command: string, args: string[], options: UnderstandingAdapterOptions & { cwd: string; timeoutMs?: number; maxBytes?: number }): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    try { child = spawn(command, args, { cwd: options.cwd, stdio: ["ignore", "pipe", "ignore"], detached: process.platform !== "win32" }); }
+    try { child = spawn(command, args, { cwd: options.cwd, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("understanding-process-unavailable")); return; }
-    let output = Buffer.alloc(0), reason: string | undefined, closed: number | null | undefined, escalated = false, settled = false;
+    let output = Buffer.alloc(0), stderrTail = Buffer.alloc(0), reason: string | undefined, closed: number | null | undefined, escalated = false, settled = false;
     const finish = () => {
       if (settled || closed === undefined || (reason && !escalated)) return;
       settled = true; clearTimeout(timer); options.signal.removeEventListener("abort", abort);
-      if (reason || closed !== 0) rejectPromise(new Error(reason ?? `exit ${closed}`)); else resolvePromise(output.toString("utf8"));
+      if (!reason && closed === 0) { resolvePromise(output.toString("utf8")); return; }
+      // A failed exit or the runner's own timeout carries the engine's last stderr line.
+      const failure = new Error(reason ?? `exit ${closed}`);
+      rejectPromise(!reason || reason === "understanding-process-timeout" ? new Error(failureReason(failure, stderrTail.toString("utf8"))) : failure);
     };
     const stop = (why: string) => {
       if (reason) return; reason = why;
@@ -90,6 +94,7 @@ function run(command: string, args: string[], options: UnderstandingAdapterOptio
     const abort = () => stop("understanding-process-cancelled");
     options.signal.addEventListener("abort", abort, { once: true });
     child.stdout!.on("data", (chunk: Buffer) => { if (output.length + chunk.length > (options.maxBytes ?? MAX_STDOUT)) stop("understanding-output-too-large"); else output = Buffer.concat([output, chunk]); });
+    child.stderr!.on("data", (chunk: Buffer) => { stderrTail = Buffer.concat([stderrTail, chunk]).subarray(-2048); });
     child.on("error", () => { reason ??= "understanding-process-unavailable"; closed = -1; escalated = true; finish(); });
     child.on("close", code => { closed = code; if (!reason) clearTimeout(timer); finish(); });
     if (options.signal.aborted) abort();

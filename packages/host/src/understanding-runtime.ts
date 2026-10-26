@@ -783,24 +783,27 @@ function runRepositoryContext(config: Config, root: string, options: Understandi
   const commandArgs = [...briefing.args, "context", "--repo", root];
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    try { child = spawn(briefing.command, commandArgs, { cwd: root, stdio: ["ignore", "pipe", "ignore"], detached: process.platform !== "win32" }); }
+    try { child = spawn(briefing.command, commandArgs, { cwd: root, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("context-spawn-failed")); return; }
     onChild(child);
-    let out = Buffer.alloc(0), settled = false;
+    let out = Buffer.alloc(0), stderrTail = Buffer.alloc(0), settled = false;
+    // A failed exit or a stop for time carries the engine's last stderr line.
+    const failed = (name: string) => new Error(failureReason(new Error(name), stderrTail.toString("utf8")));
     const finish = (error?: Error) => {
       if (settled) return; settled = true; options.signal.removeEventListener("abort", abort); onDone(child);
       if (error) { rejectPromise(error); return; }
       try { resolvePromise(parseRepoContext(JSON.parse(out.toString("utf8")))); }
       catch (error) { rejectPromise(new Error(`context-output-invalid: ${error instanceof Error ? error.message : "invalid context"}`)); }
     };
-    const abort = () => { stop(child); finish(new Error("context-aborted")); };
+    const abort = () => { stop(child); finish(failed("context-aborted")); };
     options.signal.addEventListener("abort", abort, { once: true });
     child.stdout?.on("data", (chunk: Buffer) => {
       out = Buffer.concat([out, chunk]);
       if (out.length > Math.min(options.maxBytes, MAX_CONTEXT_BYTES)) { stop(child); finish(new Error("context-output-too-large")); }
     });
+    child.stderr?.on("data", (chunk: Buffer) => { stderrTail = Buffer.concat([stderrTail, chunk]).subarray(-2048); });
     child.once("error", () => finish(new Error("context-process-error")));
-    child.once("close", code => { if (code !== 0) finish(new Error("context-process-failed")); else finish(); });
+    child.once("close", code => { if (code !== 0) finish(failed("context-process-failed")); else finish(); });
   });
 }
 function stopContextChild(child: ChildProcess) {

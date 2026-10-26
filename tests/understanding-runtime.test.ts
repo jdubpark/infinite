@@ -781,3 +781,22 @@ test("a store from before the per-workspace split is read once, written as one f
     assert.ok(!existsSync(legacy) && existsSync(`${legacy}.migrated`), "the old store is kept under a new name");
   } finally { await resumed.close(); }
 });
+
+test("a split that stopped halfway is redone from the old store on the next start", { timeout: 20000 }, async t => {
+  const s = setup(t, { processFixture: true });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").components.length === 2);
+  await s.runtime.close();
+  const key = Buffer.alloc(32, 7), dir = join(s.stateDir, "understanding", "runtime"), legacy = join(s.stateDir, "understanding", "runtime.sealed");
+  const file = unseal<{ day: string; workspace: Record<string, unknown> }>(key, "understanding-runtime:workspace", readFileSync(join(dir, "workspace.sealed"), "utf8"));
+  writeSealed(legacy, key, "understanding-runtime", { version: 1, day: file.day, workspaces: { workspace: file.workspace } });
+  // The directory exists with a half-written file, as after a crash between two workspace writes.
+  writeFileSync(join(dir, "workspace.sealed"), "half-written");
+  const resumed = new UnderstandingRuntime({ config: s.config, key, groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() } });
+  try {
+    assert.equal(resumed.read("workspace").maintenance.state, "idle");
+    assert.equal(resumed.read("workspace").components.length, 2);
+    assert.ok(!existsSync(legacy) && existsSync(`${legacy}.migrated`));
+    assert.deepEqual(unseal<{ workspace: Record<string, unknown> }>(key, "understanding-runtime:workspace", readFileSync(join(dir, "workspace.sealed"), "utf8")).workspace.repositories !== undefined, true);
+  } finally { await resumed.close(); }
+});

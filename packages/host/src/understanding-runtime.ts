@@ -304,7 +304,17 @@ export class UnderstandingRuntime {
   private load() {
     try {
       const today = new Date().toISOString().slice(0, 10);
-      if (existsSync(this.stateDir)) {
+      if (existsSync(this.stateFile)) {
+        // One store for every workspace, from before the split: read it once, write one file per workspace, keep it beside
+        // them. It stays authoritative until every file is written, so a split that stopped halfway is redone, not trusted.
+        const raw = readFileSync(this.stateFile, "utf8");
+        if (Buffer.byteLength(raw) > MAX_LEGACY_STORE_BYTES) throw new Error("store-too-large");
+        this.state = runtimeStateSchema.parse(unseal<unknown>(this.options.key, STATE_SCOPE, raw)) as RuntimeState;
+        this.dailyJobs();
+        this.written.clear();
+        if (this.persist().size) throw new Error("store-migration-failed");
+        renameSync(this.stateFile, `${this.stateFile}.migrated`);
+      } else if (existsSync(this.stateDir)) {
         for (const name of readdirSync(this.stateDir).sort()) {
           const match = /^(.+)\.sealed$/.exec(name);
           if (!match || !WORKSPACE_FILE_ID.test(match[1]!)) continue;
@@ -317,14 +327,6 @@ export class UnderstandingRuntime {
           this.state.workspaces[id] = workspace;
         }
         this.state.day = today;
-      } else if (existsSync(this.stateFile)) {
-        // One store for every workspace, from before the split: read it once, write one file per workspace, keep it beside them.
-        const raw = readFileSync(this.stateFile, "utf8");
-        if (Buffer.byteLength(raw) > MAX_LEGACY_STORE_BYTES) throw new Error("store-too-large");
-        this.state = runtimeStateSchema.parse(unseal<unknown>(this.options.key, STATE_SCOPE, raw)) as RuntimeState;
-        this.dailyJobs();
-        if (this.persist().size) throw new Error("store-migration-failed");
-        renameSync(this.stateFile, `${this.stateFile}.migrated`);
       }
       this.dailyJobs();
       let recovered = false;

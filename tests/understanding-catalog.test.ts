@@ -323,17 +323,55 @@ test("a repository set change keeps an owner's policy, disabled or enabled", () 
   }
 });
 
-test("a repository set change turns a policy the owner never set off and keeps its interval, limit and stamp", () => {
+test("a legacy record with a policy binding was an owner edit: it keeps its flags under the owner's stamp across a repository set change", () => {
+  for (const value of [{ enabled: true, synthesis: true, delivery: false, intervalMinutes: 45, dailyJobLimit: 7 }, { enabled: false, synthesis: false, delivery: false, intervalMinutes: 30, dailyJobLimit: 10 }]) {
+    const f = fixture();
+    try {
+      f.make().mutate("workspace", "policy", undefined, request(0, "update", value), emptyContext);
+      // Strip the stamp as records saved before stamping looked; the next load migrates it and keeps the policy binding.
+      const stored = unseal<{ catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
+      delete stored.catalog.policy.editedAt; delete stored.catalog.policy.editedBy;
+      writeSealed(f.file, f.key, "understanding-catalog:workspace", stored);
+      addRepository(f);
+      const policy = f.reopen().read("workspace").policy;
+      assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit, policy.editedBy], [value.enabled, value.synthesis, value.delivery, value.intervalMinutes, value.dailyJobLimit, "owner"]);
+      assert.match(policy.editedAt ?? "", /^\d{4}-/);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("a legacy record nobody edited migrates to the default-on policy and stays on across a repository set change", () => {
   const f = fixture();
   try {
-    f.make().mutate("workspace", "policy", undefined, request(0, "update", { enabled: true, synthesis: true, delivery: false, intervalMinutes: 45, dailyJobLimit: 7 }), emptyContext);
-    // Strip the stamp as records saved before stamping looked; the next load migrates it and keeps the policy binding.
-    const stored = unseal<{ catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
-    delete stored.catalog.policy.editedAt; delete stored.catalog.policy.editedBy;
+    f.writeStoredPolicy({ enabled: false, synthesis: false, delivery: false, intervalMinutes: 45, dailyJobLimit: 7 });
+    assert.equal(f.reopen().read("workspace").policy.editedBy, "migration");
+    addRepository(f);
+    const policy = f.reopen().read("workspace").policy;
+    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit, policy.editedBy], [true, true, true, 45, 7, "migration"]);
+  } finally { f.cleanup(); }
+});
+
+test("a record the first default-on build stamped as migrated, with the owner's old policy binding, stays on across a repository set change", () => {
+  const f = fixture();
+  try {
+    // The owner's edit under the old build wrote the binding; the first stamped build then turned the switches on and stamped "migration".
+    f.make().mutate("workspace", "policy", undefined, request(0, "update", { enabled: true, synthesis: false, delivery: false, intervalMinutes: 15, dailyJobLimit: 24 }), emptyContext);
+    const stored = unseal<{ policyBinding: unknown[]; catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
+    assert.ok(stored.policyBinding.length > 0);
+    stored.catalog.policy = { ...stored.catalog.policy, enabled: true, synthesis: true, delivery: true, editedAt: new Date().toISOString(), editedBy: "migration" };
     writeSealed(f.file, f.key, "understanding-catalog:workspace", stored);
     addRepository(f);
     const policy = f.reopen().read("workspace").policy;
-    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit, policy.editedBy], [false, false, false, 45, 7, "migration"]);
-    assert.match(policy.editedAt ?? "", /^\d{4}-/);
+    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.editedBy], [true, true, true, "migration"]);
+  } finally { f.cleanup(); }
+});
+
+test("a GitHub-tracked checkout without a remote binds by its source record", () => {
+  const f = fixture();
+  try {
+    execFileSync("git", ["-C", f.checkout, "remote", "remove", "origin"]);
+    assert.deepEqual(f.make().read("workspace").coverage, ["Some catalog records are withheld because their complete repository scope is unavailable or changed."], "a bare scan names a root-commit key that differs from the group's remote key");
+    f.config.projects[0].source = { mode: "github", repository: "example/catalog-fixture", baseBranch: "main" };
+    assert.deepEqual(f.make().read("workspace").coverage, []);
   } finally { f.cleanup(); }
 });

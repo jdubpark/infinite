@@ -86,6 +86,20 @@ test("GitHub permission denial is reported as unavailable without leaking proces
   assert.ok(!JSON.stringify(result).includes("private provider response"));
 });
 
+test("a GitHub-tracked checkout without a remote still reaches the provider through its source record", async t => {
+  const s = setup(t);
+  const bin = join(s.root, "fake-bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "gh"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}${previousPath ? `:${previousPath}` : ""}`;
+  t.after(() => { if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; });
+  const config = { projects: [{ id: "repo", name: "Repository", path: s.root, source: { mode: "github", repository: "example/repo" } }] } as Config;
+  const result = await createUnderstandingAdapter(config).delivery!({ workspaceId: "workspace", root: s.root, repositoryId: "repo", head: s.context.head }, options());
+  assert.equal(result.state, "unavailable");
+  assert.ok(result.coverage.some(text => /permission may be missing/.test(text)), "the source record binds the checkout; only the provider call failed: " + JSON.stringify(result.coverage));
+});
+
 test("deployment permission denial retains pull requests and reports each provider head and status", async t => {
   const s = setup(t);
   const bin = join(s.root, "fake-bin");

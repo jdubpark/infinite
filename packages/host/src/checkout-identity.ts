@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { basename, dirname } from "node:path";
+import type { ProjectSource } from "./team-types.js";
 
 /** Which repository a checkout is a copy of, captured once from the checkout's own Git metadata. */
 export type CheckoutIdentity = {
@@ -75,6 +76,21 @@ export function repoNameFromPath(path: string): string {
   if (!GENERIC_FOLDERS.has(name.toLowerCase())) return name;
   const parent = basename(dirname(path));
   return parent || name;
+}
+
+/** A GitHub-tracked project names its repository in its source record; the checkout needs no remote and no scan. */
+export function sourceIdentity(project: { id: string; source?: ProjectSource }, at = new Date().toISOString()): CheckoutIdentity | undefined {
+  if (project.source?.mode !== "github") return undefined;
+  const normalized = normalizeRemote(`https://github.com/${project.source.repository}.git`);
+  return normalized ? { projectId: project.id, key: normalized.key, repoName: normalized.repoName, capturedAt: at, from: "source" } : undefined;
+}
+
+/**
+ * The identity every host component compares: the source record when the project follows GitHub, otherwise a
+ * scan of the checkout. Enrolled GitHub checkouts carry no remote, so a scan alone would name a different key.
+ */
+export function expectedIdentity(project: { id: string; path: string; source?: ProjectSource }, git: GitReader, at = new Date().toISOString()): CheckoutIdentity | undefined {
+  return sourceIdentity(project, at) ?? captureIdentity(project, git, at);
 }
 
 /** Prefer the origin remote, then the repository's lowest root commit; nothing when Git cannot answer. */

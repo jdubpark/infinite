@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, relative, sep } from "node:path";
 import { z } from "zod";
 import { parseMermaid, type Diagram, type UnderstandingBrief, type KnowledgeClaim, type KnowledgeComponent, type KnowledgeDelivery, type KnowledgeEnvironment, type KnowledgePlan, type KnowledgePullRequest } from "@infinite/remote";
-import { captureIdentity, normalizeRemote, readGit } from "./checkout-identity.js";
+import { expectedIdentity, normalizeRemote, readGit } from "./checkout-identity.js";
 import { failureReason } from "./failure-reason.js";
 import { createContextAdapter, runRepositoryContext, understandingOutputLimits, type RepoContext, type RepositoryBriefOutput, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
 import type { Config } from "./types.js";
@@ -141,7 +141,7 @@ function githubRepository(config: Config, repositoryId: string, root: string): {
   if (!project || project.source?.mode !== "github" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(project.source.repository)) return undefined;
   const [owner, repo] = project.source.repository.split("/");
   const expected = normalizeRemote(`https://github.com/${owner}/${repo}.git`);
-  const captured = captureIdentity(project, readGit);
+  const captured = expectedIdentity(project, readGit);
   try {
     if (realpathSync(root) !== realpathSync(project.path) || !expected || captured?.key !== expected.key) return undefined;
   } catch { return undefined; }

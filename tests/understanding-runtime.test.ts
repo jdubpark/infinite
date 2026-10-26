@@ -748,3 +748,18 @@ test("a source map with more components than the stored diagram holds still publ
   assert.equal(read.diagrams?.find(diagram => diagram.id === "components:repo")?.nodes.length, 2000);
   assert.ok(read.coverage.includes("Component map: 2000 of 2001 components drawn; the rest are listed under Components."));
 });
+
+test("a GitHub-tracked checkout without a remote binds by its source record; a mismatch reads as a plain sentence", { timeout: 20000 }, async t => {
+  const s = setup(t, { adapter: { context: async root => sampleContext(root) } });
+  s.setCatalog({ ...catalog(), policy: { enabled: true, synthesis: false, delivery: false, intervalMinutes: 60, dailyJobLimit: 5 } });
+  s.group.repos[0].key = "remote:github.com/example/repo";
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").maintenance.state === "failed");
+  const failed = s.runtime.read("workspace").maintenance;
+  assert.equal(failed.lastFailure?.reason, "A checkout no longer matches the repository it was enrolled as");
+  assert.match(failed.message ?? "", /^Last attempt failed at \d{4}-.*: A checkout no longer matches the repository it was enrolled as\.$/);
+  s.config.projects[0].source = { mode: "github", repository: "example/repo", baseBranch: "main" };
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").components.length === 2);
+  assert.equal(s.runtime.read("workspace").maintenance.state, "idle");
+});

@@ -5,7 +5,7 @@ import { z } from "zod";
 import { parseMermaid } from "@infinite/remote";
 import type { Diagram, GeneratedCatalogPage, GeneratedPlan, GeneratedProject, UnderstandingArtifact, UnderstandingLink, UnderstandingPlan, UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding, WorkspaceKnowledge } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
-import { captureIdentity, readGit } from "./checkout-identity.js";
+import { expectedIdentity, readGit } from "./checkout-identity.js";
 import type { RepositorySummary, RepositoryBriefings } from "./repository-briefings.js";
 import type { Manager } from "./manager.js";
 import type { Project, Session, Config } from "./types.js";
@@ -175,11 +175,11 @@ export class UnderstandingService {
       if (member && resolve(member.cwd) !== resolve(session.cwd)) throw new Error("team-source-rebound");
     } else if (!this.inside(canonicalProject, root)) throw new Error("source-outside-project");
     const projectStat = statSync(canonicalProject), rootStat = statSync(root), cwdStat = statSync(sourceCwd);
-    const identity = captureIdentity(project, readGit);
+    const identity = expectedIdentity(project, readGit);
     const group = this.sources.groups.get(project.id);
     const repo = group.repos.find(value => value.checkouts.some(checkout => checkout.projectId === project.id));
-    const expectedIdentity = repo?.key;
-    if (!identity || (expectedIdentity && identity.key !== expectedIdentity)) throw new Error("source-identity-changed");
+    const expectedKey = repo?.key;
+    if (!identity || (expectedKey && identity.key !== expectedKey)) throw new Error("source-identity-changed");
     return { binding: bindingSchema.parse({
       projectId: project.id, sourceKind, enrolledPath: canonicalProject, root, sourceCwd, projectDevice: String(projectStat.dev), projectInode: String(projectStat.ino),
       rootDevice: String(rootStat.dev), rootInode: String(rootStat.ino), sourceCwdDevice: String(cwdStat.dev), sourceCwdInode: String(cwdStat.ino), repoIdentity: digest(identity.key),
@@ -247,11 +247,11 @@ export class UnderstandingService {
       if (name.startsWith(`${id}.sealed.`) && TEMPORARY_ARTIFACT.test(name)) unlinkSync(join(this.directory, name));
   }
 
-  private projectBinding(project: Project, expectedIdentity: string | undefined): ProjectBinding | undefined {
+  private projectBinding(project: Project, expectedKey: string | undefined): ProjectBinding | undefined {
     try {
       const enrolledPath = realpathSync(project.path), info = statSync(enrolledPath);
-      const identity = captureIdentity(project, readGit);
-      if (!identity || (expectedIdentity && identity.key !== expectedIdentity)) return undefined;
+      const identity = expectedIdentity(project, readGit);
+      if (!identity || (expectedKey && identity.key !== expectedKey)) return undefined;
       return { enrolledPath, projectDevice: String(info.dev), projectInode: String(info.ino), repoIdentity: digest(identity.key) };
     } catch { return undefined; }
   }

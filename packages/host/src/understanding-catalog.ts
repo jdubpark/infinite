@@ -6,7 +6,7 @@ import type {
   KnowledgeCatalog, KnowledgeComponentInput, KnowledgeFeatureInput, KnowledgeMutationContext,
   KnowledgePlanInput, KnowledgePolicy, KnowledgeProjectInput,
 } from "@infinite/remote";
-import { captureIdentity, readGit } from "./checkout-identity.js";
+import { expectedIdentity, readGit } from "./checkout-identity.js";
 import type { ProjectGroup, ProjectGroupList } from "./project-group-types.js";
 import type { Config } from "./types.js";
 import { seal, unseal, writeSealed } from "./vault.js";
@@ -113,7 +113,7 @@ export class UnderstandingCatalog {
       try {
         const path = realpathSync(project.path);
         const stat = statSync(path);
-        const captured = captureIdentity(project, readGit);
+        const captured = expectedIdentity(project, readGit);
         if (!captured || (repo.key && captured.key !== repo.key)) throw new Error("identity-mismatch");
         entries.push({ projectId: project.id, path, device: String(stat.dev), inode: String(stat.ino), identity: digest(captured.key),
           repositoryIdentity: digest(repo.key ?? captured.key), primaryProjectId: repo.projectId });
@@ -137,9 +137,13 @@ export class UnderstandingCatalog {
       const value = storedSchema.parse(unseal<unknown>(this.sources.key, `understanding-catalog:${workspaceId}`, raw)) as Stored;
       if (value.workspaceId !== workspaceId) throw new Error("catalog-workspace-mismatch");
       if (value.catalog.policy.editedAt === undefined) {
-        // One-time migration: records saved before edits were stamped lack the key and carry the old disabled defaults.
-        // Only the three switches change; the owner's interval and daily limit stay.
-        value.catalog.policy = { ...value.catalog.policy, enabled: defaults.enabled, synthesis: defaults.synthesis, delivery: defaults.delivery, editedAt: new Date().toISOString(), editedBy: "migration" };
+        // One-time migration: records saved before edits were stamped lack the key. Only an owner edit writes the policy
+        // binding, so a legacy record with one keeps its flags under the owner's stamp; any other record takes the
+        // default-on switches. The owner's interval and daily limit stay either way.
+        const ownerEdited = value.policyBinding.length > 0;
+        value.catalog.policy = ownerEdited
+          ? { ...value.catalog.policy, editedAt: new Date().toISOString(), editedBy: "owner" }
+          : { ...value.catalog.policy, enabled: defaults.enabled, synthesis: defaults.synthesis, delivery: defaults.delivery, editedAt: new Date().toISOString(), editedBy: "migration" };
         try { this.persist(workspaceId, value); } catch { /* keep the migrated policy in memory; it retries on the next load */ }
       }
       this.states.set(workspaceId, value);
@@ -221,8 +225,9 @@ export class UnderstandingCatalog {
     for (const item of catalog.plans) item.repositoryIds = this.canonicalRepositoryIds(item.repositoryIds, current.entries);
     catalog.componentOverrides = catalog.componentOverrides.filter(item => this.scopeMatches(state.scopes[item.id], current.entries));
     for (const item of catalog.componentOverrides) item.repositoryIds = this.canonicalRepositoryIds(item.repositoryIds, current.entries);
-    // An owner's policy holds across a repository set change; any other policy turns off until the owner decides again.
-    const policyWithheld = state.policyBinding.length > 0 && !this.exactMembershipMatches(state.policyBinding, current.entries) && catalog.policy.editedBy !== "owner";
+    // A policy the owner set, or the default-on migration stamped, holds across a repository set change; an unstamped
+    // policy turns off until the owner decides again.
+    const policyWithheld = state.policyBinding.length > 0 && !this.exactMembershipMatches(state.policyBinding, current.entries) && catalog.policy.editedBy == null;
     if (policyWithheld) catalog.policy = { ...catalog.policy, enabled: false, synthesis: false, delivery: false };
     const withheld = projectsBefore !== catalog.projects.length || featuresBefore !== catalog.features.length || plansBefore !== catalog.plans.length || componentsBefore !== catalog.componentOverrides.length;
     catalog.coverage = current.gaps.length || withheld || policyWithheld ? ["Some catalog records are withheld because their complete repository scope is unavailable or changed."] : [];

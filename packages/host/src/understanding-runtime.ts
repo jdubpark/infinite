@@ -6,7 +6,7 @@ import { z } from "zod";
 import type { Diagram, DiagramGraph, KnowledgeCatalog, KnowledgeComponent, KnowledgeDelivery, KnowledgeMaintenance, KnowledgePlan, KnowledgeRelationship, KnowledgeRepositoryBrief, KnowledgeSource, UnderstandingBrief, WorkspaceKnowledge } from "@infinite/remote";
 import type { Config } from "./types.js";
 import type { ProjectGroup, ProjectGroupList, ProjectGroupRepo } from "./project-group-types.js";
-import { captureIdentity, readGit } from "./checkout-identity.js";
+import { expectedIdentity, readGit } from "./checkout-identity.js";
 import { failureReason } from "./failure-reason.js";
 import { componentGraph, diagramFromMermaid, diagramGraphSchema, linkDiagramNodes } from "./understanding-diagrams.js";
 import { seal, unseal, writeSealed } from "./vault.js";
@@ -68,6 +68,13 @@ export interface UnderstandingAdapter {
 export function createContextAdapter(config: Config): UnderstandingAdapter {
   return config.repositoryBriefings ? { context: (root, options) => runRepositoryContext(config, root, options) } : {};
 }
+/** Plain sentences for the binding checks above; other failures keep the engine's own reason. */
+const BINDING_REASONS: Record<string, string> = {
+  "repository-identity-unavailable": "The repository's identity could not be read; the checkout may not be a Git repository",
+  "repository-identity-changed": "A checkout no longer matches the repository it was enrolled as",
+  "checkout-root-changed": "A checkout path no longer points at the root of a Git repository",
+  "project-membership-changed": "A project in this workspace is no longer enrolled on this host",
+};
 export interface UnderstandingRuntimeOptions {
   config: Config; key: Buffer;
   groups: { list(): ProjectGroupList; get(id: string): ProjectGroup };
@@ -749,7 +756,8 @@ export class UnderstandingRuntime {
   private binding(repo: ProjectGroupRepo, group: ProjectGroup): SourceBinding {
     const root = realpathSync(repo.path), rootStat = statSync(root);
     const projects = repo.checkouts.map(checkout => checkout.projectId).sort();
-    const identity = repo.key ?? (captureIdentity({ id: repo.projectId, path: repo.path }, readGit)?.key ?? "");
+    const primary = this.options.config.projects.find(item => item.id === repo.projectId);
+    const identity = repo.key ?? (expectedIdentity({ id: repo.projectId, path: repo.path, ...(primary?.source ? { source: primary.source } : {}) }, readGit)?.key ?? "");
     if (!identity) throw new Error("repository-identity-unavailable");
     const checkoutIdentities: unknown[] = [];
     for (const id of projects) {
@@ -758,7 +766,7 @@ export class UnderstandingRuntime {
       const checkout = realpathSync(project.path);
       const gitRoot = readGit(checkout, ["rev-parse", "--show-toplevel"]);
       if (!gitRoot || realpathSync(gitRoot) !== checkout) throw new Error("checkout-root-changed");
-      const captured = captureIdentity({ ...project, path: checkout }, readGit);
+      const captured = expectedIdentity({ ...project, path: checkout }, readGit);
       if (!captured || captured.key !== identity) throw new Error("repository-identity-changed");
       const checkoutStat = statSync(checkout);
       checkoutIdentities.push([id, checkout, captured.key, String(checkoutStat.dev), String(checkoutStat.ino)]);
@@ -778,7 +786,7 @@ export class UnderstandingRuntime {
     } catch { return false; }
   }
   private failWorkspace(workspaceId: string, error: unknown) {
-    const reason = failureReason(error), at = new Date().toISOString();
+    const reason = (error instanceof Error && Object.hasOwn(BINDING_REASONS, error.message) && BINDING_REASONS[error.message]) || failureReason(error), at = new Date().toISOString();
     console.error(`[Infinite] Understanding maintenance failed · workspace ${workspaceId} · ${reason}`);
     const old = this.workspace(workspaceId);
     old.failureCount = Math.min(20, old.failureCount + 1);

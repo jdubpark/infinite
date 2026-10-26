@@ -306,12 +306,14 @@ test("closing aborts the active writer, skips queued writers, and resolves promp
   });
 });
 
-test("active runs, host operations and moved workspace heads cannot be narrated", async t => {
+test("active runs, host operations, workspaces under removal and moved heads cannot be narrated", async t => {
   const f = setup(t), store = f.store();
   const active = { ...f.run, status: "implementing" as const };
   assert.match(store.refresh("workspace-1", `team:${active.id}`, active, "owner").narrative.reason, /still active/);
   const pendingStore = new WorkNarrativeStore({ config: f.config, key: f.key, adapter: { explainWork: async () => { throw new Error("unexpected writer call"); } }, teams: { understandingRecords: () => [f.run], pendingOperation: () => true } });
   assert.match(pendingStore.status("workspace-1", `team:${f.run.id}`, f.run).reason, /operation/i);
+  const removing = { ...f.run, workspaceRemovedAt: "2026-01-01T00:00:00.000Z" };
+  assert.match(store.refresh("workspace-1", `team:${f.run.id}`, removing, "owner").narrative.reason, /no longer checked out/);
   const movedHead = commit(f.root, "move head");
   assert.notEqual(movedHead, f.run.headCommit);
   assert.match(store.refresh("workspace-1", `team:${f.run.id}`, f.run, "owner").narrative.reason, /no longer checked out/);

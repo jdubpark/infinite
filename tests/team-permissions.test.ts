@@ -1,15 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:net";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
+import type { Prompt } from "@infinite/attention";
 import { claimControl, waitFor } from "./helpers.js";
 import { fixture, git, limitLineup } from "./team-fixture.js";
 import { DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE, LEGACY_DEFAULT_PERMISSION_SCOPES, currentPermissions, type TeamLineup } from "../packages/host/src/team-types.js";
-import { refusedBeforeSend } from "../packages/host/src/team-permissions.js";
+import { isCollapsedPermissionPrompt, permissionEvidenceHash, refusedBeforeSend } from "../packages/host/src/team-permissions.js";
 import { permissionEvidenceDigest } from "../packages/host/src/team-permission-evidence.js";
 import { ContentError } from "../packages/host/src/session-content.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
+import { Manager } from "../packages/host/src/manager.js";
+import { socketPath } from "../packages/host/src/ipc.js";
+import type { Config, ControlLease, Receipt, Session, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 
 const permissionLineup: TeamLineup = {
   ...limitLineup,
@@ -45,6 +50,132 @@ test("only a preflight or named worker refusal counts as an answer that sent not
     assert.equal(refusedBeforeSend(Object.assign(new Error("Worker connection failed"), { code })), false, String(code));
 });
 
+test("collapsed permission expansion requires the pinned Codex one-shot command dialog", () => {
+  const base: Prompt = {
+    id: 7,
+    kind: "menu",
+    title: "[… 4 lines] ^a view all",
+    detail: "Reason: Inspect the requested files.\n$ npm run check",
+    options: [
+      { index: 0, label: "Yes, proceed (y)", role: "accept" },
+      { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" },
+    ],
+    acceptsText: true,
+    pinned: true,
+    source: "screen",
+    hash: "a".repeat(64),
+  };
+  assert.equal(isCollapsedPermissionPrompt(base), true);
+  assert.equal(isCollapsedPermissionPrompt({
+    ...base,
+    title: "Reason: May I run npm run check outside the sandbox?",
+    detail: "• Running npm run check\n$ npm run check\n[… 4 lines] ^a view all",
+  }), true, "the live Codex parser puts the combined collapsed marker at the end of detail under a Reason title");
+  assert.equal(isCollapsedPermissionPrompt({ ...base, title: "[... 12 lines] Ctrl+A to view all" }), true,
+    "the alternate ASCII ellipsis and Ctrl+A hint remain supported");
+  assert.equal(isCollapsedPermissionPrompt({ ...base, title: "Press Ctrl-A to view all", detail: "$ npm run check\n[... 12 lines]" }), true,
+    "the split marker and spelled key hint variant remains supported");
+
+  for (const candidate of [
+    { ...base, pinned: false },
+    { ...base, source: "hook" as const, pinned: undefined },
+    { ...base, title: "Would you like to make this edit?", detail: "$ npm run check\n[… 4 lines] ^a view all" },
+    { ...base, title: "4 lines hidden", detail: "$ npm run check" },
+    { ...base, title: "Would you like to run the following command?", detail: "$ npm run check\n^a view all" },
+    { ...base, multiSelect: true },
+    { ...base, options: [{ index: 0, label: "Yes", role: "accept" as const }, base.options[1]] },
+    { ...base, options: [...base.options, { index: 2, label: "Yes, and don't ask again", role: "accept-always" as const }] },
+    { ...base, options: [base.options[0], { index: 1, label: "No", role: "reject" as const }] },
+  ]) assert.equal(isCollapsedPermissionPrompt(candidate), false, JSON.stringify(candidate));
+});
+
+test("a lost expansion acknowledgement is sealed uncertain and a fresh Manager never dispatches it again", { timeout: 20_000 }, async () => {
+  mkdirSync(".local", { recursive: true, mode: 0o700 });
+  const root = mkdtempSync(join(".local", "ie-"));
+  const stateDir = join(root, "state"), runDir = join(root, "r"), sessionId = randomUUID();
+  mkdirSync(runDir);
+  const key = Buffer.alloc(32, 17);
+  const team = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer" as const, taskId: "task-expand" };
+  const cwd = realpathSync(root);
+  const runtime = { id: randomUUID(), location: "cloud" as const, transport: "pty" as const };
+  const session = {
+    id: sessionId, team, provider: "codex" as const, title: "Collapsed permission", projectId: "fixture", cwd,
+    createdAt: new Date().toISOString(), status: "running" as const, contextVersion: 0, context: "", initialPrompt: "",
+    runtime,
+  } as Session;
+  const config = {
+    stateDir, runDir, enableDemo: true, agents: { codex: { command: process.execPath, args: [] } },
+  } as Config;
+  const prompt: Prompt = {
+    id: 9, kind: "menu", title: "[… 58 lines] ^a view all", detail: "Reason: Read the request.\n$ npm run check",
+    options: [
+      { index: 0, label: "Yes, proceed (y)", role: "accept" },
+      { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" },
+    ], acceptsText: true, pinned: true, source: "screen", hash: "c".repeat(64),
+  };
+  const liveState = {
+    status: "running", seq: 11, screen: "", runtime, control: null,
+    attention: { state: "needs-you", prompt },
+  } as WorkerState;
+  mkdirSync(join(stateDir, "sessions", sessionId), { recursive: true });
+  writeSealed(join(stateDir, "sessions", sessionId, "meta.sealed"), key, `${sessionId}:meta`, { session, fingerprint: "fixture" });
+
+  let control: ControlLease | null = null;
+  let expansionDispatches = 0;
+  let intentWasDurable = false;
+  const server = createServer(socket => {
+    let data = "";
+    socket.on("data", chunk => {
+      data += chunk.toString();
+      const end = data.indexOf("\n");
+      if (end < 0) return;
+      const request = JSON.parse(data.slice(0, end)) as WorkerRequest;
+      if (request.op === "state") {
+        socket.end(JSON.stringify({ result: { ...liveState, control } }) + "\n");
+      } else if (request.op === "control" && request.action === "claim") {
+        control = { id: randomUUID(), label: request.actor.label, expiresAt: Date.now() + 60_000 };
+        socket.end(JSON.stringify({ result: control }) + "\n");
+      } else if (request.op === "control" && request.action === "release") {
+        control = null;
+        socket.end(JSON.stringify({ result: null }) + "\n");
+      } else if (request.op === "team-permission-expand") {
+        expansionDispatches++;
+        const ledger = unseal<{ requests: Record<string, { receipt: Receipt }> }>(key, `${sessionId}:team-permission-expansions`,
+          readFileSync(join(stateDir, "sessions", sessionId, "team-permission-expansions.sealed"), "utf8"));
+        intentWasDurable = ledger.requests[request.requestId]?.receipt.state === "uncertain";
+        socket.destroy(); // The worker accepted the one-key request; its acknowledgement is lost.
+      } else socket.end(JSON.stringify({ error: "unexpected request" }) + "\n");
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath(runDir, sessionId), resolve);
+  });
+  try {
+    const manager = new Manager(config, key);
+    const requestId = randomUUID();
+    const expected = {
+      promptId: prompt.id, promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt), targetCwd: cwd,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const uncertain = await manager.expandTeamPermission(sessionId, requestId, team, expected);
+    assert.equal(uncertain.state, "uncertain");
+    assert.equal(expansionDispatches, 1);
+    assert.equal(intentWasDurable, true, "the manager sealed its at-most-once intent before worker dispatch");
+
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    const restarted = new Manager(config, key);
+    assert.deepEqual(await restarted.expandTeamPermission(sessionId, requestId, team, expected), uncertain);
+    await assert.rejects(restarted.expandTeamPermission(sessionId, requestId, team, {
+      ...expected, expiresAt: new Date(Date.now() + 90_000).toISOString(),
+    }), /different permission expansion arguments/);
+    assert.equal(expansionDispatches, 1, "same-request replay after host restart never toggles twice");
+  } finally {
+    if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("an explicit permission policy reviews and answers only the recorded one-shot prompt", { timeout: 120000 }, async () => {
   const f = await fixture("permissions", permissionLineup);
   try {
@@ -67,6 +198,82 @@ test("an explicit permission policy reviews and answers only the recorded one-sh
       state: (await f.host.fetchApi(`/sessions/${member.sessionId}`)).body,
     })));
     assert.equal(finished.status, "ready-for-review", JSON.stringify({ run: finished, runtime }));
+  } finally { await f.close(); }
+});
+
+test("collapsed Codex evidence is expanded before review and only the fresh pinned prompt is answered", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex-collapsed", permissionLineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const runId = created.body.id as string;
+    const collapsed = await waitFor(async () => {
+      const run = await f.get(runId);
+      const target = run.members.find(member => member.taskId === "a");
+      const session = target?.sessionId ? await f.host.fetchApi(`/sessions/${target.sessionId}`) : undefined;
+      return { run, target, session };
+    }, value => existsSync(join(f.receipts, `${runId}.collapsed-ready`)) && Boolean(value.target &&
+      value.session?.body.attention?.state === "needs-you" && value.session.body.attention.prompt), 60000);
+    const target = collapsed.target!;
+    const collapsedPrompt = collapsed.session!.body.attention.prompt as Prompt;
+    assert.ok(collapsedPrompt.id !== undefined && collapsedPrompt.hash);
+    assert.equal(collapsedPrompt.kind, "menu", "the collapsed Codex screen is a menu in the real host parser");
+    assert.equal(isCollapsedPermissionPrompt(collapsedPrompt), true, JSON.stringify(collapsedPrompt));
+    assert.equal(collapsed.run.permissionDecisions?.length ?? 0, 0, "collapsed evidence has not been assigned to a coordinator for approval");
+
+    const reviewed = await waitFor(async () => {
+      const run = await f.get(runId);
+      const session = await f.host.fetchApi(`/sessions/${target.sessionId}`);
+      return { run, session };
+    }, value => existsSync(join(f.receipts, `${runId}.expanded-key`)) && existsSync(join(f.receipts, `${runId}.expanded-ready`)) &&
+      existsSync(join(f.receipts, `${runId}.judge-ready`)) && value.session.body.attention?.state === "needs-you" &&
+      value.session.body.attention.prompt?.id !== collapsedPrompt.id &&
+      value.run.permissionDecisions?.[0]?.status === "reviewing" &&
+      value.run.permissionDecisions[0].promptId === value.session.body.attention.prompt.id, 60000);
+    const expandedPrompt = reviewed.session.body.attention.prompt as Prompt;
+    assert.notEqual(expandedPrompt.id, collapsedPrompt.id, "Ctrl+A redraws a new attention prompt identity");
+    assert.notEqual(expandedPrompt.hash, collapsedPrompt.hash);
+    assert.equal(expandedPrompt.source, "screen");
+    assert.equal(expandedPrompt.pinned, true);
+    assert.equal(isCollapsedPermissionPrompt(expandedPrompt), false);
+    assert.equal(reviewed.run.permissionDecisions?.length, 1);
+    const decision = reviewed.run.permissionDecisions![0]!;
+    assert.equal(decision.promptId, expandedPrompt.id, "the review is bound to the fresh screen identity");
+    assert.equal(decision.promptHash, expandedPrompt.hash);
+    assert.equal(decision.option, 0, "only the expanded one-shot option is eligible for a later answer");
+    assert.equal(reviewed.run.permissionDecisions?.some(item => item.promptId === collapsedPrompt.id), false,
+      "the collapsed display identity never receives a permission decision");
+    const feedback = JSON.parse(readFileSync(join(f.receipts, `${runId}.permission-feedback.json`), "utf8"));
+    assert.deepEqual(feedback.prompt, expandedPrompt, "the coordinator receives the actual expanded prompt evidence");
+    assert.notEqual(feedback.prompt.id, collapsedPrompt.id);
+    assert.equal(existsSync(join(f.receipts, `${runId}.permission-answer`)), false,
+      "the provider receives no answer while its fresh prompt is held for coordinator review");
+
+    writeFileSync(join(f.receipts, `${runId}.judge-release`), "release", { mode: 0o600 });
+    const answered = await waitFor(() => f.get(runId), run => run.permissionDecisions?.[0]?.status === "answered" &&
+      existsSync(join(f.receipts, `${runId}.permission-answer`)), 30000);
+    assert.equal(answered.permissionDecisions?.[0]?.receipt?.state, "delivered");
+    assert.equal(answered.permissionDecisions?.[0]?.receipt?.result, "closed");
+
+    const auditService = await f.openTeamService({ start: false });
+    const audited = auditService.understandingRecords().find(run => run.id === runId)!;
+    const recovery = audited.permissionRecovery!;
+    assert.equal(recovery.requests.length, 1);
+    assert.equal(recovery.requests[0]!.promptId, expandedPrompt.id, "the live recovery request advances to the fresh prompt identity");
+    assert.equal(recovery.requests[0]!.expansion?.status, "expanded");
+    assert.equal(recovery.requests[0]!.expansion?.promptId, collapsedPrompt.id, "the expansion record retains the original collapsed identity");
+    assert.equal(recovery.requests[0]!.expansion?.observedPromptId, expandedPrompt.id,
+      "the expansion record binds the new prompt identity");
+    assert.equal(recovery.requests[0]!.expansion?.observedPromptHash, expandedPrompt.hash);
+    assert.ok(recovery.steps.some(step => step.action === "expand-display" && step.decision === "display-expansion-delivered" &&
+      step.receipt?.state === "delivered" && step.execution === "unknown"), "the audit records key delivery without claiming command execution");
+    assert.ok(recovery.steps.some(step => step.action === "bind-expanded-prompt" && step.decision === "review-new-screen-identity"),
+      "the audit records review of the newly observed screen");
+    assert.equal(recovery.outcomes.length, 1);
+    assert.equal(recovery.outcomes[0]!.promptId, expandedPrompt.id);
+    assert.equal(recovery.outcomes[0]!.status, "complete");
+    assert.equal(recovery.outcomes[0]!.decision, "one-shot-answer-delivered");
+    assert.match(recovery.outcomes[0]!.consequence, /command's execution result remains unknown/i);
   } finally { await f.close(); }
 });
 
@@ -295,7 +502,7 @@ test("a missing pinned coordinator provider records an escalation", { timeout: 1
     writeFileSync(join(f.receipts, `${waiting.id}.target-release`), "release", { mode: 0o600 });
 
     const escalated = await waitFor(() => f.get(waiting.id), run => run.permissionDecisions?.[0]?.status === "escalated", 30000);
-    assert.match(escalated.permissionDecisions[0].reason ?? "", /pinned permission coordinator provider is not configured/i);
+    assert.match(escalated.permissionDecisions[0].reason ?? "", /pinned permission reviewer provider is not configured/i);
     assert.equal(escalated.members.some(member => member.role === "permission-coordinator"), false);
   } finally { await f.close(); }
 });
@@ -375,6 +582,15 @@ test("an explicit escalation or a foreign decision report never answers the targ
       const target = escalated.members.find(member => member.memberId === escalated.permissionDecisions[0].targetMemberId)!;
       const session = await f.host.fetchApi(`/sessions/${target.sessionId}`);
       assert.equal(session.body.attention?.state, "needs-you");
+      if (scenario === "permissions-escalate") {
+        await new Promise(resolve => setTimeout(resolve, 1800)); // Let several 500 ms TeamService passes observe the held prompt.
+        const stillEscalated = await f.get(reviewing.id);
+        assert.equal(stillEscalated.permissionDecisions?.length, 1,
+          "a terminal escalation for this exact prompt cannot launch another ordinary review on later ticks");
+        assert.equal(stillEscalated.members.filter(member => member.role === "permission-coordinator").length, 1);
+        assert.equal(existsSync(join(f.receipts, `${reviewing.id}.permission-answer`)), false);
+        assert.equal((await f.host.fetchApi(`/sessions/${target.sessionId}`)).body.attention?.state, "needs-you");
+      }
     } finally { await f.close(); }
   }
 });

@@ -33,7 +33,7 @@ infinite close SESSION_ID  # confirm before ending its provider process
 
 `list` includes each session's project and working directory, then where its tools run: `tools on MACHINE` for the host, or `laptop tools` with the executor state for `--laptop` sessions. The working directory is the recorded provider directory, or the selected laptop tool directory while laptop execution is active. It does not infer shell directory changes. JSON output retains the complete host session summary.
 
-`resources` reports timestamped CPU, memory, swap, disk, network, and per-session provider-process counters. Missing measurements stay unavailable, including CPU usage and network rates before a second sample. Process counters do not include every descendant process. `--watch` refreshes every two seconds until Ctrl+C; combined with `--json`, it emits one JSON object per line.
+`resources` reports timestamped CPU, memory, swap, network, per-project disk bytes and inodes, the configured host state and workspace volumes, and per-session provider-process counters. Storage lines show free bytes and inodes, and host volumes identify the scarcer capacity dimension. Missing measurements stay unavailable, including CPU usage and network rates before a second sample. Process counters do not include every descendant process. `--watch` refreshes every two seconds until Ctrl+C; combined with `--json`, it emits one JSON object per line.
 
 `close` requires an explicit session ID or unique prefix and an owner key. It shows the selected process and asks for confirmation; `--yes` confirms noninteractive use. Another client's active input lease blocks closing unless `--takeover` is explicitly supplied. A delivered receipt confirms the stop request reached the worker; check `list` for the resulting process status. An uncertain response is reported and never retried automatically. Closing ends the provider process; Ctrl+] only detaches the terminal client.
 
@@ -139,6 +139,7 @@ infinite team answer TEAM_ID QUESTION_ID "Use the existing route"
 infinite team pause TEAM_ID
 infinite team resume TEAM_ID
 infinite team cancel TEAM_ID
+infinite team delete TEAM_ID [--json]
 ```
 
 `infinite team status` without an ID lists each team. `infinite team status TEAM_ID`
@@ -150,7 +151,9 @@ failed, and `q` or Ctrl+C detaches. The bottom line always lists the keys for
 the current view. A non-interactive watch prints again only when the visible
 text changes. `--logs` starts in the review log, and
 `infinite team status TEAM_ID --logs` prints the current revision's logs once.
-`--json` prints the team record. See [Goals and agent teams](teams.md) for the
+`team delete` removes a settled cancelled, merged, or no-change run and its
+workspace. Repeating the command after removal prints `already removed` and
+exits successfully. `--json` prints the final team record. See [Goals and agent teams](teams.md) for the
 full key list.
 
 `repo init` takes these source and delivery options:

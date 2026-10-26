@@ -171,7 +171,7 @@ export class WorkNarrativeStore {
     if (!run || workId !== `team:${run.id}`) return unavailable("The team run is not available.");
     if (!settledStatuses.has(run.status)) return unavailable("The run is still active; its narrative is available once it settles.");
     if (this.options.teams.pendingOperation(run.id)) return unavailable("A host operation is still pending for this run.");
-    if (!run.workspace || !existsSync(run.workspace)) return unavailable("The recorded revision is no longer checked out on this host.");
+    if (run.workspaceRemovedAt || !run.workspace || !existsSync(run.workspace)) return unavailable("The recorded revision is no longer checked out on this host.");
     const head = readGit(run.workspace, ["rev-parse", "HEAD"]);
     if (!run.headCommit || head !== run.headCommit) return unavailable("The recorded revision is no longer checked out on this host.");
     const status = readGit(run.workspace, ["status", "--porcelain"]);

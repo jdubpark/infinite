@@ -1,5 +1,5 @@
 import { constants, type Stats } from "node:fs";
-import { chmod, copyFile, link, lstat, mkdir, open, opendir, readFile, realpath, rename, rm, statfs, unlink } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, open, opendir, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { cpus, freemem, loadavg, platform, totalmem, uptime } from "node:os";
@@ -7,6 +7,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Config } from "./types.js";
+import { volumeFullness, volumeUsage } from "./storage.js";
 
 export const DESKTOP_LIMITS = { chunkBytes: 48 * 1024, maxFileBytes: 256 * 1024 * 1024, uploads: 8, uploadTtlMs: 30 * 60 * 1000 };
 const hash = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
@@ -260,6 +261,35 @@ export class DesktopFiles {
 
 const cpuTotals = () => cpus().reduce((value, cpu) => ({ idle: value.idle + cpu.times.idle, total: value.total + Object.values(cpu.times).reduce((a, b) => a + b, 0) }), { idle: 0, total: 0 });
 type MetricSession = { id: string; pid?: number; status: string };
+export type HostVolume = {
+  label: "state" | "workspaces"; path: string; totalBytes: number | null; availableBytes: number | null;
+  totalInodes: number | null; availableInodes: number | null; fullness: number | null; fullnessBy: "bytes" | "inodes" | null;
+};
+/** Sample only the explicitly configured host storage roots, sharing statfs logic with admission checks. */
+export async function sampleVolumes(config: Pick<Config, "stateDir" | "teams">): Promise<HostVolume[]> {
+  const roots: { label: HostVolume["label"]; path: string }[] = [{ label: "state", path: config.stateDir }];
+  if (config.teams?.workspaceDir) roots.push({ label: "workspaces", path: config.teams.workspaceDir });
+  const sampled = await Promise.all(roots.map(async ({ label, path }) => {
+    const [usage, info] = await Promise.all([
+      volumeUsage(path).catch(() => undefined),
+      stat(path).catch(() => undefined),
+    ]);
+    let volume: HostVolume;
+    if (usage) {
+      const bytes = usage.totalBytes > 0 ? 1 - usage.availableBytes / usage.totalBytes : 0;
+      const inodes = usage.totalInodes > 0 ? 1 - usage.availableInodes / usage.totalInodes : 0;
+      volume = { label, path, totalBytes: usage.totalBytes, availableBytes: usage.availableBytes, totalInodes: usage.totalInodes, availableInodes: usage.availableInodes, fullness: volumeFullness(usage), fullnessBy: inodes >= bytes ? "inodes" : "bytes" };
+    } else volume = { label, path, totalBytes: null, availableBytes: null, totalInodes: null, availableInodes: null, fullness: null, fullnessBy: null };
+    return { volume, device: info?.dev };
+  }));
+  const devices = new Set<number>();
+  return sampled.filter(({ device }) => {
+    if (device === undefined) return true;
+    if (devices.has(device)) return false;
+    devices.add(device);
+    return true;
+  }).map(({ volume }) => volume);
+}
 /** Host-wide sampling is shared across clients; unsupported values stay null. */
 export class DesktopResources {
   private previous?: { at: number; cpu: ReturnType<typeof cpuTotals>; rx: number | null; tx: number | null };
@@ -315,9 +345,11 @@ export class DesktopResources {
     this.previous = { at, cpu, rx, tx };
     if (!previous) unavailable.push({ field: "cpu.usagePercent,network.rates", reason: "Waiting for a second sample" });
     const disks = await Promise.all(this.config.projects.map(async project => {
-      try { const disk = await statfs(project.path); return { projectId: project.id, totalBytes: disk.blocks * disk.bsize, availableBytes: disk.bavail * disk.bsize }; }
-      catch { return { projectId: project.id, totalBytes: null, availableBytes: null }; }
+      try { const disk = await volumeUsage(project.path); return { projectId: project.id, totalBytes: disk.totalBytes, availableBytes: disk.availableBytes, totalInodes: disk.totalInodes, availableInodes: disk.availableInodes }; }
+      catch { return { projectId: project.id, totalBytes: null, availableBytes: null, totalInodes: null, availableInodes: null }; }
     }));
+    const volumes = await sampleVolumes(this.config);
+    unavailable.push(...volumes.filter(volume => volume.fullness === null).map(volume => ({ field: `volumes.${volume.label}`, reason: "Filesystem counters are unavailable" })));
     const sessions = await this.sessions(), pids = [...new Set(sessions.filter(s => s.status === "running" && Number.isInteger(s.pid) && s.pid! > 1).map(s => s.pid!))];
     const processes = new Map<number, { cpuPercent: number; rssBytes: number }>();
     if (pids.length) try {
@@ -331,7 +363,7 @@ export class DesktopResources {
       memory: { totalBytes: totalmem(), availableBytes: available, availableKind },
       swap: { totalBytes: swapTotal, usedBytes: swapUsed },
       network: { receivedBytes: rx, sentBytes: tx, receiveBytesPerSecond: rate(rx, previous?.rx), sendBytesPerSecond: rate(tx, previous?.tx), scope: "non-loopback-interfaces" },
-      disks, sessions: sessions.map(s => ({ sessionId: s.id, pid: s.pid ?? null, scope: "provider-process", cpuKind: "ps-reported", cpuPercent: processes.get(s.pid!)?.cpuPercent ?? null, rssBytes: processes.get(s.pid!)?.rssBytes ?? null })), unavailable,
+      disks, volumes: volumes.map(({ fullnessBy: _fullnessBy, ...volume }) => volume), sessions: sessions.map(s => ({ sessionId: s.id, pid: s.pid ?? null, scope: "provider-process", cpuKind: "ps-reported", cpuPercent: processes.get(s.pid!)?.cpuPercent ?? null, rssBytes: processes.get(s.pid!)?.rssBytes ?? null })), unavailable,
     };
   }
 }

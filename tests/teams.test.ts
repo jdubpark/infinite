@@ -12,11 +12,12 @@ import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { TeamError, applyTeamBriefTitle, changeIndex, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
-import { createTeamSchema, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamTask, type TeamView } from "../packages/host/src/team-types.js";
+import { createTeamSchema, lineupProfiles, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamTask, type TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import type { HandoffPolicy, TeamHandoffContext } from "../packages/host/src/handoff-types.js";
-import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
-import { permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
+import { permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
+import { permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey } from "../packages/host/src/team-permissions.js";
+import { collectPermissionEvidence } from "../packages/host/src/team-permission-evidence.js";
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON } from "../packages/host/src/team-workspace.js";
 
@@ -24,6 +25,29 @@ import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON } from "../packages/host/src
 import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { Manager } from "../packages/host/src/manager.js";
+
+test("team session creation refuses native continuation for other providers or roles", () => {
+  const manager = Object.create(Manager.prototype) as Manager;
+  Object.defineProperty(manager, "config", { value: { teams: {} } });
+  const request = {
+    requestId: randomUUID(),
+    provider: "codex" as const,
+    projectId: "project",
+    title: "Coordinator",
+    prompt: "Continue",
+    continuation: { nativeSessionId: randomUUID(), mode: "resume" as const },
+  };
+  const assignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "permission-coordinator" as const };
+  assert.throws(() => manager.createTeamSession(request, assignment, "workspace"), error =>
+    error instanceof Error && error.message.includes("only supported for Claude Code") && (error as Error & { status?: number }).status === 400);
+  assert.throws(() => manager.createTeamSession({ ...request, provider: "claude" }, { ...assignment, role: "implementer" }, "workspace"), error =>
+    error instanceof Error && error.message.includes("only supported for permission or mission coordinators") && (error as Error & { status?: number }).status === 400);
+});
+
+function permissionWorkspaceEvidenceHash(prompt: Prompt, cwd: string, changedPaths: string[]) {
+  const evidence = collectPermissionEvidence({ prompt, cwd, changedPaths });
+  return createHash("sha256").update(JSON.stringify({ changedPaths, evidence: evidence.digest })).digest("hex");
+}
 
 test("a GitHub project run clones the mirror head without reading the project tree", { timeout: 90000 }, async () => {
   const f = await fixture("success", undefined, {}, { noServer: true });
@@ -1814,6 +1838,25 @@ const limitLineup: TeamLineup = {
   ],
   fallbacks: [{ id: "deepseek-light", label: "DeepSeek Flash", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light" }],
 };
+test("lineups accept only Claude permission reviewers and include them in profile resolution", () => {
+  const permissionReviewer: TeamModelProfile = { id: "permission-reviewer", label: "Permission reviewer", provider: "claude",
+    model: "claude-haiku-5-5", effort: "high", tier: "light" };
+  const parsed = teamLineupSchema.parse({ ...fallbackLineup, permissionReviewer });
+  assert.equal(lineupProfiles(parsed).at(-1)?.id, permissionReviewer.id);
+
+  for (const invalid of [
+    { ...permissionReviewer, provider: "codex", model: "gpt-6-astra" },
+    { id: "permission-reviewer", label: "Permission reviewer", provider: "opencode", model: "vendor/model", variant: "high" },
+  ]) {
+    const result = teamLineupSchema.safeParse({ ...fallbackLineup, permissionReviewer: invalid });
+    assert.equal(result.success, false);
+    if (!result.success) assert.ok(result.error.issues.some(issue => issue.message === "The permission reviewer profile must use Claude Code."));
+  }
+
+  const codexFallback = teamLineupSchema.safeParse({ ...fallbackLineup,
+    permissionReviewer: { ...permissionReviewer, limitFallback: "codex-light" } });
+  assert.equal(codexFallback.success, false, "A reviewer fallback cannot move review onto a non-Claude profile");
+});
 const readReceipts = (dir: string) => readdirSync(dir).filter(name => name.endsWith(".json")).map(name => JSON.parse(readFileSync(join(dir, name), "utf8")));
 const sessionEvents = async (host: Host, id: string, types: string) => (await host.fetchApi(`/sessions/${id}/events?types=${types}&after=0&limit=200`)).body.events as unknown[];
 
@@ -1943,6 +1986,38 @@ test("permission coordinator prompt reviews complete command evidence within the
   assert.match(prompt, /Owner-authorized permission scope \(pinned for this run\):\nPinned one-time task scope/);
   assert.match(prompt, /host rechecks the exact prompt, evidence snapshot, and current authority and alone applies any answer/);
   assert.ok(prompt.includes(evidence));
+});
+
+test("diagnostic evidence requests produce fresh immutable snapshots, then queue bounded PM correction", { timeout: 120000 }, async () => {
+  const lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude" as const,
+    model: "claude-opus-5-5", effort: "xhigh" as const, tier: "strong" as const } };
+  const f = await fixture("permissions-codex-diagnostic-evidence", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const run = await waitFor(() => f.get(created.body.id), current => (current.permissionDecisions?.length ?? 0) >= 3 &&
+      current.permissionRecovery?.outcomes.some(outcome => outcome.status === "exhausted") === true &&
+      current.recovery?.source.code === "permission-recovery", 60000);
+    const [initial, firstRefresh, secondRefresh] = run.permissionDecisions!;
+    assert.equal(run.permissionDecisions!.length, 3);
+    assert.ok([initial, firstRefresh, secondRefresh].every(decision => decision.purpose === "diagnose" && decision.option === -1 && decision.status === "escalated"));
+    assert.deepEqual(new Set(run.permissionDecisions!.map(decision => `${decision.promptId}:${decision.promptHash}`)).size, 1,
+      "evidence refreshes retain the exact unrecognized prompt identity");
+    assert.equal(new Set(run.permissionDecisions!.map(decision => decision.workspaceEvidenceHash)).size, 3,
+      "each evidence refresh launches a distinct complete snapshot review");
+    assert.deepEqual(firstRefresh.requestedPaths, ["a.txt"]);
+    assert.deepEqual(secondRefresh.requestedPaths, ["a.txt", "original.txt"]);
+    assert.equal(initial.recoveryRequestId, firstRefresh.recoveryRequestId, "fresh reports remain attached to the same bounded request");
+    assert.equal(initial.requestedPaths, undefined, "the original report keeps its original evidence request identity");
+    assert.equal(firstRefresh.recoveryRequestId, secondRefresh.recoveryRequestId);
+    assert.equal(run.recovery?.source.memberId, secondRefresh.coordinatorMemberId, "PM correction cites the actual reporting coordinator");
+    const outcome = run.permissionRecovery?.outcomes.at(-1);
+    assert.equal(outcome?.status, "exhausted");
+    assert.equal(outcome?.execution, "unknown");
+    assert.equal(outcome?.action, "project-manager-correction");
+    assert.ok(run.permissionDecisions!.every(decision => !decision.receipt), "a diagnostic conclusion never sends a provider answer");
+    assert.equal(existsSync(join(f.receipts, `${run.id}.permission-answer`)), false);
+  } finally { await f.close(); }
 });
 
 test("Codex sandbox guidance covers members but excludes the permission coordinator", () => {
@@ -2183,8 +2258,13 @@ test("promptOwner says who a member's prompt waits on: the coordinator, the owne
     assert.equal(teams.promptOwner(member.sessionId, prompt), "undecided", "a delegated run may still start the review");
     assert.equal(teams.promptOwner(randomUUID(), prompt), "user", "a session outside any run is the owner's");
     assert.equal(teams.promptOwner(member.sessionId, { ...prompt, pinned: false }), "user", "incomplete one-shot evidence stays with the owner");
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, tier: "light" },
+      permissionReviewer: { id: "permission-reviewer", label: "Permission reviewer", provider: "claude", model: "claude-haiku-5-5", effort: "high", tier: "light" } };
+    f.writeTeam();
+    assert.equal(f.openTeam().promptOwner(member.sessionId, prompt), "undecided", "a configured reviewer does not require a strong coordinator fallback");
     const decision = { id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: member.memberId, targetSessionId: member.sessionId,
       targetCwd: member.cwd, promptId: 1, promptHash: prompt.hash!, evidenceHash: "c".repeat(64), option: 0, prompt,
+      authorityHash: permissionAuthorityHash(f.run.permissions, []),
       expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), status: "reviewing" as const };
     // "answering" is not observable through a reloaded service: restart recovery marks it uncertain, which is the owner's.
     for (const [status, owner] of [["pending", "coordinator"], ["reviewing", "coordinator"], ["approved", "coordinator"], ["answering", "user"],
@@ -2203,6 +2283,311 @@ test("promptOwner says who a member's prompt waits on: the coordinator, the owne
   } finally { f.close(); }
 });
 
+test("permission reuse keys ignore prompt identity but bind the selected option and changed paths", () => {
+  const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+    title: "Run command?", detail: "npm run check", options: [{ index: 0, label: "Allow once", role: "accept" }] };
+  const input = { policyHash: "b".repeat(64), prompt, option: 0, targetTaskId: "task-a", changedPaths: ["z.ts", "a.ts", "z.ts"], acceptedChecks: null };
+  const key = permissionReuseKey(input);
+  assert.equal(permissionReuseKey({ ...input, prompt: { ...prompt, id: 99, hash: "c".repeat(64) }, changedPaths: ["a.ts", "z.ts"] }), key);
+  assert.notEqual(permissionReuseKey({ ...input, option: 1 }), key);
+  assert.notEqual(permissionReuseKey({ ...input, changedPaths: ["a.ts"] }), key);
+});
+
+test("a reviewer follow-up prompt repeats the owner's current steering and answers", () => {
+  const bare = permissionFollowUpPrompt("{\"decisionId\":\"d\"}");
+  assert.doesNotMatch(bare, /User steering and answers/);
+  const directed = permissionFollowUpPrompt("{\"decisionId\":\"d\"}", ["Keep to the API package.", "Owner answered \"Run the check again?\": No. Do not run that command again."]);
+  assert.match(directed, /User steering and answers \(current; they bind this request\):\nKeep to the API package\.\n\nOwner answered "Run the check again\?": No\. Do not run that command again\./);
+  assert.ok(directed.indexOf("User steering and answers") < directed.indexOf("Recorded permission request"), "direction precedes the untrusted evidence");
+  assert.match(directed, /^You are the team's permission-coordinator\./m);
+});
+
+test("an owner answer retires outstanding permission decisions so no verdict given before it can deliver", async () => {
+  const f = schedulerFixture();
+  try {
+    const at = new Date().toISOString(), target = f.run.members[0];
+    const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+    f.run.decisions = [{ id: randomUUID(), memberId: target.memberId, revision: 1, question: "Run the check again?", options: ["Yes", "No"], createdAt: at }];
+    const base = { revision: 1, policyHash: createHash("sha256").update(JSON.stringify(f.run.permissions)).digest("hex"), targetMemberId: target.memberId,
+      targetSessionId: target.sessionId, targetCwd: target.cwd, promptId: prompt.id, promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt), prompt,
+      option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), coordinatorMemberId: randomUUID(),
+      authorityHash: permissionAuthorityHash(f.run.permissions, []) };
+    const coordinatorQuestion = { id: randomUUID(), memberId: target.memberId, revision: 1, question: "Which file first?", options: ["a", "b"], createdAt: at };
+    f.run.decisions.push(coordinatorQuestion);
+    f.run.permissionDecisions = [{ ...base, id: randomUUID(), status: "pending" as const }, { ...base, id: randomUUID(), status: "reviewing" as const },
+      { ...base, id: randomUUID(), status: "approved" as const }, { ...base, id: randomUUID(), status: "answered" as const }];
+    const fences: [string, string][] = [];
+    (f.manager as any).invalidateTeamPermission = async (sessionId: string, decisionId: string) => { fences.push([sessionId, decisionId]); return "invalidated"; };
+    f.writeTeam();
+    const teams = f.openTeam();
+    const stored = (teams as unknown as { record(id: string): { run: TeamRun } }).record(f.run.id);
+    // An answer in flight exists only in memory: restart recovery would already have marked a stored one uncertain.
+    const inFlight = { ...base, id: randomUUID(), status: "answering" as const };
+    stored.run.permissionDecisions!.push(inFlight);
+
+    // A mission coordinator's answer is not owner direction; it retires nothing.
+    await teams.answer(f.run.id, coordinatorQuestion.id, { requestId: randomUUID(), revision: 1, text: "a" }, undefined, "coordinator");
+    assert.deepEqual(teams.get(f.run.id).permissionDecisions?.map(decision => decision.status), ["pending", "reviewing", "approved", "answered", "answering"]);
+    assert.deepEqual(fences, []);
+
+    await teams.answer(f.run.id, f.run.decisions[0].id, { requestId: randomUUID(), revision: 1, text: "No. Do not run that command again." });
+    const run = teams.get(f.run.id);
+    assert.deepEqual(run.permissionDecisions?.map(decision => decision.status), ["stale", "stale", "stale", "answered", "uncertain"]);
+    assert.ok(run.permissionDecisions?.filter(decision => decision.status !== "answered").every(decision => /owner answered a team question/.test(decision.reason ?? "")));
+    assert.deepEqual(fences, [[target.sessionId, inFlight.id]], "the in-flight answer is fenced at its target session");
+  } finally { f.close(); }
+});
+
+test("permission decisions recorded before owner-authority pinning are retired on restore and refused at delivery", async () => {
+  const f = schedulerFixture();
+  try {
+    const target = f.run.members[0];
+    const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+    const legacy = { revision: 1, policyHash: createHash("sha256").update(JSON.stringify(f.run.permissions)).digest("hex"), targetMemberId: target.memberId,
+      targetSessionId: target.sessionId, targetCwd: target.cwd, promptId: prompt.id, promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt), prompt,
+      option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), coordinatorMemberId: randomUUID() };
+    f.run.permissionDecisions = [{ ...legacy, id: randomUUID(), status: "reviewing" as const }, { ...legacy, id: randomUUID(), status: "answered" as const }];
+    f.writeTeam();
+    const teams = f.openTeam();
+    const run = teams.get(f.run.id);
+    assert.deepEqual(run.permissionDecisions?.map(decision => decision.status), ["stale", "answered"], "only outstanding legacy reviews are retired");
+    assert.match(run.permissionDecisions?.[0].reason ?? "", /before owner authority was pinned/);
+    const scheduler = teams as unknown as { record(id: string): { run: TeamRun }; permissionAnswerInvalidReason(stored: unknown, decision: unknown): Promise<string | undefined> };
+    const stored = scheduler.record(f.run.id);
+    const approvedWithoutHash = { ...legacy, id: randomUUID(), status: "approved" as const };
+    assert.match(await scheduler.permissionAnswerInvalidReason(stored, approvedWithoutHash) ?? "", /predates owner-authority pinning/);
+  } finally { f.close(); }
+});
+
+test("an owner answer during the delivery recheck stops a reused approval before any answer is sent", async () => {
+  const f = schedulerFixture();
+  try {
+    const target = f.run.members[0], at = new Date().toISOString();
+    const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+    const priorPrompt = { ...prompt, id: 99, hash: "c".repeat(64) };
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+    f.state.attention.state = "needs-you"; f.state.attention.prompt = prompt;
+    const policyHash = createHash("sha256").update(JSON.stringify(f.run.permissions)).digest("hex");
+    const prior = { id: randomUUID(), revision: 1, policyHash, targetMemberId: target.memberId, targetSessionId: target.sessionId,
+      targetCwd: target.cwd, promptId: priorPrompt.id, promptHash: priorPrompt.hash!, evidenceHash: permissionEvidenceHash(priorPrompt),
+      workspaceEvidenceHash: permissionWorkspaceEvidenceHash(priorPrompt, target.cwd, []),
+      reuseKey: permissionReuseKey({ policyHash, prompt: priorPrompt, option: 0, changedPaths: [], acceptedChecks: null }), prompt: priorPrompt,
+      reviewerProfileHash: createHash("sha256").update(JSON.stringify(f.run.lineup.coordinator)).digest("hex"), authorityHash: permissionAuthorityHash(f.run.permissions, []),
+      option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: randomUUID(),
+      answerRequestId: randomUUID(), status: "answered" as const, verdict: "approve-once" as const };
+    f.run.permissionDecisions = [prior]; f.writeTeam();
+    const teams = f.openTeam();
+    const scheduler = teams as unknown as { record(id: string): { run: TeamRun }; maybeStartPermissionReview(stored: unknown, member: typeof target): Promise<boolean> };
+    const stored = scheduler.record(f.run.id);
+    (f.manager as any).meta = () => ({ session: { cwd: target.cwd, team: { runId: f.run.id, memberId: target.memberId,
+      revision: target.revision, role: target.role } } });
+    // The first state read qualifies the prompt; the second is the delivery recheck, where the owner's answer lands.
+    let stateReads = 0;
+    const baseState = f.manager.state;
+    (f.manager as any).state = async (...args: unknown[]) => {
+      if (++stateReads === 2) stored.run.decisions.push({ id: randomUUID(), memberId: target.memberId, revision: 1, question: "Run the check again?",
+        options: ["Yes", "No"], createdAt: at, answer: "No. Do not run that command again.", answeredBy: "owner", answeredAt: at });
+      return (baseState as (...inner: unknown[]) => Promise<unknown>)(...args);
+    };
+    let deliveries = 0;
+    (f.manager as any).answerTeamPermission = async () => { deliveries++; return { state: "delivered", result: "closed", seq: 1 }; };
+    assert.equal(await scheduler.maybeStartPermissionReview(stored, target), true);
+    const result = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[1]?.status === "escalated");
+    assert.equal(deliveries, 0, "nothing reviewed before the owner's answer may deliver");
+    assert.equal(result.permissionDecisions?.[1].reusedFromDecisionId, prior.id);
+    assert.match(result.permissionDecisions?.[1].reason ?? "", /steering or answers changed/);
+  } finally { f.close(); }
+});
+
+test("an identical approved permission request reuses the review and delivers once", async () => {
+  const f = schedulerFixture();
+  try {
+    const target = f.run.members[0];
+    const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+    const priorPrompt = { ...prompt, id: 99, hash: "c".repeat(64) };
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+    f.state.attention.state = "needs-you"; f.state.attention.prompt = prompt;
+    const policyHash = createHash("sha256").update(JSON.stringify(f.run.permissions)).digest("hex");
+    const sourceCoordinatorId = randomUUID();
+    const prior = { id: randomUUID(), revision: 1, policyHash, targetMemberId: target.memberId, targetSessionId: target.sessionId,
+      targetCwd: target.cwd, promptId: priorPrompt.id, promptHash: priorPrompt.hash!, evidenceHash: permissionEvidenceHash(priorPrompt),
+      workspaceEvidenceHash: permissionWorkspaceEvidenceHash(priorPrompt, target.cwd, []),
+      reuseKey: permissionReuseKey({ policyHash, prompt: priorPrompt, option: 0, changedPaths: [], acceptedChecks: null }), prompt: priorPrompt,
+      reviewerProfileHash: createHash("sha256").update(JSON.stringify(f.run.lineup.coordinator)).digest("hex"), authorityHash: permissionAuthorityHash(f.run.permissions, []),
+      option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: sourceCoordinatorId,
+      answerRequestId: randomUUID(), status: "answered" as const, verdict: "approve-once" as const };
+    f.run.permissionDecisions = [prior];
+    (f.manager as any).meta = () => ({ session: { cwd: target.cwd, team: { runId: f.run.id, memberId: target.memberId,
+      revision: target.revision, role: target.role } } });
+    let deliveries = 0;
+    let deliveredCoordinatorId: string | undefined;
+    (f.manager as any).answerTeamPermission = async (_sessionId: string, _requestId: string, _assignment: unknown, decision: { coordinatorMemberId?: string }) => {
+      deliveries++; deliveredCoordinatorId = decision.coordinatorMemberId;
+      return { requestId: _requestId, state: "delivered", result: "closed", seq: 1 };
+    };
+    f.writeTeam();
+    const teams = f.openTeam();
+    const scheduler = teams as unknown as { record(id: string): unknown; maybeStartPermissionReview(stored: unknown, member: typeof target): Promise<boolean> };
+    assert.equal(await scheduler.maybeStartPermissionReview(scheduler.record(f.run.id), target), true);
+    const result = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[1]?.status === "answered");
+    assert.equal(result.members.length, 1, "reuse does not start another reviewer");
+    assert.equal(result.permissionDecisions?.[1].reusedFromDecisionId, prior.id);
+    assert.equal(result.permissionDecisions?.[1].coordinatorMemberId, undefined, "the persisted reused decision has no coordinator assignment");
+    assert.equal(result.permissionDecisions?.[1].verdict, undefined);
+    assert.equal(deliveries, 1);
+    assert.equal(deliveredCoordinatorId, sourceCoordinatorId, "delivery carries the linked reviewer's identity transiently");
+    assert.ok(result.events.some(event => event.text === "An identical one-shot request was approved from the recorded review."));
+  } finally { f.close(); }
+});
+
+test("reused approval observes invalidation during manager preflight", async () => {
+  const f = schedulerFixture();
+  try {
+    const target = f.run.members[0];
+    const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+    const priorPrompt = { ...prompt, id: 99, hash: "c".repeat(64) };
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+    f.state.attention.state = "needs-you"; f.state.attention.prompt = prompt;
+    const policyHash = createHash("sha256").update(JSON.stringify(f.run.permissions)).digest("hex");
+    const prior = { id: randomUUID(), revision: 1, policyHash, targetMemberId: target.memberId, targetSessionId: target.sessionId,
+      targetCwd: target.cwd, promptId: priorPrompt.id, promptHash: priorPrompt.hash!, evidenceHash: permissionEvidenceHash(priorPrompt),
+      workspaceEvidenceHash: permissionWorkspaceEvidenceHash(priorPrompt, target.cwd, []),
+      reuseKey: permissionReuseKey({ policyHash, prompt: priorPrompt, option: 0, changedPaths: [], acceptedChecks: null }), prompt: priorPrompt,
+      reviewerProfileHash: createHash("sha256").update(JSON.stringify(f.run.lineup.coordinator)).digest("hex"), authorityHash: permissionAuthorityHash(f.run.permissions, []),
+      option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: randomUUID(),
+      answerRequestId: randomUUID(), status: "answered" as const, verdict: "approve-once" as const };
+    f.run.permissionDecisions = [prior]; f.writeTeam();
+    const teams = f.openTeam();
+    const scheduler = teams as unknown as { record(id: string): { run: TeamRun }; maybeStartPermissionReview(stored: unknown, member: typeof target): Promise<boolean> };
+    const stored = scheduler.record(f.run.id);
+    (f.manager as any).meta = () => ({ session: { cwd: target.cwd, team: { runId: f.run.id, memberId: target.memberId,
+      revision: target.revision, role: target.role } } });
+    let preflights = 0, sends = 0;
+    (f.manager as any).answerTeamPermission = async (_sessionId: string, requestId: string, _assignment: unknown, decision: { status: string }) => {
+      preflights++;
+      assert.equal(decision.status, "answering");
+      stored.run.permissionDecisions![1]!.status = "uncertain";
+      await Promise.resolve();
+      if (decision.status !== "answering") throw Object.assign(new Error("The decision was invalidated before send"), { code: "control-lost" });
+      sends++;
+      return { requestId, state: "delivered", result: "closed", seq: 1 };
+    };
+    assert.equal(await scheduler.maybeStartPermissionReview(stored, target), true);
+    const result = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[1]?.status === "uncertain");
+    assert.equal(preflights, 1);
+    assert.equal(sends, 0, "an invalidated reused decision cannot pass the manager's final preflight");
+    assert.equal(result.permissionDecisions?.[1].reusedFromDecisionId, prior.id);
+  } finally { f.close(); }
+});
+
+test("permission reuse rejects changed evidence, task, role, and revision mismatches", async () => {
+  for (const mismatch of ["changed paths", "task id", "changed source contents", "role", "revision", "working directory", "reviewer profile", "owner answer"] as const) {
+    const f = schedulerFixture();
+    try {
+      const target = f.run.members[0];
+      const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+        title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+        options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+      const priorPrompt = { ...prompt, id: 99, hash: "c".repeat(64) };
+      f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+      f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+      if (mismatch === "changed paths") writeFileSync(join(target.cwd, "new-source.ts"), "export {}\n");
+      if (mismatch === "changed source contents") {
+        writeFileSync(join(target.cwd, "package.json"), JSON.stringify({ scripts: { check: "node check.js" } }));
+        writeFileSync(join(target.cwd, "check.js"), "process.exitCode = 0;\n");
+        prompt.detail = "Environment: local\n$ npm run check";
+        priorPrompt.detail = prompt.detail;
+      }
+      else if (mismatch === "task id") target.taskId = "current-task";
+      else if (mismatch === "revision") { f.run.revision = 2; target.revision = 2; }
+      const sourceTarget = mismatch === "role"
+        ? { ...target, memberId: randomUUID(), sessionId: randomUUID(), role: "integrator" as const }
+        : target;
+      if (sourceTarget !== target) f.run.members.push(sourceTarget);
+      f.state.attention.state = "needs-you"; f.state.attention.prompt = prompt;
+      const policyHash = createHash("sha256").update(JSON.stringify(f.run.permissions)).digest("hex");
+      const priorChangedPaths = mismatch === "changed source contents" ? ["check.js", "package.json"] : [];
+      const priorKey = permissionReuseKey({ policyHash, prompt: priorPrompt, option: 0,
+        ...(mismatch === "task id" ? { targetTaskId: "earlier-task" } : {}), changedPaths: priorChangedPaths, acceptedChecks: null });
+      const reviewerProfileHash = createHash("sha256").update(JSON.stringify(f.run.lineup.coordinator)).digest("hex");
+      const prior = { id: randomUUID(), revision: 1, policyHash, targetMemberId: sourceTarget.memberId,
+        targetSessionId: sourceTarget.sessionId, targetCwd: mismatch === "working directory" ? join(sourceTarget.cwd, "..", "elsewhere") : sourceTarget.cwd,
+        promptId: priorPrompt.id, promptHash: priorPrompt.hash!,
+        evidenceHash: permissionEvidenceHash(priorPrompt), workspaceEvidenceHash: permissionWorkspaceEvidenceHash(priorPrompt, sourceTarget.cwd, priorChangedPaths),
+        reuseKey: priorKey, prompt: priorPrompt, option: 0,
+        reviewerProfileHash: mismatch === "reviewer profile" ? "d".repeat(64) : reviewerProfileHash,
+        authorityHash: permissionAuthorityHash(f.run.permissions, []),
+        expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: randomUUID(), answerRequestId: randomUUID(),
+        status: "answered" as const, verdict: "approve-once" as const };
+      f.run.permissionDecisions = [prior];
+      // An owner answer after the recorded verdict is new direction the verdict never saw.
+      if (mismatch === "owner answer") f.run.decisions.push({ id: randomUUID(), memberId: target.memberId, revision: 1, question: "Run the check again?",
+        options: ["yes", "no"], createdAt: new Date().toISOString(), answer: "No. Do not run that command again.", answeredBy: "owner", answeredAt: new Date().toISOString() });
+      if (mismatch === "changed source contents") writeFileSync(join(target.cwd, "check.js"), "process.exitCode = 1;\n");
+      f.writeTeam();
+      const teams = f.openTeam();
+      const scheduler = teams as unknown as { record(id: string): unknown; maybeStartPermissionReview(stored: unknown, member: typeof target): Promise<boolean> };
+      assert.equal(await scheduler.maybeStartPermissionReview(scheduler.record(f.run.id), target), false);
+      const result = teams.get(f.run.id), fresh = result.permissionDecisions?.[1];
+      assert.equal(result.members.length, mismatch === "role" ? 2 : 1);
+      assert.equal(fresh?.status, "escalated");
+      assert.equal(fresh?.reusedFromDecisionId, undefined);
+      assert.equal(fresh?.verdict, undefined, "a host-side provider configuration failure is not a reviewer verdict");
+      assert.equal(fresh?.reuseKey === priorKey, ["changed source contents", "role", "revision", "working directory", "reviewer profile", "owner answer"].includes(mismatch));
+      assert.match(fresh?.reason ?? "", /provider is not configured/);
+    } finally { f.close(); }
+  }
+});
+
+test("an identical reviewer escalation is recorded and reused directly", async () => {
+  const f = schedulerFixture();
+  try {
+    const target = f.run.members[0];
+    const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+    const priorPrompt = { ...prompt, id: 99, hash: "c".repeat(64) };
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+    f.state.attention.state = "needs-you"; f.state.attention.prompt = prompt;
+    const policyHash = createHash("sha256").update(JSON.stringify(f.run.permissions)).digest("hex"), reviewerId = randomUUID();
+    const prior = { id: randomUUID(), revision: 1, policyHash, targetMemberId: target.memberId, targetSessionId: target.sessionId,
+      targetCwd: target.cwd, promptId: priorPrompt.id, promptHash: priorPrompt.hash!, evidenceHash: permissionEvidenceHash(priorPrompt),
+      workspaceEvidenceHash: permissionWorkspaceEvidenceHash(priorPrompt, target.cwd, []),
+      reuseKey: permissionReuseKey({ policyHash, prompt: priorPrompt, option: 0, changedPaths: [], acceptedChecks: null }), prompt: priorPrompt,
+      option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: reviewerId,
+      reviewerProfileHash: createHash("sha256").update(JSON.stringify(f.run.lineup.coordinator)).digest("hex"), authorityHash: permissionAuthorityHash(f.run.permissions, []),
+      answerRequestId: randomUUID(), status: "escalated" as const, verdict: "escalate" as const };
+    f.run.permissionDecisions = [prior]; f.writeTeam();
+    const teams = f.openTeam();
+    const scheduler = teams as unknown as { record(id: string): unknown; maybeStartPermissionReview(stored: unknown, member: typeof target): Promise<boolean> };
+    assert.equal(await scheduler.maybeStartPermissionReview(scheduler.record(f.run.id), target), false);
+    const result = teams.get(f.run.id), reused = result.permissionDecisions?.[1];
+    assert.equal(result.members.length, 1);
+    assert.equal(reused?.status, "escalated");
+    assert.equal(reused?.verdict, undefined);
+    assert.equal(reused?.reusedFromDecisionId, prior.id);
+    assert.match(reused?.reason ?? "", new RegExp(prior.id));
+    assert.ok(result.events.some(event => event.text === "An identical request was already escalated by the reviewer; it remains with the user."));
+  } finally { f.close(); }
+});
+
 test("a member back from an outage into a delegable prompt runs again and gets a permission decision", async () => {
   const f = schedulerFixture();
   try {
@@ -2218,7 +2603,231 @@ test("a member back from an outage into a delegable prompt runs again and gets a
     const result = await waitFor(async () => teams.get(f.run.id), run => (run.permissionDecisions?.length ?? 0) > 0);
     assert.equal(result.members[0].status, "running");
     assert.equal(result.permissionDecisions?.[0].status, "escalated");
-    assert.match(result.permissionDecisions?.[0].reason ?? "", /coordinator provider is not configured/);
+    assert.match(result.permissionDecisions?.[0].reason ?? "", /permission reviewer provider is not configured/);
+  } finally { f.close(); }
+});
+
+test("a configured permission reviewer launches from its profile and a later profile change escalates its decision", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.members[0].status = "unavailable";
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
+    f.run.headCommit = f.run.baseCommit;
+    const reviewerProfile: TeamModelProfile = { id: "permission-reviewer", label: "Permission reviewer", provider: "claude",
+      model: "claude-haiku-5-5", effort: "high", tier: "light" };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, tier: "light" }, permissionReviewer: reviewerProfile };
+    f.config.agents.claude = { command: "claude", args: [] };
+    f.state.attention.state = "needs-you";
+    f.state.attention.prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" }] };
+    f.writeTeam();
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.status === "blocked" ||
+      run.permissionDecisions?.[0]?.status === "reviewing" && run.members.some(member => member.role === "permission-coordinator" && member.status === "running"));
+    if (assigned.status === "blocked") {
+      const failed = f.readRecord<{ pending?: { failure?: { reason?: string } } }>("team", f.run.id);
+      assert.fail(failed.pending?.failure?.reason ?? JSON.stringify(assigned));
+    }
+    const reviewer = assigned.members.find(member => member.role === "permission-coordinator")!;
+    const decision = assigned.permissionDecisions![0];
+    assert.equal(reviewer.modelProfile?.id, reviewerProfile.id);
+    assert.equal(decision.reviewerProfileId, reviewerProfile.id);
+    assert.equal(decision.reviewerProfileHash, createHash("sha256").update(JSON.stringify(reviewerProfile)).digest("hex"));
+    assert.equal(f.launches.find(launch => launch.requestId === reviewer.sessionId)?.profile?.id, reviewerProfile.id);
+
+    teams.close(); await teams.idle();
+    const stored = f.readRecord<{ run: TeamRun; [key: string]: unknown }>("team", f.run.id);
+    stored.run.lineup!.permissionReviewer = { ...reviewerProfile, id: "alternate-reviewer", model: "claude-sonnet-4-5" };
+    f.writeRecord("team", f.run.id, stored);
+
+    const restarted = f.openTeam();
+    f.report(reviewer.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: reviewer.memberId, revision: reviewer.revision,
+      report: { kind: "permission-decision", decisionId: decision.id, verdict: "approve-once", summary: "The one-shot request matches the assigned scope." } });
+    restarted.start();
+    const escalated = await waitFor(async () => restarted.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "escalated");
+    assert.equal(escalated.permissionDecisions?.[0].reason, "The permission reviewer profile changed since this decision was assigned.");
+    assert.equal(f.permissionAnswers(), 0, "A changed reviewer profile cannot authorize an answer to the target session");
+  } finally { f.close(); }
+});
+
+function configurePermissionReviewFixture(f: ReturnType<typeof schedulerFixture>) {
+  f.run.members[0].status = "unavailable";
+  f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+  f.run.headCommit = f.run.baseCommit;
+  const profile: TeamModelProfile = { id: "permission-reviewer", label: "Permission reviewer", provider: "claude", model: "claude-haiku-5-5", effort: "high", tier: "light" };
+  f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, tier: "light" }, permissionReviewer: profile };
+  f.config.agents.claude = { command: "claude", args: [] };
+  const prompt = (id: number, command: string): Prompt => ({ id, kind: "permission", source: "screen", hash: String.fromCharCode(96 + id).repeat(64), pinned: true, acceptsText: false,
+    title: "Would you like to run the following command?", detail: `Environment: local\n$ ${command}`,
+    options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] });
+  f.state.attention.state = "needs-you";
+  f.state.attention.prompt = prompt(1, "npm test");
+  f.writeTeam();
+  return prompt;
+}
+
+test("sequential permission prompts reuse one reviewer and resume its observed native session", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    const prompt = configurePermissionReviewFixture(f);
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "reviewing" &&
+      run.members.some(member => member.role === "permission-coordinator" && member.status === "running") && f.launches.length > 0);
+    const reviewer = assigned.members.find(member => member.role === "permission-coordinator")!;
+    const firstDecision = assigned.permissionDecisions![0];
+    assert.equal(f.launches.length, 1);
+    assert.equal(f.launches[0].continuation?.mode ?? "start", "start");
+
+    const firstNativeId = f.launches[0].continuation!.nativeSessionId;
+    f.exposeNativeSession(reviewer.sessionId, firstNativeId);
+    f.report(reviewer.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: reviewer.memberId, revision: reviewer.revision,
+      report: { kind: "permission-decision", decisionId: firstDecision.id, verdict: "escalate", summary: "The command is outside the approved scope." } });
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "escalated" && run.members.some(member => member.memberId === reviewer.memberId && member.status === "waiting"));
+
+    f.state.attention.prompt = prompt(2, "npm run build");
+    const launchesBefore = f.launches.length;
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): { run: TeamRun } };
+    // A task integrated meanwhile: the reviewer has no file tools, so it keeps its member and conversation.
+    scheduler.record(f.run.id).run.headCommit = "f".repeat(40);
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.length === 2 && f.launches.length > launchesBefore);
+
+    const result = teams.get(f.run.id);
+    const persisted = f.readRecord<{ run: TeamRun }>("team", f.run.id).run;
+    const secondDecision = persisted.permissionDecisions![1];
+    const sameReviewer = persisted.members.find(member => member.memberId === reviewer.memberId)!;
+    assert.equal(result.members.filter(member => member.role === "permission-coordinator" && member.revision === 1).length, 1);
+    assert.equal(secondDecision.coordinatorMemberId, reviewer.memberId);
+    assert.equal(secondDecision.coordinatorSessionId, f.launches.at(-1)!.requestId);
+    assert.equal(f.launches.at(-1)!.continuation?.mode, "resume");
+    assert.equal(f.launches.at(-1)!.continuation?.nativeSessionId, firstNativeId);
+    assert.match(f.launches.at(-1)!.prompt, /npm run build/);
+    assert.match(f.launches.at(-1)!.prompt, /continuing the same assignment/);
+    assert.doesNotMatch(f.launches.at(-1)!.prompt, /Owner-authorized permission scope/);
+    assert.doesNotMatch(f.launches.at(-1)!.prompt, /npm test/);
+    assert.doesNotMatch(f.launches.at(-1)!.prompt, /Codex sandbox guidance/);
+    assert.ok(f.launches.at(-1)!.prompt.length < f.launches[0].prompt.length, "A resumed turn receives a short follow-up prompt");
+    assert.equal(sameReviewer.turns?.length, 2);
+    assert.deepEqual(sameReviewer.turns?.map(turn => turn.decisionId), [firstDecision.id, secondDecision.id]);
+    assert.deepEqual(sameReviewer.turns?.map(turn => turn.mode), ["start", "resume"]);
+    assert.ok(sameReviewer.turns?.every(turn => turn.sessionId && Number.isFinite(Date.parse(turn.startedAt))));
+  } finally { f.close(); }
+});
+
+test("a delivered permission decision returns its reviewer to waiting", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    configurePermissionReviewFixture(f);
+    const target = f.run.members[0], meta = f.manager.meta;
+    f.manager.meta = (sessionId => sessionId === target.sessionId ? { session: { team: {
+      runId: target.runId, memberId: target.memberId, revision: target.revision, role: target.role,
+    }, cwd: target.cwd } } : meta(sessionId)) as typeof f.manager.meta;
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "reviewing" &&
+      run.members.some(member => member.role === "permission-coordinator" && member.status === "running") && f.launches.length > 0);
+    const reviewer = assigned.members.find(member => member.role === "permission-coordinator")!;
+    f.exposeNativeSession(reviewer.sessionId, f.launches[0].continuation!.nativeSessionId);
+    f.report(reviewer.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: reviewer.memberId, revision: reviewer.revision,
+      report: { kind: "permission-decision", decisionId: assigned.permissionDecisions![0].id, verdict: "approve-once", summary: "The one-time check is in scope." } });
+
+    const delivered = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "answered" &&
+      run.members.some(member => member.memberId === reviewer.memberId && member.status === "waiting"));
+    assert.equal(f.permissionAnswers(), 1);
+    assert.equal(delivered.members.filter(member => member.role === "permission-coordinator").length, 1);
+  } finally { f.close(); }
+});
+
+test("a failed reviewer resume retries the same turn once with a fresh start and complete assignment", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    const prompt = configurePermissionReviewFixture(f);
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "reviewing" &&
+      run.members.some(member => member.role === "permission-coordinator" && member.status === "running") && f.launches.length > 0);
+    const reviewer = assigned.members.find(member => member.role === "permission-coordinator")!;
+    const firstDecision = assigned.permissionDecisions![0], nativeId = f.launches[0].continuation!.nativeSessionId;
+    f.exposeNativeSession(reviewer.sessionId, nativeId);
+    f.report(reviewer.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: reviewer.memberId, revision: reviewer.revision,
+      report: { kind: "permission-decision", decisionId: firstDecision.id, verdict: "escalate", summary: "Escalated to the owner." } });
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "escalated" && run.members.some(member => member.memberId === reviewer.memberId && member.status === "waiting"));
+    f.state.attention.prompt = prompt(2, "npm run build");
+
+    const before = f.launches.length;
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.length === 2 && f.launches.length >= before + 1);
+    const attempts = f.launches.slice(before);
+    assert.equal(attempts[0].continuation?.mode, "resume");
+    const resumedSessionId = attempts[0].requestId;
+    f.exitWithoutNativeSession(resumedSessionId);
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(async () => teams.get(f.run.id), run => f.launches.length >= before + 2 && f.launches.at(-1)?.continuation?.mode === "start");
+    const retried = f.launches.at(-1)!;
+    assert.notEqual(retried.continuation?.nativeSessionId, nativeId);
+    assert.match(retried.prompt, /targetAssignment/);
+    assert.match(retried.prompt, /npm run build/);
+    const persisted = f.readRecord<{ run: TeamRun }>("team", f.run.id).run;
+    assert.equal(persisted.permissionDecisions?.[1].coordinatorSessionId, retried.requestId);
+    assert.equal(persisted.permissionDecisions?.[1].status, "reviewing");
+    assert.equal(teams.get(f.run.id).members.filter(member => member.memberId === reviewer.memberId).length, 1);
+  } finally { f.close(); }
+});
+
+test("an expired reviewer turn waits, and the next qualifying prompt starts a new turn", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    const prompt = configurePermissionReviewFixture(f);
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "reviewing" &&
+      run.members.some(member => member.role === "permission-coordinator" && member.status === "running") && f.launches.length > 0);
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+    const stored = scheduler.record(f.run.id) as { run: TeamRun };
+    const reviewer = stored.run.members.find(member => member.role === "permission-coordinator")!;
+    const nativeSessionId = f.launches[0].continuation!.nativeSessionId;
+    f.exposeNativeSession(reviewer.sessionId, nativeSessionId);
+    reviewer.startedAt = new Date(Date.now() - 6 * 60_000).toISOString();
+    await scheduler.step(stored);
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "escalated" && run.members.some(member => member.memberId === reviewer.memberId && member.status === "waiting"));
+
+    f.state.attention.prompt = prompt(2, "npm run build");
+    const before = f.launches.length;
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.length === 2 && f.launches.length > before);
+    const persisted = f.readRecord<{ run: TeamRun }>("team", f.run.id).run;
+    const currentReviewer = persisted.members.find(member => member.memberId === reviewer.memberId)!;
+    const result = teams.get(f.run.id);
+    assert.equal(result.members.filter(member => member.role === "permission-coordinator" && member.revision === 1).length, 1);
+    assert.deepEqual(currentReviewer.turns?.map(turn => turn.mode), ["start", "resume"]);
+    assert.equal(currentReviewer.turns?.length, 2);
+    assert.equal(currentReviewer.turns?.[1].decisionId, persisted.permissionDecisions?.[1].id);
+    assert.equal(f.launches.at(-1)!.continuation?.mode, "resume");
+    assert.equal(f.launches.at(-1)!.continuation?.nativeSessionId, nativeSessionId);
+  } finally { f.close(); }
+});
+
+test("a run revision change stops its prior reviewer and assigns a fresh reviewer", { timeout: 30000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    const prompt = configurePermissionReviewFixture(f);
+    const teams = f.openTeam(); teams.start();
+    const assigned = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[0]?.status === "reviewing" &&
+      run.members.some(member => member.role === "permission-coordinator" && member.status === "running") && f.launches.length > 0);
+    const prior = assigned.members.find(member => member.role === "permission-coordinator")!;
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+
+    const stored = scheduler.record(f.run.id) as { run: TeamRun };
+    stored.run.revision = 2;
+    stored.run.members[0].revision = 2;
+    const target = stored.run.members[0];
+    (f.manager as any).meta = () => ({ session: { cwd: target.cwd, team: { runId: f.run.id, memberId: target.memberId, revision: 2, role: target.role } } });
+    f.state.attention.prompt = prompt(2, "npm run build");
+    await scheduler.step(stored);
+    await waitFor(async () => teams.get(f.run.id), run => run.members.some(member => member.role === "permission-coordinator" && member.revision === 2 && member.memberId !== prior.memberId));
+    const result = teams.get(f.run.id);
+    assert.equal(result.members.find(member => member.memberId === prior.memberId)!.status, "stopped");
+    assert.equal(result.members.filter(member => member.role === "permission-coordinator" && member.revision === 2).length, 1);
+    assert.equal(f.launches.at(-1)!.continuation?.mode ?? "start", "start");
   } finally { f.close(); }
 });
 
@@ -2236,7 +2845,7 @@ for (const [ending, minutes, event] of [
       f.run.members.push(coordinator);
       f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
       // The decision's target member is gone, so the review is obsolete even inside its window.
-      f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: randomUUID(), targetSessionId: randomUUID(),
+      f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), authorityHash: permissionAuthorityHash(f.run.permissions, []), targetMemberId: randomUUID(), targetSessionId: randomUUID(),
         targetCwd: coordinator.cwd, promptId: 1, promptHash: "b".repeat(64), evidenceHash: "c".repeat(64), option: 0,
         prompt: { id: 1, kind: "permission", source: "screen", hash: "b".repeat(64), pinned: true, acceptsText: false,
           title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
@@ -2280,7 +2889,7 @@ test("a permission coordinator back from an outage during a current review runs 
       title: "Permission coordinator", status: "unavailable" as const };
     f.run.members.push(coordinator);
     f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
-    f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: target.memberId, targetSessionId: target.sessionId,
+    f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), authorityHash: permissionAuthorityHash(f.run.permissions, []), targetMemberId: target.memberId, targetSessionId: target.sessionId,
       targetCwd: target.cwd, promptId: prompt.id, promptHash: prompt.hash, evidenceHash: permissionEvidenceHash(prompt), prompt, option: 0,
       expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: coordinator.memberId, answerRequestId: randomUUID(), status: "reviewing" }];
     // The target still waits on the same prompt; the coordinator's own session is running again and has reported nothing yet.

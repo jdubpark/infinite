@@ -20,7 +20,18 @@ process.stdin.setEncoding("utf8");
 process.stdout.write("READY\r\n\x1b[?2004h\x1b[?25l\x1b[?1006h");
 let pending = "";
 let permissionOpen = false;
+let collapsedPermissionOpen = false;
+let expansionCount = 0;
 process.stdin.on("data", data => {
+  if (collapsedPermissionOpen && data.includes("\r")) {
+    process.stdout.write("COLLAPSED ENTER RECEIVED\r\n");
+    return;
+  }
+  if (collapsedPermissionOpen && data.includes("\x01")) {
+    expansionCount++;
+    process.stdout.write("\x1b[2J\x1b[HWould you like to run the following command?\r\n  $ npm run check\r\n  Expanded command text, displayed only.\r\nEXPANDED ONCE " + expansionCount + "\r\n› 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\n");
+    return;
+  }
   if (permissionOpen && data.includes("\x1b[B")) {
     setTimeout(() => process.stdout.write("\x1b[2J\x1b[Hnpm run check\r\nPermission needed\r\n  1. No\r\n❯ 2. Yes, proceed once\r\n"), 150);
     return;
@@ -43,6 +54,9 @@ process.stdin.on("data", data => {
         method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + process.env.INFINITE_HOOK_TOKEN },
         body: JSON.stringify({ hook_event_name: "PermissionRequest", session_id: "fixture-native-session", tool_name: "Bash", tool_input: { command: "npm run check" } }),
       });
+    } else if (command === "collapsed-permission") {
+      collapsedPermissionOpen = true;
+      process.stdout.write("\x1b[2J\x1b[HReason: Inspect the requested files.\r\n  $ npm run check\r\n  [… 4 lines] ^a view all\r\n› 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\n");
     } else if (command === "split") process.stdout.write("\x1b[");
     else if (command === "finish") process.stdout.write("31mSPLIT COMPLETE\x1b[0m\r\n");
     else if (command === "alt") process.stdout.write("\x1b[?1049h\x1b[H\x1b[34mALTERNATE 界\x1b[0m\r\nNative prompt> ");
@@ -81,7 +95,7 @@ process.stdin.on("data", data => {
 });
 `;
 
-async function fixture(provider: "demo" | "claude" = "demo", initialPrompt = "", team?: TeamAssignment) {
+async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPrompt = "", team?: TeamAssignment) {
   const root = mkdtempSync("/tmp/inf-worker-");
   const id = randomUUID();
   const key = randomBytes(32);
@@ -146,6 +160,31 @@ function teamAnswerRequest(worker: Awaited<ReturnType<typeof fixture>>, team: Te
     policyHash: "a".repeat(64), promptId: prompt.id,
     promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt),
     option, actor, leaseId,
+  };
+}
+
+function teamPermissionExpansionRequest(
+  worker: Awaited<ReturnType<typeof fixture>>,
+  team: TeamAssignment,
+  prompt: NonNullable<WorkerState["attention"]["prompt"]>,
+  requestId: string,
+  actor: ControlActor,
+  leaseId: string,
+) {
+  return {
+    op: "team-permission-expand" as const,
+    requestId,
+    targetSessionId: worker.id,
+    assignment: team,
+    expected: {
+      promptId: prompt.id,
+      promptHash: prompt.hash!,
+      evidenceHash: permissionEvidenceHash(prompt),
+      targetCwd: worker.cwd,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    },
+    actor,
+    leaseId,
   };
 }
 
@@ -301,6 +340,80 @@ test("worker control fences input and resize, keeps retry receipts stable, and r
     await waitFor(async () => worker.output(), output => output.includes("RECEIVED after expiry"));
     assert.doesNotMatch(worker.output(), /RECEIVED (stale|expired|unclaimed|unleased)/);
   } finally { await worker.stop(); }
+});
+
+test("team permission expansion is Codex-only, bound to the live collapsed prompt, and delivered once", { timeout: 30_000 }, async () => {
+  const team: TeamAssignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer", taskId: "task-expand" };
+  const worker = await fixture("codex", "", team);
+  try {
+    await worker.command("collapsed-permission");
+    const open = await waitFor(() => worker.call({ op: "state" }), state =>
+      state.attention.state === "needs-you" && state.attention.prompt?.source === "screen" &&
+      Boolean(state.attention.prompt.hash && state.attention.prompt.pinned));
+    const prompt = open.attention.prompt!;
+    const expansionIntents = () => worker.events().filter(event => event.type === "input-intent" && event.data.op === "team-permission-expand");
+    const requestFor = (requestId: string) => {
+      const actor = { id: `team-permission-expand:${requestId}`, label: "Team permission display expansion" };
+      return { actor, request: teamPermissionExpansionRequest(worker, team, prompt, requestId, actor, "lease-not-yet-held") };
+    };
+
+    const human = { id: "human-expansion-control", label: "Human" };
+    const humanLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: human });
+    const blocked = requestFor(randomUUID());
+    await assert.rejects(worker.call(blocked.request), { code: "control-lost" });
+    assert.equal(expansionIntents().length, 0, "a human lease refuses before any durable intent or key");
+    await worker.call({ op: "control", action: "release", actor: human, leaseId: humanLease.id });
+
+    const stale = requestFor(randomUUID());
+    const staleLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: stale.actor });
+    await assert.rejects(worker.call({ ...stale.request, leaseId: staleLease.id, expected: { ...stale.request.expected, promptHash: "0".repeat(64) } }), { code: "prompt-changed" });
+    await worker.call({ op: "control", action: "release", actor: stale.actor, leaseId: staleLease.id });
+
+    const changedAssignment = requestFor(randomUUID());
+    const changedLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: changedAssignment.actor });
+    await assert.rejects(worker.call({ ...changedAssignment.request, leaseId: changedLease.id, assignment: { ...team, memberId: randomUUID() } }), { code: "unsupported" });
+    await worker.call({ op: "control", action: "release", actor: changedAssignment.actor, leaseId: changedLease.id });
+    assert.equal(expansionIntents().length, 0, "stale evidence and a different team assignment never write an intent");
+
+    const valid = requestFor(randomUUID());
+    const hostLease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: valid.actor });
+    const request = { ...valid.request, leaseId: hostLease.id };
+    const delivered = await worker.call<Receipt>(request);
+    assert.equal(delivered.state, "delivered");
+    assert.equal(expansionIntents().length, 1);
+    await waitFor(async () => worker.output(), output => output.includes("EXPANDED ONCE 1"));
+    const expanded = await waitFor(() => worker.call({ op: "state" }), state =>
+      state.attention.state === "needs-you" && state.attention.prompt?.id !== prompt.id &&
+      state.attention.prompt?.hash !== prompt.hash && state.attention.prompt?.pinned === true);
+    assert.equal(expanded.attention.prompt?.source, "screen");
+    assert.equal(oneShotPermissionOption(expanded.attention.prompt!), 0,
+      "review uses the fresh expanded screen prompt, whose identity differs from the collapsed prompt");
+    const repeated = await worker.call<Receipt>(request);
+    assert.deepEqual(repeated, delivered, "a request replay returns its durable receipt without toggling again");
+    await assert.rejects(worker.call({ ...request, expected: { ...request.expected, expiresAt: new Date(Date.now() + 90_000).toISOString() } }), /different input/);
+    assert.equal(expansionIntents().length, 1);
+    assert.equal(worker.output().match(/EXPANDED ONCE/g)?.length, 1);
+    assert.doesNotMatch(worker.output(), /COLLAPSED ENTER RECEIVED/);
+    assert.doesNotMatch(worker.output(), /APPROVED/);
+    assert.equal(worker.events().some(event => event.type === "input-result" && event.data.requestId === request.requestId && event.data.op === "team-permission-expand"), true);
+    await worker.call({ op: "control", action: "release", actor: valid.actor, leaseId: hostLease.id });
+  } finally { await worker.stop(); }
+
+  const otherProvider = await fixture("demo", "", team);
+  try {
+    const requestId = randomUUID();
+    const actor = { id: `team-permission-expand:${requestId}`, label: "Team permission display expansion" };
+    const expected = {
+      promptId: 1, promptHash: "a".repeat(64), evidenceHash: "b".repeat(64),
+      targetCwd: otherProvider.cwd, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    await assert.rejects(otherProvider.call({
+      op: "team-permission-expand", requestId, targetSessionId: otherProvider.id,
+      assignment: team, expected, actor, leaseId: "no-lease",
+    }), { code: "unsupported" });
+    assert.equal(otherProvider.events().some(event => event.type === "input-intent" && event.data.op === "team-permission-expand"), false,
+      "a non-Codex worker cannot receive the display key");
+  } finally { await otherProvider.stop(); }
 });
 
 test("delegated answers stay bound to the assigned one-shot prompt and stop after a control takeover", { timeout: 30_000 }, async () => {

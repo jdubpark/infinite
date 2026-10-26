@@ -99,7 +99,8 @@ repository, while the coordinator, workers, and reviewer come from the host's
 configured lineup. The host passes the selected project ID to Ubuntu provider
 wrappers as `INFINITE_PROJECT_ID`, which selects an optional project environment
 file on that host. First-time repository enrollment delegates current one-shot
-tool requests to the strong coordinator by default; `--permissions off` opts out.
+tool requests to the configured permission reviewer, using the strong coordinator
+when no reviewer profile is configured; `--permissions off` opts out.
 The repository policy bounds that authority; see
 [Delegating permission decisions](#delegating-permission-decisions).
 
@@ -265,6 +266,50 @@ delivery.
 
 Each integration records what changed. The run's `changes` lists the files changed from its base to its recorded head, each with a status of added, modified, removed, or renamed and its line counts (`null` for binary files). It holds up to 400 files and sets `truncated` when more changed. Each integrated task's `changedPaths` lists the paths its own change touched, up to 200, with its own `truncated` flag. Git reads for these fields are best-effort: if Git refuses or fails a read, the field is absent and integration still succeeds.
 
+## Workspace retention
+
+Team workspaces are host-managed temporary copies. By default, merged and
+no-change runs lose their integration and member clones 60 minutes after all
+members stop; cancelled runs lose their clones and run record after 60 minutes. A
+ready-for-review run keeps its clones for 24 hours, and a blocked run keeps them
+for 72 hours. The `teams.retention` settings (`finishedMinutes`,
+`cancelledMinutes`, `reviewHours`, `blockedHours`, `memberMinutes`) change these
+windows. A run that belongs to a goal, mission or handoff that is still active
+keeps its merged, no-change or ready-for-review clones until that owner finishes,
+because the next cycle clones from them. Full-run cleanup waits for settled
+members and for pending operations and live commands to finish. A stopped
+member's clone can be removed earlier, after its result was integrated and
+`memberMinutes` (default 60) has passed; the host leaves a pending operation's source clone in
+place and keeps a clone that a replacement member still uses as its working
+directory.
+
+The run record, events, reports, and receipts remain after merged, no-change,
+ready-for-review, and blocked workspaces are removed. Cancelled runs are deleted
+whole after their settle window. Started and completed removals are recorded as
+host events, and a failed removal is retried on later scheduler ticks. A blocked run whose workspace
+was removed cannot resume, continue, or be steered; pause and cancel remain
+available. `DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
+cancelled, merged, or no-change run (clones and record) immediately. A live
+goal, mission, or handoff that still uses the run as its source receives
+`team-retained`; `team-in-use` means another run has a pending preparation that
+clones from this workspace. Both removals can be retried once the reference
+settles. Deleted request IDs are kept in the sealed `retired.sealed` tombstone,
+up to 2,000 IDs with the oldest dropped. Replaying one returns `team-deleted`;
+start another run with a new request ID.
+
+Retention marks a workspace removal as started in the run record, then removes
+the tree outside the serialized team mutation queue. At most two background
+removals run at once. Completion and distinct failures are recorded as host
+events; failures clear the removal marker and retry on a later scheduler tick.
+After a restart, a surviving path with a persisted removal marker is retried;
+cancelled records are deleted only after the run directory is gone.
+`idle()` waits for background removals in tests and shutdown tooling; `close()`
+does not wait for them. An active team cannot be deleted.
+
+When storage falls below `teams.storageFloor`, new runs are refused before their
+workspaces are created. See the configured reason in the API response and free
+space before retrying.
+
 ## Optional provider-side delivery
 
 Repositories remain review-only until an owner configures delivery once during
@@ -309,8 +354,9 @@ When the configured base moved and the coordinator reports that nothing was
 published, it submits a structured `delivery-reconciliation` report naming the
 reviewed head, repository, branch, and observed base head. The host confirms
 that base head against its refreshed GitHub source mirror, then creates a clean
-recovery workspace at that commit and preserves the old integration workspace.
-An integrator must carry the approved changes forward from the preserved copy.
+recovery workspace at that commit and keeps the old integration workspace
+available under the workspace retention policy. An integrator must carry the
+approved changes forward from that copy while it remains available.
 The new head must pass configured checks and independent review before delivery
 can start again. This moved-base path currently requires standalone ownership;
 goal, mission, and handoff runs remain blocked for parent-directed reconciliation.
@@ -749,7 +795,7 @@ Observations are grouped into an episode held in the worker. An episode starts a
 
 - A corroborated observation, or a single-source Claude hook observation, stops the member and relaunches its work on the fallback profile. The replacement keeps the same working copy and base commit. Its prompt is the original prompt, with feedback and recorded answers, retargeted to the fallback provider. It notes that the previous member's partial edits are present and passed the path-scope check. A single-source Codex status-row observation only annotates and waits for corroboration.
 - The task records `limitSwitches` entries: the profile it left, the profile it moved to, the reason, the stated reset time if any, the member, and when. This does not use the task's one escalation. Each replacement counts against the run's and goal's member limits.
-- With no resolvable fallback, the run blocks with a reason naming the profile and the limit times. The workspace is preserved.
+- With no resolvable fallback, the run blocks with a reason naming the profile and the limit times. Its workspace remains available under the workspace retention policy described above.
 - Only a corroborated observation writes the host-level entry in `providerLimits`. It lasts until the provider's stated reset time, capped at 24 hours, or 15 minutes when the provider stated none. Only a later successful turn, by the same measure, of a session of that provider clears it early, and an older observation cannot restore a cleared entry. New members of that provider launch on their fallback while the entry exists. With no fallback, they launch on the original profile.
 - A limit seen in any session, team member or not, updates the host-level entry. Nothing else happens to a non-team session.
 - Clients show the entry on the Teams list and the observation on session rows. Reset times are the provider's own statement, and a missing time means the provider gave none.
@@ -899,11 +945,19 @@ configured lineup by default; a user can instead select one configured provider
 for all roles. Goals always use a recorded lineup and require both coordinator
 and reviewer profiles to have `tier: "strong"`.
 
-This starting configuration uses Opus 5.5 at `xhigh` for coordination and repair,
-Astra 6 at `high` for review, and Haiku 5.5 and GPT-6 Luna at `high` for ordinary
-worker tasks. Opus 5.5 `xhigh` and Astra 6 `xhigh` are available through the
-explicit escalation pool. Model IDs live in host configuration, rather than
-application routing code.
+This example uses Opus 5.5 at `xhigh` for coordination and repair, Astra 6 at
+`high` for review, and Haiku 5.5 and GPT-6 Luna at `high` for ordinary worker
+tasks. Opus 5.5 `xhigh` and Astra 6 `xhigh` are available through the explicit
+escalation pool. Model IDs live in host configuration, rather than application
+routing code.
+
+`permissionReviewer` is an optional Claude Code profile for read-only review of
+member permission prompts. When omitted, the coordinator is the fallback
+reviewer and must have `tier: "strong"`; configuring `permissionReviewer` removes
+that strong-tier requirement for this role. A light Claude profile at `high`
+effort fits this narrow, mechanical rule because the host rechecks the answer
+and applies it. The repository ships no default lineup, so add the profile to
+the deployment's host configuration to use it.
 
 ```json
 {
@@ -946,7 +1000,12 @@ application routing code.
         "provider": "codex", "model": "gpt-6-astra", "effort": "xhigh",
         "tier": "strong", "dataUse": "standard"
       }
-    ]
+    ],
+    "permissionReviewer": {
+      "id": "haiku-permission-reviewer", "label": "Haiku 5.5 high",
+      "provider": "claude", "model": "claude-haiku-5-5", "effort": "high",
+      "tier": "light", "dataUse": "standard"
+    }
   }
 }
 ```
@@ -1053,18 +1112,60 @@ explicit policy.
 While a run's coordinator can still decide a member's prompt, the phone is not
 pushed for it. The push arrives only when the request becomes the owner's: the
 coordinator escalated it, the review window expired, the run spent its decision
-limit or cannot act, or the prompt lacks complete one-shot evidence. A run gets
+limit or cannot act, or bounded evidence recovery cannot establish a complete
+one-shot request. A run gets
 a short grace period to start the review before an unreviewed prompt is pushed.
 
-A current one-shot tool prompt can start a separate turn on the run's strong
-Claude coordinator profile. The coordinator receives the task, owner scope and exact
-request, then reports approve-once or escalate. The host checks the assignment,
+A run revision has one read-only permission reviewer: the pinned Claude
+permission reviewer profile, or the strong coordinator when no reviewer profile
+is configured. The reviewer receives the task, owner scope and assignment once.
+Each qualifying request is a turn that resumes the same native conversation and
+adds that request's evidence together with the owner's current steering and
+answers. The reviewer keeps its member and conversation while the integration
+head moves, because it has no file tools. The five-minute review window applies
+to each turn. If the conversation cannot be resumed, the host restarts it once with
+the full assignment and current request evidence. Between requests, the
+reviewer waits without a running process and holds no agent slot. It reports
+approve-once, request-evidence, or escalate. The host checks the assignment,
 workspace, prompt, policy, expiry and human input control before delivering the
-recorded choice. Workers cannot approve their own requests. The permission
-coordinator runs noninteractively with built-in tools disabled and only its
-assignment's report tool allowed. It escalates when the supplied evidence is
-insufficient. Worker provider modes, global trust settings and credentials
-remain unchanged. Other coordinator providers are not yet supported for this role.
+recorded choice.
+Workers cannot approve their own requests. The permission reviewer runs
+noninteractively with built-in tools disabled and only its assignment's report
+tool allowed. It can request up to eight specific source paths for bounded read-only
+collection; the host collects them and continues the same conversation with a
+fresh review turn. It escalates when the supplied evidence is insufficient. An
+incomplete or collapsed prompt gets a diagnostic turn that can never approve.
+Worker provider modes, global trust settings and credentials remain unchanged. Other
+coordinator providers are not yet supported for this role.
+
+Within the run revision's decision limit, an identical request can reuse a
+terminal reviewer's recorded verdict without another turn. The reuse key binds
+the pinned policy, semantic prompt and chosen option, task ID, changed paths,
+and accepted checks; it excludes prompt, session, and member identifiers. Reuse
+also requires the same run revision, assigned role, working directory, reviewer
+profile, inspected workspace evidence, and owner authority (pinned policy plus
+the owner's steering and answers); a later owner answer makes every earlier
+verdict a miss, and an owner answer retires every outstanding delegated
+decision so it is reviewed again under the new direction or stays with the
+owner. A recorded approval is still rechecked against the current target
+session, including that owner authority, and delivered once. A recorded reviewer escalation remains with the
+owner. Reuse does not extend the run's decision limit or apply to host-side
+escalations.
+
+Permission recovery runs before owner escalation. A recognized collapsed Codex
+command may receive a guarded display-only Ctrl+A; this never accepts the
+command. Other incomplete permission dialogs go to the strong coordinator for diagnosis,
+with approval disabled until the ordinary one-shot checks qualify. Recovery
+retains its request identity, attempts, decisions, receipts and observed
+consequences in the sealed run record. An uncertain expansion is not replayed.
+
+PM and mission coordinators receive bounded recovery outcomes so they can make
+an in-scope correction through the existing team controls. Later reviews can
+consult relevant outcomes from the same project. These observations are
+advisory: they cannot grant permission, weaken checks or replace fresh source
+inspection. A delivered answer or expanded dialog does not prove the requested
+command succeeded; execution remains unknown until separate execution evidence
+establishes it.
 
 A request qualifies when its evidence is complete: hook tool input that storage
 did not truncate, or a Codex "Would you like to run the following command?"
@@ -1137,6 +1238,10 @@ whenever a run path is used, including for legacy records. Unsafe legacy roots
 leave their records preserved but prevent preparation, launch, and bundling.
 Stored roots outside `teams.workspaceDir` require a trusted teamwork anchor.
 Directories above each root must be owned by root or the API account and not writable by other accounts unless sticky.
+
+`repo init` uses pnpm install and pnpm run commands for repositories with a
+`pnpm-lock.yaml` or a `packageManager` field naming pnpm; npm remains the default
+for npm repositories.
 
 Enable teams in the private host configuration and define the project's
 verification commands. Commands use executable/argument arrays, without an
@@ -1281,17 +1386,18 @@ Provider tool permission dialogs use their separate permission policy.
 For a standalone team, steering records a new requirements revision. Earlier
 member results cannot satisfy it. The scheduler stops old assignments and replans from the integrated
 workspace with the new direction. Completed earlier integration remains visible;
-unfinished member copies are preserved. Pause, resume and cancel are owner
+unfinished member copies remain available under the workspace retention policy.
+Pause, resume and cancel are owner
 actions. A member with no report and no attention activity for `teams.stallMinutes`
 (5–1,440, default 30) is stopped. One replacement then continues the same task in
-the preserved workspace, with feedback that the earlier attempt stalled. A second
+that workspace, with feedback that the earlier attempt stalled. A second
 stall on the same assignment blocks the team with the reason "An agent showed no
 activity twice on the same assignment." Activity means attention activity from the
 member's terminal or hooks. Screen output also counts, so an agent stuck behind an
 animated spinner looks active. Older runs blocked by the former one-hour limit
 still resume. A team blocked only by a stall can resume with
-`infinite team resume ID`. That starts a fresh plan from the preserved
-integration commit and keeps the stopped member workspace.
+`infinite team resume ID`. That starts a fresh plan from the integration commit;
+stopped member copies remain subject to the workspace retention policy.
 Resume waits until those members have stopped. A changed verification clone has
 the separate guarded Resume path described above; other blocks, including an
 interrupted workspace or check operation, still require inspection and a new
@@ -1312,8 +1418,9 @@ ownership issues through its subteam controls.
 Settled local result failures can also enter this bounded PM diagnosis when the
 host has exact member provenance or a persisted failure marker. The host drains
 write-capable members and checks the recorded integration head. If that
-workspace is dirty at the same head, it creates a clean sibling and preserves
-the original copy and every report. The PM diagnoses the failure in a new
+workspace is dirty at the same head, it creates a clean sibling and keeps the
+original copy available under the workspace retention policy; reports remain in
+run history. The PM diagnoses the failure in a new
 revision; scope violations and rejected results are not accepted as success.
 Legacy blocked result intents are eligible only when their saved blocked state
 and failure code prove that the operation had settled. An obsolete

@@ -173,7 +173,9 @@ is keyed by work ID, base commit and head commit; a cached narrative for a
 different head is reported as `stale`, never as current. A refresh runs only
 when a summary writer is configured, the run has no pending operation and a
 settled status, and its recorded integration workspace is still checked out at
-the recorded head. The writer runs `context` and then `brief --repo <workspace>
+the recorded head. Once workspace retention (see [teams](teams.md)) starts
+removing a run's workspace, no new narrative can be generated for it; an
+already generated narrative stays readable. The writer runs `context` and then `brief --repo <workspace>
 --base <baseCommit> --format json --no-state` with a work question. Each
 workspace may start 48 narrative jobs per UTC day, a failed job blocks further
 attempts for 10 minutes, and the sealed store keeps 64 records and 4 MiB per

@@ -150,7 +150,7 @@ The coordinator reports through its mission report tool:
 | `question` | Opens a mission decision for the owner. With `subtaskId` and `childDecisionId`, the owner's answer is forwarded to that subteam decision. |
 | `steer-subtask` | Sends direction to a running or blocked subteam, such as an owner answer or direction that changes work under way. The subteam stops its members and replans under a new revision. Held while the subteam is paused; refused, and the coordinator told, when the subtask has no running or blocked subteam or the subteam refuses the direction. |
 | `resize-subtask` | Selects worker capacity with `subtaskId`, `parallelism` (1–4), and `summary`. Updates a queued subtask or durably forwards the change to its active subteam. A solo subtask permits only one worker. Lowering capacity lets running workers finish and holds new starts. |
-| `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. |
+| `cancel-subtask` | Cancels that subtask's subteam. A subtask that never started is cancelled at once, and the coordinator is told in its next attempt. A cancelled subteam is deleted with its workspace after every member settles; the mission keeps the cancelled status and final reason, and the coordinator is asked to decide whether a replacement subtask is needed. |
 | `result` | Accepted only when every subtask is `done` or `cancelled`, at least one is `done`, and no owner decision is open. A `blocked` subtask, or a queued one whose dependency ended `blocked` or `cancelled`, must be cancelled explicitly first. Moves the mission to `ready-for-review`. |
 | `blocked` | Moves the mission to `blocked` with the summary as its reason. |
 | `wait` | Ends the attempt without a decision. Refused while a subteam decision is open that the coordinator has neither answered nor escalated. Otherwise accepted only while something else will start a later attempt: an open owner decision, a subteam that is not paused, or a queued subtask that can start without anyone acting. A queued subtask whose repository any paused or blocked run holds does not count, since that run keeps the repository reserved after the others finish. |
@@ -165,6 +165,11 @@ files before it confirms its exit, including across a host restart, is applied
 as usual and is not counted as missing. The next attempt starts with a
 refusal that says so, together with every message that arrived meanwhile.
 Three missed or refused reports in a row block the mission.
+
+After the first attempt, the coordinator resumes its confirmed conversation
+and receives only the current mission state and new messages. The first attempt
+and any attempt after a failed resume receive the full prompt; a failed resume
+does not count as a missed report.
 
 Size rules: a `solo` subtask starts a subteam with parallelism 1, and a `team`
 subtask starts with its coordinator-selected `parallelism` (1–4). The subteam
@@ -206,6 +211,12 @@ repository. With several same-repository predecessors, it uses the latest run
 in the dependency chain, so its base includes earlier work. A subtask is `done`
 when its subteam reaches `ready-for-review`, `merged`, or `no-change`;
 `blocked` when its subteam is blocked; `cancelled` when its subteam is cancelled.
+After a cancelled subteam's members settle, the host removes its workspace and run
+record, clears the subtask's run ID, and keeps a small final evidence snapshot
+(the cancellation reason and head commit when available). If the work is still
+needed, the coordinator must dispatch a replacement with a new subtask ID in the
+same repository. These removals are host housekeeping, recorded by the host;
+they are not reported as agent completion.
 
 Escalation: when a subteam opens a decision or becomes blocked, the host sends
 the coordinator a message naming the subtask, the decision ID, and the question

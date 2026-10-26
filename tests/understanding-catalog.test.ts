@@ -323,7 +323,7 @@ test("a repository set change keeps an owner's policy, disabled or enabled", () 
   }
 });
 
-test("a repository set change turns a policy the owner never set off and keeps its interval, limit and stamp", () => {
+test("a policy the owner turned on under the old disabled default migrates under the owner's stamp and survives a repository set change", () => {
   const f = fixture();
   try {
     f.make().mutate("workspace", "policy", undefined, request(0, "update", { enabled: true, synthesis: true, delivery: false, intervalMinutes: 45, dailyJobLimit: 7 }), emptyContext);
@@ -333,7 +333,35 @@ test("a repository set change turns a policy the owner never set off and keeps i
     writeSealed(f.file, f.key, "understanding-catalog:workspace", stored);
     addRepository(f);
     const policy = f.reopen().read("workspace").policy;
-    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit, policy.editedBy], [false, false, false, 45, 7, "migration"]);
+    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit, policy.editedBy], [true, true, false, 45, 7, "owner"]);
     assert.match(policy.editedAt ?? "", /^\d{4}-/);
+  } finally { f.cleanup(); }
+});
+
+test("a policy the default-on migration stamped stays on across a repository set change; an unstamped policy turns off", () => {
+  const f = fixture();
+  try {
+    f.make().mutate("workspace", "policy", undefined, request(0, "update", { enabled: false, synthesis: false, delivery: false, intervalMinutes: 45, dailyJobLimit: 7 }), emptyContext);
+    const stored = unseal<{ catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
+    delete stored.catalog.policy.editedAt; delete stored.catalog.policy.editedBy;
+    writeSealed(f.file, f.key, "understanding-catalog:workspace", stored);
+    addRepository(f);
+    const migrated = f.reopen().read("workspace").policy;
+    assert.deepEqual([migrated.enabled, migrated.synthesis, migrated.delivery, migrated.intervalMinutes, migrated.dailyJobLimit, migrated.editedBy], [true, true, true, 45, 7, "migration"]);
+    // A stamp of null is what a record looks like when no edit and no migration ever touched it.
+    const reread = unseal<{ catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
+    reread.catalog.policy = { ...reread.catalog.policy, enabled: true, editedAt: null, editedBy: null };
+    writeSealed(f.file, f.key, "understanding-catalog:workspace", reread);
+    assert.equal(f.reopen().read("workspace").policy.enabled, false);
+  } finally { f.cleanup(); }
+});
+
+test("a GitHub-tracked checkout without a remote binds by its source record", () => {
+  const f = fixture();
+  try {
+    execFileSync("git", ["-C", f.checkout, "remote", "remove", "origin"]);
+    assert.deepEqual(f.make().read("workspace").coverage, ["Some catalog records are withheld because their complete repository scope is unavailable or changed."], "a bare scan names a root-commit key that differs from the group's remote key");
+    f.config.projects[0].source = { mode: "github", repository: "example/catalog-fixture", baseBranch: "main" };
+    assert.deepEqual(f.make().read("workspace").coverage, []);
   } finally { f.cleanup(); }
 });

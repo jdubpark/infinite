@@ -96,12 +96,17 @@ bounded revision history. Storage errors remain explicit.
 Workspace maintenance is independent of an active session and continues while
 clients are closed. Its policy defaults to enabled, with `enabled`, `synthesis` and `delivery`
 set to true, a 15-minute interval and 24 jobs per workspace per UTC day. A
-stored policy without `editedAt` is migrated once: its three switches turn on,
-its interval and daily limit stay, and it records `editedBy: "migration"`. An
-owner edit stamps `editedBy: "owner"` and keeps the owner's chosen values; an
-owner-disabled policy is never re-enabled. When the workspace's repository set
-changes, an owner-edited policy is kept as it is, and any other policy turns
-off with its interval and limit kept until the owner sets it again. Owner
+stored policy without `editedAt` is migrated once. Maintenance was off by
+default before stamps existed, so a stored policy that is on was the owner's
+choice: it keeps its values and records `editedBy: "owner"`. Any other legacy
+policy turns its three switches on, keeps its interval and daily limit, and
+records `editedBy: "migration"`. An owner edit stamps `editedBy: "owner"` and
+keeps the owner's chosen values; an owner-disabled policy is never re-enabled.
+When the workspace's repository set changes, a policy stamped by the owner or
+by the migration is kept as it is, and an unstamped policy turns off with its
+interval and limit kept until the owner sets it again. A GitHub-tracked
+checkout binds by the repository its source record names, so it needs no Git
+remote; other checkouts bind by their remote or root commit. Owner
 policy edits can still switch each capability off independently. An explicit
 refresh can collect a source map while scheduling is disabled; model synthesis
 still requires its own enabled policy and a configured writer. A host without

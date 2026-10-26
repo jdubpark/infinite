@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { mkdirSync, readFileSync } from "node:fs";
-import { captureIdentity, normalizeRemote, readGit, type CheckoutIdentity, type GitReader } from "./checkout-identity.js";
+import { captureIdentity, readGit, type CheckoutIdentity, type GitReader, sourceIdentity } from "./checkout-identity.js";
 import { writeSealed, unseal } from "./vault.js";
 import { TeamError } from "./team-workspace.js";
 import {
@@ -187,16 +187,7 @@ export class ProjectGroupService {
   }
 
   private sourceIdentity(project: Project): CheckoutIdentity | undefined {
-    // A GitHub-tracked project names its repository in its source record; no scan of the working tree is needed.
-    if (project.source?.mode !== "github") return undefined;
-    const normalized = normalizeRemote(`https://github.com/${project.source.repository}.git`);
-    return normalized ? {
-      projectId: project.id,
-      key: normalized.key,
-      repoName: normalized.repoName,
-      capturedAt: this.timestamp(),
-      from: "source",
-    } : undefined;
+    return sourceIdentity(project, this.timestamp());
   }
 
   private identityKey(projectId: string) {

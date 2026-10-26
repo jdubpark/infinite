@@ -158,7 +158,7 @@ at <time>: <reason>.` A reason carries the engine's last stderr line when the
 engine exited with an error. Reasons are bounded to 400 characters with long
 tokens redacted.
 
-The maintenance store has an 8 MiB encrypted budget. Legacy session briefs use
+Each workspace's maintenance state is its own encrypted file under `understanding/runtime/` with a 16 MiB budget, so one large workspace cannot block the others; a store written before that split is read once, split, and kept beside the new files with a `.migrated` suffix. One attempt has the configured briefing timeout for source capture and the later steps, plus that timeout again for every repository brief that is due, within a 30-minute ceiling. Legacy session briefs use
 a separate rolling store of at most 16 generations per project within 8 MiB.
 Team briefs stay visible after their member workspace is cleaned up, as long as
 the repository binding still matches and a head is recorded. Those briefs

@@ -8,6 +8,8 @@ import { DiagramView } from "./DiagramView";
 
 type Page<T> = { items: T[]; next: string | null };
 const MAX_PLANNED_PAGES = 20;
+const NOT_OBSERVED = "Not observed yet";
+const evidenceLabel = (head: string | null, at: string) => `From commit ${short(head)}, observed ${relative(at)}`;
 
 /** Plain-language System sections for every repository in the workspace. */
 export function SystemOverview({ connection, workspaceId, data, offline, onOpenComponent }: {
@@ -39,33 +41,35 @@ function RepositorySections({ connection, workspaceId, repo, brief, componentMap
   const covered = systemMap ? new Set(systemMap.nodes.map(node => node.componentId).filter(Boolean)).size : 0;
   const showComponentMap = Boolean(componentMap && componentMap.nodes.length && (!systemMap || covered < componentTotal));
   const stateLine = repoStateLine(repo);
+  const briefEvidence = brief ? evidenceLabel(brief.head, brief.observedAt) : undefined;
 
   return <View style={s.repo}>
     {showName ? <Text style={s.repoName}>{repo.name}</Text> : null}
-    {stateLine ? <Text style={s.notice}>{stateLine}</Text> : null}
 
-    <Section title="What this workspace is" evidence={brief ? `From commit ${short(brief.head)}, observed ${relative(brief.observedAt)}` : "Not observed yet"}>
+    <Section title="What this workspace is" evidence={briefEvidence ?? (fallback ? evidenceLabel(fallback.head, fallback.generatedAt) : NOT_OBSERVED)}>
       <Text selectable style={s.body}>{summary ?? "No explanation yet. The first observation runs within a few minutes of enrollment."}</Text>
     </Section>
 
-    <Section title="Architecture" evidence={brief ? `From commit ${short(brief.head)}` : undefined}>
+    <Section title="Architecture" evidence={briefEvidence ?? NOT_OBSERVED}>
       {systemMap ? <DiagramView graph={systemMap} onOpenComponent={onOpenComponent} /> : null}
       {brief?.brief.architecture.map((claim, index) => <Claim key={`architecture-${index}`} text={claim.text} citations={claim.citations} />)}
       {!systemMap && !brief?.brief.architecture.length ? <Text style={s.note}>The map appears after the first successful brief.</Text> : null}
     </Section>
 
-    {showComponentMap && componentMap ? <Section title="Components" evidence="From the recorded component catalog">
+    {showComponentMap && componentMap ? <Section title="Components" evidence={briefEvidence ?? NOT_OBSERVED}>
       <DiagramView graph={componentMap} onOpenComponent={onOpenComponent} />
     </Section> : null}
 
-    <Changes base={base} connection={connection} repo={repo} brief={brief} artifacts={artifacts} offline={offline} />
+    <Changes base={base} connection={connection} repo={repo} brief={brief} artifacts={artifacts} offline={offline} evidence={briefEvidence ?? (fallback ? evidenceLabel(fallback.head, fallback.generatedAt) : NOT_OBSERVED)} />
 
-    <Planned base={base} connection={connection} repo={repo} offline={offline} />
+    <Planned base={base} connection={connection} repo={repo} offline={offline} evidence={briefEvidence ?? NOT_OBSERVED} />
+
+    {stateLine ? <Text style={s.notice}>{stateLine}</Text> : null}
   </View>;
 }
 
-function Changes({ base, connection, repo, brief, artifacts, offline }: {
-  base: string; connection: Connection; repo: UnderstandingRepository; brief: KnowledgeRepositoryBrief | undefined; artifacts: UnderstandingArtifact[]; offline: boolean;
+function Changes({ base, connection, repo, brief, artifacts, offline, evidence }: {
+  base: string; connection: Connection; repo: UnderstandingRepository; brief: KnowledgeRepositoryBrief | undefined; artifacts: UnderstandingArtifact[]; offline: boolean; evidence: string;
 }) {
   const [earlier, setEarlier] = useState<UnderstandingArtifact[]>([]);
   const [next, setNext] = useState<string | null | undefined>(undefined);
@@ -85,7 +89,7 @@ function Changes({ base, connection, repo, brief, artifacts, offline }: {
   };
   const claims = brief?.brief.changes ?? [];
   const empty = !claims.length && !artifacts.length;
-  return <Section title="What changed" evidence={brief ? `Compared with commit ${short(brief.base)}` : undefined}>
+  return <Section title="What changed" evidence={evidence}>
     {claims.map((claim, index) => <Claim key={`change-${index}`} text={claim.text} citations={claim.citations} meta={brief ? `Generated ${date(brief.generatedAt)}` : undefined} />)}
     {[...artifacts, ...earlier].map(artifact => <ArtifactRow key={artifact.id} artifact={artifact} />)}
     {empty && next === undefined ? <Text style={s.note}>Nothing recorded since the first observation.</Text> : null}
@@ -102,6 +106,24 @@ function ArtifactRow({ artifact }: { artifact: UnderstandingArtifact }) {
     <Text style={s.meta}>Generated {date(artifact.generatedAt)}</Text>
     <Text selectable style={s.body}>{artifact.brief.summary}</Text>
     {artifact.brief.changes.map((claim, index) => <Claim key={`artifact-change-${index}`} text={claim.text} citations={claim.citations} />)}
+    <Disclosure title={`System shape · ${artifact.brief.architecture.length}`}>
+      {artifact.brief.architecture.length ? artifact.brief.architecture.map((claim, index) => <Claim key={`architecture-${index}`} text={claim.text} citations={claim.citations} />) : <Text style={s.note}>No architecture claims are included in this brief.</Text>}
+    </Disclosure>
+    <Disclosure title={`Review questions · ${artifact.brief.review.length}`}>
+      {artifact.brief.review.length ? artifact.brief.review.map((question, index) => <View key={`review-${index}`} style={s.review}>
+        <Text style={s.label}>{question.area} · {question.priority} priority</Text>
+        {question.why ? <Text style={s.body}>{question.why}</Text> : null}
+        <Text selectable style={s.body}>{question.question}</Text>
+        {question.citations.length ? <Text selectable style={s.evidence}>Sources: {question.citations.map(citation => `${citation.source}:${citation.line}`).join(" · ")}</Text> : null}
+      </View>) : <Text style={s.note}>No review questions are included in this brief.</Text>}
+    </Disclosure>
+    <Disclosure title={`Guidance · ${artifact.brief.guidance.length}`}>
+      {artifact.brief.guidance.length ? artifact.brief.guidance.map((guidance, index) => <View key={`guidance-${index}`} style={s.review}>
+        <Text style={s.label}>{guidance.basis === "documented" ? "Documented" : "Proposed"} guidance</Text>
+        <Text selectable style={s.body}>{guidance.text}</Text>
+        {guidance.citations.length ? <Text selectable style={s.evidence}>Sources: {guidance.citations.map(citation => `${citation.source}:${citation.line}`).join(" · ")}</Text> : null}
+      </View>) : <Text style={s.note}>No agent guidance is included in this brief.</Text>}
+    </Disclosure>
     <Disclosure title="Revision details">
       <Text selectable style={s.evidence}>Source project: {artifact.sourceProjectId}</Text>
       <Text selectable style={s.evidence}>Head: {artifact.head || "not recorded"}</Text>
@@ -113,7 +135,7 @@ function ArtifactRow({ artifact }: { artifact: UnderstandingArtifact }) {
   </View>;
 }
 
-function Planned({ base, connection, repo, offline }: { base: string; connection: Connection; repo: UnderstandingRepository; offline: boolean }) {
+function Planned({ base, connection, repo, offline, evidence }: { base: string; connection: Connection; repo: UnderstandingRepository; offline: boolean; evidence: string }) {
   const [full, setFull] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -133,7 +155,7 @@ function Planned({ base, connection, repo, offline }: { base: string; connection
       setError("The full request could not be loaded. Try again.");
     } finally { setBusy(""); }
   };
-  return <Section title="Planned" evidence="From recorded requests">
+  return <Section title="Planned" evidence={evidence}>
     {repo.planned.map((plan, index) => {
       const text = full[plan.workId] ?? plan.text;
       return <View key={`${plan.workId}/${index}`} style={s.row}>
@@ -202,6 +224,8 @@ const s = StyleSheet.create({
   note: { fontSize: 12, lineHeight: 18, color: theme.colors.mutedInk },
   evidence: { fontSize: 11, lineHeight: 16, color: theme.colors.secondaryInk, paddingLeft: 8 },
   claim: { gap: 3 },
+  label: { fontSize: 11, lineHeight: 16, fontWeight: "700", color: theme.colors.secondaryInk },
+  review: { gap: 5, paddingVertical: 7, borderTopWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },
   row: { gap: 5, paddingVertical: 8, borderTopWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },
   rowTitle: { fontSize: 14, lineHeight: 19, fontWeight: "600", color: theme.colors.ink },
   notice: { fontSize: 12, lineHeight: 18, color: theme.colors.warningInk, backgroundColor: theme.colors.warningSurface, padding: 9, borderRadius: theme.radius.card },

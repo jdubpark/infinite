@@ -221,11 +221,11 @@ function MembershipMap({ workspace, repositories, onPress }: { workspace: string
 
 function SystemView({ data, connection, workspaceId, readGeneration, offline, onComponentNavigate }: { data: WorkspaceUnderstanding; connection: Connection; workspaceId: string; readGeneration: string; offline: boolean; onComponentNavigate: (anchor: View | null) => void }) {
   const anchor = useRef<View>(null);
-  const [openComponentId, setOpenComponentId] = useState("");
+  const [open, setOpen] = useState({ id: "", nonce: 0 });
   return <View style={s.stack}>
     <SystemOverview connection={connection} workspaceId={workspaceId} data={data} offline={offline}
-      onOpenComponent={id => { setOpenComponentId(id); onComponentNavigate(anchor.current); }} />
-    <View ref={anchor}><KnowledgePanel onComponentNavigate={() => onComponentNavigate(anchor.current)} key={`${connectionKey(connection)}|${connection.url}|${connection.token}|${workspaceId}`} connection={connection} workspaceId={workspaceId} knowledge={data.knowledge} readGeneration={readGeneration} defaultArea="components" openComponentId={openComponentId} repositories={data.repositories} work={data.work} offline={offline} /></View>
+      onOpenComponent={id => { setOpen(previous => ({ id, nonce: previous.nonce + 1 })); onComponentNavigate(anchor.current); }} />
+    <View ref={anchor}><KnowledgePanel onComponentNavigate={() => onComponentNavigate(anchor.current)} key={`${connectionKey(connection)}|${connection.url}|${connection.token}|${workspaceId}`} connection={connection} workspaceId={workspaceId} knowledge={data.knowledge} readGeneration={readGeneration} defaultArea="components" openComponentId={open.id} openComponentNonce={open.nonce} repositories={data.repositories} work={data.work} offline={offline} /></View>
     {data.coverage.map((line, index) => <Text key={`coverage-${index}`} style={s.note}>{line}</Text>)}
     <Text style={s.note}>Generated from the code and the work records. It does not mean anything is deployed or approved.</Text>
   </View>;

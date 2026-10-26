@@ -165,6 +165,8 @@ export function missionCoordinatorLaunch(provider: Provider, profile: AgentProfi
         throw new Error(`Mission coordinator profile cannot configure ${flag}.`);
       if (arg.startsWith("-c") && arg !== "--" && !arg.startsWith("--"))
         throw new Error("Mission coordinator profile cannot configure -c.");
+      if (arg.startsWith("-r") && !arg.startsWith("--"))
+        throw new Error("Mission coordinator profile cannot configure -r.");
       if (valueFlags.has(flag)) { if (!arg.includes("=")) index++; continue; }
       if (listFlags.has(flag)) {
         if (!arg.includes("=")) while (index + 1 < profile.args.length && !profile.args[index + 1].startsWith("-")) index++;

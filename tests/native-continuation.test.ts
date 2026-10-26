@@ -36,4 +36,3 @@ test("resume failure only identifies an exited resume without a reported native 
   const nullNativeSession = { status: "exited", nativeSession: null } as unknown as Pick<WorkerState, "status" | "nativeSession">;
   assert.equal(resumeFailed(nullNativeSession, continuation), true);
 });
-

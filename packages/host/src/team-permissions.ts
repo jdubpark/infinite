@@ -53,6 +53,15 @@ export function permissionReuseKey(input: {
   return createHash("sha256").update(JSON.stringify(semantic)).digest("hex");
 }
 
+/**
+ * Hash of the owner authority a permission decision was made under: the pinned policy plus the
+ * owner's steering and answers. A later owner answer changes it, so an earlier verdict cannot be
+ * reused and an approved decision is rechecked before delivery.
+ */
+export function permissionAuthorityHash(permissions: unknown, ownerDirection: string[]): string {
+  return createHash("sha256").update(JSON.stringify({ permissions: permissions ?? null, ownerDirection })).digest("hex");
+}
+
 /** Worker refusal codes. A delegated answer refused with one of these wrote no key. */
 const ANSWER_REFUSALS = new Set(["prompt-changed", "unsupported", "invalid-option", "text-not-accepted", "control-busy", "control-lost"]);
 

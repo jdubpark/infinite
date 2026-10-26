@@ -9,7 +9,7 @@ import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
 import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions } from "./team-types.js";
-import { permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamPrompt } from "./team-prompts.js";
+import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
@@ -20,7 +20,7 @@ import type { Readings } from "./readings.js";
 import type { ProjectSourceService } from "./project-source.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
-import { oneShotPermissionOption, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
+import { oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
 import { collectPermissionEvidence } from "./team-permission-evidence.js";
 export { TeamError } from "./team-workspace.js";
 
@@ -54,6 +54,8 @@ type Stored = {
 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const timestamp = () => new Date().toISOString();
+/** The owner authority a permission decision is bound to: pinned policy plus current steering and answers. */
+const ownerAuthorityHash = (run: TeamRun) => permissionAuthorityHash(run.permissions, ownerDirectionLines(run));
 const activeMember = (member: TeamMember) => ["queued", "running", "reported", "unavailable"].includes(member.status);
 function permissionCoordinatorDecision(run: TeamRun, member: TeamMember) {
   const decisions = run.permissionDecisions ?? [];
@@ -1472,7 +1474,7 @@ export class TeamService {
       this.assertRunPath(stored, run.workspace);
       await this.stopObsoletePermissionCoordinators(stored);
       if (run.members.some(member => member.revision === recovery.source.revision &&
-          member.role === "permission-coordinator" && activeMember(member))) {
+          member.role === "permission-coordinator" && activeMember(member) && !terminalPermissionCoordinator(run, member))) {
         this.block(stored, new TeamError(409, "recovery-reviewer-stop-unconfirmed", "Automatic recovery could not confirm that the prior permission reviewer stopped."));
         return true;
       }
@@ -1545,6 +1547,9 @@ export class TeamService {
     const run = stored.run;
     for (const member of run.members.filter(item => item.role === "permission-coordinator" &&
       (activeMember(item) || item.status === "waiting"))) {
+      // A reviewer already kept unavailable with a terminal decision was reported once; it stays visible with its
+      // report for inspection and is not stopped again here.
+      if (member.status === "unavailable" && terminalPermissionCoordinator(run, member)) continue;
       const terminal = member.revision !== run.revision || run.permissionsRevokedAt !== undefined ||
         !run.permissions || ["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status);
       if (member.status === "waiting") {
@@ -1582,8 +1587,8 @@ export class TeamService {
       try { stopConfirmed = Boolean(await this.stopped(member)); }
       catch { /* Keep the member visible as unavailable until its process is confirmed stopped. */ }
       if (!stopConfirmed) {
+        // Keep a late report visible on the unavailable member as evidence; the next turn clears it.
         member.status = "unavailable";
-        member.report = undefined;
         if (!wasUnavailable) {
           this.event(stored, "The obsolete permission coordinator could not be confirmed stopped and remains unavailable for inspection.");
         }
@@ -1622,9 +1627,11 @@ export class TeamService {
         let all = true;
         const drainRevision = stored.halt === "block" && run.recovery?.status === "stopping" ? run.recovery.source.revision
           : stored.halt === "steer" && run.recovery ? run.revision - 1 : undefined;
-        const membersToStop = run.members.filter(member => activeMember(member) ||
+        // A drained revision's terminal reviewer keeps its unavailable status and report as evidence until its exit is confirmed elsewhere.
+        const membersToStop = run.members.filter(member => (activeMember(member) ||
           member.role === "permission-coordinator" && member.status === "waiting" ||
-          drainRevision !== undefined && member.revision === drainRevision);
+          drainRevision !== undefined && member.revision === drainRevision) &&
+          !(drainRevision !== undefined && member.revision === drainRevision && member.status !== "waiting" && terminalPermissionCoordinator(run, member)));
         for (const member of membersToStop) {
           try {
             if (member.role === "permission-coordinator" && member.status === "waiting") {
@@ -1891,7 +1898,7 @@ export class TeamService {
       id: randomUUID(), revision: run.revision, policyHash: digest(run.permissions!), targetMemberId: target.memberId,
       targetSessionId: target.sessionId, targetCwd, promptId: prompt.id, promptHash: prompt.hash!,
       evidenceHash, ...(reuseKey ? { reuseKey } : {}), prompt: structuredClone(prompt), option: oneShotPermissionOption(prompt)!,
-      reviewerProfileId: reviewer.id, reviewerProfileHash: digest(reviewer),
+      reviewerProfileId: reviewer.id, reviewerProfileHash: digest(reviewer), authorityHash: ownerAuthorityHash(run),
       expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(), answerRequestId: randomUUID(), status: "pending",
     });
 
@@ -1927,8 +1934,10 @@ export class TeamService {
     }
     const earlier = [...(run.permissionDecisions ?? [])].reverse().find(item => {
       const sourceTarget = run.members.find(member => member.memberId === item.targetMemberId && member.sessionId === item.targetSessionId);
+      // The verdict carries over only under the same owner authority, reviewer profile and working directory it was given for.
       return item.reuseKey === reuseKey && item.revision === run.revision && item.workspaceEvidenceHash === workspaceEvidenceHash &&
-        sourceTarget?.role === target.role && Boolean(item.coordinatorMemberId) &&
+        item.authorityHash === decision.authorityHash && item.reviewerProfileHash === decision.reviewerProfileHash &&
+        item.targetCwd === decision.targetCwd && sourceTarget?.role === target.role && Boolean(item.coordinatorMemberId) &&
         (item.status === "answered" && item.verdict === "approve-once" || item.status === "escalated" && item.verdict === "escalate");
     });
     if (earlier?.status === "answered" && earlier.verdict === "approve-once") {
@@ -1949,15 +1958,10 @@ export class TeamService {
       return false;
     }
     (run.permissionDecisions ??= []).push(decision);
-    if (run.members.some(member => member.revision === run.revision && member.role === "permission-coordinator" &&
-        member.status === "unavailable" && permissionCoordinatorDecision(run, member)?.status !== "reviewing")) {
-      this.escalatePermissionDecision(stored, decision, "The permission reviewer is unavailable; the request remains with the user.",
-        "The permission request remains with the user because the permission reviewer is unavailable.");
-      return false;
-    }
     const waitingReviewer = run.members.find(member => member.revision === run.revision &&
       member.role === "permission-coordinator" && member.status === "waiting");
-    const resumesExistingReviewer = Boolean(waitingReviewer && waitingReviewer.baseCommit === run.headCommit && waitingReviewer.nativeSessionId);
+    // The reviewer has no file tools, so its read-only workspace need not follow the integration head.
+    const resumesExistingReviewer = Boolean(waitingReviewer?.nativeSessionId);
     if (!this.config.agents[reviewer.provider]) {
       this.escalatePermissionDecision(stored, decision, "The pinned permission reviewer provider is not configured on this host.", "The permission request remains with the user because its pinned permission reviewer provider is not configured on this host.");
       return false;
@@ -1991,14 +1995,14 @@ export class TeamService {
       targetAssignment: assignment(target), targetCwd: decision.targetCwd, targetScratchDirectory: target.scratchDirectory ?? null, targetTask: task ?? null,
       targetChangedPaths: changedPaths.slice(0, 100), targetChangedPathCount: changedPaths.length,
       acceptedChecks, permissionEvidence, deliveryAuthority, prompt: decision.prompt });
-    if (waitingReviewer && waitingReviewer.baseCommit === run.headCommit && waitingReviewer.nativeSessionId) {
+    if (waitingReviewer?.nativeSessionId) {
       const member = waitingReviewer;
       if (member.modelProfile) {
         decision.reviewerProfileId = member.modelProfile.id;
         decision.reviewerProfileHash = digest(member.modelProfile);
       }
       let prompt: string;
-      try { prompt = permissionFollowUpPrompt(feedback); }
+      try { prompt = permissionFollowUpPrompt(feedback, ownerDirectionLines(run)); }
       catch (error) {
         if (!(error instanceof TeamError) || error.code !== "team-prompt-too-large") throw error;
         this.escalatePermissionDecision(stored, decision, "The complete evidence exceeds the 80 KiB permission reviewer prompt limit and cannot be reviewed without truncation.", "The permission request remains with the user because its complete evidence exceeds the review limit.");
@@ -2080,6 +2084,8 @@ export class TeamService {
       return "The decision or coordinator assignment is no longer current.";
     if (decision.policyHash !== digest(run.permissions))
       return "The pinned permission policy no longer matches this decision.";
+    if (decision.authorityHash && decision.authorityHash !== ownerAuthorityHash(run))
+      return "The owner's steering or answers changed since this decision was assigned.";
     if (Date.now() >= Date.parse(decision.expiresAt)) return "The five-minute permission review window expired.";
     if (decision.reviewerProfileHash) {
       const reviewer = this.reviewerProfile(run);
@@ -2126,7 +2132,8 @@ export class TeamService {
     const decision = permissionCoordinatorDecision(run, member);
     if (!decision) { this.block(stored, new TeamError(409, "invalid-permission-decision", "The permission coordinator has no recorded decision assignment.")); return; }
     if (decision.status !== "reviewing") {
-      member.status = member.revision === run.revision && !run.permissionsRevokedAt && !stored.halt &&
+      // A reviewer whose process is not confirmed stopped stays unavailable; a late report does not release it.
+      if (member.status !== "unavailable") member.status = member.revision === run.revision && !run.permissionsRevokedAt && !stored.halt &&
         !["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status) ? "waiting" : "stopped";
       this.event(stored, "A late permission coordinator report was ignored because its one-shot review is no longer current.");
       this.save(stored);

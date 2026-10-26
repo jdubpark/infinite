@@ -1072,8 +1072,10 @@ A run revision has one read-only permission reviewer: the pinned Claude
 permission reviewer profile, or the strong coordinator when no reviewer profile
 is configured. The reviewer receives the task, owner scope and assignment once.
 Each qualifying request is a turn that resumes the same native conversation and
-adds only that request's new evidence. The five-minute review window applies to
-each turn. If the conversation cannot be resumed, the host restarts it once with
+adds that request's evidence together with the owner's current steering and
+answers. The reviewer keeps its member and conversation while the integration
+head moves, because it has no file tools. The five-minute review window applies
+to each turn. If the conversation cannot be resumed, the host restarts it once with
 the full assignment and current request evidence. Between requests, the
 reviewer waits without a running process and holds no agent slot. It reports
 approve-once or escalate. The host checks the assignment, workspace, prompt,
@@ -1088,9 +1090,11 @@ Within the run revision's decision limit, an identical request can reuse a
 terminal reviewer's recorded verdict without another turn. The reuse key binds
 the pinned policy, semantic prompt and chosen option, task ID, changed paths,
 and accepted checks; it excludes prompt, session, and member identifiers. Reuse
-also requires the same run revision, assigned role, and inspected workspace
-evidence. A recorded approval is still rechecked against the current target
-session and delivered once. A recorded reviewer escalation remains with the
+also requires the same run revision, assigned role, working directory, reviewer
+profile, inspected workspace evidence, and owner authority (pinned policy plus
+the owner's steering and answers); a later owner answer makes every earlier
+verdict a miss. A recorded approval is still rechecked against the current
+target session, including that owner authority, and delivered once. A recorded reviewer escalation remains with the
 owner. Reuse does not extend the run's decision limit or apply to host-side
 escalations.
 

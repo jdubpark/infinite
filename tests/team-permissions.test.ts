@@ -295,7 +295,7 @@ test("a missing pinned coordinator provider records an escalation", { timeout: 1
     writeFileSync(join(f.receipts, `${waiting.id}.target-release`), "release", { mode: 0o600 });
 
     const escalated = await waitFor(() => f.get(waiting.id), run => run.permissionDecisions?.[0]?.status === "escalated", 30000);
-    assert.match(escalated.permissionDecisions[0].reason ?? "", /pinned permission coordinator provider is not configured/i);
+    assert.match(escalated.permissionDecisions[0].reason ?? "", /pinned permission reviewer provider is not configured/i);
     assert.equal(escalated.members.some(member => member.role === "permission-coordinator"), false);
   } finally { await f.close(); }
 });

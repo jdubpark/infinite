@@ -82,6 +82,8 @@ export interface TeamPermissionDecision {
   verdict?: "approve-once" | "escalate";
   /** Binds inspected command sources and changed paths to this exact review. */
   workspaceEvidenceHash?: string;
+  /** Pins the owner policy, steering and answers in force when this decision was assigned. */
+  authorityHash?: string;
   /** Pins the reviewer profile selected when this decision was assigned. */
   reviewerProfileId?: string;
   reviewerProfileHash?: string;

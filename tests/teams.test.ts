@@ -15,8 +15,8 @@ import { TeamError, applyTeamBriefTitle, checkTimeoutReason, memberStallReason }
 import { createTeamSchema, lineupProfiles, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamModelProfile, type TeamRun, type TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import type { HandoffPolicy, TeamHandoffContext } from "../packages/host/src/handoff-types.js";
-import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
-import { permissionEvidenceHash, permissionReuseKey } from "../packages/host/src/team-permissions.js";
+import { permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
+import { permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey } from "../packages/host/src/team-permissions.js";
 import { collectPermissionEvidence } from "../packages/host/src/team-permission-evidence.js";
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON } from "../packages/host/src/team-workspace.js";
@@ -2162,6 +2162,15 @@ test("permission reuse keys ignore prompt identity but bind the selected option 
   assert.notEqual(permissionReuseKey({ ...input, changedPaths: ["a.ts"] }), key);
 });
 
+test("a reviewer follow-up prompt repeats the owner's current steering and answers", () => {
+  const bare = permissionFollowUpPrompt("{\"decisionId\":\"d\"}");
+  assert.doesNotMatch(bare, /User steering and answers/);
+  const directed = permissionFollowUpPrompt("{\"decisionId\":\"d\"}", ["Keep to the API package.", "Owner answered \"Run the check again?\": No. Do not run that command again."]);
+  assert.match(directed, /User steering and answers \(current; they bind this request\):\nKeep to the API package\.\n\nOwner answered "Run the check again\?": No\. Do not run that command again\./);
+  assert.ok(directed.indexOf("User steering and answers") < directed.indexOf("Recorded permission request"), "direction precedes the untrusted evidence");
+  assert.match(directed, /^You are the team's permission-coordinator\./m);
+});
+
 test("an identical approved permission request reuses the review and delivers once", async () => {
   const f = schedulerFixture();
   try {
@@ -2179,6 +2188,7 @@ test("an identical approved permission request reuses the review and delivers on
       targetCwd: target.cwd, promptId: priorPrompt.id, promptHash: priorPrompt.hash!, evidenceHash: permissionEvidenceHash(priorPrompt),
       workspaceEvidenceHash: permissionWorkspaceEvidenceHash(priorPrompt, target.cwd, []),
       reuseKey: permissionReuseKey({ policyHash, prompt: priorPrompt, option: 0, changedPaths: [], acceptedChecks: null }), prompt: priorPrompt,
+      reviewerProfileHash: createHash("sha256").update(JSON.stringify(f.run.lineup.coordinator)).digest("hex"), authorityHash: permissionAuthorityHash(f.run.permissions, []),
       option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: sourceCoordinatorId,
       answerRequestId: randomUUID(), status: "answered" as const, verdict: "approve-once" as const };
     f.run.permissionDecisions = [prior];
@@ -2221,6 +2231,7 @@ test("reused approval observes invalidation during manager preflight", async () 
       targetCwd: target.cwd, promptId: priorPrompt.id, promptHash: priorPrompt.hash!, evidenceHash: permissionEvidenceHash(priorPrompt),
       workspaceEvidenceHash: permissionWorkspaceEvidenceHash(priorPrompt, target.cwd, []),
       reuseKey: permissionReuseKey({ policyHash, prompt: priorPrompt, option: 0, changedPaths: [], acceptedChecks: null }), prompt: priorPrompt,
+      reviewerProfileHash: createHash("sha256").update(JSON.stringify(f.run.lineup.coordinator)).digest("hex"), authorityHash: permissionAuthorityHash(f.run.permissions, []),
       option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: randomUUID(),
       answerRequestId: randomUUID(), status: "answered" as const, verdict: "approve-once" as const };
     f.run.permissionDecisions = [prior]; f.writeTeam();
@@ -2248,7 +2259,7 @@ test("reused approval observes invalidation during manager preflight", async () 
 });
 
 test("permission reuse rejects changed evidence, task, role, and revision mismatches", async () => {
-  for (const mismatch of ["changed paths", "task id", "changed source contents", "role", "revision"] as const) {
+  for (const mismatch of ["changed paths", "task id", "changed source contents", "role", "revision", "working directory", "reviewer profile", "owner answer"] as const) {
     const f = schedulerFixture();
     try {
       const target = f.run.members[0];
@@ -2276,13 +2287,20 @@ test("permission reuse rejects changed evidence, task, role, and revision mismat
       const priorChangedPaths = mismatch === "changed source contents" ? ["check.js", "package.json"] : [];
       const priorKey = permissionReuseKey({ policyHash, prompt: priorPrompt, option: 0,
         ...(mismatch === "task id" ? { targetTaskId: "earlier-task" } : {}), changedPaths: priorChangedPaths, acceptedChecks: null });
+      const reviewerProfileHash = createHash("sha256").update(JSON.stringify(f.run.lineup.coordinator)).digest("hex");
       const prior = { id: randomUUID(), revision: 1, policyHash, targetMemberId: sourceTarget.memberId,
-        targetSessionId: sourceTarget.sessionId, targetCwd: sourceTarget.cwd, promptId: priorPrompt.id, promptHash: priorPrompt.hash!,
+        targetSessionId: sourceTarget.sessionId, targetCwd: mismatch === "working directory" ? join(sourceTarget.cwd, "..", "elsewhere") : sourceTarget.cwd,
+        promptId: priorPrompt.id, promptHash: priorPrompt.hash!,
         evidenceHash: permissionEvidenceHash(priorPrompt), workspaceEvidenceHash: permissionWorkspaceEvidenceHash(priorPrompt, sourceTarget.cwd, priorChangedPaths),
         reuseKey: priorKey, prompt: priorPrompt, option: 0,
+        reviewerProfileHash: mismatch === "reviewer profile" ? "d".repeat(64) : reviewerProfileHash,
+        authorityHash: permissionAuthorityHash(f.run.permissions, []),
         expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: randomUUID(), answerRequestId: randomUUID(),
         status: "answered" as const, verdict: "approve-once" as const };
       f.run.permissionDecisions = [prior];
+      // An owner answer after the recorded verdict is new direction the verdict never saw.
+      if (mismatch === "owner answer") f.run.decisions.push({ id: randomUUID(), memberId: target.memberId, revision: 1, question: "Run the check again?",
+        options: ["yes", "no"], createdAt: new Date().toISOString(), answer: "No. Do not run that command again.", answeredBy: "owner", answeredAt: new Date().toISOString() });
       if (mismatch === "changed source contents") writeFileSync(join(target.cwd, "check.js"), "process.exitCode = 1;\n");
       f.writeTeam();
       const teams = f.openTeam();
@@ -2293,7 +2311,7 @@ test("permission reuse rejects changed evidence, task, role, and revision mismat
       assert.equal(fresh?.status, "escalated");
       assert.equal(fresh?.reusedFromDecisionId, undefined);
       assert.equal(fresh?.verdict, undefined, "a host-side provider configuration failure is not a reviewer verdict");
-      assert.equal(fresh?.reuseKey === priorKey, mismatch === "changed source contents" || mismatch === "role" || mismatch === "revision");
+      assert.equal(fresh?.reuseKey === priorKey, ["changed source contents", "role", "revision", "working directory", "reviewer profile", "owner answer"].includes(mismatch));
       assert.match(fresh?.reason ?? "", /provider is not configured/);
     } finally { f.close(); }
   }
@@ -2316,6 +2334,7 @@ test("an identical reviewer escalation is recorded and reused directly", async (
       workspaceEvidenceHash: permissionWorkspaceEvidenceHash(priorPrompt, target.cwd, []),
       reuseKey: permissionReuseKey({ policyHash, prompt: priorPrompt, option: 0, changedPaths: [], acceptedChecks: null }), prompt: priorPrompt,
       option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: reviewerId,
+      reviewerProfileHash: createHash("sha256").update(JSON.stringify(f.run.lineup.coordinator)).digest("hex"), authorityHash: permissionAuthorityHash(f.run.permissions, []),
       answerRequestId: randomUUID(), status: "escalated" as const, verdict: "escalate" as const };
     f.run.permissionDecisions = [prior]; f.writeTeam();
     const teams = f.openTeam();
@@ -2430,7 +2449,9 @@ test("sequential permission prompts reuse one reviewer and resume its observed n
 
     f.state.attention.prompt = prompt(2, "npm run build");
     const launchesBefore = f.launches.length;
-    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): unknown };
+    const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): { run: TeamRun } };
+    // A task integrated meanwhile: the reviewer has no file tools, so it keeps its member and conversation.
+    scheduler.record(f.run.id).run.headCommit = "f".repeat(40);
     await scheduler.step(scheduler.record(f.run.id));
     await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.length === 2 && f.launches.length > launchesBefore);
 

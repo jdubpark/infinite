@@ -50,6 +50,13 @@ test("flowchart shapes, labels, chains, fan-out and subgraphs", () => {
   assert.deepEqual(mixedDuplicateChain.coverage, []);
 });
 
+test("flowchart header suffixes are rejected for source fallback", () => {
+  for (const source of ["flowchart LR; A --> B", "flowchart LR nonsense"]) {
+    const result = parseMermaid(source);
+    assert.equal(result.ok, false, source);
+  }
+});
+
 test("sequence diagrams", () => {
   const r = parseMermaid("sequenceDiagram\n  participant A as API\n  A->>B: request\n  Note over A: skip me\n  B-->>A: reply");
   assert.ok(r.ok); assert.equal(r.kind, "sequence");

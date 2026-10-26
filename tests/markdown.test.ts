@@ -89,6 +89,37 @@ test("fenced code in a list preserves code and the following item", () => {
   assert.deepEqual(list.items[1].inlines, [{ type: "text", text: "after" }]);
 });
 
+test("fence on list-marker line preserves hashes and following sibling", () => {
+  const { nodes } = parseMarkdown("- ```sh\n  # not a heading\n  echo hi\n  ```\n- next item");
+  const list = nodes[0] as Extract<RichNode, { type: "list" }>;
+  assert.equal(list.type, "list");
+  assert.equal(list.items.length, 2);
+  assert.deepEqual(list.items[0].inlines, []);
+  assert.deepEqual(list.items[0].children, [{ type: "code", language: "sh", text: "# not a heading\necho hi" }]);
+  assert.deepEqual(list.items[1].inlines, [{ type: "text", text: "next item" }]);
+});
+
+test("maxNodes bounds list items and leaves small documents unchanged", () => {
+  const countItems = (nodes: RichNode[]): number => nodes.reduce((count, node) => {
+    if (node.type === "list") return count + node.items.length + node.items.reduce((nested, item) => nested + countItems(item.children), 0);
+    if (node.type === "quote") return count + countItems(node.children);
+    return count;
+  }, 0);
+  const bounded = parseMarkdown("- x\n".repeat(5000), { maxNodes: 10 });
+  assert.equal(bounded.truncated, true);
+  assert.ok(countItems(bounded.nodes) <= 10);
+
+  const small = parseMarkdown("- first\n- second\n\nA paragraph.");
+  assert.equal(small.truncated, false);
+  assert.deepEqual(small.nodes, [
+    { type: "list", ordered: false, items: [
+      { inlines: [{ type: "text", text: "first" }], children: [] },
+      { inlines: [{ type: "text", text: "second" }], children: [] },
+    ] },
+    { type: "paragraph", inlines: [{ type: "text", text: "A paragraph." }] },
+  ]);
+});
+
 test("fenced code survives ordered-list indentation and multiple blank lines", () => {
   const { nodes } = parseMarkdown("10. before\n\n    ```text\n    a\n\n\n    b\n    ```\n\n11. after");
   const list = nodes[0] as Extract<RichNode, { type: "list" }>;
@@ -132,15 +163,17 @@ test("byte cap truncates UTF-8 input and reports truncation", () => {
   assert.deepEqual(nodes, [{ type: "paragraph", inlines: [{ type: "text", text: "éé" }] }]);
 });
 
-test("maxNodes counts nested nodes", () => {
-  const { nodes, truncated } = parseMarkdown("* parent\n  * child\n\nfollowing", { maxNodes: 2 });
-  const countNodes = (items: RichNode[]): number => items.reduce((count, node) => {
-    if (node.type === "list") return count + 1 + node.items.reduce((children, item) => children + countNodes(item.children), 0);
-    if (node.type === "quote") return count + 1 + countNodes(node.children);
+test("maxNodes counts list items and nested nodes", () => {
+  const { nodes, truncated } = parseMarkdown("* parent\n  > quoted\n\nfollowing", { maxNodes: 4 });
+  const countBudgetUnits = (items: RichNode[]): number => items.reduce((count, node) => {
+    if (node.type === "list") return count + 1 + node.items.reduce((children, item) => children + 1 + countBudgetUnits(item.children), 0);
+    if (node.type === "quote") return count + 1 + countBudgetUnits(node.children);
     return count + 1;
   }, 0);
   assert.equal(nodes[0].type, "list");
-  assert.equal(countNodes(nodes), 2);
+  assert.equal(countBudgetUnits(nodes), 4);
+  const list = nodes[0] as Extract<RichNode, { type: "list" }>;
+  assert.deepEqual(list.items[0].children, [{ type: "quote", children: [{ type: "paragraph", inlines: [{ type: "text", text: "quoted" }] }] }]);
   assert.equal(truncated, true);
 });
 

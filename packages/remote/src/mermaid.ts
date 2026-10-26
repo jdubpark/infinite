@@ -15,7 +15,12 @@ export function parseMermaid(text: string): ParsedMermaid {
 
     const lines = source.split(/\r?\n/);
     const header = lines[0]?.trim() ?? "";
-    const flowHeader = /^(flowchart|graph)\s+(TD|TB|BT|LR|RL)\b/.exec(header);
+    const flowHeaderMatch = /^(flowchart|graph)\s+(TD|TB|BT|LR|RL)\b(.*)$/.exec(header);
+    // Reject all same-line suffixes after the direction so no header statement is silently discarded.
+    if (flowHeaderMatch && flowHeaderMatch[3].trim()) {
+      return failure("Flowchart header must end after the direction.");
+    }
+    const flowHeader = flowHeaderMatch;
     const isSequence = /^sequenceDiagram\b/.test(header);
     if (!flowHeader && !isSequence) {
       return failure("Expected a flowchart, graph, or sequenceDiagram header.");

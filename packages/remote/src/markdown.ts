@@ -164,9 +164,10 @@ class Parser {
     while (i < lines.length && !this.exhausted) {
       const marker = listMarker(contentLine(lines[i]));
       if (!marker || marker.indent !== first.indent || marker.ordered !== first.ordered) break;
+      if (!this.reserve()) break;
       const itemLines = [marker.text];
       i += 1;
-      let activeFence: { char: string; size: number; language: string } | null = null;
+      let activeFence = fenceStart(marker.text);
       while (i < lines.length) {
         const current = contentLine(lines[i]);
         const nextMarker = listMarker(current);
@@ -200,7 +201,11 @@ class Parser {
         itemLines.push(stripListIndent(lines[i], marker.width));
         i += 1;
       }
-      items.push({ inlines: parseInline(marker.text), children: this.blocks(itemLines.slice(1), depth + 1) });
+      const startsWithBlock = startsBlock(itemLines, 0);
+      items.push({
+        inlines: startsWithBlock ? [] : parseInline(marker.text),
+        children: this.blocks(startsWithBlock ? itemLines : itemLines.slice(1), depth + 1),
+      });
       if (i < lines.length && !lines[i].trim()) {
         let next = i + 1;
         while (next < lines.length && !lines[next].trim()) next += 1;

@@ -604,8 +604,8 @@ test("a cancelled run with an interrupted operation and members whose sessions a
   f.run.events.push({ at, text: "Team cancelled." }, { at, text: "The host restarted with an unresolved operation from a cancelled team. The intent will not be replayed." });
   retention(f, { cancelledMinutes: 0 });
   f.writeTeam();
-  // Both unsettled members' sessions no longer exist on the host.
-  f.manager.state = async () => { throw new Error("unknown session"); };
+  // Both unsettled members' sessions were deleted on the host; a saved status file still answers state() as running.
+  (f.manager as unknown as { meta: (id: string) => unknown }).meta = () => { throw Object.assign(new Error("Session not found"), { code: "ENOENT" }); };
   const teams = openTeam(f, { now: () => Date.parse(at) + 1000 });
   try {
     const stored = (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!;

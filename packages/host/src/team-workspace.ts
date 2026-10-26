@@ -2,7 +2,8 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
-import { basename, dirname, join, resolve, relative, isAbsolute, parse } from "node:path";
+import { rm as rmAsync } from "node:fs/promises";
+import { basename, dirname, join, resolve, relative, isAbsolute, parse, sep } from "node:path";
 import type { TeamCommand, TeamTaskPlan } from "./team-types.js";
 
 export class TeamError extends Error {
@@ -69,6 +70,65 @@ async function git(cwd: string, args: string[], prefix?: TeamCommand, timeoutMs 
 }
 function lines(value: string) { return value.split("\0").filter(Boolean); }
 export function teamWorkspacePath(root: string, directoryName: string) { return join(root, directoryName, "integration"); }
+function strictlyInside(root: string, target: string) {
+  const rel = relative(root, target);
+  return Boolean(rel) && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+/** Validate a host-owned run directory before any recursive removal. Missing targets are already removed. */
+function checkedRemovalDirectory(runDirectory: string, configuredRoot: string) {
+  const root = resolve(configuredRoot), target = resolve(runDirectory);
+  if (!strictlyInside(root, target)) throw unsafeTeamRoot();
+  let info: ReturnType<typeof lstatSync>;
+  try { info = lstatSync(target); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info)) throw unsafeTeamRoot();
+  let rootInfo: ReturnType<typeof lstatSync>, canonicalRoot: string, canonicalTarget: string;
+  try {
+    rootInfo = lstatSync(root);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw unsafeTeamRoot();
+    canonicalRoot = realpathSync(root);
+    canonicalTarget = realpathSync(target);
+  } catch { throw unsafeTeamRoot(); }
+  if (!strictlyInside(canonicalRoot, canonicalTarget)) throw unsafeTeamRoot();
+  return { root: canonicalRoot, target: canonicalTarget };
+}
+function removalFailed(result: CommandResult) {
+  if (result.exitCode === 0 && !result.interrupted && !result.truncated) return;
+  throw new TeamError(409, "workspace-removal-failed", "The host could not remove the agent-owned team workspace through its configured command prefix.");
+}
+/** Remove both team clones, then the host-owned run directory. `configuredRoot` is required to fail closed. */
+export async function removeTeamWorkspace(runDirectory: string, prefix?: TeamCommand, signal?: AbortSignal, configuredRoot?: string) {
+  if (!configuredRoot) throw new TeamError(409, "team-root-unsafe", "Team workspace removal requires its configured team root.");
+  const safe = checkedRemovalDirectory(runDirectory, configuredRoot);
+  if (!safe) return;
+  if (prefix) {
+    const result = await teamCommand({ command: "rm", args: ["-rf", "--", "integration", "members"] }, safe.target, signal, 600000, prefix);
+    removalFailed(result);
+  } else {
+    await rmAsync(join(safe.target, "integration"), { recursive: true, force: true });
+    await rmAsync(join(safe.target, "members"), { recursive: true, force: true });
+  }
+  await rmAsync(safe.target, { recursive: true, force: true });
+}
+/** Remove one member clone without following a redirected run or members directory. */
+export async function removeMemberWorkspace(runDirectory: string, memberId: string, prefix?: TeamCommand, signal?: AbortSignal, configuredRoot?: string) {
+  if (!configuredRoot) throw new TeamError(409, "team-root-unsafe", "Member workspace removal requires its configured team root.");
+  safeWorkspaceId(memberId);
+  const safe = checkedRemovalDirectory(runDirectory, configuredRoot);
+  if (!safe) return;
+  const members = join(safe.target, "members");
+  let info: ReturnType<typeof lstatSync>;
+  try { info = lstatSync(members); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info)) throw unsafeTeamRoot();
+  let canonicalMembers: string;
+  try { canonicalMembers = realpathSync(members); } catch { throw unsafeTeamRoot(); }
+  if (!strictlyInside(safe.target, canonicalMembers) || !strictlyInside(safe.root, join(canonicalMembers, memberId))) throw unsafeTeamRoot();
+  if (prefix) {
+    const result = await teamCommand({ command: "rm", args: ["-rf", "--", memberId] }, canonicalMembers, signal, 600000, prefix);
+    removalFailed(result);
+  } else await rmAsync(join(canonicalMembers, memberId), { recursive: true, force: true });
+}
 const hostOwned = (stat: ReturnType<typeof lstatSync>) => {
   if (!stat) return false;
   return typeof process.getuid !== "function" || stat.uid === process.getuid() || stat.uid === 0;

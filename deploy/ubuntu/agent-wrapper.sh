@@ -5,6 +5,9 @@ ulimit -c 0
 
 # sudo -H sets HOME to the dedicated agent account's encrypted home.
 export TMPDIR=/srv/infinite-data/tmp/agent
+# pnpm hardlinks identical files from one store on the state volume; corepack caches under the agent home.
+export npm_config_store_dir=/srv/infinite-data/agent-home/.pnpm-store
+export COREPACK_HOME=/srv/infinite-data/agent-home/.cache/corepack
 export XDG_CONFIG_HOME="$HOME/.config"
 export XDG_DATA_HOME="$HOME/.local/share"
 export XDG_STATE_HOME="$HOME/.local/state"

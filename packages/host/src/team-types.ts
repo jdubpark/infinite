@@ -15,16 +15,16 @@ export type TeamCommand = z.infer<typeof teamCommandSchema>;
 
 /** How long finished work keeps its clones. Records and events outlive every workspace; cancelled runs are deleted whole. */
 export const teamRetentionSchema = z.object({
-  /** Minutes after a run reaches merged or no-change before its integration and member clones are removed (0 = as soon as every member has stopped). */
-  finishedMinutes: z.number().int().min(0).max(10080).default(0),
+  /** Minutes after a run reaches merged or no-change, with every member stopped, before its clones are removed. Runs owned by a live goal, mission or handoff wait for that owner to finish. */
+  finishedMinutes: z.number().int().min(0).max(10080).default(60),
   /** Minutes after a run is cancelled and its members have stopped before its clones and its record are deleted. */
   cancelledMinutes: z.number().int().min(0).max(10080).default(60),
   /** Hours a ready-for-review run keeps its clones; the reviewed branch is already published for review. */
   reviewHours: z.number().int().min(1).max(720).default(24),
   /** Hours a blocked run keeps its clones; after removal the run stays blocked and cannot resume. */
   blockedHours: z.number().int().min(1).max(720).default(72),
-  /** Minutes a stopped member whose result was integrated keeps its clone while the run continues. */
-  memberMinutes: z.number().int().min(0).max(10080).default(0),
+  /** Minutes a stopped member whose result was integrated keeps its clone while the run continues; recovery briefs list these clones for read-only inspection. */
+  memberMinutes: z.number().int().min(0).max(10080).default(60),
 }).strict();
 export type TeamRetention = z.infer<typeof teamRetentionSchema>;
 export const DEFAULT_TEAM_RETENTION: TeamRetention = teamRetentionSchema.parse({});

@@ -155,9 +155,14 @@ export function createApp(config: Config, key: Buffer) {
   const linear = new LinearService(config, key);
   const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
   const readings = new Readings(config, key, manager, summarizer);
+  const ownerServices: { goals?: GoalService; missions?: MissionService; handoffs?: HandoffService } = {};
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
     onMerged: id => void projectSource.refresh(id).catch(() => {}),
+    ownerActive: run => {
+      if (ownerServices.goals?.retainsTeamRun(run.id) || ownerServices.missions?.retainsSubteamRun(run.id)) return true;
+      return Boolean(run.handoff && ownerServices.handoffs?.ownsActiveTeam(run.id));
+    },
   });
   const usage = new UsageService(config, key, manager);
   const balances = new BalanceService(config.usage?.accounts ?? {});
@@ -165,8 +170,10 @@ export function createApp(config: Config, key: Buffer) {
   // TeamService ticks on every host and drives the ledger from its own session listing.
   teams.useUsage(usage);
   const goals = new GoalService(config, key, teams, linear);
+  ownerServices.goals = goals;
   const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
   const missions = new MissionService(config, key, manager, teams, projectGroups);
+  ownerServices.missions = missions;
   missions.useUsage(usage);
   usage.useResolvers({
     goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },
@@ -192,6 +199,7 @@ export function createApp(config: Config, key: Buffer) {
         (session.projectId === projectId || handoffPathsOverlap(sourcePath, realpathSync(session.cwd)))))
       throw new TeamError(409, "project-busy", "Another native session may still be using this project. Release it before handing off work.");
   });
+  ownerServices.handoffs = handoffs;
   const assertNoHandoff = (projectId: string) => {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
@@ -637,6 +645,12 @@ export function createApp(config: Config, key: Buffer) {
     app.post(`/api/missions/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await missions[action](id.parse(req.params.id), missionActionSchema.parse(req.body))));
   app.get("/api/board", (_req, res) => res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => projectGroups.containing(id))));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  app.delete("/api/teams/:id", requireRole(["owner"]), async (req, res) => {
+    const teamId = id.parse(req.params.id);
+    if (goals.ownsActiveTeam(teamId)) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal.");
+    if (missions.ownsActiveSubteam(teamId)) throw new TeamError(409, "mission-owned-team", "Control this subteam from its mission.");
+    return res.json(await teams.removeRun(teamId));
+  });
   app.post("/api/teams/:id/tasks/:taskId/rating", requireRole(["owner"]), (req, res) =>
     res.json(teams.rateTask(id.parse(req.params.id), z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).parse(req.params.taskId), teamTaskRatingSchema.parse(req.body))));
   app.post("/api/teams/:id/permissions/revoke", requireRole(["owner"]), async (req, res) => res.json(await teams.revokePermissions(id.parse(req.params.id), teamActionSchema.parse(req.body))));
@@ -1424,5 +1438,5 @@ export function createApp(config: Config, key: Buffer) {
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
   const closeConnections = () => { live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
+  return { app, manager, projectSync, teams, goals, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

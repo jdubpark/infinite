@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { PushStore, expoSender } from "../packages/host/src/push.js";
 import { Notifier } from "../packages/host/src/notifier.js";
@@ -440,4 +442,65 @@ test("a held prompt survives a session missing from one listing and still reache
     await notifier.tick();
     assert.equal(sent.length, 1, "the escalated prompt reaches the owner after the session returns");
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("storage alerts cross warning and critical thresholds once, throttle samples, and rearm below 80 percent", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-push-"));
+  const store = new PushStore(dir, randomBytes(32)); store.add("owner", "ExponentPushToken[a]", "ios");
+  const sent: { title: string; body: string; priority: string; collapseId: string; data: { url: string } }[] = [];
+  const sender = async (messages: unknown[]) => { sent.push(...messages as typeof sent); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  let fullness = 0.84, samples = 0, now = 1_800_000_000_000;
+  const originalNow = Date.now; Date.now = () => now;
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender,
+    { detail: "minimal", events: ["host-storage"], intervalMs: 100000 }, undefined, undefined,
+    { sample: async () => { samples++; return [{ label: "state", path: "configured-state-root", fullness, availableInodes: 2_600_000, availableBytes: 81 * 1024 ** 3, fullnessBy: "inodes" }]; } },
+  );
+  const advance = async (next: number) => { fullness = next; now += 60_000; await notifier.tick(); };
+  try {
+    await notifier.tick();
+    assert.equal(sent.length, 0, "below warning threshold");
+    now += 2_000; await notifier.tick();
+    assert.equal(samples, 1, "storage is not sampled more than once per minute");
+    assert.equal(sent.length, 0);
+
+    await advance(0.86);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].title, "Host storage low");
+    assert.equal(sent[0].priority, "default");
+    assert.match(sent[0].body, /state volume is 86% full by inodes; 2\.6M inodes and 81 GB free/);
+    assert.equal(sent[0].collapseId, "storage:state"); assert.equal(sent[0].data.url, "/machine");
+
+    await advance(0.96);
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1].title, "Host storage critical"); assert.equal(sent[1].priority, "high");
+    await advance(0.97);
+    assert.equal(sent.length, 2, "no repeat while still above thresholds");
+    await advance(0.79);
+    assert.equal(sent.length, 2);
+    await advance(0.86);
+    assert.equal(sent.length, 3, "warning rearms below 80 percent");
+    await advance(0.96);
+    assert.equal(sent.length, 4, "critical rearms below 80 percent");
+  } finally { Date.now = originalNow; notifier.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("storage alerts once on startup when already high and honor the host-storage event setting", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-push-"));
+  const store = new PushStore(dir, randomBytes(32)); store.add("owner", "ExponentPushToken[a]", "ios");
+  const sent: { title: string }[] = [];
+  const sender = async (messages: unknown[]) => { sent.push(...messages as typeof sent); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  let now = 1_800_000_000_000;
+  const originalNow = Date.now; Date.now = () => now;
+  const source = { sample: async () => [{ label: "state", path: "configured-state-root", fullness: 0.96, availableInodes: 2_600_000, availableBytes: 81 * 1024 ** 3, fullnessBy: "inodes" as const }] };
+  const make = (events: string[]) => new Notifier({ list: async () => [] } as never, store, sender,
+    { detail: "minimal", events, intervalMs: 100000 }, undefined, undefined, source);
+  const enabled = make(["host-storage"]), disabled = make(["needs-you"]);
+  try {
+    await enabled.tick();
+    assert.equal(sent.length, 1); assert.equal(sent[0].title, "Host storage critical");
+    now += 60_000; await enabled.tick();
+    assert.equal(sent.length, 1, "an already-high startup volume is announced only once");
+    await disabled.tick();
+    assert.equal(sent.length, 1, "host-storage can be disabled");
+  } finally { Date.now = originalNow; enabled.stop(); disabled.stop(); rmSync(dir, { recursive: true, force: true }); }
 });

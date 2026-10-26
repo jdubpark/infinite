@@ -23,13 +23,13 @@ The host's state volume ran out of inodes twice in two days. Every team run keep
 
 | Run status | Clones removed | Record |
 |---|---|---|
-| merged, no-change | `finishedMinutes` (default 0) after every member stopped | kept, `workspaceRemovedAt` set |
+| merged, no-change | `finishedMinutes` (default 60) after every member stopped, and never while the goal, mission or handoff that owns the run is still active (the next cycle clones from this workspace) | kept, `workspaceRemovedAt` set |
 | cancelled | `cancelledMinutes` (default 60) after every member stopped | deleted with the clones |
 | ready-for-review | `reviewHours` (default 24) after the status was reached | kept |
 | blocked | `blockedHours` (default 72) after the status was reached | kept; the run can no longer resume |
-| any active run | a stopped member whose result was integrated loses its clone after `memberMinutes` (default 0) | member keeps `workspaceRemovedAt` |
+| any active run | a stopped member whose result was integrated loses its clone after `memberMinutes` (default 60), unless a newer member still uses that directory | member keeps `workspaceRemovedAt` |
 
-Removal never runs while the run has a pending operation, a live command, or a member that is not stopped. A failed removal is an event on the run and is retried on later ticks; it never blocks the run. Resuming or continuing a run whose workspace was removed is refused with `team-workspace-removed`.
+Removal never runs while the run has a pending operation, a live command, or a member that is not stopped, and a stopped member's clone is kept while a newer member still uses it as its working directory. A failed removal is an event on the run and is retried on later ticks; it never blocks the run. Resuming or continuing a run whose workspace was removed is refused with `team-workspace-removed`.
 
 Removal runs the agent-owned clones through the team command prefix (`rm -rf -- integration members` with the run directory as cwd, which the gate admits inside a team root) and then removes the host-owned run directory itself. Without a prefix the host removes the tree directly.
 

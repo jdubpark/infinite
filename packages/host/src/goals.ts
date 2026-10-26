@@ -84,6 +84,15 @@ export class GoalService {
   }
   /** Status rows for owner alerts. Unlike list(), reading them does not refresh tracker state or usage. */
   statuses() { return [...this.records.values()].map(({ goal }) => ({ id: goal.id, title: goal.title, status: goal.status, reason: goal.reason })); }
+  ownsActiveTeam(teamId: string) {
+    return [...this.records.values()].some(({ goal }) =>
+      !terminal.has(goal.status) && goal.activeTeamId === teamId);
+  }
+  /** A live goal may still need the source run while its cycle evidence is being retained. */
+  retainsTeamRun(teamId: string) {
+    return [...this.records.values()].some(({ goal }) =>
+      !terminal.has(goal.status) && (goal.activeTeamId === teamId || goal.cycles.some(cycle => cycle.teamId === teamId)));
+  }
   /** Persisted goal records for the read-only Understanding view; performs no tracker or usage refresh. */
   understandingRecords() { return [...this.records.values()].map(({ goal }) => structuredClone(goal)); }
   list() { return [...this.records.values()].map(({ goal }) => this.get(goal.id)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
@@ -163,7 +172,16 @@ export class GoalService {
   }
   private setControl(stored: Stored, action: PendingControl["action"], options: { text?: string; parallelism?: number } = {}) {
     if (!stored.goal.activeTeamId) return;
-    const team = this.teams.get(stored.goal.activeTeamId);
+    let team: TeamView;
+    try { team = this.teams.get(stored.goal.activeTeamId); }
+    catch (error) {
+      if (error instanceof TeamError && error.code === "team-not-found") {
+        if (stored.goal.cycles.some(cycle => cycle.teamId === stored.goal.activeTeamId && cycle.status === "cancelled"))
+          stored.goal.activeTeamId = undefined;
+        return;
+      }
+      throw error;
+    }
     if (["ready-for-review", "merged", "no-change", "cancelled", "blocked"].includes(team.status)) return;
     stored.control = { action, requestId: randomUUID(), teamId: team.id, revision: team.revision, ...options };
   }
@@ -338,7 +356,10 @@ export class GoalService {
   }
   private teamExtendable(stored: Stored) {
     if (!stored.goal.activeTeamId) return false;
-    const context = this.teams.get(stored.goal.activeTeamId).goal;
+    let team: TeamView;
+    try { team = this.teams.get(stored.goal.activeTeamId); }
+    catch (error) { if (error instanceof TeamError && error.code === "team-not-found") return false; throw error; }
+    const context = team.goal;
     return Boolean(context?.extendMinutes && context.ceilingAt && Date.now() < Date.parse(context.ceilingAt));
   }
   private async applyControl(stored: Stored) {
@@ -359,9 +380,25 @@ export class GoalService {
       if (!(error instanceof TeamError)) throw error;
       if (["members-stopping", "team-operation-running"].includes(error.code)) return false;
       if (error.code === "stale-team-revision" && ["pause", "cancel"].includes(control.action)) {
-        const team = this.teams.get(control.teamId);
+        let team: TeamView;
+        try { team = this.teams.get(control.teamId); }
+        catch (missing) {
+          if (missing instanceof TeamError && missing.code === "team-not-found") {
+            stored.control = undefined;
+            if (stored.goal.activeTeamId === control.teamId && stored.goal.cycles.some(cycle => cycle.teamId === control.teamId && cycle.status === "cancelled"))
+              stored.goal.activeTeamId = undefined;
+            this.save(stored); return true;
+          }
+          throw missing;
+        }
         stored.control = { ...control, requestId: randomUUID(), revision: team.revision };
         this.save(stored); return false;
+      }
+      if (error.code === "team-not-found") {
+        stored.control = undefined;
+        if (stored.goal.activeTeamId === control.teamId && stored.goal.cycles.some(cycle => cycle.teamId === control.teamId && cycle.status === "cancelled"))
+          stored.goal.activeTeamId = undefined;
+        this.save(stored); return true;
       }
       stored.control = undefined;
       if (!["paused", "cancelled", "limit-reached"].includes(stored.goal.status)) stored.goal.status = "blocked";
@@ -393,14 +430,18 @@ export class GoalService {
     const trackingReady = !goal.linear || goal.linear.status === "synced";
     // Mirror first: a paused team's approved extension still protects the goal from its old deadline.
     if (goal.activeTeamId) {
-      const team = this.teams.get(goal.activeTeamId);
-      const deadlineApproved = Boolean(team.goal?.extendMinutes) || Boolean(team.goal?.ownerExtendedDeadlineAt);
-      if (deadlineApproved && team.goal?.deadlineAt && Date.parse(team.goal.deadlineAt) > Date.parse(goal.deadlineAt)) {
-        const minutes = Math.round((Date.parse(team.goal.deadlineAt) - Date.parse(goal.deadlineAt)) / 60000);
-        goal.deadlineAt = team.goal.deadlineAt;
-        if (team.goal.ceilingAt && (!goal.ceilingAt || Date.parse(team.goal.ceilingAt) > Date.parse(goal.ceilingAt))) goal.ceilingAt = team.goal.ceilingAt;
-        this.event(stored, `The active team extended the time limit by ${minutes} minutes under the approved extension policy.`);
-        this.save(stored);
+      let team: TeamView | undefined;
+      try { team = this.teams.get(goal.activeTeamId); }
+      catch (error) { if (!(error instanceof TeamError) || error.code !== "team-not-found") throw error; }
+      if (team) {
+        const deadlineApproved = Boolean(team.goal?.extendMinutes) || Boolean(team.goal?.ownerExtendedDeadlineAt);
+        if (deadlineApproved && team.goal?.deadlineAt && Date.parse(team.goal.deadlineAt) > Date.parse(goal.deadlineAt)) {
+          const minutes = Math.round((Date.parse(team.goal.deadlineAt) - Date.parse(goal.deadlineAt)) / 60000);
+          goal.deadlineAt = team.goal.deadlineAt;
+          if (team.goal.ceilingAt && (!goal.ceilingAt || Date.parse(team.goal.ceilingAt) > Date.parse(goal.ceilingAt))) goal.ceilingAt = team.goal.ceilingAt;
+          this.event(stored, `The active team extended the time limit by ${minutes} minutes under the approved extension policy.`);
+          this.save(stored);
+        }
       }
     }
     const teamDecides = ["running", "needs-input"].includes(goal.status) && this.teamExtendable(stored);
@@ -420,7 +461,23 @@ export class GoalService {
     }
     if (!await this.applyControl(stored) || this.closed) return;
     if (goal.activeTeamId) {
-      const team = this.teams.get(goal.activeTeamId);
+      let team: TeamView | undefined;
+      try { team = this.teams.get(goal.activeTeamId); }
+      catch (error) { if (!(error instanceof TeamError) || error.code !== "team-not-found") throw error; }
+      if (!team) {
+        const cycle = goal.cycles.find(value => value.teamId === goal.activeTeamId);
+        if (cycle?.status === "cancelled") {
+          goal.activeTeamId = undefined;
+          if (["running", "needs-input"].includes(goal.status)) {
+            const deadlineStopped = goal.stopReason === "deadline" || goal.deadlineContinuation === true;
+            const extendedDeadline = deadlineStopped && goal.deadlineContinuation === true && Date.now() < Date.parse(goal.deadlineAt);
+            goal.status = extendedDeadline ? "running" : goal.stopReason ? "limit-reached" : "blocked";
+            goal.reason = extendedDeadline ? undefined : cycle.reason ?? "The active team stopped before producing a reviewed result.";
+            if (extendedDeadline) this.event(stored, "The deadline-stopped team settled after an owner extension; the goal will continue in a new cycle.");
+          }
+          this.save(stored);
+        }
+      } else {
       this.refresh(stored, team);
       if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) {
         if (["running", "needs-input"].includes(goal.status) && ["ready-for-review", "merged", "no-change"].includes(team.status) && team.linear && team.linear.status !== "synced") {
@@ -451,6 +508,26 @@ export class GoalService {
         else { goal.status = team.status === "needs-input" ? "needs-input" : "running"; goal.reason = team.reason; }
       }
       this.save(stored);
+      }
+    }
+    // Cancellation cleanup must not depend on the cycle remaining the active one: the goal can
+    // clear activeTeamId as soon as its members settle, while retention removes the workspace later.
+    for (const cycle of goal.cycles.filter(value => value.status === "cancelled")) {
+      let team: TeamView;
+      try { team = this.teams.get(cycle.teamId); }
+      catch (error) {
+        if (!(error instanceof TeamError) || error.code !== "team-not-found") throw error;
+        const cleanupEvent = `The host removed cancelled goal cycle ${cycle.cycle}'s settled run record after its workspace was removed.`;
+        if (!goal.events.some(event => event.text === cleanupEvent)) { this.event(stored, cleanupEvent); this.save(stored); }
+        continue;
+      }
+      if (team.status !== "cancelled" || !team.workspaceRemovedAt) continue;
+      this.refresh(stored, team);
+      this.save(stored);
+      try { await this.teams.removeRun(team.id); }
+      catch (error) { if (!(error instanceof TeamError) || error.code !== "team-not-found") continue; }
+      const cleanupEvent = `The host removed cancelled goal cycle ${cycle.cycle}'s settled run record after its workspace was removed.`;
+      if (!goal.events.some(event => event.text === cleanupEvent)) { this.event(stored, cleanupEvent); this.save(stored); }
     }
     if (terminal.has(goal.status) || goal.status === "paused") return;
     const timeUp = Date.now() >= Date.parse(goal.deadlineAt) && !this.teamExtendable(stored);

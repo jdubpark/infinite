@@ -296,15 +296,23 @@ function commandArray(text: string, flag: string) {
   if (!Array.isArray(value)) throw new Error(`${flag} must contain a JSON command array.`);
   return value.map(item => commandSchema.parse(item));
 }
+function detectPackageManager(root: string, pkg: { packageManager?: unknown } | undefined): "pnpm" | "npm" | undefined {
+  const isFile = (name: string) => { try { return statSync(join(root, name)).isFile(); } catch { return false; } };
+  if (typeof pkg?.packageManager === "string" && pkg.packageManager.startsWith("pnpm@")) return "pnpm";
+  if (isFile("pnpm-lock.yaml")) return "pnpm";
+  if (isFile("package-lock.json") || isFile("npm-shrinkwrap.json")) return "npm";
+  return undefined;
+}
 function inferredProjectConfig(root: string, options: Options, allowUnconfiguredChecks = false) {
   const pkgFile = join(root, "package.json");
-  let pkg: { scripts?: Record<string, unknown> } | undefined;
+  let pkg: { packageManager?: unknown; scripts?: Record<string, unknown> } | undefined;
   try { pkg = JSON.parse(readFileSync(pkgFile, "utf8")); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("package.json is unreadable; supply explicit setup and check JSON.");
   }
-  const hasLock = ["package-lock.json", "npm-shrinkwrap.json"].some(name => { try { return statSync(join(root, name)).isFile(); } catch { return false; } });
-  const setup = options["--setup-json"] !== undefined ? commandArray(String(options["--setup-json"]), "--setup-json") : hasLock ? [{ command: "npm", args: ["ci"] }] : [];
-  const checks = options["--check-json"] !== undefined ? commandArray(String(options["--check-json"]), "--check-json") : pkg?.scripts?.check ? [{ command: "npm", args: ["run", "check"] }] : [];
+  const manager = detectPackageManager(root, pkg);
+  const inferredSetup = manager === "pnpm" ? [{ command: "pnpm", args: ["install", "--frozen-lockfile"] }] : manager === "npm" ? [{ command: "npm", args: ["ci"] }] : [];
+  const setup = options["--setup-json"] !== undefined ? commandArray(String(options["--setup-json"]), "--setup-json") : inferredSetup;
+  const checks = options["--check-json"] !== undefined ? commandArray(String(options["--check-json"]), "--check-json") : pkg?.scripts?.check ? [{ command: manager === "pnpm" ? "pnpm" : "npm", args: ["run", "check"] }] : [];
   if (!checks.length && !allowUnconfiguredChecks) throw new Error("No package check script was found. Supply --check-json with a JSON array of command objects.");
   if (setup.length > 1) throw new Error("--setup-json contains one setup command at most.");
   return projectConfigSchema.parse({ ...(setup[0] ? { setup: setup[0] } : {}), checks, ...(!checks.length ? { establishChecks: true } : {}) });
@@ -438,6 +446,22 @@ function resumePendingIntent(path: string, prefix: string, endpoint: string, int
   const commandArgs = rawArgs.filter((value, index) => value !== "--request-id" && rawArgs[index - 1] !== "--request-id");
   const retry = `infinite ${[...commandArgs, "--request-id", prior[1].requestId].map(shellQuote).join(" ")}`;
   throw new Error(`An earlier request has an uncertain result. Inspect the current state first. If this is the same operation, retry with its saved request ID: ${retry}`);
+}
+async function clearTerminalTeamStartReceipt(api: Api, path: string, request: any, requestId: string) {
+  const records = readPrivateJson(path, {}) as Record<string, any>;
+  const prior = Object.entries(records).find(([key, value]) => key.startsWith("team-start:") && value?.state === "pending" &&
+    value.endpoint === "/teams" && value.requestId !== requestId && value.body?.projectId === request.projectId &&
+    value.body?.provider === request.provider && value.body?.useConfiguredLineup === request.useConfiguredLineup &&
+    value.body?.title === request.title && value.body?.objective === request.objective);
+  if (!prior) return;
+  try {
+    const team = await api.json<any>(`/teams/${prior[1].requestId}`);
+    if (!["cancelled", "merged", "no-change", "ready-for-review", "blocked"].includes(team.status)) return;
+  } catch (error) {
+    if ((error as { status?: number })?.status !== 404) return;
+  }
+  delete records[prior[0]];
+  privateJson(path, records);
 }
 async function postMutation(api: Api, receiptPath: string, key: string, endpoint: string, body: Record<string, unknown>, method = "POST", logRequest = true) {
   const records = readPrivateJson(receiptPath, {}) as Record<string, any>;
@@ -759,9 +783,23 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     if (!provider) throw new Error("The host has no configured team lineup. Set one up on the host or use --provider PROVIDER for a single-provider team.");
     let requestId = z.uuid().parse(String(options["--request-id"] ?? randomUUID()));
     const body = createTeamSchema.parse({ requestId, projectId, provider, useConfiguredLineup: options["--provider"] === undefined, title: String(options["--title"] ?? objective.split("\n")[0].slice(0, 100)), objective });
+    if (options["--request-id"] !== undefined)
+      await clearTerminalTeamStartReceipt(api, receiptsPath, body, body.requestId);
     requestId = body.requestId = resumePendingIntent(receiptsPath, "team-start:", "/teams", prior => prior.projectId === body.projectId && prior.provider === body.provider && prior.useConfiguredLineup === body.useConfiguredLineup && prior.title === body.title && prior.objective === body.objective, requestId, options["--request-id"] !== undefined, rawArgs);
     const team = await postMutation(api, receiptsPath, `team-start:${requestId}`, "/teams", body);
     outputTeam(team, Boolean(options["--json"])); return true;
+  }
+  if (subcommand === "delete") {
+    if (!id || rest.length) throw new Error("Usage: infinite team delete ID [--json]");
+    z.uuid().parse(id);
+    try {
+      outputTeam(await api.json<any>(`/teams/${id}`, undefined, undefined, undefined, "DELETE"), Boolean(options["--json"]));
+    } catch (error) {
+      if ((error as { status?: number })?.status !== 404) throw error;
+      if (options["--json"]) console.log(JSON.stringify({ id, status: "already-removed" }));
+      else console.log(`${id} already removed`);
+    }
+    return true;
   }
   if (subcommand === "status" || subcommand === "watch") {
     if (subcommand === "watch" && !id) throw new Error("Usage: infinite team watch ID [--logs]");
@@ -1079,5 +1117,5 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     return true;
   }
-  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|reconcile-delivery|reconcile-verification|retire-member|cancel|revoke-permissions ...");
+  throw new Error("Usage: infinite team start|status|watch|pull|steer|answer|pause|resume|continue|delete|reconcile-delivery|reconcile-verification|retire-member|cancel|revoke-permissions ...");
 }

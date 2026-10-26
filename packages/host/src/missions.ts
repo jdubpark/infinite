@@ -119,6 +119,17 @@ export class MissionService {
   }
   /** The usage ledger that prices coordinator sessions; subteam usage comes from their runs. */
   useUsage(service: UsageService) { this.usage = service; }
+  ownsActiveSubteam(teamId: string) {
+    return [...this.records.values()].some(({ mission }) =>
+      !["blocked", "ready-for-review", "cancelled"].includes(mission.status) &&
+      mission.subtasks.some(subtask => subtask.teamId === teamId && ["running", "blocked"].includes(subtask.status)));
+  }
+  /** A live mission retains integration state while it still references a source subteam. */
+  retainsSubteamRun(teamId: string) {
+    return [...this.records.values()].some(({ mission }) =>
+      !["blocked", "ready-for-review", "cancelled"].includes(mission.status) &&
+      mission.subtasks.some(subtask => subtask.teamId === teamId));
+  }
   enabled() {
     const lineup = this.config.teams?.lineup;
     return Boolean(lineup && lineup.coordinator.tier === "strong" && lineup.reviewer.tier === "strong");
@@ -353,7 +364,8 @@ export class MissionService {
     const mission = stored.mission;
     // A stopped mission with nothing left to stop or observe needs no further ticks.
     if (["blocked", "ready-for-review", "cancelled"].includes(mission.status) && !stored.ops.length && !Object.keys(stored.launches).length &&
-        (stored.attempts.at(-1)?.status ?? "stopped") === "stopped" && !mission.subtasks.some(subtask => subtask.status === "running")) return;
+        (stored.attempts.at(-1)?.status ?? "stopped") === "stopped" &&
+        !mission.subtasks.some(subtask => subtask.status === "running" || subtask.status === "cancelled" && subtask.teamId)) return;
     if ((live.has(mission.status) || mission.status === "paused") && Date.now() >= Date.parse(mission.deadlineAt)) {
       this.stop(stored, "blocked", timeLimitReason); this.event(stored, timeLimitReason); this.save(stored);
     }
@@ -361,7 +373,7 @@ export class MissionService {
     await this.applyOps(stored);
     await this.stepCoordinator(stored);
     if (this.closed) return;
-    this.refresh(stored);
+    await this.refresh(stored);
     if (live.has(mission.status)) {
       this.schedule(stored);
       await this.launchSubteams(stored);
@@ -495,19 +507,46 @@ export class MissionService {
     return latest.sort((a, b) => finished(b).localeCompare(finished(a)))[0];
   }
   /** Mirrors each subteam's status and sends the coordinator each new decision, block, or finish once. */
-  private refresh(stored: Stored) {
+  private async refresh(stored: Stored) {
     const mission = stored.mission;
     for (const subtask of mission.subtasks.filter(item => item.teamId)) {
+      const teamId = subtask.teamId!;
       let team: TeamView;
-      try { team = this.teams.get(subtask.teamId!); } catch (error) { if (notFound(error)) continue; throw error; }
+      try { team = this.teams.get(teamId); }
+      catch (error) {
+        if (!notFound(error)) throw error;
+        if (subtask.status === "cancelled" || subtask.teamStatus === "cancelled" || subtask.finalEvidence) {
+          subtask.status = "cancelled"; subtask.teamStatus = "cancelled"; delete subtask.teamId;
+          this.event(stored, "The host removed cancelled subtask " + subtask.id + "'s settled subteam record and workspace.");
+          if (live.has(mission.status))
+            this.message(stored, teamId + ":cancelled", { type: "subtask-finished", subtaskId: subtask.id, teamId, status: "cancelled", teamStatus: "cancelled",
+              ...(subtask.finalEvidence?.reason ? { reason: subtask.finalEvidence.reason } : {}),
+              retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." });
+          this.save(stored);
+        }
+        continue;
+      }
       subtask.teamStatus = team.status;
       if (!stored.ops.some(op => op.kind === "parallelism" && op.teamId === team.id)) subtask.parallelism = team.parallelism;
       const status = subtaskStatus(team.status), changed = status !== subtask.status;
       subtask.status = status;
+      if (status === "cancelled") subtask.finalEvidence = { ...(team.reason ? { reason: team.reason } : {}), ...(team.headCommit ? { headCommit: team.headCommit } : {}) };
       if (changed && status !== "running") this.event(stored, `Subtask ${subtask.id} is ${status} (subteam ${team.status}).`);
+      if (live.has(mission.status) && status !== "running")
+        this.message(stored, `${team.id}:${status === "cancelled" ? "cancelled" : `${status}:${team.revision}`}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status,
+          ...(team.reason ? { reason: team.reason } : {}),
+          ...(status === "cancelled" ? { retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." } : {}) });
+      if (status === "cancelled" && team.workspaceRemovedAt) {
+        // Persist the host-observed cancellation and its final evidence before deleting the child record.
+        this.save(stored);
+        try { await this.teams.removeRun(team.id); }
+        catch (error) { if (!notFound(error)) continue; }
+        delete subtask.teamId;
+        this.event(stored, `The host deleted cancelled subtask ${subtask.id}'s settled subteam record after its workspace was removed.`);
+        this.save(stored);
+        continue;
+      }
       if (!live.has(mission.status)) continue;
-      if (status !== "running")
-        this.message(stored, `${team.id}:${status}:${team.revision}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status, ...(team.reason ? { reason: team.reason } : {}) });
       for (const decision of team.decisions.filter(item => item.revision === team.revision && !item.answer))
         this.message(stored, `${team.id}:${decision.id}`, { type: "child-decision", subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options });
       // A permission diagnostic can finish without changing the team's phase. Wake its

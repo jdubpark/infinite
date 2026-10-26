@@ -103,19 +103,31 @@ type ResourceSnapshot = {
   memory: { totalBytes: number; availableBytes: number; availableKind: string };
   swap: { totalBytes: number | null; usedBytes: number | null };
   network: { receivedBytes: number | null; sentBytes: number | null; receiveBytesPerSecond: number | null; sendBytesPerSecond: number | null };
-  disks: { projectId: string; totalBytes: number | null; availableBytes: number | null }[];
+  disks: { projectId: string; totalBytes: number | null; availableBytes: number | null; totalInodes?: number | null; availableInodes?: number | null }[];
+  volumes?: { label: "state" | "workspaces"; path: string; totalBytes: number | null; availableBytes: number | null; totalInodes: number | null; availableInodes: number | null; fullness: number | null }[];
   sessions: { sessionId: string; pid: number | null; cpuPercent: number | null; rssBytes: number | null }[];
   unavailable: { field: string; reason: string }[];
 };
 function printResources(value: ResourceSnapshot) {
   const bytes = (n: number | null) => n === null ? "unavailable" : `${(n / 1048576).toFixed(1)} MiB`;
+  const gigabytes = (n: number | null) => n === null ? "unavailable" : `${(n / 1024 ** 3).toFixed(1)} GB`;
+  const count = (n: number | null | undefined) => n == null ? "unavailable" : n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M` : n >= 1_000 ? `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}K` : String(Math.round(n));
   const percent = (n: number | null) => n === null ? "unavailable" : `${n.toFixed(1)}%`;
   const rate = (n: number | null) => n === null ? "unavailable" : `${bytes(n)}/s`;
   console.log(`Captured ${clean(value.capturedAt)} · uptime ${(value.uptimeSeconds / 3600).toFixed(1)} h · interval ${value.sampleIntervalMs === null ? "first sample" : `${value.sampleIntervalMs} ms`}`);
   console.log(`CPU ${percent(value.cpu.usagePercent)} · ${value.cpu.logicalCount} logical CPUs · load ${value.cpu.loadAverage?.map(n => n.toFixed(2)).join(" / ") ?? "unavailable"}`);
   console.log(`Memory ${bytes(value.memory.availableBytes)} ${clean(value.memory.availableKind)} / ${bytes(value.memory.totalBytes)} total · swap ${bytes(value.swap.usedBytes)} used / ${bytes(value.swap.totalBytes)} total`);
   console.log(`Network received ${bytes(value.network.receivedBytes)} (${rate(value.network.receiveBytesPerSecond)}) · sent ${bytes(value.network.sentBytes)} (${rate(value.network.sendBytesPerSecond)})`);
-  for (const disk of value.disks) console.log(`Disk ${clean(disk.projectId)} · ${bytes(disk.availableBytes)} available / ${bytes(disk.totalBytes)} total`);
+  for (const disk of value.disks) console.log(`Disk ${clean(disk.projectId)} · ${gigabytes(disk.availableBytes)} available / ${gigabytes(disk.totalBytes)} total · ${count(disk.availableInodes)} of ${count(disk.totalInodes)} inodes free`);
+  for (const volume of value.volumes ?? []) {
+    if (volume.fullness === null || volume.totalBytes === null || volume.availableBytes === null || volume.totalInodes === null || volume.availableInodes === null) {
+      console.log(`Storage ${clean(volume.label)} · unavailable`); continue;
+    }
+    const bytesFull = volume.totalBytes > 0 ? 1 - volume.availableBytes / volume.totalBytes : 0;
+    const inodesFull = volume.totalInodes > 0 ? 1 - volume.availableInodes / volume.totalInodes : 0;
+    const scarcer = inodesFull >= bytesFull ? "inodes" : "bytes";
+    console.log(`Storage ${clean(volume.label)} · ${Math.round(volume.fullness * 100)}% full (${scarcer}) · ${count(volume.availableInodes)} inodes free · ${Math.round(volume.availableBytes / 1024 ** 3)} GB free`);
+  }
   for (const session of value.sessions) console.log(`Session ${clean(session.sessionId)} · PID ${session.pid ?? "unavailable"} · CPU ${percent(session.cpuPercent)} · RSS ${bytes(session.rssBytes)} (provider process)`);
   for (const item of value.unavailable) console.log(`Unavailable ${clean(item.field)}: ${clean(item.reason)}`);
 }

@@ -147,6 +147,21 @@ tailscale serve status
 
 Use **Serve**, not Funnel. Verify the HTTPS hostname matches `origin`. The systemd unit requires a storage mount and runtime key and deliberately does not auto-create a new key after reboot. API restart keeps workers; host reboot does not. The unit uses RAM-backed `/tmp` and `/var/tmp`, disables core dumps, and applies initial CPU, memory, and task ceilings. The sudoers policy disables command-argument logging for `infinite-host` because those arguments can contain prompts. Validate these controls on the target OS. [Tailscale Serve reference](https://tailscale.com/docs/reference/tailscale-cli/serve).
 
+## pnpm store and agent temporary files
+
+Repositories with a `pnpm-lock.yaml` or a `packageManager: pnpm@…` field install with `pnpm install --frozen-lockfile`, and check with `pnpm run check`. Other repositories keep npm. The agent wrappers export `npm_config_store_dir=/srv/infinite-data/agent-home/.pnpm-store`, so every workspace installs into one store. pnpm hardlinks identical files from that store, so the store must sit on the same filesystem as the workspaces, which is the state volume here. `COREPACK_HOME` points under the agent home for the same reason.
+
+pnpm must be a real installation on the agent `PATH`, for example `npm install -g pnpm@10` into the Node prefix the agents use. The corepack shim downloads pnpm on first use, and provider sandboxes have no network.
+
+Age out agent temporary files with the tmpfiles rule. Entries under `/srv/infinite-data/tmp/agent` older than three days are removed.
+
+```sh
+install -m 0644 deploy/ubuntu/infinite-tmpfiles.conf /etc/tmpfiles.d/infinite.conf
+systemd-tmpfiles --clean /etc/tmpfiles.d/infinite.conf
+```
+
+Wrappers installed before this change differ from the shipped `agent-wrapper.sh` before its anchor, so the installer reports them as drifted. Reinstall the wrappers by hand to pick up the store and cache exports.
+
 ## Acceptance before private work
 
 Run each authenticated provider on a disposable worktree. From cmux, use `ssh -t HOST 'sudo -H -u infinite-host /usr/local/bin/infinite attach SESSION_ID --config /etc/infinite/config.json'`. Native access uses the administrator's SSH identity and an explicit transition to `infinite-host`; a phone needs only its API key and tailnet connection.

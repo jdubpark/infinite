@@ -251,7 +251,7 @@ export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTa
     : role === "scout"
       ? `Investigate this read-only assignment: ${JSON.stringify(task)}. Find concrete evidence relevant to the goal. Identify source locations and observations; distinguish facts from hypotheses and unavailable information. Leave tracked and untracked repository files unchanged. Do not implement, commission more agents, or expand the assignment. Report {"kind":"findings","summary":"...","evidence":[{"source":"Repository path or inspected source","observation":"What was observed, including limitations"}]}.`
       : role === "implementer"
-      ? `Implement this assigned task: ${JSON.stringify(implementerTask)}. Change only its assigned paths. Your clone contains all integrated dependencies. Do not commit or push; the host will validate and commit your result. Report {"kind":"result","summary":"Explain changes, verification, and any limitations"}.`
+      ? `Implement this assigned task: ${JSON.stringify(implementerTask)}. Change only its assigned paths. Your clone contains all integrated dependencies. Use the repository's own package manager (pnpm when a pnpm-lock.yaml file or a pnpm packageManager field exists, otherwise npm); never add a second lockfile or install packages globally. Do not commit or push; the host will validate and commit your result. Report {"kind":"result","summary":"Explain changes, verification, and any limitations"}.`
       : role === "integrator"
         ? `Repair the integrated implementation using the check/review feedback below. Stay within the goal's allowedPaths when a goal is present; otherwise edit only files necessary for the objective. Do not commit or push. Report {"kind":"result","summary":"Explain repairs and verification"}.`
         : role === "delivery"
@@ -384,7 +384,7 @@ export type MissionMessage =
   | { type: "start" }
   | { type: "child-decision"; subtaskId: string; teamId: string; decisionId: string; question: string; options: string[] }
   | { type: "permission-recovery"; subtaskId: string; teamId: string; outcomeId: string; status: "complete" | "exhausted" | "interrupted"; cause: string; action: string; decision: string; consequence: string; execution: "unknown" }
-  | { type: "subtask-finished"; subtaskId: string; teamId?: string; status: "done" | "blocked" | "cancelled"; teamStatus?: string; reason?: string }
+  | { type: "subtask-finished"; subtaskId: string; teamId?: string; status: "done" | "blocked" | "cancelled"; teamStatus?: string; reason?: string; retentionNote?: string }
   | { type: "owner-answer"; decisionId: string; question: string; answer: string; forwardedTo?: { subtaskId: string; childDecisionId: string } }
   | { type: "owner-direction"; text: string }
   | { type: "repository-held"; subtaskId: string; repoProjectId: string; teamId: string; teamStatus: string; reason?: string }

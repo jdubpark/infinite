@@ -189,6 +189,34 @@ test("projects forget matches the Git root and removes local repository bindings
   } finally { await host.stop(); rmSync(localRoot, { recursive: true, force: true }); rmSync(cloudHome, { recursive: true, force: true }); }
 });
 
+test("repo init infers the package manager from the lockfile or packageManager field", { timeout: 120000 }, async () => {
+  const cases = [
+    { name: "pnpm-lock", files: { "pnpm-lock.yaml": "lockfileVersion: '9.0'\n" }, manager: "pnpm" },
+    { name: "pnpm-field", files: {}, pkg: { packageManager: "pnpm@10.0.0" }, manager: "pnpm" },
+    { name: "npm-lock", files: { "package-lock.json": "{}\n" }, manager: "npm" },
+  ];
+  for (const item of cases) {
+    const run = await teamFixture("success", mixedLineup);
+    const localRoot = mkdtempSync(join(homedir(), "infinite-cli-package-manager-"));
+    const clientFile = join(run.host.root, `${item.name}-client.json`);
+    writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+    const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
+    try {
+      const checkout = join(localRoot, "checkout");
+      mkdirSync(checkout);
+      await exec("git", ["init", "--initial-branch=main"], { cwd: checkout });
+      writeFileSync(join(checkout, "package.json"), JSON.stringify({ ...item.pkg, scripts: { check: "node -e process.exit(0)" } }));
+      for (const [name, text] of Object.entries(item.files)) writeFileSync(join(checkout, name), text);
+      await exec("git", ["-C", checkout, "add", "."]);
+      await exec("git", ["-C", checkout, "-c", "user.name=Example", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture"]);
+      const output = JSON.parse((await exec(entry[0], [...entry.slice(1), "repo", "init", checkout, "--project", "rehearsal", "--json"], { cwd: checkout })).stdout);
+      const setup = item.manager === "pnpm" ? { command: "pnpm", args: ["install", "--frozen-lockfile"] } : { command: "npm", args: ["ci"] };
+      assert.deepEqual(output.team.setup, setup, `${item.name} infers its setup command`);
+      assert.deepEqual(output.team.checks, [{ command: item.manager, args: ["run", "check"] }], `${item.name} runs its check through its package manager`);
+    } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
+  }
+});
+
 test("repo init sends, removes, and omits the teamwork setting as requested", { timeout: 120000 }, async () => {
   const run = await teamFixture("success", mixedLineup);
   const localRoot = mkdtempSync(join(homedir(), "infinite-cli-teamwork-"));

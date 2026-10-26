@@ -118,6 +118,10 @@ export interface Config {
     stallMinutes?: number;
     /** Minutes each configured verification command may run before the host stops it (default 60). */
     checkMinutes?: number;
+    /** How long finished, cancelled, reviewed and blocked runs keep their clones; see docs/teams.md "Workspace retention". */
+    retention?: import("./team-types.js").TeamRetention;
+    /** Free inodes and bytes the workspace volume must keep for a new run to start. */
+    storageFloor?: import("./team-types.js").StorageFloor;
   };
   machine?: { id: string; label: string };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
@@ -158,7 +162,7 @@ export interface Config {
     accessTokenFile?: string;
     endpoint: string;
     detail: "minimal" | "full";
-    events: ("needs-you" | "turn-finished" | "exited" | "recording-error")[];
+    events: ("needs-you" | "turn-finished" | "exited" | "recording-error" | "goal-started" | "goal-finished" | "goal-stuck" | "goal-cancelled" | "team-started" | "team-finished" | "team-stuck" | "team-cancelled" | "team-blocked" | "host-storage")[];
   };
 }
 export interface Receipt {

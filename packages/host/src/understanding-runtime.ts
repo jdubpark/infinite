@@ -202,17 +202,18 @@ export class UnderstandingRuntime {
     return next;
   }
 
-  /** Stored repository context per repository, for repositories whose recorded root still matches. */
+  /**
+   * Stored repository context per enrolled repository, read from retained state only. Work briefs use it for
+   * the map observation time; freshness against the checkout is the job of `read()`, which already marks stale maps.
+   */
   contexts(workspaceId: string): Record<string, RepoContext> {
     const contexts: Record<string, RepoContext> = {};
     try {
       const saved = this.state.workspaces[workspaceId];
       if (!saved) return contexts;
-      const group = this.group(workspaceId);
-      for (const repo of group.repos) {
+      for (const repo of this.group(workspaceId).repos) {
         const stored = saved.repositories[repo.projectId];
-        if (!stored || this.binding(repo, group).rootIdentity !== stored.rootIdentity) continue;
-        contexts[repo.projectId] = stored.context;
+        if (stored) contexts[repo.projectId] = stored.context;
       }
     } catch {
       return {};

@@ -94,7 +94,7 @@ before publishing generated comparisons. Failed attempts retain the previous
 usable source observations with failure and freshness metadata.
 
 The maintenance store has an 8 MiB encrypted budget. Legacy session briefs use
-a separate rolling store of at most 64 generations within 8 MiB. Those briefs
+a separate rolling store of at most 16 generations per repository within 8 MiB. Those briefs
 retain checkout/session provenance and generation/retention times. Mission
 coordinator briefs are withheld from that single-repository artifact store
 until complete multi-repository provenance is available; mission work remains

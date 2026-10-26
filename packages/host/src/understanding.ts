@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, type Stats } from "node:fs";
 import { isAbsolute, relative, resolve, sep, join } from "node:path";
 import { z } from "zod";
 import type { UnderstandingArtifact, UnderstandingLink, UnderstandingPlan, UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding, WorkspaceKnowledge } from "@infinite/remote";
@@ -15,7 +15,7 @@ import type { GoalService } from "./goals.js";
 import { writeSealed, unseal } from "./vault.js";
 import { CatalogError } from "./understanding-catalog.js";
 
-const MAX_GENERATIONS = 64;
+const MAX_GENERATIONS_PER_PROJECT = 16;
 const MAX_STORE_BYTES = 8 * 1024 * 1024;
 // Runtime output is capped at 1 MiB before sealing. Keep one bounded generation
 // of publication headroom so a full store can advance without deleting evidence first.
@@ -239,18 +239,26 @@ export class UnderstandingService {
         project.enrolledPath !== expected.enrolledPath || project.projectDevice !== expected.projectDevice ||
         project.projectInode !== expected.projectInode || project.repoIdentity !== expected.repoIdentity) return false;
     let cwd = expected.sourceCwd;
+    // Team member workspaces are deleted after a run. When the session record or run membership is gone,
+    // or the workspace paths no longer resolve, the matching repository binding and a recorded head suffice.
+    const retained = !!entry.artifact.head;
     if (expected.sourceKind === "team") {
-      const session = this.sources.manager.meta(entry.artifact.sessionId).session;
+      let session: Session | undefined;
+      try { session = this.sources.manager.meta(entry.artifact.sessionId).session; } catch { session = undefined; }
+      if (!session) return retained;
       if (session.team?.role === "mission-coordinator") return false;
       if (session.projectId !== expected.projectId || !session.team || session.team.runId !== expected.runId || session.team.memberId !== expected.memberId) return false;
       const owner = this.ownedTeamSession(session);
       if (!owner || owner.runId !== expected.runId || owner.memberId !== expected.memberId) return false;
       const run = this.sources.teams.understandingRecords().find(item => item.id === owner.runId);
       const member = run?.members.find(item => item.memberId === owner.memberId && item.sessionId === session.id);
-      if (!member || resolve(member.cwd) !== resolve(session.cwd)) return false;
+      if (!member) return retained;
+      if (resolve(member.cwd) !== resolve(session.cwd)) return false;
       cwd = session.cwd;
     }
-    const root = realpathSync(expected.root), sourceCwd = realpathSync(cwd), rootStat = statSync(root), cwdStat = statSync(sourceCwd);
+    let root: string, sourceCwd: string, rootStat: Stats, cwdStat: Stats;
+    try { root = realpathSync(expected.root); sourceCwd = realpathSync(cwd); rootStat = statSync(root); cwdStat = statSync(sourceCwd); }
+    catch (error) { if (expected.sourceKind === "team") return retained; throw error; }
     if (!this.inside(root, sourceCwd) || (expected.sourceKind === "project" && !this.inside(project.enrolledPath, root))) return false;
     return root === expected.root && String(rootStat.dev) === expected.rootDevice && String(rootStat.ino) === expected.rootInode &&
       sourceCwd === expected.sourceCwd && String(cwdStat.dev) === expected.sourceCwdDevice && String(cwdStat.ino) === expected.sourceCwdInode;
@@ -353,11 +361,12 @@ export class UnderstandingService {
 }
 
 function retainedGenerations(entries: Entry[], sizes: Map<string, number>): Entry[] {
-  let remaining = MAX_STORE_BYTES, count = 0;
+  let remaining = MAX_STORE_BYTES;
+  const perProject = new Map<string, number>();
   return [...entries].sort((a, b) => b.artifact.retainedAt.localeCompare(a.artifact.retainedAt) || a.artifact.id.localeCompare(b.artifact.id)).filter(entry => {
-    const size = sizes.get(entry.artifact.id) ?? Infinity;
-    if (count >= MAX_GENERATIONS || size > remaining) return false;
-    count++; remaining -= size; return true;
+    const size = sizes.get(entry.artifact.id) ?? Infinity, count = perProject.get(entry.artifact.sourceProjectId) ?? 0;
+    if (count >= MAX_GENERATIONS_PER_PROJECT || size > remaining) return false;
+    perProject.set(entry.artifact.sourceProjectId, count + 1); remaining -= size; return true;
   });
 }
 

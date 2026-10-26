@@ -400,6 +400,78 @@ test("work scope uses pinned membership, folds alternate checkouts, and omits ma
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });
 
+function teamFixture(temp: string) {
+  const repo = join(temp, "repo"); mkdirSync(repo); initializeRepo(repo);
+  const project = { id: "repo", name: "Repo", path: repo };
+  const root = realpathSync(repo), stat = statSync(root), runId = randomUUID(), memberId = randomUUID();
+  const identity = `root:${execFileSync("git", ["-C", repo, "rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim()}`;
+  const key = Buffer.alloc(32, 1), stateDir = join(temp, "state"), artifactDir = join(stateDir, "understanding", "artifacts");
+  mkdirSync(artifactDir, { recursive: true });
+  const member = join(temp, "member"); mkdirSync(member);
+  const memberReal = realpathSync(member), memberStat = statSync(memberReal);
+  const binding = { projectId: "repo", sourceKind: "team", enrolledPath: root, root: memberReal, sourceCwd: memberReal, projectDevice: String(stat.dev), projectInode: String(stat.ino),
+    rootDevice: String(memberStat.dev), rootInode: String(memberStat.ino), sourceCwdDevice: String(memberStat.dev), sourceCwdInode: String(memberStat.ino),
+    repoIdentity: createHash("sha256").update(JSON.stringify(identity)).digest("hex"), runId, memberId };
+  const seal = (summary: string, extra: { head?: string | null; binding?: object } = {}) => {
+    const id = randomUUID(), sessionId = randomUUID();
+    const artifact = { id, sourceProjectId: "repo", sessionId, sourceKind: "team", head: "head" in extra ? extra.head : "a".repeat(40), base: null, fingerprint: "b".repeat(40), generatedAt: "2026-10-21T00:00:00.000Z", retainedAt: "2026-10-21T00:00:00.000Z", coverage: [], brief: { summary, architecture: [], changes: [], checks: [], review: [], guidance: [], unknowns: [] }, evidence: [] };
+    writeSealed(join(artifactDir, `${id}.sealed`), key, "understanding-artifact", { binding: { ...binding, ...extra.binding }, artifact });
+    return sessionId;
+  };
+  const group: any = { id: "repo", name: "Repo", kind: "implicit", hidden: false, implicit: true, revision: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", repos: [{ projectId: "repo", name: "Repo", path: root, key: identity, checkouts: [{ projectId: "repo", name: "Repo", path: root, primary: true, teamReady: true }] }] };
+  const service = (manager: object, runs: object[] = []) => new UnderstandingService({ config: { stateDir, projects: [project] } as never, key, manager: manager as never,
+    groups: { list: () => ({ groups: [group], suggestions: [] }), get: () => group }, missions: { understandingRecords: () => [], understandingOwnsSession: () => false } as never,
+    teams: { understandingRecords: () => runs, understandingOwnsSession: () => false } as never, goals: { understandingRecords: () => [] } as never });
+  return { member, seal, service, artifactDir, key, binding };
+}
+
+test("team briefs stay visible after their session and member workspace are removed, unless the repository binding changed", () => {
+  const temp = mkdtempSync("/tmp/inf-understanding-team-cleanup-");
+  try {
+    const fixture = teamFixture(temp);
+    fixture.seal("Kept after cleanup");
+    fixture.seal("No recorded head", { head: null });
+    fixture.seal("Other repository", { binding: { repoIdentity: "f".repeat(64) } });
+    fixture.seal("Other checkout", { binding: { projectInode: "1" } });
+    rmSync(fixture.member, { recursive: true, force: true });
+    const service = fixture.service({ meta: () => { throw new Error("unknown session"); } });
+    assert.deepEqual(service.get("repo").repositories[0]!.current.map(item => item.brief.summary), ["Kept after cleanup"]);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("a team brief whose session is still available keeps the ownership check after cleanup", () => {
+  const temp = mkdtempSync("/tmp/inf-understanding-team-owned-");
+  try {
+    const fixture = teamFixture(temp);
+    const sessionId = fixture.seal("Needs ownership");
+    rmSync(fixture.member, { recursive: true, force: true });
+    const session = { id: sessionId, projectId: "repo", cwd: fixture.member, team: { runId: fixture.binding.runId, memberId: fixture.binding.memberId, revision: 1, role: "implementer" } };
+    const service = fixture.service({ meta: () => ({ session }) }, [{ id: fixture.binding.runId, members: [{ memberId: fixture.binding.memberId, sessionId, cwd: fixture.member }] }]);
+    assert.deepEqual(service.get("repo").repositories[0]!.current, [], "the host does not own this session as part of the run");
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("retention keeps the newest sixteen generations per repository instead of a global cap", () => {
+  const temp = mkdtempSync("/tmp/inf-understanding-retention-");
+  try {
+    const key = Buffer.alloc(32, 1), stateDir = join(temp, "state"), artifactDir = join(stateDir, "understanding", "artifacts");
+    mkdirSync(artifactDir, { recursive: true });
+    const binding = (projectId: string) => ({ projectId, sourceKind: "project", enrolledPath: temp, root: temp, sourceCwd: temp, projectDevice: "1", projectInode: "1", rootDevice: "1", rootInode: "1", sourceCwdDevice: "1", sourceCwdInode: "1", repoIdentity: "c".repeat(64) });
+    const seal = (projectId: string, index: number) => {
+      const id = randomUUID(), at = new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString();
+      const artifact = { id, sourceProjectId: projectId, sessionId: randomUUID(), sourceKind: "project", head: "a".repeat(40), base: null, fingerprint: "b".repeat(40), generatedAt: at, retainedAt: at, coverage: [], brief: { summary: `${projectId} ${index}`, architecture: [], changes: [], checks: [], review: [], guidance: [], unknowns: [] }, evidence: [] };
+      writeSealed(join(artifactDir, `${id}.sealed`), key, "understanding-artifact", { binding: binding(projectId), artifact });
+    };
+    for (let index = 0; index < 20; index++) seal("repo-a", index);
+    for (let index = 0; index < 5; index++) seal("repo-b", index);
+    const service = new UnderstandingService({ config: { stateDir, projects: [] } as never, key, manager: {} as never, groups: {} as never, missions: {} as never, teams: {} as never, goals: {} as never });
+    const kept = (service as any).state.generations.map((entry: any) => entry.artifact.brief.summary as string);
+    assert.equal(kept.filter((summary: string) => summary.startsWith("repo-a ")).length, 16);
+    assert.ok(!kept.includes("repo-a 3") && kept.includes("repo-a 4"), "the oldest generations of the busy repository are the ones dropped");
+    assert.equal(kept.filter((summary: string) => summary.startsWith("repo-b ")).length, 5);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
 test("retained team sources require ownership, bounded validation, and exclude mission coordinators", async t => {
   const temp = mkdtempSync("/tmp/inf-understanding-team-binding-");
   try {
@@ -411,7 +483,7 @@ test("retained team sources require ownership, bounded validation, and exclude m
     const binding = { projectId: "repo", sourceKind: "team", enrolledPath: root, root, sourceCwd: root, projectDevice: String(stat.dev), projectInode: String(stat.ino), rootDevice: String(stat.dev), rootInode: String(stat.ino), sourceCwdDevice: String(stat.dev), sourceCwdInode: String(stat.ino), repoIdentity: createHash("sha256").update(JSON.stringify(`root:${execFileSync("git", ["-C", repo, "rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim()}`)).digest("hex"), runId, memberId };
     mkdirSync(artifactDir, { recursive: true });
     writeSealed(join(artifactDir, `${artifactId}.sealed`), key, "understanding-artifact", { binding, artifact });
-    for (let index = 1; index < 64; index++) {
+    for (let index = 1; index < 20; index++) {
       const id = randomUUID();
       writeSealed(join(artifactDir, `${id}.sealed`), key, "understanding-artifact", { binding, artifact: { ...artifact, id } });
     }
@@ -433,13 +505,13 @@ test("retained team sources require ownership, bounded validation, and exclude m
       let value: WorkspaceUnderstanding;
       try { value = service.get("repo"); }
       finally { if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT; else process.env.GIT_TRACE2_EVENT = previousTrace; }
-      assert.equal(value.repositories[0].current.length, 64);
+      assert.equal(value.repositories[0].current.length, 16);
       assert.equal(groupReads, 1, "retained generations use one workspace membership snapshot");
       assert.ok(readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(event => event.event === "start").length <= 2, "Git subprocess work depends on checkout count, not generation count");
       execFileSync("git", ["-C", repo, "config", "remote.origin.url", "https://example.invalid/rebound.git"]);
       assert.deepEqual(service.get("repo").repositories[0].current, [], "a later read must notice changed Git identity");
       execFileSync("git", ["-C", repo, "config", "--unset", "remote.origin.url"]);
-      assert.equal(service.get("repo").repositories[0].current.length, 64);
+      assert.equal(service.get("repo").repositories[0].current.length, 16);
     });
     await t.test("a generated team snapshot is withheld after ownership or cwd changes", async () => {
       const summary = await briefings.summarize(session, "0");
@@ -453,7 +525,7 @@ test("retained team sources require ownership, bounded validation, and exclude m
       session.cwd = memberCwd;
       assert.equal(service.get("repo").repositories[0].current.length, 0, "moving both live and recorded cwd cannot reuse the old artifact binding");
       memberCwd = root; session.cwd = root;
-      assert.equal(service.get("repo").repositories[0].current.length, 64);
+      assert.equal(service.get("repo").repositories[0].current.length, 16);
     });
     session.team.role = "mission-coordinator";
     await t.test("previously retained mission-coordinator content is withheld", () => {
@@ -462,7 +534,7 @@ test("retained team sources require ownership, bounded validation, and exclude m
     await t.test("the runtime refuses to retain a new mission-coordinator brief", async () => {
       session.id = randomUUID();
       await assert.rejects(briefings.summarize(session, "0"));
-      assert.equal(readdirSync(artifactDir).filter(file => file.endsWith(".sealed")).length, 64);
+      assert.equal(readdirSync(artifactDir).filter(file => file.endsWith(".sealed")).length, 16);
     });
     await briefings.close();
   } finally { rmSync(temp, { recursive: true, force: true }); }

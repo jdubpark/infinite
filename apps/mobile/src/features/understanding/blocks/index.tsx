@@ -1,5 +1,7 @@
-import { Text, View } from "react-native";
-import type { WorkBlock } from "@infinite/remote";
+import { View } from "react-native";
+import type { Basis, WorkBlock } from "@infinite/remote";
+import { DiagramView } from "../diagram/DiagramView";
+import { BasisLabel } from "./BasisLabel";
 import { Checks } from "./Checks";
 import { Citations } from "./Citations";
 import { Components } from "./Components";
@@ -14,8 +16,28 @@ import { styles } from "./styles";
 
 export { RichText } from "./RichText";
 
+/** Basis for block kinds that carry no basis of their own. Kinds with per-item bases label each item instead. */
+const IMPLIED_BASIS: Partial<Record<WorkBlock["kind"], Basis>> = {
+  components: "source",
+  tasks: "agent",
+  checks: "host",
+  decisions: "host",
+  questions: "model",
+  citations: "model",
+};
+
 /** Renders one block of a work brief. Each block shows its own basis labels. */
 export function BlockView({ block, onOpenComponent, onOpenWork }: { block: WorkBlock; onOpenComponent?: (componentId: string) => void; onOpenWork?: (workId: string) => void }) {
+  const implied = IMPLIED_BASIS[block.kind];
+  const view = renderBlock(block, onOpenComponent, onOpenWork);
+  if (!implied) return view;
+  return <View style={styles.stack}>
+    <BasisLabel basis={implied} />
+    {view}
+  </View>;
+}
+
+function renderBlock(block: WorkBlock, onOpenComponent?: (componentId: string) => void, onOpenWork?: (workId: string) => void) {
   switch (block.kind) {
     case "facts":
       return <Facts items={block.items} />;
@@ -24,10 +46,9 @@ export function BlockView({ block, onOpenComponent, onOpenWork }: { block: WorkB
     case "components":
       return <Components items={block.items} onOpenComponent={onOpenComponent} />;
     case "diagram":
-      // Placeholder until the diagram view is wired into work briefs.
-      return <View style={styles.card}>
-        <Text style={styles.title}>{block.diagram.title}</Text>
-        <Text style={styles.meta}>{`${block.diagram.nodes.length} nodes · ${block.diagram.edges.length} relationships`}</Text>
+      return <View style={styles.stack}>
+        <BasisLabel basis={block.diagram.basis} />
+        <DiagramView diagram={block.diagram} onOpenComponent={onOpenComponent} />
       </View>;
     case "tasks":
       return <Tasks items={block.items} onOpenWork={onOpenWork} />;

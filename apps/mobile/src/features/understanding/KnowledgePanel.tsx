@@ -25,7 +25,7 @@ const areas: SegmentOption<Area>[] = [
 ];
 
 /** Catalog editing and live component knowledge for the selected workspace. */
-export function KnowledgePanel({ connection, workspaceId, knowledge, readGeneration, defaultArea, repositories, work, offline, onComponentNavigate }: { connection: Connection; workspaceId: string; knowledge?: WorkspaceKnowledge; readGeneration: string; defaultArea: Area; repositories: UnderstandingRepository[]; work: UnderstandingWork[]; offline: boolean; onComponentNavigate?: () => void }) {
+export function KnowledgePanel({ connection, workspaceId, knowledge, readGeneration, defaultArea, repositories, work, offline, onComponentNavigate, initialComponent }: { connection: Connection; workspaceId: string; knowledge?: WorkspaceKnowledge; readGeneration: string; defaultArea: Area; repositories: UnderstandingRepository[]; work: UnderstandingWork[]; offline: boolean; onComponentNavigate?: () => void; initialComponent?: string }) {
   const router = useRouter();
   const [area, setArea] = useState<Area>(defaultArea);
   const [catalog, setCatalog] = useState<KnowledgeCatalog | null>(knowledge?.catalog ?? null);
@@ -184,6 +184,13 @@ export function KnowledgePanel({ connection, workspaceId, knowledge, readGenerat
     pendingComponentNavigation.current = id && (id !== selectedComponent || area !== "components") ? id : null;
     setSelectedComponent(id); setArea("components"); onComponentNavigate?.();
   };
+  // A `component` route param selects one component once, when the panel mounts.
+  const appliedInitial = useRef(false);
+  useEffect(() => {
+    if (appliedInitial.current || !initialComponent) return;
+    appliedInitial.current = true;
+    navigateComponent(initialComponent);
+  });
   const componentDetailDidLayout = (id: string) => {
     if (pendingComponentNavigation.current !== id) return;
     pendingComponentNavigation.current = null;

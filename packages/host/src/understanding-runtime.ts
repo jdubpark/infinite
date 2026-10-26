@@ -88,7 +88,7 @@ type StoredRepository = {
   context: RepoContext; components: KnowledgeComponent[]; relationships: KnowledgeRelationship[]; delivery: KnowledgeDelivery;
   synthesisCoverage: string[]; completedPlanRevisions: Record<string, string>; history: Record<string, { snapshotId: string; at: string; summary: string }[]>;
   completedSourceFingerprints: Record<string, string>;
-  brief: StoredBrief | null; briefFingerprint: string | null; briefFailure: string | null; previousHead: string | null; componentDiagram: DiagramGraph | null;
+  brief: StoredBrief | null; briefFingerprint: string | null; briefFailure: string | null; componentDiagram: DiagramGraph | null;
 };
 type StoredBrief = Omit<KnowledgeRepositoryBrief, "state" | "repositoryId">;
 type RuntimeState = {
@@ -138,7 +138,7 @@ const storedRepositorySchema = z.object({
   repositoryKey: z.string().min(1).max(500), repositoryIds: z.array(z.string()).max(64), rootIdentity: z.string().regex(/^[a-f0-9]{64}$/), observedAt: z.string().datetime({ offset: true }), fingerprint: z.string().regex(/^[a-f0-9]{64}$/), head: z.string().nullable(),
   context: repoContextSchema, components: z.array(knowledgeComponentStateSchema).max(MAX_COMPONENTS), relationships: z.array(relationshipSchema).max(MAX_EDGES), delivery: deliverySchema,
   synthesisCoverage: z.array(z.string().max(1000)).max(100), completedPlanRevisions: record, completedSourceFingerprints: record, history: z.record(z.string(), z.array(z.object({ snapshotId: z.string(), at: z.string().datetime({ offset: true }), summary: z.string().max(4000) }).strict()).max(MAX_HISTORY)),
-  brief: storedBriefSchema.nullable().default(null), briefFingerprint: z.string().nullable().default(null), briefFailure: z.string().max(400).nullable().default(null), previousHead: z.string().nullable().default(null), componentDiagram: diagramGraphSchema.nullable().default(null),
+  brief: storedBriefSchema.nullable().default(null), briefFingerprint: z.string().nullable().default(null), briefFailure: z.string().max(400).nullable().default(null), componentDiagram: diagramGraphSchema.nullable().default(null),
 }).strict().superRefine((value, context) => {
   for (const [key, revision] of Object.entries(value.completedPlanRevisions)) if (typeof revision !== "string") context.addIssue({ code: "custom", path: ["completedPlanRevisions", key], message: "invalid plan watermark" });
   for (const [key, fingerprint] of Object.entries(value.completedSourceFingerprints)) if (typeof fingerprint !== "string") context.addIssue({ code: "custom", path: ["completedSourceFingerprints", key], message: "invalid source watermark" });
@@ -375,7 +375,7 @@ export class UnderstandingRuntime {
         hookedRepos.add(binding.repo.projectId);
         try {
           if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-before-brief");
-          const result = await this.invoke(binding.root, options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.previousHead, components: components.map(({ id, name }) => ({ id, name })) }, options));
+          const result = await this.invoke(binding.root, options => this.adapter.brief!({ workspaceId, root: binding.root, repositoryId: binding.repo.projectId, context: observation.context, base: observation.brief?.head ?? null, components: components.map(({ id, name }) => ({ id, name })) }, options));
           if (!this.boundStillCurrent(workspaceId, groupAtStart, binding)) throw new Error("source-rebound-after-brief");
           const observedAt = new Date().toISOString();
           const stored = storedBriefSchema.parse({
@@ -521,7 +521,7 @@ export class UnderstandingRuntime {
     const history: StoredRepository["history"] = { ...(old?.history ?? {}) };
     if (old && old.fingerprint !== fingerprint) for (const component of old.components) history[component.id] = [...(history[component.id] ?? []), { snapshotId: old.fingerprint, at: old.observedAt, summary: component.current.summary }].slice(-MAX_HISTORY);
     return { repositoryKey: key, repositoryIds: binding.projects, rootIdentity: binding.rootIdentity, observedAt: source.observedAt, fingerprint, head: parsed.head, context: parsed, components, relationships, delivery, synthesisCoverage: old?.synthesisCoverage ?? [], completedPlanRevisions: old?.completedPlanRevisions ?? {}, completedSourceFingerprints: old?.completedSourceFingerprints ?? {}, history,
-      brief: old?.brief ?? null, briefFingerprint: old?.briefFingerprint ?? null, briefFailure: old?.briefFailure ?? null, previousHead: old && old.fingerprint !== fingerprint ? old.head : old?.previousHead ?? null,
+      brief: old?.brief ?? null, briefFingerprint: old?.briefFingerprint ?? null, briefFailure: old?.briefFailure ?? null,
       componentDiagram: componentGraph({ repositoryId: binding.repo.projectId, head: parsed.head, observedAt: source.observedAt, components, relationships }) };
   }
 

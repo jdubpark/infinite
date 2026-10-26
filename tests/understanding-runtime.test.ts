@@ -508,10 +508,22 @@ test("maintenance publishes a repository brief with parsed diagrams, a component
   assert.equal(first.diagrams![0].nodes.length, 2);
   await waitUntil(() => s.runtime.read("workspace").maintenance.state === "idle");
   const head = execFileSync("git", ["-C", s.root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  writeFileSync(join(s.root, "src", "a.ts"), "export const a = 10;\n");
-  execFileSync("git", ["-C", s.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "change"]);
+  const commit = (value: number) => {
+    writeFileSync(join(s.root, "src", "a.ts"), `export const a = ${value};\n`);
+    execFileSync("git", ["-C", s.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "change"]);
+  };
+  // A failed brief must not advance the watermark: the next brief spans the skipped range.
+  commit(10);
+  process.env.UNDERSTANDING_FIXTURE_BRIEF_FAIL = "1";
+  t.after(() => { delete process.env.UNDERSTANDING_FIXTURE_BRIEF_FAIL; });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").maintenance.state === "failed");
+  assert.equal(s.runtime.read("workspace").briefs![0].state, "stale");
+  commit(11);
+  delete process.env.UNDERSTANDING_FIXTURE_BRIEF_FAIL;
   s.runtime.refresh("workspace");
   await waitUntil(() => s.runtime.read("workspace").briefs?.[0]?.base === head);
+  assert.equal(s.runtime.read("workspace").briefs![0].state, "ready");
   assert.match(s.runtime.read("workspace").briefs![0].brief.changes[0].text, /^Changed since/);
 });
 

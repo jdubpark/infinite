@@ -8,7 +8,7 @@ const mode = args[0];
 const subcommand = args.find(arg => arg === "context" || arg === "brief");
 const repo = args[args.indexOf("--repo") + 1];
 if (!repo) process.exit(2);
-if (subcommand === "brief" && mode === "brief-fail") process.exit(1);
+if (subcommand === "brief" && (mode === "brief-fail" || process.env.UNDERSTANDING_FIXTURE_BRIEF_FAIL)) process.exit(1);
 const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 const files = {
   "src/a.ts": { hash: "a".repeat(40), lines: 3 },

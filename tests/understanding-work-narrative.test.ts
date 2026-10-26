@@ -31,13 +31,16 @@ function setup(t: { after(fn: () => void): void }, options: { configured?: boole
   const priorCalls = process.env.WORK_BRIEF_CALLS;
   const priorFail = process.env.WORK_BRIEF_FAIL;
   const priorBadDiagramCitation = process.env.WORK_BRIEF_BAD_DIAGRAM_CITATION;
+  const priorWrongBase = process.env.WORK_BRIEF_WRONG_BASE;
   process.env.WORK_BRIEF_CALLS = callFile;
   delete process.env.WORK_BRIEF_FAIL;
   delete process.env.WORK_BRIEF_BAD_DIAGRAM_CITATION;
+  delete process.env.WORK_BRIEF_WRONG_BASE;
   t.after(() => {
     if (priorCalls === undefined) delete process.env.WORK_BRIEF_CALLS; else process.env.WORK_BRIEF_CALLS = priorCalls;
     if (priorFail === undefined) delete process.env.WORK_BRIEF_FAIL; else process.env.WORK_BRIEF_FAIL = priorFail;
     if (priorBadDiagramCitation === undefined) delete process.env.WORK_BRIEF_BAD_DIAGRAM_CITATION; else process.env.WORK_BRIEF_BAD_DIAGRAM_CITATION = priorBadDiagramCitation;
+    if (priorWrongBase === undefined) delete process.env.WORK_BRIEF_WRONG_BASE; else process.env.WORK_BRIEF_WRONG_BASE = priorWrongBase;
     rmSync(directory, { recursive: true, force: true });
   });
   const key = Buffer.alloc(32, 7);
@@ -61,6 +64,13 @@ function setup(t: { after(fn: () => void): void }, options: { configured?: boole
     catch { return []; }
   };
   return { directory, root, stateDir, key, config, run, store, calls, baseCommit, headCommit };
+}
+
+function explanation() {
+  return {
+    brief: { summary: "Recorded work summary.", architecture: [], changes: [], checks: [], review: [], guidance: [], unknowns: [], diagrams: [] },
+    diagrams: [], engine: "fixture", model: "fixture", generatedAt: new Date().toISOString(), coverage: [],
+  };
 }
 
 async function waitFor<T>(read: () => T | null, timeout = 5000): Promise<T> {
@@ -120,6 +130,74 @@ test("owner refresh runs context and brief once, then returns the cached narrati
   await store.close();
 });
 
+test("owner refresh refuses a dirty workspace even when HEAD is unchanged", async t => {
+  const f = setup(t);
+  let writerCalls = 0;
+  const store = new WorkNarrativeStore({
+    config: f.config, key: f.key,
+    adapter: { explainWork: async () => { writerCalls++; return explanation(); } },
+    teams: { understandingRecords: () => [f.run], pendingOperation: () => false },
+  });
+  writeFileSync(join(f.root, "src/a.ts"), "uncommitted edit\n");
+  assert.equal(execFileSync("git", ["-C", f.root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), f.headCommit);
+
+  const result = store.refresh("workspace-1", `team:${f.run.id}`, f.run, "owner");
+  assert.equal(result.queued, false);
+  assert.equal(result.narrative.state, "unavailable");
+  assert.match(result.narrative.reason, /dirty|uncommitted|clean/i);
+  await Promise.resolve();
+  assert.equal(writerCalls, 0);
+  await store.close();
+});
+
+test("a workspace dirtied during writing is not stored", async t => {
+  const f = setup(t);
+  let writerCalls = 0;
+  const store = new WorkNarrativeStore({
+    config: f.config, key: f.key,
+    adapter: { explainWork: async () => {
+      writerCalls++;
+      writeFileSync(join(f.root, "src/a.ts"), "changed while writing\n");
+      return explanation();
+    } },
+    teams: { understandingRecords: () => [f.run], pendingOperation: () => false },
+  });
+  assert.equal(store.refresh("workspace-1", `team:${f.run.id}`, f.run, "owner").queued, true);
+  const status = await waitFor(() => {
+    const value = store.status("workspace-1", `team:${f.run.id}`, f.run);
+    return value.state === "pending" ? null : value;
+  });
+  assert.equal(writerCalls, 1);
+  assert.equal(store.read("workspace-1", `team:${f.run.id}`), null);
+  assert.equal(status.state, "unavailable");
+  await store.close();
+});
+
+test("the synchronous workspace gate contains the Git owner test override", async t => {
+  const f = setup(t);
+  let writerOverride: string | null = null;
+  const store = new WorkNarrativeStore({
+    config: f.config, key: f.key,
+    adapter: { explainWork: async () => { writerOverride = process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER ?? null; return explanation(); } },
+    teams: { understandingRecords: () => [f.run], pendingOperation: () => false },
+  });
+  const priorOverride = process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER;
+  process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = "1";
+  let result: ReturnType<typeof store.refresh> | null = null;
+  try {
+    result = store.refresh("workspace-1", `team:${f.run.id}`, f.run, "owner");
+  } finally {
+    if (priorOverride === undefined) delete process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER;
+    else process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = priorOverride;
+  }
+
+  assert.ok(result);
+  assert.equal(result.queued, true);
+  await waitFor(() => store.read("workspace-1", `team:${f.run.id}`));
+  assert.equal(writerOverride, null);
+  await store.close();
+});
+
 test("status reads do not launch Git or writer processes", async t => {
   const f = setup(t), store = f.store();
   const shimDirectory = join(f.directory, "bin");
@@ -146,13 +224,86 @@ test("status reads do not launch Git or writer processes", async t => {
   await store.close();
 });
 
-test("diagram citations outside the collected source are omitted", async t => {
+test("invalid diagram citations are omitted with stored coverage disclosure", async t => {
   const f = setup(t), store = f.store();
   process.env.WORK_BRIEF_BAD_DIAGRAM_CITATION = "1";
   store.refresh("workspace-1", `team:${f.run.id}`, f.run, "owner");
   const record = await waitFor(() => store.read("workspace-1", `team:${f.run.id}`));
   assert.deepEqual(record.diagrams[0]!.citations, []);
+  const stored = record as typeof record & { coverage: unknown };
+  assert.ok(Array.isArray(stored.coverage), "stored narrative coverage is available");
+  assert.ok(stored.coverage.some(item => typeof item === "string" && /Omitted 1 claim, citation, or evidence item/.test(item)), "invalid evidence is disclosed by brief validation");
+  assert.ok(stored.coverage.some(item => typeof item === "string" && /diagram.*citation.*(omit|drop)|(?:omit|drop).*diagram.*citation/i.test(item)), "the dropped diagram citation is disclosed");
   await store.close();
+  const reopened = f.store();
+  assert.deepEqual(reopened.read("workspace-1", `team:${f.run.id}`)?.coverage, stored.coverage);
+  await reopened.close();
+});
+
+test("a brief with the wrong base fails without storing a record", async t => {
+  const f = setup(t), store = f.store();
+  process.env.WORK_BRIEF_WRONG_BASE = "1";
+  const result = store.refresh("workspace-1", `team:${f.run.id}`, f.run, "owner");
+  assert.equal(result.queued, true);
+  const status = await waitFor(() => {
+    const value = store.status("workspace-1", `team:${f.run.id}`, f.run);
+    return value.state === "pending" ? null : value;
+  });
+  assert.equal(status.state, "failed");
+  assert.equal(store.read("workspace-1", `team:${f.run.id}`), null);
+  await store.close();
+});
+
+test("closing aborts the active writer, skips queued writers, and resolves promptly", async t => {
+  const f = setup(t);
+  const first = structuredClone(f.run);
+  const second = { ...structuredClone(f.run), id: "run-2" };
+  const records = [first, second];
+  let markStarted!: () => void;
+  const started = new Promise<void>(resolve => { markStarted = resolve; });
+  let calls = 0;
+  let firstAborted = false;
+  let releaseFirst!: () => void;
+  const store = new WorkNarrativeStore({
+    config: f.config, key: f.key,
+    adapter: { explainWork: async (_input, { signal }) => {
+      calls++;
+      if (calls !== 1) return explanation();
+      markStarted();
+      return await new Promise((resolve, reject) => {
+        const onAbort = () => { firstAborted = true; reject(new Error("writer aborted")); };
+        signal.addEventListener("abort", onAbort, { once: true });
+        releaseFirst = () => { signal.removeEventListener("abort", onAbort); resolve(explanation()); };
+      });
+    } },
+    teams: { understandingRecords: () => records, pendingOperation: () => false },
+  });
+  assert.equal(store.refresh("workspace-1", `team:${first.id}`, first, "owner").queued, true);
+  await started;
+  assert.equal(store.refresh("workspace-1", `team:${second.id}`, second, "owner").queued, true);
+
+  const close = store.close();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const prompt = await Promise.race([
+    close.then(() => true),
+    new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 1000); }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (!prompt) {
+    releaseFirst();
+    await close;
+  }
+  assert.deepEqual({
+    resolvedPromptly: prompt,
+    activeWriterAborted: firstAborted,
+    writerCalls: calls,
+    secondRecord: store.read("workspace-1", `team:${second.id}`),
+  }, {
+    resolvedPromptly: true,
+    activeWriterAborted: true,
+    writerCalls: 1,
+    secondRecord: null,
+  });
 });
 
 test("active runs, host operations and moved workspace heads cannot be narrated", async t => {
@@ -199,7 +350,7 @@ test("queued jobs recheck pending operations before invoking the writer", async 
       if (calls === 1) { markStarted(); await firstGate; }
       return {
         brief: { summary: "Recorded work summary.", architecture: [], changes: [], checks: [], review: [], guidance: [], unknowns: [], diagrams: [] },
-        diagrams: [], engine: "fixture", model: "fixture", generatedAt: new Date().toISOString(),
+        diagrams: [], engine: "fixture", model: "fixture", generatedAt: new Date().toISOString(), coverage: [],
       };
     },
   };
@@ -209,6 +360,7 @@ test("queued jobs recheck pending operations before invoking the writer", async 
   assert.equal(store.refresh("workspace-1", `team:${second.id}`, second, "owner").queued, true);
   pendingRunId = second.id;
   releaseFirst();
+  await waitFor(() => store.status("workspace-1", `team:${second.id}`, second).state === "unavailable" ? true : null);
   await store.close();
   assert.equal(calls, 1);
   assert.equal(store.read("workspace-1", `team:${second.id}`), null);

@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { UnderstandingBrief, WorkNarrativeStatus } from "@infinite/remote";
 import type { UnderstandingAdapter, UnderstandingAdapterOptions } from "./understanding-runtime.js";
+import { readGit } from "./checkout-identity.js";
 import type { TeamRun } from "./team-types.js";
 import type { Config } from "./types.js";
 import type { TeamService } from "./teams.js";
@@ -93,6 +93,7 @@ export class WorkNarrativeStore {
   private readonly directory: string;
   private readonly states = new Map<string, StoredNarratives>();
   private readonly pending = new Map<string, { requestedAt: string; key: string }>();
+  private readonly activeControllers = new Set<AbortController>();
   private chain: Promise<void> = Promise.resolve();
   private closed = false;
 
@@ -161,6 +162,7 @@ export class WorkNarrativeStore {
 
   async close(): Promise<void> {
     this.closed = true;
+    for (const controller of this.activeControllers) controller.abort();
     await this.chain;
   }
 
@@ -170,16 +172,22 @@ export class WorkNarrativeStore {
     if (!settledStatuses.has(run.status)) return unavailable("The run is still active; its narrative is available once it settles.");
     if (this.options.teams.pendingOperation(run.id)) return unavailable("A host operation is still pending for this run.");
     if (!run.workspace || !existsSync(run.workspace)) return unavailable("The recorded revision is no longer checked out on this host.");
-    try {
-      const head = execFileSync("git", ["-C", run.workspace, "rev-parse", "HEAD"], { encoding: "utf8", timeout: 2000, maxBuffer: 4096 }).trim();
-      if (!run.headCommit || head !== run.headCommit) return unavailable("The recorded revision is no longer checked out on this host.");
-    } catch { return unavailable("The recorded revision is no longer checked out on this host."); }
+    const head = readGit(run.workspace, ["rev-parse", "HEAD"]);
+    if (!run.headCommit || head !== run.headCommit) return unavailable("The recorded revision is no longer checked out on this host.");
+    const status = readGit(run.workspace, ["status", "--porcelain"]);
+    if (status === undefined) return unavailable("The recorded revision is no longer checked out on this host.");
+    if (status) return unavailable("The workspace has uncommitted changes; its narrative is unavailable until the working tree is clean.");
     return null;
   }
 
   private async generate(workspaceId: string, workId: string, expectedKey: string, requestedAt: string) {
     const jobKey = `${workspaceId}/${workId}`;
+    if (this.closed) {
+      if (this.pending.get(jobKey)?.requestedAt === requestedAt) this.pending.delete(jobKey);
+      return;
+    }
     const controller = new AbortController();
+    this.activeControllers.add(controller);
     const timeoutMs = this.options.config.repositoryBriefings?.timeoutMs ?? 30_000;
     const timeout = setTimeout(() => controller.abort(), timeoutMs + 1000);
     timeout.unref();
@@ -189,9 +197,10 @@ export class WorkNarrativeStore {
     try {
       const run = currentRun();
       if (!run || !currentJob() || narrativeKey(workId, run.baseCommit ?? null, run.headCommit ?? null) !== expectedKey || this.gate(workspaceId, workId, run)) return;
+      if (this.closed) return;
       const result = await this.options.adapter.explainWork!({ root: run.workspace, baseCommit: run.baseCommit, question: workQuestion(run) }, adapterOptions);
       const latest = currentRun();
-      if (!latest || !currentJob() || narrativeKey(workId, latest.baseCommit ?? null, latest.headCommit ?? null) !== expectedKey || latest.workspace !== run.workspace || this.gate(workspaceId, workId, latest)) return;
+      if (this.closed || !latest || !currentJob() || narrativeKey(workId, latest.baseCommit ?? null, latest.headCommit ?? null) !== expectedKey || latest.workspace !== run.workspace || this.gate(workspaceId, workId, latest)) return;
       const state = this.state(workspaceId);
       const record: NarrativeRecord = {
         key: expectedKey,
@@ -202,6 +211,7 @@ export class WorkNarrativeStore {
         model: result.model,
         brief: result.brief,
         diagrams: result.diagrams,
+        ...(result.coverage?.length ? { coverage: result.coverage } : {}),
       };
       state.records[workId] = record;
       delete state.failures[workId];
@@ -209,7 +219,7 @@ export class WorkNarrativeStore {
       this.persist(workspaceId, state);
     } catch (error) {
       const latest = currentRun();
-      if (latest && currentJob() && narrativeKey(workId, latest.baseCommit ?? null, latest.headCommit ?? null) === expectedKey && !this.gate(workspaceId, workId, latest)) {
+      if (!this.closed && latest && currentJob() && narrativeKey(workId, latest.baseCommit ?? null, latest.headCommit ?? null) === expectedKey && !this.gate(workspaceId, workId, latest)) {
         const state = this.state(workspaceId);
         const at = this.now().toISOString();
         const reason = (error instanceof Error ? error.message : "Narrative generation failed.").slice(0, 500);
@@ -217,6 +227,7 @@ export class WorkNarrativeStore {
         this.persist(workspaceId, state);
       }
     } finally {
+      this.activeControllers.delete(controller);
       clearTimeout(timeout);
       if (this.pending.get(jobKey)?.requestedAt === requestedAt) this.pending.delete(jobKey);
     }

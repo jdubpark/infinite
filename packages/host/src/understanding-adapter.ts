@@ -61,7 +61,7 @@ export function validateBrief(value: unknown, root: string, context: RepoContext
   return {
     ...parsed, evidence,
     brief: { ...parsed.brief, architecture: claims(parsed.brief.architecture), changes: claims(parsed.brief.changes), checks: claims(parsed.brief.checks), review, guidance },
-    coverage: [...parsed.coverage, ...(omitted ? [`Omitted ${omitted} claim, citation, or evidence item without a matching in-bounds source reference.`] : [])].slice(0, 100),
+    coverage: [...parsed.coverage, ...(omitted ? [`Omitted ${omitted} claim, citation, or evidence item without a matching in-bounds source reference.`] : [])].slice(-100),
   };
 }
 
@@ -156,10 +156,13 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
       const raw = await run(briefing.command, [...briefing.args, ...writerArgs, "brief", "--repo", input.root, "--base", input.baseCommit, "--format", "json", "--no-state", "--question", input.question], { ...options, cwd: input.root, timeoutMs: options.timeoutMs, maxBytes: Math.min(options.maxBytes, MAX_STDOUT) });
       if (Buffer.byteLength(raw) > Math.min(options.maxBytes, MAX_STDOUT)) throw new Error("understanding-output-too-large");
       const parsed = validateBrief(JSON.parse(raw), input.root, context);
+      if (parsed.base !== input.baseCommit) throw new Error("understanding-brief-base-mismatch");
       const diagrams: Diagram[] = [];
+      let droppedDiagramCitations = 0;
       const sources = z.array(z.object({ title: z.string().min(1).max(200), kind: z.enum(["system", "change"]), mermaid: z.string().max(3000), citations: z.array(citationSchema).max(24) }).strict()).max(2).parse(parsed.brief.diagrams ?? []);
       sources.forEach((source, index) => {
         const citations = source.citations.filter(citation => relativePath(citation.source) && Boolean(context.files[citation.source]) && citation.line <= context.files[citation.source]!.lines);
+        droppedDiagramCitations += source.citations.length - citations.length;
         const base = { id: `narrative:${index}`, title: source.title, kind: source.kind, basis: "model" as const, citations };
         const result = parseMermaid(source.mermaid);
         if (result.ok && result.diagram.nodes.length <= 48 && result.diagram.edges.length <= 120) {
@@ -169,7 +172,11 @@ export function createUnderstandingAdapter(config: Config): UnderstandingAdapter
         }
       });
       const brief: UnderstandingBrief = { ...parsed.brief, diagrams };
-      return { brief, diagrams, engine: briefing.runner ?? "configured", model: briefing.model ?? briefing.runner ?? "configured", generatedAt: parsed.generatedAt };
+      const coverage = [
+        ...parsed.coverage,
+        ...(droppedDiagramCitations ? [`Omitted ${droppedDiagramCitations} diagram citation${droppedDiagramCitations === 1 ? "" : "s"} without a matching in-bounds source reference.`] : []),
+      ].slice(-100);
+      return { brief, diagrams, engine: briefing.runner ?? "configured", model: briefing.model ?? briefing.runner ?? "configured", generatedAt: parsed.generatedAt, coverage };
     } } : {}),
     ...(config.repositoryBriefings ? { synthesize: async (input, options) => {
       const components: KnowledgeComponent[] = [], coverage: string[] = [];

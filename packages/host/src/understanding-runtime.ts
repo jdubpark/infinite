@@ -48,7 +48,7 @@ export interface UnderstandingAdapter {
   synthesize?(input: UnderstandingSynthesisInput, options: UnderstandingAdapterOptions): Promise<{ components: KnowledgeComponent[]; coverage: string[] }>;
   delivery?(input: { workspaceId: string; root: string; repositoryId: string; head: string | null }, options: UnderstandingAdapterOptions): Promise<KnowledgeDelivery>;
   /** Writes one work narrative for a recorded range; only an explicit refresh calls it. */
-  explainWork?(input: { root: string; baseCommit: string; question: string }, options: UnderstandingAdapterOptions): Promise<{ brief: UnderstandingBrief; diagrams: Diagram[]; engine: string; model: string; generatedAt: string }>;
+  explainWork?(input: { root: string; baseCommit: string; question: string }, options: UnderstandingAdapterOptions): Promise<{ brief: UnderstandingBrief; diagrams: Diagram[]; engine: string; model: string; generatedAt: string; coverage: string[] }>;
 }
 export function createContextAdapter(config: Config): UnderstandingAdapter {
   return config.repositoryBriefings ? { context: (root, options) => runRepositoryContext(config, root, options) } : {};

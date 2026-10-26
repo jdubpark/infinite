@@ -27,7 +27,8 @@ if (mode === "context") {
   process.stdout.write(JSON.stringify({ version: 1, repo, generatedAt: new Date().toISOString(), head, base: null, files, components: [], edges: [], limitations: [] }));
 } else if (mode === "brief") {
   if (process.env.WORK_BRIEF_FAIL === "1") process.exit(1);
-  const base = args[args.indexOf("--base") + 1];
+  const requestedBase = args[args.indexOf("--base") + 1];
+  const base = process.env.WORK_BRIEF_WRONG_BASE === "1" ? "0".repeat(40) : requestedBase;
   process.stdout.write(JSON.stringify({
     repo, head, base, generatedAt: new Date().toISOString(), fingerprint,
     brief: {
@@ -36,6 +37,6 @@ if (mode === "context") {
       checks: [], review: [{ priority: "medium", area: "Source behavior", why: "The changed behavior has limited recorded coverage.", question: "Does the updated behavior cover the intended case?", citations: [{ source: "src/a.ts", line: 1 }] }],
       guidance: [], unknowns: [], diagrams: [{ title: "Change", kind: "change", mermaid: "flowchart LR\n  A --> B", citations: process.env.WORK_BRIEF_BAD_DIAGRAM_CITATION === "1" ? [{ source: "../outside.ts", line: 999 }] : [] }],
     },
-    evidence: [], coverage: [],
+    evidence: process.env.WORK_BRIEF_BAD_DIAGRAM_CITATION === "1" ? [{ source: "../outside.ts", line: 999, path: null, text: "outside the collected source" }] : [], coverage: [],
   }));
 } else process.exit(2);

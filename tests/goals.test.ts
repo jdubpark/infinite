@@ -49,7 +49,8 @@ async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof star
       claude: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), scenario, receipts, "claude"] },
       codex: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), scenario, receipts, "codex"] },
     }, config: {
-      teams: { workspaceDir: join(root, "teams"), lineup },
+      // Head publication would push to GitHub; goal tests do not exercise it.
+      teams: { workspaceDir: join(root, "teams"), lineup, publishHeads: false },
       ...(linear ? { linear: { apiKeyFile, endpoint: linear.endpoint } } : {}),
       projects: [{ id: "rehearsal", name: "Rehearsal", path: source, team: bootstrapGoal
         ? { checks: [], establishChecks: true }

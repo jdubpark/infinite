@@ -421,14 +421,17 @@ test("failed workspace removal records one event, retries later, and does not bl
     'const { spawnSync } = require("node:child_process");',
     'const marker = process.argv[1];',
     'const [command, ...args] = process.argv.slice(2);',
-    'if (!fs.existsSync(marker)) { fs.writeFileSync(marker, "failed once"); process.exit(73); }',
+    // The first attempt leaves an unreadable directory behind, which the host cannot remove either; the retry repairs it.
+    'if (!fs.existsSync(marker)) { fs.writeFileSync(marker, "failed once"); fs.mkdirSync("locked", { recursive: true }); fs.writeFileSync("locked/keep", ""); fs.chmodSync("locked", 0); process.exit(73); }',
+    'if (fs.existsSync("locked")) fs.chmodSync("locked", 0o755);',
     'const result = spawnSync(command, args, { stdio: "inherit" });',
     'process.exit(result.status ?? 1);',
   ].join("\n");
   f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", script, marker] };
   retention(f, { finishedMinutes: 0 });
   f.writeTeam();
-  const teams = openTeam(f, { now: () => Date.parse(at) + 1000 });
+  let now = Date.parse(at) + 1000;
+  const teams = openTeam(f, { now: () => now });
   try {
     teams.start();
     await waitFor(() => teams.get(f.run.id).events.some(event => event.text.startsWith("Workspace removal under the retention policy failed")), "failed removal should be recorded");
@@ -436,7 +439,10 @@ test("failed workspace removal records one event, retries later, and does not bl
     assert.equal(afterFailure.status, "merged");
     assert.ok(afterFailure.workspaceRemovedAt, "the removal intent stays durable after a failure so a partially removed tree is never resumed");
     assert.equal(existsSync(runDirectory(f.run)), true);
-    await waitFor(() => !existsSync(runDirectory(f.run)), "failed removal should be retried on a later tick");
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    assert.equal(existsSync(runDirectory(f.run)), true, "a failed removal waits out its backoff before the next attempt");
+    now += 5 * 60_000 + 1;
+    await waitFor(() => !existsSync(runDirectory(f.run)), "failed removal should be retried once the backoff elapses");
     const afterRetry = teams.get(f.run.id);
     assert.equal(afterRetry.status, "merged");
     assert.ok(afterRetry.workspaceRemovedAt);
@@ -559,4 +565,27 @@ test("background retention is bounded, leaves the mutation queue responsive, and
     if (!existsSync(release)) writeFileSync(release, "continue after test cleanup");
     await close(f, teams);
   }
+});
+
+test("entries the agent account cannot remove are finished by the host", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "merged";
+  f.run.updatedAt = at;
+  f.run.events.push({ at, text: "The delivery agent reported a merged pull request for the reviewed commit." });
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  mkdirSync(join(runDirectory(f.run), "scratch", "notes"), { recursive: true });
+  // The prefix stands in for an agent-side rm that exits non-zero on a host-owned scratch directory and removes nothing.
+  f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", "process.exit(1)"] };
+  retention(f, { finishedMinutes: 0 });
+  f.writeTeam();
+  const teams = openTeam(f, { now: () => Date.parse(at) + 1000 });
+  try {
+    teams.start();
+    await waitFor(() => !existsSync(runDirectory(f.run)), "the host removes what the agent account could not");
+    const run = teams.get(f.run.id);
+    assert.ok(run.workspaceRemovedAt);
+    assert.ok(run.events.some(event => event.text.startsWith("Workspaces removed under the retention policy after this merged run settled")));
+    assert.ok(!run.events.some(event => event.text.startsWith("Workspace removal under the retention policy failed")), "no failure is recorded when the host finishes the removal");
+  } finally { await close(f, teams); }
 });

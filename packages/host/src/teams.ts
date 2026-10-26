@@ -1908,6 +1908,9 @@ export class TeamService {
     for (const member of run.members) {
       if (member.status === "stopped") continue;
       // Whatever the recorded member status, a session that has exited or no longer exists has nothing left to stop.
+      // A deleted session can still answer state() from its saved status file, so existence is checked first.
+      try { this.manager.meta(member.sessionId); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; }
       try { if ((await this.manager.state(member.sessionId)).status !== "exited") return false; }
       catch { continue; }
     }

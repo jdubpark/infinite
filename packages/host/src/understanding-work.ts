@@ -32,6 +32,7 @@ const MAX_COMPONENTS = 60;
 const MAX_COMPONENT_FILES = 400;
 const MAX_CITATIONS = 24;
 const MAX_DIAGRAMS = 4;
+const MAX_DIAGRAM_EDGES = 120;
 const MAX_RICH_NODES = 4000;
 const MAX_BLOCKS = 40;
 const MAX_SECTIONS = 12;
@@ -57,6 +58,7 @@ export interface NarrativeRecord {
   model: string;
   brief: import("@infinite/remote").UnderstandingBrief;
   diagrams: Diagram[];
+  coverage?: string[];
 }
 
 export function classifyChanges(
@@ -124,6 +126,7 @@ export function changeMap(changes: ComponentChange[], relationships: KnowledgeRe
   const byId = new Map(components.map(component => [component.id, component]));
   const changed = changes.slice().sort((a, b) => a.path.localeCompare(b.path) || (a.componentId ?? "").localeCompare(b.componentId ?? ""));
   const changedIds = new Set(changed.flatMap(change => change.componentId ? [change.componentId] : []));
+  const changedUnitIds = new Set(changed.map(change => change.componentId ?? `folder:${change.repositoryId}:${change.path}`));
   const includedIds = new Set(changedIds);
   const neighborCount = new Map<string, number>();
   for (const edge of relationships) {
@@ -158,19 +161,26 @@ export function changeMap(changes: ComponentChange[], relationships: KnowledgeRe
     nodes.push(node); nodeById.set(id, node);
   }
   const componentNodeIds = new Set([...includedIds].filter(id => nodeById.has(id)));
-  const edges: Diagram["edges"] = relationships
-    .filter(edge => componentNodeIds.has(edge.from) && componentNodeIds.has(edge.to))
+  const candidateIds = new Set([...changedIds, ...neighbors]);
+  const candidateEdges = relationships
+    .filter(edge => candidateIds.has(edge.from) && candidateIds.has(edge.to))
     .slice()
-    .sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to) || a.kind.localeCompare(b.kind))
+    .sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to) || a.kind.localeCompare(b.kind));
+  const retainedEdges = candidateEdges
+    .filter(edge => componentNodeIds.has(edge.from) && componentNodeIds.has(edge.to))
+    .slice(0, MAX_DIAGRAM_EDGES);
+  const edges: Diagram["edges"] = retainedEdges
     .map(edge => ({ from: edge.from, to: edge.to, style: "solid", kind: edge.kind }));
   const citations: UnderstandingCitation[] = [];
-  for (const edge of relationships
-    .filter(value => componentNodeIds.has(value.from) && componentNodeIds.has(value.to))
-    .slice()
-    .sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to) || a.kind.localeCompare(b.kind))) {
+  for (const edge of retainedEdges) {
     const evidence = edge.evidence.find(item => item.line !== null && item.line > 0 && item.source);
     if (evidence) citations.push({ source: evidence.source, line: evidence.line! });
   }
+  const omittedChangedUnits = [...changedUnitIds].filter(id => !nodeById.has(id)).length;
+  const omittedRelationships = candidateEdges.length - retainedEdges.length;
+  const coverage = omittedChangedUnits || omittedRelationships
+    ? [`${omittedChangedUnits} changed unit${omittedChangedUnits === 1 ? "" : "s"} and ${omittedRelationships} relationship${omittedRelationships === 1 ? "" : "s"} were omitted from the map`]
+    : [];
   return {
     id: "change-map",
     title: "Component change map",
@@ -181,7 +191,7 @@ export function changeMap(changes: ComponentChange[], relationships: KnowledgeRe
     edges,
     groups: [],
     citations: uniqueCitations(citations).slice(0, MAX_CITATIONS),
-    coverage: [],
+    coverage,
   };
 }
 
@@ -201,9 +211,11 @@ export function assembleTeamBrief(input: {
   const staleNarrative = narrative && (revisionChanged || keyChanged) ? narrative : null;
   const currentNarrative = staleNarrative ? null : narrative;
   const tasks = allTasks(run);
-  const changes = run.changes ? classifyChanges(run.changes.files, repositoryId, components, taskPathsFor(tasks)) : [];
+  const changeIndex = currentChangeIndex(run);
+  const changes = changeIndex ? classifyChanges(changeIndex.files, repositoryId, components, taskPathsFor(tasks)) : [];
+  const hasUnrecordedPaths = !changeIndex && (Boolean(run.changes) || tasks.some(task => task.diffStat));
   const hasMap = mapObservedAt !== null || components.some(component => component.repositoryIds.includes(repositoryId));
-  const coverage = runCoverage(run, mapObservedAt, hasMap, changes.length > 0);
+  const coverage = [...new Set([...runCoverage(run, mapObservedAt, hasMap, changes.length > 0), ...(currentNarrative?.coverage ?? [])])];
   const taskSummaries = taskSummariesFor(tasks, changes, run);
   const reportedSummary = run.noChange?.summary ?? run.deliveryReceipt?.summary ?? run.pullRequest?.summary ?? run.discovery?.summary;
   const requestNodes = parseMarkdown(run.objective).nodes;
@@ -227,8 +239,7 @@ export function assembleTeamBrief(input: {
   ];
   sections.push(section("overview", "Overview", overviewBlocks));
 
-  const hasLegacyDiff = !run.changes && tasks.some(task => task.diffStat);
-  if (changes.length || hasLegacyDiff) {
+  if (changes.length || hasUnrecordedPaths) {
     const blocks: WorkBlock[] = [];
     if (changes.length) blocks.push({ kind: "components", items: changes });
     else blocks.push({ kind: "note", tone: "info", text: "Changed paths were not recorded for this run." });
@@ -258,11 +269,13 @@ export function assembleTeamBrief(input: {
   if (decisions.length) sections.push(section("decisions", "Decisions", [{ kind: "decisions", items: decisions }]));
 
   const reviewQuestions = currentNarrative?.brief.review ?? [];
-  const latestReview = latestRunReview(run);
-  if (reviewQuestions.length || latestReview) {
+  const currentReview = currentRunReview(run);
+  const earlierReview = hasEarlierRunReview(run);
+  if (reviewQuestions.length || currentReview || earlierReview) {
     const blocks: WorkBlock[] = [];
     if (reviewQuestions.length) blocks.push({ kind: "questions", items: reviewQuestions });
-    if (latestReview) blocks.push({ kind: "rich", basis: "agent", nodes: parseMarkdown(`${latestReview.verdict}\n\n${latestReview.summary}`).nodes });
+    if (currentReview) blocks.push({ kind: "rich", basis: "agent", nodes: parseMarkdown(`${currentReview.verdict}\n\n${currentReview.summary}`).nodes });
+    else if (earlierReview) blocks.push({ kind: "note", tone: "info", text: "An earlier round's review is not shown as current" });
     sections.push(section("review", "Review", blocks));
   }
 
@@ -445,8 +458,8 @@ export function boundedWorkBrief(brief: WorkBrief): WorkBrief {
         if (block.diagram.nodes.length > 48) { block.diagram.nodes = block.diagram.nodes.slice(0, 48); truncated = true; }
         const nodeIds = new Set(block.diagram.nodes.map(node => node.id));
         const validEdges = block.diagram.edges.filter(edge => nodeIds.has(edge.from) && nodeIds.has(edge.to));
-        if (validEdges.length > 120) truncated = true;
-        block.diagram.edges = validEdges.slice(0, 120);
+        if (validEdges.length > MAX_DIAGRAM_EDGES) truncated = true;
+        block.diagram.edges = validEdges.slice(0, MAX_DIAGRAM_EDGES);
         if (block.diagram.citations.length > MAX_CITATIONS) { block.diagram.citations = block.diagram.citations.slice(0, MAX_CITATIONS); truncated = true; }
         if (block.diagram.groups.length > 48) { block.diagram.groups = block.diagram.groups.slice(0, 48); truncated = true; }
       } else if (block.kind === "citations") {
@@ -518,8 +531,15 @@ function boundRichNodes(nodes: RichNode[], budget: { nodes: number; chars: numbe
     if (node.type === "list") {
       const items: typeof node.items = [];
       for (const item of node.items) {
+        if (nodesRemaining <= 0) { truncated = true; break; }
+        nodesRemaining -= 1;
         const inlines = item.inlines.map(takeInline).filter((inline): inline is Inline => inline !== null);
-        const children = item.children.map(visit).filter((child): child is RichNode => child !== null);
+        const children: RichNode[] = [];
+        for (const child of item.children) {
+          if (nodesRemaining <= 0) { truncated = true; break; }
+          const boundedChild = visit(child);
+          if (boundedChild) children.push(boundedChild);
+        }
         if (inlines.length || children.length) items.push({ inlines, children });
       }
       return { ...node, items };
@@ -566,7 +586,7 @@ function assembleMissionBrief(workspaceId: string, mission: Mission, teams: Team
   const brief = aggregateBriefBase({ workspaceId, workId: `mission:${mission.id}`, kind: "mission", title: mission.title, objective: mission.objective,
     status: mission.status, revision: mission.revision, updatedAt: mission.updatedAt, repositoryIds, baseCommit: latest?.baseCommit ?? null, headCommit: latest?.headCommit ?? null,
     now, summary, changes, relationships: knowledge.relationships, components: knowledge.components, mapObservedAt: aggregateMapObservedAt(repositoryIds, knowledge.contexts, knowledge.components),
-    sourceFingerprint: sourceFingerprint({ mission, teams: children }), hasUnrecordedDiff: children.some(team => !team.changes && allTasks(team).some(task => task.diffStat)), coverage });
+    sourceFingerprint: sourceFingerprint({ mission, teams: children }), hasUnrecordedDiff: children.some(hasUnrecordedChangePaths), coverage });
   const subtaskItems: TaskSummary[] = mission.subtasks.map(subtask => {
     const team = subtask.teamId ? childById.get(subtask.teamId) : undefined;
     const childChanges = changes.filter(change => team && change.taskIds.some(id => allTasks(team).some(task => task.id === id)));
@@ -607,7 +627,7 @@ function assembleGoalBrief(workspaceId: string, goal: ProductGoal, teams: TeamRu
     status: goal.status, revision: goal.revision, updatedAt: goal.updatedAt, repositoryIds, baseCommit: latest?.baseCommit ?? null, headCommit: latest?.headCommit ?? null,
     now, summary: goal.outcomes.at(-1)?.summary ?? goal.reason, changes, relationships: knowledge.relationships, components: knowledge.components,
     mapObservedAt: aggregateMapObservedAt(repositoryIds, knowledge.contexts, knowledge.components), sourceFingerprint: sourceFingerprint({ goal, teams: children }),
-    hasUnrecordedDiff: children.some(team => !team.changes && allTasks(team).some(task => task.diffStat)), coverage });
+    hasUnrecordedDiff: children.some(hasUnrecordedChangePaths), coverage });
   const cycleTasks: TaskSummary[] = orderedCycles.map(cycle => {
     const team = teamById.get(cycle.teamId);
     const report = team && teamReports(team).at(-1)?.text;
@@ -652,10 +672,13 @@ function aggregateBriefBase(input: {
     ] },
     { kind: "rich", basis: input.summary ? "agent" : "owner", nodes: summaryNodes },
   ])];
-  if (input.changes.length) {
-    sections.push(section("changes", "Changes", [{ kind: "components", items: input.changes }]));
-    sections.push(section("diagram", "Diagrams", [{ kind: "diagram", diagram: changeMap(input.changes, input.relationships, input.components) }]));
-  } else if (input.hasUnrecordedDiff) sections.push(section("changes", "Changes", [{ kind: "note", tone: "info", text: "Changed paths were not recorded for this run." }]));
+  if (input.changes.length || input.hasUnrecordedDiff) {
+    sections.push(section("changes", "Changes", [
+      ...(input.changes.length ? [{ kind: "components", items: input.changes } as const] : []),
+      ...(input.hasUnrecordedDiff ? [{ kind: "note", tone: "info", text: "Changed paths were not recorded for this run." } as const] : []),
+    ]));
+    if (input.changes.length) sections.push(section("diagram", "Diagrams", [{ kind: "diagram", diagram: changeMap(input.changes, input.relationships, input.components) }]));
+  }
   sections.push(section("request", "Request", [{ kind: "rich", basis: "owner", nodes: parseMarkdown(input.objective).nodes }]));
   sections.push(evidenceSection({ baseCommit: input.baseCommit, headCommit: input.headCommit, mapObservedAt: input.mapObservedAt,
     mapSnapshot: mapSnapshot(input.components.filter(component => input.repositoryIds.some(id => component.repositoryIds.includes(id)))),
@@ -669,8 +692,9 @@ function aggregateBriefBase(input: {
 function aggregateChanges(teams: TeamRun[], components: KnowledgeComponent[]): ComponentChange[] {
   const merged = new Map<string, ComponentChange>();
   for (const team of teams) {
-    if (!team.changes) continue;
-    const changes = classifyChanges(team.changes.files, team.projectId, components, taskPathsFor(allTasks(team)));
+    const changeIndex = currentChangeIndex(team);
+    if (!changeIndex) continue;
+    const changes = classifyChanges(changeIndex.files, team.projectId, components, taskPathsFor(allTasks(team)));
     for (const change of changes) {
       const key = `${change.repositoryId}\0${change.componentId ?? change.path}`;
       const current = merged.get(key);
@@ -699,10 +723,12 @@ function aggregateCoverage(teams: TeamRun[], contexts: Record<string, RepoContex
   else if (repositoryIds.some(id => !contexts?.[id]?.generatedAt && !mapObservationTime(components.filter(component => component.repositoryIds.includes(id)), id)))
     coverage.push("The component map observation time was not recorded");
   for (const team of teams) {
-    if (!team.changes && allTasks(team).some(task => task.diffStat)) coverage.push("Changed paths were not recorded for this run.");
-    if (team.changes?.truncated) coverage.push("The recorded change index is truncated to its retained file limit.");
+    const changeIndex = currentChangeIndex(team);
+    if (hasStaleChangeIndex(team)) coverage.push("The recorded change index belongs to an earlier head.");
+    else if (!changeIndex && allTasks(team).some(task => task.diffStat)) coverage.push("Changed paths were not recorded for this run.");
+    if (changeIndex?.truncated) coverage.push("The recorded change index is truncated to its retained file limit.");
     const observedAt = contexts?.[team.projectId]?.generatedAt ?? mapObservationTime(components.filter(component => component.repositoryIds.includes(team.projectId)), team.projectId);
-    if (observedAt && team.changes && observedAt < team.changes.recordedAt)
+    if (observedAt && changeIndex && observedAt < changeIndex.recordedAt)
       coverage.push("The component map was observed before this run's last integration");
   }
   return [...new Set(coverage)];
@@ -716,10 +742,12 @@ function addAggregateSections(sections: WorkSection[], teams: TeamRun[]) {
       .filter((value, index, values) => values.findIndex(candidate => candidate.id === value.id) === index);
     if (decisions.length) insertBefore(sections, "request", section("decisions", "Decisions", [{ kind: "decisions", items: decisions }]));
   }
-  const reviews = teams.flatMap(team => {
-    const review = latestRunReview(team);
-    return review ? [{ kind: "rich" as const, basis: "agent" as const, nodes: parseMarkdown(`${review.verdict}\n\n${review.summary}`).nodes }] : [];
-  });
+  const reviews: WorkBlock[] = [];
+  for (const team of teams) {
+    const review = currentRunReview(team);
+    if (review) reviews.push({ kind: "rich", basis: "agent", nodes: parseMarkdown(`${review.verdict}\n\n${review.summary}`).nodes });
+    else if (hasEarlierRunReview(team)) reviews.push({ kind: "note", tone: "info", text: "An earlier round's review is not shown as current" });
+  }
   if (reviews.length) insertBefore(sections, "request", section("review", "Review", reviews));
   const facts: Extract<WorkBlock, { kind: "facts" }> ["items"] = [];
   const links: Extract<WorkBlock, { kind: "links" }> ["items"] = [];
@@ -737,6 +765,18 @@ function addAggregateSections(sections: WorkSection[], teams: TeamRun[]) {
 
 function taskPathsFor(tasks: TeamTask[]) {
   return tasks.flatMap(task => task.changedPaths ? [{ taskId: task.id, paths: task.changedPaths.paths }] : []);
+}
+
+function currentChangeIndex(run: TeamRun) {
+  return run.changes?.headCommit === run.headCommit ? run.changes : undefined;
+}
+
+function hasStaleChangeIndex(run: TeamRun) {
+  return Boolean(run.changes && run.changes.headCommit !== run.headCommit);
+}
+
+function hasUnrecordedChangePaths(run: TeamRun) {
+  return !currentChangeIndex(run) && (Boolean(run.changes) || allTasks(run).some(task => task.diffStat));
 }
 
 function allTasks(run: TeamRun): TeamTask[] {
@@ -809,8 +849,12 @@ function teamReports(run: TeamRun): { text: string; at: string }[] {
   ];
 }
 
-function latestRunReview(run: TeamRun) {
-  return run.review ?? run.continuations?.slice().reverse().find(continuation => continuation.review)?.review;
+function currentRunReview(run: TeamRun) {
+  return run.review;
+}
+
+function hasEarlierRunReview(run: TeamRun) {
+  return !run.review && Boolean(run.continuations?.some(continuation => continuation.review));
 }
 
 function citationsFromNarrative(brief: NarrativeRecord["brief"] | undefined): UnderstandingCitation[] {
@@ -839,13 +883,15 @@ function evidenceSection(input: { baseCommit: string | null; headCommit: string 
 
 function runCoverage(run: TeamRun, mapObservedAt: string | null, hasMap: boolean, hasChanges: boolean): string[] {
   const coverage: string[] = [];
+  const changeIndex = currentChangeIndex(run);
   if (!hasMap) coverage.push("Component boundaries come from folder layout; run a workspace refresh for the repository map");
   else if (!mapObservedAt) coverage.push("The component map observation time was not recorded");
-  else if (run.changes && mapObservedAt < run.changes.recordedAt) coverage.push("The component map was observed before this run's last integration");
-  if (!run.changes && allTasks(run).some(task => task.diffStat)) coverage.push("Changed paths were not recorded for this run.");
-  if (run.changes?.truncated) coverage.push("The recorded change index is truncated to its retained file limit.");
+  else if (changeIndex && mapObservedAt < changeIndex.recordedAt) coverage.push("The component map was observed before this run's last integration");
+  if (hasStaleChangeIndex(run)) coverage.push("The recorded change index belongs to an earlier head.");
+  else if (!changeIndex && allTasks(run).some(task => task.diffStat)) coverage.push("Changed paths were not recorded for this run.");
+  if (changeIndex?.truncated) coverage.push("The recorded change index is truncated to its retained file limit.");
   for (const task of allTasks(run)) if (task.changedPaths?.truncated) coverage.push(`Recorded paths for task ${task.id} are truncated.`);
-  if (!hasChanges && run.changes?.files.length) coverage.push("No changed unit could be matched to the retained component map.");
+  if (!hasChanges && changeIndex?.files.length) coverage.push("No changed unit could be matched to the retained component map.");
   return [...new Set(coverage)];
 }
 

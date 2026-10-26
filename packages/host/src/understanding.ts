@@ -192,11 +192,13 @@ export class UnderstandingService {
     if (digest(capture) !== digest(current)) throw new Error("The enrolled source changed while its brief was generated.");
     const brief = summary.repository.brief;
     const artifactId = randomUUID();
+    const retained = retainedDiagrams(artifactId, brief.diagrams);
     const artifact: UnderstandingArtifact = artifactSchema.parse({
       id: artifactId, sourceProjectId: session.projectId, sessionId: session.id, sourceKind: capture.binding.sourceKind,
       head: summary.repository.head, base: summary.repository.base, fingerprint: summary.repository.fingerprint,
-      generatedAt: summary.repository.generatedAt, retainedAt: new Date().toISOString(), coverage: summary.repository.coverage,
-      brief: { summary: brief.summary, architecture: brief.architecture, changes: brief.changes, checks: brief.checks, review: brief.review, guidance: brief.guidance, unknowns: brief.unknowns, diagrams: retainedDiagrams(artifactId, brief.diagrams) },
+      generatedAt: summary.repository.generatedAt, retainedAt: new Date().toISOString(),
+      coverage: [...summary.repository.coverage.slice(0, Math.max(0, 100 - retained.coverage.length)), ...retained.coverage],
+      brief: { summary: brief.summary, architecture: brief.architecture, changes: brief.changes, checks: brief.checks, review: brief.review, guidance: brief.guidance, unknowns: brief.unknowns, diagrams: retained.diagrams },
       evidence: summary.repository.evidence.map(item => ({ source: item.source, line: item.line, text: item.text })),
     });
     const entry = entrySchema.parse({ binding: capture.binding, artifact });
@@ -371,18 +373,29 @@ export class UnderstandingService {
   }
 }
 
-/** Parse the writer's Mermaid at persist time. Unsupported or oversized diagrams keep their source and error, never a partial graph. */
-function retainedDiagrams(artifactId: string, sources: { title: string; kind: "system" | "change"; mermaid: string; citations: { source: string; line: number }[] }[]): Diagram[] {
-  return sources.map((source, index) => {
+/** Parse and validate writer diagrams at persist time; retain source when the parsed graph is outside the artifact schema. */
+export function retainedDiagrams(artifactId: string, sources: { title: string; kind: "system" | "change"; mermaid: string; citations: { source: string; line: number }[] }[]): { diagrams: Diagram[]; coverage: string[] } {
+  const diagrams: Diagram[] = [], coverage: string[] = [];
+  sources.forEach((source, index) => {
     const base = { id: `${artifactId}:${index}`, title: source.title, kind: source.kind, basis: "model" as const, citations: source.citations };
     const parsed = parseMermaid(source.mermaid);
-    if (parsed.ok && parsed.diagram.nodes.length <= MAX_DIAGRAM_NODES && parsed.diagram.edges.length <= MAX_DIAGRAM_EDGES) {
-      return { ...base, direction: parsed.diagram.direction, nodes: parsed.diagram.nodes, edges: parsed.diagram.edges, groups: parsed.diagram.groups,
-        ...(parsed.diagram.sequence ? { sequence: parsed.diagram.sequence } : {}), coverage: parsed.coverage };
+    const candidate = parsed.ok && parsed.diagram.nodes.length <= MAX_DIAGRAM_NODES && parsed.diagram.edges.length <= MAX_DIAGRAM_EDGES
+      ? { ...base, direction: parsed.diagram.direction, nodes: parsed.diagram.nodes, edges: parsed.diagram.edges, groups: parsed.diagram.groups,
+        ...(parsed.diagram.sequence ? { sequence: parsed.diagram.sequence } : {}), coverage: parsed.coverage }
+      : undefined;
+    if (candidate) {
+      const validated = diagramSchema.safeParse(candidate);
+      if (validated.success) { diagrams.push(validated.data); return; }
     }
-    const parseError = parsed.ok ? "The diagram exceeds the retained node or edge limit." : parsed.error;
-    return { ...base, direction: "LR", nodes: [], edges: [], groups: [], sourceText: source.mermaid, parseError, coverage: [] };
+    const parseError = candidate
+      ? "The parsed diagram exceeds the retained schema limits."
+      : parsed.ok ? "The diagram exceeds the retained node or edge limit." : parsed.error;
+    const fallback = { ...base, direction: "LR" as const, nodes: [], edges: [], groups: [], sourceText: source.mermaid, parseError, coverage: [] };
+    const validatedFallback = diagramSchema.safeParse(fallback);
+    if (validatedFallback.success) diagrams.push(validatedFallback.data);
+    else coverage.push("A diagram was omitted because its parsed graph and source fallback failed retained schema validation.");
   });
+  return { diagrams, coverage };
 }
 
 function retainedGenerations(entries: Entry[], sizes: Map<string, number>): Entry[] {

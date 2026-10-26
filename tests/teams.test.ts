@@ -12,7 +12,7 @@ import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { Journal, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { TeamError, applyTeamBriefTitle, changeIndex, checkTimeoutReason, memberStallReason } from "../packages/host/src/teams.js";
-import { createTeamSchema, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamModelProfile, type TeamRun, type TeamView } from "../packages/host/src/team-types.js";
+import { createTeamSchema, teamLineupSchema, type CreateTeam, type TeamBrief, type TeamLineup, type TeamMember, type TeamModelProfile, type TeamRun, type TeamTask, type TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import type { HandoffPolicy, TeamHandoffContext } from "../packages/host/src/handoff-types.js";
 import { refreshReportingInstructions, retargetPrompt, teamPrompt } from "../packages/host/src/team-prompts.js";
@@ -66,6 +66,75 @@ test("a GitHub project blocks when its first refresh has no mirror head", { time
     const created = await teams.create(f.create());
     const blocked = await waitFor(() => Promise.resolve(teams.get(created.id)), current => current.status === "blocked", 30000);
     assert.match(blocked.reason ?? "", /no copy of this repository from GitHub yet/);
+  } finally { await f.close(); }
+});
+
+test("moved-base delivery recovery clears change summaries tied to the previous head", { timeout: 90000 }, async () => {
+  const f = await fixture("delivery-fast", fallbackLineup, {}, { deliveryMode: "pr", noServer: true });
+  try {
+    const mirror = join(f.host.root, "source-mirror.git");
+    git(f.source, "clone", "--bare", f.source, mirror);
+    const branch = "infinite/team-delivery-recovery-test";
+    const id = randomUUID(), memberId = randomUUID(), at = new Date().toISOString();
+    const runRoot = join(f.host.config.teams!.workspaceDir, id);
+    const workspace = join(runRoot, "integration");
+    mkdirSync(dirname(workspace), { recursive: true, mode: 0o700 });
+    git(f.source, "clone", "--no-hardlinks", f.source, workspace);
+    git(workspace, "remote", "remove", "origin");
+    git(workspace, "checkout", "-b", branch);
+    const headCommit = git(workspace, "rev-parse", "HEAD");
+    const cwd = join(runRoot, "members", memberId);
+    mkdirSync(dirname(cwd), { recursive: true, mode: 0o700 });
+    git(workspace, "clone", "--no-hardlinks", workspace, cwd);
+    git(cwd, "remote", "remove", "origin");
+
+    git(f.source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null",
+      "commit", "--allow-empty", "-m", "Move the base");
+    const movedBase = git(f.source, "rev-parse", "HEAD");
+    git(mirror, "fetch", "--no-tags", "--", f.source, "+refs/heads/main:refs/heads/main");
+    const sourceStatus: ProjectSourceStatus = { mode: "github", repository: "example/app", baseBranch: "main", mirrorHead: movedBase };
+    const source: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> = {
+      refresh: async () => sourceStatus,
+      mirrorPath: () => mirror,
+      isGithub: () => true,
+      status: () => sourceStatus,
+    };
+    const teams = await f.openTeamService({ source, start: false });
+    const delivery = structuredClone(f.host.config.projects.find(project => project.id === "rehearsal")!.team!.delivery!);
+    const member: TeamMember = { runId: id, memberId, revision: 1, role: "delivery", provider: "codex", sessionId: randomUUID(),
+      title: "delivery: Inspect publication state", status: "reported", cwd, baseCommit: headCommit, prompt: "", cursor: 0,
+      stopRequestId: randomUUID(), startedAt: at,
+      report: { kind: "delivery-reconciliation", headCommit, repository: "example/app", branch, baseHeadCommit: movedBase,
+        disposition: "no-publication", summary: "No publication exists and the base moved." } };
+    const task: TeamTask = { id: "readme", title: "Update the README", instructions: "Update the README.", paths: ["README.md"], dependsOn: [],
+      revision: 1, status: "integrated", changedPaths: { paths: ["README.md"], truncated: false } };
+    const priorTask: TeamTask = { id: "prior-readme", title: "Earlier README update", instructions: "Update the README.", paths: ["README.md"], dependsOn: [],
+      revision: 0, status: "integrated", changedPaths: { paths: ["README.md"], truncated: false } };
+    const run: TeamRun = { id, projectId: "rehearsal", provider: "codex", title: "Update the README", objective: "Update the README safely.",
+      parallelism: 1, parallelismCeiling: 4, revision: 1, status: "delivering", createdAt: at, updatedAt: at, workspace, branch,
+      baseCommit: f.base, headCommit, tasks: [task], members: [member], decisions: [], checks: [], steering: [], events: [], round: 0,
+      continuations: [{ revision: 0, requestId: randomUUID(), at, reason: "Earlier implementation round.", baseCommit: f.base, headCommit: f.base, tasks: [priorTask] }],
+      lineup: structuredClone(fallbackLineup), delivery, review: { verdict: "approved", summary: "Reviewed the recorded head.", revision: 1 },
+      changes: { headCommit, recordedAt: at, files: [{ path: "README.md", status: "modified", added: 1, removed: 0 }], truncated: false } };
+    const stored = { run, fingerprint: "fixture", receipts: {}, prepared: true, root: f.host.config.teams!.workspaceDir,
+      checkHead: headCommit, deliveryAttempt: { memberId, revision: 1, headCommit } };
+    const internals = teams as unknown as { records: Map<string, typeof stored>; consume(stored: typeof stored, member: TeamMember): void };
+    internals.records.set(id, stored);
+    internals.consume(stored, member);
+
+    const rebased = await waitFor(() => Promise.resolve(teams.get(id)), view => view.revision === 2 && view.deliveryRecovery?.status === "replanning" &&
+      view.members.some(current => current.role === "integrator") && !view.pendingOperation, 30000);
+    assert.equal(rebased.baseCommit, movedBase);
+    assert.equal(rebased.headCommit, movedBase);
+    assert.equal(rebased.changes, undefined, "the previous base-to-head summary is not shown for the fresh baseline");
+    assert.ok(rebased.continuations?.flatMap(continuation => continuation.tasks).every(previous => previous.changedPaths === undefined),
+      "task path summaries from the replaced range are cleared from current and retained continuation tasks");
+
+    const persisted = unseal<typeof stored>(readFileSync(f.host.config.keyFile), `team:${id}`,
+      readFileSync(join(f.host.config.stateDir, "teams", `${id}.sealed`), "utf8"));
+    assert.equal(persisted.run.changes, undefined);
+    assert.ok(persisted.run.continuations?.flatMap(continuation => continuation.tasks).every(previous => previous.changedPaths === undefined));
+    assert.equal(persisted.run.deliveryRecovery?.status, "replanning");
   } finally { await f.close(); }
 });
 

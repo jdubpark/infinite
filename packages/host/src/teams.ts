@@ -2524,6 +2524,9 @@ export class TeamService {
         if (result) {
           const previousRevision = run.revision, oldBase = run.baseCommit, oldHead = run.headCommit!;
           const originalPath = relative(stored.root ?? this.config.teams?.workspaceDir ?? dirname(result.originalWorkspace), result.originalWorkspace).slice(0, 256);
+          delete run.changes;
+          for (const task of run.tasks) delete task.changedPaths;
+          for (const continuation of run.continuations ?? []) for (const task of continuation.tasks) delete task.changedPaths;
           run.continuations = [...(run.continuations ?? []), {
             revision: previousRevision, requestId: randomUUID(), at: timestamp(),
             reason: "The delivery coordinator reported no publication after the configured base moved; original implementation and review history are retained.",

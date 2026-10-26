@@ -152,6 +152,26 @@ test("change map shows changed units, relationship kinds, source basis, and caps
   assert.ok(bounded.nodes.length <= 24);
   assert.ok(bounded.nodes.some(node => node.id === "auth"));
   assert.ok(bounded.nodes.some(node => node.id === "billing"));
+  assert.ok(bounded.coverage.includes("0 changed units and 20 relationships were omitted from the map"));
+
+  const changedUnits = Array.from({ length: 25 }, (_, index) => ({
+    componentId: `unit-${index}`,
+    name: `Unit ${index}`,
+    path: `src/unit-${index}`,
+    repositoryId,
+    change: "modified" as const,
+    files: [],
+    filesTotal: 0,
+    taskIds: [],
+  }));
+  const changedComponents = changedUnits.map(change => component(change.componentId!, change.name, change.path));
+  const cappedChanges = changeMap(changedUnits, [], changedComponents);
+  assert.ok(cappedChanges.coverage.includes("1 changed unit and 0 relationships were omitted from the map"));
+
+  const denseEdges = Array.from({ length: 121 }, (_, index) => ({ ...edge, id: `auth-billing-${index}` }));
+  const cappedEdges = changeMap(changes, denseEdges, components);
+  assert.equal(cappedEdges.edges.length, 120);
+  assert.deepEqual(cappedEdges.coverage, ["0 changed units and 1 relationship were omitted from the map"]);
 });
 
 test("assembles team sections in contract order from recorded work", () => {
@@ -230,8 +250,10 @@ test("adds model claims and diagrams after the source change map", () => {
       unknowns: [],
     },
     diagrams: [diagram("system", "system"), diagram("sequence", "sequence")],
+    coverage: ["Narrative evidence was omitted during validation."],
   };
   const brief = assembleTeamBrief({ workspaceId: "ws", run: run(), repositoryId, components: fixtureComponents(), relationships: [relationship("auth", "billing")], mapObservedAt: at, narrative, now: at });
+  assert.ok(brief.coverage.includes("Narrative evidence was omitted during validation."));
   assert.deepEqual(brief.sections.map(section => section.kind), ["overview", "changes", "diagram", "narrative", "tasks", "review", "request", "evidence"]);
   const diagramBlocks = brief.sections.find(section => section.kind === "diagram")?.blocks.filter(block => block.kind === "diagram");
   assert.ok(diagramBlocks?.every(block => block.kind === "diagram"));
@@ -266,6 +288,36 @@ test("omits empty sections and explains unavailable legacy change paths", () => 
   assert.equal(changes?.blocks.some(block => block.kind === "components"), false);
 });
 
+test("ignores a change index recorded for an earlier head", () => {
+  const stale = run({ changes: { headCommit: "earlier-head", recordedAt: at, files: fixtureFiles(), truncated: false } });
+  const brief = assembleTeamBrief({ workspaceId: "ws", run: stale, repositoryId, components: fixtureComponents(), relationships: [], mapObservedAt: at, narrative: null, now: at });
+
+  const changes = brief.sections.find(section => section.kind === "changes");
+  assert.ok(changes?.blocks.some(block => block.kind === "note" && block.text === "Changed paths were not recorded for this run."));
+  assert.equal(changes?.blocks.some(block => block.kind === "components"), false);
+  assert.ok(brief.coverage.includes("The recorded change index belongs to an earlier head."));
+});
+
+test("does not show a continuation review as the current run review", () => {
+  const brief = assembleTeamBrief({
+    workspaceId: "ws",
+    run: run({
+      review: undefined,
+      continuations: [{ revision: 4, requestId: "continued", at, reason: "Continue after review", headCommit: "head-commit", tasks: [], review: { verdict: "approved", summary: "Earlier approval", revision: 3 } }],
+    }),
+    repositoryId,
+    components: fixtureComponents(),
+    relationships: [],
+    mapObservedAt: at,
+    narrative: null,
+    now: at,
+  });
+
+  const review = brief.sections.find(section => section.kind === "review");
+  assert.ok(review?.blocks.some(block => block.kind === "note" && block.text === "An earlier round's review is not shown as current"));
+  assert.equal(review?.blocks.some(block => block.kind === "rich" && JSON.stringify(block.nodes).includes("Earlier approval")), false);
+});
+
 test("bounds a large brief while retaining overview and request", () => {
   const large = "x".repeat(3 * 1024 * 1024);
   const brief = assembleTeamBrief({ workspaceId: "ws", run: run({ objective: large, tasks: [], checks: [], decisions: [], changes: undefined }), repositoryId, components: [], relationships: [], mapObservedAt: null, narrative: null, now: at });
@@ -290,6 +342,26 @@ test("bounds a large brief while retaining overview and request", () => {
   const boundedCrowded = boundedWorkBrief(crowded);
   assert.ok(boundedCrowded.sections.find(section => section.kind === "request")?.blocks.length);
   assert.ok(boundedCrowded.sections.reduce((count, section) => count + section.blocks.length, 0) <= 40);
+});
+
+test("bounds a request containing 5000 bullet items", () => {
+  const brief = assembleTeamBrief({ workspaceId: "ws", run: run({ tasks: [], checks: [], decisions: [], changes: undefined }), repositoryId, components: [], relationships: [], mapObservedAt: null, narrative: null, now: at });
+  const request = brief.sections.find(section => section.kind === "request")!;
+  const rich = request.blocks.find(block => block.kind === "rich");
+  assert.ok(rich?.kind === "rich");
+  if (!rich || rich.kind !== "rich") return;
+  rich.nodes = [{ type: "list", ordered: false, items: Array.from({ length: 5000 }, (_, index) => ({
+    inlines: [{ type: "text" as const, text: `Bullet ${index}` }],
+    children: [{ type: "paragraph" as const, inlines: [{ type: "text" as const, text: `Detail ${index}` }] }],
+  })) }];
+
+  const bounded = boundedWorkBrief(brief);
+  const boundedRequest = bounded.sections.find(section => section.kind === "request")?.blocks.find(block => block.kind === "rich");
+  const list = boundedRequest?.kind === "rich" ? boundedRequest.nodes.find(node => node.type === "list") : undefined;
+  assert.ok(list?.type === "list");
+  assert.ok(list.items.length < 5000);
+  assert.ok(list.items.length <= 1000);
+  assert.ok(bounded.coverage.some(line => /truncated/i.test(line)));
 });
 
 test("mission work links task summaries to child team briefs and hides unknown or partial scope", () => {
@@ -323,6 +395,10 @@ test("mission work links task summaries to child team briefs and hides unknown o
   const brief = service.get("ws", "mission:mission-1");
 
   assert.equal(brief.narrative.state, "unavailable");
+  const changes = brief.sections.find(section => section.kind === "changes");
+  assert.ok(changes?.blocks.some(block => block.kind === "note" && block.text === "Changed paths were not recorded for this run."));
+  assert.equal(changes?.blocks.some(block => block.kind === "components"), false);
+  assert.ok(brief.coverage.includes("The recorded change index belongs to an earlier head."));
   const taskBlock = brief.sections.find(section => section.kind === "tasks")?.blocks.find(block => block.kind === "tasks");
   assert.ok(taskBlock?.kind === "tasks" && taskBlock.items.some(item => item.workId === "team:child"));
   assert.throws(() => service.get("ws", "team:unknown"), (error: unknown) => Boolean(error && typeof error === "object" && "statusCode" in error && error.statusCode === 404));
@@ -346,7 +422,7 @@ test("mission work links task summaries to child team briefs and hides unknown o
 
 test("goal work assembles cycles latest first and links each run to its team brief", () => {
   const child = run({ id: "goal-child", title: "Goal cycle", tasks: [task("goal-task", "Implement billing", ["src/billing/index.ts"])], changes: {
-    headCommit: "head-commit", recordedAt: at, files: [fixtureFiles()[1]], truncated: false,
+    headCommit: "older-head", recordedAt: at, files: [fixtureFiles()[1]], truncated: false,
   } });
   const goal = {
     id: "goal-1",
@@ -375,6 +451,10 @@ test("goal work assembles cycles latest first and links each run to its team bri
   const brief = new WorkBriefService(sources, { read: () => null }).get("ws", row.id);
 
   assert.equal(brief.kind, "goal");
+  const changes = brief.sections.find(section => section.kind === "changes");
+  assert.ok(changes?.blocks.some(block => block.kind === "note" && block.text === "Changed paths were not recorded for this run."));
+  assert.equal(changes?.blocks.some(block => block.kind === "components"), false);
+  assert.ok(brief.coverage.includes("The recorded change index belongs to an earlier head."));
   const tasks = brief.sections.find(section => section.kind === "tasks");
   assert.ok(tasks?.blocks.some(block => block.kind === "facts" && block.items[0]?.label === "Cycle 1"));
   assert.ok(tasks?.blocks.some(block => block.kind === "tasks" && block.items[0]?.workId === "team:goal-child"));

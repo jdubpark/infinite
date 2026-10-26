@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rename
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { claimControl, startHost, waitFor } from "./helpers.js";
-import { UnderstandingService } from "../packages/host/src/understanding.js";
+import { retainedDiagrams, UnderstandingService } from "../packages/host/src/understanding.js";
 import { writeSealed } from "../packages/host/src/vault.js";
 import { createRemoteClient, type WorkspaceUnderstanding } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
@@ -14,6 +14,21 @@ import { createGoalSchema, type ProductGoal } from "../packages/host/src/goal-ty
 import { RepositoryBriefings } from "../packages/host/src/repository-briefings.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
+
+test("retained diagrams fall back to source when a parsed graph violates the retained schema", () => {
+  const mermaid = `flowchart LR\n  API[${"x".repeat(201)}] --> Store`;
+  const retained = retainedDiagrams("a".repeat(36), [{ title: "Oversized node", kind: "system", mermaid, citations: [] }]);
+  const diagram = retained.diagrams[0];
+
+  assert.equal(diagram?.sourceText, mermaid);
+  assert.ok(diagram?.parseError);
+  assert.equal(diagram?.nodes.length, 0);
+  assert.deepEqual(retained.coverage, []);
+
+  const invalidFallback = retainedDiagrams("a".repeat(36), [{ title: "x".repeat(121), kind: "system", mermaid: "flowchart LR\n  A --> B", citations: [] }]);
+  assert.deepEqual(invalidFallback.diagrams, []);
+  assert.equal(invalidFallback.coverage.length, 1, "a diagram that cannot fit even as source is reported without aborting artifact retention");
+});
 
 function initializeRepo(path: string) {
   execFileSync("git", ["init", "-q"], { cwd: path });

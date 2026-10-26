@@ -560,3 +560,14 @@ test("sealed state from before the repository brief, with a legacy previousHead 
     assert.deepEqual(read.briefs, []);
   } finally { await resumed.close(); }
 });
+
+test("sourceChanged queues a refresh only for enabled workspaces that contain the checkout", { timeout: 20000 }, async t => {
+  const s = setup(t, { adapter: { context: async root => sampleContext(root) } });
+  s.runtime.sourceChanged("repo");
+  assert.equal(s.runtime.read("workspace").maintenance.state, "disabled");
+  s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true } });
+  s.runtime.sourceChanged("other-project");
+  assert.notEqual(s.runtime.read("workspace").maintenance.state, "queued");
+  s.runtime.sourceChanged("repo");
+  await waitUntil(() => s.runtime.read("workspace").components.length === 2);
+});

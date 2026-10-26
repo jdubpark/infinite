@@ -204,6 +204,16 @@ export class UnderstandingRuntime {
     });
   }
 
+  /** Queues a refresh for each enabled workspace containing the checkout after new work reached its working tree. */
+  sourceChanged(projectId: string): void {
+    let list: ReturnType<UnderstandingRuntimeOptions["groups"]["list"]>;
+    try { list = this.options.groups.list(); } catch { return; }
+    for (const group of list.groups) {
+      if (!group.repos.some(repo => repo.projectId === projectId || repo.checkouts.some(checkout => checkout.projectId === projectId))) continue;
+      try { if (this.options.catalog.read(group.id).policy.enabled) this.refresh(group.id); } catch { /* A workspace that cannot refresh now is picked up by the timer. */ }
+    }
+  }
+
   refresh(workspaceId: string): KnowledgeMaintenanceResult {
     this.group(workspaceId);
     const maintenance = this.workspace(workspaceId).maintenance;

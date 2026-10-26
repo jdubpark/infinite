@@ -133,7 +133,8 @@ export function createApp(config: Config, key: Buffer) {
   const startsInFlight = new Map<string, number>();
   const projectFileChanges = new Set<string>();
   const projectConfigChanges = new Set<string>();
-  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix });
+  let sourceChanged: (projectId: string) => void = () => {};
+  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: id => sourceChanged(id) });
   /**
    * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
    * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
@@ -157,7 +158,7 @@ export function createApp(config: Config, key: Buffer) {
   const readings = new Readings(config, key, manager, summarizer);
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
-    onMerged: id => void projectSource.refresh(id).catch(() => {}),
+    onMerged: id => { void projectSource.refresh(id).catch(() => {}); sourceChanged(id); },
   });
   const usage = new UsageService(config, key, manager);
   const balances = new BalanceService(config.usage?.accounts ?? {});
@@ -301,6 +302,7 @@ export function createApp(config: Config, key: Buffer) {
   repositoryBriefings?.useUsage(usage);
   const understandingCatalog = new UnderstandingCatalog({ config, key, groups: projectGroups });
   const understandingRuntime = new UnderstandingRuntime({ config, key, groups: projectGroups, catalog: understandingCatalog, adapter: createUnderstandingAdapter(config) });
+  sourceChanged = id => understandingRuntime.sourceChanged(id);
   const understandingBehaviors = new UnderstandingBehaviorService({ config, key, groups: projectGroups, catalog: understandingCatalog, runtime: understandingRuntime });
   const understanding = new UnderstandingService({ config, key, manager, groups: projectGroups, missions, teams, goals, briefings: repositoryBriefings,
     knowledge: { read: workspaceId => ({ schemaVersion: 1, catalog: understandingCatalog.read(workspaceId), ...understandingRuntime.read(workspaceId) }) },

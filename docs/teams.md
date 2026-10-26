@@ -283,6 +283,8 @@ member's clone can be removed earlier, after its result was integrated and
 place and keeps a clone that a replacement member still uses as its working
 directory.
 
+Removal also waits for head publication; see [Head publication](#head-publication).
+
 The run record, events, reports, and receipts remain after merged, no-change,
 ready-for-review, and blocked workspaces are removed. Cancelled runs are deleted
 whole after their settle window. Started and completed removals are recorded as
@@ -309,6 +311,45 @@ does not wait for them. An active team cannot be deleted.
 When storage falls below `teams.storageFloor`, new runs are refused before their
 workspaces are created. See the configured reason in the API response and free
 space before retrying.
+
+## Head publication
+
+The host publishes each integrated head to GitHub, so the work survives workspace
+removal and disk loss. The target is the run's pinned delivery repository
+(`run.delivery.repository`), or else the project's GitHub source repository. With
+neither, nothing is published. The URL is `https://github.com/OWNER/REPO.git`;
+`source.remoteOverrides` can override it per project.
+
+The host runs one operation through `teams.commandPrefix`, from the run's
+integration workspace:
+
+```sh
+git push https://github.com/OWNER/REPO.git FULL_COMMIT_SHA:refs/heads/RUN_BRANCH
+```
+
+Publication runs after every accepted integration, before any reviewer or delivery
+member starts. Blocked and cancelled runs publish before retention removes their
+workspace. Merged and no-change runs need no publication, and neither does a run
+whose workspace was already removed or is missing, since no head is left to push.
+
+A failed push is retried after 1 minute, doubling per attempt up to one hour. The
+run does not block: review and delivery wait, and the run continues on its own once
+GitHub accepts the head. Each failure category is recorded once in run history, and
+after the third failed attempt for a head the history says that review and delivery
+are waiting on GitHub access. Owner removal and owner delivery reconciliation refuse
+with `head-not-published` while the head is unpublished. Git output, URLs and tokens
+are never stored.
+
+If GitHub rejects the push as non-fast-forward, the host leaves that remote branch
+untouched and publishes the head as `RUN_BRANCH-` plus the first eight hex
+characters of the SHA. The host never deletes or force-updates a remote branch.
+
+The delivery prompt says the host already published the reviewed head, so a remote
+branch already at that commit is the expected unchanged head. That host publication
+is not a delivery: with no pull request and a moved base, the delivery member reports
+the `no-publication` disposition, so clean-base recovery still applies. Its new head
+then publishes to a SHA-suffixed sibling branch. Set `teams.publishHeads` to `false`
+to disable publication.
 
 ## Optional provider-side delivery
 
@@ -1329,6 +1370,12 @@ GitHub-tracked sources add these operations. The host runs each through
   on the base commit, and, for a continuation, `fetch --no-tags -- MIRROR_PATH SHA`
   of the current mirror head into the parent run's integration checkout so the
   host can tell whether that run is behind the base.
+- in a team run's integration checkout: `push` of the exact commit SHA to
+  `refs/heads/RUN_BRANCH` on the GitHub URL, with no force, delete or implicit
+  refspec. See [Head publication](#head-publication).
+
+`teams.publishHeads` (boolean, default `true`) controls head publication. Set it
+to `false` to disable it.
 
 Nothing new is needed for `--delivery pr`. The delivery member pushes from its
 member clone with its own tools, as it does for `merge`.

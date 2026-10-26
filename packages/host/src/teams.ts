@@ -9,8 +9,8 @@ import { TeamStopRefused, type Manager } from "./manager.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { PROVIDER_NAMES, recoveryTurnEnd, type Prompt, type SignalData } from "@infinite/attention";
-import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION } from "./team-types.js";
-import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamPrompt } from "./team-prompts.js";
+import { createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamContinueSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamParallelismSchema, teamReportEnvelopeSchema, type CreateTeam, type TeamAssignment, type TeamBrief, type TeamContinue, type TeamContinuation, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryOutcome, type TeamPermissionRecoveryRequest, type TeamPermissionRecoveryStep, type TeamPermissionRecoveryView, type TeamPublication, type TeamPublicationCategory, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, DEFAULT_TEAM_RETENTION } from "./team-types.js";
+import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstructions, retargetPrompt, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
@@ -18,8 +18,9 @@ import { teamUsage } from "./team-usage.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
 import type { Readings } from "./readings.js";
+import { mirrorRemoteUrl } from "./project-source.js";
 import type { ProjectSourceService } from "./project-source.js";
-import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, removeMemberWorkspace, removeTeamWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
@@ -330,6 +331,8 @@ const assignment = (member: TeamMember): TeamAssignment => ({ runId: member.runI
   ...(member.verificationRefused ? { verificationRefused: true } : {}) });
 
 /** Durable orchestration; reports describe agent claims, configured checks describe host evidence. */
+/** Delivery evidence may name the run branch (recorded before publication) or the branch the host published the head to. */
+function deliveryBranchMatches(run: TeamRun, branch: string) { return branch === run.branch || branch === teamDeliveryBranch(run); }
 export class TeamService {
   private readonly records = new Map<string, Stored>();
   private readonly retiredRunIds = new Set<string>();
@@ -341,6 +344,9 @@ export class TeamService {
   private readonly commands = new Map<string, AbortController>();
   private readonly removingRuns = new Set<string>();
   private readonly removalTasks = new Set<Promise<void>>();
+  private readonly publishingRuns = new Set<string>();
+  private readonly publicationTasks = new Set<Promise<void>>();
+  private readonly publicationControllers = new Map<string, AbortController>();
   private readonly removalWaiters: Array<() => void> = [];
   private activeRemovals = 0;
   private readonly permissionPromptFirstSeen = new Map<string, number>();
@@ -723,6 +729,91 @@ export class TeamService {
     if (this.hasPendingPreparationFrom(stored))
       throw new TeamError(409, "team-in-use", "Another run is preparing from this run's workspace; retry removal after preparation settles.");
   }
+  private publishHeadsEnabled() {
+    const teams = this.config.teams as (NonNullable<Config["teams"]> & { publishHeads?: boolean }) | undefined;
+    return teams?.publishHeads !== false;
+  }
+  private publicationTarget(stored: Stored) {
+    if (!this.publishHeadsEnabled()) return undefined;
+    const { run } = stored, project = this.config.projects.find(item => item.id === run.projectId);
+    const repository = run.delivery?.repository ?? (project?.source?.mode === "github" ? project.source.repository : undefined);
+    if (!repository) return undefined;
+    return { repository, remoteUrl: mirrorRemoteUrl({ repository }, this.config.source?.remoteOverrides?.[run.projectId]) };
+  }
+  private needsPublication(stored: Stored) {
+    const { run } = stored, target = this.publicationTarget(stored);
+    // A removed or lost workspace has no head left to push, so it must not hold retention or owner removal.
+    return Boolean(target && run.headCommit && run.headCommit !== run.baseCommit && !["merged", "no-change"].includes(run.status) &&
+      !(run.publication?.commit === run.headCommit && run.publication.repository === target.repository) &&
+      !run.workspaceRemovedAt && filesystemEntryExists(run.workspace));
+  }
+  /** Review and delivery wait for the published head; a failing push keeps retrying instead of blocking, so the run continues once GitHub accepts it. */
+  private publicationGate(stored: Stored, role: TeamMember["role"]) {
+    if ((role !== "reviewer" && role !== "delivery") || !this.needsPublication(stored)) return false;
+    this.startPublication(stored);
+    return true;
+  }
+  private startPublication(stored: Stored) {
+    const { run } = stored, target = this.publicationTarget(stored), commit = run.headCommit;
+    // Pushing a fixed commit only reads objects, so it may overlap queued workspace operations, including intents retained after a crash.
+    if (!target || !commit || !this.needsPublication(stored) || this.publishingRuns.has(run.id)) return false;
+    const now = this.options?.now?.() ?? Date.now();
+    const failure = run.publication?.failure;
+    if (failure?.commit === commit && now < Date.parse(failure.retryAt)) return false;
+    const id = run.id, runBranch = run.branch, controller = new AbortController();
+    this.publishingRuns.add(id);
+    this.publicationControllers.set(id, controller);
+    let task: Promise<void>;
+    task = (async () => {
+      let outcome: Awaited<ReturnType<typeof publishTeamHead>> = { published: false, category: "other" };
+      let branch = runBranch, diverged = false;
+      try {
+        outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, runBranch, this.config.teams?.commandPrefix, controller.signal);
+        if (!outcome.published && outcome.category === "rejected") {
+          branch = `${runBranch}-${commit.slice(0, 8)}`;
+          outcome = await publishTeamHead(run.workspace, target.remoteUrl, commit, branch, this.config.teams?.commandPrefix, controller.signal);
+          diverged = outcome.published;
+        }
+      } catch {
+        outcome = { published: false, category: "other" };
+      }
+      await this.enqueue(() => {
+        if (this.records.get(id) !== stored) return;
+        const previousPublication = run.publication, previousEvents = run.events.slice();
+        const at = this.retentionNow();
+        if (outcome.published) {
+          run.publication = { repository: target.repository, branch, commit, publishedAt: at };
+          this.event(stored, diverged
+            ? `Published head ${commit.slice(0, 12)} to GitHub ${target.repository} ${branch}; GitHub's run branch had diverged, so the head was published as the sibling branch.`
+            : `Published head ${commit.slice(0, 12)} to GitHub ${target.repository} ${branch}.`);
+        } else {
+          const previous = previousPublication?.repository === target.repository ? previousPublication : undefined;
+          const attempts = previous?.failure?.commit === commit ? previous.failure.attempts + 1 : 1;
+          const retryMs = Math.min(60_000 * 2 ** (attempts - 1), 60 * 60_000);
+          run.publication = {
+            repository: target.repository,
+            branch: previous?.branch ?? runBranch,
+            ...(previous?.commit ? { commit: previous.commit } : {}),
+            ...(previous?.publishedAt ? { publishedAt: previous.publishedAt } : {}),
+            failure: { commit, category: outcome.category, attempts, at, retryAt: new Date(Date.parse(at) + retryMs).toISOString() },
+          };
+          const event = `Could not publish head ${commit.slice(0, 12)} to GitHub (${outcome.category}); the head is only on the host until a retry succeeds.`;
+          if (!run.events.some(item => item.text === event)) this.event(stored, event);
+          if (attempts === 3) this.event(stored, `Head ${commit.slice(0, 12)} failed to publish to GitHub ${target.repository} three times. Review and delivery wait, and the host keeps retrying up to hourly; check the GitHub App's access to that repository.`);
+        }
+        try { this.save(stored); }
+        catch (error) { run.publication = previousPublication; run.events = previousEvents; throw error; }
+      });
+    })().catch(() => {
+      console.warn("Could not record the result of a background team head publication.");
+    }).finally(() => {
+      this.publishingRuns.delete(id);
+      this.publicationControllers.delete(id);
+      this.publicationTasks.delete(task);
+    });
+    this.publicationTasks.add(task);
+    return true;
+  }
   private persistRetiredRunId(id: string) {
     const ids = [...this.retiredRunIds].filter(item => item !== id);
     ids.push(id);
@@ -772,6 +863,7 @@ export class TeamService {
   removeRun(id: string): Promise<TeamView> {
     return this.enqueue(async () => {
       const stored = this.record(id), run = stored.run;
+      if (this.needsPublication(stored)) throw new TeamError(409, "head-not-published", "The integrated head must be published to GitHub before this run can be removed.");
       if (this.removingRuns.has(id)) throw new TeamError(409, "team-operation-running", "A background workspace removal is still running. Retry deletion after it settles.");
       this.assertRunRetentionSafe(stored);
       if (!(["cancelled", "merged", "no-change"].includes(run.status) && await this.membersSettled(stored)))
@@ -1063,6 +1155,10 @@ export class TeamService {
       if (this.replay(stored, "reconcile-delivery", body)) return this.view(stored);
       if (body.revision !== run.revision) throw new TeamError(409, "stale-team-revision", "The team changed. Refresh it before reconciling delivery.");
       if (run.status === "cancelled") throw new TeamError(409, "team-cancelled", "This team has been cancelled.");
+      if (this.needsPublication(stored)) {
+        this.startPublication(stored);
+        throw new TeamError(409, "head-not-published", "The reviewed head is still being published to GitHub. Retry reconciliation after it is published.");
+      }
       if (run.linearTracking || run.linear) {
         const refreshed = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
         const tracking = this.linear?.getTeam(run.id) ?? refreshed;
@@ -1094,7 +1190,7 @@ export class TeamService {
         pending.source.memberId === previous?.memberId && pending.source.memberId === attempt?.memberId && pending.source.cwd === previous?.cwd &&
         pending.source.baseCommit === run.headCommit && pending.source.headCommit === run.headCommit && previous?.report?.kind === "delivery-reconciliation" &&
         previous.report.disposition === "no-publication" && previous.report.repository === run.delivery?.repository &&
-        previous.report.branch === run.branch && previous.report.headCommit === run.headCommit && previous.report.remoteHeadCommit === undefined &&
+        deliveryBranchMatches(run, previous.report.branch) && previous.report.headCommit === run.headCommit && previous.report.remoteHeadCommit === undefined &&
         previous.report.pullRequestUrl === undefined && previous.report.baseHeadCommit !== run.baseCommit && run.deliveryRecovery?.revision === run.revision &&
         run.deliveryRecovery.headCommit === run.headCommit && run.deliveryRecovery.policyHash === digest(run.delivery) &&
         run.deliveryRecovery.sourceMemberId === previous.memberId && run.deliveryRecovery.disposition === "no-publication" &&
@@ -1105,7 +1201,7 @@ export class TeamService {
       if (failedPendingEligible && recoveryAttempts >= automaticRecoveryLimit)
         throw new TeamError(409, "delivery-recovery-exhausted", "The team exhausted its delivery recovery allowance. Its failed operation and remote report remain retained.");
       const retainedFailure = previous?.report?.kind === "blocked" || Boolean(reconciliation && reconciliation.disposition !== "pull-request" &&
-        reconciliation.repository === run.delivery?.repository && reconciliation.branch === run.branch && reconciliation.headCommit === run.headCommit);
+        reconciliation.repository === run.delivery?.repository && deliveryBranchMatches(run, reconciliation.branch) && reconciliation.headCommit === run.headCommit);
       if (!attempt || !previous || previous.role !== "delivery" || previous.revision !== run.revision || previous.status !== "stopped" ||
           !retainedFailure || attempt.revision !== run.revision || !run.headCommit ||
           attempt.headCommit !== run.headCommit || previous.baseCommit !== run.headCommit || !run.branch)
@@ -1142,7 +1238,7 @@ export class TeamService {
       const feedback = [
         "Owner-authorized reconciliation of an interrupted delivery attempt.",
         `Owner reconciliation instructions: ${body.text}`,
-        `Prior delivery member: ${previous.memberId}; prior revision: ${previous.revision}; pinned head: ${priorAttempt.headCommit}; branch: ${run.branch}.`,
+        `Prior delivery member: ${previous.memberId}; prior revision: ${previous.revision}; pinned head: ${priorAttempt.headCommit}; branch: ${teamDeliveryBranch(run)}.`,
         `Prior ${priorReport?.kind === "blocked" ? "blocked" : "delivery"} report (preserved verbatim in the original member record): ${JSON.stringify(priorReport)}`,
         ...(failedReceipt ? [`The failure of pending operation ${failedReceipt.pendingId} (${failedReceipt.failure.code}, ${failedReceipt.failure.at}) is preserved in deliveryOperationReconciliations.`,
           `Operator process-quiescence claim, not host-verified: ${JSON.stringify(failedReceipt.attestation.text)}`,
@@ -1157,7 +1253,7 @@ export class TeamService {
           run.deliveryOperationReconciliations.push(failedReceipt);
           delete stored.pending;
         }
-        this.event(stored, `Owner authorized a fresh delivery reconciliation at ${head} on ${run.branch}; prior attempt ${previous.memberId} and its delivery report remain in team history.${failedReceipt ? ` Failed operation ${failedReceipt.pendingId} (${failedReceipt.failure.code}, ${failedReceipt.failure.at}) was preserved. Operator claim, not host-verified: ${JSON.stringify(failedReceipt.attestation.text.slice(0, 500))}` : ""}`);
+        this.event(stored, `Owner authorized a fresh delivery reconciliation at ${head} on ${teamDeliveryBranch(run)}; prior attempt ${previous.memberId} and its delivery report remain in team history.${failedReceipt ? ` Failed operation ${failedReceipt.pendingId} (${failedReceipt.failure.code}, ${failedReceipt.failure.at}) was preserved. Operator claim, not host-verified: ${JSON.stringify(failedReceipt.attestation.text.slice(0, 500))}` : ""}`);
         // prepareMember persists the receipt and replacement member intent together, before any copy work.
         this.prepareMember(stored, "delivery", undefined, feedback, member => {
           stored.deliveryAttempt = { memberId: member.memberId, revision: member.revision, headCommit: head };
@@ -1522,13 +1618,17 @@ export class TeamService {
     };
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
   }
-  close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const controller of this.commands.values()) controller.abort(); }
+  close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); }
   /** Settles once work queued before now has finished, so a caller can stop sessions it may still launch. */
   async idle() {
     await this.serial;
     // Drain a bounded number of removal generations; retries queued by later ticks are not "work queued before now".
     for (let pass = 0; pass < 5 && this.removalTasks.size; pass++) {
       await Promise.allSettled([...this.removalTasks]);
+      await this.serial;
+    }
+    for (let pass = 0; pass < 5 && this.publicationTasks.size; pass++) {
+      await Promise.allSettled([...this.publicationTasks]);
       await this.serial;
     }
     await this.serial;
@@ -1739,6 +1839,7 @@ export class TeamService {
   }
   private async startAutomaticDeliveryRecovery(stored: Stored, trackingReady: boolean) {
     const { run } = stored, recovery = run.recovery, delivery = run.deliveryRecovery;
+    if (this.publicationGate(stored, "delivery")) return true;
     const attempt = stored.deliveryAttempt;
     const previous = attempt && run.members.find(member => member.memberId === attempt.memberId);
     if (!recovery || !delivery || !attempt || !previous || previous.role !== "delivery" || previous.report?.kind !== "blocked" ||
@@ -1762,7 +1863,7 @@ export class TeamService {
       const feedback = [
         `Automatic delivery reconciliation ${delivery.attempts} of ${automaticRecoveryLimit} under the unchanged owner policy.`,
         `Prior delivery attempt ${previous.memberId} reported blocked at revision ${previous.revision}, head ${head}. Its full report remains in team history: ${JSON.stringify(previous.report)}`,
-        `Before any write or publication, inspect the exact remote repository ${run.delivery!.repository}, branch ${run.branch}, base ${run.delivery!.baseBranch}, and any pull request for this head. Reuse existing matching work and never create a duplicate PR.`,
+        `Before any write or publication, inspect the exact remote repository ${run.delivery!.repository}, branch ${teamDeliveryBranch(run)}, base ${run.delivery!.baseBranch}, and any pull request for this head. Reuse existing matching work and never create a duplicate PR.`,
         `If no publication exists, report the structured delivery-reconciliation disposition with exact repository, branch, reviewed head, and current base head. A moved base with no publication may return to implementation for a fresh review. An owned branch or open PR must keep its exact remote head; do not rewrite or force-push it.`,
         `If the same capability is still missing, report blocked. Do not switch tools, credentials, or routes, or request broader permissions.`,
       ].join("\n\n");
@@ -2070,6 +2171,7 @@ export class TeamService {
         }
       }
 
+      if (this.needsPublication(stored)) this.startPublication(stored);
       if (run.workspaceRemovedAt) {
         if (filesystemEntryExists(runDirectory)) {
           if (!this.removalBackoffActive(retention, "workspaces", now)) removeRunInBackground(run.workspaceRemovedAt);
@@ -2094,6 +2196,7 @@ export class TeamService {
         return;
       }
       if (retentionMs === undefined || elapsed < retentionMs || !(await this.membersSettled(stored))) return;
+      if (this.needsPublication(stored)) { this.startPublication(stored); return; }
 
       run.workspaceRemovedAt = this.retentionNow();
       const startedAt = run.workspaceRemovedAt, previousEvents = run.events.slice();
@@ -2114,6 +2217,7 @@ export class TeamService {
     const run = stored.run;
     await this.retire(stored);
     if (!this.records.has(run.id)) return;
+    this.startPublication(stored);
     try {
       const tracking = this.linear?.updateTeam(run, run.linearTracking === true) ?? run.linear;
       if (JSON.stringify(run.linear) !== JSON.stringify(tracking)) { run.linear = tracking; this.save(stored); }
@@ -2380,7 +2484,10 @@ export class TeamService {
         } else {
           run.status = "ready-for-review"; run.reason = undefined;
           if (run.recovery) run.recovery.status = "complete";
-          this.event(stored, "The reviewer approved the integrated change and configured checks passed. Ready for human review; nothing was published."); this.save(stored);
+          const publication = run.publication?.commit === run.headCommit ? run.publication : undefined;
+          this.event(stored, publication
+            ? `The reviewer approved the integrated change and configured checks passed. Ready for human review. The host published the integration head to GitHub ${publication.repository} ${publication.branch}.`
+            : "The reviewer approved the integrated change and configured checks passed. Ready for human review; nothing was published."); this.save(stored);
         }
       }
     } catch (error) { this.block(stored, error); }
@@ -2888,7 +2995,7 @@ export class TeamService {
         stopRecovery(decision.reason!);
         return false;
       }
-      deliveryAuthority = { policy: run.delivery!, branch: run.branch, headCommit: run.headCommit!, review: run.review!,
+      deliveryAuthority = { policy: run.delivery!, branch: teamDeliveryBranch(run), headCommit: run.headCommit!, review: run.review!,
         checks: run.checks.filter(check => check.revision === run.revision).map(({ command, status, exitCode }) => ({ command, status, exitCode })) };
     }
     const permissionRecoveryHistory = this.permissionRecoveryHistory(run);
@@ -3329,11 +3436,11 @@ export class TeamService {
     const provider = modelProfile?.provider ?? run.provider;
     const configuredProject = this.config.projects.find(project => project.id === run.projectId)?.team;
     const permissionRecoveryHistory = this.permissionRecoveryHistory(run);
-    let instructions = prompt === undefined ? teamPrompt(run, role, task, undefined, provider, modelProfile, configuredProject, permissionRecoveryHistory) : refreshReportingInstructions(prompt, provider);
+    let instructions = prompt === undefined ? teamPrompt(run, role, task, undefined, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled()) : refreshReportingInstructions(prompt, provider);
     // Carried questions and recovery notes can outgrow an otherwise bounded prompt.
     // Keep them complete in the context file and rebuild the role's current authority.
     if (role !== "permission-coordinator" && Buffer.byteLength(instructions) > 80 * 1024)
-      instructions = teamPrompt(run, role, task, prompt, provider, modelProfile, configuredProject, permissionRecoveryHistory);
+      instructions = teamPrompt(run, role, task, prompt, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled());
     if (Buffer.byteLength(instructions) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
     return { runId: run.id, memberId, revision: run.revision, role, ...(role === "project-manager" && !run.establishChecks && !run.verification ? { verificationRefused: true as const } : {}), provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: instructions, ...(prompt ? { contextFeedback: prompt } : {}), cursor: 0, stopRequestId: randomUUID() };
   }
@@ -3460,7 +3567,7 @@ export class TeamService {
     this.operation(stored, "result", signal => editing ? assertMemberScope(member.cwd, member.baseCommit, task ? task.paths : run.goal?.allowedPaths, prefix, signal) : assertMemberReadOnly(member.cwd, member.baseCommit, prefix, signal), () => {
       // The prompt keeps its feedback and user answers. An unrecognized prompt is rebuilt with its answers.
       const configuredProject = this.config.projects.find(project => project.id === run.projectId)?.team;
-      const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback, configuredProject, this.permissionRecoveryHistory(run)),
+      const carried = retargetPrompt(member.prompt, { provider: fallback.provider, profile: fallback }) ?? [teamPrompt(run, member.role, task ?? scout, undefined, fallback.provider, fallback, configuredProject, this.permissionRecoveryHistory(run), this.publishHeadsEnabled()),
         ...run.decisions.filter(decision => decision.answer && run.members.some(prior => prior.memberId === decision.memberId && prior.role === member.role && prior.taskId === member.taskId && prior.revision === member.revision)).map(decision => `${decision.answeredBy === "coordinator" ? "Mission coordinator" : "User"} answered: ${decision.answer}`)].join("\n\n");
       const next = this.newMember(run, member.role, member.cwd, member.baseCommit, member.taskId, `${carried}\n\n${note}`, fallback);
       next.contextFeedback = [member.contextFeedback ?? member.prompt, note].filter(Boolean).join("\n\n");
@@ -3478,13 +3585,14 @@ export class TeamService {
     });
   }
   private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, onPrepared?: (member: TeamMember) => void) {
+    if (this.publicationGate(stored, role)) return;
     const run = stored.run, member = this.newMember(run, role, "", run.headCommit!, task?.id);
     const continuationHead = role === "project-manager" && stored.continuationHead?.revision === run.revision
       ? structuredClone(stored.continuationHead) : undefined;
     if (feedback) {
       member.contextFeedback = feedback;
       member.prompt = teamPrompt(run, role, task, feedback, member.provider ?? run.provider, member.modelProfile,
-        this.config.projects.find(project => project.id === run.projectId)?.team, this.permissionRecoveryHistory(run));
+        this.config.projects.find(project => project.id === run.projectId)?.team, this.permissionRecoveryHistory(run), this.publishHeadsEnabled());
     }
     if (role !== "permission-coordinator") run.status = role === "project-manager" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
     this.operation(stored, "member", async signal => {
@@ -3549,6 +3657,15 @@ export class TeamService {
     this.save(stored);
   }
   private async launch(stored: Stored, member: TeamMember) {
+    if (this.publicationGate(stored, member.role)) return;
+    // A delivery member queued before the head was published lacks the host-publication instructions. Rebuild it only
+    // before its launch request exists, so a replayed launch keeps the request it was created with.
+    const run = stored.run, publication = run.publication;
+    if (member.role === "delivery" && !this.hasLaunch(member) && publication && publication.commit === run.headCommit &&
+        publication.repository === run.delivery?.repository && !member.prompt.includes(`The host has already published ${run.headCommit}`)) {
+      member.prompt = teamPrompt(run, "delivery", undefined, member.contextFeedback, member.provider ?? run.provider, member.modelProfile,
+        this.config.projects.find(project => project.id === run.projectId)?.team, this.permissionRecoveryHistory(run), this.publishHeadsEnabled());
+    }
     this.assertBudget(stored.run);
     this.assertRunPath(stored, member.cwd);
     // Recover an already-created assignment even while Linear is unavailable. A new
@@ -3717,7 +3834,7 @@ export class TeamService {
     if (report.kind === "delivery-reconciliation") {
       const { run } = stored;
       const attempt = stored.deliveryAttempt;
-      if (!run.delivery || report.repository !== run.delivery.repository || report.branch !== run.branch ||
+      if (!run.delivery || report.repository !== run.delivery.repository || !deliveryBranchMatches(run, report.branch) ||
           report.headCommit !== run.headCommit || member.baseCommit !== run.headCommit || attempt?.memberId !== member.memberId ||
           attempt.revision !== run.revision || attempt.headCommit !== run.headCommit ||
           run.deliveryRecovery && (run.deliveryRecovery.status !== "planning" || run.deliveryRecovery.revision !== run.revision ||
@@ -3845,7 +3962,7 @@ export class TeamService {
           const recovery = run.deliveryRecovery;
           const inspected = recovery?.lastEvidenceHash && run.members.some(prior => prior.role === "delivery" && prior.status === "stopped" &&
             prior.revision === run.revision && prior.report?.kind === "delivery-reconciliation" && prior.report.headCommit === report.headCommit &&
-            prior.report.repository === run.delivery!.repository && prior.report.branch === run.branch &&
+            prior.report.repository === run.delivery!.repository && deliveryBranchMatches(run, prior.report.branch) &&
             deliveryInspectionHash(prior.report) === recovery.lastEvidenceHash);
           if (recovery && recovery.attempts > 0 && recovery.status !== "complete" && !inspected)
             throw new TeamError(409, "delivery-reconciliation-required", "An automatic recovery requires structured remote evidence before a delivery repair can change the reviewed head.");

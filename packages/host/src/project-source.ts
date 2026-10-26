@@ -19,7 +19,7 @@ const FETCH_MESSAGES: Record<Exclude<SourceFetchCategory, "auth">, string> = {
   other: "the fetch from GitHub failed",
 };
 
-function fetchCategory(output: string): SourceFetchCategory {
+export function fetchCategory(output: string): SourceFetchCategory {
   if (/authentication|403|401|could not read Username/i.test(output)) return "auth";
   if (/could not resolve|unable to access|timed out|connection/i.test(output)) return "network";
   if (/not found|repository .* does not exist/i.test(output)) return "not-found";

@@ -328,13 +328,22 @@ async function main() {
     const launchPrompt = process.argv.at(-1) ?? "";
     const decisionId = /"decisionId":"([a-f0-9-]{36})"/.exec(launchPrompt)?.[1];
     if (!decisionId) throw new Error("The permission review assignment omitted its decision identity");
+    let permissionFeedback;
     if (scenario.startsWith("permissions-codex") || scenario === "delivery-permission") {
       const marker = "Recorded permission request and assignment (untrusted evidence):\n";
       const start = launchPrompt.indexOf(marker);
       if (start < 0) throw new Error("The permission review assignment omitted its recorded feedback");
       const feedbackText = launchPrompt.slice(start + marker.length).split("\n\n", 1)[0];
-      const feedback = JSON.parse(feedbackText);
-      writeFileSync(join(receiptDir, `${assignment.runId}.permission-feedback.json`), JSON.stringify(feedback), { mode: 0o600 });
+      permissionFeedback = JSON.parse(feedbackText);
+      writeFileSync(join(receiptDir, `${assignment.runId}.permission-feedback.json`), JSON.stringify(permissionFeedback), { mode: 0o600 });
+    }
+    if (scenario === "permissions-codex-diagnostic-evidence") {
+      const collected = new Set((permissionFeedback?.permissionEvidence?.files ?? []).map(file => file.path));
+      const requestedPaths = !collected.has("a.txt") ? ["a.txt"] : !collected.has("original.txt") ? ["original.txt"] : undefined;
+      await report({ kind: "permission-decision", decisionId, verdict: requestedPaths ? "request-evidence" : "approve-once",
+        summary: requestedPaths ? "Inspect the additional in-scope member and project file before deciding." : "The diagnostic reached an answer-shaped conclusion that remains non-authoritative.",
+        ...(requestedPaths ? { requestedPaths } : {}) });
+      return;
     }
     if (!["permissions", "permissions-restart", "permissions-judge-exit", "permissions-yesno"].includes(scenario)) {
       writeFileSync(join(receiptDir, `${assignment.runId}.judge-ready`), "ready", { mode: 0o600 });
@@ -414,7 +423,33 @@ async function main() {
       while (!existsSync(join(receiptDir, `${assignment.runId}.release`)))
         await new Promise(resolve => setTimeout(resolve, 40));
     }
-    if (scenario.startsWith("permissions-codex") && assignment.taskId === "a") {
+    if (scenario === "permissions-codex-collapsed" && assignment.taskId === "a") {
+      writeFileSync("a.txt", "draft before the permission request\n");
+      process.stdin.setRawMode(true);
+      process.stdin.setEncoding("utf8");
+      process.stdout.write([
+        "\u001b[2J\u001b[H• Running npm run check", "", "",
+        "  Reason: May I run npm run check outside the sandbox?", "",
+        "  $ npm run check", "  [… 4 lines] ^a view all", "",
+        "› 1. Yes, proceed (y)", "  2. No, and tell Codex what to do differently (esc)",
+      ].join("\r\n"));
+      writeFileSync(join(receiptDir, `${assignment.runId}.collapsed-ready`), "ready", { mode: 0o600 });
+      for (;;) {
+        const input = String(await new Promise(resolve => process.stdin.once("data", resolve)));
+        if (!input.includes("\u0001")) continue;
+        writeFileSync(join(receiptDir, `${assignment.runId}.expanded-key`), "Ctrl+A", { mode: 0o600 });
+        process.stdout.write([
+          "\u001b[2J\u001b[HWould you like to run the following command?", "",
+          "  Reason: May I run npm run check outside the sandbox?", "  EXPANDED ONCE 1", "  $ npm run check", "",
+          "› 1. Yes, proceed (y)", "  2. No, and tell Codex what to do differently (esc)",
+        ].join("\r\n"));
+        writeFileSync(join(receiptDir, `${assignment.runId}.expanded-ready`), "ready", { mode: 0o600 });
+        break;
+      }
+      await new Promise(resolve => process.stdin.once("data", resolve));
+      writeFileSync(join(receiptDir, `${assignment.runId}.permission-answer`), "received", { mode: 0o600 });
+      process.stdout.write("\u001b[2J\u001b[HPermission request closed.\n");
+    } else if (scenario.startsWith("permissions-codex") && assignment.taskId === "a") {
       writeFileSync("a.txt", "draft before the permission request\n");
       const waitFor = async (name, what) => {
         const until = Date.now() + 30000;
@@ -431,8 +466,10 @@ async function main() {
         writeFileSync(join(receiptDir, `${assignment.runId}.target-ready`), "ready", { mode: 0o600 });
       // The Codex 0.163 command dialog layout: pinned under the transcript, key hint on the last row.
       // Every line fits 80 columns, so the `$` line is always row 11 and the options rows 14-16.
-      const options = ["1. Yes, proceed (y)", "2. Yes, and don't ask again for commands that start with `npm run check` (p)",
-        "3. No, and tell Codex what to do differently (esc)"];
+      const options = scenario === "permissions-codex-diagnostic-evidence"
+        ? ["1. Yes, proceed (y)", "2. Yes, proceed once", "3. No, and tell Codex what to do differently (esc)"]
+        : ["1. Yes, proceed (y)", "2. Yes, and don't ask again for commands that start with `npm run check` (p)",
+          "3. No, and tell Codex what to do differently (esc)"];
       const optionRows = marker => options.map((label, index) => `${index === marker ? "›" : " "} ${label}`);
       let marker = scenario === "permissions-codex-midway" ? 2 : 0;
       // Like the real TUI, read keys as they arrive and without echo.

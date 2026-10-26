@@ -40,7 +40,7 @@ import { socketPath } from "./ipc.js";
 import { startHookServer, HookPayloadError, type HookReply, type HookRoute } from "./hooks.js";
 import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { missionReportEnvelopeSchema } from "./mission-types.js";
-import { permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
+import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
 import { buildLaunch } from "./launch.js";
 import { addProjectIdToLaunchEnv } from "./worker-env.js";
@@ -89,6 +89,7 @@ const terminal = new headless.Terminal({
 const snapshots = new TerminalSnapshots(terminal);
 type AnswerRequest = Extract<WorkerRequest, { op: "answer" }>;
 type TeamAnswerRequest = Extract<WorkerRequest, { op: "team-answer" }>;
+type TeamPermissionExpansionRequest = Extract<WorkerRequest, { op: "team-permission-expand" }>;
 type DeliveryRequest = Extract<WorkerRequest, { op: "input" | "raw" | "key" | "stop" }>;
 type StoredReceipt = Receipt & { digest: string; result?: AnswerResult };
 const receipts = new Map<string, StoredReceipt>();
@@ -707,7 +708,7 @@ function refreshControl(request: InputControl) {
     controller.lease.expiresAt = Date.now() + CONTROL_TTL_MS;
 }
 /** A retry identifies the intended input, not the client which currently holds control. */
-function requestDigest(request: (DeliveryRequest | AnswerRequest | TeamAnswerRequest)) {
+function requestDigest(request: (DeliveryRequest | AnswerRequest | TeamAnswerRequest | TeamPermissionExpansionRequest)) {
   const { actor: _actor, leaseId: _leaseId, ...input } = request;
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
@@ -1039,6 +1040,103 @@ async function answer(
   }
 }
 
+function validTeamPermissionExpansion(request: TeamPermissionExpansionRequest) {
+  const rawAssignment: unknown = request.assignment;
+  const expected: unknown = request.expected;
+  if (!rawAssignment || typeof rawAssignment !== "object" || Array.isArray(rawAssignment) ||
+      !expected || typeof expected !== "object" || Array.isArray(expected)) return false;
+  const assignment = rawAssignment as TeamAssignment;
+  const screen = expected as TeamPermissionExpansionRequest["expected"];
+  return typeof request.requestId === "string" && /^[a-f0-9-]{36}$/i.test(request.requestId) &&
+    request.targetSessionId === session.id &&
+    /^[a-f0-9-]{36}$/i.test(assignment.runId) && /^[a-f0-9-]{36}$/i.test(assignment.memberId) &&
+    Number.isInteger(assignment.revision) && assignment.revision > 0 &&
+    ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"].includes(assignment.role) &&
+    (assignment.taskId === undefined || typeof assignment.taskId === "string") &&
+    Number.isInteger(screen.promptId) && screen.promptId >= 1 &&
+    /^[a-f0-9]{64}$/i.test(screen.promptHash) && /^[a-f0-9]{64}$/i.test(screen.evidenceHash) &&
+    typeof screen.targetCwd === "string" && screen.targetCwd.length > 0 && screen.targetCwd.length <= 4096 &&
+    typeof screen.expiresAt === "string" && Number.isFinite(Date.parse(screen.expiresAt)) &&
+    validActor(request.actor) && typeof request.leaseId === "string" && request.leaseId.length > 0 && request.leaseId.length <= 80;
+}
+
+function expandTeamPermission(request: TeamPermissionExpansionRequest): Receipt {
+  const digest = requestDigest(request);
+  const previous = receipts.get(request.requestId);
+  if (previous) {
+    if (previous.digest !== digest) throw new Error("Request ID already belongs to different input");
+    return publicReceipt(previous);
+  }
+  if (!validTeamPermissionExpansion(request)) throw new Error("Invalid collapsed permission expansion request");
+
+  const assigned = request.assignment;
+  const expected = request.expected;
+  const sameAssignment = (left: TeamAssignment | undefined) => Boolean(left &&
+    left.runId === assigned.runId && left.memberId === assigned.memberId && left.revision === assigned.revision &&
+    left.role === assigned.role && left.taskId === assigned.taskId);
+  const assertCurrent = (pty: ReturnType<typeof spawn> | undefined) => {
+    if (state.status !== "running" || !pty || child !== pty || handoffReceipt ||
+        provider !== "codex" || session.runtime?.transport !== "pty" || session.runtime.nativeUi ||
+        !sameAssignment(session.team) || request.targetSessionId !== session.id)
+      throw new Refusal("unsupported");
+    let cwd: string;
+    try { cwd = realpathSync(session.cwd); }
+    catch { throw new Refusal("unsupported"); }
+    if (cwd !== expected.targetCwd) throw new Refusal("unsupported");
+    if (Date.parse(expected.expiresAt) <= Date.now()) throw new Refusal("prompt-changed");
+    if (request.actor.id !== `team-permission-expand:${request.requestId}` ||
+        request.actor.label !== "Team permission display expansion")
+      throw new Refusal("unsupported");
+    checkControl(request);
+
+    const prompt = attention.prompt;
+    if (attention.state !== "needs-you" || !prompt || prompt.id !== expected.promptId ||
+        prompt.hash !== expected.promptHash || permissionEvidenceHash(prompt) !== expected.evidenceHash)
+      throw new Refusal("prompt-changed");
+    const current = screenPrompt();
+    if (!current || hashOf(current.fingerprint) !== expected.promptHash || current.title !== prompt.title ||
+        current.detail !== prompt.detail ||
+        JSON.stringify(current.options) !== JSON.stringify(prompt.options) || current.pinned !== true ||
+        Boolean(current.multiSelect) !== Boolean(prompt.multiSelect))
+      throw new Refusal("prompt-changed");
+    const visible: Prompt = {
+      id: prompt.id, kind: current.kind, title: current.title, detail: current.detail,
+      options: current.options, acceptsText: current.acceptsText,
+      multiSelect: Boolean(prompt.multiSelect) || current.multiSelect, pinned: current.pinned,
+      source: "screen", hash: hashOf(current.fingerprint),
+    };
+    if (!isCollapsedPermissionPrompt(visible)) throw new Refusal("prompt-changed");
+  };
+
+  const pty = child;
+  assertCurrent(pty);
+  flush();
+  assertCurrent(pty);
+  const prompt = attention.prompt!;
+  const intent = append("input-intent", {
+    op: "team-permission-expand", requestId: request.requestId, promptId: prompt.id,
+    promptHash: expected.promptHash, evidenceHash: expected.evidenceHash,
+    targetSessionId: request.targetSessionId, assignment: request.assignment,
+    targetCwd: expected.targetCwd, expiresAt: expected.expiresAt,
+  });
+  const receipt: StoredReceipt = { requestId: request.requestId, state: "uncertain", seq: intent.seq, digest };
+  receipts.set(request.requestId, receipt);
+  try {
+    // This second check is synchronous with the sole key write: no async work can
+    // interleave a screen change, assignment change, expiry, or control takeover.
+    assertCurrent(pty);
+    pty!.write("\x01"); // Ctrl+A only reveals the collapsed command text.
+    append("input-result", { requestId: request.requestId, state: "delivered", op: "team-permission-expand" });
+    receipt.state = "delivered";
+    receipt.seq = journal.seq;
+    refreshControl(request);
+    return publicReceipt(receipt);
+  } catch (error) {
+    if (error instanceof Refusal) return publicReceipt(receipt);
+    throw error;
+  }
+}
+
 function validAnswer(request: AnswerRequest) {
   return (
     typeof request.requestId === "string" &&
@@ -1167,6 +1265,9 @@ const server = createServer((socket) => {
       } else if (request.op === "team-answer") {
         if (!validTeamAnswer(request)) throw new Error("Invalid delegated answer request");
         result = await serialize(() => answer(request));
+      } else if (request.op === "team-permission-expand") {
+        if (!validTeamPermissionExpansion(request)) throw new Error("Invalid collapsed permission expansion request");
+        result = await serialize(() => expandTeamPermission(request));
       } else {
         if (
           !["input", "raw", "key", "stop"].includes(request.op) ||

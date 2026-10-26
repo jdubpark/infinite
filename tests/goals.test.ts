@@ -11,7 +11,9 @@ import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { startLinearServer } from "./fixtures/linear-server.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { GoalService } from "../packages/host/src/goals.js";
-import { TeamError } from "../packages/host/src/teams.js";
+import { TeamError, TeamService } from "../packages/host/src/teams.js";
+import { emptyUsage } from "../packages/host/src/team-usage.js";
+import type { Manager } from "../packages/host/src/manager.js";
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const lineup: TeamLineup = {
@@ -606,6 +608,45 @@ function extensionFixture() {
     writeGoal: (extra: object = {}) => f.writeRecord("goal", goal.id, { goal, receipts: {}, fingerprint: "fixture", ...extra }),
   };
 }
+
+test("a deleted cancelled goal cycle keeps its measured usage in the goal total", async () => {
+  const f = extensionFixture();
+  let goals: GoalService | undefined;
+  let teams: TeamService | undefined;
+  try {
+    const total = { ...emptyUsage(), cost: 0.0123, tokens: { input: 10, output: 20, reasoning: 3, cacheRead: 4, cacheWrite: 5 }, messages: 2,
+      pricing: { configured: 0, catalog: 2, provider: 0, unknown: 0 } };
+    const usage: TeamView["usage"] = { total, byProfile: { light: total }, byProvider: { codex: total }, unmeasuredMembers: 1 };
+    f.run.status = "cancelled"; f.run.workspaceRemovedAt = new Date().toISOString();
+    f.run.members[0].status = "stopped";
+    const unmeasuredMember = structuredClone(f.run.members[0]);
+    unmeasuredMember.memberId = randomUUID(); unmeasuredMember.sessionId = randomUUID(); unmeasuredMember.title = "Unmeasured worker";
+    f.run.members.push(unmeasuredMember);
+    f.goal.status = "cancelled"; f.goal.activeTeamId = undefined; f.goal.cycles[0].status = "cancelled";
+    f.writeTeam(); f.writeGoal();
+
+    teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { ownerActive: () => false });
+    const getTeam = teams.get.bind(teams);
+    teams.get = id => ({ ...getTeam(id), usage });
+    goals = new GoalService(f.config, f.key, teams);
+    goals.start();
+
+    const retained = await waitFor(() => f.readRecord<{ goal: ProductGoal }>("goal", f.goal.id), value => value.goal.cycles[0].usage !== undefined, 5000);
+    assert.deepEqual(retained.goal.cycles[0].usage, { ...total, ...usage });
+    await waitFor(async () => {
+      try { teams.get(f.run.id); return false; }
+      catch (error) { return error instanceof TeamError && error.code === "team-not-found"; }
+    }, removed => removed, 5000);
+
+    const deleted = goals.get(f.goal.id);
+    assert.deepEqual(deleted.cycles[0].usage, { ...total, ...usage }, "The cycle retains its flattened totals and full rollup after its child record is removed");
+    assert.equal(deleted.cycles[0].usage?.messages, total.messages, "Existing cycle display fields remain available at the top level");
+    assert.deepEqual(deleted.usage?.total, total, "The parent total still includes the deleted cycle's measured usage");
+    assert.deepEqual(deleted.usage?.byProfile, usage.byProfile);
+    assert.deepEqual(deleted.usage?.byProvider, usage.byProvider);
+    assert.equal(deleted.usage?.unmeasuredMembers, usage.unmeasuredMembers);
+  } finally { goals?.close(); teams?.close(); f.close(); }
+});
 
 test("a persisted legacy owner capacity control is discarded instead of changing the active team", async () => {
   const f = extensionFixture();

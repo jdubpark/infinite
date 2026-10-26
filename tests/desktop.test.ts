@@ -153,6 +153,14 @@ test("resources report timestamps and session paths; running sessions fence dest
     assert.equal(before.status, 200); assert.ok(Number.isFinite(Date.parse(before.body.capturedAt)));
     assert.equal(before.body.cpu.usagePercent, null); assert.ok(before.body.memory.totalBytes > 0);
     assert.equal(before.body.disks[0].projectId, "rehearsal");
+    assert.ok(before.body.disks[0].totalInodes > 0); assert.ok(before.body.disks[0].availableInodes >= 0);
+    const stateVolume = before.body.volumes.find((volume: { label: string }) => volume.label === "state");
+    assert.ok(stateVolume); assert.equal(stateVolume.path, host.config.stateDir);
+    assert.ok(stateVolume.totalBytes > 0); assert.ok(stateVolume.availableBytes >= 0);
+    assert.ok(stateVolume.totalInodes > 0); assert.ok(stateVolume.availableInodes >= 0);
+    assert.ok(Number.isFinite(stateVolume.fullness));
+    const configuredVolumePaths = [host.config.stateDir, host.config.teams?.workspaceDir].filter(Boolean);
+    assert.ok(before.body.volumes.every((volume: { path: string }) => configuredVolumePaths.includes(volume.path)));
     const upload = await stage(host, "pending.txt", Buffer.from("pending"));
     const requestId = randomUUID();
     assert.equal((await host.fetchApi("/sessions", "owner", { requestId, provider: "demo", projectId: "rehearsal", title: "Metrics fixture" })).status, 201);

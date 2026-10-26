@@ -5,15 +5,16 @@ import { writeSealed, unseal } from "./vault.js";
 import { TeamService, TeamError, providerInputReason } from "./teams.js";
 import type { Manager } from "./manager.js";
 import type { Config } from "./types.js";
-import type { CreateTeam, TeamAssignment, TeamView } from "./team-types.js";
+import type { CreateTeam, NativeContinuation, TeamAssignment, TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
-import { missionPromptWithMessageCount, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
+import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
 import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory } from "./team-workspace.js";
+import { resumeFailed } from "./native-continuation.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -21,6 +22,11 @@ export type ProjectGroupLookup = { get(id: string): ProjectGroup };
 type Action = { requestId: string; revision: number };
 /** One coordinator session. Like a team member, it ends with one report; the host starts the next attempt when needed. */
 type Attempt = { memberId: string; sessionId: string; revision: number; prompt: string; cursor: number; stopRequestId: string; status: "queued" | "running" | "reported" | "stopped"; report?: MissionReport; startedAt?: string;
+  continuation?: NativeContinuation;
+  nativeConfirmed?: boolean;
+  resumeFailed?: boolean;
+  consumedInbox?: MissionMessage[];
+  consumedNotes?: MissionMessage[];
   /** The owner input count when this attempt's prompt was built; a result from an attempt that missed later input is not applied. */
   ownerInputs?: number;
   /** The session ended its turn or went quiet without a report; it is stopped and the next attempt is told why. */
@@ -65,6 +71,7 @@ const turnActivity = new Set(["turn-start", "tool-start", "tool-end", "prompt-op
 /** Messages delivered per coordinator attempt; the rest wait for the next attempt. */
 const messageLimit = 30;
 const timeLimitReason = "The approved time limit has expired. Active subteams were cancelled; their workspaces remain available.";
+const messageTooLargeReason = "The next coordinator message cannot fit with the mission state. Its evidence remains queued; no empty coordinator attempt was started.";
 const subtaskStatus = (status: TeamView["status"]) => teamDone.has(status) ? "done" as const : status === "blocked" ? "blocked" as const : status === "cancelled" ? "cancelled" as const : "running" as const;
 const notFound = (error: unknown) => error instanceof TeamError && error.code === "team-not-found";
 
@@ -118,6 +125,17 @@ export class MissionService {
   }
   /** The usage ledger that prices coordinator sessions; subteam usage comes from their runs. */
   useUsage(service: UsageService) { this.usage = service; }
+  ownsActiveSubteam(teamId: string) {
+    return [...this.records.values()].some(({ mission }) =>
+      !["blocked", "ready-for-review", "cancelled"].includes(mission.status) &&
+      mission.subtasks.some(subtask => subtask.teamId === teamId && ["running", "blocked"].includes(subtask.status)));
+  }
+  /** A live mission retains integration state while it still references a source subteam. */
+  retainsSubteamRun(teamId: string) {
+    return [...this.records.values()].some(({ mission }) =>
+      !["blocked", "ready-for-review", "cancelled"].includes(mission.status) &&
+      mission.subtasks.some(subtask => subtask.teamId === teamId));
+  }
   enabled() {
     const lineup = this.config.teams?.lineup;
     return Boolean(lineup && lineup.coordinator.tier === "strong" && lineup.reviewer.tier === "strong");
@@ -146,8 +164,10 @@ export class MissionService {
   private view(stored: Stored): Mission {
     const mission = structuredClone(stored.mission), profile = mission.lineup.coordinator;
     const coordinator = teamUsage(stored.attempts.map(attempt => ({ sessionId: attempt.sessionId, provider: profile.provider, modelProfile: profile })), profile.provider, this.usage).rollup;
-    const subteams = mission.subtasks.filter(subtask => subtask.teamId).map(subtask => {
-      try { return this.teams.get(subtask.teamId!).usage; } catch (error) { if (notFound(error)) return emptyRollup(); throw error; }
+    const subteams = mission.subtasks.flatMap(subtask => {
+      if (!subtask.teamId) return subtask.finalEvidence?.usage ? [subtask.finalEvidence.usage] : [];
+      try { return [this.teams.get(subtask.teamId).usage]; }
+      catch (error) { if (notFound(error)) return [subtask.finalEvidence?.usage ?? emptyRollup()]; throw error; }
     });
     mission.usage = addRollups([coordinator, ...subteams]);
     return mission;
@@ -352,7 +372,8 @@ export class MissionService {
     const mission = stored.mission;
     // A stopped mission with nothing left to stop or observe needs no further ticks.
     if (["blocked", "ready-for-review", "cancelled"].includes(mission.status) && !stored.ops.length && !Object.keys(stored.launches).length &&
-        (stored.attempts.at(-1)?.status ?? "stopped") === "stopped" && !mission.subtasks.some(subtask => subtask.status === "running")) return;
+        (stored.attempts.at(-1)?.status ?? "stopped") === "stopped" &&
+        !mission.subtasks.some(subtask => subtask.status === "running" || subtask.status === "cancelled" && subtask.teamId)) return;
     if ((live.has(mission.status) || mission.status === "paused") && Date.now() >= Date.parse(mission.deadlineAt)) {
       this.stop(stored, "blocked", timeLimitReason); this.event(stored, timeLimitReason); this.save(stored);
     }
@@ -360,7 +381,7 @@ export class MissionService {
     await this.applyOps(stored);
     await this.stepCoordinator(stored);
     if (this.closed) return;
-    this.refresh(stored);
+    await this.refresh(stored);
     if (live.has(mission.status)) {
       this.schedule(stored);
       await this.launchSubteams(stored);
@@ -494,21 +515,60 @@ export class MissionService {
     return latest.sort((a, b) => finished(b).localeCompare(finished(a)))[0];
   }
   /** Mirrors each subteam's status and sends the coordinator each new decision, block, or finish once. */
-  private refresh(stored: Stored) {
+  private async refresh(stored: Stored) {
     const mission = stored.mission;
     for (const subtask of mission.subtasks.filter(item => item.teamId)) {
+      const teamId = subtask.teamId!;
       let team: TeamView;
-      try { team = this.teams.get(subtask.teamId!); } catch (error) { if (notFound(error)) continue; throw error; }
+      try { team = this.teams.get(teamId); }
+      catch (error) {
+        if (!notFound(error)) throw error;
+        if (subtask.status === "cancelled" || subtask.teamStatus === "cancelled" || subtask.finalEvidence) {
+          subtask.status = "cancelled"; subtask.teamStatus = "cancelled"; delete subtask.teamId;
+          this.event(stored, "The host removed cancelled subtask " + subtask.id + "'s settled subteam record and workspace.");
+          if (live.has(mission.status))
+            this.message(stored, teamId + ":cancelled", { type: "subtask-finished", subtaskId: subtask.id, teamId, status: "cancelled", teamStatus: "cancelled",
+              ...(subtask.finalEvidence?.reason ? { reason: subtask.finalEvidence.reason } : {}),
+              retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." });
+          this.save(stored);
+        }
+        continue;
+      }
       subtask.teamStatus = team.status;
       if (!stored.ops.some(op => op.kind === "parallelism" && op.teamId === team.id)) subtask.parallelism = team.parallelism;
       const status = subtaskStatus(team.status), changed = status !== subtask.status;
       subtask.status = status;
+      if (status === "cancelled") subtask.finalEvidence = { ...(team.reason ? { reason: team.reason } : {}), ...(team.headCommit ? { headCommit: team.headCommit } : {}), usage: team.usage };
       if (changed && status !== "running") this.event(stored, `Subtask ${subtask.id} is ${status} (subteam ${team.status}).`);
+      if (live.has(mission.status) && status !== "running")
+        this.message(stored, `${team.id}:${status === "cancelled" ? "cancelled" : `${status}:${team.revision}`}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status,
+          ...(team.reason ? { reason: team.reason } : {}),
+          ...(status === "cancelled" ? { retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." } : {}) });
+      if (status === "cancelled" && team.workspaceRemovedAt) {
+        // Persist the host-observed cancellation and its final evidence before deleting the child record.
+        this.save(stored);
+        try { await this.teams.removeRun(team.id); }
+        catch (error) { if (!notFound(error)) continue; }
+        delete subtask.teamId;
+        this.event(stored, `The host deleted cancelled subtask ${subtask.id}'s settled subteam record after its workspace was removed.`);
+        this.save(stored);
+        continue;
+      }
       if (!live.has(mission.status)) continue;
-      if (status !== "running")
-        this.message(stored, `${team.id}:${status}:${team.revision}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status, ...(team.reason ? { reason: team.reason } : {}) });
       for (const decision of team.decisions.filter(item => item.revision === team.revision && !item.answer))
         this.message(stored, `${team.id}:${decision.id}`, { type: "child-decision", subtaskId: subtask.id, teamId: team.id, decisionId: decision.id, question: decision.question, options: decision.options });
+      // A permission diagnostic can finish without changing the team's phase. Wake its
+      // supervising coordinator once, with observations rather than approval authority.
+      for (const outcome of team.permissionRecovery?.outcomes ?? []) {
+        if (outcome.revision !== team.revision) continue;
+        const brief = (value: string) => value.slice(0, 240);
+        this.message(stored, `${team.id}:permission-recovery:${outcome.id}`, {
+          type: "permission-recovery", subtaskId: subtask.id, teamId: team.id,
+          outcomeId: outcome.id, status: outcome.status, cause: brief(outcome.cause),
+          action: brief(outcome.action), decision: brief(outcome.decision),
+          consequence: brief(outcome.consequence), execution: "unknown",
+        });
+      }
     }
   }
   private async applyOps(stored: Stored) {
@@ -609,7 +669,7 @@ export class MissionService {
     const mission = stored.mission;
     try {
       const session = await this.manager.createTeamSession({ requestId: attempt.sessionId, provider: mission.lineup.coordinator.provider, projectId: mission.repoProjectIds[0],
-        title: `Mission coordinator: ${mission.title}`.slice(0, 100), prompt: attempt.prompt }, this.assignment(stored, attempt), stored.folder, mission.lineup.coordinator,
+        title: `Mission coordinator: ${mission.title}`.slice(0, 100), prompt: attempt.prompt, ...(attempt.continuation ? { continuation: attempt.continuation } : {}) }, this.assignment(stored, attempt), stored.folder, mission.lineup.coordinator,
       this.config.teams?.workspaceDir, this.config.teams?.trustWorkspaces === true);
       if (this.closed) return;
       attempt.status = "running"; attempt.startedAt ??= now();
@@ -633,6 +693,7 @@ export class MissionService {
       this.readReport(stored, attempt);
       if (attempt.status === "running" && !attempt.missedReport && live.has(mission.status)) {
         const state = await this.manager.state(attempt.sessionId);
+        if (attempt.continuation && state.nativeSession?.id === attempt.continuation.nativeSessionId) attempt.nativeConfirmed = true;
         // A coordinator that ends its turn without a report, or goes quiet, would otherwise hold the attempt open
         // while subteam and owner messages wait behind it. A provider prompt waiting on the owner is not quiet.
         const quiet = state.attention.state !== "needs-you" &&
@@ -641,6 +702,10 @@ export class MissionService {
         if (state.status !== "exited" && !ended && !quiet) { this.save(stored); return; }
         this.readReport(stored, attempt);
         if (attempt.status === "running" && state.status === "exited") {
+          if (!attempt.report && resumeFailed(state, attempt.continuation)) {
+            this.failResume(stored, attempt);
+            this.save(stored); return;
+          }
           attempt.status = "stopped";
           this.stop(stored, "blocked", "The mission coordinator exited without a valid structured report. Subteam workspaces remain available.");
           this.event(stored, stored.mission.reason!); this.save(stored); return;
@@ -652,9 +717,14 @@ export class MissionService {
     let state;
     try { state = await this.manager.stopTeamSession(attempt.sessionId, attempt.stopRequestId, this.assignment(stored, attempt)); }
     catch { this.save(stored); return; }
+    if (attempt.continuation && state.nativeSession?.id === attempt.continuation.nativeSessionId) attempt.nativeConfirmed = true;
     if (this.closed || state.status !== "exited") { this.save(stored); return; }
     // The session can no longer write, so this read is the last chance for a report filed before the stop.
     if (attempt.status === "running") this.readReport(stored, attempt);
+    if (!attempt.report && resumeFailed(state, attempt.continuation)) {
+      this.failResume(stored, attempt);
+      this.save(stored); return;
+    }
     attempt.status = "stopped";
     if (attempt.report) {
       if (live.has(mission.status)) this.consume(stored, attempt.report, attempt);
@@ -662,6 +732,14 @@ export class MissionService {
     } else if (attempt.missedReport && live.has(mission.status))
       this.refuse(stored, "missing", "Your previous attempt ended without a mission report. File exactly one report in every attempt; report wait when nothing needs a decision.");
     this.save(stored);
+  }
+  private failResume(stored: Stored, attempt: Attempt) {
+    attempt.resumeFailed = true;
+    attempt.missedReport = false;
+    attempt.status = "stopped";
+    stored.inbox = [...(attempt.consumedInbox ?? []), ...stored.inbox];
+    stored.notes = [...(attempt.consumedNotes ?? []), ...stored.notes];
+    this.event(stored, "The coordinator's conversation could not be resumed; a fresh attempt starts with the full mission state.");
   }
   /** Starts the next coordinator attempt once the previous one stopped and a message needs it. */
   private async wake(stored: Stored) {
@@ -672,14 +750,42 @@ export class MissionService {
       this.event(stored, mission.reason!); this.save(stored); return;
     }
     const revision = stored.attempts.length + 1, profile = mission.lineup.coordinator;
+    let continuation: NativeContinuation | undefined;
+    if (profile.provider === "claude") {
+      for (let index = stored.attempts.length - 1; index >= 0; index--) {
+        const previous = stored.attempts[index], nativeSessionId = previous.continuation?.nativeSessionId;
+        if (!previous.nativeConfirmed || !nativeSessionId) continue;
+        const failedLater = stored.attempts.slice(index + 1).some(attempt => attempt.resumeFailed && attempt.continuation?.nativeSessionId === nativeSessionId);
+        if (!failedLater) { continuation = { mode: "resume", nativeSessionId }; break; }
+      }
+      continuation ??= { mode: "start", nativeSessionId: randomUUID() };
+    }
     // Messages that need the coordinator go first; any beyond the limit wait for the next attempt rather than being dropped.
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;
     // The prompt keeps a byte budget by leaving trailing messages queued, so inbox messages lead and notes are deferred first.
-    const built = missionPromptWithMessageCount(mission, stored.repos, [...inbox, ...notes], revision, profile.provider, profile, { openChildDecisions: this.openChildDecisions(stored), waiting });
+    const messages = [...inbox, ...notes], context = { openChildDecisions: this.openChildDecisions(stored), waiting };
+    const build = (list: MissionMessage[], promptContext: typeof context) => continuation?.mode === "resume"
+      ? missionFollowUpPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext)
+      : missionPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext);
+    let built = build(messages, context);
+    if (!built.includedMessageCount && inbox[0]?.type === "permission-recovery") {
+      // Keep the durable outcome in the team record. A large objective must not
+      // repeatedly spend coordinator attempts without delivering the leading message.
+      const first = inbox[0];
+      const compact: MissionMessage = { ...first, cause: "See the subteam permissionRecovery outcome.",
+        action: "", decision: "", consequence: "" };
+      built = build([compact], { ...context, waiting: stored.inbox.length + stored.notes.length - 1 });
+    }
+    if (!built.includedMessageCount) {
+      if (mission.reason !== messageTooLargeReason) this.event(stored, messageTooLargeReason);
+      mission.reason = messageTooLargeReason;
+      return;
+    }
+    if (mission.reason === messageTooLargeReason) mission.reason = undefined;
     const fromInbox = Math.min(built.includedMessageCount, inbox.length), fromNotes = built.includedMessageCount - fromInbox;
     const attempt: Attempt = { memberId: randomUUID(), sessionId: randomUUID(), revision, cursor: 0, stopRequestId: randomUUID(), status: "queued", ownerInputs: stored.ownerInputs ?? 0,
-      prompt: built.prompt };
+      prompt: built.prompt, ...(continuation ? { continuation } : {}), consumedInbox: inbox.slice(0, fromInbox), consumedNotes: notes.slice(0, fromNotes) };
     stored.attempts.push(attempt); stored.inbox = stored.inbox.slice(fromInbox); stored.notes = stored.notes.slice(fromNotes);
     this.save(stored);
     await this.launch(stored, attempt);

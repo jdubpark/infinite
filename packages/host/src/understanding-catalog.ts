@@ -138,7 +138,8 @@ export class UnderstandingCatalog {
       if (value.workspaceId !== workspaceId) throw new Error("catalog-workspace-mismatch");
       if (value.catalog.policy.editedAt === undefined) {
         // One-time migration: records saved before edits were stamped lack the key and carry the old disabled defaults.
-        value.catalog.policy = { ...defaults, editedAt: new Date().toISOString(), editedBy: "migration" };
+        // Only the three switches change; the owner's interval and daily limit stay.
+        value.catalog.policy = { ...value.catalog.policy, enabled: defaults.enabled, synthesis: defaults.synthesis, delivery: defaults.delivery, editedAt: new Date().toISOString(), editedBy: "migration" };
         try { this.persist(workspaceId, value); } catch { /* keep the migrated policy in memory; it retries on the next load */ }
       }
       this.states.set(workspaceId, value);
@@ -220,10 +221,11 @@ export class UnderstandingCatalog {
     for (const item of catalog.plans) item.repositoryIds = this.canonicalRepositoryIds(item.repositoryIds, current.entries);
     catalog.componentOverrides = catalog.componentOverrides.filter(item => this.scopeMatches(state.scopes[item.id], current.entries));
     for (const item of catalog.componentOverrides) item.repositoryIds = this.canonicalRepositoryIds(item.repositoryIds, current.entries);
-    const policyChanged = state.policyBinding.length > 0 && !this.exactMembershipMatches(state.policyBinding, current.entries);
-    if (policyChanged) catalog.policy = { ...defaults };
+    // An owner's policy holds across a repository set change; any other policy turns off until the owner decides again.
+    const policyWithheld = state.policyBinding.length > 0 && !this.exactMembershipMatches(state.policyBinding, current.entries) && catalog.policy.editedBy !== "owner";
+    if (policyWithheld) catalog.policy = { ...catalog.policy, enabled: false, synthesis: false, delivery: false };
     const withheld = projectsBefore !== catalog.projects.length || featuresBefore !== catalog.features.length || plansBefore !== catalog.plans.length || componentsBefore !== catalog.componentOverrides.length;
-    catalog.coverage = current.gaps.length || withheld || policyChanged ? ["Some catalog records are withheld because their complete repository scope is unavailable or changed."] : [];
+    catalog.coverage = current.gaps.length || withheld || policyWithheld ? ["Some catalog records are withheld because their complete repository scope is unavailable or changed."] : [];
     return catalog;
   }
 

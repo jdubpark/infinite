@@ -369,7 +369,7 @@ test("accepted catalog text boundaries publish and survive runtime restart witho
   await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state));
   assert.equal(s.runtime.read("workspace").maintenance.state, "idle");
   await s.runtime.close();
-  const resumed = new UnderstandingRuntime({ config: s.config, key: Buffer.alloc(32, 7), groups, catalog: ownerCatalog });
+  const resumed = new UnderstandingRuntime({ config: s.config, key: Buffer.alloc(32, 7), groups, catalog: ownerCatalog, adapter: { context: async root => sampleContext(root) } });
   try {
     const result = resumed.read("workspace");
     assert.equal(result.maintenance.state, "idle");
@@ -464,7 +464,7 @@ test("accepted context path boundaries retain generated coverage and relationshi
   assert.ok(published.components[0].coverage.some(message => message.includes(from)));
   assert.deepEqual(published.relationships[0]?.evidence.map(item => item.source), [from, to]);
   await s.runtime.close();
-  const resumed = new UnderstandingRuntime({ config: s.config, key: Buffer.alloc(32, 7), groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() } });
+  const resumed = new UnderstandingRuntime({ config: s.config, key: Buffer.alloc(32, 7), groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() }, adapter: { context: async root => sampleContext(root) } });
   try { assert.deepEqual(resumed.read("workspace"), published); }
   finally { await resumed.close(); }
 });
@@ -609,7 +609,7 @@ test("sealed state from before the repository brief, with a legacy previousHead 
     repository.previousHead = "a".repeat(40);
   }
   writeSealed(file, key, "understanding-runtime", state);
-  const resumed = new UnderstandingRuntime({ config: { stateDir: s.stateDir, projects: [{ id: "repo", name: "Repository", path: s.root }] } as Config, key, groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() } });
+  const resumed = new UnderstandingRuntime({ config: s.config, key, groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() } });
   try {
     const read = resumed.read("workspace");
     assert.equal(read.components.length, 2);
@@ -642,4 +642,59 @@ test("a change that lands while a job runs queues one more refresh after it", { 
   await waitUntil(() => s.runtime.read("workspace").maintenance.state === "idle");
   assert.equal(calls, 2);
   assert.equal(s.runtime.read("workspace").maintenance.jobsToday, 2);
+});
+
+test("a host without a summary writer reads as unavailable and says why", async t => {
+  const s = setup(t);
+  const read = s.runtime.read("workspace");
+  assert.equal(read.maintenance.state, "unavailable");
+  assert.equal(read.maintenance.message, "No summary writer is configured on this host.");
+  assert.equal(s.runtime.refresh("workspace").message, "No summary writer is configured on this host.");
+});
+
+/** Moves the clock past one 15-minute interval and runs one scheduler pass, as the host timer does. */
+function ticker(t: test.TestContext, runtime: UnderstandingRuntime) {
+  let offset = 0;
+  const realNow = Date.now.bind(Date);
+  t.mock.method(Date, "now", () => realNow() + offset);
+  return () => { offset += 16 * 60_000; (runtime as unknown as { reconcile(): void }).reconcile(); };
+}
+const commit = (root: string, value: number) => {
+  writeFileSync(join(root, "src", "a.ts"), `export const a = ${value};\n`);
+  execFileSync("git", ["-C", root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "change"]);
+};
+
+test("interval ticks admit a job only after a repository moves; an explicit refresh always admits", { timeout: 30000 }, async t => {
+  const s = setup(t, { adapter: { context: async root => sampleContext(root) } });
+  s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, intervalMinutes: 15, dailyJobLimit: 24 } });
+  const tick = ticker(t, s.runtime);
+  const settled = (jobs: number) => () => { const value = s.runtime.read("workspace").maintenance; return value.state === "idle" && value.jobsToday === jobs; };
+  tick();
+  await waitUntil(settled(1));
+  for (let index = 0; index < 8; index++) tick();
+  await new Promise(resolvePromise => setTimeout(resolvePromise, 50));
+  assert.equal(s.runtime.read("workspace").maintenance.jobsToday, 1, "ticks over unchanged repositories admit no job");
+  commit(s.root, 5);
+  tick();
+  await waitUntil(settled(2));
+  tick();
+  await new Promise(resolvePromise => setTimeout(resolvePromise, 50));
+  assert.equal(s.runtime.read("workspace").maintenance.jobsToday, 2);
+  assert.equal(s.runtime.refresh("workspace").state, "queued", "an explicit refresh admits without a source change");
+  await waitUntil(settled(3));
+});
+
+test("a spent daily budget is recorded once and later ticks leave the store alone", { timeout: 30000 }, async t => {
+  const s = setup(t, { adapter: { context: async root => sampleContext(root) } });
+  s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, intervalMinutes: 15, dailyJobLimit: 1 } });
+  const tick = ticker(t, s.runtime);
+  tick();
+  await waitUntil(() => s.runtime.read("workspace").maintenance.state === "idle" && s.runtime.read("workspace").maintenance.jobsToday === 1);
+  commit(s.root, 6);
+  tick();
+  assert.equal(s.runtime.read("workspace").maintenance.state, "budget-limited");
+  const file = join(s.stateDir, "understanding", "runtime.sealed"), sealed = readFileSync(file, "utf8");
+  tick(); tick();
+  assert.equal(readFileSync(file, "utf8"), sealed, "budget-limited ticks do not rewrite the encrypted store");
+  assert.equal(s.runtime.read("workspace").maintenance.state, "budget-limited");
 });

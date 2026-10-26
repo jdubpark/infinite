@@ -30,6 +30,7 @@ const MAX_ATTEMPT_MS = 10 * 60_000;
 /** Floor of the time an attempt keeps for the final source re-check; at most a fifth of the attempt. */
 const RECHECK_RESERVE_MS = 5000;
 const STATE_SCOPE = "understanding-runtime";
+const NO_WRITER = "No summary writer is configured on this host.";
 /** Errors that mean an engine call ran out of time rather than produced a wrong answer. */
 const isDeadline = (error: unknown) => error instanceof Error && /^(?:understanding-attempt-deadline|understanding-timeout|understanding-process-timeout)(?:\s|$)/.test(error.message);
 export const understandingOutputLimits = { differenceSummary: 5000, pullRequestTitle: 2000, environment: 200, url: 2048 } as const;
@@ -233,7 +234,7 @@ export class UnderstandingRuntime {
     if (maintenance.state === "running" || this.queued.has(workspaceId)) return { ...maintenance, state: "queued", message: "A refresh is already queued for this workspace." };
     const policy = this.options.catalog.read(workspaceId).policy;
     if (this.storageUnavailable) return { ...maintenance, state: "unavailable", message: "Encrypted maintenance state is unavailable; new work is refused until its durable watermark can be loaded." };
-    if (!this.hasConfiguredContext) return { ...maintenance, state: "unavailable", message: "Repository context collection is not configured." };
+    if (!this.hasConfiguredContext) return { ...maintenance, state: "unavailable", message: NO_WRITER };
     if (this.queue.length >= MAX_QUEUE) return { ...maintenance, state: "unavailable", message: "The bounded maintenance queue is full." };
     if (this.dailyJobs(workspaceId) >= policy.dailyJobLimit) return this.setMaintenance(workspaceId, { ...maintenance, state: "budget-limited", jobsToday: this.dailyJobs(workspaceId), dailyJobLimit: policy.dailyJobLimit, message: "The daily maintenance job limit has been reached." });
     this.queue.push(workspaceId); this.queued.add(workspaceId);
@@ -263,6 +264,9 @@ export class UnderstandingRuntime {
       const coverage = [...new Set([...catalog.coverage, ...repos.flatMap(repo => repo.context.limitations), ...repos.flatMap(repo => repo.synthesisCoverage), ...(saved?.maintenance.state === "failed" && saved.maintenance.message ? [saved.maintenance.message] : []), ...(this.storageUnavailable ? ["Encrypted runtime state could not be loaded or saved; current deterministic data may be unavailable."] : [])])].slice(0, 200);
       let maintenance = saved?.maintenance ?? emptyMaintenance(catalog.policy);
       maintenance = { ...maintenance, dailyJobLimit: catalog.policy.dailyJobLimit, jobsToday: this.dailyJobs(workspaceId) };
+      // Ticks no longer clear the limit state after midnight when nothing moved, so the read does.
+      if (maintenance.state === "budget-limited" && maintenance.jobsToday < maintenance.dailyJobLimit) maintenance = { ...maintenance, state: "idle", message: null };
+      if (!this.hasConfiguredContext) maintenance = { ...maintenance, state: "unavailable", message: NO_WRITER };
       if (this.loadFailed) maintenance = { ...maintenance, state: "unavailable", message: "Encrypted maintenance state failed validation; the host will not overwrite it or start jobs until explicit recovery." };
       const briefs: KnowledgeRepositoryBrief[] = entries.flatMap(({ projectId, stored, currentHead }) => stored.brief ? [{ repositoryId: projectId, ...stored.brief, state: currentHead && currentHead === stored.brief.head ? "ready" as const : "stale" as const }] : []);
       const diagrams = [...repos.flatMap(repo => repo.componentDiagram ? [repo.componentDiagram] : []), ...briefs.flatMap(brief => brief.diagrams)];
@@ -340,9 +344,23 @@ export class UnderstandingRuntime {
         const delay = this.backoff(group.id, policy.intervalMinutes * 60_000);
         const retryAt = Date.parse(state.maintenance.nextAttemptAt ?? "");
         const isBackoff = state.maintenance.state === "failed";
-        if ((!Number.isFinite(retryAt) || Date.now() >= retryAt) && (isBackoff || !Number.isFinite(last) || Date.now() - last >= delay)) this.refresh(group.id);
+        const due = (!Number.isFinite(retryAt) || Date.now() >= retryAt) && (isBackoff || !Number.isFinite(last) || Date.now() - last >= delay);
+        if (!due) continue;
+        // The limit is recorded once; later ticks leave the store alone until the day rolls over.
+        if (state.maintenance.state === "budget-limited" && this.dailyJobs(group.id) >= policy.dailyJobLimit) continue;
+        // A failed attempt retries on its backoff, as its "next attempt" time promises; an ordinary tick runs only when a repository moved.
+        if (!isBackoff && !this.sourceMoved(group, state.repositories)) continue;
+        this.refresh(group.id);
       } catch { /* A concurrently removed group is skipped until the next reconciliation. */ }
     }
+  }
+  /** True when a bound repository's HEAD differs from its stored observation or it was never observed. Reads Git only; no engine call. */
+  private sourceMoved(group: ProjectGroup, repositories: Record<string, StoredRepository>): boolean {
+    return group.repos.some(repo => {
+      const stored = repositories[repo.projectId];
+      if (!stored) return true;
+      try { return readGit(realpathSync(repo.path), ["rev-parse", "HEAD"]) !== stored.head; } catch { return true; }
+    });
   }
   private backoff(id: string, interval: number) { const attempts = this.state.workspaces[id]?.failureCount ?? 0; return Math.max(interval, Math.min(24 * 60 * 60_000, interval * (2 ** Math.min(Math.max(0, attempts - 1), 8)))); }
 

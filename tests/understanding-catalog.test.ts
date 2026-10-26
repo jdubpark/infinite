@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeSealed } from "../packages/host/src/vault.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import type { KnowledgeMutationContext } from "@infinite/remote";
 import { UnderstandingCatalog, CatalogError } from "../packages/host/src/understanding-catalog.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -39,7 +39,22 @@ function fixture() {
       catalog: { revision: 0, projects: [], features: [], plans: [], componentOverrides: [], policy, coverage: [] } };
     writeSealed(file, key, "understanding-catalog:workspace", stored);
   };
-  return { root, checkout, config, group, make, reopen, writeStoredPolicy, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, checkout, config, group, file, key, make, reopen, writeStoredPolicy, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+/** Enrolls a second repository in the fixture's group, which changes its repository set. */
+function addRepository(f: ReturnType<typeof fixture>) {
+  const path = join(f.root, "second-checkout"); mkdirSync(path);
+  execFileSync("git", ["init", "--quiet", path]);
+  execFileSync("git", ["-C", path, "config", "user.email", "catalog@example.invalid"]);
+  execFileSync("git", ["-C", path, "config", "user.name", "Catalog Test"]);
+  writeFileSync(join(path, "README.md"), "second repository\n");
+  execFileSync("git", ["-C", path, "add", "README.md"]);
+  execFileSync("git", ["-C", path, "commit", "--quiet", "-m", "fixture"]);
+  execFileSync("git", ["-C", path, "remote", "add", "origin", "https://github.com/example/second-fixture.git"]);
+  f.config.projects.push({ id: "second-repo", name: "Second", path });
+  f.group.repos.push({ projectId: "second-repo", name: "second-fixture", path, key: "remote:github.com/example/second-fixture",
+    checkouts: [{ projectId: "second-repo", name: "Second", path, primary: true, teamReady: false, identityFrom: "host-scan" }] });
 }
 
 test("catalog writes are sealed, globally CASed, replay-safe, and survive restart", () => {
@@ -282,5 +297,43 @@ test("a stored policy without editedAt migrates to enabled once; an owner-disabl
     assert.equal(migrated.revision, 0);
     f.reopen().mutate("workspace", "policy", undefined, request(0, "update", { enabled: false, synthesis: false, delivery: false, intervalMinutes: 15, dailyJobLimit: 24 }), emptyContext);
     assert.equal(f.reopen().read("workspace").policy.enabled, false);
+  } finally { f.cleanup(); }
+});
+
+test("migration turns maintenance on and keeps the stored interval and daily limit", () => {
+  const f = fixture();
+  try {
+    f.writeStoredPolicy({ enabled: false, synthesis: false, delivery: false, intervalMinutes: 60, dailyJobLimit: 5 });
+    const policy = f.reopen().read("workspace").policy;
+    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit, policy.editedBy], [true, true, true, 60, 5, "migration"]);
+  } finally { f.cleanup(); }
+});
+
+test("a repository set change keeps an owner's policy, disabled or enabled", () => {
+  for (const value of [{ enabled: false, synthesis: false, delivery: false, intervalMinutes: 30, dailyJobLimit: 10 }, { enabled: true, synthesis: false, delivery: true, intervalMinutes: 45, dailyJobLimit: 3 }]) {
+    const f = fixture();
+    try {
+      const catalog = f.make();
+      const editedAt = catalog.mutate("workspace", "policy", undefined, request(0, "update", value), emptyContext).policy.editedAt;
+      addRepository(f);
+      const policy = catalog.read("workspace").policy;
+      assert.deepEqual(policy, { ...value, editedAt, editedBy: "owner" });
+      assert.deepEqual(f.reopen().read("workspace").policy, policy);
+    } finally { f.cleanup(); }
+  }
+});
+
+test("a repository set change turns a policy the owner never set off and keeps its interval, limit and stamp", () => {
+  const f = fixture();
+  try {
+    f.make().mutate("workspace", "policy", undefined, request(0, "update", { enabled: true, synthesis: true, delivery: false, intervalMinutes: 45, dailyJobLimit: 7 }), emptyContext);
+    // Strip the stamp as records saved before stamping looked; the next load migrates it and keeps the policy binding.
+    const stored = unseal<{ catalog: { policy: Record<string, unknown> } }>(f.key, "understanding-catalog:workspace", readFileSync(f.file, "utf8"));
+    delete stored.catalog.policy.editedAt; delete stored.catalog.policy.editedBy;
+    writeSealed(f.file, f.key, "understanding-catalog:workspace", stored);
+    addRepository(f);
+    const policy = f.reopen().read("workspace").policy;
+    assert.deepEqual([policy.enabled, policy.synthesis, policy.delivery, policy.intervalMinutes, policy.dailyJobLimit, policy.editedBy], [false, false, false, 45, 7, "migration"]);
+    assert.match(policy.editedAt ?? "", /^\d{4}-/);
   } finally { f.cleanup(); }
 });

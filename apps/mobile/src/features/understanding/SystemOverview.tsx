@@ -9,7 +9,7 @@ import { DiagramView } from "./DiagramView";
 type Page<T> = { items: T[]; next: string | null };
 const MAX_PLANNED_PAGES = 20;
 const NOT_OBSERVED = "Not observed yet";
-const evidenceLabel = (head: string | null, at: string) => `From commit ${short(head)}, observed ${relative(at)}`;
+const evidenceLabel = (head: string | null, at: string) => head ? `From commit ${short(head)}, observed ${relative(at)}` : `Observed ${relative(at)}`;
 
 /** Plain-language System sections for every repository in the workspace. */
 export function SystemOverview({ connection, workspaceId, data, offline, onOpenComponent }: {
@@ -62,7 +62,7 @@ function RepositorySections({ connection, workspaceId, repo, brief, componentMap
 
     <Changes base={base} connection={connection} repo={repo} brief={brief} artifacts={artifacts} offline={offline} evidence={briefEvidence ?? (fallback ? evidenceLabel(fallback.head, fallback.generatedAt) : NOT_OBSERVED)} />
 
-    <Planned base={base} connection={connection} repo={repo} offline={offline} evidence={briefEvidence ?? NOT_OBSERVED} />
+    <Planned base={base} connection={connection} repo={repo} offline={offline} evidence={briefEvidence ?? (fallback ? evidenceLabel(fallback.head, fallback.generatedAt) : NOT_OBSERVED)} />
 
     {stateLine ? <Text style={s.notice}>{stateLine}</Text> : null}
   </View>;

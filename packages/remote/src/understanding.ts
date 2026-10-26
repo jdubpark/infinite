@@ -53,6 +53,8 @@ export interface UnderstandingPlan {
   status: string;
   updatedAt: string;
   source: "request";
+  /** True when `text` was cut to 600 characters; absent on older hosts. */
+  excerpt?: boolean;
 }
 export interface UnderstandingRepository {
   /** Primary enrolled project ID, matching the workspace's folded repository. */

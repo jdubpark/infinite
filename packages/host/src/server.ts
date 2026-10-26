@@ -566,6 +566,30 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   app.get("/api/project-groups", requireRole(["owner", "controller", "viewer"]), (_req, res) => res.json(projectGroups.list()));
   app.get("/api/project-groups/:id/understanding", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(understanding.get(projectGroupIdSchema.parse(req.params.id))));
+  const readRoles = requireRole(["owner", "controller", "viewer"]);
+  const pageQuery = z.object({ repository: z.string().regex(/^[a-z0-9-]{1,80}$/), cursor: z.string().max(200).optional() }).strict();
+  app.get("/api/project-groups/:id/understanding/briefs", readRoles, (req, res) => {
+    const query = pageQuery.parse(req.query);
+    return res.json(understanding.briefsPage(projectGroupIdSchema.parse(req.params.id), query.repository, query.cursor));
+  });
+  app.get("/api/project-groups/:id/understanding/planned", readRoles, (req, res) => {
+    const query = pageQuery.parse(req.query);
+    return res.json(understanding.plannedPage(projectGroupIdSchema.parse(req.params.id), query.repository, query.cursor));
+  });
+  app.get("/api/project-groups/:id/understanding/work", readRoles, (req, res) => {
+    const query = pageQuery.pick({ cursor: true }).strict().parse(req.query);
+    return res.json(understanding.workPage(projectGroupIdSchema.parse(req.params.id), query.cursor));
+  });
+  app.get("/api/project-groups/:id/understanding/diagrams/:diagramId", readRoles, (req, res) => {
+    const diagramId = z.string().regex(/^[A-Za-z0-9_:.-]{1,200}$/).parse(req.params.diagramId);
+    const diagram = understandingRuntime.read(projectGroupIdSchema.parse(req.params.id)).diagrams?.find(item => item.id === diagramId);
+    return diagram ? res.json(diagram) : void res.status(404).json({ error: "Diagram is unavailable in this workspace." });
+  });
+  app.get("/api/project-groups/:id/understanding/brief", readRoles, (req, res) => {
+    const query = pageQuery.pick({ repository: true }).strict().parse(req.query);
+    const brief = understandingRuntime.read(projectGroupIdSchema.parse(req.params.id)).briefs?.find(item => item.repositoryId === query.repository);
+    return brief ? res.json(brief) : void res.status(404).json({ error: "No brief is available for this repository." });
+  });
   app.get("/api/project-groups/:id/understanding/catalog", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(understandingCatalog.read(projectGroupIdSchema.parse(req.params.id))));
   app.get("/api/project-groups/:id/understanding/components", requireRole(["owner", "controller", "viewer"]), (req, res) => {
     const value = understandingRuntime.read(projectGroupIdSchema.parse(req.params.id));

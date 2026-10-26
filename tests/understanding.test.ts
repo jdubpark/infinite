@@ -70,7 +70,7 @@ test("catalog edits cross encrypted transport only for owners and preserve revis
     const refresh = await owner.request<{ state: string }>(`${path}/refresh`, { body: {} });
     assert.equal(refresh.state, "unavailable", "an unconfigured collector cannot start a writer");
     assert.equal((await viewer.request<WorkspaceUnderstanding>(path)).knowledge?.maintenance.jobsToday, 0);
-  } finally { owner.close(); viewer.close(); await host.stop(); }
+  } finally { owner.close(); viewer?.close(); await host.stop(); }
 });
 
 test("unavailable brief storage leaves the host and Work readable and cannot acknowledge a later write", { timeout: 40000 }, async () => {
@@ -145,10 +145,12 @@ test("encrypted Understanding bounds its response and turns over a full retained
     assert.equal(value.repositories[0].current[0].id, artifacts.at(-1)!.id, "the latest source snapshot is prioritized");
     assert.equal(value.repositories[0].current[0].brief.architecture[0].text, "Complete source claim");
     assert.equal(value.work[0].sourceId, goals.at(-1)!.id, "the latest work remains useful");
-    assert.ok(value.work.length > 0 && value.work.length < goals.length);
+    assert.equal(value.work.length, goals.length, "the single budget keeps every work record before spending on evidence");
     assert.equal(value.work[0].objective, goals.at(-1)!.objective, "an included request is never silently cut mid-text");
-    assert.match(value.coverage.join(" "), /work.*omitted/i);
-    assert.match([...value.repositories[0].coverage, ...value.repositories[0].current.flatMap(item => item.coverage)].join(" "), /omitted/i);
+    assert.equal(value.repositories[0].current.length, artifacts.length, "older snapshots are kept without evidence before evidence is spent");
+    const lines = [...value.coverage, ...value.repositories[0].coverage, ...value.repositories[0].current.flatMap(item => item.coverage)];
+    assert.match(lines.join(" "), /Evidence excerpts: \d+ of 50 shown here; the rest are available on the detail pages\./);
+    assert.doesNotMatch(lines.join(" "), /byte|omit/i);
     assert.equal(readdirSync(join(host.config.stateDir, "understanding", "artifacts")).filter(name => name.endsWith(".sealed")).length, artifacts.length, "response limits never prune stored generations");
     const again = await remote.request<WorkspaceUnderstanding>(await understandingPath(host));
     assert.deepEqual(again.work.map(item => item.id), value.work.map(item => item.id));
@@ -212,6 +214,42 @@ test("encrypted Understanding bounds its response and turns over a full retained
     assert.ok(files.reduce((size, name) => size + statSync(join(directory, name)).size, 0) <= 8 * 1024 * 1024);
     assert.ok(!files.includes(`${artifacts[0].id}.sealed`), "successful publication evicts the oldest superseded generation");
   } finally { remote?.close(); await host.stop(); }
+});
+
+test("planned requests are complete across the overview excerpt and the planned page", { timeout: 60000 }, async () => {
+  let viewer: ReturnType<typeof createRemoteClient> | undefined;
+  const host = await startHost({ config: { remote: { enabled: true } } });
+  try {
+    initializeRepo(host.config.projects[0].path);
+    await host.stopApi();
+    for (let index = 0; index < 13; index++) retainGoal(host, index, "o".repeat(12_000));
+    await host.start();
+    viewer = createRemoteClient({ url: host.origin, token: host.tokens.viewer });
+    const path = await understandingPath(host);
+    const overview = await viewer.request<WorkspaceUnderstanding>(path);
+    const repo = overview.repositories[0];
+    assert.equal(repo.planned.length, 13);
+    assert.ok(repo.planned.every(plan => plan.text.length === 600 && plan.excerpt === true));
+    assert.equal(repo.coverage.length, 0);
+    let cursor: string | undefined;
+    const all: string[] = [];
+    do {
+      const page = await viewer.request<{ items: { workId: string; text: string }[]; next: string | null }>(`${path}/planned?repository=${repo.id}${cursor ? `&cursor=${cursor}` : ""}`);
+      all.push(...page.items.map(item => item.text)); cursor = page.next ?? undefined;
+    } while (cursor);
+    assert.equal(all.length, 13);
+    assert.ok(all.every(text => text.length === 12_000));
+  } finally { viewer?.close(); await host.stop(); }
+});
+
+test("the diagram and brief routes answer with 404 before any observation", { timeout: 40000 }, async () => {
+  const host = await startHost();
+  try {
+    const path = await understandingPath(host);
+    assert.equal((await host.fetchApi(`${path}/diagrams/components:rehearsal`, "viewer")).status, 404);
+    assert.equal((await host.fetchApi(`${path}/brief?repository=rehearsal`, "viewer")).status, 404);
+    assert.equal((await host.fetchApi(`${path}/work`, "viewer")).status, 200);
+  } finally { await host.stop(); }
 });
 
 test("Understanding is a read-only scoped API and its source-bound brief survives API restart", { timeout: 60000 }, async () => {

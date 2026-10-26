@@ -7,6 +7,7 @@ import { dialogCommand } from "@infinite/attention";
 const MAX_FILES = 20;
 const MAX_FILE_BYTES = 16 * 1024;
 const MAX_TOTAL_BYTES = 36 * 1024;
+const MAX_REQUESTED_PATHS = 8;
 const EXCLUDED = /^(?:\.git|node_modules|.*\.env(?:\..*)?|\.npmrc|\.pypirc|\.netrc|credentials?(?:\..*)?|secrets?(?:\..*)?|private|\.local|id_rsa|id_ed25519|[^/]+\.(?:pem|key))$/i;
 /** Emitted JavaScript specifiers and the TypeScript sources they are compiled from. */
 const TYPESCRIPT_SOURCES: Record<string, string[]> = { ".js": [".ts", ".tsx"], ".mjs": [".mts"], ".cjs": [".cts"], ".jsx": [".tsx"] };
@@ -35,6 +36,8 @@ export interface CollectPermissionEvidenceInput {
   baseCommit?: string;
   /** Exact scratch directories approved by the host for this permission decision. */
   approvedScratchRoots?: string[];
+  /** Additional exact paths requested by the coordinator for read-only evidence collection. */
+  requestedPaths?: string[];
 }
 
 /**
@@ -54,9 +57,10 @@ export function collectPermissionEvidence(input: CollectPermissionEvidenceInput)
   const command = completeCommand(input.prompt, limitations);
   const commands = command ? splitLiteralCommandChain(command, limitations) : undefined;
   if (commands) for (const part of commands) {
-    const argv = tokenize(part, limitations);
-    if (argv?.length) collectCommandEvidence(argv, root, cwd, scratchRoots, input.changedPaths, files, limitations);
+    const tokens = tokenize(part, limitations);
+    if (tokens?.words.length) collectCommandEvidence(tokens.words, tokens.environmentAssignments, root, cwd, scratchRoots, input.changedPaths, files, limitations);
   }
+  collectRequestedPaths(input.requestedPaths ?? [], root, cwd, scratchRoots, files, limitations);
   // Include changed command/config sources even when the command itself is direct. This is
   // evidence only; scope and whether the request may use a changed file remain owner decisions.
   for (const path of input.changedPaths) {
@@ -104,6 +108,8 @@ function completeCommand(prompt: Prompt, limitations: string[]): string | undefi
 }
 
 function splitLiteralCommandChain(command: string, limitations: string[]): string[] | undefined {
+  // A screen capture may visually wrap a command, but its text cannot distinguish that from a
+  // shell newline that starts another command. Keep newlines semantic and refuse both cases.
   if (/[\n\r\0]/.test(command) || /[|;<>`]/.test(command) || /\$\(|\$\{|\$[A-Za-z_]/.test(command)) {
     limitations.push("The command uses shell composition, expansion, or multiple lines; source collection is incomplete.");
     return undefined;
@@ -131,33 +137,112 @@ function splitLiteralCommandChain(command: string, limitations: string[]): strin
   return parts;
 }
 
+interface TokenizedCommand {
+  words: string[];
+  /** True only when the NAME= prefix was unquoted and unescaped in the original shell text. */
+  environmentAssignments: boolean[];
+}
+
 /** A deliberately small shell-word parser; any shell composition or expansion is a limitation. */
-function tokenize(command: string, limitations: string[]): string[] | undefined {
+function tokenize(command: string, limitations: string[]): TokenizedCommand | undefined {
   if (/[\n\r\0]/.test(command) || /[|;&<>`]/.test(command) || /\$\(|\$\{|\$[A-Za-z_]/.test(command)) {
     limitations.push("The command segment uses unsupported shell syntax.");
     return undefined;
   }
   const words: string[] = [];
+  const environmentAssignments: boolean[] = [];
   let word = "", quote: "'" | '"' | undefined, escaped = false, started = false;
+  let assignmentName = "", assignmentPrefixValid = true, assignmentEquals = false;
+  const resetWord = () => {
+    word = "";
+    started = false;
+    assignmentName = "";
+    assignmentPrefixValid = true;
+    assignmentEquals = false;
+  };
+  const observeUnquotedCharacter = (char: string) => {
+    if (!assignmentPrefixValid || assignmentEquals) return;
+    if (char === "=") {
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(assignmentName)) assignmentEquals = true;
+      else assignmentPrefixValid = false;
+      return;
+    }
+    assignmentName += char;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(assignmentName)) assignmentPrefixValid = false;
+  };
+  const finishWord = () => {
+    words.push(word);
+    environmentAssignments.push(assignmentPrefixValid && assignmentEquals);
+    resetWord();
+  };
   for (const char of command.trim()) {
     if (escaped) { word += char; escaped = false; started = true; continue; }
-    if (char === "\\" && quote !== "'") { escaped = true; started = true; continue; }
+    if (char === "\\" && quote !== "'") {
+      if (!assignmentEquals) assignmentPrefixValid = false;
+      escaped = true; started = true; continue;
+    }
     if (quote) { if (char === quote) quote = undefined; else word += char; started = true; continue; }
-    if (char === "'" || char === '"') { quote = char; started = true; continue; }
-    if (/\s/.test(char)) { if (started) { words.push(word); word = ""; started = false; } continue; }
+    if (char === "'" || char === '"') {
+      if (!assignmentEquals) assignmentPrefixValid = false;
+      quote = char; started = true; continue;
+    }
+    if (/\s/.test(char)) { if (started) finishWord(); continue; }
+    observeUnquotedCharacter(char);
     word += char; started = true;
   }
   if (escaped || quote) { limitations.push("The command contains an unterminated quote or escape."); return undefined; }
-  if (started) words.push(word);
+  if (started) finishWord();
   if (!words.length || words.some(word => /[*?\[\]]/.test(word))) {
     limitations.push("The command is not a single literal executable invocation.");
     return undefined;
   }
-  return words;
+  return { words, environmentAssignments };
 }
 
-function collectCommandEvidence(argv: string[], root: string, cwd: string, scratchRoots: string[], changedPaths: string[], files: Map<string, PermissionEvidenceFile>, limitations: string[]) {
+function collectRequestedPaths(requestedPaths: string[], root: string, cwd: string, scratchRoots: string[], files: Map<string, PermissionEvidenceFile>, limitations: string[]) {
+  const limit = Math.min(requestedPaths.length, MAX_REQUESTED_PATHS);
+  for (let index = 0; index < limit; index++) {
+    const candidate = requestedPaths[index];
+    if (typeof candidate !== "string") {
+      limitations.push(`Coordinator-requested source path ${index + 1} is not a string.`);
+      continue;
+    }
+    addFile(candidate, root, cwd, scratchRoots, files, limitations);
+  }
+  if (requestedPaths.length > MAX_REQUESTED_PATHS) {
+    const omitted = createHash("sha256").update(String(requestedPaths.length - MAX_REQUESTED_PATHS)).update("\0");
+    for (let index = MAX_REQUESTED_PATHS; index < requestedPaths.length; index++) {
+      const candidate = requestedPaths[index];
+      omitted.update(typeof candidate === "string" ? candidate : String(candidate)).update("\0");
+    }
+    limitations.push(`Coordinator-requested source paths exceed the ${MAX_REQUESTED_PATHS}-path limit; ${requestedPaths.length - MAX_REQUESTED_PATHS} additional path(s) were not inspected (sha256 ${omitted.digest("hex")}).`);
+  }
+}
+
+function stripLiteralEnvironmentAssignments(argv: string[], environmentAssignments: boolean[], limitations: string[]): string[] | undefined {
+  let index = 0;
+  while (index < argv.length && environmentAssignments[index]) index++;
+  if (!index) return argv;
+  if (index === argv.length) {
+    limitations.push("The command contains literal environment assignments but no executable.");
+    return undefined;
+  }
+  return argv.slice(index);
+}
+
+const STATIC_TOOL_RUNNERS = new Set(["playwright", "vitest", "jest", "vite", "webpack", "rollup"]);
+
+function collectCommandEvidence(argv: string[], environmentAssignments: boolean[], root: string, cwd: string, scratchRoots: string[], changedPaths: string[], files: Map<string, PermissionEvidenceFile>, limitations: string[]) {
+  const unwrapped = stripLiteralEnvironmentAssignments(argv, environmentAssignments, limitations);
+  if (!unwrapped?.length) return;
+  argv = unwrapped;
   const executable = basename(argv[0]).replace(/\.cmd$/i, "").toLowerCase();
+  if (executable === "npx") {
+    const runner = argv[1] ?? "";
+    if (STATIC_TOOL_RUNNERS.has(runner)) collectStaticToolEvidence(runner, argv.slice(2), root, cwd, root, scratchRoots, files, limitations);
+    else limitations.push("The npx command does not name a supported static local tool runner.");
+    return;
+  }
   if (SAFE_PACKAGE_MANAGERS.has(executable)) {
     collectPackageCommand(executable, argv.slice(1), root, cwd, scratchRoots, files, limitations);
     return;
@@ -170,12 +255,8 @@ function collectCommandEvidence(argv: string[], root: string, cwd: string, scrat
     collectFlaggedConfigs(argv, root, cwd, scratchRoots, files, limitations);
     return;
   }
-  if (["playwright", "vitest", "jest", "vite", "webpack", "rollup"].includes(executable)) {
-    for (const name of defaultConfigNames(executable)) if (existsRegular(join(root, name))) addFile(name, root, cwd, scratchRoots, files, limitations);
-    const testPath = argv.find(arg => /\.(?:spec|test)\.[cm]?[jt]sx?$/.test(arg));
-    if (testPath) addFile(testPath, root, cwd, scratchRoots, files, limitations);
-    else if (["playwright", "vitest", "jest"].includes(executable)) limitations.push("The test runner did not name an explicit test file; default test discovery is not part of this source snapshot.");
-    collectFlaggedConfigs(argv, root, cwd, scratchRoots, files, limitations);
+  if (STATIC_TOOL_RUNNERS.has(executable)) {
+    collectStaticToolEvidence(executable, argv.slice(1), root, cwd, root, scratchRoots, files, limitations);
     return;
   }
   if (executable === "git") {
@@ -185,8 +266,17 @@ function collectCommandEvidence(argv: string[], root: string, cwd: string, scrat
   for (const path of changedPaths) if (looksLikeCommandSource(path)) addFile(path, root, cwd, scratchRoots, files, limitations);
 }
 
+function collectStaticToolEvidence(tool: string, args: string[], root: string, cwd: string, configRoot: string, scratchRoots: string[], files: Map<string, PermissionEvidenceFile>, limitations: string[]) {
+  const manifest = join(configRoot, "package.json");
+  if (existsRegular(manifest)) addFile(manifest, root, cwd, scratchRoots, files, limitations);
+  for (const name of defaultConfigNames(tool)) if (existsRegular(join(configRoot, name))) addFile(join(configRoot, name), root, cwd, scratchRoots, files, limitations);
+  const testPath = args.find(arg => /\.(?:spec|test)\.[cm]?[jt]sx?$/.test(arg));
+  if (testPath) addFile(testPath, root, cwd, scratchRoots, files, limitations);
+  else if (["playwright", "vitest", "jest"].includes(tool)) limitations.push("The test runner did not name an explicit test file; default test discovery is not part of this source snapshot.");
+  collectFlaggedConfigs(args, root, cwd, scratchRoots, files, limitations);
+}
+
 function collectPackageCommand(manager: string, args: string[], root: string, cwd: string, scratchRoots: string[], files: Map<string, PermissionEvidenceFile>, limitations: string[]) {
-  const rootManifest = addFile("package.json", root, cwd, scratchRoots, files, limitations);
   const boundary = args.indexOf("--");
   const options = boundary < 0 ? args : args.slice(0, boundary);
   if (options.some(arg => /^(?:--(?:filter|prefix|dir|cwd|workspaces|global|recursive)(?:=|$)|-[CrgW])/.test(arg) || arg === "workspace") ||
@@ -224,11 +314,26 @@ function collectPackageCommand(manager: string, args: string[], root: string, cw
     }
   }
   const commandIndex = args.findIndex(arg => ["run", "test", "build", "lint", "exec", "x", "dlx", "install", "add", "publish", "deploy"].includes(arg));
+  const verb = args[commandIndex];
+  if (manager === "npm" && verb === "exec") {
+    const execArgs = args.slice(commandIndex + 1);
+    if (commandIndex !== 0 || execArgs[0] !== "--") {
+      limitations.push("Only plain npm exec -- <supported runner> is mapped; npm exec package or command-selection flags are unsupported.");
+      return;
+    }
+    const runner = execArgs[1] ?? "";
+    if (!STATIC_TOOL_RUNNERS.has(runner)) {
+      limitations.push("The npm exec command does not name a supported static local tool runner.");
+      return;
+    }
+    collectStaticToolEvidence(runner, execArgs.slice(2), root, packageRoot, packageRoot, scratchRoots, files, limitations);
+    return;
+  }
+  const rootManifest = addFile("package.json", root, cwd, scratchRoots, files, limitations);
   if (commandIndex < 0) {
     limitations.push(`The ${manager} command does not name a statically inspectable script entrypoint.`);
     return;
   }
-  const verb = args[commandIndex];
   const name = verb === "run" ? args[commandIndex + 1] : ["test", "build", "lint"].includes(verb) ? verb : undefined;
   if (name && rootManifest) {
     const manifestFile = packageRoot === root ? rootManifest : addFile(join(packageRoot, "package.json"), root, cwd, scratchRoots, files, limitations);

@@ -273,8 +273,10 @@ installation from declared manifests, test planning, scripts, local listeners
 and local browser checks. Changed command definitions require inspection rather
 than automatic rejection. A reviewer without an implementation task uses its
 review assignment and the objective. Missing evidence that leaves the command
-itself or its direct target unknown still escalates, as does an uncollected or
-omitted executable file the member changed; an uncollected unchanged repository
+itself or its direct target unknown enters bounded evidence recovery before
+escalation, as does an uncollected executable file the member changed. The
+coordinator can request specific files for a new review; the same paths and
+their contents are recollected before an answer. An uncollected unchanged repository
 file that the visible command merely tests, builds or runs is reported as a
 limitation. Production or staging actions, credentials, other repositories,
 global settings, destructive operations outside the workspace, persistent
@@ -283,6 +285,18 @@ provider sandbox, or needing network, sockets or IPC, does not itself expand
 authority or require an owner decision. Source collection maps emitted `.js`
 import specifiers to their TypeScript sources so the code a test runs under a
 TypeScript loader is in the evidence.
+
+Recovery is not approval. Display expansion is restricted to a recognized pinned
+Codex collapsed-command dialog with the current assignment, prompt evidence,
+canonical workspace and control lease. It can send only Ctrl+A, with durable
+intent and receipt tracking; loss of acknowledgement cannot cause a second
+toggle. Unrecognized permission dialogs can be diagnosed by the strong coordinator but
+cannot be answered until the existing complete one-shot contract qualifies.
+Evidence requests keep the collector's root, secret-path, symlink and size
+restrictions. Requests, decisions and consequences are retained as scoped
+observations for PM correction and later reviews; historical success never
+authorizes another command. A display or answer receipt does not establish
+command execution success.
 
 The screen parser takes a Codex dialog's own title ("Would you like to run the
 following command?") as the prompt title even when the agent's reason below it

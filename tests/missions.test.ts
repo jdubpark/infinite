@@ -864,6 +864,64 @@ const teamPlan = (id: string, repoProjectId: string, parallelism = 1, dependsOn:
   ({ id, repoProjectId, title: `Subtask ${id}`, objective: `Do ${id}`, size: "team" as const, parallelism, dependsOn });
 const teamOf = (mission: Mission, subtaskId: string) => mission.subtasks.find(item => item.id === subtaskId)?.teamId;
 
+test("permission recovery wakes the mission once with bounded observations and permits a scoped correction", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = (await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")))).subtasks[0].teamId!;
+    const outcomeId = randomUUID();
+    const recovery = { outcomes: [{ id: outcomeId, decisionId: randomUUID(), revision: 1, promptId: 1,
+      status: "exhausted" as const, cause: "Missing executable evidence", action: "Read requested files",
+      decision: "Cannot approve the unread command", consequence: "界".repeat(4000), execution: "unknown" as const,
+      at: new Date().toISOString() }] };
+    Object.assign(h.runs.get(teamId)!, { permissionRecovery: recovery });
+    const delivered = (await h.messages(2)).filter((message: MissionMessage) => message.type === "permission-recovery");
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].outcomeId, outcomeId);
+    assert.equal(delivered[0].execution, "unknown");
+    assert.ok(Buffer.byteLength(JSON.stringify(delivered[0])) < 2000);
+    assert.equal(h.get(id).decisions.length, 0, "A diagnostic outcome does not create an owner question");
+    await h.report(2, { kind: "steer-subtask", subtaskId: "a", text: "Keep the approved check; place its helper in the assigned scratch directory so it can be inspected." });
+    await waitFor(async () => h.steers.length, count => count === 1, 10000);
+    // A later independent event wakes another attempt; the same terminal observation must not recur.
+    h.set(teamId, { status: "ready-for-review" });
+    const later = await h.messages(3);
+    assert.equal(later.filter((message: MissionMessage) => message.type === "permission-recovery").length, 0);
+    assert.equal(h.answers.length, 0, "The mission's correction does not answer a provider permission");
+  } finally { h.close(); }
+});
+
+for (const scenario of [
+  { name: "a large mission delivers a compact recovery outcome", objectiveLength: 23800, summary: "One API change", held: false },
+  { name: "a full mission holds recovery evidence without empty attempts or child cancellation", objectiveLength: 24000, summary: "S".repeat(900), held: true },
+]) test(scenario.name, { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create("界".repeat(scenario.objectiveLength));
+    await h.report(1, { kind: "dispatch", summary: scenario.summary, subtasks: [plan("a", "api")] });
+    const teamId = (await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")))).subtasks[0].teamId!;
+    const outcomeId = randomUUID();
+    Object.assign(h.runs.get(teamId)!, { permissionRecovery: { outcomes: [{ id: outcomeId, revision: 1, promptId: 1,
+      status: "exhausted", cause: "界".repeat(400), action: "界".repeat(400), decision: "界".repeat(400),
+      consequence: "界".repeat(400), execution: "unknown", at: new Date().toISOString() }] } });
+    if (scenario.held) {
+      await until(() => h.get(id), mission => /evidence remains queued/.test(mission.reason ?? ""), 10000);
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      assert.equal(h.get(id).status, "working");
+      assert.equal(h.attempts(), 1, "An undeliverable notification must not spend coordinator attempts");
+      assert.equal(h.get(id).events.filter(event => /evidence remains queued/.test(event.text)).length, 1);
+    } else {
+      const messages = await h.messages(2);
+      assert.equal(messages.length, 1);
+      assert.equal(messages[0].outcomeId, outcomeId);
+      assert.equal(messages[0].cause, "See the subteam permissionRecovery outcome.");
+      assert.equal(h.attempts(), 2);
+    }
+    assert.equal(h.runs.get(teamId)!.status, "implementing");
+  } finally { h.close(); }
+});
+
 test("mission restore adopts a legacy pending solo launch and persists capacity once", () => {
   const root = realpathSync(mkdtempSync("/tmp/inf-mission-capacity-restore-"));
   const stateDir = join(root, "state"), key = randomBytes(32), missionId = randomUUID(), teamId = randomUUID();

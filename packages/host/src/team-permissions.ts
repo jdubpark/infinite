@@ -5,6 +5,43 @@ import { ContentError } from "./session-content.js";
 
 export { oneShotPermissionOption } from "@infinite/attention";
 
+const COLLAPSED_LINES = /^\[?\s*(?:…|\.\.\.)\s*\+?\d+\s+lines?\s*\]?$/i;
+const CODEX_COMMAND_PROMPT = /^would you like to run the following command\?$/i;
+const VIEW_ALL = /^(?:press\s+)?(?:\^a|ctrl(?:\+|-)?a|control(?:\+|-)?a|⌃a)(?:\s+to)?\s+view all$/i;
+const COLLAPSED_AND_VIEW_ALL = /^\[?\s*(?:…|\.\.\.)\s*\+?\d+\s+lines?\s*\]?(?:\s*[|·—-]\s*|\s+)(?:press\s+)?(?:\^a|ctrl(?:\+|-)?a|control(?:\+|-)?a|⌃a)(?:\s+to)?\s+view all$/i;
+const TRUST_LANGUAGE = /always|trust|workspace|project|session|folder|remember|future/i;
+
+/**
+ * A Codex command dialog whose command is still collapsed on the pinned screen.
+ * This predicate only admits the narrow display-expansion case; it does not
+ * authorize a prompt or establish what the hidden command will do.
+ */
+export function isCollapsedPermissionPrompt(prompt: Prompt): boolean {
+  if (!["permission", "menu"].includes(prompt.kind) || !["screen", "hook"].includes(prompt.source) ||
+      !/^[a-f0-9]{64}$/i.test(prompt.hash ?? "") || prompt.pinned !== true || prompt.multiSelect || prompt.acceptsText !== true ||
+      prompt.options.length !== 2 || prompt.options.some(option => TRUST_LANGUAGE.test(option.label)))
+    return false;
+
+  const accepts = prompt.options.filter(option => option.role === "accept" &&
+    /^yes,\s*proceed(?:\s+once)?(?:\s*\(y\))?$/i.test(option.label.trim()));
+  const feedback = prompt.options.filter(option => option.role === "reject-with-feedback");
+  if (accepts.length !== 1 || feedback.length !== 1 ||
+      prompt.options.some(option => option.role !== "accept" && option.role !== "reject-with-feedback"))
+    return false;
+
+  const detail = (prompt.detail ?? "").split("\n").map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const title = prompt.title.replace(/\s+/g, " ").trim();
+  const collapsedDetail = COLLAPSED_AND_VIEW_ALL.test(detail.at(-1) ?? "") ||
+    detail.length >= 2 && COLLAPSED_LINES.test(detail.at(-2)!) && VIEW_ALL.test(detail.at(-1)!);
+  const reasonTitle = /^reason:\s*\S/i.test(title);
+  if (!COLLAPSED_AND_VIEW_ALL.test(title) && !COLLAPSED_LINES.test(title) && !VIEW_ALL.test(title) &&
+      !CODEX_COMMAND_PROMPT.test(title) && !(reasonTitle && collapsedDetail)) return false;
+  const layouts = [[...detail, title], [title, ...detail]];
+  return layouts.some(lines => lines.some((line, index) =>
+    ((index === lines.length - 1 || index + 2 === lines.length) && COLLAPSED_AND_VIEW_ALL.test(line)) ||
+    (index + 2 === lines.length && COLLAPSED_LINES.test(line) && VIEW_ALL.test(lines[index + 1]))));
+}
+
 /** Hash every prompt field that can change what a one-shot answer means. */
 export function permissionEvidenceHash(prompt: Prompt): string {
   const evidence = {

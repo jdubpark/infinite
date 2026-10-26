@@ -27,13 +27,14 @@ test("rejects more than 200 nodes", () => {
 });
 
 test("builds a component graph grouped by top-level directory with deduplicated edges", () => {
-  const graph = componentGraph({ repositoryId: "repo", head: "a".repeat(40), observedAt: "2026-10-25T00:00:00.000Z",
+  const { graph, coverage } = componentGraph({ repositoryId: "repo", head: "a".repeat(40), observedAt: "2026-10-25T00:00:00.000Z",
     components: [{ id: "cmp_a", name: "A", paths: [{ repositoryId: "repo", path: "src/a" }], retired: false }, { id: "cmp_b", name: "B", paths: [{ repositoryId: "repo", path: "src/b" }], retired: false }, { id: "cmp_r", name: "R", paths: [{ repositoryId: "repo", path: "README.md" }], retired: false }, { id: "cmp_old", name: "Old", paths: [], retired: true }],
     relationships: [{ from: "cmp_a", to: "cmp_b", kind: "imports" }, { from: "cmp_a", to: "cmp_b", kind: "imports" }, { from: "cmp_b", to: "cmp_old", kind: "calls" }] });
   assert.equal(graph.id, "components:repo");
   assert.deepEqual(graph.nodes.map(n => [n.id, n.group, n.componentId]), [["cmp_a", "src", "cmp_a"], ["cmp_b", "src", "cmp_b"], ["cmp_r", "root", "cmp_r"]]);
   assert.deepEqual(graph.groups.map(g => g.id), ["src", "root"]);
   assert.deepEqual(graph.edges, [{ from: "cmp_a", to: "cmp_b", label: null }]);
+  assert.deepEqual(coverage, []);
 });
 
 test("links diagram nodes to components by id, then by unique case-insensitive name", () => {
@@ -44,7 +45,22 @@ test("links diagram nodes to components by id, then by unique case-insensitive n
 
 test("stored component graphs validate beyond the parser node limit", () => {
   const components = Array.from({ length: 201 }, (_, i) => ({ id: `cmp_${i}`, name: `C${i}`, paths: [{ repositoryId: "repo", path: `src/c${i}` }], retired: false }));
-  const graph = componentGraph({ repositoryId: "repo", head: null, observedAt: "2026-10-25T00:00:00.000Z", components, relationships: [] });
+  const { graph } = componentGraph({ repositoryId: "repo", head: null, observedAt: "2026-10-25T00:00:00.000Z", components, relationships: [] });
   assert.equal(graph.nodes.length, 201);
   assert.equal(diagramGraphSchema.safeParse(graph).success, true);
+});
+
+test("a component map larger than the stored ceilings is capped, validates, and says how much it drew", () => {
+  // 2,001 components in 250 top-level directories, one named directory too long for a label, one empty name, 4,500 connections.
+  const components = Array.from({ length: 2001 }, (_, i) => ({ id: `cmp_${i}`, name: i === 0 ? "" : i === 1 ? "n".repeat(260) : `C${i}`,
+    paths: [{ repositoryId: "repo", path: `${i === 2 ? "d".repeat(300) : `dir${i % 250}`}/c${i}` }], retired: false }));
+  const relationships = Array.from({ length: 4500 }, (_, i) => ({ from: `cmp_${i % 2000}`, to: `cmp_${(i % 2000 + 1 + Math.floor(i / 2000)) % 2000}`, kind: "imports" as const }));
+  const { graph, coverage } = componentGraph({ repositoryId: "repo", head: null, observedAt: "2026-10-25T00:00:00.000Z", components, relationships });
+  assert.equal(diagramGraphSchema.safeParse(graph).success, true);
+  assert.deepEqual([graph.nodes.length, graph.groups.length, graph.edges.length], [2000, 200, 4000]);
+  assert.deepEqual(graph.nodes.slice(0, 3).map(node => [node.label.length, node.group?.length]), [[5, 4], [200, 4], [2, 200]]);
+  assert.equal(graph.nodes[0].label, "cmp_0");
+  assert.ok(graph.nodes.every(node => node.group === null || graph.groups.some(group => group.id === node.group)));
+  assert.ok(graph.nodes.some(node => node.group === null), "components past the group ceiling are drawn without a group box");
+  assert.deepEqual(coverage, ["Component map: 2000 of 2001 components drawn; the rest are listed under Components.", "Component map: 4000 of 4500 connections between drawn components are shown."]);
 });

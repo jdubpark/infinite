@@ -207,33 +207,46 @@ function groupOf(path: string | undefined): string {
   return slash > 0 ? path.slice(0, slash) : "root";
 }
 
+/**
+ * Builds the deterministic component map within the stored graph ceilings: the first components, groups and
+ * edges in input order, with labels clipped. Its coverage says how much of the map was drawn.
+ */
 export function componentGraph(input: {
   repositoryId: string; head: string | null; observedAt: string;
   components: Pick<KnowledgeComponent, "id" | "name" | "paths" | "retired">[];
   relationships: Pick<KnowledgeRelationship, "from" | "to" | "kind">[];
-}): DiagramGraph {
-  const nodes: DiagramNode[] = input.components.filter(c => !c.retired).map(c => ({
-    id: c.id, label: c.name.slice(0, MAX_LABEL), group: groupOf(c.paths[0]?.path), componentId: c.id,
-  }));
-  const ids = new Set(nodes.map(node => node.id));
+}): { graph: DiagramGraph; coverage: string[] } {
+  const live = input.components.filter(c => !c.retired);
+  const groupIds = new Set<string>();
   const groups: DiagramGroup[] = [];
-  for (const node of nodes) {
-    const group = node.group ?? "root";
-    if (!groups.some(g => g.id === group)) groups.push({ id: group, label: group });
-  }
+  const nodes: DiagramNode[] = live.slice(0, SCHEMA_MAX_NODES).map(c => {
+    const group = groupOf(c.paths[0]?.path).slice(0, MAX_LABEL);
+    if (!groupIds.has(group) && groups.length < SCHEMA_MAX_GROUPS) { groupIds.add(group); groups.push({ id: group, label: group }); }
+    return { id: c.id, label: (c.name || c.id).slice(0, MAX_LABEL), group: groupIds.has(group) ? group : null, componentId: c.id };
+  });
+  const ids = new Set(nodes.map(node => node.id));
   const seen = new Set<string>();
   const edges: DiagramEdge[] = [];
+  let connections = 0;
   for (const relationship of input.relationships) {
     if (!ids.has(relationship.from) || !ids.has(relationship.to)) continue;
     const key = JSON.stringify([relationship.from, relationship.to]);
     if (seen.has(key)) continue;
     seen.add(key);
-    edges.push({ from: relationship.from, to: relationship.to, label: relationship.kind === "imports" ? null : relationship.kind });
+    connections += 1;
+    if (edges.length < SCHEMA_MAX_EDGES) edges.push({ from: relationship.from, to: relationship.to, label: relationship.kind === "imports" ? null : relationship.kind });
   }
+  const coverage = [
+    ...(nodes.length < live.length ? [`Component map: ${nodes.length} of ${live.length} components drawn; the rest are listed under Components.`] : []),
+    ...(edges.length < connections ? [`Component map: ${edges.length} of ${connections} connections between drawn components are shown.`] : []),
+  ];
   return {
-    id: `components:${input.repositoryId}`, title: "Component map", kind: "components", direction: "LR",
-    nodes, groups, edges, source: "components", sourceText: null, parseError: null,
-    repositoryId: input.repositoryId, head: input.head, observedAt: input.observedAt,
+    graph: {
+      id: `components:${input.repositoryId}`, title: "Component map", kind: "components", direction: "LR",
+      nodes, groups, edges, source: "components", sourceText: null, parseError: null,
+      repositoryId: input.repositoryId, head: input.head, observedAt: input.observedAt,
+    },
+    coverage,
   };
 }
 

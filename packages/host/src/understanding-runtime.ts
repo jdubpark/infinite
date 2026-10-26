@@ -610,9 +610,12 @@ export class UnderstandingRuntime {
     const delivery = old?.delivery ?? emptyDelivery(binding.repo.projectId);
     const history: StoredRepository["history"] = { ...(old?.history ?? {}) };
     if (old && old.fingerprint !== fingerprint) for (const component of old.components) history[component.id] = [...(history[component.id] ?? []), { snapshotId: old.fingerprint, at: old.observedAt, summary: component.current.summary }].slice(-MAX_HISTORY);
-    return { repositoryKey: key, repositoryIds: binding.projects, rootIdentity: binding.rootIdentity, observedAt: source.observedAt, fingerprint, head: parsed.head, context: parsed, components, relationships, delivery, synthesisCoverage: old?.synthesisCoverage ?? [], completedPlanRevisions: old?.completedPlanRevisions ?? {}, completedSourceFingerprints: old?.completedSourceFingerprints ?? {}, history,
+    const map = componentGraph({ repositoryId: binding.repo.projectId, head: parsed.head, observedAt: source.observedAt, components, relationships });
+    // The map's own coverage is recomputed with each capture, so it travels with this observation's limitations.
+    const observed = { ...parsed, limitations: [...map.coverage, ...parsed.limitations].slice(0, 100) };
+    return { repositoryKey: key, repositoryIds: binding.projects, rootIdentity: binding.rootIdentity, observedAt: source.observedAt, fingerprint, head: parsed.head, context: observed, components, relationships, delivery, synthesisCoverage: old?.synthesisCoverage ?? [], completedPlanRevisions: old?.completedPlanRevisions ?? {}, completedSourceFingerprints: old?.completedSourceFingerprints ?? {}, history,
       brief: old?.brief ?? null, briefFingerprint: old?.briefFingerprint ?? null, briefFailure: old?.briefFailure ?? null,
-      componentDiagram: componentGraph({ repositoryId: binding.repo.projectId, head: parsed.head, observedAt: source.observedAt, components, relationships }) };
+      componentDiagram: map.graph };
   }
 
   private mapComponents(binding: SourceBinding, context: RepoContext, source: KnowledgeSource, key: string, catalog: KnowledgeCatalog) {

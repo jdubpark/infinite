@@ -8,6 +8,8 @@ export interface LayoutGroup { id: string; label: string; x: number; y: number; 
 export interface GraphLayout { width: number; height: number; nodes: LayoutNode[]; edges: LayoutEdge[]; groups: LayoutGroup[] }
 
 export const defaultLayoutOptions: LayoutOptions = { nodeWidth: 150, nodeHeight: 44, gapX: 48, gapY: 28, groupPadding: 12 };
+/** Room for a group box's label above its padding. */
+export const groupLabelHeadroom = 16;
 
 type Point = { x: number; y: number };
 
@@ -16,6 +18,11 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
   const pad = o.groupPadding;
   const lr = graph.direction === "LR";
   const nodes = graph.nodes;
+  const groupOf = new Map(nodes.map(node => [node.id, node.group]));
+  const grouped = graph.groups.length > 0 && nodes.some(node => node.group !== null);
+  // Boxes carry a label above their members, so a grouped graph starts lower and spaces rows so that boxes stay apart.
+  const top = grouped ? groupLabelHeadroom : 0;
+  const gapY = grouped ? Math.max(o.gapY, 2 * pad + groupLabelHeadroom + 4) : o.gapY;
   const ids = new Set(nodes.map(node => node.id));
   const edges = graph.edges.filter(edge => ids.has(edge.from) && ids.has(edge.to));
   const back = markBackEdges(nodes.map(node => node.id), edges);
@@ -41,7 +48,8 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
   const layers: string[][] = Array.from({ length: layerCount }, () => []);
   for (const node of nodes) layers[layerOf.get(node.id) ?? 0].push(node.id);
 
-  // Barycenter sweeps (down, up, down, up) against the adjacent layer; ties keep input order.
+  // Barycenter sweeps (down, up, down, up) against the adjacent layer; ties go by group id, then input order.
+  // After each sort the members of one group are made contiguous, so a box around a layer's members holds no other node.
   const rank = new Map(nodes.map((node, index) => [node.id, index]));
   const position = new Map<string, number>();
   const indexLayers = (): void => layers.forEach(row => row.forEach((id, index) => position.set(id, index)));
@@ -52,9 +60,11 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
       const mean = near.length ? near.reduce((sum, other) => sum + (position.get(other) ?? 0), 0) / near.length : (position.get(id) ?? 0);
       return [id, mean] as const;
     }));
-    row.sort((a, b) => (bary.get(a) ?? 0) - (bary.get(b) ?? 0) || (rank.get(a) ?? 0) - (rank.get(b) ?? 0));
-    row.forEach((id, index) => position.set(id, index));
+    row.sort((a, b) => (bary.get(a) ?? 0) - (bary.get(b) ?? 0) || (groupOf.get(a) ?? "").localeCompare(groupOf.get(b) ?? "") || (rank.get(a) ?? 0) - (rank.get(b) ?? 0));
+    layers[layer] = contiguous(row, groupOf);
+    layers[layer].forEach((id, index) => position.set(id, index));
   };
+  layers.forEach((row, layer) => { layers[layer] = contiguous(row, groupOf); });
   const adjacentPreds = new Map([...preds].map(([id, list]) => [id, list.filter(other => layerOf.get(other) === (layerOf.get(id) ?? 0) - 1)]));
   const adjacentSuccs = new Map([...succs].map(([id, list]) => [id, list.filter(other => layerOf.get(other) === (layerOf.get(id) ?? 0) + 1)]));
   indexLayers();
@@ -66,13 +76,13 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
   }
 
   // Layers advance along the flow axis; nodes within a layer advance along the other axis.
-  const mainStep = lr ? o.nodeWidth + o.gapX : o.nodeHeight + o.gapY;
-  const crossStep = lr ? o.nodeHeight + o.gapY : o.nodeWidth + o.gapX;
+  const mainStep = lr ? o.nodeWidth + o.gapX : o.nodeHeight + gapY;
+  const crossStep = lr ? o.nodeHeight + gapY : o.nodeWidth + o.gapX;
   const laidNodes: LayoutNode[] = nodes.map(node => {
     const layer = layerOf.get(node.id) ?? 0;
     const along = pad + layer * mainStep;
     const across = pad + (position.get(node.id) ?? 0) * crossStep;
-    return { id: node.id, x: lr ? along : across, y: lr ? across : along, width: o.nodeWidth, height: o.nodeHeight, layer };
+    return { id: node.id, x: lr ? along : across, y: (lr ? across : along) + top, width: o.nodeWidth, height: o.nodeHeight, layer };
   });
   const byId = new Map(laidNodes.map(node => [node.id, node]));
 
@@ -86,7 +96,9 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
     const minY = Math.min(...members.map(m => m.y));
     const maxX = Math.max(...members.map(m => m.x + m.width));
     const maxY = Math.max(...members.map(m => m.y + m.height));
-    return [{ id: group.id, label: group.label, x: minX - pad, y: minY - pad, width: maxX - minX + 2 * pad, height: maxY - minY + 2 * pad }];
+    const box = { id: group.id, label: group.label, x: minX - pad, y: minY - pad - groupLabelHeadroom, width: maxX - minX + 2 * pad, height: maxY - minY + 2 * pad + groupLabelHeadroom };
+    // Members spread over several layers can still surround another node; such a box would misstate membership.
+    return laidNodes.some(node => groupOf.get(node.id) !== group.id && overlaps(node, box)) ? [] : [box];
   });
 
   const boxes = [...laidNodes, ...groups];
@@ -104,6 +116,21 @@ export function layoutGraph(graph: Pick<DiagramGraph, "direction" | "nodes" | "g
   });
 
   return { width, height, nodes: laidNodes, edges: layoutEdges, groups };
+}
+
+/** Reorders a layer so each group's members sit together: groups keep the order of their first member, members keep theirs. Ungrouped nodes stay where they are. */
+function contiguous(row: string[], groupOf: Map<string, string | null>): string[] {
+  const blocks = new Map<string, string[]>();
+  for (const id of row) {
+    const key = groupOf.get(id) ? `g:${groupOf.get(id)}` : `n:${id}`;
+    const block = blocks.get(key);
+    if (block) block.push(id); else blocks.set(key, [id]);
+  }
+  return [...blocks.values()].flat();
+}
+
+function overlaps(a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }): boolean {
+  return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
 }
 
 /** Marks edges that close a cycle in a DFS over nodes in input order, so the rest form a DAG. */

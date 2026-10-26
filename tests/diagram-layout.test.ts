@@ -84,3 +84,46 @@ test("option overrides change the width by the overridden rules", () => {
   const layout = layoutGraph({ direction: "LR", groups: [], nodes: n(["a", "b", "c"]), edges: [e("a", "b"), e("b", "c")] }, { nodeWidth: 100, gapX: 10 });
   assert.equal(layout.width, 3 * 100 + 2 * 10 + 2 * 12);
 });
+
+type Box = { x: number; y: number; width: number; height: number };
+const inside = (node: Box, box: Box) => node.x >= box.x && node.y >= box.y && node.x + node.width <= box.x + box.width && node.y + node.height <= box.y + box.height;
+const overlap = (a: Box, b: Box) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+const grouped = (members: [string, string][]) => members.map(([id, group]) => ({ id, label: id, group, componentId: null }));
+function assertHonestBoxes(layout: ReturnType<typeof layoutGraph>, nodes: { id: string; group: string | null }[]) {
+  const groupOf = new Map(nodes.map(node => [node.id, node.group]));
+  for (const box of layout.groups) {
+    const members = layout.nodes.filter(node => groupOf.get(node.id) === box.id);
+    assert.ok(members.every(node => inside(node, box)), `${box.id} encloses its members`);
+    assert.deepEqual(layout.nodes.filter(node => groupOf.get(node.id) !== box.id && overlap(node, box)).map(node => node.id), [], `${box.id} holds no other group's node`);
+    assert.ok(Math.min(...members.map(node => node.y)) - box.y >= 16, `${box.id} leaves room for its label`);
+    assert.ok(box.y >= 0, `${box.id} stays on the canvas`);
+  }
+  for (const a of layout.groups) for (const b of layout.groups) if (a.id < b.id) assert.equal(overlap(a, b), false, `${a.id} and ${b.id} do not overlap`);
+}
+
+test("five nodes in three groups sharing a layer get contiguous boxes that hold no foreign node", () => {
+  const nodes = grouped([["a1", "a"], ["b1", "b"], ["a2", "a"], ["c1", "c"], ["b2", "b"]]);
+  const layout = layoutGraph({ direction: "LR", groups: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }], nodes, edges: [] });
+  assert.deepEqual(layout.groups.map(group => group.id), ["a", "b", "c"]);
+  const order = [...layout.nodes].sort((x, y) => x.y - y.y).map(node => node.id);
+  assert.deepEqual(order, ["a1", "a2", "b1", "b2", "c1"]);
+  assertHonestBoxes(layout, nodes);
+});
+
+test("a component-map shape across layers keeps boxes honest and labelled", () => {
+  const nodes = grouped([["web", "apps"], ["mobile", "apps"], ["host", "packages"], ["remote", "packages"], ["readme", "root"]]);
+  const layout = layoutGraph({ direction: "LR", groups: [{ id: "apps", label: "apps" }, { id: "packages", label: "packages" }, { id: "root", label: "root" }], nodes,
+    edges: [e("web", "remote"), e("mobile", "remote"), e("host", "remote"), e("readme", "host")] });
+  assert.equal(layout.groups.length, 3);
+  assertHonestBoxes(layout, nodes);
+  const tb = layoutGraph({ direction: "TB", groups: [{ id: "apps", label: "apps" }, { id: "packages", label: "packages" }, { id: "root", label: "root" }], nodes,
+    edges: [e("web", "remote"), e("mobile", "remote"), e("host", "remote"), e("readme", "host")] });
+  assertHonestBoxes(tb, nodes);
+});
+
+test("a group whose members surround another node across layers draws no box", () => {
+  const nodes = grouped([["a1", "a"], ["x", "b"], ["a2", "a"]]);
+  const layout = layoutGraph({ direction: "LR", groups: [{ id: "a", label: "A" }, { id: "b", label: "B" }], nodes, edges: [e("a1", "x"), e("x", "a2")] });
+  assert.deepEqual(layout.groups.map(group => group.id), ["b"]);
+  assertHonestBoxes(layout, nodes);
+});

@@ -711,3 +711,22 @@ test("an engine that exits with an error line on stderr reports that line as the
     assert.ok(s.runtime.read("workspace").maintenance.lastFailure?.reason.includes(reason), s.runtime.read("workspace").maintenance.lastFailure?.reason);
   });
 });
+
+test("a source map with more components than the stored diagram holds still publishes and says how much it drew", { timeout: 60000 }, async t => {
+  const s = setup(t, { adapter: { context: async root => {
+    const base = sampleContext(root), hash = base.files["src/a.ts"].hash;
+    const files: RepoContext["files"] = {}, components: RepoContext["components"] = [];
+    for (let i = 0; i < 2001; i++) {
+      files[`pkg${i}/index.ts`] = { hash, lines: 1 };
+      components.push({ id: `c${i}`, path: `pkg${i}`, name: `C${i}`, files: 1, examples: [], entryPoints: [], incoming: 0, outgoing: 0, changed: 0 });
+    }
+    return { ...base, files, components, edges: [] };
+  } } });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 30000);
+  const read = s.runtime.read("workspace");
+  assert.equal(read.maintenance.state, "idle", read.maintenance.message ?? "");
+  assert.equal(read.components.length, 2001);
+  assert.equal(read.diagrams?.find(diagram => diagram.id === "components:repo")?.nodes.length, 2000);
+  assert.ok(read.coverage.includes("Component map: 2000 of 2001 components drawn; the rest are listed under Components."));
+});

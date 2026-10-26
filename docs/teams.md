@@ -99,7 +99,8 @@ repository, while the coordinator, workers, and reviewer come from the host's
 configured lineup. The host passes the selected project ID to Ubuntu provider
 wrappers as `INFINITE_PROJECT_ID`, which selects an optional project environment
 file on that host. First-time repository enrollment delegates current one-shot
-tool requests to the strong coordinator by default; `--permissions off` opts out.
+tool requests to the configured permission reviewer, using the strong coordinator
+when no reviewer profile is configured; `--permissions off` opts out.
 The repository policy bounds that authority; see
 [Delegating permission decisions](#delegating-permission-decisions).
 
@@ -942,11 +943,19 @@ configured lineup by default; a user can instead select one configured provider
 for all roles. Goals always use a recorded lineup and require both coordinator
 and reviewer profiles to have `tier: "strong"`.
 
-This starting configuration uses Opus 5.5 at `xhigh` for coordination and repair,
-Astra 6 at `high` for review, and Haiku 5.5 and GPT-6 Luna at `high` for ordinary
-worker tasks. Opus 5.5 `xhigh` and Astra 6 `xhigh` are available through the
-explicit escalation pool. Model IDs live in host configuration, rather than
-application routing code.
+This example uses Opus 5.5 at `xhigh` for coordination and repair, Astra 6 at
+`high` for review, and Haiku 5.5 and GPT-6 Luna at `high` for ordinary worker
+tasks. Opus 5.5 `xhigh` and Astra 6 `xhigh` are available through the explicit
+escalation pool. Model IDs live in host configuration, rather than application
+routing code.
+
+`permissionReviewer` is an optional Claude Code profile for read-only review of
+member permission prompts. When omitted, the coordinator is the fallback
+reviewer and must have `tier: "strong"`; configuring `permissionReviewer` removes
+that strong-tier requirement for this role. A light Claude profile at `high`
+effort fits this narrow, mechanical rule because the host rechecks the answer
+and applies it. The repository ships no default lineup, so add the profile to
+the deployment's host configuration to use it.
 
 ```json
 {
@@ -989,7 +998,12 @@ application routing code.
         "provider": "codex", "model": "gpt-6-astra", "effort": "xhigh",
         "tier": "strong", "dataUse": "standard"
       }
-    ]
+    ],
+    "permissionReviewer": {
+      "id": "haiku-permission-reviewer", "label": "Haiku 5.5 high",
+      "provider": "claude", "model": "claude-haiku-5-5", "effort": "high",
+      "tier": "light", "dataUse": "standard"
+    }
   }
 }
 ```
@@ -1100,16 +1114,41 @@ limit or cannot act, or bounded evidence recovery cannot establish a complete
 one-shot request. A run gets
 a short grace period to start the review before an unreviewed prompt is pushed.
 
-A current one-shot tool prompt can start a separate turn on the run's strong
-Claude coordinator profile. The coordinator receives the task, owner scope and exact
-request, then reports approve-once, request-evidence, or escalate. The host checks the assignment,
+A run revision has one read-only permission reviewer: the pinned Claude
+permission reviewer profile, or the strong coordinator when no reviewer profile
+is configured. The reviewer receives the task, owner scope and assignment once.
+Each qualifying request is a turn that resumes the same native conversation and
+adds that request's evidence together with the owner's current steering and
+answers. The reviewer keeps its member and conversation while the integration
+head moves, because it has no file tools. The five-minute review window applies
+to each turn. If the conversation cannot be resumed, the host restarts it once with
+the full assignment and current request evidence. Between requests, the
+reviewer waits without a running process and holds no agent slot. It reports
+approve-once, request-evidence, or escalate. The host checks the assignment,
 workspace, prompt, policy, expiry and human input control before delivering the
-recorded choice. Workers cannot approve their own requests. The permission
-coordinator runs noninteractively with built-in tools disabled and only its
-assignment's report tool allowed. It can request up to eight specific source
-paths for bounded read-only collection and a fresh review when evidence is
-missing. Worker provider modes, global trust settings and credentials
-remain unchanged. Other coordinator providers are not yet supported for this role.
+recorded choice.
+Workers cannot approve their own requests. The permission reviewer runs
+noninteractively with built-in tools disabled and only its assignment's report
+tool allowed. It can request up to eight specific source paths for bounded read-only
+collection; the host collects them and continues the same conversation with a
+fresh review turn. It escalates when the supplied evidence is insufficient. An
+incomplete or collapsed prompt gets a diagnostic turn that can never approve.
+Worker provider modes, global trust settings and credentials remain unchanged. Other
+coordinator providers are not yet supported for this role.
+
+Within the run revision's decision limit, an identical request can reuse a
+terminal reviewer's recorded verdict without another turn. The reuse key binds
+the pinned policy, semantic prompt and chosen option, task ID, changed paths,
+and accepted checks; it excludes prompt, session, and member identifiers. Reuse
+also requires the same run revision, assigned role, working directory, reviewer
+profile, inspected workspace evidence, and owner authority (pinned policy plus
+the owner's steering and answers); a later owner answer makes every earlier
+verdict a miss, and an owner answer retires every outstanding delegated
+decision so it is reviewed again under the new direction or stays with the
+owner. A recorded approval is still rechecked against the current target
+session, including that owner authority, and delivered once. A recorded reviewer escalation remains with the
+owner. Reuse does not extend the run's decision limit or apply to host-side
+escalations.
 
 Permission recovery runs before owner escalation. A recognized collapsed Codex
 command may receive a guarded display-only Ctrl+A; this never accepts the

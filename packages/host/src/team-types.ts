@@ -62,6 +62,11 @@ export const teamDeliverySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("pr"), repository: githubRepository, baseBranch: gitBranch }).strict(),
 ]);
 export type TeamDelivery = z.infer<typeof teamDeliverySchema>;
+export const nativeContinuationSchema = z.object({
+  nativeSessionId: z.string().uuid(),
+  mode: z.enum(["start", "resume"]),
+}).strict();
+export type NativeContinuation = z.infer<typeof nativeContinuationSchema>;
 /** The owner's default delegation: routine development work is the coordinator's to approve; release actions stay with the owner. */
 export const DEFAULT_PERMISSION_SCOPE = "Approve one-time development operations that an engineer would routinely run for the accepted objective and assigned role inside the assigned workspace: repository inspection and fetch, scoped edits and staging, dependency installation from the repository's declared manifests and lockfiles, test planning, builds, tests, scripts, local listeners and local browser checks. These may run outside the provider sandbox and use network access, local sockets, IPC and task-owned temporary files while preserving the assigned repository and path scope. Delivery operations require the run's separate pinned delivery policy. Escalate only production or staging actions such as deploy, promote, roll out, release or publish, new or external credentials, other repositories, global or account settings, destructive operations outside the assigned workspace, persistent approvals, permission bypasses, and commands whose effect is unrelated to the task or appears malicious.";
 export const DEFAULT_PERMISSION_LIMIT = 25;
@@ -95,12 +100,23 @@ export interface TeamPermissionDecision {
   promptId: number;
   promptHash: string;
   evidenceHash: string;
+  /** Absent only when the target workspace or changed paths could not be inspected. */
+  reuseKey?: string;
+  reusedFromDecisionId?: string;
+  verdict?: "approve-once" | "escalate";
   /** Binds inspected command sources and changed paths to this exact review. */
   workspaceEvidenceHash?: string;
+  /** Pins the owner policy, steering and answers in force when this decision was assigned. */
+  authorityHash?: string;
+  /** Pins the reviewer profile selected when this decision was assigned. */
+  reviewerProfileId?: string;
+  reviewerProfileHash?: string;
   prompt: Prompt;
   option: number;
   expiresAt: string;
   coordinatorMemberId?: string;
+  /** Host session that handled this decision on a sticky reviewer member. */
+  coordinatorSessionId?: string;
   answerRequestId: string;
   /** Absent on old records; diagnostic reviews can request evidence but can never answer a prompt. */
   purpose?: "answer" | "diagnose";
@@ -206,7 +222,11 @@ export const teamLineupSchema = z.object({
   implementers: z.array(teamModelProfileSchema).min(1).max(8),
   escalations: z.array(teamModelProfileSchema).min(1).max(8).optional(),
   fallbacks: z.array(teamModelProfileSchema).min(1).max(8).optional(),
+  // Keep this last: lineup fingerprints include the parsed object's key order.
+  permissionReviewer: teamModelProfileSchema.optional(),
 }).strict().superRefine((lineup, context) => {
+  if (lineup.permissionReviewer && lineup.permissionReviewer.provider !== "claude")
+    context.addIssue({ code: "custom", path: ["permissionReviewer", "provider"], message: "The permission reviewer profile must use Claude Code." });
   for (const pool of ["implementers", "escalations", "fallbacks"] as const) {
     const ids = new Set<string>();
     for (const [index, profile] of (lineup[pool] ?? []).entries()) {
@@ -223,13 +243,24 @@ export const teamLineupSchema = z.object({
     identities.set(profile.id, identity);
   }
   const byId = new Map(profiles.map(profile => [profile.id, profile]));
+  const permissionReviewerFallbacks = new Set<string>();
+  let permissionFallback = lineup.permissionReviewer;
+  for (let hop = 0; hop < 2 && permissionFallback?.limitFallback; hop++) {
+    permissionReviewerFallbacks.add(permissionFallback.id);
+    const target = byId.get(permissionFallback.limitFallback);
+    if (!target) break;
+    permissionFallback = target;
+  }
   for (const profile of profiles) {
     if (!profile.limitFallback) continue;
     const seen = new Set([profile.id]);
     let current: TeamModelProfile = profile;
+    const permissionReviewerChain = permissionReviewerFallbacks.has(profile.id);
     for (let hop = 1; current.limitFallback; hop++) {
       const target = byId.get(current.limitFallback);
       if (!target) { context.addIssue({ code: "custom", message: `Limit fallback "${current.limitFallback}" of "${current.id}" is not a profile in this lineup` }); break; }
+      if (permissionReviewerChain && target.provider !== "claude")
+        context.addIssue({ code: "custom", message: "A permission reviewer limit fallback must use Claude Code." });
       if (target.provider === current.provider) { context.addIssue({ code: "custom", message: `Limit fallback "${target.id}" of "${current.id}" must use a different provider` }); break; }
       if (current.tier === "strong" && target.tier !== "strong") { context.addIssue({ code: "custom", message: `Strong profile "${current.id}" must fall back to a strong profile` }); break; }
       if (seen.has(target.id)) { context.addIssue({ code: "custom", message: `Limit fallback chain from "${profile.id}" revisits "${target.id}"` }); break; }
@@ -240,9 +271,9 @@ export const teamLineupSchema = z.object({
   }
 });
 export type TeamLineup = z.infer<typeof teamLineupSchema>;
-type LineupShape = Pick<TeamLineup, "coordinator" | "integrator" | "reviewer" | "implementers" | "escalations" | "fallbacks">;
+type LineupShape = Pick<TeamLineup, "coordinator" | "integrator" | "reviewer" | "implementers" | "escalations" | "fallbacks" | "permissionReviewer">;
 export function lineupProfiles(lineup: LineupShape): TeamModelProfile[] {
-  return [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? []), ...(lineup.fallbacks ?? [])];
+  return [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? []), ...(lineup.fallbacks ?? []), ...(lineup.permissionReviewer ? [lineup.permissionReviewer] : [])];
 }
 /** First profile reachable within two `limitFallback` hops whose provider is not limited. */
 export function resolveLimitFallback(lineup: LineupShape, profileId: string, limited: Set<Provider>): TeamModelProfile | undefined {
@@ -358,6 +389,14 @@ export interface TeamMember extends TeamAssignment {
   provider?: Provider;
   modelProfile?: TeamModelProfile;
   sessionId: string;
+  /** Claude conversation resumed for successive permission review turns. */
+  nativeSessionId?: string;
+  /** Native conversation launch used for the current or most recent turn. */
+  continuation?: NativeContinuation;
+  /** Permission decisions handled by this reviewer member, in order. */
+  turns?: { sessionId: string; decisionId: string; startedAt: string; mode: "start" | "resume" }[];
+  /** Full evidence for rebuilding the original prompt if native resume fails. */
+  pendingFeedback?: string;
   title: string;
   status: "queued" | "running" | "waiting" | "reported" | "stopped" | "unavailable";
   cwd: string;
@@ -542,8 +581,8 @@ export interface TeamRun {
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
   pendingOperation?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number; failed: boolean;
     failureCode?: string; sourceMemberId?: string; sourceRole?: TeamMember["role"] };
-  members: Omit<TeamMember, "prompt" | "contextFeedback">[];
-  permissionDecisions?: Omit<TeamPermissionDecision, "prompt">[];
+  members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback">[];
+  permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];
   permissionRecovery?: { outcomes: TeamPermissionRecoveryView[] };
   usage: UsageRollup;
   providerLimits: ProviderLimit[];

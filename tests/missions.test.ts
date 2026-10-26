@@ -14,11 +14,11 @@ import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, missionBoard, type ProjectGroupLookup } from "../packages/host/src/missions.js";
 import { createMissionReportEnvelope } from "../packages/host/src/team-report-client.js";
-import { missionPromptWithMessageCount, type MissionOpenChildDecision, type MissionMessage } from "../packages/host/src/team-prompts.js";
+import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, type MissionOpenChildDecision, type MissionMessage } from "../packages/host/src/team-prompts.js";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { Config, Session } from "../packages/host/src/types.js";
-import type { CreateTeam, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
+import type { CreateTeam, NativeContinuation, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { CreateMission, Mission, MissionReport } from "../packages/host/src/mission-types.js";
 import { emptyRollup, emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
 import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
@@ -416,6 +416,26 @@ test("mission prompt keeps 21 open child questions under the byte limit without 
   assert.match(bounded.prompt, new RegExp(`${oversizedMessages.length - bounded.includedMessageCount} more messages are waiting`));
 });
 
+test("mission follow-up prompt defers trailing messages when they exceed the byte limit", () => {
+  const mission = {
+    id: "mission", groupName: "Example", status: "working", deadlineAt: "", maxSubtasks: 8,
+    subtasks: [], decisions: [], dispatchSummary: "", steering: [], objective: "Coordinate repository work.",
+  } as unknown as Mission;
+  const repos = [{ projectId: "api", name: "API", path: "/repo/api", teamReady: true }];
+  const messages: MissionMessage[] = Array.from({ length: 30 }, (_, index) => ({
+    type: "owner-direction", text: "Direction " + index + ": " + "d".repeat(3500),
+  }));
+  const result = missionFollowUpPromptWithMessageCount(mission, repos, messages, 3, "claude", lineup.coordinator,
+    { openChildDecisions: [], waiting: 2 });
+
+  assert.ok(Buffer.byteLength(result.prompt) < 80 * 1024);
+  assert.ok(result.includedMessageCount < messages.length, "Trailing messages remain queued for the next attempt");
+  assert.match(result.prompt, /Mission state:/);
+  assert.match(result.prompt, /coordinator attempt 3, continuing the same mission conversation/);
+  assert.doesNotMatch(result.prompt, /Repositories in this project|Requested runtime profile/);
+  assert.match(result.prompt, new RegExp(String(messages.length - result.includedMessageCount + 2) + " more messages are waiting"));
+});
+
 test("a mission pins a team-ready alternate checkout when its primary checkout is not configured", async () => {
   const h = missionCheckoutAdmission(false);
   try {
@@ -694,10 +714,13 @@ function scripted() {
     environment: "local", enableDemo: false, maxSessions: 24, agents: { claude: { command: process.execPath, args: [] } },
     projects: [{ id: "api", name: "API", path: repo("api"), team: { checks } }, { id: "web", name: "Web", path: repo("web"), team: { checks } }],
     teams: { workspaceDir: join(root, "teams"), lineup } };
-  const attempts: { sessionId: string; assignment: TeamAssignment; prompt: string }[] = [];
+  type CoordinatorRequest = { requestId: string; prompt: string; continuation?: NativeContinuation };
+  const attempts: { sessionId: string; assignment: TeamAssignment; prompt: string; request: CoordinatorRequest }[] = [];
   const reports = new Map<string, MissionReport>();
   // Each coordinator session's journaled signals and the attention the real reducer derives from them.
   const signals = new Map<string, SignalEvent[]>(), attention = new Map<string, Attention>();
+  const stateReads = new Map<string, number>(), sessionStatuses = new Map<string, "running" | "exited">();
+  const nativeSessions = new Map<string, { id: string; source: "hook" }>();
   const held = new Set<string>(), stops: string[] = [];
   const signal = (sessionId: string, data: Signal, at = new Date()) => {
     const journal = signals.get(sessionId)!;
@@ -706,10 +729,11 @@ function scripted() {
     attention.set(sessionId, applySignal(attention.get(sessionId)!, event));
   };
   const manager = {
-    async createTeamSession(request: { requestId: string; prompt: string }, assignment: TeamAssignment) {
+    async createTeamSession(request: CoordinatorRequest, assignment: TeamAssignment) {
       if (!attempts.some(item => item.sessionId === request.requestId)) {
-        attempts.push({ sessionId: request.requestId, assignment, prompt: request.prompt });
+        attempts.push({ sessionId: request.requestId, assignment, prompt: request.prompt, request });
         signals.set(request.requestId, []); attention.set(request.requestId, initialAttention(new Date().toISOString(), true));
+        sessionStatuses.set(request.requestId, "running");
         signal(request.requestId, { kind: "turn-start" });
       }
       return { status: "running" };
@@ -722,8 +746,15 @@ function scripted() {
       return { events: [{ data: { requestId: randomUUID(), missionId: runId, memberId, revision, report } }], cursor: 1, more: false };
     },
     meta() { return {}; },
-    async state(sessionId: string) { return { status: "running", attention: attention.get(sessionId) }; },
-    async stopTeamSession(sessionId: string) { stops.push(sessionId); return { status: held.has(sessionId) ? "running" : "exited" }; },
+    async state(sessionId: string) {
+      stateReads.set(sessionId, (stateReads.get(sessionId) ?? 0) + 1);
+      return { status: sessionStatuses.get(sessionId) ?? "running", attention: attention.get(sessionId), nativeSession: nativeSessions.get(sessionId) };
+    },
+    async stopTeamSession(sessionId: string) {
+      stops.push(sessionId);
+      if (!held.has(sessionId)) sessionStatuses.set(sessionId, "exited");
+      return { status: held.has(sessionId) ? "running" : "exited", nativeSession: nativeSessions.get(sessionId) };
+    },
   };
   const runs = new Map<string, FakeRun>(), standalone = new Set<string>(), failing = new Set<string>();
   let resumeBusy = false;
@@ -735,6 +766,7 @@ function scripted() {
   let loseCapacityReply = false, bumpCapacityRevision = false;
   const steerReceipts = new Map<string, string>();
   let steerLimit: boolean | Set<string> = false, steerBusy = false, loseSteerReply = false;
+  const key = randomBytes(32);
   const view = (run: FakeRun) => ({ ...structuredClone(run), title: run.id, tasks: [], usage: run.usage ?? emptyRollup() }) as unknown as TeamView;
   const run = (id: string) => { const value = runs.get(id); if (!value) throw new TeamError(404, "team-not-found", "This team does not exist."); return value; };
   const set = (id: string, patch: Partial<FakeRun>) => Object.assign(run(id), patch, { updatedAt: new Date().toISOString() });
@@ -812,7 +844,7 @@ function scripted() {
         { projectId: "web", name: "Web", path: config.projects[1].path, checkouts: [{ projectId: "web", name: "Web", path: config.projects[1].path, primary: true, teamReady: true }] },
       ] };
   } };
-  const missions = new MissionService(config, randomBytes(32), manager as unknown as Manager, teams as unknown as TeamService, groups);
+  const missions = new MissionService(config, key, manager as unknown as Manager, teams as unknown as TeamService, groups);
   missions.start();
   const attempt = async (n: number) => (await waitFor(async () => attempts[n - 1], value => Boolean(value), 20000))!;
   const parse = (prompt: string, label: string) => JSON.parse(prompt.split("\n").find(line => line.startsWith(label))!.slice(label.length));
@@ -829,6 +861,20 @@ function scripted() {
     remove: () => { removed = true; },
     attempts: () => attempts.length,
     attempt,
+    confirmNative: async (n: number) => {
+      const current = await attempt(n), sessionId = current.sessionId;
+      const nativeSessionId = current.request.continuation?.nativeSessionId;
+      if (!nativeSessionId) throw new Error("Coordinator attempt has no native continuation ID");
+      const previousReads = stateReads.get(sessionId) ?? 0;
+      nativeSessions.set(sessionId, { id: nativeSessionId, source: "hook" });
+      await waitFor(async () => stateReads.get(sessionId) ?? 0, reads => reads > previousReads, 5000);
+    },
+    exitWithoutNative: async (n: number) => {
+      const sessionId = (await attempt(n)).sessionId;
+      nativeSessions.delete(sessionId);
+      sessionStatuses.set(sessionId, "exited");
+    },
+    refusals: (id: string) => unseal<{ refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")).refusals,
     messages: async (n: number) => parse((await attempt(n)).prompt, "Messages since your last attempt (JSON): "),
     state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),
     report: async (n: number, report: MissionReport) => { reports.set((await attempt(n)).sessionId, report); },
@@ -1167,6 +1213,53 @@ test("a coordinator that ends its turn without a report is replaced, so the last
     assert.ok(h.get(id).events.some(event => /missing report was refused: Your previous attempt ended without a mission report/.test(event.text)));
     await h.report(4, { kind: "result", summary: "Both repositories are ready; the endpoint is GET /health" });
     await until(() => h.get(id), mission => mission.status === "ready-for-review", 20000);
+  } finally { h.close(); }
+});
+
+test("a second coordinator attempt resumes the confirmed native conversation with a delta prompt", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    const first = await h.attempt(1);
+    assert.equal(first.request.continuation?.mode, "start");
+    await h.confirmNative(1);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Check the new endpoint" });
+
+    const second = await h.attempt(2);
+    assert.equal(second.request.continuation?.mode, "resume");
+    assert.equal(second.request.continuation?.nativeSessionId, first.request.continuation?.nativeSessionId);
+    assert.match(second.prompt, /Mission state:/);
+    assert.match(second.prompt, /Check the new endpoint/);
+    assert.doesNotMatch(second.prompt, /Repositories in this project/);
+  } finally { h.close(); }
+});
+
+test("a failed coordinator resume restores consumed messages and starts with the full prompt", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.confirmNative(1);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "First direction" });
+    const resumed = await h.attempt(2);
+    assert.equal(resumed.request.continuation?.mode, "resume");
+    await h.missions.steer(id, { requestId: randomUUID(), revision: h.get(id).revision, text: "Second direction" });
+    const refusalsBefore = h.refusals(id);
+    await h.exitWithoutNative(2);
+
+    const fallback = await h.attempt(3);
+    assert.equal(fallback.request.continuation?.mode, "start");
+    assert.notEqual(fallback.request.continuation?.nativeSessionId, resumed.request.continuation?.nativeSessionId);
+    assert.match(fallback.prompt, /Repositories in this project/);
+    assert.deepEqual((await h.messages(3)).filter((message: { type: string }) => message.type === "owner-direction").map((message: { text: string }) => message.text),
+      ["First direction", "Second direction"]);
+    assert.equal((await h.messages(3)).some((message: { type: string; kind?: string }) => message.type === "refused" && message.kind === "missing"), false);
+    await until(() => h.get(id), mission => mission.events.some(event => event.text === "The coordinator's conversation could not be resumed; a fresh attempt starts with the full mission state."));
+    assert.equal(h.refusals(id), refusalsBefore);
+    assert.ok(!h.get(id).events.some(event => /missing report was refused/.test(event.text)));
   } finally { h.close(); }
 });
 

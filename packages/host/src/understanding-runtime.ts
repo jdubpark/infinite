@@ -139,6 +139,7 @@ const storedRepositorySchema = z.object({
   context: repoContextSchema, components: z.array(knowledgeComponentStateSchema).max(MAX_COMPONENTS), relationships: z.array(relationshipSchema).max(MAX_EDGES), delivery: deliverySchema,
   synthesisCoverage: z.array(z.string().max(1000)).max(100), completedPlanRevisions: record, completedSourceFingerprints: record, history: z.record(z.string(), z.array(z.object({ snapshotId: z.string(), at: z.string().datetime({ offset: true }), summary: z.string().max(4000) }).strict()).max(MAX_HISTORY)),
   brief: storedBriefSchema.nullable().default(null), briefFingerprint: z.string().nullable().default(null), briefFailure: z.string().max(400).nullable().default(null), componentDiagram: diagramGraphSchema.nullable().default(null),
+  previousHead: z.string().nullable().optional(), // Legacy key from an earlier build; accepted and ignored.
 }).strict().superRefine((value, context) => {
   for (const [key, revision] of Object.entries(value.completedPlanRevisions)) if (typeof revision !== "string") context.addIssue({ code: "custom", path: ["completedPlanRevisions", key], message: "invalid plan watermark" });
   for (const [key, fingerprint] of Object.entries(value.completedSourceFingerprints)) if (typeof fingerprint !== "string") context.addIssue({ code: "custom", path: ["completedSourceFingerprints", key], message: "invalid source watermark" });

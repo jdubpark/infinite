@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { UnderstandingRuntime, type RepoContext, type UnderstandingAdapter } from "../packages/host/src/understanding-runtime.js";
+import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { CatalogError, UnderstandingCatalog } from "../packages/host/src/understanding-catalog.js";
 import { createUnderstandingAdapter } from "../packages/host/src/understanding-adapter.js";
 import type { KnowledgeCatalog } from "@infinite/remote";
@@ -537,4 +538,25 @@ test("a failing brief step keeps the source map and records the brief reason", {
   assert.equal(read.briefs?.length ?? 0, 0);
   assert.equal(read.diagrams![0].kind, "components");
   assert.match(read.maintenance.message ?? "", /brief unavailable: exit 1/);
+});
+
+test("sealed state from before the repository brief, with a legacy previousHead key, still loads", { timeout: 20000 }, async t => {
+  const s = setup(t, { processFixture: true });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").components.length === 2);
+  await s.runtime.close();
+  const file = join(s.stateDir, "understanding", "runtime.sealed"), key = Buffer.alloc(32, 7);
+  const state = unseal<{ workspaces: Record<string, { repositories: Record<string, Record<string, unknown>> }> }>(key, "understanding-runtime", readFileSync(file, "utf8"));
+  for (const repository of Object.values(state.workspaces.workspace.repositories)) {
+    for (const field of ["brief", "briefFingerprint", "briefFailure", "componentDiagram"]) delete repository[field];
+    repository.previousHead = "a".repeat(40);
+  }
+  writeSealed(file, key, "understanding-runtime", state);
+  const resumed = new UnderstandingRuntime({ config: { stateDir: s.stateDir, projects: [{ id: "repo", name: "Repository", path: s.root }] } as Config, key, groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() } });
+  try {
+    const read = resumed.read("workspace");
+    assert.equal(read.components.length, 2);
+    assert.notEqual(read.maintenance.state, "unavailable");
+    assert.deepEqual(read.briefs, []);
+  } finally { await resumed.close(); }
 });

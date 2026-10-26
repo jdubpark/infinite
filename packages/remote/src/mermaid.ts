@@ -21,7 +21,9 @@ export function parseMermaid(text: string): ParsedMermaid {
       return failure("Flowchart header must end after the direction.");
     }
     const flowHeader = flowHeaderMatch;
-    const isSequence = /^sequenceDiagram\b/.test(header);
+    const sequenceHeader = /^sequenceDiagram\b(.*)$/.exec(header);
+    if (sequenceHeader && sequenceHeader[1].trim()) return failure("Sequence header must end after sequenceDiagram.");
+    const isSequence = Boolean(sequenceHeader);
     if (!flowHeader && !isSequence) {
       return failure("Expected a flowchart, graph, or sequenceDiagram header.");
     }

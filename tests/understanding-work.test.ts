@@ -172,6 +172,11 @@ test("change map shows changed units, relationship kinds, source basis, and caps
   const cappedEdges = changeMap(changes, denseEdges, components);
   assert.equal(cappedEdges.edges.length, 120);
   assert.deepEqual(cappedEdges.coverage, ["0 changed units and 1 relationship were omitted from the map"]);
+
+  const wideRun = run({ changes: { headCommit: "head-commit", recordedAt: at, truncated: false,
+    files: changedUnits.map(unit => ({ path: `${unit.path}/index.ts`, status: "modified" as const, added: 1, removed: 1 })) } });
+  const wideBrief = assembleTeamBrief({ workspaceId: "ws", run: wideRun, repositoryId, components: changedComponents, relationships: [], mapObservedAt: at, narrative: null, now: at });
+  assert.ok(wideBrief.coverage.includes("1 changed unit and 0 relationships were omitted from the map"), "the map's omission reaches the brief coverage");
 });
 
 test("assembles team sections in contract order from recorded work", () => {

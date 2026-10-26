@@ -569,7 +569,7 @@ export function createApp(config: Config, key: Buffer) {
   const workNarratives = new WorkNarrativeStore({ config, key, adapter: understandingAdapter, teams });
   const workBriefs = new WorkBriefService({
     groups: projectGroups, missions, teams, goals,
-    knowledge: { read: workspaceId => { const value = understandingRuntime.read(workspaceId); return { components: value.components, relationships: value.relationships, contexts: understandingRuntime.contexts(workspaceId) }; } },
+    knowledge: { read: workspaceId => { const { knowledge, contexts } = understandingRuntime.readWithContexts(workspaceId); return { components: knowledge.components, relationships: knowledge.relationships, contexts }; } },
     work: understanding,
   }, workNarratives);
   const workIdSchema = z.string().regex(/^(team|mission|goal):[0-9a-f-]{36}$/);

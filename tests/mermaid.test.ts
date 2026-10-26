@@ -107,6 +107,7 @@ test("dropped inputs", () => {
   assert.equal(parseMermaid("flowchart LR\n  " + pairs.map(([from, to]) => `N${from} --> N${to}`).join("\n")).ok, false);
   assert.equal(parseMermaid("sequenceDiagram\n  A->>B: hello link there").ok, true);
   assert.equal(parseMermaid("sequenceDiagram\n  link A: Docs").ok, false);
+  assert.equal(parseMermaid("sequenceDiagram; A->>B: dropped").ok, false, "a sequence header suffix is rejected rather than dropped");
 });
 
 test("unparsed lines over 10% drop the diagram, under keep it with coverage", () => {

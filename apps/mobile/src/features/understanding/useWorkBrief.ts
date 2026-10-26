@@ -27,14 +27,15 @@ export function useWorkBrief(connection: Connection, workspaceId: string, workId
   const base = `/project-groups/${encodeURIComponent(workspaceId)}/understanding/work/${encodeURIComponent(workId)}`;
   const roleFor = useRef<{ scope: string; role: Me["role"] } | null>(null);
   const requestedFor = useRef("");
-  const [refresh, setRefresh] = useState<{ scope: string; state: RefreshState }>({ scope: "", state: "idle" });
+  const [refresh, setRefresh] = useState<{ scope: string; state: RefreshState; narrative?: WorkNarrativeStatus }>({ scope: "", state: "idle" });
 
-  const sendRefresh = async (): Promise<RefreshState> => {
+  /** The host answers a refused refresh with 200 and a reason; keep that reason, since the next GET only says no narrative exists. */
+  const sendRefresh = async (): Promise<{ state: RefreshState; narrative?: WorkNarrativeStatus }> => {
     try {
-      await api<{ narrative: WorkNarrativeStatus }>(connection, `${base}/refresh`, { method: "POST", body: {} });
-      return "sent";
+      const result = await api<{ narrative: WorkNarrativeStatus }>(connection, `${base}/refresh`, { method: "POST", body: {} });
+      return { state: "sent", narrative: result.narrative };
     } catch (error) {
-      return error instanceof ApiError && error.status === 403 ? "denied" : "failed";
+      return { state: error instanceof ApiError && error.status === 403 ? "denied" : "failed" };
     }
   };
 
@@ -67,7 +68,7 @@ export function useWorkBrief(connection: Connection, workspaceId: string, workId
     const canRefresh = await canRefreshFor(scope);
     if (canRefresh && needsNarrative(brief.narrative) && requestedFor.current !== scope) {
       requestedFor.current = scope;
-      setRefresh({ scope, state: await sendRefresh() });
+      setRefresh({ scope, ...await sendRefresh() });
     }
     return { scope, state: "ready", brief, canRefresh };
   }, 5000, [connection, scope]);
@@ -80,11 +81,13 @@ export function useWorkBrief(connection: Connection, workspaceId: string, workId
     brief: result?.state === "ready" ? result.brief : null,
     canRefresh: result?.state === "ready" ? result.canRefresh : false,
     refreshState: refresh.scope === scope ? refresh.state : "idle",
+    /** The narrative status the last refresh in this scope returned, when the host answered. */
+    refreshNarrative: refresh.scope === scope ? refresh.narrative ?? null : null,
     /** Asks the host for a narrative now. Owners and controllers only; a `sent` result refreshes the poll. */
     requestRefresh: async () => {
-      const state = await sendRefresh();
-      setRefresh({ scope, state });
-      if (state === "sent") poll.refresh();
+      const result = await sendRefresh();
+      setRefresh({ scope, ...result });
+      if (result.state === "sent") poll.refresh();
     },
   };
 }

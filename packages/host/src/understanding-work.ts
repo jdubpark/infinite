@@ -250,6 +250,7 @@ export function assembleTeamBrief(input: {
   if (changes.length) diagrams.push(changeMap(changes, relationships, components));
   if (currentNarrative) diagrams.push(...currentNarrative.diagrams.slice(0, MAX_DIAGRAMS));
   if (diagrams.length) sections.push(section("diagram", "Diagrams", diagrams.slice(0, MAX_DIAGRAMS).map(diagram => ({ kind: "diagram", diagram }))));
+  for (const line of diagrams.slice(0, MAX_DIAGRAMS).flatMap(diagram => diagram.coverage)) if (!coverage.includes(line)) coverage.push(line);
 
   if (currentNarrative) {
     const claims = currentNarrative.brief.changes.flatMap(claim => parseMarkdown(claim.text).nodes);
@@ -677,7 +678,11 @@ function aggregateBriefBase(input: {
       ...(input.changes.length ? [{ kind: "components", items: input.changes } as const] : []),
       ...(input.hasUnrecordedDiff ? [{ kind: "note", tone: "info", text: "Changed paths were not recorded for this run." } as const] : []),
     ]));
-    if (input.changes.length) sections.push(section("diagram", "Diagrams", [{ kind: "diagram", diagram: changeMap(input.changes, input.relationships, input.components) }]));
+    if (input.changes.length) {
+      const diagram = changeMap(input.changes, input.relationships, input.components);
+      sections.push(section("diagram", "Diagrams", [{ kind: "diagram", diagram }]));
+      for (const line of diagram.coverage) if (!input.coverage.includes(line)) input.coverage.push(line);
+    }
   }
   sections.push(section("request", "Request", [{ kind: "rich", basis: "owner", nodes: parseMarkdown(input.objective).nodes }]));
   sections.push(evidenceSection({ baseCommit: input.baseCommit, headCommit: input.headCommit, mapObservedAt: input.mapObservedAt,

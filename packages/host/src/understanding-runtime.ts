@@ -202,35 +202,21 @@ export class UnderstandingRuntime {
     return next;
   }
 
-  /**
-   * Stored repository context per enrolled repository, read from retained state only. Work briefs use it for
-   * the map observation time; freshness against the checkout is the job of `read()`, which already marks stale maps.
-   */
-  contexts(workspaceId: string): Record<string, RepoContext> {
-    const contexts: Record<string, RepoContext> = {};
-    try {
-      const saved = this.state.workspaces[workspaceId];
-      if (!saved) return contexts;
-      for (const repo of this.group(workspaceId).repos) {
-        const stored = saved.repositories[repo.projectId];
-        if (stored) contexts[repo.projectId] = stored.context;
-      }
-    } catch {
-      return {};
-    }
-    return contexts;
-  }
+  read(workspaceId: string): ReadKnowledge { return this.readWithContexts(workspaceId).knowledge; }
 
-  read(workspaceId: string): ReadKnowledge {
+  /** Knowledge plus the accepted repositories' stored contexts from the same validated pass, so provenance never outlives a rejected binding. */
+  readWithContexts(workspaceId: string): { knowledge: ReadKnowledge; contexts: Record<string, RepoContext> } {
     const group = this.group(workspaceId);
     try {
       const catalog = this.options.catalog.read(workspaceId);
       const saved = this.state.workspaces[workspaceId];
+      const contexts: Record<string, RepoContext> = {};
       const repos = group.repos.map(repo => {
         const stored = saved?.repositories[repo.projectId];
         if (!stored) return undefined;
         const binding = this.binding(repo, group);
         if (binding.rootIdentity !== stored.rootIdentity) return undefined;
+        contexts[repo.projectId] = stored.context;
         const currentHead = readGit(binding.root, ["rev-parse", "HEAD"]);
         if (currentHead && currentHead === stored.head) return stored;
         return { ...stored, components: stored.components.map(component => ({ ...component, current: { ...component.current, state: "stale" as const, summary: "Repository HEAD changed since this source map was observed." }, coverage: [...component.coverage, "Repository HEAD differs from the latest observed source map."] })) };
@@ -242,9 +228,9 @@ export class UnderstandingRuntime {
       let maintenance = saved?.maintenance ?? emptyMaintenance(catalog.policy);
       maintenance = { ...maintenance, dailyJobLimit: catalog.policy.dailyJobLimit, jobsToday: this.dailyJobs(workspaceId) };
       if (this.loadFailed) maintenance = { ...maintenance, state: "unavailable", message: "Encrypted maintenance state failed validation; the host will not overwrite it or start jobs until explicit recovery." };
-      return { components, relationships, delivery, maintenance, coverage };
+      return { knowledge: { components, relationships, delivery, maintenance, coverage }, contexts };
     } catch {
-      return { components: [], relationships: [], delivery: [], maintenance: { ...emptyMaintenance({ enabled: false, synthesis: false, delivery: false, intervalMinutes: 60, dailyJobLimit: 0 }), state: "unavailable", message: "Workspace sources are unavailable or changed." }, coverage: ["Workspace source or catalog could not be read safely."] };
+      return { knowledge: { components: [], relationships: [], delivery: [], maintenance: { ...emptyMaintenance({ enabled: false, synthesis: false, delivery: false, intervalMinutes: 60, dailyJobLimit: 0 }), state: "unavailable", message: "Workspace sources are unavailable or changed." }, coverage: ["Workspace source or catalog could not be read safely."] }, contexts: {} };
     }
   }
 

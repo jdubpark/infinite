@@ -71,6 +71,24 @@ test("fixture process publishes stable component maps, validated source edges, a
   } finally { await resumed.close(); }
 });
 
+test("stored contexts are served only for repositories whose binding still matches", { timeout: 20000 }, async t => {
+  const s = setup(t, { processFixture: true });
+  assert.deepEqual(s.runtime.readWithContexts("workspace").contexts, {}, "no context before a map is published");
+  s.runtime.refresh("workspace");
+  await waitUntil(() => s.runtime.read("workspace").components.length === 2);
+  const accepted = s.runtime.readWithContexts("workspace");
+  assert.equal(accepted.contexts.repo?.head, accepted.knowledge.components[0].current.sources[0]?.head ?? accepted.contexts.repo?.head);
+  assert.ok(accepted.contexts.repo?.generatedAt, "an accepted repository exposes its stored context");
+  // Replace the checkout with a different repository at the same path: the stored map and its context are rejected together.
+  rmSync(join(s.root, ".git"), { recursive: true, force: true });
+  execFileSync("git", ["init", "-q", s.root]);
+  execFileSync("git", ["-C", s.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "add", "."]);
+  execFileSync("git", ["-C", s.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "replaced"]);
+  const rejected = s.runtime.readWithContexts("workspace");
+  assert.equal(rejected.knowledge.components.length, 0, "a rebound checkout hides the stored map");
+  assert.deepEqual(rejected.contexts, {}, "a rejected binding supplies no context provenance");
+});
+
 test("explicit refresh coalesces and rejects publication when the workspace binding moves during collection", { timeout: 20000 }, async t => {
   let release: (() => void) | undefined, calls = 0;
   const s = setup(t, { adapter: { context: async root => { calls++; const context = sampleContext(root); await new Promise<void>(resolvePromise => { release = resolvePromise; }); return context; } } });

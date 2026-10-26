@@ -12,7 +12,7 @@ import { useWorkBrief, type RefreshState } from "./useWorkBrief";
 /** One work brief as a sectioned phone screen: a section rail, a narrative status line, and section cards. */
 export function WorkBriefScreen({ connection, workspaceId, workId, machine }: { connection: Connection; workspaceId: string; workId: string; machine?: string }) {
   const router = useRouter();
-  const { poll, result, brief, canRefresh, refreshState, requestRefresh } = useWorkBrief(connection, workspaceId, workId);
+  const { poll, result, brief, canRefresh, refreshState, refreshNarrative, requestRefresh } = useWorkBrief(connection, workspaceId, workId);
   const body = useRef<ScrollView>(null);
   const offsets = useRef<Record<string, number>>({});
   const [selected, setSelected] = useState("");
@@ -57,7 +57,7 @@ export function WorkBriefScreen({ connection, workspaceId, workId, machine }: { 
       <Text style={s.note}>{`${kindLabel(brief.kind)} · ${brief.source.status}`}</Text>
       <Button compact secondary title={`Open ${kindLabel(brief.kind).toLowerCase()}`} onPress={openSource} />
     </View> : null}
-    {brief ? <NarrativeLine narrative={brief.narrative} canRefresh={canRefresh} refreshState={refreshState} onRefresh={() => void requestRefresh()} /> : null}
+    {brief ? <NarrativeLine narrative={shownNarrative(brief.narrative, refreshNarrative)} canRefresh={canRefresh} refreshState={refreshState} onRefresh={() => void requestRefresh()} /> : null}
     <ScrollView ref={body} scrollEventThrottle={100} onScroll={track} keyboardShouldPersistTaps="handled" contentContainerStyle={s.content}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => poll.refresh()} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       {!result && poll.loading ? <ActivityIndicator style={s.loading} color={theme.colors.forest} /> : null}
@@ -137,6 +137,12 @@ function NarrativeLine({ narrative, canRefresh, refreshState, onRefresh }: {
     {line ? <View style={s.narrativeRow}>{line}</View> : null}
     {refreshNote ? <Text style={s.narrativeText}>{refreshNote}</Text> : null}
   </View>;
+}
+
+/** A refused refresh carries the specific reason; the brief's own status only says that no narrative exists. */
+function shownNarrative(current: WorkNarrativeStatus, fromRefresh: WorkNarrativeStatus | null): WorkNarrativeStatus {
+  if (!fromRefresh || current.state !== "unavailable") return current;
+  return fromRefresh.state === "unavailable" || fromRefresh.state === "failed" ? fromRefresh : current;
 }
 
 /** Section rail labels carry a count only where the section lists items. */

@@ -48,6 +48,7 @@ function renderBlock(block: WorkBlock, onOpenComponent?: (componentId: string) =
       return <View style={styles.stack}>
         <BasisLabel basis={block.diagram.basis} />
         <DiagramView diagram={block.diagram} onOpenComponent={onOpenComponent} />
+        {block.diagram.coverage.map((line, index) => <Note key={`coverage-${index}`} tone="info" text={line} />)}
       </View>;
     case "tasks":
       return <Tasks items={block.items} onOpenWork={onOpenWork} />;

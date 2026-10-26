@@ -49,6 +49,8 @@ import { UnderstandingService } from "./understanding.js";
 import { UnderstandingCatalog, CatalogError } from "./understanding-catalog.js";
 import { UnderstandingRuntime } from "./understanding-runtime.js";
 import { createUnderstandingAdapter } from "./understanding-adapter.js";
+import { WorkBriefService } from "./understanding-work.js";
+import { WorkNarrativeStore } from "./understanding-work-narrative.js";
 import { BehaviorError, UnderstandingBehaviorService } from "./understanding-behavior.js";
 import { BalanceService } from "./balances.js";
 import { LiveFeed, type LiveTopic } from "./live.js";
@@ -300,7 +302,8 @@ export function createApp(config: Config, key: Buffer) {
     : undefined;
   repositoryBriefings?.useUsage(usage);
   const understandingCatalog = new UnderstandingCatalog({ config, key, groups: projectGroups });
-  const understandingRuntime = new UnderstandingRuntime({ config, key, groups: projectGroups, catalog: understandingCatalog, adapter: createUnderstandingAdapter(config) });
+  const understandingAdapter = createUnderstandingAdapter(config);
+  const understandingRuntime = new UnderstandingRuntime({ config, key, groups: projectGroups, catalog: understandingCatalog, adapter: understandingAdapter });
   const understandingBehaviors = new UnderstandingBehaviorService({ config, key, groups: projectGroups, catalog: understandingCatalog, runtime: understandingRuntime });
   const understanding = new UnderstandingService({ config, key, manager, groups: projectGroups, missions, teams, goals, briefings: repositoryBriefings,
     knowledge: { read: workspaceId => ({ schemaVersion: 1, catalog: understandingCatalog.read(workspaceId), ...understandingRuntime.read(workspaceId) }) },
@@ -563,6 +566,41 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   app.get("/api/project-groups", requireRole(["owner", "controller", "viewer"]), (_req, res) => res.json(projectGroups.list()));
+  const workNarratives = new WorkNarrativeStore({ config, key, adapter: understandingAdapter, teams });
+  const workBriefs = new WorkBriefService({
+    groups: projectGroups, missions, teams, goals,
+    knowledge: { read: workspaceId => { const value = understandingRuntime.read(workspaceId); return { components: value.components, relationships: value.relationships, contexts: understandingRuntime.contexts(workspaceId) }; } },
+    work: understanding,
+  }, workNarratives);
+  const workIdSchema = z.string().regex(/^(team|mission|goal):[0-9a-f-]{36}$/);
+  const teamRun = (workId: string) => workId.startsWith("team:") ? teams.understandingRecords().find(run => `team:${run.id}` === workId) ?? null : null;
+  const workBriefError = (error: unknown, res: express.Response) => {
+    if (error instanceof CatalogError && error.statusCode === 404) return res.status(404).json({ code: "understanding-work", error: error.message });
+    throw error;
+  };
+  app.get("/api/project-groups/:id/understanding/work/:workId", requireRole(["owner", "controller", "viewer"]), (req, res) => {
+    const workspaceId = projectGroupIdSchema.parse(req.params.id);
+    const workId = workIdSchema.parse(req.params.workId);
+    try {
+      const brief = workBriefs.get(workspaceId, workId);
+      if (workId.startsWith("team:")) brief.narrative = workNarratives.status(workspaceId, workId, teamRun(workId));
+      return res.json(brief);
+    } catch (error) {
+      return workBriefError(error, res);
+    }
+  });
+  app.post("/api/project-groups/:id/understanding/work/:workId/refresh", requireRole(["owner", "controller"]), (req, res) => {
+    const workspaceId = projectGroupIdSchema.parse(req.params.id);
+    const workId = workIdSchema.parse(req.params.workId);
+    z.object({}).strict().parse(req.body);
+    try {
+      workBriefs.get(workspaceId, workId);
+      const { narrative, queued } = workNarratives.refresh(workspaceId, workId, teamRun(workId), res.locals.role);
+      return res.status(queued ? 202 : 200).json({ narrative });
+    } catch (error) {
+      return workBriefError(error, res);
+    }
+  });
   app.get("/api/project-groups/:id/understanding", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(understanding.get(projectGroupIdSchema.parse(req.params.id))));
   app.get("/api/project-groups/:id/understanding/catalog", requireRole(["owner", "controller", "viewer"]), (req, res) => res.json(understandingCatalog.read(projectGroupIdSchema.parse(req.params.id))));
   app.get("/api/project-groups/:id/understanding/components", requireRole(["owner", "controller", "viewer"]), (req, res) => {
@@ -1416,6 +1454,7 @@ export function createApp(config: Config, key: Buffer) {
   server.once("close", () => repositoryBriefings?.close());
   server.once("close", () => { void understandingRuntime.close(); });
   server.once("close", () => { void understandingBehaviors.close(); });
+  server.once("close", () => { void workNarratives.close(); });
   server.once("close", () => linear.close());
   server.once("close", () => handoffs.close());
   server.once("close", () => readings.stop());
@@ -1423,6 +1462,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

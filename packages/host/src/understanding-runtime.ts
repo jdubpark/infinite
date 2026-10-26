@@ -202,6 +202,24 @@ export class UnderstandingRuntime {
     return next;
   }
 
+  /** Stored repository context per repository, for repositories whose recorded root still matches. */
+  contexts(workspaceId: string): Record<string, RepoContext> {
+    const contexts: Record<string, RepoContext> = {};
+    try {
+      const saved = this.state.workspaces[workspaceId];
+      if (!saved) return contexts;
+      const group = this.group(workspaceId);
+      for (const repo of group.repos) {
+        const stored = saved.repositories[repo.projectId];
+        if (!stored || this.binding(repo, group).rootIdentity !== stored.rootIdentity) continue;
+        contexts[repo.projectId] = stored.context;
+      }
+    } catch {
+      return {};
+    }
+    return contexts;
+  }
+
   read(workspaceId: string): ReadKnowledge {
     const group = this.group(workspaceId);
     try {

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { teamContext, teamPrompt } from "../packages/host/src/team-prompts.js";
-import type { TeamRun, TeamTask } from "../packages/host/src/team-types.js";
+import { teamReportSchema, type TeamRun, type TeamTask } from "../packages/host/src/team-types.js";
 
 const PROMPT_LIMIT_BYTES = 80 * 1024;
 
@@ -201,6 +201,44 @@ test("permission recovery steps stay in sealed team context and remain advisory 
   const snapshot = teamContext(run, evidence, undefined, "project-manager", [prior]);
   assert.deepEqual(snapshot.permissionRecovery, { outcomes: [outcome], steps: [step], sameProjectHistory: [prior] });
   assert.equal(snapshot.feedback, evidence);
+});
+
+test("blocked reports accept bounded structured evidence and keep it in coordinator context", () => {
+  const legacy = { kind: "blocked", summary: "The provider tool was unavailable." };
+  assert.deepEqual(teamReportSchema.parse(legacy), legacy, "summary-only blocked reports remain valid");
+  const blocker = {
+    cause: { status: "hypothesis", detail: "The configured provider lacks the required tool." },
+    issueRefs: ["TASK-123"],
+    sourceRefs: ["packages/host/src/team-prompts.ts@abc123"],
+    attemptedFixes: [{ fix: "Checked the configured tools for this assignment.", outcome: "The required tool remains unavailable." }],
+    proposedRecovery: "Ask the owner to provide an authorized tool or choose another supported workflow.",
+    prevention: "Check required provider capabilities before dispatch.",
+    validationEvidence: [{ sourceRef: "packages/host/src/team-prompts.ts", observation: "The prompt pins the available provider tools." }],
+  };
+  const report = { ...legacy, blocker };
+  assert.deepEqual(teamReportSchema.parse(report), report);
+  const acceptsEvidence = (change: object) => teamReportSchema.safeParse({ ...legacy, blocker: { ...blocker, ...change } }).success;
+  assert.equal(acceptsEvidence({ arbitraryCommand: "run this" }), false, "strict evidence objects cannot grow executable fields");
+  assert.equal(acceptsEvidence({ validationEvidence: [] }), false, "blocker evidence requires a source or check observation");
+  assert.equal(acceptsEvidence({ proposedRecovery: "x".repeat(1201) }), false, "reported recovery remains bounded");
+  const multibyte = teamReportSchema.safeParse({ ...legacy, blocker: { ...blocker, validationEvidence: Array.from({ length: 8 }, () => ({ sourceRef: "界".repeat(500), observation: "界".repeat(1000) })) } });
+  assert.ok(!multibyte.success && multibyte.error.issues.some(issue => issue.message === "Blocker evidence must fit within 12 KiB of UTF-8 JSON"),
+    "the UTF-8 payload is capped even when every field is within its character limit");
+
+  const run = largeRun();
+  run.status = "blocked";
+  run.reason = report.summary;
+  run.members = [{ memberId: "blocked-worker", revision: run.revision, role: "implementer", status: "stopped", baseCommit: run.baseCommit,
+    report: teamReportSchema.parse(report) } as TeamRun["members"][number]];
+  assert.deepEqual(teamContext(run).memberReports[0].report, report, "the durable context snapshot retains structured blocker evidence");
+  const prompt = (role: "project-manager" | "reviewer" | "implementer") => teamPrompt(run, role, undefined, undefined, "demo");
+  const sharedKnowledge = /Shared knowledge: when the workflow is available/;
+  assert.match(prompt("project-manager"), sharedKnowledge);
+  assert.match(prompt("reviewer"), sharedKnowledge);
+  assert.doesNotMatch(prompt("implementer"), sharedKnowledge, "only planning and review roles receive the shared-knowledge rule");
+  assert.match(prompt("project-manager"), /inspect prior structured blocker evidence before recovery/);
+  assert.match(prompt("project-manager"), /A report, continuation, or claimed fix is not a verified resolution/);
+  assert.match(prompt("implementer"), /may add "blocker":\{"cause"/, "workers see the structured blocked example");
 });
 
 test("permission evidence stays complete inline and an over-budget review fails closed", () => {

@@ -18,8 +18,8 @@ import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, t
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { Config, Session } from "../packages/host/src/types.js";
-import type { CreateTeam, NativeContinuation, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
-import type { CreateMission, Mission, MissionReport } from "../packages/host/src/mission-types.js";
+import { teamReportSchema, type CreateTeam, type NativeContinuation, type TeamAssignment, type TeamLineup, type TeamView } from "../packages/host/src/team-types.js";
+import { missionReportSchema, type CreateMission, type Mission, type MissionReport } from "../packages/host/src/mission-types.js";
 import { emptyRollup, emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
 import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
 
@@ -436,6 +436,94 @@ test("mission follow-up prompt defers trailing messages when they exceed the byt
   assert.match(result.prompt, new RegExp(String(messages.length - result.includedMessageCount + 2) + " more messages are waiting"));
 });
 
+test("mission blocked reports accept summary-only legacy and bounded structured evidence", () => {
+  const legacy = { kind: "blocked", summary: "The remaining subtask cannot proceed safely." };
+  assert.deepEqual(missionReportSchema.parse(legacy), legacy, "summary-only legacy blocked reports remain valid");
+  const blocker = {
+    cause: { status: "observed", detail: "The required service endpoint is not present." },
+    issueRefs: ["TASK-123"],
+    sourceRefs: ["packages/host/src/server.ts@abc123"],
+    attemptedFixes: [{ fix: "Inspected the current route registration.", outcome: "No matching endpoint exists." }],
+    proposedRecovery: "Dispatch a scoped API subtask before the dependent client work.",
+    prevention: "Verify the upstream interface before dispatching its consumer.",
+    validationEvidence: [{ sourceRef: "packages/host/src/server.ts", observation: "The expected route is absent at the inspected revision." }],
+  };
+  assert.deepEqual(missionReportSchema.parse({ ...legacy, blocker }), { ...legacy, blocker });
+  assert.equal(missionReportSchema.safeParse({ ...legacy, blocker: { ...blocker, issueRefs: Array(9).fill("TASK-123") } }).success, false, "issue references stay bounded");
+  assert.equal(missionReportSchema.safeParse({ ...legacy, blocker: { ...blocker, unexpected: true } }).success, false, "evidence objects are strict");
+});
+
+test("a later mission coordinator attempt receives and durably records blocked subteam evidence", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const mission = await h.create("Repair the API, then update its client.");
+    await h.report(1, { kind: "dispatch", summary: "Start the API work first.", subtasks: [plan("api", "api")] });
+    const started = await until(() => h.get(mission.id), value => Boolean(teamOf(value, "api")));
+    const teamId = teamOf(started, "api")!;
+    const blocker = {
+      cause: { status: "observed", detail: "The required API route is absent." },
+      issueRefs: ["TASK-123"],
+      sourceRefs: ["packages/host/src/server.ts@abc123"],
+      attemptedFixes: [{ fix: "Inspected route registration.", outcome: "No matching route exists." }],
+      proposedRecovery: "Implement the route, then recheck its caller.",
+      prevention: "Confirm the upstream interface before dispatching dependent work.",
+      validationEvidence: [
+        { sourceRef: "packages/host/src/server.ts", observation: "界".repeat(1000) },
+        { sourceRef: "packages/host/src/server.ts", observation: "界".repeat(1000) },
+        { sourceRef: "packages/host/src/server.ts", observation: "界".repeat(1000) },
+      ],
+    };
+    const bytes = Buffer.byteLength(JSON.stringify(blocker), "utf8");
+    assert.ok(bytes > 9 * 1024 && bytes < 12 * 1024, "the fixture is a near-limit blocker that the schema accepts");
+    assert.equal(teamReportSchema.safeParse({ kind: "blocked", summary: "The API route is absent.", blocker }).success, true);
+    h.set(teamId, { status: "blocked", blockCode: "agent-blocked", reason: "The API route is absent.",
+      members: [{ memberId: "blocked-member", revision: 1, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The API route is absent.", blocker } }] as unknown as TeamView["members"] });
+    const messages = await h.messages(2);
+    assert.ok(messages.some((message: MissionMessage) => message.type === "subtask-finished" && JSON.stringify(message.blocker) === JSON.stringify(blocker)),
+      "the subteam-finished message carries the structured evidence to the next coordinator attempt");
+    const stored = await waitFor(async () => h.stored(mission.id), record => record.attempts.length >= 2, 5000);
+    const prompt = stored.attempts.at(-1)!.prompt;
+    assert.ok(prompt.includes("Messages since your last attempt"), "the evidence arrives through the normal inbox");
+    assert.ok(prompt.includes(JSON.stringify(blocker)), "the durable attempt prompt retains the blocker evidence");
+  } finally { h.close(); }
+});
+
+test("mission blocker handoff attaches evidence only to the one current agent block that explains the team", { timeout: 60000 }, async () => {
+  const evidence = {
+    cause: { status: "observed", detail: "An older API failure." }, issueRefs: ["TASK-123"], sourceRefs: ["src/api.ts"],
+    proposedRecovery: "Recheck the current API state.", prevention: "Verify the current report revision.",
+    validationEvidence: [{ sourceRef: "src/api.ts", observation: "The old route was absent." }],
+  };
+  const cases = [
+    { name: "a later summary-only blocker", revision: 2, blockCode: "agent-blocked", reason: "The current API route is absent.", members: [
+      { memberId: "old", revision: 1, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The old API route is absent.", blocker: evidence } },
+      { memberId: "current", revision: 2, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The current API route is absent." } },
+    ] },
+    { name: "ambiguous current blocked reports", revision: 2, blockCode: "agent-blocked", reason: "The current API route is absent.", members: [
+      { memberId: "current-with-evidence", revision: 2, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The current API route is absent.", blocker: evidence } },
+      { memberId: "current-legacy", revision: 2, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The current API route is absent." } },
+    ] },
+    { name: "a host-generated block", revision: 2, blockCode: "team-decision-limit", reason: "The team reached its decision limit.", members: [
+      { memberId: "old", revision: 1, role: "implementer", status: "stopped", report: { kind: "blocked", summary: "The old API route is absent.", blocker: evidence } },
+    ] },
+  ];
+  for (const scenario of cases) {
+    const h = scripted();
+    try {
+      const mission = await h.create("Repair the API.");
+      await h.report(1, { kind: "dispatch", summary: "Start API work.", subtasks: [plan("api", "api")] });
+      const started = await until(() => h.get(mission.id), value => Boolean(teamOf(value, "api")));
+      h.set(teamOf(started, "api")!, { revision: scenario.revision, status: "blocked", blockCode: scenario.blockCode, reason: scenario.reason,
+        members: scenario.members as unknown as TeamView["members"] });
+      const messages = await h.messages(2);
+      const finished = messages.find((message: MissionMessage) => message.type === "subtask-finished");
+      assert.ok(finished, `${scenario.name} still wakes the coordinator`);
+      assert.equal(finished.blocker, undefined, `${scenario.name} carries no structured evidence`);
+      assert.equal(JSON.stringify(messages).includes(JSON.stringify(evidence)), false, `${scenario.name} does not carry stale structured evidence`);
+    } finally { h.close(); }
+  }
+});
+
 test("a mission pins a team-ready alternate checkout when its primary checkout is not configured", async () => {
   const h = missionCheckoutAdmission(false);
   try {
@@ -698,6 +786,7 @@ test("a mission coordinator reports through its own MCP tool and envelope, separ
 });
 
 type FakeRun = { id: string; projectId: string; missionId: string; status: TeamView["status"]; revision: number; updatedAt: string; parallelism?: number; parallelismCeiling?: number;
+  blockCode?: string; reason?: string; members?: TeamView["members"];
   usage?: UsageRollup; workspaceRemovedAt?: string;
   recovery?: { attempts: number; status: "stopping" | "planning" | "exhausted"; source: { code: string; memberId: string; revision: number; reportKind?: string; reason: string; at: string } };
   decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string }[] };
@@ -874,6 +963,7 @@ function scripted() {
       nativeSessions.delete(sessionId);
       sessionStatuses.set(sessionId, "exited");
     },
+    stored: (id: string) => unseal<{ attempts: { prompt: string }[]; refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")),
     refusals: (id: string) => unseal<{ refusals: number }>(key, "mission:" + id, readFileSync(join(config.stateDir, "missions", id + ".sealed"), "utf8")).refusals,
     messages: async (n: number) => parse((await attempt(n)).prompt, "Messages since your last attempt (JSON): "),
     state: async (n: number) => parse((await attempt(n)).prompt, "Mission state (JSON): "),

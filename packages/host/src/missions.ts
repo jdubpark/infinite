@@ -5,7 +5,7 @@ import { writeSealed, unseal } from "./vault.js";
 import { TeamService, TeamError, providerInputReason } from "./teams.js";
 import type { Manager } from "./manager.js";
 import type { Config } from "./types.js";
-import type { CreateTeam, NativeContinuation, TeamAssignment, TeamView } from "./team-types.js";
+import type { BlockerEvidence, CreateTeam, NativeContinuation, TeamAssignment, TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionReport, type MissionSubtaskPlan } from "./mission-types.js";
@@ -540,9 +540,11 @@ export class MissionService {
       subtask.status = status;
       if (status === "cancelled") subtask.finalEvidence = { ...(team.reason ? { reason: team.reason } : {}), ...(team.headCommit ? { headCommit: team.headCommit } : {}), usage: team.usage };
       if (changed && status !== "running") this.event(stored, `Subtask ${subtask.id} is ${status} (subteam ${team.status}).`);
+      const blocker = currentAgentBlockerEvidence(team);
       if (live.has(mission.status) && status !== "running")
         this.message(stored, `${team.id}:${status === "cancelled" ? "cancelled" : `${status}:${team.revision}`}`, { type: "subtask-finished", subtaskId: subtask.id, teamId: team.id, status, teamStatus: team.status,
           ...(team.reason ? { reason: team.reason } : {}),
+          ...(blocker ? { blocker } : {}),
           ...(status === "cancelled" ? { retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." } : {}) });
       if (status === "cancelled" && team.workspaceRemovedAt) {
         // Persist the host-observed cancellation and its final evidence before deleting the child record.
@@ -1057,6 +1059,16 @@ const teamStep: Record<string, string> = {
   "no-change": "No change needed", cancelled: "Cancelled",
 };
 const openTeamQuestion = (team: TeamView | undefined) => team?.decisions.find(decision => decision.revision === team.revision && !decision.answer)?.question;
+/**
+ * The structured evidence of the one current-revision agent block that matches the team's reason. Summary-only,
+ * ambiguous, superseded, and host-generated blocks carry none, so evidence never attaches to another report.
+ */
+function currentAgentBlockerEvidence(team: TeamView): BlockerEvidence | undefined {
+  if (team.status !== "blocked" || team.blockCode !== "agent-blocked") return undefined;
+  const matches = team.members.filter(member => member.revision === team.revision && member.report?.kind === "blocked" && member.report.summary === team.reason);
+  const report = matches.length === 1 ? matches[0]?.report : undefined;
+  return report?.kind === "blocked" ? report.blocker : undefined;
+}
 /** A member stopped on a provider prompt waits on the person; the team never approves it. */
 const waitsOnProvider = (team: TeamView | undefined) => Boolean(team && !["cancelled", "ready-for-review", "merged", "no-change"].includes(team.status) && team.reason === providerInputReason);
 function teamDetail(team: TeamView) {

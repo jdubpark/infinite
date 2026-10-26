@@ -109,14 +109,19 @@ export async function removeTeamWorkspace(runDirectory: string, prefix?: TeamCom
   if (prefix) {
     const entries = readdirSync(safe.target).map(safeRemovalName);
     if (entries.length) {
+      // The agent account removes what it owns; host-owned entries such as member scratch directories
+      // make this exit non-zero, so the host finishes the job below and judges success by the result.
       const result = await teamCommand({ command: "rm", args: ["-rf", "--", ...entries] }, safe.target, signal, 600000, prefix);
-      removalFailed(result);
+      if (result.interrupted) removalFailed(result);
     }
   } else {
     await rmAsync(join(safe.target, "integration"), { recursive: true, force: true });
     await rmAsync(join(safe.target, "members"), { recursive: true, force: true });
   }
-  await rmAsync(safe.target, { recursive: true, force: true });
+  await rmAsync(safe.target, { recursive: true, force: true }).catch(() => undefined);
+  let remaining: string[] | undefined;
+  try { remaining = readdirSync(safe.target); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  throw new TeamError(409, "workspace-removal-failed", `The team workspace could not be removed completely; remaining entries: ${remaining.slice(0, 8).join(", ") || "(directory)"}.`);
 }
 /** Remove the recorded member clone without following a redirected run or parent directory. */
 export async function removeMemberWorkspace(runDirectory: string, memberCwd: string, prefix?: TeamCommand, signal?: AbortSignal, configuredRoot?: string): Promise<boolean> {

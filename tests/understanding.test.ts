@@ -597,3 +597,46 @@ test("generated plans and projects derive from recorded work without touching th
     assert.equal((await viewer.request<WorkspaceUnderstanding>(path)).knowledge?.catalog.revision, 0);
   } finally { viewer?.close(); await host.stop(); }
 });
+
+test("generated plans skip partial and empty work, link to repositories, and page while projects stay complete", () => {
+  const temp = mkdtempSync("/tmp/inf-understanding-generated-");
+  try {
+    const checkout = (id: string) => ({ projectId: id, name: id, path: `/workspace/${id}`, primary: true, teamReady: true });
+    const group: any = { id: "workspace", name: "Workspace", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", repos: [
+      { projectId: "primary", name: "Primary", path: "/workspace/primary", checkouts: [checkout("primary"), { ...checkout("alternate"), primary: false }] },
+      { projectId: "other", name: "Other", path: "/workspace/other", checkouts: [checkout("other")] },
+    ] };
+    let records: object[] = [];
+    const mission = (id: string, repoProjectIds: string[], objective = "full request", index = 0) => ({ id, repoProjectIds, title: `Mission ${id}`, objective, result: { summary: `outcome ${id}` }, status: "cancelled", updatedAt: new Date(Date.UTC(2026, 9, 21, 0, 0, index)).toISOString() });
+    const service = new UnderstandingService({ config: { stateDir: join(temp, "state"), projects: [] } as never, key: Buffer.alloc(32), manager: {} as never,
+      groups: { list: () => ({ groups: [group], suggestions: [] }), get: () => group }, missions: { understandingRecords: () => records, understandingOwnsSession: () => false } as never,
+      teams: { understandingRecords: () => [], understandingOwnsSession: () => false } as never, goals: { understandingRecords: () => [] } as never });
+    const coverage = ["From work: derived from recorded team, mission and goal requests. Status is the run's own status."];
+
+    records = [mission("kept", ["alternate", "other"]), mission("partial", ["primary", "outside"]), mission("empty", ["primary"], ""), mission("primary-only", ["primary"], "primary request", 1)];
+    const page = service.generatedPage("workspace");
+    assert.deepEqual(page.plans.map(plan => plan.id).sort(), ["plan:mission:kept", "plan:mission:primary-only"], "partial and empty-objective rows produce no plan");
+    const kept = page.plans.find(plan => plan.workId === "mission:kept")!;
+    assert.deepEqual({ objective: kept.objective, outcome: kept.outcome, basis: kept.basis, status: kept.status, repositoryIds: kept.repositoryIds }, { objective: "full request", outcome: "outcome kept", basis: "work", status: "cancelled", repositoryIds: ["primary", "other"] });
+    assert.deepEqual(page.projects.map(project => [project.id, project.name, project.repositoryIds, [...project.planIds].sort()]), [
+      ["project:primary", "Primary", ["primary"], ["plan:mission:kept", "plan:mission:primary-only"]],
+      ["project:other", "Other", ["other"], ["plan:mission:kept"]],
+    ]);
+    assert.deepEqual(page.coverage, coverage);
+    assert.equal(page.next, null);
+
+    records = Array.from({ length: 60 }, (_, index) => mission(`m${String(index).padStart(2, "0")}`, ["primary"], "request", index));
+    const first = service.generatedPage("workspace");
+    assert.equal(first.plans.length, 50);
+    assert.ok(first.next);
+    const second = service.generatedPage("workspace", first.next!);
+    assert.equal(second.plans.length, 10);
+    assert.equal(second.next, null);
+    assert.equal(new Set([...first.plans, ...second.plans].map(plan => plan.id)).size, 60);
+    for (const part of [first, second]) {
+      assert.equal(part.projects.length, 2);
+      assert.equal(part.projects[0]!.planIds.length, 60);
+      assert.deepEqual(part.coverage, coverage);
+    }
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});

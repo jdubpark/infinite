@@ -337,6 +337,12 @@ export class TeamService {
         decision.reason = "The host restarted during a team operation. Review this request with the user.";
         this.save(stored);
       }
+      // A review recorded before owner authority was pinned cannot prove what direction it saw; it is reviewed again.
+      for (const decision of stored.run.permissionDecisions ?? []) if (!decision.authorityHash && ["pending", "reviewing", "approved"].includes(decision.status)) {
+        decision.status = "stale";
+        decision.reason = "Recorded before owner authority was pinned; the request is reviewed again under the current owner direction.";
+        this.save(stored);
+      }
       this.recoverLegacyBlocked(stored);
       this.admitBlockedDeliveryRecovery(stored);
     }
@@ -1013,6 +1019,9 @@ export class TeamService {
       if (!this.mutation(stored, `answer:${decisionId}`, body)) return this.view(stored);
       decision.answer = body.text; decision.answeredBy = by; decision.answeredAt = timestamp();
       this.event(stored, by === "coordinator" ? "A mission coordinator decision was recorded. The requesting member will continue in a new attempt." : "A user decision was recorded. The requesting member will continue in a new attempt."); this.save(stored);
+      // An owner answer is new direction no outstanding review saw; those requests are reviewed again under it or stay with the user.
+      if (by === "owner" && (run.permissionDecisions ?? []).some(item => ["pending", "reviewing", "approved", "answering"].includes(item.status)))
+        await this.invalidatePermissionDecisions(stored, "The owner answered a team question; a request reviewed before that answer remains with the user.");
       return this.view(stored);
     });
   }
@@ -1887,7 +1896,7 @@ export class TeamService {
     const prompt = state.attention.prompt;
     if (state.status !== "running" || state.attention.state !== "needs-you" || !prompt || oneShotPermissionOption(prompt) === undefined) return false;
     const evidenceHash = permissionEvidenceHash(prompt);
-    const existing = (run.permissionDecisions ?? []).find(decision => decision.targetMemberId === target.memberId &&
+    const existing = (run.permissionDecisions ?? []).find(decision => !(decision.status === "stale" && !decision.authorityHash) && decision.targetMemberId === target.memberId &&
       decision.targetSessionId === target.sessionId && decision.promptId === prompt.id && decision.promptHash === prompt.hash &&
       decision.evidenceHash === evidenceHash);
     if (existing) return false;
@@ -2084,7 +2093,8 @@ export class TeamService {
       return "The decision or coordinator assignment is no longer current.";
     if (decision.policyHash !== digest(run.permissions))
       return "The pinned permission policy no longer matches this decision.";
-    if (decision.authorityHash && decision.authorityHash !== ownerAuthorityHash(run))
+    if (!decision.authorityHash) return "This decision predates owner-authority pinning; the request remains with the user.";
+    if (decision.authorityHash !== ownerAuthorityHash(run))
       return "The owner's steering or answers changed since this decision was assigned.";
     if (Date.now() >= Date.parse(decision.expiresAt)) return "The five-minute permission review window expired.";
     if (decision.reviewerProfileHash) {
@@ -2169,6 +2179,9 @@ export class TeamService {
       }
       const reason = await this.permissionAnswerInvalidReason(stored, decision, coordinator);
       if (reason) return { status: "escalated" as const, reason };
+      // The owner may have answered during the asynchronous checks above; nothing reviewed before that answer may deliver.
+      if (decision.authorityHash !== ownerAuthorityHash(run))
+        return { status: "escalated" as const, reason: "The owner's steering or answers changed while the target session was being checked." };
       if (decision.status !== "approved" || !run.permissions || run.permissionsRevokedAt || stored.halt ||
           ["paused", "cancelled", "blocked"].includes(run.status) || decision.revision !== run.revision ||
           (coordinator && decision.coordinatorMemberId !== coordinator.memberId) || decision.policyHash !== digest(run.permissions) ||

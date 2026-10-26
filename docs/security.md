@@ -252,8 +252,9 @@ task ID, changed paths, and accepted checks match. Prompt, session, and member
 IDs are excluded from the reuse key. Reuse also requires the same run revision,
 assigned role, working directory, reviewer profile, inspected workspace
 evidence, and owner authority (the pinned policy plus the owner's steering and
-answers). Reused approvals still pass every live authorization and prompt
-check, including that owner authority, and use the same single-delivery path; reviewer escalations remain with the owner, and host-side escalations
+answers). An owner answer retires every outstanding delegated decision.
+Reused approvals still pass every live authorization and prompt check,
+including that owner authority, and use the same single-delivery path; reviewer escalations remain with the owner, and host-side escalations
 are never reused.
 
 A Codex command dialog ("Would you like to run the following command?") runs its

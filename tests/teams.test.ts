@@ -2171,6 +2171,97 @@ test("a reviewer follow-up prompt repeats the owner's current steering and answe
   assert.match(directed, /^You are the team's permission-coordinator\./m);
 });
 
+test("an owner answer retires outstanding permission decisions so no verdict given before it can deliver", async () => {
+  const f = schedulerFixture();
+  try {
+    const at = new Date().toISOString(), target = f.run.members[0];
+    const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+    f.run.decisions = [{ id: randomUUID(), memberId: target.memberId, revision: 1, question: "Run the check again?", options: ["Yes", "No"], createdAt: at }];
+    const base = { revision: 1, policyHash: createHash("sha256").update(JSON.stringify(f.run.permissions)).digest("hex"), targetMemberId: target.memberId,
+      targetSessionId: target.sessionId, targetCwd: target.cwd, promptId: prompt.id, promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt), prompt,
+      option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), coordinatorMemberId: randomUUID(),
+      authorityHash: permissionAuthorityHash(f.run.permissions, []) };
+    f.run.permissionDecisions = [{ ...base, id: randomUUID(), status: "reviewing" as const }, { ...base, id: randomUUID(), status: "approved" as const }];
+    f.writeTeam();
+    const teams = f.openTeam();
+    await teams.answer(f.run.id, f.run.decisions[0].id, { requestId: randomUUID(), revision: 1, text: "No. Do not run that command again." });
+    const run = teams.get(f.run.id);
+    assert.deepEqual(run.permissionDecisions?.map(decision => decision.status), ["stale", "stale"]);
+    assert.ok(run.permissionDecisions?.every(decision => /owner answered a team question/.test(decision.reason ?? "")));
+  } finally { f.close(); }
+});
+
+test("permission decisions recorded before owner-authority pinning are retired on restore and refused at delivery", async () => {
+  const f = schedulerFixture();
+  try {
+    const target = f.run.members[0];
+    const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+    const legacy = { revision: 1, policyHash: createHash("sha256").update(JSON.stringify(f.run.permissions)).digest("hex"), targetMemberId: target.memberId,
+      targetSessionId: target.sessionId, targetCwd: target.cwd, promptId: prompt.id, promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt), prompt,
+      option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), coordinatorMemberId: randomUUID() };
+    f.run.permissionDecisions = [{ ...legacy, id: randomUUID(), status: "reviewing" as const }, { ...legacy, id: randomUUID(), status: "answered" as const }];
+    f.writeTeam();
+    const teams = f.openTeam();
+    const run = teams.get(f.run.id);
+    assert.deepEqual(run.permissionDecisions?.map(decision => decision.status), ["stale", "answered"], "only outstanding legacy reviews are retired");
+    assert.match(run.permissionDecisions?.[0].reason ?? "", /before owner authority was pinned/);
+    const scheduler = teams as unknown as { record(id: string): { run: TeamRun }; permissionAnswerInvalidReason(stored: unknown, decision: unknown): Promise<string | undefined> };
+    const stored = scheduler.record(f.run.id);
+    const approvedWithoutHash = { ...legacy, id: randomUUID(), status: "approved" as const };
+    assert.match(await scheduler.permissionAnswerInvalidReason(stored, approvedWithoutHash) ?? "", /predates owner-authority pinning/);
+  } finally { f.close(); }
+});
+
+test("an owner answer during the delivery recheck stops a reused approval before any answer is sent", async () => {
+  const f = schedulerFixture();
+  try {
+    const target = f.run.members[0], at = new Date().toISOString();
+    const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+      title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+      options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+    const priorPrompt = { ...prompt, id: 99, hash: "c".repeat(64) };
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+    f.run.lineup = { ...fallbackLineup, coordinator: { ...fallbackLineup.coordinator, provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" } };
+    f.state.attention.state = "needs-you"; f.state.attention.prompt = prompt;
+    const policyHash = createHash("sha256").update(JSON.stringify(f.run.permissions)).digest("hex");
+    const prior = { id: randomUUID(), revision: 1, policyHash, targetMemberId: target.memberId, targetSessionId: target.sessionId,
+      targetCwd: target.cwd, promptId: priorPrompt.id, promptHash: priorPrompt.hash!, evidenceHash: permissionEvidenceHash(priorPrompt),
+      workspaceEvidenceHash: permissionWorkspaceEvidenceHash(priorPrompt, target.cwd, []),
+      reuseKey: permissionReuseKey({ policyHash, prompt: priorPrompt, option: 0, changedPaths: [], acceptedChecks: null }), prompt: priorPrompt,
+      reviewerProfileHash: createHash("sha256").update(JSON.stringify(f.run.lineup.coordinator)).digest("hex"), authorityHash: permissionAuthorityHash(f.run.permissions, []),
+      option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: randomUUID(),
+      answerRequestId: randomUUID(), status: "answered" as const, verdict: "approve-once" as const };
+    f.run.permissionDecisions = [prior]; f.writeTeam();
+    const teams = f.openTeam();
+    const scheduler = teams as unknown as { record(id: string): { run: TeamRun }; maybeStartPermissionReview(stored: unknown, member: typeof target): Promise<boolean> };
+    const stored = scheduler.record(f.run.id);
+    (f.manager as any).meta = () => ({ session: { cwd: target.cwd, team: { runId: f.run.id, memberId: target.memberId,
+      revision: target.revision, role: target.role } } });
+    // The first state read qualifies the prompt; the second is the delivery recheck, where the owner's answer lands.
+    let stateReads = 0;
+    const baseState = f.manager.state;
+    (f.manager as any).state = async (...args: unknown[]) => {
+      if (++stateReads === 2) stored.run.decisions.push({ id: randomUUID(), memberId: target.memberId, revision: 1, question: "Run the check again?",
+        options: ["Yes", "No"], createdAt: at, answer: "No. Do not run that command again.", answeredBy: "owner", answeredAt: at });
+      return (baseState as (...inner: unknown[]) => Promise<unknown>)(...args);
+    };
+    let deliveries = 0;
+    (f.manager as any).answerTeamPermission = async () => { deliveries++; return { state: "delivered", result: "closed", seq: 1 }; };
+    assert.equal(await scheduler.maybeStartPermissionReview(stored, target), true);
+    const result = await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.[1]?.status === "escalated");
+    assert.equal(deliveries, 0, "nothing reviewed before the owner's answer may deliver");
+    assert.equal(result.permissionDecisions?.[1].reusedFromDecisionId, prior.id);
+    assert.match(result.permissionDecisions?.[1].reason ?? "", /steering or answers changed/);
+  } finally { f.close(); }
+});
+
 test("an identical approved permission request reuses the review and delivers once", async () => {
   const f = schedulerFixture();
   try {
@@ -2605,7 +2696,7 @@ for (const [ending, minutes, event] of [
       f.run.members.push(coordinator);
       f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
       // The decision's target member is gone, so the review is obsolete even inside its window.
-      f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: randomUUID(), targetSessionId: randomUUID(),
+      f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), authorityHash: permissionAuthorityHash(f.run.permissions, []), targetMemberId: randomUUID(), targetSessionId: randomUUID(),
         targetCwd: coordinator.cwd, promptId: 1, promptHash: "b".repeat(64), evidenceHash: "c".repeat(64), option: 0,
         prompt: { id: 1, kind: "permission", source: "screen", hash: "b".repeat(64), pinned: true, acceptsText: false,
           title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
@@ -2649,7 +2740,7 @@ test("a permission coordinator back from an outage during a current review runs 
       title: "Permission coordinator", status: "unavailable" as const };
     f.run.members.push(coordinator);
     f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
-    f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: target.memberId, targetSessionId: target.sessionId,
+    f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), authorityHash: permissionAuthorityHash(f.run.permissions, []), targetMemberId: target.memberId, targetSessionId: target.sessionId,
       targetCwd: target.cwd, promptId: prompt.id, promptHash: prompt.hash, evidenceHash: permissionEvidenceHash(prompt), prompt, option: 0,
       expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: coordinator.memberId, answerRequestId: randomUUID(), status: "reviewing" }];
     // The target still waits on the same prompt; the coordinator's own session is running again and has reported nothing yet.

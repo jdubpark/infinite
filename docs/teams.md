@@ -1093,8 +1093,10 @@ and accepted checks; it excludes prompt, session, and member identifiers. Reuse
 also requires the same run revision, assigned role, working directory, reviewer
 profile, inspected workspace evidence, and owner authority (pinned policy plus
 the owner's steering and answers); a later owner answer makes every earlier
-verdict a miss. A recorded approval is still rechecked against the current
-target session, including that owner authority, and delivered once. A recorded reviewer escalation remains with the
+verdict a miss, and an owner answer retires every outstanding delegated
+decision so it is reviewed again under the new direction or stays with the
+owner. A recorded approval is still rechecked against the current target
+session, including that owner authority, and delivered once. A recorded reviewer escalation remains with the
 owner. Reuse does not extend the run's decision limit or apply to host-side
 escalations.
 

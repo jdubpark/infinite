@@ -589,3 +589,29 @@ test("entries the agent account cannot remove are finished by the host", async (
     assert.ok(!run.events.some(event => event.text.startsWith("Workspace removal under the retention policy failed")), "no failure is recorded when the host finishes the removal");
   } finally { await close(f, teams); }
 });
+
+test("a cancelled run with an interrupted operation and members whose sessions are gone still settles", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "cancelled";
+  f.run.updatedAt = at;
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  const ghost = structuredClone(f.run.members[0]!);
+  Object.assign(ghost, { memberId: randomUUID(), sessionId: randomUUID(), status: "unavailable", title: "implementer: ghost" });
+  const waiting = structuredClone(f.run.members[0]!);
+  Object.assign(waiting, { memberId: randomUUID(), sessionId: randomUUID(), status: "waiting", title: "implementer: waiting" });
+  f.run.members.push(ghost, waiting);
+  f.run.events.push({ at, text: "Team cancelled." }, { at, text: "The host restarted with an unresolved operation from a cancelled team. The intent will not be replayed." });
+  retention(f, { cancelledMinutes: 0 });
+  f.writeTeam();
+  // Both unsettled members' sessions no longer exist on the host.
+  f.manager.state = async () => { throw new Error("unknown session"); };
+  const teams = openTeam(f, { now: () => Date.parse(at) + 1000 });
+  try {
+    const stored = (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!;
+    stored.pending = { id: randomUUID(), kind: "prepare", revision: 1 };
+    teams.start();
+    await waitFor(() => !teams.statuses().some(row => row.id === f.run.id), "a cancelled run settles once nothing is left to stop, interrupted operation or not");
+    assert.equal(existsSync(runDirectory(f.run)), false);
+  } finally { await close(f, teams); }
+});

@@ -2134,6 +2134,7 @@ test("promptOwner says who a member's prompt waits on: the coordinator, the owne
     assert.equal(f.openTeam().promptOwner(member.sessionId, prompt), "undecided", "a configured reviewer does not require a strong coordinator fallback");
     const decision = { id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: member.memberId, targetSessionId: member.sessionId,
       targetCwd: member.cwd, promptId: 1, promptHash: prompt.hash!, evidenceHash: "c".repeat(64), option: 0, prompt,
+      authorityHash: permissionAuthorityHash(f.run.permissions, []),
       expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), status: "reviewing" as const };
     // "answering" is not observable through a reloaded service: restart recovery marks it uncertain, which is the owner's.
     for (const [status, owner] of [["pending", "coordinator"], ["reviewing", "coordinator"], ["approved", "coordinator"], ["answering", "user"],
@@ -2184,13 +2185,29 @@ test("an owner answer retires outstanding permission decisions so no verdict giv
       targetSessionId: target.sessionId, targetCwd: target.cwd, promptId: prompt.id, promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt), prompt,
       option: 0, expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), coordinatorMemberId: randomUUID(),
       authorityHash: permissionAuthorityHash(f.run.permissions, []) };
-    f.run.permissionDecisions = [{ ...base, id: randomUUID(), status: "reviewing" as const }, { ...base, id: randomUUID(), status: "approved" as const }];
+    const coordinatorQuestion = { id: randomUUID(), memberId: target.memberId, revision: 1, question: "Which file first?", options: ["a", "b"], createdAt: at };
+    f.run.decisions.push(coordinatorQuestion);
+    f.run.permissionDecisions = [{ ...base, id: randomUUID(), status: "pending" as const }, { ...base, id: randomUUID(), status: "reviewing" as const },
+      { ...base, id: randomUUID(), status: "approved" as const }, { ...base, id: randomUUID(), status: "answered" as const }];
+    const fences: [string, string][] = [];
+    (f.manager as any).invalidateTeamPermission = async (sessionId: string, decisionId: string) => { fences.push([sessionId, decisionId]); return "invalidated"; };
     f.writeTeam();
     const teams = f.openTeam();
+    const stored = (teams as unknown as { record(id: string): { run: TeamRun } }).record(f.run.id);
+    // An answer in flight exists only in memory: restart recovery would already have marked a stored one uncertain.
+    const inFlight = { ...base, id: randomUUID(), status: "answering" as const };
+    stored.run.permissionDecisions!.push(inFlight);
+
+    // A mission coordinator's answer is not owner direction; it retires nothing.
+    await teams.answer(f.run.id, coordinatorQuestion.id, { requestId: randomUUID(), revision: 1, text: "a" }, undefined, "coordinator");
+    assert.deepEqual(teams.get(f.run.id).permissionDecisions?.map(decision => decision.status), ["pending", "reviewing", "approved", "answered", "answering"]);
+    assert.deepEqual(fences, []);
+
     await teams.answer(f.run.id, f.run.decisions[0].id, { requestId: randomUUID(), revision: 1, text: "No. Do not run that command again." });
     const run = teams.get(f.run.id);
-    assert.deepEqual(run.permissionDecisions?.map(decision => decision.status), ["stale", "stale"]);
-    assert.ok(run.permissionDecisions?.every(decision => /owner answered a team question/.test(decision.reason ?? "")));
+    assert.deepEqual(run.permissionDecisions?.map(decision => decision.status), ["stale", "stale", "stale", "answered", "uncertain"]);
+    assert.ok(run.permissionDecisions?.filter(decision => decision.status !== "answered").every(decision => /owner answered a team question/.test(decision.reason ?? "")));
+    assert.deepEqual(fences, [[target.sessionId, inFlight.id]], "the in-flight answer is fenced at its target session");
   } finally { f.close(); }
 });
 

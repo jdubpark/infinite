@@ -96,12 +96,17 @@ bounded revision history. Storage errors remain explicit.
 Workspace maintenance is independent of an active session and continues while
 clients are closed. Its policy defaults to enabled, with `enabled`, `synthesis` and `delivery`
 set to true, a 15-minute interval and 24 jobs per workspace per UTC day. A
-stored policy without `editedAt` is migrated once to these defaults with
-`editedBy: "migration"`. An owner edit stamps `editedBy: "owner"`, keeps the
-owner's chosen values and is never re-enabled automatically. Owner policy
-edits can still switch each capability off independently. An explicit
+stored policy without `editedAt` is migrated once: its three switches turn on,
+its interval and daily limit stay, and it records `editedBy: "migration"`. An
+owner edit stamps `editedBy: "owner"` and keeps the owner's chosen values; an
+owner-disabled policy is never re-enabled. When the workspace's repository set
+changes, an owner-edited policy is kept as it is, and any other policy turns
+off with its interval and limit kept until the owner sets it again. Owner
+policy edits can still switch each capability off independently. An explicit
 refresh can collect a source map while scheduling is disabled; model synthesis
-still requires its own enabled policy and a configured writer.
+still requires its own enabled policy and a configured writer. A host without
+a configured engine reports maintenance as unavailable with the message "No
+summary writer is configured on this host."
 
 The configured engine's `context --repo` command supplies deterministic source
 maps without a model call. Source fingerprints suppress synthesis for unchanged
@@ -110,22 +115,43 @@ briefs per workspace job, rotates pending components, applies daily admission
 limits and backs off failed attempts. A workspace attempt has an overall time
 limit capped at ten minutes. Each selected component gets a separate bounded
 synthesis invocation; every invocation shares the remaining workspace deadline.
-Collection and synthesis also have process, output and storage bounds. Current source and plan bindings are rechecked
-before publishing generated comparisons. Failed attempts retain the previous
-usable source observations with failure and freshness metadata.
+Engine steps leave a reserve for the final source re-check: twice the capture
+time, and at least five seconds or a fifth of the attempt, whichever is
+smaller. Collection and synthesis also have process, output and storage
+bounds. Current source and plan bindings are rechecked before publishing
+generated comparisons. Failed attempts retain the previous usable source
+observations with failure and freshness metadata.
 
-Each job also runs a repository-level `brief --repo` at the tracked head. Its
-comparison base is the head of the last successful brief, so the first brief
-has no changes section. The host parses up to two Mermaid flowchart diagrams
-into graph data, a strict subset of the syntax. A diagram outside that subset
-keeps its source text and a `parseError`. A deterministic component map is
-always published. `knowledge.briefs` and `knowledge.diagrams` expose both.
+A job runs the repository-level `brief --repo` at the tracked head only when
+synthesis is enabled and the repository's source fingerprint changed since its
+last stored brief. A brief gets at most half of the time left after the
+re-check reserve. Its comparison base is the head of the last successful brief,
+so the first brief has no changes section. The host parses up to two Mermaid
+flowchart diagrams into graph data, a strict subset of the syntax. A diagram
+outside that subset keeps its source text and a `parseError`. A deterministic
+component map is published with every captured source map, even when the brief
+fails or an engine step runs out of time. It draws at most 2,000 components,
+200 groups and 4,000 connections, and a coverage line says how many were drawn.
+`knowledge.briefs` and `knowledge.diagrams` expose both. A job whose engine
+output fails validation, or whose source or plans change while it runs,
+publishes nothing and keeps the previous generation.
 
-A job runs on the interval, after a merged team run, after a GitHub source
-fast-forward, and on an owner refresh. A change that lands during a running
-job requeues one more run. Maintenance keeps `lastFailure: { at, reason }`, and
-its message reads `Last attempt failed at <time>: <reason>.` Reasons are bounded
-to 400 characters with long tokens redacted.
+A brief, synthesis or delivery step that runs out of time becomes a partial
+line, `Repository <name>: <step> unavailable: <reason>`, and the job still
+publishes the source map, the component diagram and any stored brief. A
+re-check that runs out of time drops only that repository's unconfirmed engine
+output.
+
+An interval tick admits a job only when a bound repository's HEAD differs from
+its stored observation or the repository was never observed; a failed attempt
+retries on its backoff. A merged team run, a GitHub source fast-forward and an
+owner refresh do not wait for a HEAD change; they still count against the
+daily limit. While the daily limit is spent, ticks do not rewrite the store. A
+change that lands during a running job requeues one more run. Maintenance
+keeps `lastFailure: { at, reason }`, and its message reads `Last attempt failed
+at <time>: <reason>.` A reason carries the engine's last stderr line when the
+engine exited with an error. Reasons are bounded to 400 characters with long
+tokens redacted.
 
 The maintenance store has an 8 MiB encrypted budget. Legacy session briefs use
 a separate rolling store of at most 16 generations per project within 8 MiB.

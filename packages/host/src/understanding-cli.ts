@@ -89,7 +89,7 @@ function renderGenerated(value: GeneratedCatalogPage): string[] {
   return lines;
 }
 
-export function renderUnderstanding(value: WorkspaceUnderstanding, planned?: PlannedByRepository): string[] {
+export function renderUnderstanding(value: WorkspaceUnderstanding, planned?: PlannedByRepository, plannedUnavailable: Record<string, string> = {}): string[] {
   if (value.schemaVersion !== 1) throw new Error("This host returned an unsupported Understanding response");
   if (!value.workspace?.id || !value.work || !value.repositories) throw new Error("This host returned a mismatched Understanding response");
   const lines = [`Understanding · ${value.workspace.name} (${value.workspace.id}) · revision ${value.workspace.revision} · observed ${value.observedAt}`, "Work"];
@@ -101,6 +101,7 @@ export function renderUnderstanding(value: WorkspaceUnderstanding, planned?: Pla
     lines.push(`  ${repo.name} (${repo.id}) · ${repo.state} · checkouts ${listed(repo.checkoutIds)}`);
     for (const artifact of repo.current) lines.push(...artifactLines(artifact));
     for (const plan of planned?.[repo.id] ?? repo.planned) lines.push(`    Planned: ${plan.title} · ${plan.status} · ${plan.text}`);
+    if (plannedUnavailable[repo.id]) lines.push(`    Planned requests unavailable: ${plannedUnavailable[repo.id]}`);
     for (const warning of repo.warnings) lines.push(`    Warning: ${warning}`);
     for (const coverage of repo.coverage) lines.push(`    Coverage: ${coverage}`);
   }
@@ -331,11 +332,16 @@ export async function handleUnderstandingCommand(positional: string[], options: 
       const value = await api.json<WorkspaceUnderstanding>(route(id, ""));
       if (value.workspace?.id !== id) throw new Error("This host returned a mismatched Understanding response");
       const planned: PlannedByRepository = {};
-      for (const repo of value.repositories ?? []) planned[repo.id] = await fetchPlanned(api, id, repo.id);
+      const plannedUnavailable: Record<string, string> = {};
+      for (const repo of value.repositories ?? []) {
+        try { planned[repo.id] = await fetchPlanned(api, id, repo.id); }
+        catch (error) { planned[repo.id] = repo.planned; plannedUnavailable[repo.id] = clean((error as Error).message); }
+      }
       if (options["--json"]) {
-        const generated = await fetchGenerated(api, id);
-        printJsonOrLines({ ...value, briefs: value.knowledge?.briefs ?? [], planned, generated }, [], true);
-      } else printJsonOrLines(value, renderUnderstanding(value, planned), false);
+        let generated: GeneratedCatalogPage | null = null, generatedUnavailable: string | undefined;
+        try { generated = await fetchGenerated(api, id); } catch (error) { generatedUnavailable = clean((error as Error).message); }
+        printJsonOrLines({ ...value, briefs: value.knowledge?.briefs ?? [], planned, generated, ...(Object.keys(plannedUnavailable).length ? { plannedUnavailable } : {}), ...(generatedUnavailable ? { generatedUnavailable } : {}) }, [], true);
+      } else printJsonOrLines(value, renderUnderstanding(value, planned, plannedUnavailable), false);
     } catch (error) {
       if ((error as { status?: number }).status === 404) throw new Error("Workspace Understanding requires a newer host or a valid workspace ID.");
       throw error;

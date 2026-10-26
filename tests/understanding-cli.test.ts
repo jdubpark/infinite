@@ -115,9 +115,9 @@ test("understand reports an unparsed diagram instead of edges", async () => {
   assert.match(await runUnderstand(api, { "--workspace": "w" }), /Diagram Broken \(0 nodes, 0 edges\)\n\s*diagram not parsed: unexpected token/);
 });
 
-test("a repeating planned cursor stops the read with an error", async () => {
+test("a repeating planned cursor stops paging and is reported as unavailable", async () => {
   const api = fakeApi({ [root]: withBriefs([]), [`${root}/planned?repository=repo`]: { items: [], next: "c" }, [`${root}/planned?repository=repo&cursor=c`]: { items: [], next: "c" } });
-  await assert.rejects(runUnderstand(api, { "--workspace": "w" }), /repeating page cursor/);
+  assert.match(await runUnderstand(api, { "--workspace": "w" }), /Planned requests unavailable: The host returned a repeating page cursor/);
 });
 
 test("JSON mode emits the overview plus briefs, complete planned pages and the generated catalog", async () => {
@@ -126,13 +126,27 @@ test("JSON mode emits the overview plus briefs, complete planned pages and the g
     [`${root}/planned?repository=repo`]: { items: [fullPlan("p1")], next: null },
     [`${root}/generated`]: { projects: [{ id: "g1", name: "G", repositoryIds: ["repo"], planIds: [], basis: "repository" }], plans: [], next: "g2", coverage: ["c"] },
     [`${root}/generated?cursor=g2`]: { projects: [], plans: [], next: null, coverage: ["c"] } });
-  const printed = JSON.parse(await runUnderstand(api, { "--workspace": "w", "--json": true }));
+  const printed = JSON.parse(await runUnderstand(api, { "--workspace": "w", "--json": true, "--client-config": "client.json" }));
+  const { briefs, planned, generated, ...overviewOnly } = printed;
+  assert.deepEqual(overviewOnly, overview);
   assert.deepEqual(printed.planned, { repo: [fullPlan("p1")] });
   assert.deepEqual(printed.briefs, overview.knowledge.briefs);
   assert.equal(printed.generated.projects[0].id, "g1");
   assert.equal(printed.generated.next, null);
   assert.deepEqual(printed.generated.coverage, ["c"]);
   assert.deepEqual(printed.workspace, overview.workspace);
+});
+
+test("a failing planned request keeps the overview and falls back to its excerpts", async () => {
+  const api = fakeApi({ [root]: withBriefs([]) });
+  const out = await runUnderstand(api, { "--workspace": "w" });
+  assert.match(out, /Understanding · Sample \(w\)/);
+  assert.match(out, /Planned: Fix the build/);
+  assert.match(out, /Planned requests unavailable: unexpected request/);
+  const json = JSON.parse(await runUnderstand(api, { "--workspace": "w", "--json": true }));
+  assert.equal(json.generated, null);
+  assert.match(json.generatedUnavailable, /unexpected request/);
+  assert.equal(json.repositories[0].id, "repo");
 });
 
 test("understand generated follows cursors and lists projects and plans", async () => {

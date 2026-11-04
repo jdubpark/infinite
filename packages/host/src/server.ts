@@ -786,8 +786,12 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await (teams.get(teamId).goal ? goals.answer(teamId, decisionId, body) : teams.answer(teamId, decisionId, body)));
   });
   for (const action of ["pause", "resume", "cancel"] as const) {
-    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) =>
-      res.json(await teams[action](standaloneTeam(req.params.id), teamActionSchema.parse(req.body))));
+    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) => {
+      const teamId = id.parse(req.params.id);
+      // A goal's run stays under its goal; the goal decides whether it has released the run for a cancel.
+      if (action === "cancel" && teams.get(teamId).goal) return res.json(await goals.cancelReleasedRun(teamId, teamActionSchema.parse(req.body)));
+      return res.json(await teams[action](standaloneTeam(teamId), teamActionSchema.parse(req.body)));
+    });
   }
   app.get("/api/machine/resources", async (_req, res) => res.json(await desktopResources.sample()));
   app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {

@@ -50,7 +50,7 @@ async function fixture(scenario: string, linear?: Awaited<ReturnType<typeof star
       codex: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), scenario, receipts, "codex"] },
     }, config: {
       // Head publication would push to GitHub; goal tests do not exercise it.
-      teams: { workspaceDir: join(root, "teams"), lineup, publishHeads: false },
+      teams: { workspaceDir: join(root, "teams"), lineup, publishHeads: false, ...(scenario === "scope" ? { retention: { cancelledMinutes: 0 } } : {}) },
       ...(linear ? { linear: { apiKeyFile, endpoint: linear.endpoint } } : {}),
       projects: [{ id: "rehearsal", name: "Rehearsal", path: source, team: bootstrapGoal
         ? { checks: [], establishChecks: true }
@@ -362,6 +362,19 @@ test("goal scope and required UI evidence block plans or approvals at their real
       if (scenario === "scope") {
         assert.match(run.reason ?? "", /outside the approved goal scope/);
         assert.equal(run.members.length, 1); assert.equal(run.tasks.length, 0); assert.equal(run.checks.length, 0);
+        // The stopped goal no longer controls its blocked run: cancel is accepted so the run can be removed,
+        // while every other team control still belongs to the goal and the goal keeps its own status.
+        for (const action of ["pause", "resume"]) {
+          const denied = await f.host.fetchApi(`/teams/${run.id}/${action}`, "owner", { requestId: randomUUID(), revision: run.revision });
+          assert.deepEqual([denied.status, denied.body.code], [409, "goal-owned-team"]);
+        }
+        const cancelled = await f.host.fetchApi(`/teams/${run.id}/cancel`, "owner", { requestId: randomUUID(), revision: run.revision });
+        assert.equal(cancelled.status, 200, JSON.stringify(cancelled.body));
+        assert.equal(cancelled.body.status, "cancelled");
+        const recorded = await f.goal(stopped.id);
+        assert.deepEqual([recorded.status, recorded.cycles[0].status], ["blocked", "cancelled"]);
+        // Goal runs are removed by their goal, not by team retention: the record must not be left behind.
+        await waitFor(() => f.host.fetchApi(`/teams/${run.id}`), response => response.status === 404, 30000);
       } else {
         assert.match(run.reason ?? "", /Approval of UI changes requires/);
         assert.equal(run.brief?.uiChanges, true);

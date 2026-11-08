@@ -29,6 +29,10 @@ export interface ProjectSyncStatus {
   skipped?: number;
 }
 type Received = { manifest: WorkspaceManifest; receivedAt: string; generation: string };
+/** A publisher ID distinguishes multiple laptop daemons that use the same paired device credential. */
+export interface SyncWriter { deviceId: string; publisherId?: string }
+type UploadLease = { generation: string; writer: SyncWriter; updatedAt: string; committing: boolean };
+type ActiveUploadLease = { value: UploadLease; expiresAt: number; lastActivityAt: number; lastPersistedAt: number };
 /**
  * Whether a cloud session is running or starting in the project. Commit and apply
  * call it inside the project's queue after `applying()` turns true, so a session
@@ -39,8 +43,8 @@ export type RunningCheck = () => Promise<boolean>;
 type Applied = { manifest: WorkspaceManifest; appliedAt: string; baseline?: WorkspaceManifest };
 
 export class ProjectSyncError extends Error {
-  constructor(message: string, readonly code: "cloud-changed" | "session-running" | "apply-failed" | "sync-failed" | "sync-applying" | "stale-generation" | "missing-content" | "invalid-manifest" | "unknown-project",
-    readonly status = 409, readonly category?: SyncFailureCategory) {
+  constructor(message: string, readonly code: "cloud-changed" | "session-running" | "apply-failed" | "sync-failed" | "sync-applying" | "sync-in-progress" | "stale-generation" | "missing-content" | "invalid-manifest" | "unknown-project",
+    readonly status = 409, readonly category?: SyncFailureCategory, readonly retryAfterSeconds?: number) {
     super(message);
   }
 }
@@ -69,6 +73,13 @@ export function syncFailure(error: unknown, projectPath?: string): { category: S
 }
 
 const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
+/** A stalled upload stops owning the project after five minutes without an owning request. */
+const UPLOAD_LEASE_MS = 5 * 60 * 1000;
+/** Persist lease heartbeats at most every 30 seconds instead of rewriting lease state for every chunk. */
+const UPLOAD_LEASE_PERSIST_MS = 30 * 1000;
+/** The persisted heartbeat may lag activity by one interval, so restart recovery adds a bounded grace period. */
+const UPLOAD_LEASE_RECOVERY_GRACE_MS = 30 * 1000;
+const INTERNAL_WRITER: SyncWriter = { deviceId: "internal", publisherId: "internal" };
 /** Paths Infinite itself owns inside a project; never part of drift detection. */
 const OWNED_PREFIX = ".infinite";
 const ownedPath = (path: string) => path === OWNED_PREFIX || path.startsWith(`${OWNED_PREFIX}/`);
@@ -90,13 +101,47 @@ function reusable(applied: Applied, next: WorkspaceManifest) {
 
 /** One-way laptop-to-cloud synchronization state for configured projects. */
 export class ProjectSync {
-  private readonly generations = new Map<string, string>();
+  private readonly uploads = new Map<string, ActiveUploadLease | undefined>();
   private readonly serial = new Map<string, Promise<unknown>>();
   private readonly changing = new Set<string>();
   private readonly skipped = new Map<string, number>();
+  private readonly recoveries = new Map<string, Promise<void>>();
+  private readonly recovered = new Set<string>();
   constructor(private readonly config: Config, private readonly key: Buffer) {
     // An API stopped in the middle of an apply leaves its stage, and possibly a missing project directory, behind.
-    for (const project of config.projects) void this.queue(project.id, () => this.recover(project.path)).catch(() => {});
+    for (const project of config.projects) {
+      const recovery = this.queue(project.id, async () => {
+        let filesystemRecovered = false;
+        try { await this.recover(project.path); filesystemRecovered = true; } catch { /* The project operation reports the actionable refusal. */ }
+        const saved = this.readLease(project.id);
+        if (saved?.committing && filesystemRecovered) this.clearLease(project.id);
+        else if (saved?.committing) this.uploads.set(project.id, {
+          value: saved,
+          expiresAt: Number.POSITIVE_INFINITY,
+          lastActivityAt: Date.parse(saved.updatedAt),
+          lastPersistedAt: Date.parse(saved.updatedAt),
+        });
+        else if (saved) {
+          const updatedAt = Date.parse(saved.updatedAt), now = Date.now();
+          if (!Number.isFinite(updatedAt) || now > updatedAt + UPLOAD_LEASE_MS + UPLOAD_LEASE_RECOVERY_GRACE_MS) this.clearLease(project.id);
+          else this.uploads.set(project.id, {
+            value: saved,
+            expiresAt: updatedAt + UPLOAD_LEASE_MS + UPLOAD_LEASE_RECOVERY_GRACE_MS,
+            lastActivityAt: updatedAt,
+            lastPersistedAt: updatedAt,
+          });
+        }
+        this.recovered.add(project.id);
+      });
+      this.recoveries.set(project.id, recovery);
+      void recovery.catch(() => {});
+    }
+  }
+
+  private ready(projectId: string) {
+    if (this.recovered.has(projectId)) return Promise.resolve();
+    const recovery = this.recoveries.get(projectId);
+    return recovery ?? Promise.resolve();
   }
 
   private project(projectId: string) {
@@ -114,8 +159,61 @@ export class ProjectSync {
     const file = join(this.dir(projectId), `${name}.sealed`);
     return existsSync(file) ? unseal<T>(this.key, `project-sync:${projectId}:${name}`, readFileSync(file, "utf8")) : undefined;
   }
+  private store(projectId: string) {
+    return { directory: join(this.dir(projectId), "blobs"), sharedPoolDirectory: join(this.config.stateDir, "workspace-pool") };
+  }
   private write(projectId: string, name: "received" | "applied", value: unknown) {
     writeSealed(join(this.dir(projectId), `${name}.sealed`), this.key, `project-sync:${projectId}:${name}`, value);
+  }
+  private readLease(projectId: string): UploadLease | undefined {
+    const file = join(this.dir(projectId), "upload-lease.sealed");
+    return existsSync(file) ? unseal<UploadLease>(this.key, `project-sync:${projectId}:upload-lease`, readFileSync(file, "utf8")) : undefined;
+  }
+  private writeLease(projectId: string, value: UploadLease) {
+    writeSealed(join(this.dir(projectId), "upload-lease.sealed"), this.key, `project-sync:${projectId}:upload-lease`, value);
+  }
+  private clearLease(projectId: string) {
+    rmSync(join(this.dir(projectId), "upload-lease.sealed"), { force: true });
+    this.uploads.delete(projectId);
+  }
+  private expireLease(projectId: string, now = Date.now()) {
+    const active = this.uploads.get(projectId);
+    if (active && !active.value.committing && active.expiresAt <= now) this.clearLease(projectId);
+    return this.uploads.get(projectId);
+  }
+  private sameWriter(a: SyncWriter, b: SyncWriter) {
+    return a.deviceId === b.deviceId && a.publisherId === b.publisherId;
+  }
+  private conflict(active: ActiveUploadLease, now = Date.now()): never {
+    const retryAfterSeconds = active.value.committing ? 5 : Math.max(1, Math.ceil((active.expiresAt - now) / 1000));
+    throw new ProjectSyncError(active.value.committing
+      ? "A workspace sync is being committed for this project. Retry shortly."
+      : `Another workspace publisher is uploading this project. Retry in about ${retryAfterSeconds} seconds.`,
+    "sync-in-progress", 409, undefined, retryAfterSeconds);
+  }
+  private touchLease(projectId: string, active: ActiveUploadLease, now = Date.now()) {
+    active.lastActivityAt = now;
+    active.expiresAt = now + UPLOAD_LEASE_MS;
+    if (!active.value.committing && now - active.lastPersistedAt >= UPLOAD_LEASE_PERSIST_MS) {
+      active.value.updatedAt = new Date(now).toISOString();
+      this.writeLease(projectId, active.value);
+      active.lastPersistedAt = now;
+    }
+  }
+  private ownedLease(projectId: string, writer: SyncWriter, generation: string | undefined, options: { touch?: boolean; allowLegacyContent?: boolean; allowCommitting?: boolean } = {}) {
+    this.project(projectId);
+    if (writer.publisherId && !generation) throw new ProjectSyncError("This sync request is missing its generation; begin again", "stale-generation");
+    const active = this.expireLease(projectId);
+    // Headerless legacy clients may still transfer immutable content. Their begin and commit operations remain fenced.
+    if (!generation && !writer.publisherId && options.allowLegacyContent) {
+      if (active && !active.value.committing && !active.value.writer.publisherId && active.value.writer.deviceId === writer.deviceId && options.touch)
+        this.touchLease(projectId, active);
+      return undefined;
+    }
+    if (!active || (active.value.committing && !options.allowCommitting) || active.value.generation !== generation || !this.sameWriter(active.value.writer, writer))
+      throw new ProjectSyncError("This sync generation is stale or belongs to another publisher; begin again", "stale-generation");
+    if (options.touch) this.touchLease(projectId, active);
+    return active;
   }
   /** Serialize commit and apply per project; blob writes are content-addressed and need no lock. */
   private queue<T>(projectId: string, task: () => Promise<T>): Promise<T> {
@@ -162,53 +260,99 @@ export class ProjectSync {
     writeJson(file, value);
   }
 
-  begin(projectId: string) {
+  async begin(projectId: string, writer: SyncWriter = INTERNAL_WRITER) {
+    await this.ready(projectId);
     this.project(projectId);
-    const generation = randomUUID();
-    this.generations.set(projectId, generation);
-    return { generation };
+    const now = Date.now(), active = this.expireLease(projectId, now);
+    if (active) {
+      // Unknown legacy writers cannot prove they are the caller that started the lease, so they never resume by identity.
+      if (writer.publisherId !== undefined && this.sameWriter(active.value.writer, writer)) {
+        if (active.value.committing) this.conflict(active, now);
+        this.touchLease(projectId, active, now);
+        return { generation: active.value.generation };
+      }
+      this.conflict(active, now);
+    }
+    const value: UploadLease = { generation: randomUUID(), writer, updatedAt: new Date(now).toISOString(), committing: false };
+    this.writeLease(projectId, value);
+    this.uploads.set(projectId, { value, expiresAt: now + UPLOAD_LEASE_MS, lastActivityAt: now, lastPersistedAt: now });
+    return { generation: value.generation };
   }
-  async missing(projectId: string, hashes: string[]) {
+  async missing(projectId: string, hashes: string[], writer: SyncWriter = INTERNAL_WRITER, generation?: string) {
+    this.ownedLease(projectId, writer, generation, { touch: true, allowLegacyContent: true });
     if (!Array.isArray(hashes) || hashes.length > 512 || hashes.some(h => !/^[a-f0-9]{64}$/.test(h))) throw new ProjectSyncError("Invalid blob presence request", "invalid-manifest", 400);
-    return hasWorkspaceBlobs(join(this.dir(projectId), "blobs"), hashes);
+    return hasWorkspaceBlobs(this.store(projectId), hashes);
   }
-  async putBlob(projectId: string, hash: string, bytes: Buffer) {
+  async putBlob(projectId: string, hash: string, bytes: Buffer, writer: SyncWriter = INTERNAL_WRITER, generation?: string) {
+    this.ownedLease(projectId, writer, generation, { touch: true, allowLegacyContent: true });
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
     if (createHash("sha256").update(bytes).digest("hex") !== hash) throw new ProjectSyncError("The uploaded content does not match its hash", "invalid-manifest", 400);
-    await putWorkspaceBlob(join(this.dir(projectId), "blobs"), hash, bytes.toString("base64"));
+    await putWorkspaceBlob(this.store(projectId), hash, bytes.toString("base64"));
   }
   /** Store a framed batch; returns the number of chunks it held. */
-  async putBlobs(projectId: string, body: Buffer) {
+  async putBlobs(projectId: string, body: Buffer, writer: SyncWriter = INTERNAL_WRITER, generation?: string) {
+    this.ownedLease(projectId, writer, generation, { touch: true, allowLegacyContent: true });
     let chunks: { hash: string; bytes: Buffer }[];
     try { chunks = decodeChunkBatch(body); } catch { throw new ProjectSyncError("Invalid chunk batch", "invalid-manifest", 400); }
     if (chunks.some(({ hash, bytes }) => createHash("sha256").update(bytes).digest("hex") !== hash))
       throw new ProjectSyncError("The uploaded content does not match its hash", "invalid-manifest", 400);
-    await putWorkspaceBlobs(join(this.dir(projectId), "blobs"), chunks);
+    await putWorkspaceBlobs(this.store(projectId), chunks);
     return chunks.length;
   }
   async readBlob(projectId: string, hash: string) {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
-    try { return await readWorkspaceBlob(join(this.dir(projectId), "blobs"), hash); } catch (error) {
+    try { return await readWorkspaceBlob(this.store(projectId), hash); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ProjectSyncError("This content is not stored for the project", "missing-content", 404);
       throw error;
     }
   }
 
-  commit(projectId: string, generation: string, value: unknown, running: RunningCheck) {
-    return this.changeQueue(projectId, async () => {
-      this.project(projectId);
-      if (this.generations.get(projectId) !== generation) throw new ProjectSyncError("This sync generation is stale; begin again", "stale-generation");
-      if (Buffer.byteLength(JSON.stringify(value) ?? "") > MAX_MANIFEST_BYTES) throw new ProjectSyncError("Manifest exceeds the size limit", "invalid-manifest", 413);
-      let manifest: WorkspaceManifest;
-      try { manifest = validateWorkspaceManifest(value); } catch { throw new ProjectSyncError("Invalid workspace manifest", "invalid-manifest", 400); }
-      if (manifest.roots.length !== 1) throw new ProjectSyncError("Project sync accepts exactly one root", "invalid-manifest", 400);
-      const hashes = [...new Set(manifest.entries.flatMap(e => e.chunks ?? []))];
-      if ((await hasWorkspaceBlobs(join(this.dir(projectId), "blobs"), hashes)).length) throw new ProjectSyncError("The manifest references content that was not uploaded", "missing-content");
-      this.write(projectId, "received", { manifest, receivedAt: new Date().toISOString(), generation } satisfies Received);
-      // A pending marker always describes the newest received generation.
-      this.writePending(projectId, undefined);
-      return this.applyReceived(projectId, { running });
-    });
+  commit(projectId: string, generation: string, value: unknown, running: RunningCheck, writer: SyncWriter = INTERNAL_WRITER) {
+    const admit = () => {
+      const active = this.ownedLease(projectId, writer, generation);
+      if (!active) throw new ProjectSyncError("This sync generation is stale; begin again", "stale-generation");
+      // Admission is durable before the commit waits in the project queue, and this flag disables lease expiry.
+      const admitted = { ...active.value, updatedAt: new Date().toISOString(), committing: true };
+      this.writeLease(projectId, admitted);
+      active.value = admitted;
+      active.lastPersistedAt = active.lastActivityAt = Date.now();
+      active.expiresAt = Number.POSITIVE_INFINITY;
+      return this.changeQueue(projectId, async () => {
+        try {
+          this.ownedLease(projectId, writer, generation, { allowCommitting: true });
+          if (Buffer.byteLength(JSON.stringify(value) ?? "") > MAX_MANIFEST_BYTES) throw new ProjectSyncError("Manifest exceeds the size limit", "invalid-manifest", 413);
+          let manifest: WorkspaceManifest;
+          try { manifest = validateWorkspaceManifest(value); } catch { throw new ProjectSyncError("Invalid workspace manifest", "invalid-manifest", 400); }
+          if (manifest.roots.length !== 1) throw new ProjectSyncError("Project sync accepts exactly one root", "invalid-manifest", 400);
+          const hashes = [...new Set(manifest.entries.flatMap(e => e.chunks ?? []))];
+          if ((await hasWorkspaceBlobs(this.store(projectId), hashes)).length) throw new ProjectSyncError("The manifest references content that was not uploaded", "missing-content");
+          this.ownedLease(projectId, writer, generation, { allowCommitting: true });
+          this.write(projectId, "received", { manifest, receivedAt: new Date().toISOString(), generation } satisfies Received);
+          // A pending marker always describes the newest received generation.
+          this.writePending(projectId, undefined);
+          const status = await this.applyReceived(projectId, { running });
+          this.clearLease(projectId);
+          return status;
+        } catch (error) {
+          const current = this.uploads.get(projectId);
+          if (current?.value.generation === generation) {
+            if (error instanceof ProjectSyncError && error.code === "apply-failed") this.clearLease(projectId);
+            else {
+              current.value.committing = false;
+              current.value.updatedAt = new Date().toISOString();
+              this.writeLease(projectId, current.value);
+              current.lastActivityAt = current.lastPersistedAt = Date.now();
+              current.expiresAt = current.lastActivityAt + UPLOAD_LEASE_MS;
+            }
+          }
+          throw error;
+        }
+      });
+    };
+    if (this.recovered.has(projectId)) {
+      try { return admit(); } catch (error) { return Promise.reject(error); }
+    }
+    return this.ready(projectId).then(admit);
   }
 
   apply(projectId: string, options: { force?: boolean; running: RunningCheck }) {
@@ -266,7 +410,7 @@ export class ProjectSync {
     let moved = false, retired = false, restored = true, written: WorkspaceManifest | undefined;
     try {
       const sharedGroup = await this.sharedGroup(parent);
-      const tree = await materializeWorkspace({ manifest: received.manifest, storeDir: join(this.dir(projectId), "blobs"), destination: join(stage, "tree"), sharedGroup, previous: reuse, flush: "once" });
+      const tree = await materializeWorkspace({ manifest: received.manifest, storeDir: this.store(projectId), destination: join(stage, "tree"), sharedGroup, previous: reuse, flush: "once" });
       await rename(tree.roots[0], source);
       // The cloud copy of Infinite's own directory wins; a laptop copy never replaces it.
       await removeTree(carried);
@@ -344,7 +488,7 @@ export class ProjectSync {
   private async scan(projectId: string, path: string, previous?: WorkspaceManifest) {
     const root = await this.projectRoot(path);
     let skipped = 0;
-    const manifest = await captureWorkspace({ roots: [root], cwd: root, storeDir: join(this.dir(projectId), "blobs"), previous: previous?.roots[0] === root ? previous : undefined, onSkipped: () => { skipped += 1; } });
+    const manifest = await captureWorkspace({ roots: [root], cwd: root, storeDir: this.store(projectId), previous: previous?.roots[0] === root ? previous : undefined, onSkipped: () => { skipped += 1; } });
     this.skipped.set(projectId, skipped);
     return manifest;
   }

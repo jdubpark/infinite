@@ -1334,11 +1334,13 @@ const hookServer = wantsHooks
         publish({ ...attention, hookErrors: attention.hookErrors + 1 }),
     }).catch(() => null)
   : null;
-function exitWorker(code: number) {
+async function exitWorker(code: number) {
   native?.stop();
-  hybrid?.close(); executor?.close();
+  const workspaceClosing = hybrid?.close();
+  executor?.close();
   server.close();
   hookServer?.close();
+  await workspaceClosing?.catch(() => {});
   try {
     unlinkSync(socketPath(runDir, session.id));
   } catch {
@@ -1417,7 +1419,8 @@ server.listen(socketPath(runDir, session.id), async () => {
     if (session.runtime?.nativeUi === "codex") {
       if (session.workspace) {
         hybrid = await createHybridWorkspace({
-          workspace: session.workspace, directory: join(dir, "workspace"), command: profile.command, commandArgs: profile.args,
+          workspace: session.workspace, directory: join(dir, "workspace"), sharedPoolDirectory: join(stateDir, "workspace-pool"),
+          command: profile.command, commandArgs: profile.args,
           ...(profile.workspaceDir ? { workspaceDirectory: join(profile.workspaceDir, session.id), sharedWorkspace: profile.sharedWorkspace } : {}),
           record: data => { append("lifecycle", { execution: data }); },
           publish: execution => {
@@ -1541,7 +1544,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     });
     const exited = (exitCode: number) => {
       native?.stop();
-      hybrid?.close(); executor?.close();
+      void hybrid?.close().catch(() => {}); executor?.close();
       try {
         flush();
         controller = null;
@@ -1552,7 +1555,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       } catch {
         recordingFailure();
       }
-      const finish = () => { if (handoffStopping) setTimeout(finish, 100); else exitWorker(0); };
+      const finish = () => { if (handoffStopping) setTimeout(finish, 100); else void exitWorker(0); };
       setTimeout(finish, 1500);
     };
     child.onExit(({ exitCode }) => {
@@ -1567,6 +1570,6 @@ server.listen(socketPath(runDir, session.id), async () => {
       error: (error as Error).message,
     });
     persist();
-    exitWorker(1);
+    void exitWorker(1);
   }
 });

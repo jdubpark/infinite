@@ -1,14 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawnSync } from "node:child_process";
+import { createServer as createHttpServer } from "node:http";
 import { promisify } from "node:util";
 import { createServer } from "node:net";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, existsSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { demoProfile, startHost, waitFor } from "./helpers.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { demoProfile, inProcessHost, startHost, waitFor } from "./helpers.js";
 import { readSyncState, stopSyncService } from "../packages/host/src/sync-service.js";
+import { captureWorkspace, readWorkspaceBlob, WORKSPACE_LIMITS } from "../packages/host/src/workspace-checkpoint.js";
 import { compareLaptop, describeSource } from "../packages/host/src/client.js";
 import type { ProjectSourceStatus } from "../packages/host/src/project-source.js";
 
@@ -247,6 +250,110 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
   } finally {
     if (existsSync(stateFile)) stopSyncService(stateFile);
     await host.stop(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pull overlaps cloud blob downloads and materializes the complete checkpoint", { timeout: 60000 }, async () => {
+  const host = await inProcessHost();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-pull-transfer-")));
+  const tokenFile = join(root, "owner.key"), clientFile = join(root, "client.json");
+  const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/cli.ts"), "--client-config", clientFile];
+  const chunkBytes = 256 * 1024;
+  const contents = Buffer.concat(Array.from({ length: 8 }, (_, index) => Buffer.alloc(chunkBytes, index + 1)));
+  let active = 0, maxActive = 0;
+  const readBlob = host.projectSync.readBlob.bind(host.projectSync);
+  host.projectSync.readBlob = async (projectId, hash) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    try { await delay(30); return await readBlob(projectId, hash); }
+    finally { active -= 1; }
+  };
+  try {
+    writeFileSync(join(host.config.projects[0]!.path, "chunks.bin"), contents);
+    await host.projectSync.exportTree("rehearsal");
+    writeFileSync(tokenFile, host.tokens.owner, { mode: 0o600 });
+    await exec(process.execPath, [...cli, "pair", host.origin, "--token-file", tokenFile]);
+    const output = join(root, "pulled");
+    const pulled = await exec(process.execPath, [...cli, "pull", "rehearsal", "--output", output], { timeout: 60000 });
+    assert.equal(readFileSync(join(pulled.stdout.trim(), "chunks.bin")).compare(contents), 0, "all downloaded chunks produce the original file");
+    assert.ok(maxActive > 1, "the client keeps multiple blob requests in flight");
+    assert.ok(maxActive <= 4, "pull leaves executor control headroom");
+  } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("recover overlaps checkpoint downloads and waits for every blob before materializing", { timeout: 60000 }, async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-recover-transfer-")));
+  const source = join(root, "cloud-source"); mkdirSync(source);
+  const canonicalSource = realpathSync(source), cloudStore = join(root, "cloud-store");
+  const contents = Buffer.concat(Array.from({ length: 8 }, (_, index) => Buffer.alloc(WORKSPACE_LIMITS.chunkBytes, index + 1)));
+  writeFileSync(join(source, "chunks.bin"), contents);
+  const manifest = await captureWorkspace({ roots: [canonicalSource], cwd: canonicalSource, storeDir: cloudStore });
+  const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
+  const blobs = new Map(await Promise.all(hashes.map(async hash => [hash, await readWorkspaceBlob(cloudStore, hash)] as const)));
+  const sessionId = randomUUID(), token = randomBytes(32).toString("hex");
+  const clientFile = join(root, "client.json"), destination = join(root, "recovered");
+  let releaseFirst!: () => void, releaseSecond!: () => void;
+  const firstWindow = new Promise<void>(resolve => { releaseFirst = resolve; });
+  const secondWindow = new Promise<void>(resolve => { releaseSecond = resolve; });
+  const started: string[] = [];
+  let active = 0, maxActive = 0;
+  const server = createHttpServer(async (request, response) => {
+    const send = (status: number, value: unknown) => {
+      response.writeHead(status, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(value));
+    };
+    if (request.headers.authorization !== `Bearer ${token}`) return send(401, { error: "Unauthorized" });
+    if (request.url === "/api/me") return send(200, { role: "owner", projects: [] });
+    if (request.url === "/api/sessions") return send(200, { sessions: [{ id: sessionId, provider: "codex", status: "running", projectId: "example", title: "Checkpoint", cwd: canonicalSource }] });
+    if (request.url !== `/api/sessions/${sessionId}/workspace-export`) return send(404, { error: "Not found" });
+
+    const parts: Buffer[] = [];
+    for await (const part of request) parts.push(Buffer.from(part));
+    const payload = JSON.parse(Buffer.concat(parts).toString("utf8")) as { method?: string; hash?: string };
+    if (payload.method === "sync/export") return send(200, { manifest });
+    if (payload.method !== "sync/blob" || typeof payload.hash !== "string") return send(400, { error: "Invalid workspace export request" });
+
+    const blob = blobs.get(payload.hash);
+    if (!blob) return send(404, { error: "Unknown blob" });
+    started.push(payload.hash);
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    const gate = started.length <= 4 ? firstWindow : secondWindow;
+    try {
+      await gate;
+      send(200, { base64: blob });
+    } finally { active -= 1; }
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("The local test server did not expose a TCP port");
+  writeFileSync(clientFile, JSON.stringify({ origin: `http://127.0.0.1:${address.port}`, token }), { mode: 0o600 });
+  const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/cli.ts"), "--client-config", clientFile,
+    "recover", sessionId, "--output", destination];
+  const running = exec(process.execPath, cli, { timeout: 55000 });
+
+  try {
+    await waitFor(() => Promise.resolve(started.length), count => count >= 4, 10000);
+    assert.equal(active, 4, "the first recovery window overlaps four blob requests");
+    assert.equal(existsSync(destination), false, "recovery remains invisible while transfers are pending");
+
+    releaseFirst();
+    await waitFor(() => Promise.resolve(started.length), count => count === hashes.length, 10000);
+    assert.equal(active, 4, "the second recovery window stays within the same bound");
+    assert.equal(existsSync(destination), false, "recovery waits for the final blob window before materializing");
+    releaseSecond();
+
+    const recovered = await running;
+    assert.equal(recovered.stdout.trim(), join(destination, "workspace", canonicalSource.slice(1)), "recover prints the copied working directory");
+    assert.equal(readFileSync(join(recovered.stdout.trim(), "chunks.bin")).compare(contents), 0);
+    assert.equal(started.length, hashes.length, "every unique checkpoint blob was fetched");
+    assert.equal(maxActive, 4, "recovery never exceeds the shared transfer bound");
+  } finally {
+    releaseFirst(); releaseSecond();
+    await running.catch(() => {});
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

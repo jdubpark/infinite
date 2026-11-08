@@ -11,6 +11,12 @@ import { inProcessHost, startHost, waitFor, type Host } from "./helpers.js";
 import { fixture as teamFixture } from "./team-fixture.js";
 
 type Api = Pick<Host, "origin" | "tokens" | "fetchApi">;
+const syncPublisher = randomUUID();
+const syncOwner = { deviceId: "owner", publisherId: syncPublisher };
+const syncHeaders = (generation?: string) => ({
+  "X-Infinite-Sync-Publisher": syncPublisher,
+  ...(generation ? { "X-Infinite-Sync-Generation": generation } : {}),
+});
 
 test("owner CLI resolves distinct home-relative projects without falling back to the paired project", async () => {
   const host = await inProcessHost();
@@ -137,39 +143,42 @@ test("forget refuses a mirrored project with an unfinished team run", { timeout:
   } finally { await run.close(); rmSync(home, { recursive: true, force: true }); }
 });
 
-const putChunk = (host: Api, hash: string, body: Buffer) => fetch(`${host.origin}/api/projects/rehearsal/sync/blob/${hash}`, {
-  method: "PUT", headers: { Authorization: `Bearer ${host.tokens.owner}`, "Content-Type": "application/octet-stream" }, body,
+const putChunk = (host: Api, hash: string, body: Buffer, publisherId?: string, generation?: string) => fetch(`${host.origin}/api/projects/rehearsal/sync/blob/${hash}`, {
+  method: "PUT", headers: { Authorization: `Bearer ${host.tokens.owner}`, "Content-Type": "application/octet-stream",
+    ...(publisherId ? { "X-Infinite-Sync-Publisher": publisherId } : {}), ...(generation ? { "X-Infinite-Sync-Generation": generation } : {}) }, body,
 });
 
-const putBatch = (host: Api, body: Buffer) => fetch(`${host.origin}/api/projects/rehearsal/sync/blobs`, {
-  method: "PUT", headers: { Authorization: `Bearer ${host.tokens.owner}`, "Content-Type": "application/octet-stream" }, body,
+const putBatch = (host: Api, body: Buffer, publisherId?: string, generation?: string) => fetch(`${host.origin}/api/projects/rehearsal/sync/blobs`, {
+  method: "PUT", headers: { Authorization: `Bearer ${host.tokens.owner}`, "Content-Type": "application/octet-stream",
+    ...(publisherId ? { "X-Infinite-Sync-Publisher": publisherId } : {}), ...(generation ? { "X-Infinite-Sync-Generation": generation } : {}) }, body,
 });
 const ok = async (response: Response) => { assert.equal(response.status, 200, await response.text()); };
 /** The CLI's transport over the real routes; `batches` counts batch requests, and `legacy` answers them as a host without the route would. */
-function transport(host: Api, counts = { batches: 0, singles: 0 }, legacy = false): ChunkTransport {
-  return {
-    has: async hashes => (await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes })).body.missing,
+function transport(host: Api, counts = { batches: 0, singles: 0 }, legacy = false) {
+  return (generation: string): ChunkTransport => ({
+    has: async hashes => (await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes }, syncHeaders(generation))).body.missing,
     putBatch: async body => {
       counts.batches += 1;
       if (legacy) return "unsupported";
-      await ok(await putBatch(host, body));
+      await ok(await putBatch(host, body, syncPublisher, generation));
     },
-    put: async (hash, bytes) => { counts.singles += 1; await ok(await putChunk(host, hash, bytes)); },
-  };
+    put: async (hash, bytes) => { counts.singles += 1; await ok(await putChunk(host, hash, bytes, syncPublisher, generation)); },
+  });
 }
 
 /** Capture the laptop tree, begin a generation, and upload the chunks the host lacks. */
-async function upload(host: Api, laptop: string, storeDir: string, chunks: ChunkTransport = transport(host)) {
+async function upload(host: Api, laptop: string, storeDir: string, chunks: (generation: string) => ChunkTransport = transport(host)) {
   const manifest = await captureWorkspace({ roots: [laptop], cwd: laptop, storeDir });
-  const begin = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {});
+  const begin = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, syncHeaders());
   assert.equal(begin.status, 200);
-  await uploadMissingChunks({ storeDir, hashes: manifest.entries.flatMap(e => e.chunks ?? []), transport: chunks });
-  return { manifest, generation: begin.body.generation as string };
+  const generation = begin.body.generation as string;
+  await uploadMissingChunks({ storeDir, hashes: manifest.entries.flatMap(e => e.chunks ?? []), transport: chunks(generation) });
+  return { manifest, generation };
 }
 
 async function pushTree(host: Api, laptop: string, storeDir: string) {
   const { manifest, generation } = await upload(host, laptop, storeDir);
-  return { manifest, commit: await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation, manifest }) };
+  return { manifest, commit: await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation, manifest }, syncHeaders(generation)) };
 }
 
 test("sync routes receive a laptop tree, hold it while a session runs, and apply on request", { timeout: 60000 }, async () => {
@@ -213,8 +222,8 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
     assert.equal((await putBatch(host, framed.subarray(0, framed.length - 1))).status, 400);
     assert.equal((await putBatch(host, Buffer.alloc(2 * 1024 * 1024 + 1))).status, 413);
     // A manifest at the bound still fits the commit body with its generation, so the store judges it.
-    const begun = (await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {})).body.generation;
-    const atBound = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation: begun, manifest: "x".repeat(32 * 1024 * 1024 - 2) });
+    const begun = (await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, syncHeaders())).body.generation;
+    const atBound = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation: begun, manifest: "x".repeat(32 * 1024 * 1024 - 2) }, syncHeaders(begun));
     assert.deepEqual([atBound.status, atBound.body.code], [400, "invalid-manifest"]);
 
     writeFileSync(join(laptop, "notes.md"), "v1\n");
@@ -268,15 +277,18 @@ test("chunk upload batches a large tree into bounded requests and falls back to 
     for (let index = 0; index < 12; index++) writeFileSync(join(laptop, `file-${index}.bin`), randomBytes(256 * 1024));
     for (let index = 0; index < 300; index++) writeFileSync(join(laptop, `small-${index}.txt`), `small ${index}\n`);
     // The first batch request loses its connection, as fetch reports a dropped socket; the uploader sends it again.
-    const counts = { batches: 0, singles: 0 }, base = transport(host, counts);
+    const counts = { batches: 0, singles: 0 };
     let dropped = false;
-    const flaky: ChunkTransport = { ...base, putBatch: async (body, signal) => {
-      if (!dropped) { dropped = true; counts.batches += 1; throw new TypeError("fetch failed"); }
-      return base.putBatch(body, signal);
-    } };
+    const flaky = (generation: string): ChunkTransport => {
+      const base = transport(host, counts)(generation);
+      return { ...base, putBatch: async (body, signal) => {
+        if (!dropped) { dropped = true; counts.batches += 1; throw new TypeError("fetch failed"); }
+        return base.putBatch(body, signal);
+      } };
+    };
     const { manifest, generation } = await upload(host, laptop, join(root, "store"), flaky);
     assert.deepEqual(counts, { batches: 3, singles: 0 }, "two batches, one of them sent twice");
-    const committed = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation, manifest });
+    const committed = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation, manifest }, syncHeaders(generation));
     assert.equal(committed.body.appliedManifest, manifest.id);
     assert.equal(readFileSync(join(host.config.projects[0].path, "small-299.txt"), "utf8"), "small 299\n");
 
@@ -285,9 +297,26 @@ test("chunk upload batches a large tree into bounded requests and falls back to 
     const legacy = { batches: 0, singles: 0 };
     const second = await upload(host, laptop, join(root, "store"), transport(host, legacy, true));
     assert.equal(legacy.singles, 2, "only the two new chunks are sent, one request each");
-    assert.equal((await host.fetchApi("/projects/rehearsal/sync/commit", "owner", second)).body.appliedManifest, second.manifest.id);
+    assert.equal((await host.fetchApi("/projects/rehearsal/sync/commit", "owner", second, syncHeaders(second.generation))).body.appliedManifest, second.manifest.id);
     assert.equal(readFileSync(join(host.config.projects[0].path, "added.txt"), "utf8"), "added\n");
   } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("an active publisher lease resumes across API restart and another publisher gets a retryable conflict", { timeout: 60000 }, async () => {
+  const host = await startHost();
+  try {
+    const publisher = randomUUID(), other = randomUUID();
+    const first = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, { "X-Infinite-Sync-Publisher": publisher });
+    assert.equal(first.status, 200);
+    await host.stopApi();
+    await host.start();
+    const resumed = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, { "X-Infinite-Sync-Publisher": publisher });
+    assert.equal(resumed.status, 200);
+    assert.equal(resumed.body.generation, first.body.generation);
+    const conflict = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, { "X-Infinite-Sync-Publisher": other });
+    assert.deepEqual([conflict.status, conflict.body.code], [409, "sync-in-progress"]);
+    assert.ok(Number(conflict.headers.get("retry-after")) > 0, "the host tells another publisher when to retry");
+  } finally { await host.stop(); }
 });
 
 test("session starts are refused while a sync holds the project, and an admitted start holds the next apply", { timeout: 60000 }, async () => {
@@ -308,7 +337,7 @@ test("session starts are refused while a sync holds the project, and an admitted
     const held = host.projectSync.commit("rehearsal", first.generation, first.manifest, () => {
       atCheck();
       return new Promise<boolean>(resolve => { answer = resolve; });
-    });
+    }, syncOwner);
     await reached;
     const late = randomUUID();
     const refused = await host.fetchApi("/sessions", "owner", { requestId: late, provider: "demo", projectId: "rehearsal", title: "Late", prompt: "" });

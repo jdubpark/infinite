@@ -37,6 +37,92 @@ test("the live feed shares topic reads, emits only changed snapshots, and stops 
   t.mock.timers.reset();
 });
 
+test("a current journal subscriber receives its page while an older listener catches up", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const journal = Array.from({ length: 12 }, (_, index) => ({ seq: index + 1, type: "signal" }));
+  const source = {
+    sessions: async () => ({}),
+    teams: () => ({}),
+    session: async () => ({ status: "running" }),
+    events: async (_id: string, after: number) => {
+      const events = journal.filter(event => event.seq > after).slice(0, 2);
+      const cursor = events.at(-1)?.seq ?? after;
+      return { events, cursor, more: cursor < journal.length };
+    },
+  };
+  const seen = (updates: unknown[]) => updates.flatMap(update => {
+    const events = (update as { data: { events: { events: { seq: number }[] } } }).data.events.events;
+    return events.map(event => event.seq);
+  });
+  const feed = new LiveFeed(source, 750), older: unknown[] = [], current: unknown[] = [];
+  try {
+    feed.subscribe(["session/live"], 0, update => older.push(update));
+    await flush();
+    assert.deepEqual(seen(older), [1, 2]);
+
+    feed.subscribe(["session/live"], 4, update => current.push(update));
+    await flush();
+    assert.deepEqual(seen(older), [1, 2, 3, 4]);
+    assert.deepEqual(seen(current), [5, 6], "the current listener receives its next journal page while the older cursor remains behind");
+
+    for (let i = 0; i < 4; i++) { t.mock.timers.tick(750); await flush(); }
+    assert.deepEqual(seen(older), journal.map(event => event.seq), "the older listener catches up without skipped or duplicated events");
+    assert.deepEqual(seen(current), journal.slice(4).map(event => event.seq), "the current listener continues in order without replaying its earlier history");
+  } finally { feed.close(); t.mock.timers.reset(); }
+});
+
+test("live journal replay shares cursor groups and bounds work with many listeners", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const topics = Array.from({ length: 40 }, (_, index) => `session/live-${index}` as const);
+  const pending: (() => void)[] = [], reads: { id: string; after: number }[] = [];
+  let active = 0, maxActive = 0;
+  const source = {
+    sessions: async () => ({}),
+    teams: () => ({}),
+    session: async () => ({ status: "running" }),
+    events: async (id: string, after: number) => {
+      reads.push({ id, after });
+      active++;
+      maxActive = Math.max(maxActive, active);
+      return await new Promise<{ events: unknown[]; cursor: number; more: boolean }>(resolve => pending.push(() => {
+        active--;
+        resolve({ events: [{ seq: after + 1 }], cursor: after + 1, more: false });
+      }));
+    },
+  };
+  const feed = new LiveFeed(source, 750);
+  const olderEvents = new Map(topics.map(topic => [topic, [] as number[]]));
+  const currentEvents = new Map(topics.map(topic => [topic, [] as number[]]));
+  const collect = (target: Map<typeof topics[number], number[]>) => (update: { topic: string; data: unknown }) => {
+    if (!update.topic.startsWith("session/")) return;
+    const events = (update.data as { events: { events: { seq: number }[] } }).events.events;
+    target.get(update.topic as typeof topics[number])?.push(...events.map(event => event.seq));
+  };
+  async function drainTick() {
+    const start = reads.length;
+    await flush();
+    while (pending.length) {
+      const batch = pending.splice(0);
+      for (const finish of batch) finish();
+      await flush();
+    }
+    const readCount = reads.length - start;
+    assert.ok(readCount <= 32, "one tick bounds total journal page reads despite many cursor groups");
+    const tickReads = reads.slice(start);
+    assert.equal(new Set(tickReads.map(read => `${read.id}:${read.after}`)).size, tickReads.length, "listeners at the same topic and cursor share one page read");
+  }
+  try {
+    feed.subscribe([...topics], 0, collect(olderEvents));
+    feed.subscribe([...topics], 1, collect(currentEvents));
+    feed.subscribe([...topics], 1, () => {});
+    await drainTick();
+    assert.deepEqual(currentEvents.get(topics[0]), [2], "a current cursor receives a page in the first bounded tick");
+    assert.ok(maxActive <= 4, "journal page reads run with bounded concurrency");
+    for (let i = 0; i < 2; i++) { t.mock.timers.tick(750); await drainTick(); }
+    assert.deepEqual([...olderEvents.values()], topics.map(() => [1]), "all older cursor groups eventually progress across the bounded rotation");
+  } finally { feed.close(); t.mock.timers.reset(); }
+});
+
 test("unchanged refetch notifications retry failed REST loads without resending oversized data", async t => {
   t.mock.timers.enable({ apis: ["setInterval"] });
   let now = 0;

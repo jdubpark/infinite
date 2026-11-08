@@ -711,7 +711,10 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await missions.answer(id.parse(req.params.id), id.parse(req.params.decisionId), missionTextSchema.parse(req.body))));
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/missions/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await missions[action](id.parse(req.params.id), missionActionSchema.parse(req.body))));
-  app.get("/api/board", (_req, res) => res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => projectGroups.containing(id))));
+  app.get("/api/board", (_req, res) => {
+    const memberships = projectGroups.membershipSnapshot();
+    return res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => memberships.get(id)));
+  });
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
   app.delete("/api/teams/:id", requireRole(["owner"]), async (req, res) => {
     const teamId = id.parse(req.params.id);
@@ -1343,32 +1346,39 @@ export function createApp(config: Config, key: Buffer) {
     res.status(409).json({ error: "This project follows GitHub; laptop sync is off. Re-enroll with --source laptop to upload from this computer.", code: "source-github" });
     return true;
   };
-  app.post("/api/projects/:id/sync/begin", requireRole(["owner"]), requireOwnerCli, (req, res) => {
+  const syncWriter = (req: express.Request, res: express.Response) => ({
+    deviceId: String(res.locals.deviceId),
+    publisherId: z.uuid().optional().parse(req.get("X-Infinite-Sync-Publisher")),
+  });
+  const syncGeneration = (req: express.Request) => z.uuid().optional().parse(req.get("X-Infinite-Sync-Generation"));
+  app.post("/api/projects/:id/sync/begin", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (refuseGithubSync(projectId, res)) return;
-    res.json(projectSync.begin(projectId));
+    res.json(await projectSync.begin(projectId, syncWriter(req, res)));
   });
   app.post("/api/projects/:id/sync/has", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     const body = z.object({ hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(512) }).strict().parse(req.body);
-    res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes) });
+    res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes, syncWriter(req, res), syncGeneration(req)) });
   });
   // A body over one chunk can never be stored; it answers 413 before it is read.
   app.put("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.chunkBytes }), async (req, res) => {
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk as application/octet-stream" });
-    await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body);
+    await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body, syncWriter(req, res), syncGeneration(req));
     res.json({ stored: true });
   });
   // A batch frames many chunks in one request, so an upload pays one round trip per batch instead of per chunk.
   app.put("/api/projects/:id/sync/blobs", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.batchBytes }), async (req, res) => {
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk batch as application/octet-stream" });
-    res.json({ stored: await projectSync.putBlobs(projectSchema.parse(req.params.id), req.body) });
+    res.json({ stored: await projectSync.putBlobs(projectSchema.parse(req.params.id), req.body, syncWriter(req, res), syncGeneration(req)) });
   });
   // The body wraps a manifest of up to the manifest bound with its generation; the store checks the manifest itself.
   app.post("/api/projects/:id/sync/commit", requireRole(["owner"]), requireOwnerCli, express.json({ limit: WORKSPACE_LIMITS.manifestBytes + 64 * 1024 }), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (refuseGithubSync(projectId, res)) return;
     const body = z.object({ generation: z.uuid(), manifest: z.unknown() }).strict().parse(req.body);
-    res.json(await projectSync.commit(projectId, body.generation, body.manifest, () => projectRunning(projectId)));
+    const headerGeneration = syncGeneration(req);
+    if (headerGeneration && headerGeneration !== body.generation) throw new ProjectSyncError("The sync generation does not match this request", "stale-generation");
+    res.json(await projectSync.commit(projectId, body.generation, body.manifest, () => projectRunning(projectId), syncWriter(req, res)));
   });
   app.post("/api/projects/:id/sync/apply", requireRole(["owner"]), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
@@ -1431,8 +1441,10 @@ export function createApp(config: Config, key: Buffer) {
       if (error instanceof TeamError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof CatalogError) return res.status(error.statusCode).json({ code: "understanding-catalog", error: error.message });
       if (error instanceof BehaviorError) return res.status(error.statusCode).json({ code: "understanding-behavior", error: error.message });
-      if (error instanceof ProjectSyncError)
+      if (error instanceof ProjectSyncError) {
+        if (error.retryAfterSeconds !== undefined) res.setHeader("Retry-After", String(error.retryAfterSeconds));
         return res.status(error.status).json({ code: error.code, error: error.message, ...(error.category ? { category: error.category, message: error.message } : {}) });
+      }
       if (error instanceof ProjectSourceError) return res.status(error.status).json({ error: error.message, code: error.code });
       if (error instanceof ContentError) return res.status(error.status).json({ error: error.message });
       if (error instanceof DesktopError) return res.status(error.status).json({ code: error.code, error: error.message });

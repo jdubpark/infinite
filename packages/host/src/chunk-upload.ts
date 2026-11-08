@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { CHUNK_FRAME_BYTES, encodeChunkBatch, readWorkspaceBlob, WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
+import { CHUNK_FRAME_BYTES, encodeChunkBatch, readWorkspaceBlob, WORKSPACE_LIMITS, type WorkspaceStoreTarget } from "./workspace-checkpoint.js";
 
 /** Requests kept in flight. A remote host is often a long round trip away, so a serial upload is bound by latency, not bandwidth. */
 const BATCHES_IN_FLIGHT = 4;
@@ -39,7 +39,7 @@ async function pool<T, R>(items: T[], limit: number, run: (item: T) => Promise<R
 }
 
 /** Upload the chunks of `hashes` the host lacks, batched and in parallel; resolves once the host stored every one. */
-export async function uploadMissingChunks(options: { storeDir: string; hashes: string[]; transport: ChunkTransport; signal?: AbortSignal; progress?: () => void }) {
+export async function uploadMissingChunks(options: { storeDir: WorkspaceStoreTarget; hashes: string[]; transport: ChunkTransport; signal?: AbortSignal; progress?: () => void }) {
   const { storeDir, transport, progress } = options;
   // The first failure cancels the requests still in flight, so a retry never competes with them for the uplink.
   const failure = new AbortController();

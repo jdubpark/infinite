@@ -54,6 +54,12 @@ test("the detached sync service pushes edits, stays pending while a session runs
     assert.equal(stopSyncService(stateFile), true);
     assert.equal(existsSync(stateFile), false);
     await waitFor(async () => { try { process.kill(state.pid, 0); return true; } catch { return false; } }, alive => alive === false, 10000);
+    const restarted = await startSyncService({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal", root: laptop, stateFile, storeDir });
+    assert.equal(restarted.skipped.count, 1);
+    const restartedState = readSyncState(stateFile)!;
+    assert.equal(restartedState.publisherId, state.publisherId, "normal daemon shutdown keeps its publisher identity for the next process");
+    assert.equal(stopSyncService(stateFile), true);
+    await waitFor(async () => { try { process.kill(restartedState.pid, 0); return true; } catch { return false; } }, alive => alive === false, 10000);
   } finally {
     await new Promise(resolve => server.close(resolve));
     if (existsSync(stateFile)) stopSyncService(stateFile);

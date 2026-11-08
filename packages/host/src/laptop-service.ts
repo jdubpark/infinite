@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import { forwardExecutor, type ExecutorControl } from "./executor-tunnel.js";
 import { captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob, validateWorkspaceManifest, type WorkspaceManifest } from "./workspace-checkpoint.js";
 import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
+import { transferWorkspaceBlobs } from "./workspace-transfer.js";
 
 interface LaptopServiceOptions {
   origin: string;
@@ -35,8 +36,9 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
   if (options.roots.some(root => inside(root, directory))) directory = join(homedir(), ".infinite", "workspaces", options.sessionId);
   if (options.roots.some(root => inside(root, directory))) throw new Error("Workspace cache must be outside the selected project");
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  const storeDir = join(directory, "objects");
-  const changeDetector = await watchWorkspaceChanges(options.roots, join(storeDir, "watch-cache"));
+  const storeDir = { directory: join(directory, "objects"), sharedPoolDirectory: join(dirname(dirname(directory)), "workspace-pool") };
+  if (options.roots.some(root => inside(root, storeDir.sharedPoolDirectory))) throw new Error("Workspace cache must be outside the selected project");
+  const changeDetector = await watchWorkspaceChanges(options.roots, join(storeDir.directory, "watch-cache"));
   let previous: WorkspaceManifest | undefined, recovered: string | undefined, lastFull = 0;
   let committed: { revision: number; epoch: number; id: string; entriesFingerprint: string } | undefined;
   let previousIterationFailed = false, lastCaptureStartedAt = 0;
@@ -52,12 +54,14 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
             const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
             for (let offset = 0; offset < hashes.length; offset += 512) {
               const missing = await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512));
-              for (const hash of missing) {
-                if (signal.aborted) return;
+              await transferWorkspaceBlobs(missing, async (hash, transferSignal) => {
+                transferSignal.throwIfAborted();
                 const { base64 } = await control("sync/blob", { hash });
+                transferSignal.throwIfAborted();
                 await putWorkspaceBlob(storeDir, hash, base64);
-              }
+              }, signal);
             }
+            signal.throwIfAborted();
             const destination = join(directory, "recovered", manifest.id);
             await materializeWorkspace({ manifest, storeDir, destination });
             await writeFile(join(directory, "recovery.json"), JSON.stringify({ checkpoint: status.checkpoint, cloudCheckpoint: manifest.id,
@@ -84,11 +88,14 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
               for (let offset = 0; offset < hashes.length; offset += 512) {
                 const { missing } = await control("sync/has", { hashes: hashes.slice(offset, offset + 512) });
                 if (!Array.isArray(missing) || missing.some(hash => !hashes.includes(hash))) throw new Error("Invalid workspace transfer reply");
-                for (const hash of missing) {
-                  if (signal.aborted) return;
-                  await control("sync/blob", { hash, base64: await readWorkspaceBlob(storeDir, hash) });
-                }
+                await transferWorkspaceBlobs(missing, async (hash, transferSignal) => {
+                  transferSignal.throwIfAborted();
+                  const base64 = await readWorkspaceBlob(storeDir, hash);
+                  transferSignal.throwIfAborted();
+                  await control("sync/blob", { hash, base64 });
+                }, signal);
               }
+              signal.throwIfAborted();
               await control("sync/commit", { ...begin, manifest });
               previous = manifest;
               committed = { revision: begin.revision, epoch: begin.epoch, id: manifest.id, entriesFingerprint: content };

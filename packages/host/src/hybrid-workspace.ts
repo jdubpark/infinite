@@ -4,8 +4,9 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { startCloudExecutor } from "./cloud-executor.js";
 import {
   captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob,
-  readWorkspaceBlob, validateWorkspaceManifest, type WorkspaceManifest,
+  readWorkspaceBlob, validateWorkspaceManifest, type WorkspaceManifest, type WorkspaceStoreTarget,
 } from "./workspace-checkpoint.js";
+import { createWorkspaceTransferPool } from "./workspace-transfer.js";
 import type { ExecutionState, LaptopWorkspace } from "./types.js";
 
 const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
@@ -51,14 +52,17 @@ export async function createHybridWorkspace(options: {
   commandArgs?: string[];
   workspaceDirectory?: string;
   sharedWorkspace?: boolean;
+  sharedPoolDirectory?: string;
 }) {
-  const directory = resolve(options.directory), storeDir = join(directory, "blobs");
+  const directory = resolve(options.directory), scopeDirectory = join(directory, "blobs");
+  const storeDir: WorkspaceStoreTarget = options.sharedPoolDirectory
+    ? { directory: scopeDirectory, sharedPoolDirectory: options.sharedPoolDirectory } : scopeDirectory;
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const directoryInfo = await lstat(directory);
   if (!directoryInfo.isDirectory() || (directoryInfo.mode & 0o077) ||
       (process.getuid && directoryInfo.uid !== process.getuid()))
     throw new Error("Hybrid workspace state requires a private owner-controlled directory.");
-  await mkdir(storeDir, { recursive: true, mode: 0o700 });
+  await mkdir(scopeDirectory, { recursive: true, mode: 0o700 });
   if (options.sharedWorkspace && !options.workspaceDirectory) throw new Error("A shared execution identity requires a separate workspace directory.");
   const dataDirectory = resolve(options.workspaceDirectory ?? directory);
   if (options.workspaceDirectory) {
@@ -94,6 +98,9 @@ export async function createHybridWorkspace(options: {
   let cloud: Awaited<ReturnType<typeof startCloudExecutor>> | undefined;
   let cloudWorkspace: { cwd: string; roots: string[] } | undefined;
   let tail: Promise<unknown> = Promise.resolve();
+  const blobTransfers = createWorkspaceTransferPool();
+  const admittedBlobs = new Set<Promise<unknown>>();
+  let closePromise: Promise<void> | undefined;
   let reconnectDeadline = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   const abort = new AbortController();
@@ -123,7 +130,10 @@ export async function createHybridWorkspace(options: {
     if (JSON.stringify(next) !== JSON.stringify(state)) { state = next; options.publish(next); }
   };
   const enqueue = <T>(action: () => Promise<T>): Promise<T> => {
+    const precedingBlobs = [...admittedBlobs];
     const result = tail.then(async () => {
+      if (closed) throw new Error("Hybrid workspace is closed.");
+      await Promise.allSettled(precedingBlobs);
       if (closed) throw new Error("Hybrid workspace is closed.");
       const value = await action();
       if (closed) throw new Error("Hybrid workspace is closed.");
@@ -131,6 +141,24 @@ export async function createHybridWorkspace(options: {
     });
     tail = result.catch(() => {});
     return result;
+  };
+  const enqueueBlob = (params: any): Promise<{ base64: string } | { stored: true }> => {
+    if (closed) return Promise.reject(new Error("Hybrid workspace is closed."));
+    const previous = tail;
+    const operation = previous.then(async () => {
+      if (closed) throw new Error("Hybrid workspace is closed.");
+      return blobTransfers.run(async () => {
+        if (closed) throw new Error("Hybrid workspace is closed.");
+        const result = params?.base64 === undefined
+          ? { base64: await readWorkspaceBlob(storeDir, params?.hash) }
+          : (await putWorkspaceBlob(storeDir, params?.hash, params.base64), { stored: true as const });
+        if (closed) throw new Error("Hybrid workspace is closed.");
+        return result;
+      });
+    });
+    admittedBlobs.add(operation);
+    operation.then(() => admittedBlobs.delete(operation), () => admittedBlobs.delete(operation));
+    return operation;
   };
   const placement = async (phase: Placement["phase"]) => {
     await durableJson(directory, "placement.json", { epoch, phase, checkpoint: checkpoint() } satisfies Placement);
@@ -205,6 +233,8 @@ export async function createHybridWorkspace(options: {
   publish();
   return {
     control(method: string, params: any): Promise<any> {
+      if (closed) return Promise.reject(new Error("Hybrid workspace is closed."));
+      if (method === "sync/blob") return enqueueBlob(params);
       return enqueue(async () => {
         if (method === "sync/status") { publish(); return { ...state, revision, epoch, acknowledged }; }
         if (method === "sync/problem") {
@@ -220,11 +250,6 @@ export async function createHybridWorkspace(options: {
           if (!Array.isArray(params?.hashes) || params.hashes.length > 512)
             throw new Error("A blob presence request must contain at most 512 hashes.");
           return { missing: await hasWorkspaceBlobs(storeDir, params.hashes) };
-        }
-        if (method === "sync/blob") {
-          if (params?.base64 === undefined) return { base64: await readWorkspaceBlob(storeDir, params?.hash) };
-          await putWorkspaceBlob(storeDir, params?.hash, params.base64);
-          return { stored: true };
         }
         if (method === "sync/begin") {
           if (sticky || location !== "laptop" || transitioning || busy || uncertain || !online)
@@ -307,10 +332,16 @@ export async function createHybridWorkspace(options: {
       if (closed) return;
       supported = value; publish(); if (!online) schedule();
     },
-    close(): void {
-      if (closed) return;
+    close(): Promise<void> {
+      if (closePromise) return closePromise;
       closed = true; epoch += 1; abort.abort(); clearTimeout(reconnectTimer);
-      void cloud?.close().catch(() => {});
+      closePromise = (async () => {
+        await Promise.allSettled([...admittedBlobs]);
+        await tail;
+        await blobTransfers.drain();
+        await cloud?.close().catch(() => {});
+      })();
+      return closePromise;
     },
   };
 }

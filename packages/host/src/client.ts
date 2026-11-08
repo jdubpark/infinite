@@ -16,6 +16,7 @@ import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { checkLaptopExecutor, startLaptopService } from "./laptop-service.js";
 import { hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, validateWorkspaceManifest } from "./workspace-checkpoint.js";
+import { transferWorkspaceBlobs } from "./workspace-transfer.js";
 import { readSyncState, startSyncService, stopSyncService, syncServiceRunning } from "./sync-service.js";
 import { localProjectPath } from "./mirrored-projects.js";
 import type { ProjectSourceStatus } from "./project-source.js";
@@ -837,7 +838,8 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         if (!existing.lastCommitAt) throw new Error("Workspace sync is still preparing its first upload. Wait for it before launching a session.");
         return { skipped: { count: existing.skipped ?? 0, paths: [] as string[] } };
       }
-      return startSyncService({ origin: config.origin, token: config.token, projectId, root, stateFile, storeDir: join(syncDir, `${projectId}-store`) });
+      return startSyncService({ origin: config.origin, token: config.token, projectId, root, stateFile,
+        storeDir: join(syncDir, `${projectId}-store`), sharedPoolDirectory: join(dirname(path), "workspace-pool") });
     };
     if (command === "close") {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
@@ -884,7 +886,8 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         (await api.request(`/sessions/${selected.id}/workspace-export`, { method, ...extra }, AbortSignal.timeout(300000))).json();
       const exported = await call("sync/export");
       const manifest = validateWorkspaceManifest(exported.manifest);
-      const directory = join(dirname(path), "workspaces", selected.id), storeDir = join(directory, "objects");
+      const directory = join(dirname(path), "workspaces", selected.id);
+      const storeDir = { directory: join(directory, "objects"), sharedPoolDirectory: join(dirname(path), "workspace-pool") };
       const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
       for (let offset = 0; offset < hashes.length; offset += 512) {
         for (const hash of await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512))) {
@@ -929,22 +932,25 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       if (me.role !== "owner") throw new Error("Workspace pull requires an owner device key");
       const projectId = positional[0] ?? String(localSyncProject(join(dirname(path), "sync"), config.origin) ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!PROJECT_ID.test(projectId) || !me.projects.some(p => p.id === projectId)) throw new Error("Unknown project. Use infinite projects");
-      const directory = join(dirname(path), "pulls", projectId), storeDir = join(directory, "objects");
+      const directory = join(dirname(path), "pulls", projectId);
+      const storeDir = { directory: join(directory, "objects"), sharedPoolDirectory: join(dirname(path), "workspace-pool") };
       const output = options["--output"] === undefined ? undefined : resolve(String(options["--output"]));
       // A sync service uploads everything under its root, so a pulled copy there would travel back to the cloud.
       const target = realPath(output ?? directory);
       if (syncRoots(join(dirname(path), "sync")).some(root => target === root || target.startsWith(root.endsWith(sep) ? root : root + sep)))
         throw new Error("Choose an --output directory outside every synced checkout; the sync service would upload the pulled copy");
       progress.start("Downloading the cloud project tree");
+      const exportSignal = AbortSignal.timeout(300000);
       // The host scans the whole cloud tree before replying; api.json would cap that at 15 s.
-      const { manifest: exported } = await (await api.request(`/projects/${projectId}/sync/export`, {}, AbortSignal.timeout(300000))).json() as { manifest: unknown };
+      const { manifest: exported } = await (await api.request(`/projects/${projectId}/sync/export`, {}, exportSignal)).json() as { manifest: unknown };
       const manifest = validateWorkspaceManifest(exported);
       const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
       for (let offset = 0; offset < hashes.length; offset += 512)
-        for (const hash of await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512))) {
-          const { base64 } = await api.json<{ base64: string }>(`/projects/${projectId}/sync/blob/${hash}`);
+        await transferWorkspaceBlobs(await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512)), async (hash, signal) => {
+          const { base64 } = await api.json<{ base64: string }>(`/projects/${projectId}/sync/blob/${hash}`, undefined, signal);
+          signal.throwIfAborted();
           await putWorkspaceBlob(storeDir, hash, base64);
-        }
+        });
       const destination = output ?? join(directory, manifest.id);
       const pulled = await materializeWorkspace({ manifest, storeDir, destination });
       progress.stop();

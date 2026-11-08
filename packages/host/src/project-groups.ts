@@ -451,6 +451,21 @@ export class ProjectGroupService {
     return group ? { id: group.id, name: group.name } : { id: project.id, name: project.name };
   }
 
+  /** Capture the current holder for every enrolled project after one reconciliation. */
+  membershipSnapshot(): ReadonlyMap<string, { id: string; name: string }> {
+    this.reconcile();
+    const enrolled = new Set(this.config.projects.map(project => project.id));
+    const memberships = new Map<string, { id: string; name: string }>();
+    for (const group of Object.values(this.state.groups)) {
+      const holder = { id: group.id, name: group.name };
+      for (const projectId of group.members)
+        if (enrolled.has(projectId) && !memberships.has(projectId)) memberships.set(projectId, holder);
+    }
+    for (const project of this.config.projects)
+      if (!memberships.has(project.id)) memberships.set(project.id, { id: project.id, name: project.name });
+    return memberships;
+  }
+
   create(input: CreateProjectGroup): ProjectGroup {
     this.reconcile();
     const request = createProjectGroupSchema.parse(input);

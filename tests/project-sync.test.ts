@@ -2,11 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, chownSync, mkdtempSync, mkdirSync, readFileSync, renameSync, writeFileSync, existsSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { execFileSync } from "node:child_process";
 import { createServer, type Server } from "node:net";
-import { ProjectSync, ProjectSyncError } from "../packages/host/src/project-sync.js";
+import { ProjectSync, ProjectSyncError, type SyncWriter } from "../packages/host/src/project-sync.js";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
 import { hashToken } from "../packages/host/src/config.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -28,6 +28,17 @@ function fixture(sync?: Config["sync"]) {
 }
 
 const busy = async () => true, idle = async () => false;
+const testWriter: SyncWriter = { deviceId: "paired-owner", publisherId: randomUUID() };
+
+async function upload(f: ReturnType<typeof fixture>, writer: SyncWriter, previous?: Awaited<ReturnType<typeof captureWorkspace>>) {
+  const storeDir = join(f.root, "laptop-store");
+  const manifest = await captureWorkspace({ roots: [f.laptop], cwd: f.laptop, storeDir, previous });
+  const { generation } = await f.sync.begin("example", writer);
+  const hashes = [...new Set(manifest.entries.flatMap(e => e.chunks ?? []))];
+  for (const hash of await f.sync.missing("example", hashes, writer, generation))
+    await f.sync.putBlob("example", hash, Buffer.from(await readWorkspaceBlob(storeDir, hash), "base64"), writer, generation);
+  return { manifest, generation };
+}
 
 /** Make every rename into `destination` that `matches` fail, as a crash between steps would leave it. */
 function failRenames(destination: string, matches: (from: string) => boolean) {
@@ -44,13 +55,8 @@ const stages = (f: { cloud: string }) => readdirSync(dirname(f.cloud)).filter(n 
 
 /** Push the laptop tree the way the service will: capture, upload missing blobs, commit. */
 async function push(f: ReturnType<typeof fixture>, running = false, previous?: Awaited<ReturnType<typeof captureWorkspace>>) {
-  const storeDir = join(f.root, "laptop-store");
-  const manifest = await captureWorkspace({ roots: [f.laptop], cwd: f.laptop, storeDir, previous });
-  const { generation } = f.sync.begin("example");
-  const hashes = [...new Set(manifest.entries.flatMap(e => e.chunks ?? []))];
-  for (const hash of await f.sync.missing("example", hashes))
-    await f.sync.putBlob("example", hash, Buffer.from(await readWorkspaceBlob(storeDir, hash), "base64"));
-  return { manifest, status: await f.sync.commit("example", generation, manifest, running ? busy : idle) };
+  const { manifest, generation } = await upload(f, testWriter, previous);
+  return { manifest, status: await f.sync.commit("example", generation, manifest, running ? busy : idle, testWriter) };
 }
 
 test("first push applies onto an empty cloud directory and records both manifests", async () => {
@@ -282,22 +288,102 @@ test("sockets and FIFOs are left out of laptop captures and cloud scans, and the
   }
 });
 
-test("stale generations and missing content are refused", async () => {
+test("competing publishers cannot replace a live generation and foreign commits are refused", async () => {
   const f = fixture();
   try {
     writeFileSync(join(f.laptop, "a.txt"), "1\n");
     const storeDir = join(f.root, "laptop-store");
     const manifest = await captureWorkspace({ roots: [f.laptop], cwd: f.laptop, storeDir });
-    const stale = f.sync.begin("example");
-    f.sync.begin("example");
-    await assert.rejects(f.sync.commit("example", stale.generation, manifest, false), (error: ProjectSyncError) => error.code === "stale-generation");
-    const current = f.sync.begin("example");
-    await assert.rejects(f.sync.commit("example", current.generation, manifest, false), (error: ProjectSyncError) => error.code === "missing-content");
+    const otherWriter: SyncWriter = { deviceId: testWriter.deviceId, publisherId: randomUUID() };
+    const generation = (await f.sync.begin("example", testWriter)).generation;
+    assert.equal((await f.sync.begin("example", testWriter)).generation, generation, "the same identified publisher resumes its upload token");
+    await assert.rejects(f.sync.begin("example", otherWriter), (error: ProjectSyncError) => error.code === "sync-in-progress");
+    await assert.rejects(f.sync.commit("example", generation, manifest, idle, otherWriter), (error: ProjectSyncError) => error.code === "stale-generation");
+    await assert.rejects(f.sync.commit("example", generation, manifest, idle, { deviceId: testWriter.deviceId }), (error: ProjectSyncError) => error.code === "stale-generation");
+    await assert.rejects(f.sync.commit("example", generation, manifest, idle, testWriter), (error: ProjectSyncError) => error.code === "missing-content");
     assert.throws(() => f.sync.status("nope"), (error: ProjectSyncError) => error.code === "unknown-project");
     await assert.rejects(f.sync.missing("nope", []), (error: ProjectSyncError) => error.code === "unknown-project");
     await assert.rejects(f.sync.readBlob("nope", "0".repeat(64)), (error: ProjectSyncError) => error.code === "unknown-project");
     assert.equal(existsSync(join(f.config.stateDir, "projects", "nope")), false, "unknown projects leave no state behind");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("headerless legacy publishers conflict while active and only the exact generation can commit", async () => {
+  const f = fixture();
+  try {
+    const legacy = { deviceId: "paired-owner" }, unknown = { deviceId: "paired-owner" };
+    const { generation } = await f.sync.begin("example", legacy);
+    await assert.rejects(f.sync.begin("example", unknown), (error: ProjectSyncError) => error.code === "sync-in-progress");
+    await assert.rejects(f.sync.commit("example", randomUUID(), {}, idle, legacy), (error: ProjectSyncError) => error.code === "stale-generation");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("idle upload leases expire after activity stops, while upload activity renews the bound", async () => {
+  const f = fixture();
+  const realNow = Date.now;
+  let now = realNow();
+  Date.now = () => now;
+  try {
+    const first: SyncWriter = { deviceId: "paired-owner", publisherId: randomUUID() };
+    const second: SyncWriter = { deviceId: "paired-owner", publisherId: randomUUID() };
+    const { generation } = await f.sync.begin("example", first);
+    now += 4 * 60 * 1000;
+    await f.sync.missing("example", [], first, generation);
+    now += 4 * 60 * 1000 + 59 * 1000;
+    await assert.rejects(f.sync.begin("example", second), (error: ProjectSyncError) => error.code === "sync-in-progress");
+    now += 2 * 1000;
+    assert.notEqual((await f.sync.begin("example", second)).generation, generation, "an idle writer can be replaced after the lease bound");
+  } finally { Date.now = realNow; rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("an upload lease survives API state reconstruction for the same identified publisher", async () => {
+  const f = fixture();
+  try {
+    const writer: SyncWriter = { deviceId: "paired-owner", publisherId: randomUUID() };
+    const other: SyncWriter = { deviceId: writer.deviceId, publisherId: randomUUID() };
+    const { generation } = await f.sync.begin("example", writer);
+    const restarted = new ProjectSync(f.config, f.key);
+    assert.equal((await restarted.begin("example", writer)).generation, generation);
+    await assert.rejects(restarted.begin("example", other), (error: ProjectSyncError) => error.code === "sync-in-progress");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a queued commit fences its lease until it finishes, even after the idle timeout", async () => {
+  const f = fixture();
+  const realNow = Date.now;
+  let now = realNow();
+  let answerApply: ((running: boolean) => void) | undefined, applying: Promise<unknown> | undefined, queued: Promise<unknown> | undefined;
+  try {
+    writeFileSync(join(f.laptop, "a.txt"), "first\n");
+    const initial = await push(f, true);
+    assert.equal(initial.status.pendingGeneration?.reason, "session-running");
+
+    let enterApply!: () => void;
+    const atApply = new Promise<void>(resolve => { enterApply = resolve; });
+    applying = f.sync.apply("example", { running: () => {
+      enterApply();
+      return new Promise<boolean>(resolve => { answerApply = resolve; });
+    } });
+    await atApply;
+
+    const writer: SyncWriter = { deviceId: testWriter.deviceId, publisherId: randomUUID() };
+    const competitor: SyncWriter = { deviceId: testWriter.deviceId, publisherId: randomUUID() };
+    writeFileSync(join(f.laptop, "a.txt"), "second\n");
+    const next = await upload(f, writer);
+    Date.now = () => now;
+    queued = f.sync.commit("example", next.generation, next.manifest, idle, writer);
+    now += 10 * 60 * 1000;
+    await assert.rejects(f.sync.begin("example", competitor), (error: ProjectSyncError) => error.code === "sync-in-progress");
+    answerApply(false);
+    await applying;
+    assert.equal((await queued).appliedManifest, next.manifest.id);
+    assert.notEqual((await f.sync.begin("example", competitor)).generation, next.generation, "terminal commit releases the lease");
+  } finally {
+    answerApply?.(false);
+    await Promise.allSettled([applying, queued].filter((promise): promise is Promise<unknown> => Boolean(promise)));
+    Date.now = realNow;
+    rmSync(f.root, { recursive: true, force: true });
+  }
 });
 
 test("recommitting the applied generation clears a stale pending marker", async () => {
@@ -307,7 +393,8 @@ test("recommitting the applied generation clears a stale pending marker", async 
     const first = await push(f);
     writeFileSync(join(f.laptop, "a.txt"), "2\n");
     assert.equal((await push(f, true, first.manifest)).status.pendingGeneration?.reason, "session-running");
-    const status = await f.sync.commit("example", f.sync.begin("example").generation, first.manifest, busy);
+    const retry = await f.sync.begin("example", testWriter);
+    const status = await f.sync.commit("example", retry.generation, first.manifest, busy, testWriter);
     assert.equal(status.lastSyncedManifest, first.manifest.id);
     assert.equal(status.pendingGeneration, undefined, "the newest generation is already applied");
   } finally { rmSync(f.root, { recursive: true, force: true }); }

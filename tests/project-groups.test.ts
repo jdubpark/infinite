@@ -244,6 +244,25 @@ test("get resolves a host project id to its folded group and containing names th
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("membership snapshots hold one board view and a fresh snapshot observes group changes", () => {
+  const f = fixture();
+  try {
+    const service = f.service();
+    const before = service.membershipSnapshot();
+    assert.equal(before.size, f.projects.length, "every enrolled checkout has a snapshot holder");
+    assert.deepEqual(before.get("rehearsal"), { id: "alpha", name: "alpha" });
+    assert.deepEqual(before.get("home-one"), { id: "home-one", name: "Home One" });
+    assert.equal(before.get("unlisted"), undefined);
+
+    const created = service.create({ requestId: randomUUID(), name: "Home workspace", repos: ["home-one"] });
+    assert.deepEqual(before.get("home-one"), { id: "home-one", name: "Home One" }, "an existing snapshot remains stable after a mutation");
+    assert.deepEqual(service.membershipSnapshot().get("home-one"), { id: created.id, name: created.name });
+
+    const renamed = service.update(created.id, { requestId: randomUUID(), revision: created.revision, name: "Home group" });
+    assert.deepEqual(service.membershipSnapshot().get("home-one"), { id: renamed.id, name: renamed.name });
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("suggestions span repository and implicit groups and list all checkouts, never owner groups", () => {
   const f = fixture();
   try {
@@ -551,14 +570,16 @@ test("a retired group id never aliases its replacement, and a prototype-named ch
 test("a scanned identity gives way to the source record once the project follows GitHub, and the group keeps its id", () => {
   const f = fixture();
   try {
-    const before = f.service().list().groups.find(group => group.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === "linear-one")))!;
+    const service = f.service();
+    const before = service.list().groups.find(group => group.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === "linear-one")))!;
     assert.equal(before.repos[0]!.key, "root:aaaa");
     f.config.projects.find(project => project.id === "linear-one")!.source = { mode: "github", repository: "example/linear", baseBranch: "main" };
-    const after = f.service().list().groups.find(group => group.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === "linear-one")))!;
+    assert.deepEqual(service.membershipSnapshot().get("linear-one"), { id: before.id, name: before.name });
+    const after = service.list().groups.find(group => group.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === "linear-one")))!;
     assert.equal(after.id, before.id);
     assert.equal(after.repos[0]!.key, "remote:github.com/example/linear");
     assert.equal(after.repos[0]!.checkouts.find(checkout => checkout.projectId === "linear-one")?.identityFrom, "source");
-    assert.equal(f.service().list().groups.find(group => group.id === before.id)!.repos[0]!.key, "remote:github.com/example/linear", "the refreshed identity persists");
+    assert.equal(service.list().groups.find(group => group.id === before.id)!.repos[0]!.key, "remote:github.com/example/linear", "the refreshed identity persists");
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }

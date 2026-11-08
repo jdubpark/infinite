@@ -160,8 +160,39 @@ export function validateWorkspaceManifest(value: unknown, expectedRoots?: string
   return { ...body, id: value.id };
 }
 
-/** `unsynced` collects shards whose new entries a capture syncs once at its end instead of after every chunk. */
-type Store = { root: string; blobs: string; shards: Set<string>; unsynced?: Set<string> };
+/**
+ * An isolated string target preserves the legacy layout. The object form keeps
+ * `directory` as the authorization scope and stores only immutable chunks in
+ * the explicitly shared pool. Pool objects remain invisible to a scope until
+ * its private reference has been published. Objects are not automatically
+ * reclaimed because this layer cannot determine which existing manifests and
+ * readers still need them.
+ */
+export type WorkspaceStoreTarget = string | { directory: string; sharedPoolDirectory: string };
+
+/** `unsynced` collects object shards whose new entries a capture syncs once at its end. */
+type Store = {
+  root: string;
+  blobs: string;
+  localBlobs: string;
+  sharedRoot?: string;
+  references?: string;
+  shards: Set<string>;
+  referenceShards: Set<string>;
+  unsynced?: Set<string>;
+  requiredReferences?: Set<string>;
+};
+function targetPaths(target: WorkspaceStoreTarget) {
+  if (typeof target === "string") {
+    if (!target || target.includes("\0")) throw new Error("Invalid workspace store target");
+    return { directory: target };
+  }
+  if (!record(target) || typeof target.directory !== "string" || !target.directory || target.directory.includes("\0") ||
+      typeof target.sharedPoolDirectory !== "string" || !target.sharedPoolDirectory || target.sharedPoolDirectory.includes("\0")) {
+    throw new Error("Invalid workspace store target");
+  }
+  return { directory: target.directory, sharedPoolDirectory: target.sharedPoolDirectory };
+}
 async function privateDirectory(path: string) {
   const created = await mkdir(path, { recursive: true, mode: 0o700 });
   const info = await lstat(path);
@@ -176,18 +207,36 @@ async function privateDirectory(path: string) {
     await syncDirectory(dirname(resolve(created)));
   }
 }
-async function storeAt(path: string): Promise<Store> {
+async function privateRoot(path: string) {
   await privateDirectory(path);
-  const root = await realpath(path), blobs = join(root, "blobs");
-  await privateDirectory(blobs);
-  return { root, blobs, shards: new Set() };
+  return realpath(path);
+}
+async function storeAt(target: WorkspaceStoreTarget): Promise<Store> {
+  const paths = targetPaths(target);
+  const futureScope = await futurePath(paths.directory);
+  const futureShared = paths.sharedPoolDirectory ? await futurePath(paths.sharedPoolDirectory) : undefined;
+  if (futureShared && (inside(futureScope, futureShared) || inside(futureShared, futureScope))) {
+    throw new Error("Workspace scope and shared pool must use separate directories");
+  }
+  const root = await privateRoot(paths.directory), localBlobs = join(root, "blobs");
+  await privateDirectory(localBlobs);
+  const sharedRoot = paths.sharedPoolDirectory ? await privateRoot(paths.sharedPoolDirectory) : undefined;
+  const blobs = sharedRoot ? join(sharedRoot, "blobs") : localBlobs;
+  if (sharedRoot) await privateDirectory(blobs);
+  const references = sharedRoot ? join(root, "refs") : undefined;
+  if (references) await privateDirectory(references);
+  return { root, blobs, localBlobs, sharedRoot, references, shards: new Set(), referenceShards: new Set() };
 }
 async function blobPath(store: Store, hash: string) {
   if (!HASH.test(hash)) throw new Error("Invalid workspace blob hash");
   return join(store.blobs, hash.slice(0, 2), hash);
 }
-async function readBlob(store: Store, hash: string): Promise<Buffer> {
-  const file = await blobPath(store, hash);
+async function readBlobAt(blobs: string, hash: string): Promise<Buffer> {
+  if (!HASH.test(hash)) throw new Error("Invalid workspace blob hash");
+  const shard = join(blobs, hash.slice(0, 2));
+  const shardInfo = await lstat(shard);
+  if (!shardInfo.isDirectory() || shardInfo.uid !== process.getuid?.() || (shardInfo.mode & 0o077)) throw new Error("Unsafe workspace blob directory");
+  const file = join(shard, hash);
   const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const info = await handle.stat({ bigint: true });
@@ -206,11 +255,57 @@ async function readBlob(store: Store, hash: string): Promise<Buffer> {
     return data;
   } finally { await handle.close(); }
 }
-async function verifyBlob(store: Store, hash: string) {
-  const file = await blobPath(store, hash), info = await lstat(file, { bigint: true });
+async function verifyBlobAt(blobs: string, hash: string) {
+  if (!HASH.test(hash)) throw new Error("Invalid workspace blob hash");
+  const shard = join(blobs, hash.slice(0, 2)), shardInfo = await lstat(shard);
+  if (!shardInfo.isDirectory() || shardInfo.uid !== process.getuid?.() || (shardInfo.mode & 0o077)) throw new Error("Unsafe workspace blob directory");
+  const file = join(shard, hash), info = await lstat(file, { bigint: true });
   if (!info.isFile() || info.size > BigInt(CHUNK_BYTES) || info.uid !== BigInt(process.getuid!()) || (info.mode & 0o077n) || info.nlink !== 1n) throw new Error("Unsafe workspace blob");
   if (verifiedBlobs.get(file) === stamp(info)) return;
-  await readBlob(store, hash);
+  await readBlobAt(blobs, hash);
+}
+function recoverableBlobError(error: unknown) {
+  return (error as NodeJS.ErrnoException).code === "ENOENT" || (error instanceof Error && error.message === "Corrupt workspace blob");
+}
+async function referencePath(store: Store, hash: string) {
+  if (!HASH.test(hash)) throw new Error("Invalid workspace blob hash");
+  if (!store.references) throw new Error("Workspace store has no shared pool");
+  return join(store.references, hash.slice(0, 2), hash);
+}
+async function verifyReference(store: Store, hash: string) {
+  const file = await referencePath(store, hash), shardInfo = await lstat(dirname(file));
+  if (!shardInfo.isDirectory() || shardInfo.uid !== process.getuid?.() || (shardInfo.mode & 0o077)) throw new Error("Unsafe workspace reference directory");
+  const before = await lstat(file, { bigint: true });
+  if (!before.isFile() || before.size !== 0n || before.uid !== BigInt(process.getuid!()) || (before.mode & 0o077n) || before.nlink !== 1n) {
+    throw new Error("Unsafe workspace reference");
+  }
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== 0n ||
+        opened.uid !== BigInt(process.getuid!()) || (opened.mode & 0o077n) || opened.nlink !== 1n ||
+        stamp(await handle.stat({ bigint: true })) !== stamp(opened)) throw new Error("Unsafe workspace reference");
+  } finally { await handle.close(); }
+}
+async function readBlob(store: Store, hash: string): Promise<Buffer> {
+  try { return await readBlobAt(store.localBlobs, hash); }
+  catch (error) {
+    if (!store.sharedRoot || !recoverableBlobError(error)) throw error;
+  }
+  await verifyReference(store, hash);
+  return readBlobAt(store.blobs, hash);
+}
+async function verifyBlob(store: Store, hash: string) {
+  try { await verifyBlobAt(store.localBlobs, hash); return; }
+  catch (error) {
+    if (!store.sharedRoot || !recoverableBlobError(error)) throw error;
+  }
+  await verifyReference(store, hash);
+  await verifyBlobAt(store.blobs, hash);
+  if (store.requiredReferences) {
+    store.requiredReferences.add(hash);
+    store.unsynced?.add(join(store.blobs, hash.slice(0, 2)));
+  }
 }
 /** Write back every dirty buffer of the filesystem holding `path`: syncfs on Linux, a full sync elsewhere. */
 async function flushFilesystem(path: string) {
@@ -220,11 +315,35 @@ async function flushFilesystem(path: string) {
   await execute("sync", [], { timeout: 600000 });
 }
 async function syncDirectory(path: string) { const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY); try { await handle.sync(); } finally { await handle.close(); } }
+/** Sync every directory entry from a storage root to `/`; recursive mkdir may have raced with this writer. */
+async function syncDirectoryChain(path: string) {
+  let current = resolve(path);
+  for (;;) {
+    await syncDirectory(current);
+    const parent = dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
+async function syncSharedPoolHierarchy(store: Store, hashes: Iterable<string>) {
+  if (!store.sharedRoot) return;
+  const shards = new Set([...hashes].map(hash => join(store.blobs, hash.slice(0, 2))));
+  await Promise.all([...shards].map(syncDirectory));
+  // The pool root and its ancestors may have been created by a different writer
+  // that observed this path before its parent directory sync completed.
+  await syncDirectory(store.blobs);
+  await syncDirectoryChain(store.sharedRoot);
+}
 async function writeBlob(store: Store, hash: string, bytes: Buffer) {
   if (bytes.length > CHUNK_BYTES || !HASH.test(hash) || sha(bytes) !== hash) throw new Error("Invalid workspace blob content");
   const file = await blobPath(store, hash), shard = dirname(file);
   if (!store.shards.has(shard)) { await privateDirectory(shard); store.shards.add(shard); }
-  try { await verifyBlob(store, hash); return; } catch (error) {
+  try {
+    await verifyBlobAt(store.blobs, hash);
+    if (store.unsynced) store.unsynced.add(shard);
+    else if (!store.sharedRoot) await syncDirectory(shard);
+    return;
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof Error && error.message === "Corrupt workspace blob")) throw error;
   }
   const temporary = join(shard, `.${hash}-${randomUUID()}`);
@@ -232,17 +351,48 @@ async function writeBlob(store: Store, hash: string, bytes: Buffer) {
   try {
     try { await handle.writeFile(bytes); await handle.sync(); }
     finally { await handle.close(); }
-    // Shard creation already made the shard's own entry durable; only the new name needs a directory sync.
+    // Shared stores flush the full directory hierarchy when publishing references.
     await rename(temporary, file);
-    if (store.unsynced) store.unsynced.add(shard); else await syncDirectory(shard);
+    if (store.unsynced) store.unsynced.add(shard);
+    else if (!store.sharedRoot) await syncDirectory(shard);
     rememberBlob(file, stamp(await lstat(file, { bigint: true })));
   } finally { await rm(temporary, { force: true }); }
 }
-export async function putWorkspaceBlob(storeDir: string, hash: string, base64: string): Promise<void> {
+async function createReference(store: Store, hash: string) {
+  if (!store.references) return undefined;
+  const file = await referencePath(store, hash), shard = dirname(file);
+  if (!store.referenceShards.has(shard)) { await privateDirectory(shard); store.referenceShards.add(shard); }
+  try {
+    const handle = await open(file, "wx", 0o600);
+    try { await handle.sync(); } finally { await handle.close(); }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    await verifyReference(store, hash);
+  }
+  return shard;
+}
+async function publishReferences(store: Store, hashes: Iterable<string>, progress?: () => void) {
+  if (!store.references) return;
+  const unique = new Set(hashes);
+  if (!unique.size) return;
+  await syncSharedPoolHierarchy(store, unique);
+  const shards = new Set<string>();
+  for (const hash of unique) {
+    progress?.();
+    const shard = await createReference(store, hash);
+    if (shard) shards.add(shard);
+  }
+  await Promise.all([...shards].map(syncDirectory));
+  await syncDirectory(store.references);
+  await syncDirectoryChain(store.root);
+}
+export async function putWorkspaceBlob(storeDir: WorkspaceStoreTarget, hash: string, base64: string): Promise<void> {
   if (typeof base64 !== "string" || base64.length > Math.ceil(CHUNK_BYTES / 3) * 4) throw new Error("Workspace blob exceeds the chunk bound");
   const data = Buffer.from(base64, "base64");
   if (data.toString("base64") !== base64 || data.length > CHUNK_BYTES) throw new Error("Invalid workspace blob encoding");
-  await writeBlob(await storeAt(storeDir), hash, data);
+  const store = await storeAt(storeDir);
+  await writeBlob(store, hash, data);
+  await publishReferences(store, [hash]);
 }
 /** Frame chunks for one transfer; each is its digest, its length, and its bytes. */
 export function encodeChunkBatch(chunks: { hash: string; bytes: Buffer }[]): Buffer {
@@ -271,7 +421,7 @@ export function decodeChunkBatch(body: Buffer): { hash: string; bytes: Buffer }[
   return chunks;
 }
 /** Store a batch and sync each touched shard once; every chunk is durable when this resolves. */
-export async function putWorkspaceBlobs(storeDir: string, chunks: { hash: string; bytes: Buffer }[]): Promise<void> {
+export async function putWorkspaceBlobs(storeDir: WorkspaceStoreTarget, chunks: { hash: string; bytes: Buffer }[]): Promise<void> {
   if (chunks.length > BATCH_CHUNKS) throw new Error("Workspace chunk batch exceeds its bound");
   const store: Store = { ...await storeAt(storeDir), unsynced: new Set() };
   for (let offset = 0; offset < chunks.length; offset += 16) {
@@ -280,13 +430,15 @@ export async function putWorkspaceBlobs(storeDir: string, chunks: { hash: string
     const failed = results.find(result => result.status === "rejected");
     if (failed) throw failed.reason;
   }
-  // A chunk already present may come from an earlier request that failed before its sync, and a
-  // concurrent request may have just created a shard, so sync every touched shard and the shard parent.
-  await Promise.all([...new Set(chunks.map(({ hash }) => join(store.blobs, hash.slice(0, 2))))].map(syncDirectory));
-  await syncDirectory(store.blobs);
+  if (store.references) await publishReferences(store, chunks.map(({ hash }) => hash));
+  else {
+    // A chunk may predate this request or come from a concurrent writer; sync the touched names.
+    await Promise.all([...new Set(chunks.map(({ hash }) => join(store.blobs, hash.slice(0, 2))))].map(syncDirectory));
+    await syncDirectory(store.blobs);
+  }
 }
-export async function readWorkspaceBlob(storeDir: string, hash: string): Promise<string> { return (await readBlob(await storeAt(storeDir), hash)).toString("base64"); }
-export async function hasWorkspaceBlobs(storeDir: string, hashes: string[]): Promise<string[]> {
+export async function readWorkspaceBlob(storeDir: WorkspaceStoreTarget, hash: string): Promise<string> { return (await readBlob(await storeAt(storeDir), hash)).toString("base64"); }
+export async function hasWorkspaceBlobs(storeDir: WorkspaceStoreTarget, hashes: string[]): Promise<string[]> {
   if (!Array.isArray(hashes) || hashes.length > MAX_ENTRIES || hashes.some(hash => typeof hash !== "string" || !HASH.test(hash))) throw new Error("Invalid workspace blob request");
   const store = await storeAt(storeDir), missing: string[] = [];
   for (const hash of new Set(hashes)) {
@@ -315,7 +467,7 @@ async function openDirectory(path: string) { return open(path, constants.O_RDONL
  * writable mappings may escape change notifications and metadata comparisons.
  */
 export async function captureWorkspace(options: {
-  roots: string[]; cwd: string; storeDir: string; signal?: AbortSignal;
+  roots: string[]; cwd: string; storeDir: WorkspaceStoreTarget; signal?: AbortSignal;
   previous?: WorkspaceManifest; forceFull?: boolean;
   /** Called at most every 100 ms while entries are walked and chunks written, so a caller can tell a long capture from a stalled one. */
   onProgress?: () => void;
@@ -326,11 +478,15 @@ export async function captureWorkspace(options: {
   if (!options.roots.length || options.roots.length > 64) throw new Error("Invalid workspace roots");
   const roots = await Promise.all(options.roots.map(root => realpath(root))), cwd = await realpath(options.cwd);
   if (new Set(roots).size !== roots.length) throw new Error("Duplicate workspace roots");
-  const canonicalStore = await futurePath(options.storeDir);
-  if (roots.some(root => inside(root, canonicalStore))) throw new Error("Workspace storage must be outside all selected roots");
+  const storePaths = targetPaths(options.storeDir);
+  const storagePaths = await Promise.all([
+    futurePath(storePaths.directory),
+    ...(storePaths.sharedPoolDirectory ? [futurePath(storePaths.sharedPoolDirectory)] : []),
+  ]);
+  if (roots.some(root => storagePaths.some(path => inside(root, path)))) throw new Error("Workspace storage must be outside all selected roots");
   const cwdRoot = roots.map((root, index) => ({ root, index })).filter(item => inside(item.root, cwd)).sort((a, b) => b.root.length - a.root.length)[0];
   if (!cwdRoot) throw new Error("Workspace cwd is outside the selected roots");
-  const store: Store = { ...await storeAt(options.storeDir), unsynced: new Set() }, handles: FileHandle[] = [];
+  const handles: FileHandle[] = [];
   let reported = Date.now();
   const tick = () => {
     if (!options.onProgress || Date.now() - reported < 100) return;
@@ -350,12 +506,15 @@ export async function captureWorkspace(options: {
       const info = await lstat(join(root, ".git"), { bigint: true });
       if (!info.isFile()) continue;
       const [selected, common] = await gitLocation(root);
-      if ([selected, common].some(path => inside(path, canonicalStore))) throw new Error("Workspace storage must be outside Git metadata");
+      if ([selected, common].some(path => storagePaths.some(storage => inside(path, storage) || inside(storage, path)))) {
+        throw new Error("Workspace storage must be outside Git metadata");
+      }
       gitProjections.set(join(root, ".git"), { common, selected, pointerStamp: stamp(info) });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
+  const store: Store = { ...await storeAt(options.storeDir), unsynced: new Set(), requiredReferences: new Set() };
   let watch: WorkspaceWatch | undefined;
   const entries: WorkspaceEntry[] = [], observed = new Map<string, string>(), written = new Set<string>();
   const virtualDirectories = new Set<string>();
@@ -537,9 +696,11 @@ export async function captureWorkspace(options: {
       version: 1, capturedAt: new Date().toISOString(), captureStartedAt,
       cwd: { root: cwdRoot.index, path: posix.relative(cwdRoot.root, cwd) }, roots, entries,
     };
-    // Every chunk a returned manifest names has a durable directory entry.
-    for (const shard of store.unsynced!) { await syncDirectory(shard); tick(); }
+    // Pool objects and their ancestor entries reach disk before scope references.
+    if (store.references) await publishReferences(store, [...written, ...store.requiredReferences!], () => { abort(options.signal); tick(); });
+    else for (const shard of store.unsynced!) { await syncDirectory(shard); tick(); }
     store.unsynced!.clear();
+    abort(options.signal);
     return validateWorkspaceManifest({ ...body, id: manifestId(body) });
   } catch (error) {
     if (["ENOENT", "ENOTDIR", "ELOOP", "ESTALE"].includes((error as NodeJS.ErrnoException).code ?? "")) changed();
@@ -594,7 +755,7 @@ export async function describeMaterializedTree(manifest: WorkspaceManifest, at: 
  * removes the old ready generation. The caller owns that provenance and fence.
  */
 export async function materializeWorkspace(options: {
-  manifest: WorkspaceManifest; storeDir: string; destination: string; sharedGroup?: boolean;
+  manifest: WorkspaceManifest; storeDir: WorkspaceStoreTarget; destination: string; sharedGroup?: boolean;
   previous?: { manifest: WorkspaceManifest; roots: string[] };
   /** `each` (default) syncs every written file and directory; `once` flushes the filesystem once before publication. */
   flush?: "each" | "once";
@@ -647,7 +808,9 @@ export async function materializeWorkspace(options: {
     }
   }
   const destination = await futurePath(options.destination), parent = dirname(destination);
-  if (inside(destination, store.root) || inside(store.root, destination)) throw new Error("Workspace destination must be separate from content storage");
+  if ([store.root, store.sharedRoot].some(path => path && (inside(destination, path) || inside(path, destination)))) {
+    throw new Error("Workspace destination must be separate from content storage");
+  }
   try { await lstat(destination); throw new Error("Workspace destination already exists"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   await mkdir(parent, { recursive: true, mode: 0o700 });

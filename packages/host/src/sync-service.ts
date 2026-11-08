@@ -5,16 +5,19 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { captureWorkspace, type WorkspaceManifest } from "./workspace-checkpoint.js";
+import { captureWorkspace, type WorkspaceManifest, type WorkspaceStoreTarget } from "./workspace-checkpoint.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
 import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
 
 export interface SyncServiceOptions {
   origin: string; token: string; projectId: string; root: string; stateFile: string; storeDir: string;
+  sharedPoolDirectory?: string;
+  /** Stable identity for this laptop daemon, independent of its paired device key. */
+  publisherId?: string;
   /** Startup inactivity bound in milliseconds; defaults to 60 s. */
   startupInactivityMs?: number;
 }
-export interface SyncState { pid: number; projectId: string; root: string; origin: string; startedAt: string; lastCommitAt?: string; lastManifest?: string; problem?: string; skipped?: number }
+export interface SyncState { pid: number; projectId: string; root: string; origin: string; startedAt: string; publisherId?: string; lastCommitAt?: string; lastManifest?: string; problem?: string; skipped?: number }
 /** Special files the first capture left out: how many, and up to 20 of their root-relative paths. */
 export interface SyncStart { skipped: { count: number; paths: string[] } }
 
@@ -24,6 +27,7 @@ const STARTUP_TIMEOUT = 60000;
 const COMMIT_TIMEOUT = 30 * 60 * 1000;
 const STARTUP_ERROR = "The workspace sync service did not complete its first upload. Nothing was applied on the host.";
 const STALLED = "Run infinite sync again to resume; chunks already uploaded are kept.";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const inside = (root: string, path: string) => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
 const printable = (text: string) => text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 300);
 /**
@@ -56,11 +60,16 @@ function validateOptions(options: SyncServiceOptions): SyncServiceOptions {
       !/^[a-z0-9-]{1,80}$/.test(options.projectId) || !/^[\x21-\x7e]{32,200}$/.test(options.token) ||
       (options.startupInactivityMs !== undefined && (!Number.isInteger(options.startupInactivityMs) || options.startupInactivityMs < 100 || options.startupInactivityMs > STARTUP_TIMEOUT)))
     throw new Error("Invalid sync pairing.");
+  if (options.publisherId !== undefined && !UUID.test(options.publisherId)) throw new Error("Invalid sync publisher identity.");
   const root = realpathSync(options.root);
   if (!statSync(root).isDirectory() || root === sep || root === realpathSync(homedir())) throw new Error("Select a project directory, not the entire home or filesystem.");
   const storeDir = canonical(options.storeDir), stateFile = canonical(options.stateFile);
-  if (inside(root, storeDir) || inside(root, stateFile)) throw new Error("Sync storage must be outside the synced project.");
-  return { ...options, origin: origin.origin, root, storeDir, stateFile };
+  if (options.sharedPoolDirectory !== undefined && (typeof options.sharedPoolDirectory !== "string" || !options.sharedPoolDirectory))
+    throw new Error("Invalid shared workspace storage.");
+  const sharedPoolDirectory = options.sharedPoolDirectory === undefined ? undefined : canonical(options.sharedPoolDirectory);
+  if ([storeDir, stateFile, ...(sharedPoolDirectory ? [sharedPoolDirectory] : [])].some(path => inside(root, path)))
+    throw new Error("Sync storage must be outside the synced project.");
+  return { ...options, origin: origin.origin, root, storeDir, stateFile, sharedPoolDirectory };
 }
 
 /** The recorded service still runs; a record left by a killed service or a reboot does not. */
@@ -68,6 +77,21 @@ export const syncServiceRunning = (state: SyncState) => runningService(state.pid
 export function readSyncState(stateFile: string): SyncState | undefined {
   try { return JSON.parse(readFileSync(stateFile, "utf8")) as SyncState; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+}
+function publisherFile(stateFile: string) { return `${stateFile}.publisher`; }
+function readPublisherId(stateFile: string, previous?: SyncState) {
+  try {
+    const saved = readFileSync(publisherFile(stateFile), "utf8").trim();
+    if (UUID.test(saved)) return saved;
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  return previous?.publisherId && UUID.test(previous.publisherId) ? previous.publisherId : undefined;
+}
+function writePublisherId(stateFile: string, publisherId: string) {
+  const file = publisherFile(stateFile);
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, `${publisherId}\n`, { mode: 0o600, flag: "wx" });
+  renameSync(temporary, file);
 }
 function writeState(stateFile: string, state: SyncState) {
   mkdirSync(dirname(stateFile), { recursive: true, mode: 0o700 });
@@ -96,6 +120,10 @@ export async function startSyncService(options: SyncServiceOptions): Promise<Syn
     if (runningService(existing.pid)) throw new Error("A sync service already runs for this project. Stop it first.");
     rmSync(validated.stateFile, { force: true });
   }
+  const existingPublisher = readPublisherId(validated.stateFile, existing);
+  const publisherId = existingPublisher ?? randomUUID();
+  if (!existingPublisher) writePublisherId(validated.stateFile, publisherId);
+  const serviceOptions = { ...validated, publisherId };
   const file = fileURLToPath(import.meta.url);
   const child = spawn(process.execPath, [...(file.endsWith(".ts") ? ["--import", import.meta.resolve("tsx")] : []), file, "--sync-service"], {
     cwd: validated.root, detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -131,7 +159,7 @@ export async function startSyncService(options: SyncServiceOptions): Promise<Syn
       if (type === "failed") { fail(typeof reason === "string" ? printable(reason) : undefined); return; }
       if (type === "boot" && !started) {
         started = true;
-        try { child.send({ type: "start", options: validated }, error => { if (error) fail(); }); } catch { fail(); }
+        try { child.send({ type: "start", options: serviceOptions }, error => { if (error) fail(); }); } catch { fail(); }
         return;
       }
       if (type === "detached" && ready && !detached) { detached = true; return; }
@@ -168,10 +196,16 @@ async function refusal(response: Response): Promise<never> {
   if ([401, 403, 404, 413].includes(response.status)) throw new FatalSyncError(`Host refused sync (${response.status}): ${reason}`);
   throw new SyncRequestError(reason, response.status, typeof reply.code === "string" ? reply.code : undefined, typeof reply.category === "string" ? reply.category : undefined);
 }
-async function api<T>(options: SyncServiceOptions, path: string, signal: AbortSignal, body: unknown, raw?: Buffer, timeout = 60000): Promise<T> {
+async function api<T>(options: SyncServiceOptions, path: string, signal: AbortSignal, body: unknown, raw?: Buffer, timeout = 60000, generation?: string): Promise<T> {
+  const headers = {
+    Authorization: `Bearer ${options.token}`,
+    "Content-Type": raw ? "application/octet-stream" : "application/json",
+    ...(options.publisherId ? { "X-Infinite-Sync-Publisher": options.publisherId } : {}),
+    ...(generation ? { "X-Infinite-Sync-Generation": generation } : {}),
+  };
   const response = await fetch(`${options.origin}/api/projects/${options.projectId}/sync/${path}`, {
     method: raw ? "PUT" : "POST", redirect: "error", signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
-    headers: { Authorization: `Bearer ${options.token}`, "Content-Type": raw ? "application/octet-stream" : "application/json" },
+    headers,
     body: raw ? new Uint8Array(raw) : JSON.stringify(body),
   });
   if (!response.ok) await refusal(response);
@@ -227,7 +261,9 @@ async function runSyncService(): Promise<void> {
       else try { process.send?.({ type: "boot" }, error => { if (error) failed(); }); } catch { failed(); }
     });
     if (config.startupInactivityMs) { inactivity = config.startupInactivityMs; clearTimeout(startup); startup = setTimeout(stop, inactivity); }
-    const state: SyncState = { pid: process.pid, projectId: config.projectId, root: config.root, origin: config.origin, startedAt: new Date().toISOString() };
+    const storeDir: WorkspaceStoreTarget = config.sharedPoolDirectory
+      ? { directory: config.storeDir, sharedPoolDirectory: config.sharedPoolDirectory } : config.storeDir;
+    const state: SyncState = { pid: process.pid, projectId: config.projectId, root: config.root, origin: config.origin, startedAt: new Date().toISOString(), publisherId: config.publisherId };
     writeState(config.stateFile, state);
     // After a stop removed the file, a late write must not bring it back.
     const record = () => { if (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) writeState(config.stateFile, state); };
@@ -253,7 +289,7 @@ async function runSyncService(): Promise<void> {
           lastCaptureStartedAt = Date.now();
           const forceFull = Date.now() - lastFull > 60000;
           const left: string[] = [];
-          const manifest = await captureWorkspace({ roots: [config.root], cwd: config.root, storeDir: config.storeDir, signal: abort.signal, previous, forceFull, onProgress: progress, onSkipped: path => left.push(path) });
+          const manifest = await captureWorkspace({ roots: [config.root], cwd: config.root, storeDir, signal: abort.signal, previous, forceFull, onProgress: progress, onSkipped: path => left.push(path) });
           previous = manifest;
           if (left.length !== skipped.length) { if (left.length) state.skipped = left.length; else delete state.skipped; record(); }
           skipped = left;
@@ -266,18 +302,18 @@ async function runSyncService(): Promise<void> {
             // A batch request reports nothing until the host has stored it; a heartbeat keeps startup alive meanwhile.
             const uploading = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
             try {
-              await uploadMissingChunks({ storeDir: config.storeDir, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), signal: abort.signal, progress, transport: {
-                has: async (hashes, signal) => (await api<{ missing: unknown }>(config, "has", signal, { hashes })).missing,
+              await uploadMissingChunks({ storeDir, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), signal: abort.signal, progress, transport: {
+                has: async (hashes, signal) => (await api<{ missing: unknown }>(config, "has", signal, { hashes }, undefined, 60000, generation)).missing,
                 putBatch: async (body, signal) => {
-                  try { await api(config, "blobs", signal, undefined, body, BATCH_TIMEOUT); }
+                  try { await api(config, "blobs", signal, undefined, body, BATCH_TIMEOUT, generation); }
                   catch (error) { if (error instanceof MissingRouteError) return "unsupported"; throw error; }
                 },
-                put: async (hash, bytes, signal) => { await api(config, `blob/${hash}`, signal, undefined, bytes); },
+                put: async (hash, bytes, signal) => { await api(config, `blob/${hash}`, signal, undefined, bytes, 60000, generation); },
               } });
             } finally { clearInterval(uploading); }
             // The host applies inside this request and reports nothing until it finishes; a heartbeat keeps startup alive meanwhile.
             const heartbeat = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
-            try { await api(config, "commit", abort.signal, { generation, manifest }, undefined, COMMIT_TIMEOUT); }
+            try { await api(config, "commit", abort.signal, { generation, manifest }, undefined, COMMIT_TIMEOUT, generation); }
             finally { clearInterval(heartbeat); }
             committed = content; pushFailures = 0;
             state.lastCommitAt = new Date().toISOString(); state.lastManifest = manifest.id; delete state.problem;

@@ -7,7 +7,8 @@ import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync,
 import { join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { demoProfile, startHost, waitFor } from "./helpers.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { demoProfile, inProcessHost, startHost, waitFor } from "./helpers.js";
 import { readSyncState, stopSyncService } from "../packages/host/src/sync-service.js";
 import { compareLaptop, describeSource } from "../packages/host/src/client.js";
 import type { ProjectSourceStatus } from "../packages/host/src/project-source.js";
@@ -248,6 +249,34 @@ test("infinite sync, projects, and pull round-trip a checkout through the host",
     if (existsSync(stateFile)) stopSyncService(stateFile);
     await host.stop(); rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("pull overlaps cloud blob downloads and materializes the complete checkpoint", { timeout: 60000 }, async () => {
+  const host = await inProcessHost();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-pull-transfer-")));
+  const tokenFile = join(root, "owner.key"), clientFile = join(root, "client.json");
+  const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/cli.ts"), "--client-config", clientFile];
+  const chunkBytes = 256 * 1024;
+  const contents = Buffer.concat(Array.from({ length: 8 }, (_, index) => Buffer.alloc(chunkBytes, index + 1)));
+  let active = 0, maxActive = 0;
+  const readBlob = host.projectSync.readBlob.bind(host.projectSync);
+  host.projectSync.readBlob = async (projectId, hash) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    try { await delay(30); return await readBlob(projectId, hash); }
+    finally { active -= 1; }
+  };
+  try {
+    writeFileSync(join(host.config.projects[0]!.path, "chunks.bin"), contents);
+    await host.projectSync.exportTree("rehearsal");
+    writeFileSync(tokenFile, host.tokens.owner, { mode: 0o600 });
+    await exec(process.execPath, [...cli, "pair", host.origin, "--token-file", tokenFile]);
+    const output = join(root, "pulled");
+    const pulled = await exec(process.execPath, [...cli, "pull", "rehearsal", "--output", output], { timeout: 60000 });
+    assert.equal(readFileSync(join(pulled.stdout.trim(), "chunks.bin")).compare(contents), 0, "all downloaded chunks produce the original file");
+    assert.ok(maxActive > 1, "the client keeps multiple blob requests in flight");
+    assert.ok(maxActive <= 4, "pull leaves executor control headroom");
+  } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test("a cloud launch reports laptop changes that wait for an apply, then starts on the tree in place", { timeout: 120000 }, async () => {

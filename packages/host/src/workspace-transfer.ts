@@ -50,14 +50,13 @@ export async function transferWorkspaceBlobs(
   };
   const cancel = () => stop(signal?.reason);
   signal?.addEventListener("abort", cancel, { once: true });
-  const pool = createWorkspaceTransferPool();
   let next = 0;
   const worker = async () => {
     while (!stopped) {
       if (signal?.aborted) { cancel(); return; }
       const index = next++;
       if (index >= hashes.length) return;
-      try { await pool.run(() => transfer(hashes[index]!, controller.signal)); }
+      try { await transfer(hashes[index]!, controller.signal); }
       catch (error) {
         if (!stopped) { failed = true; failure = error; stop(error); }
         return;
@@ -67,7 +66,6 @@ export async function transferWorkspaceBlobs(
 
   try {
     await Promise.all(Array.from({ length: Math.min(WORKSPACE_TRANSFER_CONCURRENCY, hashes.length) }, worker));
-    await pool.drain();
   } finally { signal?.removeEventListener("abort", cancel); }
   if (signal?.aborted) signal.throwIfAborted();
   if (failed) throw failure;

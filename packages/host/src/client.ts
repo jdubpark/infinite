@@ -882,18 +882,21 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
       const selected = await selectSession(sessions, positional[0], true);
       progress.start("Downloading a cloud checkpoint for reconciliation");
-      const call = async (method: string, extra: Record<string, unknown> = {}) =>
-        (await api.request(`/sessions/${selected.id}/workspace-export`, { method, ...extra }, AbortSignal.timeout(300000))).json();
+      const call = async (method: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) =>
+        (await api.request(`/sessions/${selected.id}/workspace-export`, { method, ...extra },
+          signal ? AbortSignal.any([signal, AbortSignal.timeout(300000)]) : AbortSignal.timeout(300000))).json();
       const exported = await call("sync/export");
       const manifest = validateWorkspaceManifest(exported.manifest);
       const directory = join(dirname(path), "workspaces", selected.id);
       const storeDir = { directory: join(directory, "objects"), sharedPoolDirectory: join(dirname(path), "workspace-pool") };
       const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
       for (let offset = 0; offset < hashes.length; offset += 512) {
-        for (const hash of await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512))) {
-          const { base64 } = await call("sync/blob", { hash });
+        const missing = await hasWorkspaceBlobs(storeDir, hashes.slice(offset, offset + 512));
+        await transferWorkspaceBlobs(missing, async (hash, signal) => {
+          const { base64 } = await call("sync/blob", { hash }, signal);
+          signal.throwIfAborted();
           await putWorkspaceBlob(storeDir, hash, base64);
-        }
+        });
       }
       const destination = resolve(String(options["--output"] ?? join(directory, "recovered", manifest.id)));
       const recovered = await materializeWorkspace({ manifest, storeDir, destination });

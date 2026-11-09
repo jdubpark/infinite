@@ -72,6 +72,7 @@ const turnActivity = new Set(["turn-start", "tool-start", "tool-end", "prompt-op
 const messageLimit = 30;
 const timeLimitReason = "The approved time limit has expired. Active subteams were cancelled; their workspaces remain available.";
 const messageTooLargeReason = "The next coordinator message cannot fit with the mission state. Its evidence remains queued; no empty coordinator attempt was started.";
+const messageCannotFitReason = "The next coordinator message cannot fit with the mission state, even shortened. No empty coordinator attempt was started; start a new mission with a consolidated objective.";
 const subtaskStatus = (status: TeamView["status"]) => teamDone.has(status) ? "done" as const : status === "blocked" ? "blocked" as const : status === "cancelled" ? "cancelled" as const : "running" as const;
 const notFound = (error: unknown) => error instanceof TeamError && error.code === "team-not-found";
 
@@ -770,21 +771,20 @@ export class MissionService {
     const build = (list: MissionMessage[], promptContext: typeof context) => continuation?.mode === "resume"
       ? missionFollowUpPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext)
       : missionPromptWithMessageCount(mission, stored.repos, list, revision, profile.provider, profile, promptContext);
-    let built = build(messages, context);
-    if (!built.includedMessageCount && inbox[0]?.type === "permission-recovery") {
-      // Keep the durable outcome in the team record. A large objective must not
-      // repeatedly spend coordinator attempts without delivering the leading message.
-      const first = inbox[0];
-      const compact: MissionMessage = { ...first, cause: "See the subteam permissionRecovery outcome.",
-        action: "", decision: "", consequence: "" };
-      built = build([compact], { ...context, waiting: stored.inbox.length + stored.notes.length - 1 });
+    let built: ReturnType<typeof missionPromptWithMessageCount>;
+    try { built = build(messages, context); }
+    catch (error) {
+      if (!(error instanceof TeamError) || error.code !== "mission-prompt-too-large") throw error;
+      built = { prompt: "", includedMessageCount: 0, shortened: false };
     }
     if (!built.includedMessageCount) {
-      if (mission.reason !== messageTooLargeReason) this.event(stored, messageTooLargeReason);
-      mission.reason = messageTooLargeReason;
+      this.stop(stored, "blocked", messageCannotFitReason);
+      this.event(stored, messageCannotFitReason);
+      this.save(stored);
       return;
     }
     if (mission.reason === messageTooLargeReason) mission.reason = undefined;
+    if (built.shortened) this.event(stored, "The host shortened the next coordinator message to fit the prompt budget; its full record stays with its source.");
     const fromInbox = Math.min(built.includedMessageCount, inbox.length), fromNotes = built.includedMessageCount - fromInbox;
     const attempt: Attempt = { memberId: randomUUID(), sessionId: randomUUID(), revision, cursor: 0, stopRequestId: randomUUID(), status: "queued", ownerInputs: stored.ownerInputs ?? 0,
       prompt: built.prompt, ...(continuation ? { continuation } : {}), consumedInbox: inbox.slice(0, fromInbox), consumedNotes: notes.slice(0, fromNotes) };

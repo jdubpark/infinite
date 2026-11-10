@@ -5,6 +5,8 @@ dist/
 .env
 credentials.txt
 *.tsbuildinfo
+__pycache__/
+*.py[cod]
 android/
 ios/
 .terraform/

@@ -20,6 +20,7 @@ import type { LinearService } from "./linear.js";
 import type { Readings } from "./readings.js";
 import { mirrorRemoteUrl } from "./project-source.js";
 import type { ProjectSourceService } from "./project-source.js";
+import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, memberChangedPaths, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveredWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, teamCommand, teamHead, teamPathAllowed, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption, permissionAuthorityHash, permissionEvidenceHash, permissionReuseKey, refusedBeforeSend } from "./team-permissions.js";
@@ -36,6 +37,7 @@ type MissionReservationLookup = (projectId: string, exceptMissionId?: string) =>
 type DeliveryReconciliationReport = Extract<TeamReport, { kind: "delivery-reconciliation" }>;
 type TeamServiceOptions = {
   source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">;
+  graphs?: Pick<RepositoryGraphs, "refresh">;
   onMerged?: (projectId: string) => void;
   ownerActive?: (run: TeamRun) => boolean;
   now?: () => number;
@@ -44,6 +46,7 @@ type TeamServiceOptions = {
 type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string> };
 /** How long a failed workspace removal waits before the scheduler tries it again. */
 const REMOVAL_RETRY_MS = 5 * 60_000;
+const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
 function deliveryInspectionHash(report: DeliveryReconciliationReport) {
   return digest({ headCommit: report.headCommit, repository: report.repository, branch: report.branch,
     baseHeadCommit: report.baseHeadCommit, disposition: report.disposition, remoteHeadCommit: report.remoteHeadCommit });
@@ -1634,6 +1637,9 @@ export class TeamService {
     await this.serial;
   }
   private stallWindow() { return (this.config.teams?.stallMinutes ?? 30) * 60000; }
+  private stallWindowFor(member: TeamMember) {
+    return member.role === "reviewer" ? Math.min(this.stallWindow(), REVIEW_QUIET_WINDOW_MS) : this.stallWindow();
+  }
   /**
    * Extends a deadline only under the owner's recorded policy, and only while an active member of this
    * revision showed activity within the stall window. The extension never passes the policy's ceiling.
@@ -2388,7 +2394,7 @@ export class TeamService {
             }
             // A member back from an outage may come back straight into a prompt; it is running again.
             if (state.status === "running" && member.status === "unavailable" && member.role !== "permission-coordinator") member.status = "running";
-            if (state.attention.state === "needs-you" && await this.maybeStartPermissionReview(stored, member)) return;
+            if (await this.maybeStartPermissionReview(stored, member, state)) return;
             if (["unavailable", "recording-error"].includes(state.status)) { member.status = "unavailable"; run.reason = runtimeUnavailableReason; }
             // A prompt that waits on a person outranks one the coordinator is still reviewing.
             else if (state.attention.state === "needs-you")
@@ -2399,7 +2405,7 @@ export class TeamService {
               permissionCoordinatorDecision(run, member)?.status === "reviewing") member.status = "running";
             this.save(stored);
             if (state.status === "running" && journalDrained && member.role !== "permission-coordinator" &&
-                (member.stalledAt || state.attention.state !== "needs-you" && !member.pendingLimit && quietFor(member) > this.stallWindow())) {
+                (member.stalledAt || state.attention.state !== "needs-you" && !member.pendingLimit && quietFor(member) > this.stallWindowFor(member))) {
               await this.replaceStalledMember(stored, member);
               if (stored.pending || run.status === "blocked") return;
             }
@@ -2524,7 +2530,15 @@ export class TeamService {
     return Boolean(request.expansion && isCollapsedPermissionPrompt(prompt) && prompt.id === request.expansion.promptId &&
       prompt.hash === request.expansion.promptHash && permissionEvidenceHash(prompt) === request.evidenceHash);
   }
-  private deferExpandedPermissionRead(stored: Stored, request: TeamPermissionRecoveryRequest, reason: string) {
+  private deferExpandedPermissionRead(stored: Stored, request: TeamPermissionRecoveryRequest, reason: string, humanHeld = false) {
+    if (humanHeld) {
+      const cause = "A human control lease became active after display expansion; the request remains with its owner.";
+      this.finishPermissionRecovery(stored, request, "interrupted", cause, "re-read-after-expansion", "owner-control-took-over",
+        "The target was left untouched; no permission answer was sent.");
+      this.event(stored, cause);
+      this.save(stored);
+      return true;
+    }
     const expansion = request.expansion!;
     expansion.rereads = (expansion.rereads ?? 0) + 1;
     if (expansion.rereads < 3) {
@@ -2602,13 +2616,15 @@ export class TeamService {
     return undefined;
   }
   private async inspectPermissionRecoveryPrompt(stored: Stored, request: TeamPermissionRecoveryRequest, target: TeamMember, allowPromptRefresh = false):
-    Promise<{ state: Awaited<ReturnType<Manager["state"]>>; prompt: Prompt } | { reason: string }> {
+    Promise<{ state: Awaited<ReturnType<Manager["state"]>>; prompt: Prompt } | { reason: string; humanHeld?: boolean }> {
     const invalid = this.permissionRecoveryPromptInvalidReason(stored, request, target);
     if (invalid) return { reason: invalid } as const;
     try {
       const state = await this.manager.state(target.sessionId, true);
-      if (state.status !== "running" || state.attention.state !== "needs-you" || state.control && state.control.expiresAt > Date.now())
-        return { reason: "The target is unavailable, no longer waiting on this request, or a human control lease is active." } as const;
+      if (state.control && state.control.expiresAt > Date.now())
+        return { reason: "The target has an active human control lease.", humanHeld: true } as const;
+      if (state.status !== "running" || state.attention.state !== "needs-you")
+        return { reason: "The target is unavailable or no longer waiting on this request." } as const;
       const prompt = state.attention.prompt;
       if (!prompt || !allowPromptRefresh && prompt.id !== request.promptId || !prompt.hash ||
           !allowPromptRefresh && (prompt.hash !== request.promptHash || permissionEvidenceHash(prompt) !== request.evidenceHash))
@@ -2691,7 +2707,7 @@ export class TeamService {
     if (run.permissionRecovery.requests.length > permissionRecoveryOutcomeLimit) run.permissionRecovery.requests.splice(0, run.permissionRecovery.requests.length - permissionRecoveryOutcomeLimit);
     return request;
   }
-  private async maybeStartPermissionReview(stored: Stored, target: TeamMember) {
+  private async maybeStartPermissionReview(stored: Stored, target: TeamMember, observedState?: Awaited<ReturnType<Manager["state"]>>) {
     const run = stored.run;
     if (!run.permissions || run.permissionsRevokedAt || target.status !== "running" || stored.halt ||
         ["paused", "cancelled", "blocked"].includes(run.status) || target.revision !== run.revision) return false;
@@ -2704,8 +2720,22 @@ export class TeamService {
       return !decision || !["answered", "escalated", "stale"].includes(decision.status);
     })) return false;
     let state;
-    try { state = await this.manager.state(target.sessionId, true); } catch { return false; }
+    try { state = observedState ?? await this.manager.state(target.sessionId, true); } catch { return false; }
     const prompt = state.attention.prompt;
+    const pendingExpansion = (run.permissionRecovery?.requests ?? []).filter(item => item.revision === run.revision &&
+      item.targetMemberId === target.memberId && item.targetSessionId === target.sessionId && item.status === "expanding" &&
+      item.expansion && ["expanded", "uncertain"].includes(item.expansion.status)).at(-1);
+    if (pendingExpansion && state.control && state.control.expiresAt > Date.now()) {
+      const cause = "A human control lease became active after display expansion; the request remains with its owner.";
+      this.finishPermissionRecovery(stored, pendingExpansion, "interrupted", cause, "re-read-after-expansion", "owner-control-took-over",
+        "The target was left untouched; no permission answer was sent.");
+      this.event(stored, cause);
+      this.save(stored);
+      return true;
+    }
+    if (pendingExpansion && (state.status !== "running" || state.attention.state !== "needs-you" || !prompt))
+      return this.deferExpandedPermissionRead(stored, pendingExpansion,
+        "The expanded request no longer has a reviewable screen; the prompt remains unanswered.");
     if (state.status !== "running" || state.attention.state !== "needs-you" || !prompt) return false;
     const currentRecovery = (run.permissionRecovery?.requests ?? []).filter(item => item.revision === run.revision &&
       item.targetMemberId === target.memberId && item.targetSessionId === target.sessionId &&
@@ -2718,7 +2748,7 @@ export class TeamService {
         const fresh = await this.inspectPermissionRecoveryPrompt(stored, currentRecovery, target, true);
         if (!("state" in fresh)) {
           const reason = fresh.reason ?? "The current target state could not be confirmed after expansion.";
-          return this.deferExpandedPermissionRead(stored, currentRecovery, reason);
+          return this.deferExpandedPermissionRead(stored, currentRecovery, reason, fresh.humanHeld);
         }
         if (!coordinatorPermissionPrompt(fresh.prompt))
           return this.deferExpandedPermissionRead(stored, currentRecovery, "The latest display refresh is not yet a complete reviewable permission screen.");
@@ -2782,7 +2812,7 @@ export class TeamService {
       const fresh = await this.inspectPermissionRecoveryPrompt(stored, request, target, true);
       if (!("state" in fresh)) {
         const reason = fresh.reason ?? "The current target state could not be confirmed after expansion.";
-        return this.deferExpandedPermissionRead(stored, request, reason);
+        return this.deferExpandedPermissionRead(stored, request, reason, fresh.humanHeld);
       }
       if (!coordinatorPermissionPrompt(fresh.prompt)) {
         const cause = "The fresh target screen no longer contains a supported permission prompt.";
@@ -3477,7 +3507,7 @@ export class TeamService {
    * the same working copy. A second stall on the same assignment blocks the run for the owner.
    */
   private async replaceStalledMember(stored: Stored, member: TeamMember) {
-    const run = stored.run, minutes = this.stallWindow() / 60000;
+    const run = stored.run, minutes = this.stallWindowFor(member) / 60000;
     const earlierStop = Boolean(member.stalledAt);
     member.stalledAt ??= timestamp();
     member.stoppedReason ??= `No activity for ${minutes} minutes`;
@@ -3610,6 +3640,20 @@ export class TeamService {
         const result = await teamCommand(setup, cwd, signal, 600000, this.config.teams?.commandPrefix);
         if (result.exitCode !== 0 || result.interrupted) throw new TeamError(409, "team-setup-failed", "A member's configured setup command failed. Its isolated workspace was preserved.");
         await assertMemberReadOnly(cwd, member.baseCommit, this.config.teams?.commandPrefix, signal, "setup");
+      }
+      if (role !== "permission-coordinator" && this.options?.graphs) {
+        let graph: RepositoryGraphResult;
+        try {
+          // prepareMemberWorkspace created this checkout from baseCommit; the graph builder resolves
+          // and validates this exact ref inside the checkout before publishing any receipt.
+          graph = await this.options.graphs.refresh(run.projectId, cwd, member.baseCommit, `run-${run.id}`, signal);
+        } catch (error) {
+          graph = { status: "failed", requestedHead: member.baseCommit, reason: error instanceof Error ? error.message.slice(0, 300) : "Graph refresh unavailable." };
+        }
+        const ready = ["ready", "unchanged"].includes(graph.status) && graph.head === member.baseCommit && graph.graphPath;
+        member.prompt += ready
+          ? `\n\nRepository graph checkpoint: available at ${graph.graphPath} for exact checkout head ${member.baseCommit}. This code-only Graphify artifact is advisory; verify relevant claims against source files. Do not treat it as approval or permission.`
+          : `\n\nRepository graph checkpoint: unavailable for exact checkout head ${member.baseCommit}${graph.reason ? ` (${graph.reason})` : graph.head ? `; last successful artifact is for a different head and must be treated as stale` : ""}. Search the checkout source directly. Graph refresh status is advisory and does not affect permissions or approval.`;
       }
       return cwd;
     }, cwd => {

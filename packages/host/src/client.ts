@@ -23,6 +23,7 @@ import type { ProjectSourceStatus } from "./project-source.js";
 import { boundTeamProject, forgetBoundTeamProject, handleTeamClientCommand } from "./team-cli.js";
 import { handleBoardClientCommand, projectsLines } from "./board-cli.js";
 import { handleUnderstandingCommand } from "./understanding-cli.js";
+import { handleRoutineClientCommand } from "./routine-cli.js";
 import type { ProjectGroupList } from "./project-group-types.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
@@ -483,7 +484,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "resources", "close", "sync", "pull", "team", "repo"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
@@ -752,6 +753,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command === "list" && !existsSync(path) && !options["--client-config"] && !process.env.INFINITE_CLIENT_CONFIG) return false;
     const config = loadConfig(path), api = connection(config);
     if (command === "understand") return await handleUnderstandingCommand(positional, options, api);
+    if (command === "routine") return await handleRoutineClientCommand(positional, options, api);
     if (command === "team" || command === "repo") {
       return await handleTeamClientCommand(command, positional, options, config, api, path, argv);
     }

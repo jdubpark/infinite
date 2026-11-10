@@ -259,6 +259,9 @@ infinite team status [ID] [--logs]          Show teams, or one team's Brief
 infinite team watch ID [--logs]             Follow the summary; l logs, n/p agents, b summary
 infinite team steer ID TEXT                 Steer an active team
 infinite team answer ID QUESTION_ID TEXT    Answer a pending question
+infinite routine create --file FILE [--request-id UUID] [--json]
+infinite routine list [--json] | status ID [--json]
+infinite routine pause|resume|cancel ID --revision N [--request-id UUID] [--json]
 
 Ctrl+] detaches. Ctrl+G returns to monitor mode. Flags after a provider
 name belong to that provider and use cloud paths.

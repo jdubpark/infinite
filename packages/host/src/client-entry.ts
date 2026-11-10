@@ -34,6 +34,9 @@ infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--
 infinite repo init --permissions off        Disable delegation for future runs
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
 infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]
+infinite routine create --file FILE [--request-id UUID] [--json]
+infinite routine list [--json] | status ID [--json]
+infinite routine pause|resume|cancel ID --revision N [--request-id UUID] [--json]
 infinite understand [--workspace ID] [--json]  Read workspace Understanding
 infinite understand catalog|components|component ID|policy|refresh --workspace ID
 infinite understand create COLLECTION|update COLLECTION ID|archive COLLECTION ID --workspace ID

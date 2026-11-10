@@ -277,6 +277,75 @@ test("collapsed Codex evidence is expanded before review and only the fresh pinn
   } finally { await f.close(); }
 });
 
+test("a vanished expanded prompt advances through bounded recovery on later team ticks", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex-collapsed-redraw", permissionLineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const runId = created.body.id as string;
+    const collapsed = await waitFor(async () => {
+      const run = await f.get(runId);
+      const target = run.members.find(member => member.taskId === "a");
+      const session = target?.sessionId ? await f.host.fetchApi("/sessions/" + target.sessionId) : undefined;
+      return { run, target, session };
+    }, value => existsSync(join(f.receipts, runId + ".collapsed-ready")) && Boolean(value.target &&
+      value.session?.body.attention?.state === "needs-you" && value.session.body.attention.prompt), 60000);
+    const target = collapsed.target!;
+    writeFileSync(join(f.receipts, runId + ".redraw-release"), "release", { mode: 0o600 });
+    await waitFor(() => existsSync(join(f.receipts, runId + ".redraw-cleared")), Boolean, 10000);
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    const recovered = await f.get(runId);
+    assert.ok(recovered.permissionRecovery?.outcomes?.some(outcome => outcome.status === "exhausted"),
+      "the real team tick loop must finish bounded recovery after the prompt vanishes");
+    assert.equal(recovered.recovery?.attempts, 1, JSON.stringify(recovered.recovery));
+    assert.equal(recovered.recovery?.source.code, "permission-recovery");
+    const auditService = await f.openTeamService({ start: false });
+    const audited = auditService.understandingRecords().find(run => run.id === runId)!;
+    const request = audited.permissionRecovery!.requests[0]!;
+    assert.equal(request.status, "exhausted");
+    assert.equal(request.expansion?.status, "expanded");
+    assert.equal(request.expansion?.rereads, 3, "later team ticks reach the bounded reread limit after the prompt vanishes");
+    assert.equal(existsSync(join(f.receipts, runId + ".expanded-key")), true, "recovery does not send another display expansion");
+    assert.equal(existsSync(join(f.receipts, runId + ".permission-answer")), false, "a vanished prompt never becomes consent");
+    assert.equal(target.role, "implementer", "the recovery remains bound to the original target assignment");
+  } finally { await f.close(); }
+});
+
+test("a human-held prompt is left untouched when an expanded screen vanishes", { timeout: 120000 }, async () => {
+  const f = await fixture("permissions-codex-collapsed-redraw", permissionLineup);
+  let held: Awaited<ReturnType<typeof claimControl>> | undefined;
+  let targetSessionId: string | undefined;
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const runId = created.body.id as string;
+    const collapsed = await waitFor(async () => {
+      const run = await f.get(runId);
+      const target = run.members.find(member => member.taskId === "a");
+      const session = target?.sessionId ? await f.host.fetchApi("/sessions/" + target.sessionId) : undefined;
+      return { run, target, session };
+    }, value => existsSync(join(f.receipts, runId + ".collapsed-ready")) && Boolean(value.target &&
+      value.session?.body.attention?.state === "needs-you" && value.session.body.attention.prompt), 60000);
+    targetSessionId = collapsed.target!.sessionId;
+    await waitFor(() => existsSync(join(f.receipts, runId + ".expanded-key")), Boolean, 15000);
+    held = await claimControl(f.host, targetSessionId, "controller");
+    writeFileSync(join(f.receipts, runId + ".redraw-release"), "release", { mode: 0o600 });
+    await waitFor(() => existsSync(join(f.receipts, runId + ".redraw-cleared")), Boolean, 10000);
+    const interrupted = await waitFor(() => f.get(runId), run =>
+      run.permissionRecovery?.outcomes?.some(outcome => outcome.status === "interrupted" && outcome.decision === "owner-control-took-over") === true, 15000);
+    assert.equal(interrupted.recovery, undefined, "human control does not queue automatic member stopping");
+    const targetState = await f.host.fetchApi("/sessions/" + targetSessionId);
+    assert.equal(targetState.body.status, "running");
+    assert.equal(targetState.body.control?.id, held.lease.id);
+    assert.equal(existsSync(join(f.receipts, runId + ".permission-answer")), false);
+    const auditService = await f.openTeamService({ start: false });
+    const audited = auditService.understandingRecords().find(run => run.id === runId)!;
+    assert.equal(audited.permissionRecovery!.requests[0]!.status, "interrupted");
+  } finally {
+    if (held && targetSessionId) await f.host.fetchApi("/sessions/" + targetSessionId + "/control", "controller",
+      { action: "release", leaseId: held.lease.id }, held.headers).catch(() => {});
+    await f.close();
+  }
+});
+
 test("a Codex permission review preserves a large objective and complete request evidence", { timeout: 120000 }, async () => {
   const f = await fixture("permissions-codex", permissionLineup);
   try {

@@ -76,6 +76,29 @@ test("a GitHub project run clones the mirror head without reading the project tr
   } finally { await f.close(); }
 });
 
+test("a member receives only the graph checkpoint completed for its prepared checkout head", { timeout: 90000 }, async () => {
+  const f = await fixture("success", fallbackLineup, {}, { noServer: true });
+  try {
+    const checkpoints: { projectId: string; root: string; head: string; lane: string }[] = [];
+    const teams = await f.openTeamService({ graphs: { refresh: async (projectId, root, head, lane) => {
+      checkpoints.push({ projectId, root, head, lane });
+      return { status: "ready", requestedHead: head, head, graphPath: "/graph-cache/current.json", mode: "initial" };
+    } } });
+    const created = await teams.create(f.create());
+    const run = await waitFor(() => Promise.resolve(teams.get(created.id)), value => {
+      const manager = value.members.find(member => member.role === "project-manager");
+      return Boolean(manager && existsSync(join(f.receipts, `${manager.memberId}.json`)));
+    }, 30000);
+    const member = run.members.find(item => item.role === "project-manager")!;
+    const launch = JSON.parse(readFileSync(join(f.receipts, `${member.memberId}.json`), "utf8")) as { prompt: string };
+    assert.deepEqual(checkpoints.map(({ projectId, head, lane }) => ({ projectId, head, lane })), [
+      { projectId: "rehearsal", head: f.base, lane: `run-${created.id}` },
+    ]);
+    assert.match(launch.prompt, /Repository graph checkpoint: available at \/graph-cache\/current\.json/);
+    assert.match(launch.prompt, new RegExp(`exact checkout head ${f.base}`));
+  } finally { await f.close(); }
+});
+
 test("a GitHub project blocks when its first refresh has no mirror head", { timeout: 90000 }, async () => {
   const f = await fixture("success", undefined, {}, { noServer: true });
   try {
@@ -3128,5 +3151,58 @@ globalThis.Date = class extends RealDate {
     assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
     assert.equal(resumed.body.status, "planning");
     assert.equal(resumed.body.revision, blocked.revision + 1);
+  } finally { await f.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a quiet reviewer uses the bounded review window before the configured general stall window", { timeout: 90000 }, async () => {
+  const root = mkdtempSync("/tmp/inf-review-stall-clock-");
+  const offset = join(root, "offset");
+  const preload = join(root, "clock.mjs");
+  writeFileSync(offset, "0");
+  writeFileSync(preload, [
+    "import { readFileSync } from 'node:fs';",
+    "const offsetFile = process.env.INFINITE_TEST_CLOCK_FILE;",
+    "const RealDate = Date;",
+    "globalThis.Date = class extends RealDate {",
+    "  static now() { return RealDate.now() + Number(readFileSync(offsetFile, 'utf8')); }",
+    "  constructor(...args) { super(...(args.length ? args : [globalThis.Date.now()])); }",
+    "};",
+  ].join("\n"));
+  const env = {
+    INFINITE_TEST_CLOCK_FILE: offset,
+    NODE_OPTIONS: [process.env.NODE_OPTIONS, "--import=" + pathToFileURL(preload).href].filter(Boolean).join(" "),
+  };
+  const f = await fixture("reviewer-stall", undefined, {}, { env });
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const id = created.body.id;
+    const before = await waitFor(() => f.get(id), run => existsSync(join(f.receipts, id + ".reviewer-stall")) &&
+      run.members.some(member => member.role === "reviewer" && member.status === "running"), 90000);
+    await f.host.stopApi();
+    const key = readFileSync(f.host.config.keyFile);
+    const file = join(f.host.config.stateDir, "teams", id + ".sealed");
+    const scope = "team:" + id;
+    const stored = unseal<{ run: { members: TeamMember[] } }>(key, scope, readFileSync(file, "utf8"));
+    const reviewer = stored.run.members.find(member => member.role === "reviewer")!;
+    reviewer.startedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    reviewer.lastActivityAt = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    writeSealed(file, key, scope, stored);
+    writeFileSync(offset, String(6 * 60 * 1000));
+    await f.host.start();
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    const replaced = await f.get(id);
+    assert.equal(replaced.members.length, before.members.length + 1,
+      "the reviewer must enter bounded replacement before the configured 30-minute stall limit");
+    const previous = replaced.members.find(member => member.memberId === reviewer.memberId)!;
+    const replacement = replaced.members.at(-1)!;
+    assert.equal(previous.stalledAt !== undefined, true);
+    assert.equal(replacement.role, "reviewer");
+    assert.equal(replacement.cwd, reviewer.cwd);
+    assert.equal(replacement.baseCommit, reviewer.baseCommit);
+    assert.ok(replaced.events.some(event => event.text.includes("stalled with no activity for 5 minutes")),
+      "review recovery uses the five-minute cap while the configured general window remains 30 minutes");
+    const saved = unseal<{ run: { members: TeamMember[] } }>(key, scope, readFileSync(file, "utf8"));
+    assert.match(saved.run.members.find(member => member.memberId === replacement.memberId)!.prompt,
+      /stalled with no activity for 5 minutes.*working copy was checked unchanged/);
   } finally { await f.close(); rmSync(root, { recursive: true, force: true }); }
 });

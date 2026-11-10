@@ -141,6 +141,8 @@ export interface Config {
   dictation?: { model: string; apiKeyFile: string; baseUrl: string };
   /** Read-only repository briefs produced by an administrator-configured host wrapper. */
   repositoryBriefings?: { command: string; args: string[]; runner?: "muse" | "deepseek" | "codex"; model?: string; automatic: boolean; intervalMs: number; cooldownMs: number; timeoutMs: number };
+  /** Optional code-only repository graph refreshes. Cache paths are assigned per project and lane. */
+  repositoryGraphs?: { command: string; args: string[]; graphifyCommand: string; cacheDir: string; projectIds?: string[]; timeoutMs: number; debounceMs: number; intervalMs: number };
   port: number;
   origin: string;
   stateDir: string;

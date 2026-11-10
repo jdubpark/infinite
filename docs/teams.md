@@ -138,6 +138,97 @@ whether Linear has confirmed its issue and execution evidence. Historical runs
 remain unchanged. Run status, verification, and human acceptance retain the
 separate meanings described below.
 
+## Scheduled routines
+
+An owner can create a finite routine for a project enrolled with `infinite repo init`.
+Each occurrence submits the routine's fixed goal to the existing GoalService,
+which applies the same project enrollment, execution policy, path scope, provider
+permissions, delivery policy, and review requirements as a manually started goal.
+The independent reviewer and the existing scoped coordinator approvals remain
+part of each goal cycle.
+
+Create a JSON file with the goal scope, explicit budgets, and finite schedule.
+Use a stable request ID in the file or pass it on the command line so an
+uncertain create can be retried safely:
+
+```json
+{
+  "goal": {
+    "projectId": "project-id",
+    "title": "Keep the project guide current",
+    "objective": "Review and improve the project guide using current repository evidence.",
+    "successCriteria": "The guide is accurate, scoped, and independently reviewed.",
+    "allowedPaths": ["docs"],
+    "nonGoals": ["Change application behavior"],
+    "evidence": ["Cite the repository evidence used"],
+    "maxRuns": 2,
+    "maxMinutes": 60,
+    "maxTotalMinutes": 90,
+    "maxMembers": 8,
+    "parallelism": 2
+  },
+  "intervalMinutes": 10080,
+  "maxOccurrences": 3,
+  "startsAt": "2026-11-10T00:00:00Z",
+  "expiresAt": "2026-11-27T00:00:00Z"
+}
+```
+
+Replace the example project ID and dates with an enrolled project and future UTC
+timestamps. Approval must expire within 30 days of creation; the entire next
+goal's time ceiling must fit before expiry. The aggregate upper bound is the occurrence
+count multiplied by each goal's total time ceiling (`maxTotalMinutes`, or
+`maxMinutes` when no total ceiling is set); `maxRuns` limits cycles within each
+goal occurrence. A routine is refused or
+blocked if the enrolled execution policy changes; review the new policy and
+create a new owner-approved routine to use it.
+
+```sh
+infinite routine create --file routine.json --request-id REQUEST_UUID
+infinite routine list
+infinite routine status ROUTINE_ID
+infinite routine pause ROUTINE_ID --revision 1
+infinite routine resume ROUTINE_ID --revision 2
+infinite routine cancel ROUTINE_ID --revision 2
+```
+
+Use `--json` for machine-readable records. `infinite routine status` shows
+the revision needed for the next action, occurrence goal IDs, the active goal,
+next due time, and any blocking reason.
+Watch each goal on the existing board or with `infinite usage goal GOAL_ID`.
+Pause and cancel stop future triggers; an already active goal continues under
+its own controls and limits. Resume does not change the approved scope or resume
+a child goal. A blocked, needs-input, or limit-reached child stops further
+triggers until an owner reviews and resolves the state, then explicitly resumes
+the routine when it remains eligible. A changed project approval policy needs
+a new owner-approved routine. A completed review does not itself authorize
+merge or infer that the goal was achieved.
+Missed schedule ticks are coalesced, so downtime does not produce a burst of
+catch-up goals.
+
+### Navigating large repositories
+
+For large codebases, agents can use [Graphify](https://github.com/Graphify-Labs/graphify)
+to find relevant symbols and relationships before reading source. Install the
+tested `graphifyy==0.9.104` package in an isolated Python environment on the
+execution host. Keep its output in a private scratch directory outside the
+repository, scoped to one checkout and accessible to that run's agent identity.
+
+```sh
+graphify extract REPOSITORY_PATH --code-only --max-workers 2 --out GRAPH_DIRECTORY
+graphify query 'RoutineService' --graph GRAPH_DIRECTORY/graphify-out/graph.json --budget 1500
+```
+
+Use code-only extraction for this workflow; semantic extraction, hosted graph
+uploads, global hooks, and cross-repository graph merging are not required.
+Record the checkout revision and dirty-file state alongside the graph, and
+refresh extraction after source changes. Query specific symbols with a bounded
+output budget; inspect truncation and skipped-file warnings. Open the referenced
+source at the current revision before making a change or review claim. A graph
+may omit files or relationships and does not establish test coverage, independent
+review, completion, or permission to act. If the tool is unavailable to the
+agent, continue with direct repository search and report the coverage gap.
+
 ## GitHub-tracked sources
 
 A project in `github` source mode follows its base branch on GitHub. The host
@@ -1436,8 +1527,10 @@ workspace with the new direction. Completed earlier integration remains visible;
 unfinished member copies remain available under the workspace retention policy.
 Pause, resume and cancel are owner
 actions. A member with no report and no attention activity for `teams.stallMinutes`
-(5–1,440, default 30) is stopped. One replacement then continues the same task in
-that workspace, with feedback that the earlier attempt stalled. A second
+(5–1,440, default 30) is stopped. A reviewer uses the shorter of that setting and
+a five-minute quiet window so a silent review can recover before a goal deadline.
+One replacement then continues the same task in that workspace, with feedback
+that the earlier attempt stalled. A second
 stall on the same assignment blocks the team with the reason "An agent showed no
 activity twice on the same assignment." Activity means attention activity from the
 member's terminal or hooks. Screen output also counts, so an agent stuck behind an

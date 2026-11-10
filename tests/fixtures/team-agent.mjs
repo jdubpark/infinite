@@ -313,6 +313,12 @@ async function main() {
     if (scenario === "bootstrap-change" && assignment.revision > 2)
       verification.checks[0].args.push("--different");
     const plan = { kind: "plan", summary: "Build two independent files and verify their integrated contents", tasks,
+      ...(scenario === "permissions-routine" ? { brief: {
+        title: "Add matching output files", problem: "The project has no matching output files.",
+        evidence: [{ source: "original.txt", observation: "The source describes the fixture project." }],
+        dataShape: "Two text files containing the same revision line", acceptance: ["The configured check validates both output files."],
+        expectedOutcome: "The output files pass verification; product impact remains unassessed.", uiChanges: false,
+      } } : {}),
       ...(scenario === "live-limit" || scenario === "result-operation-fails-once" ? { parallelism: 1 } : {}),
       ...(scenario === "bootstrap-missing" || scenario === "bootstrap-replan" && assignment.revision > 1 ? {} : scenario.startsWith("bootstrap") ? { verification } : {}) };
     if (scenario === "bootstrap-override") {
@@ -423,7 +429,7 @@ async function main() {
       while (!existsSync(join(receiptDir, `${assignment.runId}.release`)))
         await new Promise(resolve => setTimeout(resolve, 40));
     }
-    if (scenario === "permissions-codex-collapsed" && assignment.taskId === "a") {
+    if (["permissions-codex-collapsed", "permissions-codex-collapsed-redraw"].includes(scenario) && assignment.taskId === "a") {
       writeFileSync("a.txt", "draft before the permission request\n");
       process.stdin.setRawMode(true);
       process.stdin.setEncoding("utf8");
@@ -438,6 +444,15 @@ async function main() {
         const input = String(await new Promise(resolve => process.stdin.once("data", resolve)));
         if (!input.includes("\u0001")) continue;
         writeFileSync(join(receiptDir, `${assignment.runId}.expanded-key`), "Ctrl+A", { mode: 0o600 });
+        if (scenario === "permissions-codex-collapsed-redraw") {
+          while (!existsSync(join(receiptDir, `${assignment.runId}.redraw-release`))) await new Promise(resolve => setTimeout(resolve, 20));
+          process.stdout.write("\u001b[2J\u001b[H");
+          writeFileSync(join(receiptDir, `${assignment.runId}.redraw-cleared`), "cleared", { mode: 0o600 });
+          await new Promise(resolve => process.stdin.once("data", resolve));
+          writeFileSync(join(receiptDir, `${assignment.runId}.permission-answer`), "received", { mode: 0o600 });
+          process.stdout.write("\u001b[2J\u001b[HPermission request closed.\n");
+          return;
+        }
         process.stdout.write([
           "\u001b[2J\u001b[HWould you like to run the following command?", "",
           "  Reason: May I run npm run check outside the sandbox?", "  EXPANDED ONCE 1", "  $ npm run check", "",
@@ -718,6 +733,10 @@ ${branch}`;
       pullRequestUrl: scenario === "delivery-foreign" ? "https://github.com/example/other/pull/1" : "https://github.com/example/app/pull/1",
       mergeCommit: scenario === "delivery-baseline-tree" ? execFileSync("git", ["rev-parse", `${head}^{tree}`], { encoding: "utf8" }).trim() : mergeCommit, summary: "Synthetic delivery report exercising host binding; no GitHub request was made." });
   } else if (assignment.role === "reviewer") {
+    if (scenario === "reviewer-stall") {
+      writeFileSync(join(receiptDir, `${assignment.runId}.reviewer-stall`), assignment.memberId, { mode: 0o600 });
+      await new Promise(() => setInterval(() => {}, 1000));
+    }
     if (scenario === "reviewer-recording-error" && !existsSync(join(receiptDir, "reviewer-recording-error-started"))) {
       writeFileSync(join(receiptDir, "reviewer-recording-error-started"), "started", { mode: 0o600 });
       const descendantScript = `const { existsSync, writeFileSync } = require('node:fs'); const { join } = require('node:path'); let child; process.on('SIGTERM',()=>{}); setInterval(() => { if (!child && existsSync(join(${JSON.stringify(receiptDir)}, 'retirement-expand-tree'))) { child = require('node:child_process').spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"], { detached:true, stdio:'ignore' }); writeFileSync(join(${JSON.stringify(receiptDir)}, 'retirement-discovered-pid.json'), JSON.stringify({ pid:child.pid }), { mode:0o600 }); } }, 50);`;

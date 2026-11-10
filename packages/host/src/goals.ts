@@ -140,7 +140,7 @@ export class GoalService {
   activeForProject(projectId: string) {
     return [...this.records.values()].some(({ goal, launch, control }) => goal.projectId === projectId && (Boolean(launch || control || goal.activeTeamId) || ["running", "needs-input", "paused"].includes(goal.status)));
   }
-  create(input: CreateGoal) {
+  create(input: CreateGoal, admit?: () => void) {
     const request = createGoalSchema.parse(input);
     return this.enqueue(() => {
       const fingerprint = digest(request), prior = this.records.get(request.requestId);
@@ -148,6 +148,10 @@ export class GoalService {
         if (prior.fingerprint !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different goal.");
         return structuredClone(prior.goal);
       }
+      // A scheduled approval can expire or change while waiting behind another
+      // goal operation. Validate it in this transaction, immediately before a
+      // new goal receives its execution window. Existing receipts remain replayable.
+      admit?.();
       if (!this.enabled()) throw new TeamError(409, "goals-not-configured", "Configure a team lineup with a strong coordinator and reviewer before starting a goal.");
       if (Buffer.byteLength(JSON.stringify(request)) > 40000) throw new TeamError(409, "goal-too-large", "Keep the goal and evidence below 40 KiB. Link to longer source material.");
       const project = this.config.projects.find(value => value.id === request.projectId);

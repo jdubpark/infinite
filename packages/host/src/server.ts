@@ -34,6 +34,8 @@ import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecard } from "./scorecard.js";
 import { GoalService } from "./goals.js";
+import { RoutineService } from "./routines.js";
+import { createRoutineSchema, routineActionSchema } from "./routine-types.js";
 import { MissionService, missionBoard } from "./missions.js";
 import { createMissionSchema, missionActionSchema, missionTextSchema } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
@@ -45,6 +47,7 @@ import type { Config, Role, Receipt, Session } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
+import { RepositoryGraphs } from "./repository-graphs.js";
 import { UnderstandingService } from "./understanding.js";
 import { UnderstandingCatalog, CatalogError } from "./understanding-catalog.js";
 import { UnderstandingRuntime } from "./understanding-runtime.js";
@@ -133,16 +136,26 @@ export function createApp(config: Config, key: Buffer) {
   const desktopFiles = new DesktopFiles(config);
   // Session starts admitted past the sync check that the session list may not show yet.
   const startsInFlight = new Map<string, number>();
+  const routineStarts = new Set<string>();
   const projectFileChanges = new Set<string>();
   const projectConfigChanges = new Set<string>();
   let sourceChanged: (projectId: string) => void = () => {};
-  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: id => sourceChanged(id) });
+  let sourceAppliedGraph: (projectId: string, head: string) => void = () => {};
+  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); } });
+  const repositoryGraphs = config.repositoryGraphs
+    ? new RepositoryGraphs(config.repositoryGraphs, config.projects, config.teams?.workspaceDir, config.teams?.commandPrefix)
+    : undefined;
+  const scheduleGraphForSession = (projectId: string) => {
+    const project = config.projects.find(item => item.id === projectId);
+    if (repositoryGraphs && project) void repositoryGraphs.refreshCurrent(projectId, project.path, "shared").catch(() => undefined);
+  };
   /**
    * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
    * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
    * tools run elsewhere, and an exited session never counts. A session list that cannot be read counts as running.
    */
-  const startInProject = async <T>(projectId: string, start: () => Promise<T>): Promise<T> => {
+  const startInProject = async <T>(projectId: string, start: () => Promise<T>, routineStart = false): Promise<T> => {
+    if (routineStarts.has(projectId) && !routineStart) throw new TeamError(409, "routine-starting", "A scheduled goal is being admitted for this project. Retry after it appears.");
     if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
     if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
     if (projectSource.isGithub(projectId) && projectSource.refreshing(projectId))
@@ -161,7 +174,11 @@ export function createApp(config: Config, key: Buffer) {
   const ownerServices: { goals?: GoalService; missions?: MissionService; handoffs?: HandoffService } = {};
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
-    onMerged: id => void projectSource.refresh(id).then(() => sourceChanged(id), () => sourceChanged(id)),
+    graphs: repositoryGraphs,
+    onMerged: id => void projectSource.refresh(id).then(status => {
+      sourceChanged(id);
+      if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
+    }, () => sourceChanged(id)),
     ownerActive: run => {
       if (ownerServices.goals?.retainsTeamRun(run.id) || ownerServices.missions?.retainsSubteamRun(run.id)) return true;
       return Boolean(run.handoff && ownerServices.handoffs?.ownsActiveTeam(run.id));
@@ -287,6 +304,29 @@ export function createApp(config: Config, key: Buffer) {
       (["running", "starting"].includes(s.status) ||
         (["unavailable", "recording-error"].includes(s.status) && (alive(s.pid) || alive((s as { workerPid?: unknown }).workerPid)))));
   };
+  const routineProjectBusy = async (projectId: string) => {
+    if (routineStarts.has(projectId) || projectFileChanges.has(projectId) || projectSync.applying(projectId) || projectSource.refreshing(projectId)) return true;
+    if (missions.list().some(mission => mission.repoProjectIds.includes(projectId) && !["ready-for-review", "cancelled"].includes(mission.status))) return true;
+    return projectRunning(projectId);
+  };
+  const routines = new RoutineService(config, key, goals, {
+    isProjectBusy: routineProjectBusy,
+    startGoal: async (request, admit) => {
+      // Recover an acknowledged goal through its original idempotency key before
+      // applying busy checks: the existing goal itself reserves this project.
+      try { goals.get(request.requestId); return await goals.create(request, admit); }
+      catch (error) { if (!(error instanceof TeamError) || error.code !== "goal-not-found") throw error; }
+      if (await routineProjectBusy(request.projectId)) throw new TeamError(409, "routine-project-busy", "This project already has active work. The routine has not launched another goal.");
+      // Close the admission gap after the asynchronous session inventory.
+      if (startsInFlight.has(request.projectId) || goals.activeForProject(request.projectId) || teams.activeForProject(request.projectId))
+        throw new TeamError(409, "routine-project-busy", "Work started in this project while the routine checked it.");
+      routineStarts.add(request.projectId);
+      try {
+        assertNoHandoff(request.projectId);
+        return await startInProject(request.projectId, () => goals.create(request, admit), true);
+      } finally { routineStarts.delete(request.projectId); }
+    },
+  });
   const desktopResources = new DesktopResources(config, listSessions);
   const changeProjectFiles = async <T>(projectId: string, action: () => Promise<T>) => {
     if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
@@ -314,6 +354,12 @@ export function createApp(config: Config, key: Buffer) {
   const understandingAdapter = createUnderstandingAdapter(config);
   const understandingRuntime = new UnderstandingRuntime({ config, key, groups: projectGroups, catalog: understandingCatalog, adapter: understandingAdapter });
   sourceChanged = id => understandingRuntime.sourceChanged(id);
+  sourceAppliedGraph = (id, head) => {
+    if (!repositoryGraphs) return;
+    const project = config.projects.find(item => item.id === id);
+    if (!project) return;
+    void repositoryGraphs.refresh(id, project.path, head, "shared").catch(() => undefined);
+  };
   const understandingBehaviors = new UnderstandingBehaviorService({ config, key, groups: projectGroups, catalog: understandingCatalog, runtime: understandingRuntime });
   const understanding = new UnderstandingService({ config, key, manager, groups: projectGroups, missions, teams, goals, briefings: repositoryBriefings,
     knowledge: { read: workspaceId => ({ schemaVersion: 1, catalog: understandingCatalog.read(workspaceId), ...understandingRuntime.read(workspaceId) }) },
@@ -575,6 +621,11 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
+  app.get("/api/routines", (_req, res) => res.json({ routines: routines.list() }));
+  app.get("/api/routines/:id", (req, res) => res.json(routines.get(id.parse(req.params.id))));
+  app.post("/api/routines", requireRole(["owner"]), async (req, res) => res.json(await routines.create(createRoutineSchema.parse(req.body))));
+  for (const action of ["pause", "resume", "cancel"] as const)
+    app.post(`/api/routines/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await routines[action](id.parse(req.params.id), routineActionSchema.parse(req.body))));
   app.get("/api/project-groups", requireRole(["owner", "controller", "viewer"]), (_req, res) => res.json(projectGroups.list()));
   const workNarratives = new WorkNarrativeStore({ config, key, adapter: understandingAdapter, teams });
   const workBriefs = new WorkBriefService({
@@ -969,9 +1020,11 @@ export function createApp(config: Config, key: Buffer) {
     if (request.backend === "cmux") {
       if (!cmux) return void res.status(409).json({ error: "cmux is not enabled on this machine" });
       if (request.nativeArgs || request.workspace || request.localUi) return void res.status(400).json({ error: "Choose a configured project and agent for cmux" });
+      scheduleGraphForSession(request.projectId);
       return void res.status(201).json(await startInProject(request.projectId, () => cmux.create(request)));
     }
     const { backend: _backend, ...nativeRequest } = request;
+    scheduleGraphForSession(request.projectId);
     res.status(201).json(await startInProject(request.projectId, () => manager.create(nativeRequest)));
   });
   // Imported sessions keep their own transport and journal. Authorization is the same
@@ -1027,7 +1080,9 @@ export function createApp(config: Config, key: Buffer) {
       if (action === "/stop") return void res.json(await cmux.call(sessionId, { op: "stop", ...z.object({ requestId: id }).strict().parse(req.body), ...authority }));
       if (action === "/resume") {
         const { requestId } = z.object({ requestId: id }).strict().parse(req.body);
-        return void res.json(await startInProject((await cmux.get(sessionId)).projectId, () => cmux.resume(sessionId, requestId)));
+        const projectId = (await cmux.get(sessionId)).projectId;
+        scheduleGraphForSession(projectId);
+        return void res.json(await startInProject(projectId, () => cmux.resume(sessionId, requestId)));
       }
       return void res.status(409).json({ error: "This action is unavailable for cmux sessions", code: "unsupported" });
     } catch (error) {
@@ -1112,7 +1167,9 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/sessions/:id/resume", refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);
     const { requestId } = z.object({ requestId: id }).strict().parse(req.body);
-    res.json(await startInProject(manager.meta(sessionId).session.projectId, () => manager.resume(sessionId, requestId)));
+    const projectId = manager.meta(sessionId).session.projectId;
+    scheduleGraphForSession(projectId);
+    res.json(await startInProject(projectId, () => manager.resume(sessionId, requestId)));
   });
   app.get("/api/sessions/:id/native", refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });
@@ -1333,6 +1390,12 @@ export function createApp(config: Config, key: Buffer) {
     if (!project) return void res.status(404).json({ error: "Unknown project" });
     res.json({ id: project.id, name: project.name, path: project.path, source: projectSource.status(projectId), sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
   });
+  app.get("/api/projects/:id/graph", requireRole(["owner"]), (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
+    const enabled = Boolean(repositoryGraphs && (!config.repositoryGraphs?.projectIds || config.repositoryGraphs.projectIds.includes(projectId)));
+    res.json({ enabled, state: enabled ? "enabled" : "disabled", receipts: enabled ? repositoryGraphs!.status(projectId) : [] });
+  });
   app.post("/api/projects/:id/source/refresh", requireRole(["owner"]), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (!projectSource.isGithub(projectId)) throw new ProjectSourceError("This project follows the laptop, not GitHub.", "not-github");
@@ -1498,11 +1561,13 @@ export function createApp(config: Config, key: Buffer) {
     linear.start();
     teams.start();
     goals.start();
+    routines.start();
     missions.start();
     handoffs.start();
     readings.start();
     // The timer checks each tick which projects follow GitHub, so one enrolled while the server runs is picked up too.
     projectSource.start();
+    repositoryGraphs?.start();
     void repositoryBriefings?.start().catch(() => {});
     understandingRuntime.start();
     balances.start();
@@ -1512,8 +1577,10 @@ export function createApp(config: Config, key: Buffer) {
     usage.close();
     balances.close();
     goals.close();
+    routines.close();
     missions.close();
     repositoryBriefings?.close();
+    repositoryGraphs?.close();
     void understandingRuntime.close();
     void understandingBehaviors.close();
     void workNarratives.close();
@@ -1525,6 +1592,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
+  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

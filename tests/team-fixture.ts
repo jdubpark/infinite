@@ -7,6 +7,7 @@ import { startHost, stopSessionWorkers, waitFor, type Host } from "./helpers.js"
 import type { Config } from "../packages/host/src/types.js";
 import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService } from "../packages/host/src/project-source.js";
+import type { RepositoryGraphs } from "../packages/host/src/repository-graphs.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamService } from "../packages/host/src/teams.js";
 
@@ -158,13 +159,13 @@ process.exit(child.status ?? 1);
   };
   const settled = (id: string) => waitFor(() => get(id), run => ["ready-for-review", "merged", "blocked"].includes(run.status), 90000);
   const directServices: TeamService[] = [];
-  const openTeamService = async (serviceOptions: { source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">; onMerged?: (projectId: string) => void; start?: boolean } = {}) => {
+  const openTeamService = async (serviceOptions: { source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">; graphs?: Pick<RepositoryGraphs, "refresh">; onMerged?: (projectId: string) => void; start?: boolean } = {}) => {
     await host.stopApi();
     if (serviceOptions.source) host.config.projects.find(project => project.id === "rehearsal")!.source = { mode: "github", repository: "example/app", baseBranch: "main" };
     const key = readFileSync(host.config.keyFile);
     const manager = new Manager(host.config, key);
     const service = new TeamService(host.config, key, manager, (_projectId, start) => start(), undefined, undefined,
-      { ...(serviceOptions.source ? { source: serviceOptions.source } : {}), ...(serviceOptions.onMerged ? { onMerged: serviceOptions.onMerged } : {}) });
+      { ...(serviceOptions.source ? { source: serviceOptions.source } : {}), ...(serviceOptions.graphs ? { graphs: serviceOptions.graphs } : {}), ...(serviceOptions.onMerged ? { onMerged: serviceOptions.onMerged } : {}) });
     if (serviceOptions.start !== false) service.start();
     directServices.push(service);
     return service;

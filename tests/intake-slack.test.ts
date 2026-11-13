@@ -94,7 +94,7 @@ async function surfaceFor(services: Services, stateRoot: string, options: { bind
   const realClient = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000 });
   const client = options.wrapClient ? options.wrapClient(realClient) : realClient;
   const config = { intake: {
-    linear: { teamIds: [randomUUID()], label: "infinite", commentsMirrorToSlack: false },
+    linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
     slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
       bindByMention: options.bindByMention ?? false, endpoint: slack.endpoint },
     mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3, requireSlackThread: true,

@@ -245,6 +245,48 @@ repository-scoped App credential. The refspec is an exact commit SHA to
 point is durability: work survives workspace removal and loss of the host disk. See
 [Head publication](teams.md#head-publication).
 
+## Request intake
+
+Intake lets the owner start a mission from a Linear issue and follow it in a Slack
+thread. See [intake](intake.md) for the flow.
+
+Only the owner causes work. An issue starts a mission only when its creator is the
+owner's Linear user ID, `intake.linear.creatorId`. When a Slack thread is required,
+the thread must also hold a message from the owner's Slack user ID,
+`intake.slack.ownerUserId`, that mentions Linear's agent and was sent before the
+issue was filed. The bot acts only on `app_mention` events from that
+Slack user in a thread bound to a record. A teammate's message is not stored as a
+request and is never acted on. Thread messages from other people are kept only
+as labelled background inside the objective.
+
+The bot posts only into the thread a record is bound to. Every outbound Slack
+function takes an intake record and reads its thread; none takes a channel ID
+from an inbound event. Linear comments go only to the issue whose record they
+belong to. Neither surface changes a Linear issue's state, assignee, or labels,
+and neither approves a provider permission or marks work complete. Results are
+labelled as agent reports.
+
+Slack and Linear credentials are regular files with mode `0600`, outside
+`stateDir`, `runDir`, `teams.workspaceDir`, and every project path. The host reads
+them for its own requests. They never enter an agent's environment. Loopback HTTP
+endpoints are accepted only when `environment` is `"local"`; every other endpoint
+must be the official one. Slack uses Socket Mode, so the host has no inbound
+public endpoint, and Linear is polled.
+
+Intake errors are not shared as text. The intake service's `lastError` carries an
+error's name and, when it has one, its code, and the message and stack go to the
+host log only. A Slack message's error field carries the Slack error code.
+Known gap: the Slack surface's `lastError` on `GET /api/intake` currently carries
+the full error message, not the name and code. This is open against the Slack
+surface and must be fixed before this section is relied on.
+
+Residual risk: the objective carries the Linear title and description, and the
+Slack thread, to the coordinator and subteams. Anyone who can write to the issue
+or the thread can put instructions in that text. The objective labels only the
+owner's lines as instructions, and the coordinator is told that other people's
+messages are information. That is a prompt boundary, not a guarantee, and it does
+not stop an injected request from the owner's own account.
+
 ## Dependency audit
 
 The current lockfile's production host dependency audit reports zero known advisories. The full workspace audit reports 29 findings (19 high, 10 moderate), propagated from four transitive packages in the Expo 57 dependency tree: `braces`, `node-forge`, `uuid`, and `decode-uri-component`. Most are in build tooling; the Router URI decoder also requires review before native release. At the time of the check, the registry's latest `braces` and `node-forge` versions remained affected. A forced audit fix proposed incompatible SDK changes, so it was not applied. These findings remain open; the mobile debug build is not a security-reviewed release.

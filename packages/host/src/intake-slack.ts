@@ -20,8 +20,12 @@ const UNEXPECTED = "The request could not be applied.";
 const ACTIONS = new Set(["status", "pause", "resume", "cancel"]);
 
 interface Outcome { outcome: string; reply?: string }
+type SavedCall = NonNullable<IntakeInbound["call"]>;
+type Routed = { outcome: string; reply?: string; call?: Omit<SavedCall, "revision"> };
+const OUTCOMES: Record<SavedCall["action"], string> = { answer: "answered", steer: "steered", pause: "pause", resume: "resume", cancel: "cancel" };
 
 const now = () => new Date().toISOString();
+const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const sameThread = (a: IntakeThread | undefined, b: IntakeThread | undefined) =>
   Boolean(a && b && a.channelId === b.channelId && a.threadTs === b.threadTs);
@@ -61,6 +65,9 @@ export class IntakeSlackSurface {
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private readonly pumping = new Set<string>();
   private readonly draining = new Set<string>();
+  private readonly composeRetries = new Map<string, { attempts: number; timer?: NodeJS.Timeout }>();
+  /** The newest unresolved error per record; a later successful reconcile of that record clears it. */
+  private readonly failures = new Map<string, string>();
   private unsubscribers: (() => void)[] = [];
 
   constructor(config: Config, private readonly store: IntakeStore, private readonly missions: MissionService,
@@ -83,12 +90,16 @@ export class IntakeSlackSurface {
     this.identityTimer = undefined;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    for (const retry of this.composeRetries.values()) clearTimeout(retry.timer);
+    this.composeRetries.clear();
     this.connection?.close();
     this.connection = undefined;
   }
 
-  status(): { connected: boolean; reason?: string; dropped: number } {
-    return { connected: this.connection?.connected() ?? false, ...(this.reason ? { reason: this.reason } : {}), dropped: this.droppedCount };
+  status(): { connected: boolean; reason?: string; dropped: number; lastError?: string } {
+    const lastError = [...this.failures.values()].at(-1);
+    return { connected: this.connection?.connected() ?? false, ...(this.reason ? { reason: this.reason } : {}),
+      ...(lastError ? { lastError } : {}), dropped: this.droppedCount };
   }
 
   private async verify(): Promise<void> {
@@ -139,10 +150,35 @@ export class IntakeSlackSurface {
       if (probe.messages.length !== record.messages.length || probe.questions.length !== record.questions.length) {
         this.store.update(issueId, draft => this.compose(draft, mission));
       }
-    } catch {
-      // A composition that cannot read its mission or team is retried on the next change.
+      this.settle(issueId);
+    } catch (error) {
+      this.fail(issueId, error);
+      return;
     }
     void this.pump(issueId);
+  }
+
+  /** A successful reconcile clears the record's error and its pending composition retry. */
+  private settle(issueId: string): void {
+    this.failures.delete(issueId);
+    const retry = this.composeRetries.get(issueId);
+    if (retry) clearTimeout(retry.timer);
+    this.composeRetries.delete(issueId);
+  }
+
+  /** Records the error and retries this record's reconcile on the Slack retry schedule; the mission is never touched. */
+  private fail(issueId: string, error: unknown): void {
+    this.failures.delete(issueId);
+    this.failures.set(issueId, message(error));
+    const retry = this.composeRetries.get(issueId) ?? { attempts: 0 };
+    retry.attempts += 1;
+    clearTimeout(retry.timer);
+    const delay = RETRY_DELAYS_MS[retry.attempts - 1] ?? RETRY_EVERY_MS;
+    retry.timer = setTimeout(() => {
+      retry.timer = undefined;
+      this.reconcile(issueId);
+    }, delay);
+    this.composeRetries.set(issueId, retry);
   }
 
   private compose(draft: IntakeRecord, mission: Mission | undefined): void {
@@ -229,8 +265,10 @@ export class IntakeSlackSurface {
         if (due > Date.now()) { this.wake(issueId, due); return; }
         await this.deliver(issueId, record.thread, message);
       }
-    } catch {
+    } catch (error) {
       // A failed store write leaves the message pending; the next change pumps again.
+      this.failures.delete(issueId);
+      this.failures.set(issueId, message(error));
     } finally {
       this.pumping.delete(issueId);
     }
@@ -244,17 +282,22 @@ export class IntakeSlackSurface {
     }, Math.max(0, at - Date.now())));
   }
 
+  /**
+   * The Slack key is the record's ID and the message's local key, so two records in one thread never share a receipt.
+   * The message is marked uncertain before the post, so a crash inside the send is found by lookup on restart.
+   */
   private async deliver(issueId: string, thread: IntakeThread, message: IntakeMessage): Promise<void> {
-    const key = message.key;
+    const key = message.key, transport = `${issueId}:${key}`;
     if (message.uncertain) {
       let messages: SlackThreadMessage[] | "unreadable";
       try {
         messages = await this.client.thread(thread);
       } catch (error) {
+        this.patch(issueId, key, item => { item.attempts += 1; });
         this.failed(issueId, key, error);
         return;
       }
-      const found = Array.isArray(messages) ? messages.find(item => item.key === key) : undefined;
+      const found = Array.isArray(messages) ? messages.find(item => item.key === transport) : undefined;
       if (found) {
         this.patch(issueId, key, item => {
           item.status = "sent"; item.ts = found.ts; delete item.uncertain; delete item.nextAttemptAt; delete item.error;
@@ -262,10 +305,11 @@ export class IntakeSlackSurface {
         return;
       }
     }
+    this.patch(issueId, key, item => { item.uncertain = true; item.attempts += 1; });
     try {
-      const { ts } = await this.client.post(thread, message.text, key);
+      const { ts } = await this.client.post(thread, message.text, transport);
       this.patch(issueId, key, item => {
-        item.status = "sent"; item.ts = ts; item.attempts += 1;
+        item.status = "sent"; item.ts = ts;
         delete item.uncertain; delete item.nextAttemptAt; delete item.error;
       });
     } catch (error) {
@@ -273,11 +317,11 @@ export class IntakeSlackSurface {
     }
   }
 
+  /** Called after the attempt was counted; schedules the next attempt or gives up. */
   private failed(issueId: string, key: string, error: unknown): void {
     const code = error instanceof SlackError ? error.code : "error";
     const permanent = error instanceof SlackError && !error.transient;
     this.patch(issueId, key, item => {
-      item.attempts += 1;
       item.error = code;
       if (permanent) {
         item.status = "failed"; delete item.uncertain; delete item.nextAttemptAt;
@@ -351,8 +395,10 @@ export class IntakeSlackSurface {
         if (!record || !entry) return;
         await this.apply(record, entry);
       }
-    } catch {
+    } catch (error) {
       // A failed store write leaves the entry unhandled; it is applied again on the next event or start.
+      this.failures.delete(issueId);
+      this.failures.set(issueId, message(error));
     } finally {
       this.draining.delete(issueId);
     }
@@ -369,83 +415,92 @@ export class IntakeSlackSurface {
     });
   }
 
+  /** An entry with a saved call performs exactly that call; any other entry is routed once, and the chosen call is saved first. */
   private async act(record: IntakeRecord, entry: IntakeInbound): Promise<Outcome> {
-    const text = entry.text;
+    if (entry.call) return this.perform(record, entry, entry.call);
     if (record.state === "finished") return { outcome: "finished", reply: FINISHED };
     const mission = record.missionId ? this.missions.peek(record.missionId) : undefined;
     if (!mission) return { outcome: "not-started", reply: NOT_STARTED };
-    const requestId = deterministicUuid("intake-slack-event", entry.eventId);
-    const id = mission.id;
-    const call = (run: (revision: number) => unknown) => this.missionAction(record.issueId, entry, id, run);
-    try {
-      const lower = text.toLowerCase();
-      if (ACTIONS.has(lower)) return await this.missionCommand(record, mission, lower, requestId, call);
-      const open = mission.decisions.filter(decision => !decision.answer);
-      const leading = /^Q(\d+)(?!\w)\s*/i.exec(text);
-      if (open.length === 0) {
-        if (leading || /^\d+$/.test(text)) return { outcome: "already-answered", reply: ALREADY_ANSWERED };
-        await call(revision => this.missions.steer(id, { requestId, revision, text }, "slack"));
-        return { outcome: "steered" };
-      }
-      let decision: MissionDecision;
-      if (leading) {
-        const number = Number(leading[1]);
-        const question = record.questions.find(item => item.n === number);
-        if (!question) return { outcome: "unknown-question", reply: `There is no question Q${number}.` };
-        const target = mission.decisions.find(item => item.id === question.decisionId);
-        if (!target || target.answer) return { outcome: "already-answered", reply: ALREADY_ANSWERED };
-        decision = target;
-      } else {
-        decision = open[0];
-      }
-      const remainder = leading ? text.slice(leading[0].length).trim() : text;
-      if (remainder === "") return { outcome: "empty-answer", reply: "Reply with a mention and your answer." };
-      const choice = /^\d+$/.test(remainder) ? Number(remainder) : undefined;
-      const answer = choice !== undefined && choice >= 1 && choice <= decision.options.length ? decision.options[choice - 1] : remainder;
-      const decisionId = decision.id;
-      await call(revision => this.missions.answer(id, decisionId, { requestId, revision, text: answer }, "slack"));
-      return { outcome: "answered" };
-    } catch (error) {
-      if (error instanceof TeamError) return { outcome: "refused", reply: error.message };
-      return { outcome: "error", reply: UNEXPECTED };
-    }
+    const routed = this.route(record, mission, entry.text);
+    if (!routed.call) return { outcome: routed.outcome, reply: routed.reply };
+    const call: SavedCall = { ...routed.call, revision: mission.revision };
+    this.rememberCall(record.issueId, entry.eventId, call);
+    return this.perform(record, entry, call);
   }
 
-  private async missionCommand(record: IntakeRecord, mission: Mission, command: string, requestId: string,
-    call: (run: (revision: number) => unknown) => Promise<void>): Promise<Outcome> {
-    const id = mission.id;
-    if (command === "status") {
+  /** Chooses the mission call for a reply from the mission's current state, or the reply that needs no call. */
+  private route(record: IntakeRecord, mission: Mission, text: string): Routed {
+    const lower = text.toLowerCase();
+    if (lower === "status") {
       const open = mission.decisions.filter(decision => !decision.answer).flatMap(decision => {
         const question = record.questions.find(item => item.decisionId === decision.id);
         return question ? [`Q${question.n}: ${decision.question}`] : [];
       });
       return { outcome: "status", reply: [mission.status, ...open].join("\n") };
     }
-    if (command === "pause") await call(revision => this.missions.pause(id, { requestId, revision }));
-    else if (command === "resume") await call(revision => this.missions.resume(id, { requestId, revision }));
-    else await call(revision => this.missions.cancel(id, { requestId, revision }));
-    return { outcome: command };
+    if (ACTIONS.has(lower)) return { outcome: lower, call: { action: lower as "pause" | "resume" | "cancel" } };
+    const open = mission.decisions.filter(decision => !decision.answer);
+    const leading = /^Q(\d+)(?!\w)\s*/i.exec(text);
+    if (open.length === 0) {
+      if (leading || /^\d+$/.test(text)) return { outcome: "already-answered", reply: ALREADY_ANSWERED };
+      return { outcome: "steered", call: { action: "steer", text } };
+    }
+    let decision: MissionDecision;
+    if (leading) {
+      const number = Number(leading[1]);
+      const question = record.questions.find(item => item.n === number);
+      if (!question) return { outcome: "unknown-question", reply: `There is no question Q${number}.` };
+      const target = mission.decisions.find(item => item.id === question.decisionId);
+      if (!target || target.answer) return { outcome: "already-answered", reply: ALREADY_ANSWERED };
+      decision = target;
+    } else {
+      decision = open[0];
+    }
+    const remainder = leading ? text.slice(leading[0].length).trim() : text;
+    if (remainder === "") return { outcome: "empty-answer", reply: "Reply with a mention and your answer." };
+    const choice = /^\d+$/.test(remainder) ? Number(remainder) : undefined;
+    const answer = choice !== undefined && choice >= 1 && choice <= decision.options.length ? decision.options[choice - 1] : remainder;
+    return { outcome: "answered", call: { action: "answer", decisionId: decision.id, text: answer } };
   }
 
   /**
-   * Runs one mission call at the revision stored on the entry, so a replay after a crash meets the mission's recorded receipt.
-   * The revision is stored before the call; a stale revision is replaced by the current one and the call is retried once.
+   * Runs the saved call at its saved revision. The revision is saved before each attempt; a stale revision is replaced by
+   * the current one and the same call is retried once. Any other mission refusal becomes the reply.
    */
-  private async missionAction(issueId: string, entry: IntakeInbound, missionId: string, call: (revision: number) => unknown): Promise<void> {
-    let revision = entry.revision ?? this.currentRevision(missionId);
-    for (let attempt = 1; ; attempt++) {
-      this.rememberRevision(issueId, entry.eventId, revision);
-      try {
-        await call(revision);
-        return;
-      } catch (error) {
-        if (attempt === 1 && error instanceof TeamError && error.code === "stale-mission-revision") {
-          revision = this.currentRevision(missionId);
-          continue;
+  private async perform(record: IntakeRecord, entry: IntakeInbound, saved: SavedCall): Promise<Outcome> {
+    try {
+      const missionId = record.missionId;
+      if (!missionId) throw new TeamError(404, "mission-not-found", "This mission does not exist.");
+      const requestId = deterministicUuid("intake-slack-event", entry.eventId);
+      let revision = saved.revision;
+      for (let attempt = 1; ; attempt++) {
+        const call: SavedCall = { ...saved, revision };
+        this.rememberCall(record.issueId, entry.eventId, call);
+        try {
+          await this.run(missionId, requestId, call);
+          break;
+        } catch (error) {
+          if (attempt === 1 && error instanceof TeamError && error.code === "stale-mission-revision") {
+            revision = this.currentRevision(missionId);
+            continue;
+          }
+          throw error;
         }
-        throw error;
       }
+      return { outcome: OUTCOMES[saved.action] };
+    } catch (error) {
+      if (error instanceof TeamError) return { outcome: "refused", reply: error.message };
+      return { outcome: "error", reply: UNEXPECTED };
     }
+  }
+
+  private run(missionId: string, requestId: string, call: SavedCall): Promise<unknown> {
+    const { revision } = call;
+    if (call.action === "steer") return this.missions.steer(missionId, { requestId, revision, text: call.text! }, "slack");
+    if (call.action === "answer") return this.missions.answer(missionId, call.decisionId!, { requestId, revision, text: call.text! }, "slack");
+    if (call.action === "pause") return this.missions.pause(missionId, { requestId, revision });
+    if (call.action === "resume") return this.missions.resume(missionId, { requestId, revision });
+    return this.missions.cancel(missionId, { requestId, revision });
   }
 
   private currentRevision(missionId: string): number {
@@ -454,10 +509,10 @@ export class IntakeSlackSurface {
     return mission.revision;
   }
 
-  private rememberRevision(issueId: string, eventId: string, revision: number): void {
+  private rememberCall(issueId: string, eventId: string, call: SavedCall): void {
     this.store.update(issueId, draft => {
       const item = draft.inbound.find(candidate => candidate.eventId === eventId);
-      if (item && !item.handledAt) item.revision = revision;
+      if (item && !item.handledAt) item.call = call;
     });
   }
 }

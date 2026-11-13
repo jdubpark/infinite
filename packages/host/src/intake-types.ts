@@ -41,7 +41,11 @@ export interface IntakeMessage {
   /** The last send may have reached Slack; look the key up in the thread before sending again. */
   uncertain?: boolean; nextAttemptAt?: string; ts?: string; error?: string;
 }
-export interface IntakeInbound { eventId: string; ts: string; text: string; receivedAt: string; handledAt?: string; outcome?: string; /** The mission revision the entry's mission call was made at; a replay reuses it. */ revision?: number }
+export interface IntakeInbound {
+  eventId: string; ts: string; text: string; receivedAt: string; handledAt?: string; outcome?: string;
+  /** The mission call chosen for this event, saved before the call; a replay performs exactly this call. */
+  call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel"; decisionId?: string; text?: string; revision: number };
+}
 export interface IntakeComment { id: string; body: string; delivered: boolean; attempts: number; error?: string }
 export interface IntakeRecord {
   issueId: string; identifier: string; url: string; title: string; description: string;

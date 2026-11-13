@@ -32,7 +32,8 @@ export function splitSlackText(text: string, limit = 3000): string[] {
     let rest = line;
     let fenceAfter = nextFence(fence, line);
     while (true) {
-      const reserve = fence !== undefined ? "\n```".length : 0;
+      // Room for the closing fence this line leaves open, or the one the part already needs.
+      const reserve = fence !== undefined || fenceAfter !== undefined ? "\n```".length : 0;
       const separator = lines.length > 0 ? 1 : 0;
       const room = limit - length - separator - reserve;
       if (rest.length <= room) {

@@ -178,7 +178,11 @@ test("a page and its cursor commit together", async () => {
     let writes = 0, armed = false;
     const flaky = { register: (module: Parameters<EvidenceStore["register"]>[0]) => store.register(module), status: () => store.status(),
       read: <T>(fn: Parameters<EvidenceStore["read"]>[0]) => store.read(fn),
-      write: <T>(fn: Parameters<EvidenceStore["write"]>[0]) => { if (armed && ++writes === 2) throw new Error("disk full"); return store.write(fn); },
+      write: <T>(fn: Parameters<EvidenceStore["write"]>[0]) => {
+        // The page's records and cursor are written inside the transaction, then the write fails before commit.
+        if (armed && ++writes === 2) return store.write(tx => { fn(tx); throw new Error("disk full after the page"); });
+        return store.write(fn);
+      },
     } as unknown as EvidenceStore;
     const usage = new UsageService(fixtureConfig(dir), key, manager, flaky);
     armed = true;
@@ -226,10 +230,36 @@ test("an unavailable store never throws", async () => {
     await usage.tick([]);
     assert.deepEqual(usage.session("x"), { measured: false, coverage: "none", unavailable: true });
     assert.throws(() => usage.summary(), (error: unknown) => error instanceof EvidenceError && error.code === "unavailable");
+    assert.deepEqual(usage.sessions(["x"]), usage.sessions([]), "sessions() reads as no sessions");
+    assert.equal(usage.sessions(["x"]).messages, 0);
     const before = warnings.length;
     usage.recordBriefing("demo", "brief", "2026-10-21T05:00:00.000Z", null);
     assert.equal(warnings.length - before, 1, "a lost briefing warns once");
   } finally { console.warn = warn; rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a failed page write makes the ledger unavailable until a tick succeeds", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+  try {
+    let failNext = false;
+    const manager = { events: (_id: string, after: number) => after === 0
+      ? { events: [{ seq: 1, at: NOW.toISOString(), type: "usage", data: usageRow("2026-10-21T01:00:00.000Z", "deepseek-flash", "deepseek", "f1") }], cursor: 1, more: false }
+      : { events: [], cursor: after, more: false } } as unknown as Manager;
+    const flaky = { register: (module: Parameters<EvidenceStore["register"]>[0]) => store.register(module), status: () => store.status(),
+      read: <T>(fn: Parameters<EvidenceStore["read"]>[0]) => store.read(fn),
+      write: <T>(fn: Parameters<EvidenceStore["write"]>[0]) => { if (failNext) { failNext = false; throw new Error("disk full"); } return store.write(fn); },
+    } as unknown as EvidenceStore;
+    const usage = new UsageService(fixtureConfig(dir), key, manager, flaky);
+    const row = { id: "flagged", provider: "opencode", projectId: "demo", createdAt: "2026-10-21T10:00:00.000Z", status: "running", runtime: { nativeUi: "opencode" } } as unknown as UsageSessionRow;
+    failNext = true;
+    await usage.tick([row]);
+    assert.equal(usage.available(), false, "a failed write reads as unavailable");
+    assert.throws(() => usage.summary(NOW), (error: unknown) => error instanceof EvidenceError && error.code === "unavailable");
+    await usage.tick([row]);
+    assert.equal(usage.available(), true, "a clean tick clears the flag");
+    assert.equal(usage.summary(NOW).providers.opencode.spent?.messages, 1, "the totals include the page");
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("a new service resumes from the stored cursors", async () => {
@@ -398,6 +428,9 @@ test("aggregate coverage takes the first lasting gap", () => {
     { coverage: "partial", coverageReason: "running" }, { coverage: "partial", coverageReason: "drain-incomplete" }, { coverage: "partial", coverageReason: "stopped-mid-turn" },
   ]), { coverage: "partial", reason: "drain-incomplete" });
   assert.equal(combineCoverage([{ coverage: "none", coverageReason: "unsupported" }]).coverage, "none");
+  assert.deepEqual(combineCoverage([{ coverage: "complete" }, { coverage: "partial" }]), { coverage: "partial" }, "a gap without a reason stays without one");
+  assert.deepEqual(combineCoverage([{ coverage: "partial", coverageReason: "running" }, { coverage: "partial" }]), { coverage: "partial" });
+  assert.deepEqual(combineCoverage([{ coverage: "partial", coverageReason: "running" }, { coverage: "partial", coverageReason: "running" }]), { coverage: "partial", reason: "running" });
 });
 
 test("task usage carries coverage", async () => {
@@ -515,17 +548,22 @@ test("member coverage is the worst of its sessions", async () => {
     "b-done": [claudeUsage("bd"), coverageEvent({ coverage: "complete" })],
     "b-stop": [claudeUsage("bs"), coverageEvent({ coverage: "partial", reason: "stopped-mid-turn" })],
     "c-none": [coverageEvent({ coverage: "none", reason: "unsupported" })],
+    "d-bare": [claudeUsage("dd"), coverageEvent({ coverage: "partial" })],
   });
   try {
     await usage.tick([
       memberRow("a-open", "running", teamOf("run-a", "m")), memberRow("a-done", "exited", teamOf("run-a", "m")),
       memberRow("b-done", "exited", teamOf("run-b", "m")), memberRow("b-stop", "exited", teamOf("run-b", "m")),
-      memberRow("c-none", "exited", teamOf("run-c", "m")),
+      memberRow("c-none", "exited", teamOf("run-c", "m")), memberRow("d-bare", "exited", teamOf("run-d", "m")),
     ]);
     subset(usage.member("run-a", "m"), { measured: true, coverage: "partial", coverageReason: "running", messages: 2 });
     subset(usage.member("run-b", "m"), { measured: true, coverage: "partial", coverageReason: "stopped-mid-turn", messages: 2 });
     assert.deepEqual(usage.member("run-c", "m"), { measured: false, coverage: "none" });
     assert.deepEqual(usage.member("run-x", "m"), { measured: false, coverage: "none" }, "a member with no session is unmeasured");
+    const bare = usage.member("run-d", "m");
+    subset(bare, { measured: true, coverage: "partial", messages: 1 });
+    assert.equal("coverageReason" in bare, false, "a gap with no reason reports no reason");
+    assert.equal(teamUsage([{ sessionId: "d-bare", runId: "run-d", memberId: "m" }], "claude", usage).rollup.partialMembers, 1);
     const rollup = teamUsage([
       { sessionId: "a-done", runId: "run-a", memberId: "m" }, { sessionId: "b-stop", runId: "run-b", memberId: "m" },
       { sessionId: "c-none", runId: "run-c", memberId: "m" },

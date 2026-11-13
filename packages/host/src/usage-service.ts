@@ -88,8 +88,10 @@ export function combineCoverage(parts: readonly { coverage: UsageCoverage; cover
   const live = parts.filter(part => part.coverage !== "none");
   if (live.length === 0) return { coverage: "none" };
   if (live.every(part => part.coverage === "complete")) return { coverage: "complete" };
-  const reason = live.find(part => part.coverageReason !== undefined && part.coverageReason !== "running")?.coverageReason ?? "running";
-  return { coverage: "partial", reason };
+  // The first gap whose reason is not `running` names the result. A gap with no reason is not running, so it stays without one.
+  const gap = live.find(part => part.coverage === "partial" && part.coverageReason !== "running");
+  if (!gap) return { coverage: "partial", reason: "running" };
+  return gap.coverageReason === undefined ? { coverage: "partial" } : { coverage: "partial", reason: gap.coverageReason };
 }
 
 /**
@@ -103,6 +105,7 @@ export class UsageService {
   private closed = false;
   private ticking = false;
   private imported = false;
+  /** Set by a tick whose store write failed. The ledger reads as unavailable until a tick completes without one. */
   private tickFailed = false;
   private readonly failed = new Set<string>();
   /** When the ledger first saw each covered session listed as exited. Kept in memory only. */
@@ -139,7 +142,9 @@ export class UsageService {
   useResolvers(resolvers: UsageResolvers) { this.resolvers = resolvers; }
 
   /** True when the usage module is ready and the sealed ledger's import has been recorded. */
-  available(): boolean { return this.imported && this.store.status().modules[usageModule.name] === "ready"; }
+  available(): boolean { return this.storeReady() && !this.tickFailed; }
+  /** The store has the usage module and the sealed import is recorded. Ticks run on this, so a failed tick retries. */
+  private storeReady(): boolean { return this.imported && this.store.status().modules[usageModule.name] === "ready"; }
 
   /** Updates a subscription plan override, retaining config as the default. */
   setPlan(accountId: string, planUsd: number | null): "missing" | "metered" | "updated" {
@@ -161,7 +166,7 @@ export class UsageService {
    * without one, the manager is asked. A failed write ends the tick with one warning and never throws.
    */
   async tick(rows?: UsageSessionRow[]) {
-    if (this.ticking || this.closed || !this.available()) return;
+    if (this.ticking || this.closed || !this.storeReady()) return;
     this.ticking = true;
     try {
       const stored = new Map(this.store.read(db => readSessions(db)).map(row => [row.sessionId, row]));
@@ -460,7 +465,8 @@ export class UsageService {
   }
   /** Sum over the measured sessions among `ids`; unmeasured ones contribute nothing. */
   sessions(ids: string[]): UsageTotals {
-    const data = this.snapshot({ sessionIds: ids });
+    let data: Snapshot;
+    try { data = this.snapshot({ sessionIds: ids }); } catch { return sumUsage([]); }
     const measuredIds = new Set(data.sessions.filter(measured).map(session => session.sessionId));
     return sumUsage(this.priced(ids.filter(id => measuredIds.has(id)).flatMap(id => data.bySession.get(id) ?? [])));
   }

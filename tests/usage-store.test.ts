@@ -274,10 +274,21 @@ test("the import maps the sealed ledger", () => {
     assert.equal(unmeasured?.cursor, 0);
     assert.equal(unmeasured?.exited, false);
     assert.equal(store.read(db => importState(db)), "done");
+    // The fold moves on after the import: a newer copy of a record, and a later cursor.
+    store.write(tx => {
+      writeSession(tx, { sessionId: "open-a", provider: "opencode", projectId: "demo", createdAt: AT,
+        team: { runId: "run-1", memberId: "member-a", revision: 1, role: "implementer", taskId: "task-1" }, profileId: "ds" },
+        { coverage: "complete", cursor: 8, seen: 1, refused: 0, exited: true });
+      assert.equal(writeRecord(tx, "open-a", sealed("msg-1", 200)), "replaced");
+    });
     const before = ["usage_meta", "usage_projects", "usage_models", "usage_sessions", "usage_records", "usage_briefings"].map(table => rows(store, table));
-    assert.deepEqual(store.write(tx => importLedger(tx, ledger, "imported")), { sessions: 2, records: 3, briefings: 2, refused: 2 });
+    // A second import, with the same ledger or another outcome, writes nothing.
+    assert.deepEqual(store.write(tx => importLedger(tx, ledger, "imported")), { sessions: 0, records: 0, briefings: 0, refused: 0 });
+    assert.deepEqual(store.write(tx => importLedger(tx, undefined, "absent")), { sessions: 0, records: 0, briefings: 0, refused: 0 });
     const after = ["usage_meta", "usage_projects", "usage_models", "usage_sessions", "usage_records", "usage_briefings"].map(table => rows(store, table));
     assert.deepEqual(after, before);
+    assert.equal(store.read(db => readSessions(db)).find(row => row.sessionId === "open-a")?.cursor, 8);
+    assert.equal(store.read(db => readRecords(db, { sessionIds: ["open-a"] })).some(row => row.record.tokens.input === 200), true);
   } finally {
     store.close();
     f.close();

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -125,6 +125,29 @@ test("the status route and command report the store", { timeout: 60000 }, async 
     rmSync(root, { recursive: true, force: true });
     await host.stop();
   }
+});
+
+test("usage routes answer 503 and change nothing while the ledger is unavailable", { timeout: 90000 }, async () => {
+  const host = await startHost({ config: { usage: { prices: {}, budgets: {}, accounts: {
+    claude: { kind: "subscription", match: ["anthropic/*"], planUsd: 20 },
+  } } } });
+  try {
+    await host.stopApi();
+    const location = join(host.config.stateDir, "evidence");
+    rmSync(location, { recursive: true, force: true });
+    writeFileSync(location, "not a directory");
+    const plan = join(host.config.stateDir, "usage-plans.sealed");
+    const before = existsSync(plan) ? readFileSync(plan) : undefined;
+    await host.start();
+    assert.equal((await host.fetchApi("/usage/models")).status, 503);
+    const put = await host.fetchApi("/usage/accounts/claude/plan", "owner", { planUsd: 12 }, {}, "PUT");
+    assert.equal(put.status, 503);
+    assert.deepEqual(put.body, { error: "The usage ledger is unavailable" });
+    assert.deepEqual(existsSync(plan) ? readFileSync(plan) : undefined, before, "a refused plan override writes nothing");
+    const refresh = await host.fetchApi("/usage/balances/refresh", "owner", {});
+    assert.equal(refresh.status, 503);
+    assert.deepEqual(refresh.body, { error: "The usage ledger is unavailable" });
+  } finally { await host.stop(); }
 });
 
 test("a host with an unusable evidence location still serves and reports the store unavailable", { timeout: 90000 }, async () => {

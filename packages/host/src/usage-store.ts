@@ -432,6 +432,8 @@ export function importState(db: EvidenceDb): "pending" | "done" {
 export function importLedger(tx: EvidenceTx, ledger: SealedLedger | undefined, outcome: "imported" | "absent" | "unreadable"):
   { sessions: number; records: number; briefings: number; refused: number } {
   const counts = { sessions: 0, records: 0, briefings: 0, refused: 0 };
+  // The import runs once. A later call must not rewind cursors or records that the fold wrote since.
+  if (tx.get("SELECT value FROM usage_meta WHERE key=?", SEALED_IMPORT)) return counts;
   if (outcome === "imported" && ledger) {
     const imported = new Set<string>();
     for (const [sessionId, session] of Object.entries(ledger.sessions)) {

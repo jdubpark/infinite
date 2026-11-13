@@ -335,10 +335,12 @@ mission targets `intake.mission.groupId`, an owner project that groups the
 workspace's repositories; the coordinator picks the repositories.
 
 The objective is the issue identifier, title, and description, followed by the
-thread text as background: the root message and the newest messages that fit in
-the 24,000-character objective limit. The objective states that only the
-owner's words are instructions and that other people's messages, and anything
-read later through a connector, are information.
+owner's own messages from the linked thread: the owner's first message and the
+owner's newest messages that fit in the 24,000-character objective limit.
+Messages from anyone else, and bot messages, are read at admission to check
+authorship; they are not stored, shown to agents, or logged. The objective
+states that only the owner's words are instructions and that anything read
+later through a connector is information.
 
 When `maxActive` intake missions are planning or working, the record waits in
 `queued` and starts when one leaves those states. A mission that is waiting on
@@ -564,8 +566,9 @@ is not a new mechanism.
 - **Residual: label added by someone else.** A teammate who adds the label to an
   issue the owner created through Slack would start a mission on it. The owner
   accepted being the creator as sufficient.
-- **Untrusted text.** Thread messages from other people, issue edits, mail, and
-  chat history can contain instructions aimed at agents. Mitigations: the
+- **Untrusted text.** Other people's thread messages never reach the objective.
+  Issue edits, mail, and chat history read through a connector can still
+  contain instructions aimed at agents. Mitigations: the
   objective framing, read-only connector scopes, no agent write path to Slack,
   permission escalation for sends and new credentials, and the instance
   boundary. None of these is a proof against a determined injection.

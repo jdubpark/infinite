@@ -9,6 +9,7 @@ import { projectSourceSchema, teamProjectSchema, type ProjectSource, type TeamCo
 import { TeamError, teamCommand } from "./team-workspace.js";
 import { unseal, writeSealed } from "./vault.js";
 import { homeRelativePath } from "./mirrored-projects.js";
+import { autonomyModeSchema, autonomyOf, enrollmentAutonomy, type AutonomyMode, type AutonomySource } from "./autonomy.js";
 
 const enrollmentTeamSchema = teamProjectSchema;
 const enrollmentLinearSchema = z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict();
@@ -19,8 +20,12 @@ export const repoEnrollmentRequestSchema = z.object({
   linear: z.union([enrollmentLinearSchema, z.null()]).optional(),
   teamwork: z.union([z.string().refine(homeRelativePath), z.null()]).optional(),
   source: projectSourceSchema.optional(),
+  autonomy: autonomyModeSchema.optional(),
 }).strict();
 export type RepoEnrollmentRequest = z.infer<typeof repoEnrollmentRequestSchema>;
+
+export const autonomyChangeSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), mode: autonomyModeSchema }).strict();
+export type AutonomyChange = z.infer<typeof autonomyChangeSchema>;
 
 export interface RepoEnrollmentView {
   id: string;
@@ -33,6 +38,8 @@ export interface RepoEnrollmentView {
   revision: number;
   execution: "cloud" | "local";
   hostSetup: { ready: boolean; missing: string[] };
+  autonomy: AutonomyMode;
+  autonomySource: AutonomySource;
 }
 
 interface StoredEnrollment {
@@ -43,6 +50,8 @@ interface StoredEnrollment {
   teamwork?: string | null;
   /** Absent on enrollments saved before source modes existed; those projects follow the laptop. */
   source?: ProjectSource;
+  /** Absent on enrollments saved before autonomy modes existed; they read the host default. */
+  autonomy?: AutonomyMode;
   revision: number;
 }
 interface Receipt { fingerprint: string; projectId: string; path: string; response: RepoEnrollmentView }
@@ -113,12 +122,53 @@ export class RepoEnrollmentService {
   }
 
   async put(projectId: string, input: RepoEnrollmentRequest): Promise<RepoEnrollmentView> {
+    return this.serialized(() => this.putLocked(projectId, input));
+  }
+
+  /** Owner-only mode change. It writes one revision and runs no Git command. */
+  async setAutonomy(projectId: string, input: AutonomyChange): Promise<RepoEnrollmentView> {
+    return this.serialized(() => this.setAutonomyLocked(projectId, input));
+  }
+
+  private async serialized<T>(run: () => Promise<T>): Promise<T> {
     const previous = this.mutation;
     let release!: () => void;
     this.mutation = new Promise<void>(resolve => { release = resolve; });
     await previous;
-    try { return await this.putLocked(projectId, input); }
+    try { return await run(); }
     finally { release(); }
+  }
+
+  private async setAutonomyLocked(projectId: string, input: AutonomyChange): Promise<RepoEnrollmentView> {
+    const change = autonomyChangeSchema.parse(input);
+    const project = this.project(projectId);
+    const path = this.projectPath(project);
+    const requestFingerprint = createHash("sha256").update(JSON.stringify({ action: "autonomy", ...change })).digest("hex");
+    const prior = this.store.requests[change.requestId];
+    if (prior) {
+      if (prior.fingerprint !== requestFingerprint || prior.projectId !== projectId)
+        throw new TeamError(409, "request-conflict", "This request ID belongs to a different repository enrollment request.");
+      if (prior.path !== path) throw this.pathMismatch();
+      return structuredClone(prior.response);
+    }
+
+    const current = this.store.projects[projectId];
+    if (!current) throw new TeamError(409, "autonomy-requires-enrollment", "Only a repository enrolled with infinite repo init has an autonomy mode. Other projects stay supervised.");
+    this.assertPathBinding(project, current);
+    if (change.revision !== current.revision) throw new TeamError(409, "stale-enrollment-revision", "The repository enrollment changed. Refresh it before saving.");
+
+    const entry: StoredEnrollment = { ...current, autonomy: change.mode, revision: current.revision + 1 };
+    const applied = enrollmentAutonomy(entry, this.config).mode;
+    const response = this.view({ ...project, autonomy: applied }, entry.revision, entry);
+    const next: EnrollmentStore = {
+      version: 1,
+      projects: { ...this.store.projects, [projectId]: entry },
+      requests: { ...this.store.requests, [change.requestId]: { fingerprint: requestFingerprint, projectId, path, response } },
+    };
+    writeSealed(this.file, this.key, "repo-enrollments", next);
+    this.store = next;
+    project.autonomy = applied;
+    return structuredClone(response);
   }
 
   private async putLocked(projectId: string, input: RepoEnrollmentRequest): Promise<RepoEnrollmentView> {
@@ -157,8 +207,10 @@ export class RepoEnrollmentService {
       linear: request.linear === undefined ? inheritedLinear : request.linear,
       ...(request.teamwork !== undefined ? { teamwork: request.teamwork === null ? null : this.relativeTeamworkPath(teamworkPath!) } : current?.teamwork !== undefined ? { teamwork: current.teamwork } : project.teamworkDir ? { teamwork: this.relativeTeamworkPath(teamworkPath!) } : {}),
       ...(request.source ? { source: structuredClone(request.source) } : current?.source ? { source: current.source } : {}),
+      ...(request.autonomy !== undefined ? { autonomy: request.autonomy } : current?.autonomy !== undefined ? { autonomy: current.autonomy } : {}),
       revision: nextRevision,
     };
+    const applied = enrollmentAutonomy(entry, this.config).mode;
     const prospective: Config = { ...this.config, projects: this.config.projects.map(item => item.id === projectId ? { ...item, team: entry.team, ...(entry.teamwork ? { teamworkDir: teamworkPath } : {}), ...(entry.linear === null ? { linear: undefined } : entry.linear ? { linear: entry.linear } : {}) } : item) };
     try { validateLinearConfig(prospective); }
     catch { throw new TeamError(409, "linear-configuration-invalid", "The requested Linear mapping conflicts with the host credential or protected workspace paths."); }
@@ -168,6 +220,7 @@ export class RepoEnrollmentService {
 
     const responseProject: Project = { ...project, team: entry.team as Project["team"] };
     if (entry.source) responseProject.source = entry.source; else delete responseProject.source;
+    responseProject.autonomy = applied;
     if (entry.teamwork) responseProject.teamworkDir = teamworkPath;
     else delete responseProject.teamworkDir;
     if (entry.linear) responseProject.linear = entry.linear;
@@ -182,6 +235,7 @@ export class RepoEnrollmentService {
     this.store = next;
     Object.assign(project, { team: entry.team });
     if (entry.source) project.source = entry.source; else delete project.source;
+    project.autonomy = applied;
     if (entry.teamwork) project.teamworkDir = teamworkPath;
     else delete project.teamworkDir;
     if (entry.linear === null) delete project.linear;
@@ -260,6 +314,8 @@ export class RepoEnrollmentService {
       revision,
       execution: this.config.environment === "cloud" ? "cloud" : "local",
       hostSetup: { ready: missing.length === 0, missing },
+      autonomy: autonomyOf(project),
+      autonomySource: project.autonomy === undefined ? "not-enrolled" : saved?.autonomy !== undefined ? "saved" : "host-default",
     };
   }
 
@@ -279,6 +335,7 @@ export class RepoEnrollmentService {
     } catch { return; }
     project.team = enrollment.team as Project["team"];
     if (enrollment.source) project.source = enrollment.source; else delete project.source;
+    project.autonomy = enrollmentAutonomy(enrollment, this.config).mode;
     if (Object.hasOwn(enrollment, "linear")) {
       if (enrollment.linear) project.linear = enrollment.linear;
       else delete project.linear;

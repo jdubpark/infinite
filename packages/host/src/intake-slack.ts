@@ -232,7 +232,8 @@ export class IntakeSlackSurface {
       // Posted once: the key exists after the first hold, so a later hold reason posts nothing.
       add("ack", "ack", `Received ${title}. It has not started: ${draft.holdReason}\nI'll post questions and the result here once it starts.`);
     }
-    const ack = draft.messages.find(message => message.key === "ack");
+    // A split acknowledgement is decided by its first part.
+    const ack = draft.messages.find(message => message.key === "ack" || message.key === "ack#1");
     if (draft.state === "started" && ack && !ack.text.startsWith("Started on ")) {
       add("started", "started", `Started on ${draft.identifier}.`);
     }

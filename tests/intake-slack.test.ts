@@ -980,6 +980,43 @@ test("a request that starts on its first attempt gets one acknowledgement", { ti
   } finally { await close(); }
 });
 
+/** A title long enough that every acknowledgement naming it is split into parts. */
+const LONG_TITLE = "Export fails on empty rows ".repeat(120).trim();
+const sentMessages = (s: Awaited<ReturnType<typeof surfaceFor>>, count: number) =>
+  waitFor(async () => s.store.get(ISSUE)!.messages, list => list.length >= count && list.every(message => message.status === "sent"), 15000);
+
+test("a held request whose notice is split into parts gets one started line when it starts", { timeout: 90000 }, async () => {
+  const { sh, s, close } = await scriptedSurface();
+  try {
+    const notice = splitSlackText(`Received TEST-1 "${LONG_TITLE}". It has not started: ${HELD}\nI'll post questions and the result here once it starts.`);
+    assert.ok(notice.length > 1, "The notice is split");
+    s.store.create(intakeRecord(ISSUE, "queued", { thread: BINDING, holdReason: HELD, title: LONG_TITLE }));
+    await s.surface.start(); await s.connected();
+    await sentMessages(s, notice.length);
+    assert.deepEqual(s.texts(), notice);
+    const { id } = await sh.create();
+    s.store.update(ISSUE, record => { record.state = "started"; delete record.holdReason; record.missionId = id; });
+    await waitFor(async () => s.texts(), list => list.length > notice.length, 15000);
+    await delay(300);
+    assert.deepEqual(s.texts(), [...notice, "Started on TEST-1."]);
+  } finally { await close(); }
+});
+
+test("a request that starts on its first attempt with a split acknowledgement gets no separate started line", { timeout: 90000 }, async () => {
+  const { sh, s, close } = await scriptedSurface();
+  try {
+    const ack = splitSlackText(`Started on TEST-1 "${LONG_TITLE}". I'll post questions and the result here.\nReply with a mention to answer or steer.`);
+    assert.ok(ack.length > 1, "The acknowledgement is split");
+    s.store.create(intakeRecord(ISSUE, "queued", { thread: BINDING, title: LONG_TITLE }));
+    await s.surface.start(); await s.connected();
+    const { id } = await sh.create();
+    s.store.update(ISSUE, record => { record.state = "started"; record.missionId = id; });
+    await sentMessages(s, ack.length);
+    await delay(300);
+    assert.deepEqual(s.texts(), ack);
+  } finally { await close(); }
+});
+
 test("a record over the message bound keeps its composed messages, so nothing is posted again", { timeout: 60000 }, async () => {
   const { s, close } = await scriptedSurface();
   try {

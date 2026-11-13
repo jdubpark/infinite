@@ -72,6 +72,18 @@ function slackMilliseconds(ts: string): number {
   return Number(seconds) * 1000 + Number(fraction.slice(0, 3).padEnd(3, "0"));
 }
 
+const summaryName = /^[A-Za-z][A-Za-z0-9]{0,39}$/, summaryCode = /^[A-Z][A-Z0-9_]{0,39}$/;
+/**
+ * A failure as text that may be shown or stored: the error's name and, when it has one, its code. The message is
+ * left out because it can carry local paths or addresses. The full error goes to the host log.
+ */
+export function failureSummary(error: unknown): string {
+  if (!(error instanceof Error)) return "Error";
+  const name = summaryName.test(error.name) ? error.name : "Error";
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && summaryCode.test(code) ? `${name} (${code})` : name;
+}
+
 function outcomeBody(mission: Mission): string {
   if (mission.status === "ready-for-review")
     return sharedText(`Infinite agent report: ready for review.${mission.result?.summary ? `\n\n${mission.result.summary}` : ""}`);
@@ -85,6 +97,7 @@ export class IntakeService {
   private closed = false;
   private inFlight?: Promise<void>;
   private lastError?: { at: string; step: string; message: string };
+  private readonly log: (line: string, error: unknown) => void;
   private readonly pollMs: number;
 
   constructor(
@@ -92,9 +105,10 @@ export class IntakeService {
     private readonly store: IntakeStore,
     private readonly missions: MissionService,
     private readonly linear: IntakeLinear,
-    private readonly options: { threads?: IntakeThreadReader; pollMs?: number; create?: (request: CreateMission, origin: MissionOrigin) => Promise<Mission> } = {},
+    private readonly options: { threads?: IntakeThreadReader; pollMs?: number; create?: (request: CreateMission, origin: MissionOrigin) => Promise<Mission>; log?: (line: string, error: unknown) => void } = {},
   ) {
     this.pollMs = options.pollMs ?? 30000;
+    this.log = options.log ?? ((line, error) => console.warn(line, error));
   }
 
   enabled(): boolean { return this.config.intake !== undefined; }
@@ -159,9 +173,11 @@ export class IntakeService {
     try { await run(); } catch (error) { this.fail(step, error, identifier); }
   }
 
+  /** Records the failure's summary; the full error goes to the host log only, never to a record or the API. */
   private fail(step: string, error: unknown, identifier?: string): void {
-    const text = sharedText(error instanceof Error ? error.message : "The step failed.").slice(0, 500);
-    this.lastError = { at: new Date().toISOString(), step, message: identifier ? `${identifier}: ${text}` : text };
+    const summary = failureSummary(error);
+    this.log(identifier ? `Intake ${step} failed for ${identifier}.` : `Intake ${step} failed.`, error);
+    this.lastError = { at: new Date().toISOString(), step, message: identifier ? `${identifier}: ${summary}` : summary };
   }
 
   /** The newest failure of any step; the cycle keeps running past it. */
@@ -193,8 +209,8 @@ export class IntakeService {
 
   private async admitIssue(issue: IntakeIssue): Promise<void> {
     const intake = this.config.intake!;
-    const creatorId = intake.linear.creatorId;
-    if (creatorId !== undefined && issue.creatorId !== creatorId) return this.skip(issue, "creator-mismatch");
+    // The creator is required in configuration. A missing creator on the issue is a mismatch.
+    if (issue.creatorId !== intake.linear.creatorId) return this.skip(issue, "creator-mismatch");
     let messages: SlackThreadMessage[] | undefined;
     if (intake.requireSlackThread) {
       if (!issue.thread) return this.skip(issue, "no-slack-thread");
@@ -205,10 +221,7 @@ export class IntakeService {
         if (Date.now() - Date.parse(issue.createdAt) < threadUnreadableMs) return;
         return this.skip(issue, "thread-unreadable");
       }
-      // With a creator, the owner must have mentioned the agent before filing. Without one, the thread alone decides:
-      // the newest mention of the agent before filing must be the owner's.
-      const authored = creatorId !== undefined ? this.ownerMentionedBeforeFiling(read, issue) : this.newestMentionIsOwners(read, issue);
-      if (!authored) return this.skip(issue, "no-owner-mention");
+      if (!this.ownerMentionedBeforeFiling(read, issue)) return this.skip(issue, "no-owner-mention");
       messages = read;
     } else if (issue.thread && this.options.threads) {
       // Background only: a failed or unreadable read admits the issue without a thread section, with no wait or retry.
@@ -216,9 +229,8 @@ export class IntakeService {
     }
     const rule = [
       `label "${intake.linear.label}"`,
-      ...(creatorId !== undefined ? ["owner creator"] : []),
-      ...(creatorId !== undefined && intake.requireSlackThread ? ["owner Slack mention"] : []),
-      ...(creatorId === undefined ? [`newest Slack mention of Linear's agent before creation is the owner's`] : []),
+      "owner creator",
+      ...(intake.requireSlackThread ? ["owner Slack mention"] : []),
     ].join(", ");
     const now = new Date().toISOString();
     const request: CreateMission = {
@@ -242,24 +254,13 @@ export class IntakeService {
     } catch { return undefined; }
   }
 
-  /** Mentions of Linear's agent by humans, timestamped strictly before the issue was filed, oldest first. */
-  private mentionsBeforeFiling(thread: SlackThreadMessage[], issue: IntakeIssue): SlackThreadMessage[] {
-    const agent = this.config.intake!.slack?.linearAgentUserId;
-    if (agent === undefined) return [];
-    const mention = `<@${agent}>`, filed = Date.parse(issue.createdAt);
-    return thread
-      .filter(message => message.botId === undefined && message.text.includes(mention) && slackMilliseconds(message.ts) < filed)
-      .sort((a, b) => slackMilliseconds(a.ts) - slackMilliseconds(b.ts));
-  }
-
+  /** True when a human message in the thread mentions Linear's agent and is timestamped strictly before filing. Order is not used. */
   private ownerMentionedBeforeFiling(thread: SlackThreadMessage[], issue: IntakeIssue): boolean {
-    const owner = this.config.intake!.slack?.ownerUserId;
-    return this.mentionsBeforeFiling(thread, issue).some(message => message.user === owner);
-  }
-
-  private newestMentionIsOwners(thread: SlackThreadMessage[], issue: IntakeIssue): boolean {
-    const newest = this.mentionsBeforeFiling(thread, issue).at(-1);
-    return newest !== undefined && newest.user === this.config.intake!.slack?.ownerUserId;
+    const slack = this.config.intake!.slack;
+    if (slack?.linearAgentUserId === undefined || slack.ownerUserId === undefined) return false;
+    const mention = `<@${slack.linearAgentUserId}>`, filed = Date.parse(issue.createdAt);
+    return thread.some(message => message.user === slack.ownerUserId && message.botId === undefined
+      && message.text.includes(mention) && slackMilliseconds(message.ts) < filed);
   }
 
   private skip(issue: IntakeIssue, reason: IntakeSkipReason): void {
@@ -294,8 +295,7 @@ export class IntakeService {
         if (error instanceof TeamError) this.hold(record.issueId, error.message);
         else {
           this.fail("start", error, record.identifier);
-          const reason = error instanceof Error ? error.message : "The step failed.";
-          this.hold(record.issueId, `The start failed and will be retried: ${sharedText(reason).slice(0, 200)}`);
+          this.hold(record.issueId, `The start failed and will be retried: ${failureSummary(error)}`);
         }
       }
     }
@@ -374,7 +374,7 @@ export class IntakeService {
         try {
           await this.linear.comment(record.issueId, { id: pending.id, body: pending.body });
         } catch (error) {
-          const message = sharedText(error instanceof Error ? error.message : "The Linear comment could not be sent.").slice(0, 500);
+          const message = error instanceof TeamError ? error.message : failureSummary(error);
           this.fail("deliver", error, record.identifier);
           this.attemptSync("deliver", () => this.store.update(record.issueId, next => {
             const comment = next.comments[kind];

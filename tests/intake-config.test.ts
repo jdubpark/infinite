@@ -76,8 +76,10 @@ test("a required Slack thread needs the Slack block and Linear's agent ID", () =
   assert.throws(() => validate({ slack: undefined, requireSlackThread: true }), /requireSlackThread needs intake\.slack/);
   assert.throws(() => validate({ slack: { ...slack, linearAgentUserId: undefined } }), /linearAgentUserId/);
 });
-test("intake needs one authorship gate", () =>
-  assert.throws(() => validate({ linear: { ...base.linear, creatorId: undefined }, requireSlackThread: false }), /creator ID or a required Slack thread/));
+test("intake refuses a configuration without the owner's creator ID when a thread is required", () =>
+  assert.throws(() => validate({ linear: { ...base.linear, creatorId: undefined }, requireSlackThread: true }), /creatorId/));
+test("intake refuses a configuration without the owner's creator ID when no thread is required", () =>
+  assert.throws(() => validate({ linear: { ...base.linear, creatorId: undefined }, requireSlackThread: false }), /creatorId/));
 test("binding by mention excludes a required thread", () => assert.throws(() => validate({ slack: { ...slack, bindByMention: true } }), /bindByMention/));
 test("Slack token files are private and outside runtime state", () => {
   assert.throws(() => validate({ slack: { ...slack, botTokenFile: worldReadable } }), /private 0600 file/);

@@ -16,6 +16,7 @@ import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
+import type { Blackboard } from "./evidence/blackboard.js";
 import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
@@ -48,6 +49,8 @@ type TeamServiceOptions = {
   volumeUsage?: (path: string) => Promise<VolumeUsage>;
   /** Run events for the evidence store. Without it no record gains a ledger field and nothing is emitted. */
   events?: EventOutbox;
+  /** Host entries and launch sizes for the blackboard. Without it no entry is written and no size is recorded. */
+  entries?: Blackboard;
 };
 type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
   /** When a record removal first waited for its events to reach the evidence store. */
@@ -56,6 +59,8 @@ type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedA
 const REMOVAL_RETRY_MS = 5 * 60_000;
 /** A run's record waits at most this long for its events to reach the evidence store before retention removes it. */
 const EVIDENCE_WAIT_MS = 24 * 3600_000;
+/** Backlog runs whose missed blackboard entries one scheduler tick retries. */
+const ENTRY_DRAIN_RUNS = 4;
 const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
 /** Event kinds whose drop has been logged; one line per kind for the life of the process. */
 const droppedEventKinds = new Set<string>();
@@ -368,6 +373,8 @@ export class TeamService {
   private running = false;
   private closed = false;
   private tickQueued = false;
+  /** Runs whose blackboard entries are not all stored yet. In memory only: the drain retries them without a save. */
+  private readonly entryBacklog = new Set<string>();
   private readonly commands = new Map<string, AbortController>();
   private readonly removingRuns = new Set<string>();
   private readonly removalTasks = new Set<Promise<void>>();
@@ -530,6 +537,13 @@ export class TeamService {
     }
     // Events a previous process sealed but did not store go out now. Nothing is saved here.
     if (this.options?.events) for (const stored of this.records.values()) if (stored.outbox?.length) this.flushOutbox(stored);
+    // Entries that a previous process did not store are retried: every retained run joins the backlog, active runs
+    // first, because a run can settle in the very save whose entry write was lost. Nothing is saved here.
+    if (this.options?.entries) {
+      for (const stored of this.records.values()) if (activeTeamRun(stored.run.status)) this.entryBacklog.add(stored.run.id);
+      for (const stored of this.records.values()) this.entryBacklog.add(stored.run.id);
+      this.drainEntries();
+    }
   }
   /** The usage ledger this service prices member usage from; its tick also drives the ledger's reads. */
   useUsage(service: UsageService) { this.usage = service; }
@@ -682,6 +696,41 @@ export class TeamService {
     stored.run.updatedAt = timestamp();
     writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored);
     if (this.options?.events) this.flushOutbox(stored);
+    this.mirrorEntries(stored.run);
+  }
+  /**
+   * Mirrors the run's entries right after its sealed write, and keeps the run in the backlog while some are not
+   * stored. Only a save may pass the live run: here it equals the record just sealed. Never throws.
+   */
+  private mirrorEntries(run: TeamRun) {
+    const entries = this.options?.entries;
+    if (!entries) return;
+    if (entries.mirror(run)) this.entryBacklog.delete(run.id);
+    else this.entryBacklog.add(run.id);
+  }
+  /**
+   * Retries a few backlog runs from their sealed records. It never reads a live run: a check's result reaches the
+   * live run a moment before its save, and an entry must not exist for a state the record does not hold.
+   * It stops while its own writes fail, saves nothing, and changes no record.
+   */
+  private drainEntries() {
+    const entries = this.options?.entries;
+    if (!entries || this.entryBacklog.size === 0) return;
+    for (const id of [...this.entryBacklog].slice(0, ENTRY_DRAIN_RUNS)) {
+      if (!entries.retryable()) return;
+      this.entryBacklog.delete(id);
+      if (!this.records.has(id)) continue;
+      // A run that waits out its own failed write goes to the end without a read, so it does not hold the others back.
+      if (entries.held(id)) { this.entryBacklog.add(id); continue; }
+      const run = this.sealedRun(id);
+      // An unreadable record leaves the backlog. Its next save adds it again.
+      if (run && entries.retry(run) !== "done") this.entryBacklog.add(id);
+    }
+  }
+  /** The run as its sealed record file holds it, or undefined when the file cannot be read. */
+  private sealedRun(id: string): TeamRun | undefined {
+    try { return unseal<Stored>(this.key, `team:${id}`, readFileSync(join(this.directory, `${id}.sealed`), "utf8")).run; }
+    catch { return undefined; }
   }
   /** Emits run.blocked or run.settled when the run status differs from the status the ledger last saw. */
   private emitStatusEvents(stored: Stored, statusAt: string) {
@@ -1006,6 +1055,7 @@ export class TeamService {
     this.commands.get(stored.run.id)?.abort();
     this.commands.delete(stored.run.id);
     this.records.delete(stored.run.id);
+    this.entryBacklog.delete(stored.run.id);
     // deleteRun never throws. A failed delete is repeated by the hourly sweep, so the removal does not wait on it.
     this.evidence?.deleteRun(stored.run.id);
     return finalView;
@@ -1771,6 +1821,7 @@ export class TeamService {
             }
           }
           for (const stored of this.records.values()) await this.step(stored);
+          this.drainEntries();
         }
         finally { this.tickQueued = false; }
       }).catch(() => { this.tickQueued = false; });
@@ -3925,7 +3976,9 @@ export class TeamService {
         this.save(stored);
       }
       const configuredProject = stored.run.handoff?.project ?? this.config.projects.find(project => project.id === stored.run.projectId)?.team;
-      await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run)), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
+      const launchSeq = this.options?.entries?.launchMark(stored.run.id);
+      const contextBytes = await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run)), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
+      this.options?.entries?.recordLaunch(stored.run, member, { launchSeq, promptBytes: Buffer.byteLength(member.prompt, "utf8"), contextBytes });
     }
     let result;
     const request = { requestId: member.sessionId, provider: member.provider ?? stored.run.provider,

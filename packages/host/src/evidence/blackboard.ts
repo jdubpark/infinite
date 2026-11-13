@@ -31,6 +31,8 @@ export type MemberContextUsage = {
 };
 
 type Known = "stored" | "refused";
+/** `done`: nothing is left to store. `more`: sources remain. `held`: the run waits out a failed write. */
+type MirrorResult = "done" | "more" | "held" | "failed" | "invalid" | "unready";
 type Pending = { id: string; entry: HostEntry; json: string };
 type EntryRow = {
   seq: number;
@@ -107,7 +109,7 @@ export class Blackboard {
   private readonly now: () => number;
   private readonly known = new Map<string, Map<string, Known>>();
   private readonly failedAt = new Map<string, number>();
-  private lastFailedAt: number | undefined;
+  private retryFailedAt: number | undefined;
   private readonly warned = new Set<HostEntryKind>();
   private refused = 0;
 
@@ -126,16 +128,42 @@ export class Blackboard {
    */
   mirror(run: TeamRun): boolean {
     try {
-      return this.mirrorRun(run);
+      return this.mirrorRun(run) === "done";
     } catch {
       return false;
     }
   }
 
-  /** False when the store is not ready, or when a write of this blackboard failed under a minute ago. Never throws. */
-  writable(): boolean {
+  /**
+   * `mirror` for the retry pass. `done`: nothing is left to store, or the value is not a run record, so a retry
+   * cannot help. `more`: sources remain (a batch limit, a held run, a store that is not ready). `failed`: a write
+   * was tried now and failed, or the pass threw. Only `failed` starts the retry pause. Never throws.
+   */
+  retry(run: TeamRun): "done" | "more" | "failed" {
     try {
-      return this.ready() && !this.recent(this.lastFailedAt, this.now());
+      const result = this.mirrorRun(run);
+      if (result === "done" || result === "invalid") return "done";
+      if (result !== "failed") return "more";
+    } catch {
+      // A pass that throws would throw again at once, so it pauses like a failed write.
+    }
+    this.retryFailedAt = this.now();
+    return "failed";
+  }
+
+  /** False when the store is not ready, or when a retry failed under a minute ago. Never throws. */
+  retryable(): boolean {
+    try {
+      return this.ready() && !this.recent(this.retryFailedAt, this.now());
+    } catch {
+      return false;
+    }
+  }
+
+  /** True while the run's last failed write is under a minute old: a write for it would not be tried. Never throws. */
+  held(runId: string): boolean {
+    try {
+      return this.recent(this.failedAt.get(runId), this.now());
     } catch {
       return false;
     }
@@ -186,7 +214,7 @@ export class Blackboard {
           tx.seal("member_scopes", member.memberId, scope),
         );
       });
-      if (!written) this.failed(run.id, time);
+      if (!written) this.failedAt.set(run.id, time);
       return written;
     } catch {
       return false;
@@ -264,11 +292,12 @@ export class Blackboard {
     })));
   }
 
-  private mirrorRun(run: TeamRun): boolean {
-    if (!this.ready() || !isRunShape(run)) return false;
+  private mirrorRun(run: TeamRun): MirrorResult {
+    if (!this.ready()) return "unready";
+    if (!isRunShape(run)) return "invalid";
     const runId = run.id;
     const time = this.now();
-    if (this.recent(this.failedAt.get(runId), time)) return false;
+    if (this.recent(this.failedAt.get(runId), time)) return "held";
 
     let known = this.known.get(runId);
     if (known === undefined) {
@@ -295,15 +324,15 @@ export class Blackboard {
         for (const item of pending) this.insert(tx, item);
       });
       if (!written) {
-        this.failed(runId, time);
-        return false;
+        this.failedAt.set(runId, time);
+        return "failed";
       }
       this.failedAt.delete(runId);
       for (const item of pending) known.set(item.id, "stored");
     }
 
     // A refused source counts as done: the same body would be refused again.
-    return hostEntrySources(run).every(source => known.get(hostEntryId(runId, kindOf(source), source)) !== undefined);
+    return hostEntrySources(run).every(source => known.get(hostEntryId(runId, kindOf(source), source)) !== undefined) ? "done" : "more";
   }
 
   /** True while a failure at `failedAt` is under a minute old. A clock that moved back ends the wait. */
@@ -311,11 +340,6 @@ export class Blackboard {
     return failedAt !== undefined && time >= failedAt && time - failedAt < MIRROR_RETRY_MS;
   }
 
-  /** A failed write holds back the run for a minute, and marks the store as not writable for the same time. */
-  private failed(runId: string, time: number): void {
-    this.failedAt.set(runId, time);
-    this.lastFailedAt = time;
-  }
 
   /** The built entry and its canonical body, or undefined when the body cannot be stored. Refusals are counted. */
   private build(run: TeamRun, source: string, at: string, kind: HostEntryKind): { entry: HostEntry; json: string } | undefined {

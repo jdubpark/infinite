@@ -314,37 +314,74 @@ test("a failed write also holds back launch sizes", () => {
   }
 });
 
-test("writable follows the store and the last failure", () => {
+test("the retry pass pauses after its own failed write", () => {
   const f = fixture(), g = fixture();
   try {
     const store = open(f, { busyTimeoutMs: 0 });
     let clock = 1_000_000;
     const board = new Blackboard(store, { now: () => clock });
-    assert.equal(board.writable(), true);
+    const run = hostEntryRun();
+    assert.equal(board.retryable(), true);
     const blocker = new DatabaseSync(f.path);
     try {
       blocker.exec("BEGIN IMMEDIATE");
-      assert.equal(board.mirror(hostEntryRun()), false);
+      assert.equal(board.retry(run), "failed");
     } finally {
       blocker.exec("ROLLBACK");
       blocker.close();
     }
-    // One failed write pauses every run, not only the one that failed.
-    assert.equal(board.writable(), false);
+    assert.equal(board.retryable(), false);
     clock += 59_000;
-    assert.equal(board.writable(), false);
+    assert.equal(board.retryable(), false);
     clock += 2_000;
-    assert.equal(board.writable(), true);
+    assert.equal(board.retryable(), true);
+    assert.equal(board.retry(run), "done");
+    assert.equal(rowCount(store, "entries"), 8);
+    // A value that is not a run record cannot be helped by a retry.
+    assert.equal(board.retry(null as never), "done");
+    assert.equal(board.retryable(), true);
     store.close();
-    assert.equal(board.writable(), false, "a closed store is not writable");
+    assert.equal(board.retryable(), false, "a closed store is not retryable");
 
     open(g).close();
     const wrong = open(g, { key: randomBytes(32) });
-    assert.equal(new Blackboard(wrong).writable(), false);
+    assert.equal(new Blackboard(wrong).retryable(), false);
     wrong.close();
   } finally {
     f.close();
     g.close();
+  }
+});
+
+test("a failed save write holds back only its own run", () => {
+  const f = fixture();
+  try {
+    const store = open(f, { busyTimeoutMs: 0 });
+    let clock = 1_000_000;
+    const board = new Blackboard(store, { now: () => clock });
+    const run = hostEntryRun();
+    const other = { ...hostEntryRun(), id: randomUUID() };
+    const blocker = new DatabaseSync(f.path);
+    try {
+      blocker.exec("BEGIN IMMEDIATE");
+      assert.equal(board.mirror(run), false);
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
+    }
+    assert.equal(board.held(run.id), true);
+    assert.equal(board.held(other.id), false);
+    // A save that fails says nothing about the other runs, so the retry pass goes on.
+    assert.equal(board.retryable(), true);
+    assert.equal(board.retry(run), "more", "a held run is not written");
+    assert.equal(rowCount(store, "entries"), 0);
+    assert.equal(board.retry(other), "done");
+    clock += 61_000;
+    assert.equal(board.held(run.id), false);
+    assert.equal(board.retry(run), "done");
+    store.close();
+  } finally {
+    f.close();
   }
 });
 

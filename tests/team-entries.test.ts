@@ -310,11 +310,9 @@ test("a settled run's missed entries are written after a restart", async () => {
     const before = recordBytes(f);
 
     const entries = new Blackboard(good);
-    const second = f.openTeam({ entries });
-    assert.equal(entries.list(f.run.id).entries.length, 0, "a settled run waits for the drain");
-    internal(second).drainEntries();
+    f.openTeam({ entries });
     const [direction] = entries.list(f.run.id, { kinds: ["direction"] }).entries;
-    assert.ok(direction, "the drain writes the missed entry");
+    assert.ok(direction, "the restart writes the settled run's missed entry");
     assert.deepEqual(entries.get(f.run.id, direction.entryId)!.body, { source: "steering", text: "Keep the API stable" });
     assert.deepEqual(recordBytes(f), before, "the drain saves nothing");
   } finally { good.close(); bad.close(); f.close(); }
@@ -355,32 +353,108 @@ test("a failing store stops the drain after one write", async () => {
     let clock = Date.now();
     const entries = new Blackboard(store, { now: () => clock });
     const calls: string[] = [];
-    const mirror = entries.mirror.bind(entries);
-    entries.mirror = run => { calls.push(run.id); return mirror(run); };
+    const retry = entries.retry.bind(entries);
+    entries.retry = run => { const result = retry(run); calls.push(result); return result; };
     f.writeTeam();
     const settled = Array.from({ length: 6 }, (_, index) => writeSettledRun(f, `Direction ${index}`));
-    const teams = f.openTeam({ entries });
-    calls.length = 0;
-    const scheduler = internal(teams);
+    // The lock is held while the service starts, so its first pass fails once and leaves every run waiting.
     const blocker = new DatabaseSync(evidenceDatabasePath(f.config.stateDir));
+    let teams: TeamService;
     try {
       blocker.exec("BEGIN IMMEDIATE");
+      teams = f.openTeam({ entries });
+      // The fixture's own run is active, so it comes first, and it has nothing to store.
+      assert.deepEqual(calls, ["done", "failed"], "the start's pass stops at its first failed write");
+      clock += 61_000;
+      calls.length = 0;
+      const scheduler = internal(teams);
       scheduler.drainEntries();
-      assert.equal(calls.length, 1, "one failed write ends the pass");
+      assert.deepEqual(calls, ["failed"], "one failed write ends the pass");
       scheduler.drainEntries();
-      assert.equal(calls.length, 1, "the same minute costs nothing more");
+      assert.deepEqual(calls, ["failed"], "the same minute costs nothing more");
     } finally {
       blocker.exec("ROLLBACK");
       blocker.close();
     }
+    const scheduler = internal(teams);
     clock += 61_000;
+    calls.length = 0;
+    // The six settled runs wait.
     scheduler.drainEntries();
-    assert.equal(calls.length, 5, "a pass retries four runs at most");
+    assert.deepEqual(calls, ["done", "done", "done", "done"], "a pass retries four runs at most");
     scheduler.drainEntries();
-    assert.equal(calls.length, 7);
+    assert.equal(calls.length, 6);
     scheduler.drainEntries();
-    assert.equal(calls.length, 7, "an empty backlog costs nothing");
+    assert.equal(calls.length, 6, "an empty backlog costs nothing");
     for (const id of settled) assert.equal(entries.list(id, { kinds: ["direction"] }).entries.length, 1);
+  } finally { store.close(); f.close(); }
+});
+
+test("the drain stores only what the sealed record holds", async () => {
+  const f = schedulerFixture(), store = openStore(f, f.key, 0);
+  try {
+    let clock = Date.now();
+    const entries = new Blackboard(store, { now: () => clock });
+    f.writeTeam();
+    const teams = f.openTeam({ entries });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun };
+    // A failed entry write at a save puts the run in the backlog.
+    const blocker = new DatabaseSync(evidenceDatabasePath(f.config.stateDir));
+    try {
+      blocker.exec("BEGIN IMMEDIATE");
+      await teams.steer(f.run.id, { requestId: randomUUID(), revision: 1, text: "Saved direction" });
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
+    }
+    await teams.idle();
+    clock += 61_000;
+    // The live run changes a moment before its save, as a finished check does.
+    stored.run.steering.push({ text: "Unsaved direction", revision: stored.run.revision, at: new Date().toISOString() });
+    scheduler.drainEntries();
+    const texts = () => entries.list(f.run.id, { kinds: ["direction"] }).entries
+      .map(head => (entries.get(f.run.id, head.entryId)!.body as { text: string }).text);
+    assert.deepEqual(texts(), ["Saved direction"], "only the sealed direction is stored");
+    scheduler.save(stored);
+    assert.deepEqual(texts(), ["Saved direction", "Unsaved direction"], "the save stores the new direction");
+  } finally { store.close(); f.close(); }
+});
+
+test("one failing run does not hold back the others", async () => {
+  const f = schedulerFixture(), store = openStore(f, f.key);
+  try {
+    let clock = Date.now(), failing = true;
+    // A store whose writes fail while the flag is set. Reads and the module registration pass through.
+    const flaky = {
+      status: () => store.status(),
+      register: (module: Parameters<EvidenceStore["register"]>[0]) => store.register(module),
+      read: <T,>(fn: Parameters<EvidenceStore["read"]>[0]) => store.read(fn) as T,
+      tryWrite: (fn: Parameters<EvidenceStore["tryWrite"]>[0]) => failing ? false : store.tryWrite(fn),
+    } as unknown as EvidenceStore;
+    const entries = new Blackboard(flaky, { now: () => clock });
+    f.writeTeam();
+    const settled = writeSettledRun(f, "Settled direction");
+    // The start's pass fails once, so the settled run waits.
+    const teams = f.openTeam({ entries });
+    assert.equal(entries.list(settled, { kinds: ["direction"] }).entries.length, 0);
+
+    // The active run's saves keep failing, a minute apart.
+    clock += 61_000;
+    await teams.steer(f.run.id, { requestId: randomUUID(), revision: 1, text: "First" });
+    clock += 61_000;
+    await teams.steer(f.run.id, { requestId: randomUUID(), revision: 2, text: "Second" });
+    await teams.idle();
+    assert.equal(entries.held(f.run.id), true, "the active run's last save failed just now");
+
+    // The store works again for everyone else, in the same minute as that failure.
+    failing = false;
+    internal(teams).drainEntries();
+    assert.equal(entries.list(settled, { kinds: ["direction"] }).entries.length, 1, "the settled run is not held back");
+    assert.equal(entries.list(f.run.id, { kinds: ["direction"] }).entries.length, 0, "the failing run waits out its own minute");
+    clock += 61_000;
+    internal(teams).drainEntries();
+    assert.equal(entries.list(f.run.id, { kinds: ["direction"] }).entries.length, 2);
   } finally { store.close(); f.close(); }
 });
 

@@ -537,11 +537,12 @@ export class TeamService {
     }
     // Events a previous process sealed but did not store go out now. Nothing is saved here.
     if (this.options?.events) for (const stored of this.records.values()) if (stored.outbox?.length) this.flushOutbox(stored);
-    // Entries that a previous process did not store are written now for active runs. Every other retained run joins
-    // the backlog, because a run can settle in the very save whose entry write was lost. Nothing is saved here.
-    if (this.options?.entries) for (const stored of this.records.values()) {
-      if (activeTeamRun(stored.run.status)) this.mirrorEntries(stored.run);
-      else this.entryBacklog.add(stored.run.id);
+    // Entries that a previous process did not store are retried: every retained run joins the backlog, active runs
+    // first, because a run can settle in the very save whose entry write was lost. Nothing is saved here.
+    if (this.options?.entries) {
+      for (const stored of this.records.values()) if (activeTeamRun(stored.run.status)) this.entryBacklog.add(stored.run.id);
+      for (const stored of this.records.values()) this.entryBacklog.add(stored.run.id);
+      this.drainEntries();
     }
   }
   /** The usage ledger this service prices member usage from; its tick also drives the ledger's reads. */
@@ -697,24 +698,39 @@ export class TeamService {
     if (this.options?.events) this.flushOutbox(stored);
     this.mirrorEntries(stored.run);
   }
-  /** Mirrors the run's entries, and keeps the run in the backlog while some are not stored. Never throws. */
+  /**
+   * Mirrors the run's entries right after its sealed write, and keeps the run in the backlog while some are not
+   * stored. Only a save may pass the live run: here it equals the record just sealed. Never throws.
+   */
   private mirrorEntries(run: TeamRun) {
     const entries = this.options?.entries;
     if (!entries) return;
     if (entries.mirror(run)) this.entryBacklog.delete(run.id);
     else this.entryBacklog.add(run.id);
   }
-  /** Retries a few backlog runs. It stops while the store is failing, saves nothing, and changes no record. */
+  /**
+   * Retries a few backlog runs from their sealed records. It never reads a live run: a check's result reaches the
+   * live run a moment before its save, and an entry must not exist for a state the record does not hold.
+   * It stops while its own writes fail, saves nothing, and changes no record.
+   */
   private drainEntries() {
     const entries = this.options?.entries;
     if (!entries || this.entryBacklog.size === 0) return;
     for (const id of [...this.entryBacklog].slice(0, ENTRY_DRAIN_RUNS)) {
-      if (!entries.writable()) return;
+      if (!entries.retryable()) return;
       this.entryBacklog.delete(id);
-      const stored = this.records.get(id);
-      // A run that is still incomplete goes to the end, so it does not hold the others back.
-      if (stored && !entries.mirror(stored.run)) this.entryBacklog.add(id);
+      if (!this.records.has(id)) continue;
+      // A run that waits out its own failed write goes to the end without a read, so it does not hold the others back.
+      if (entries.held(id)) { this.entryBacklog.add(id); continue; }
+      const run = this.sealedRun(id);
+      // An unreadable record leaves the backlog. Its next save adds it again.
+      if (run && entries.retry(run) !== "done") this.entryBacklog.add(id);
     }
+  }
+  /** The run as its sealed record file holds it, or undefined when the file cannot be read. */
+  private sealedRun(id: string): TeamRun | undefined {
+    try { return unseal<Stored>(this.key, `team:${id}`, readFileSync(join(this.directory, `${id}.sealed`), "utf8")).run; }
+    catch { return undefined; }
   }
   /** Emits run.blocked or run.settled when the run status differs from the status the ledger last saw. */
   private emitStatusEvents(stored: Stored, statusAt: string) {

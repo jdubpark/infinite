@@ -68,6 +68,7 @@ export class IntakeStore {
     this.trim(saved);
     writeSealed(join(this.recordsDirectory, `${saved.issueId}.sealed`), this.key, recordScope(saved.issueId), saved);
     this.records.set(saved.issueId, saved);
+    this.notify(saved);
     return structuredClone(saved);
   }
 
@@ -82,10 +83,7 @@ export class IntakeStore {
     this.trim(saved);
     writeSealed(join(this.recordsDirectory, `${issueId}.sealed`), this.key, recordScope(issueId), saved);
     this.records.set(issueId, saved);
-    for (const listener of this.listeners) {
-      try { listener(structuredClone(saved)); }
-      catch { /* A listener cannot undo a persisted update or block another listener. */ }
-    }
+    this.notify(saved);
     return structuredClone(saved);
   }
 
@@ -107,6 +105,14 @@ export class IntakeStore {
   onChange(listener: (record: IntakeRecord) => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
+  }
+
+  /** Called after each sealed write, with a copy; a listener cannot undo the write or block another listener. */
+  private notify(saved: IntakeRecord) {
+    for (const listener of this.listeners) {
+      try { listener(structuredClone(saved)); }
+      catch { /* A listener cannot undo a persisted write or block another listener. */ }
+    }
   }
 
   private trim(record: IntakeRecord) {

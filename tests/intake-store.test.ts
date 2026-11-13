@@ -211,3 +211,20 @@ test("update retains only the newest inbound entries and messages", () => {
     assert.equal(saved.messages.at(-1)!.key, "message-400");
   } finally { h.close(); }
 });
+
+test("create notifies listeners after the write, and a throwing listener loses nothing", () => {
+  const h = setup();
+  try {
+    const store = h.open();
+    store.onChange(() => { throw new Error("listener"); });
+    const seen: { issueId: string; onDisk: boolean; state: string }[] = [];
+    store.onChange(r => {
+      seen.push({ issueId: r.issueId, onDisk: h.open().get(A)?.state === "queued", state: r.state });
+      r.state = "finished"; // a listener's copy cannot change the stored record
+    });
+    store.create(record(A));
+    assert.deepEqual(seen, [{ issueId: A, onDisk: true, state: "queued" }], "A new record reaches listeners once, after the write");
+    assert.equal(h.open().get(A)!.state, "queued", "A listener's change to its copy is not stored");
+    assert.equal(store.get(A)!.state, "queued");
+  } finally { h.close(); }
+});

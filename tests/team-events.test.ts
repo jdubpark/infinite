@@ -708,8 +708,12 @@ test("a permission coordinator emits no member event", async () => {
       report: { kind: "permission-decision", decisionId: randomUUID(), verdict: "escalate", summary: "Needs the owner" } });
     scheduler.readMemberJournal(stored, member);
     assert.equal(member.report?.kind, "permission-decision", "the coordinator's report was read");
+    // A save flushes the outbox, so a wrongly emitted member event would reach the store here.
+    scheduler.save(stored);
     await teams.idle();
     assert.deepEqual(allEvents(store, f.run.id).filter(event => event.kind.startsWith("member.")), []);
+    const sealed = f.readRecord<{ outbox?: OutboxEvent[] }>("team", f.run.id);
+    assert.deepEqual((sealed.outbox ?? []).filter(event => event.kind.startsWith("member.")), []);
   } finally { store.close(); f.close(); }
 });
 
@@ -803,18 +807,34 @@ test("a sibling block stops the other members as host stops", async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);
   try {
+    const reporter = f.run.members[0]!;
+    const sibling = { ...reporter, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer" as const, title: "Implementer: b",
+      taskId: "b", status: "running" as const, report: undefined };
+    f.run.members = [reporter, sibling];
     f.writeTeam();
     const teams = f.openTeam({ events: new EventOutbox(store) });
+    // The fixture launches the sibling's session so the halt loop can stop it.
+    await f.manager.createTeamSession({ requestId: sibling.sessionId, provider: "demo", title: sibling.title, prompt: "Write b" },
+      { runId: f.run.id, memberId: sibling.memberId, revision: sibling.revision, role: "implementer", taskId: "b" } as never, f.run.workspace);
+    f.report(reporter.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: reporter.memberId, revision: reporter.revision,
+      report: { kind: "blocked", summary: "Cannot proceed" } });
     const scheduler = internal(teams);
     const stored = scheduler.record(f.run.id);
-    const member = f.run.members[0]!;
-    scheduler.block(stored, new TeamError(409, "wrong-agent-report", "An agent's report does not match its assigned role."));
+    scheduler.readMemberJournal(stored, reporter);
+    scheduler.consume(stored, reporter);
     await scheduler.step(stored);
     await scheduler.step(stored);
     await teams.idle();
-    const stops = memberStops(store, f.run.id, member.memberId);
-    assert.equal(stops.length, 1);
-    assert.deepEqual(stops[0]!.data, { v: 1, role: "project-manager", reason: "host", detail: "block", reported: false });
+
+    const reported = eventsOfKind(store, f.run.id, "member.reported").filter(event => event.memberId === reporter.memberId);
+    assert.equal(reported.length, 1);
+    assert.deepEqual(reported[0]!.data, { v: 1, role: "project-manager", reportKind: "blocked" });
+    const ownStops = memberStops(store, f.run.id, reporter.memberId);
+    assert.equal(ownStops.length, 1);
+    assert.deepEqual(ownStops[0]!.data, { v: 1, role: "project-manager", reason: "host", detail: "block", reported: true });
+    const siblingStops = memberStops(store, f.run.id, sibling.memberId);
+    assert.equal(siblingStops.length, 1);
+    assert.deepEqual(siblingStops[0]!.data, { v: 1, role: "implementer", reason: "host", detail: "block", reported: false });
   } finally { store.close(); f.close(); }
 });
 
@@ -835,6 +855,43 @@ test("a member that exits without a report keeps its first reason", async () => 
     await scheduler.step(scheduler.record(f.run.id));
     await teams.idle();
     assert.equal(memberStops(store, f.run.id, member.memberId).length, 1, "later ticks add no second stop");
+  } finally { store.close(); f.close(); }
+});
+
+test("a stop barrier that reads the same member on every tick stores one stop", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    // The first member drains at revision 1 on every tick. The second is not stopped until its third stop attempt,
+    // so the barrier stays open for three ticks.
+    const drained = f.run.members[0]!;
+    const waiting = { ...drained, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer" as const, title: "Implementer: b",
+      taskId: "b", revision: 2, status: "running" as const, report: undefined };
+    f.run.members = [drained, waiting];
+    f.run.recovery = { attempts: 1, status: "stopping", source: { code: "agent-blocked", memberId: drained.memberId, revision: 1,
+      reason: "Blocked", at: new Date().toISOString() } };
+    f.writeTeam({ halt: "block" });
+    await f.manager.createTeamSession({ requestId: waiting.sessionId, provider: "demo", title: waiting.title, prompt: "Write b" },
+      { runId: f.run.id, memberId: waiting.memberId, revision: waiting.revision, role: "implementer", taskId: "b" } as never, f.run.workspace);
+    const stopSession = f.manager.stopTeamSession;
+    let attempts = 0;
+    (f.manager as unknown as Record<string, unknown>).stopTeamSession = (requestedId: string) => {
+      if (requestedId === waiting.sessionId && attempts++ < 2) return f.manager.state(requestedId);
+      return stopSession(requestedId);
+    };
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const expected = { v: 1, role: "project-manager", reason: "host", detail: "block", reported: false };
+    for (let tick = 1; tick <= 3; tick++) {
+      await scheduler.step(scheduler.record(f.run.id));
+      await teams.idle();
+      const stops = memberStops(store, f.run.id, drained.memberId);
+      assert.equal(stops.length, 1, `tick ${tick} stores exactly one stop`);
+      assert.deepEqual(stops[0]!.data, expected, `tick ${tick} keeps the first stop's reason`);
+    }
+    const waitingStops = memberStops(store, f.run.id, waiting.memberId);
+    assert.equal(waitingStops.length, 1, "the sibling stops once the barrier closes");
+    assert.deepEqual(waitingStops[0]!.data, { ...expected, role: "implementer" });
   } finally { store.close(); f.close(); }
 });
 

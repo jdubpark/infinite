@@ -1000,6 +1000,25 @@ test("a record over the message bound keeps its composed messages, so nothing is
   } finally { await close(); }
 });
 
+test("a record with more than 400 composed messages still accepts a reply and delivers it", { timeout: 60000 }, async () => {
+  const { sh, s, close } = await scriptedSurface();
+  try {
+    const { id } = await sh.create();
+    const composed = Array.from({ length: 401 }, (_, index) => ({ key: `status:blocked:${index}`, kind: "status" as const, text: "Blocked: earlier.",
+      createdAt: NOW, status: "sent" as const, attempts: 1, ts: `1700000400.${String(index).padStart(6, "0")}` }));
+    s.store.create(intakeRecord(ISSUE, "finished", { thread: BINDING, missionId: id, messages: composed }));
+    assert.equal(s.store.get(ISSUE)!.messages.length, 401, "Composed messages are kept above the bound");
+    await s.surface.start(); await s.connected();
+    await s.slack.emit(mention("also cover the CSV export"));
+    await waitFor(async () => s.texts(), list => list.includes(FINISHED), 15000);
+    await delay(300);
+    assert.deepEqual(s.texts(), [FINISHED], "The reply is posted once");
+    // Once sent, the reply will not be sent again, so the next write may drop it; the composed messages all stay.
+    const kept = s.store.get(ISSUE)!.messages;
+    assert.deepEqual(kept.map(message => message.key), composed.map(message => message.key));
+  } finally { await close(); }
+});
+
 test("a permanent Slack identity failure sets a reason that names Slack's code, and a transient one sets none", { timeout: 60000 }, async () => {
   const sh = scripted();
   const services = { missions: sh.missions as unknown as MissionService, teams: sh.teams as unknown as TeamService };

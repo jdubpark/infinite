@@ -114,15 +114,22 @@ export class IntakeStore {
   }
 
   /**
-   * Keeps the newest 200 inbound entries. Past 400 messages, only replies (`reply:` keys) are dropped, oldest first:
-   * the Slack surface composes every other message from its key, so dropping one would post it again.
+   * Past 200 inbound entries, the oldest handled ones are dropped; an unhandled entry is still to be applied and stays.
+   * Past 400 messages, the oldest replies (`reply:` keys) that will not be sent again, `sent` or `failed`, are dropped.
+   * A `pending` reply, including one waiting for a retry, stays, and so does every other message: the Slack surface
+   * composes those from their keys, so dropping one would post it again. When nothing more may go, a list stays over its cap.
    */
   private trim(record: IntakeRecord) {
-    if (record.inbound.length > 200) record.inbound.splice(0, record.inbound.length - 200);
+    let inboundExcess = record.inbound.length - 200;
+    if (inboundExcess > 0) record.inbound = record.inbound.filter(entry => {
+      if (inboundExcess === 0 || !entry.handledAt) return true;
+      inboundExcess -= 1;
+      return false;
+    });
     let excess = record.messages.length - 400;
     if (excess <= 0) return;
     record.messages = record.messages.filter(message => {
-      if (excess === 0 || !message.key.startsWith("reply:")) return true;
+      if (excess === 0 || !message.key.startsWith("reply:") || message.status === "pending") return true;
       excess -= 1;
       return false;
     });

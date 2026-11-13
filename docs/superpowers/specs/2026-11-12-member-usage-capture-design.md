@@ -41,7 +41,7 @@ Not confirmed: a `message.usage.iterations` array with more than one element, an
 **Codex**, in the session transcript:
 
 - A `token_usage_record` row has `timestamp` and a `payload` with `response_id`, `thread_id`, `turn_id`, `usage`, and `thread_token_usage`.
-- Each usage object has `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, and `total_tokens`. `total_tokens` always equalled `input_tokens + output_tokens`, so cached tokens are part of input and reasoning tokens are part of output.
+- Each usage object has `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, and `total_tokens`. `total_tokens` always equalled `input_tokens + output_tokens`, so cached tokens are part of input and reasoning tokens are part of output. The parser refuses a usage object that breaks this rule.
 - `response_id` was unique within a transcript and never appeared in two.
 - An `event_msg` row with `payload.type: "token_count"` has `payload.info.total_token_usage` and `payload.rate_limits.primary.used_percent`. The cumulative total never decreased, and the same total repeats across rows.
 - A `turn_context` row has `payload.turn_id`, `payload.model`, and `payload.effort`. A `session_meta` row has `payload.cli_version` and `payload.parent_thread_id`.
@@ -128,9 +128,9 @@ A hook payload only names the transcript. No usage comes from the payload.
 
 **One pass per row.** The worker gives each transcript row to a usage tail as well as to the chat parser. The usage tail is a new module, `packages/host/src/transcript-usage.ts`. It reads identifiers, model names, timestamps, and numbers, and never content. The worker appends each usage record as a `usage` journal record, the type OpenCode already uses.
 
-**Claude Code rule.** A transcript row yields a usage record when `type` is `assistant`, `message.id` and `message.usage` exist, and `message.model` does not start with `<`. The model is `reported`. Rows that share a `message.id` yield one usage record. The worker emits it again only when a token class grows.
+**Claude Code rule.** A transcript row yields a usage record when `type` is `assistant`, `message.id` and `message.usage` exist, and `message.model` does not start with `<`. The model is `reported`. Rows that share a `message.id` yield one usage record. The worker emits it again only when one of the provider's counts for that message grows.
 
-**Codex rule.** A `token_usage_record` row yields a usage record from `payload.usage`. The model comes from the `turn_context` row with the same `turn_id`, or else from the profile with `modelSource: "requested"`. A conversation without `token_usage_record` rows falls back to `token_count` rows. The usage tail holds a conversation's cumulative totals and emits nothing from them while the provider runs, because a `token_usage_record` row can still arrive. When the provider exits, a conversation that produced no `token_usage_record` row yields one usage record per increase of the held cumulative total. One conversation therefore never uses both row types.
+**Codex rule.** A `token_usage_record` row yields a usage record from `payload.usage`. The model comes from the `turn_context` row with the same `turn_id`, or else from the profile with `modelSource: "requested"`. A conversation without `token_usage_record` rows falls back to `token_count` rows. The usage tail holds the conversation's last cumulative total and emits nothing from it while the provider runs, because a `token_usage_record` row can still arrive. When the provider exits, a conversation that produced no `token_usage_record` row yields one usage record for the thread: its last cumulative total, with the time of the last increase and the last model the conversation named. One conversation therefore never uses both row types. *(My call: one snapshot per thread. A record per increase is not stable when a transcript is read again, and it loses tokens when a long conversation exceeds the tail's memory bound. The cost is coarse timing: the whole thread counts on the day of its last increase.)*
 
 **Secondary transcripts.** A subagent's usage is not in the session transcript. After the primary transcript, the relay posts an end marker that lists secondary transcripts: for Claude Code, the `agent-<id>.jsonl` files in the session's `subagents` folder. The worker answers with a byte offset for each file it wants. It accepts a secondary path only inside the folder derived from the authenticated primary path, and it keeps at most 64 usage tails. Codex child threads are not captured in the first version.
 
@@ -138,7 +138,7 @@ A hook payload only names the transcript. No usage comes from the payload.
 
 **Keys and cursors.**
 
-- The record key is `message.id` for Claude and `response_id` for Codex. The Codex fallback key is the thread and the cumulative total. OpenCode keeps session, message, and part.
+- The record key is `message.id` for Claude and `response_id` for Codex. The Codex fallback key is the thread. OpenCode keeps session, message, and part.
 - Claude and Codex keys are global, not per session, so a replay from a relay retry, a new worker, or a resumed conversation adds nothing. A usage record belongs to the first session that captured it.
 - The transcript offset lives in worker memory. A new worker reads from zero.
 - The journal cursor is stored per session in the same transaction as the rows it covers.
@@ -187,7 +187,7 @@ CREATE TABLE usage_records (
 );
 ```
 
-A write that meets an existing key keeps the larger value of each token class and the first `session_id`. Briefing rows move to a `usage_briefings` table.
+A write that meets an existing key keeps one whole record and the first `session_id`. It never mixes classes from two records, because the classes of one request are derived together. The kept record is the larger one in this order: token total, then reasoning tokens, then one-hour cache tokens. A record that is equal or smaller in that order changes nothing, so a transcript that is read again cannot undo a later refinement. Briefing rows move to a `usage_briefings` table.
 
 A usage row has no free text and no encrypted column. Its opaque identifiers, enumerations, and numbers are plain so that SQL can index and sum them. The project and the task are stored as blind indexes, `project_ref` and `task_key`, as contract C1 requires. The service resolves a project's rows by computing the index of each project it knows.
 
@@ -279,7 +279,7 @@ There is no MCP surface. A member gets no usage tool.
 Fixtures come from synthetic sessions against a scratch repository. A script replaces all text with placeholders and keeps structure and numbers.
 
 1. A Claude fixture has one request split over three rows, one synthetic row, and one request with thinking tokens and one-hour cache writes. The parser yields two usage records, `output + reasoning` equals `output_tokens`, and `cacheWrite1h` is set.
-2. A Codex fixture has `token_usage_record` rows and repeated `token_count` rows. Usage records equal distinct `response_id` values and sum to the last `thread_token_usage`. A fixture without `token_usage_record` rows yields differences that sum to the final cumulative total.
+2. A Codex fixture has `token_usage_record` rows and repeated `token_count` rows. Usage records equal distinct `response_id` values and sum to the last `thread_token_usage`. A fixture without `token_usage_record` rows yields one record that equals the final cumulative total.
 3. With usage rows added to the rehearsal provider's transcript (`packages/host/src/demo.ts`), a team run shows member tokens, `coverage: "complete"`, and unchanged Spent.
 4. A member stopped mid-turn is `partial` with reason `drain-incomplete` without the final drain. With it, the session is `partial` with reason `stopped-mid-turn`, and its totals include the rows written after the last hook.
 5. A transcript re-read from offset zero changes no total. Neither does a second session whose transcript replays the first.

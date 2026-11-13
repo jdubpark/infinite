@@ -2,8 +2,26 @@ import type { UsageConfig } from "./config.js";
 import { PRICE_CATALOG, type CatalogPrice } from "./price-catalog.js";
 
 export interface UsageTokens { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
-/** `modelSource: "unknown"` means neither OpenCode nor the launch named a model; its ids are then "unknown". */
-export interface UsageRecord { provider: "opencode"; providerId: string; modelId: string; messageId: string; partId: string; modelSource: "requested" | "reported" | "unknown"; completedAt: string; tokens: UsageTokens; reportedCost: number }
+/**
+ * `modelSource: "unknown"` means neither the provider nor the launch named a model. Its `modelId` is then "unknown",
+ * and so is the `providerId` of an OpenCode record. Claude Code and Codex records always use `providerId` "claude"
+ * or "codex", an empty `partId`, and a zero `reportedCost`.
+ */
+export interface UsageRecord {
+  provider: "opencode" | "claude" | "codex";
+  providerId: string;
+  modelId: string;
+  messageId: string;
+  partId: string;
+  nativeId?: string;
+  secondary?: true;
+  modelSource: "requested" | "reported" | "unknown";
+  completedAt: string;
+  tokens: UsageTokens;
+  /** The part of `tokens.cacheWrite` with a one-hour lifetime. */
+  cacheWrite1h?: number;
+  reportedCost: number;
+}
 export type Pricing = "configured" | "catalog" | "provider" | "unknown";
 export interface UsageTotals { cost: number; tokens: UsageTokens; messages: number; pricing: Record<Pricing, number> }
 

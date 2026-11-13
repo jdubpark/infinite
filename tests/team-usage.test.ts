@@ -41,3 +41,11 @@ test("a rollup for unreadable usage reports zero totals and counts every member 
   assert.deepEqual(empty.byProvider, {});
   assert.equal(addRollups([empty, emptyRollup(1)]).unmeasuredMembers, 5);
 });
+
+test("rollups count and merge partial members", () => {
+  const withPartial = (partialMembers: number): UsageRollup => ({ ...emptyRollup(), partialMembers });
+  assert.equal(addRollups([withPartial(1), withPartial(2)]).partialMembers, 3);
+  const { partialMembers: _missing, ...legacy } = withPartial(0);
+  assert.equal(addRollups([legacy as UsageRollup, withPartial(1)]).partialMembers, 1, "a snapshot from before this field counts as 0");
+  assert.equal(emptyRollup(4).partialMembers, 0);
+});

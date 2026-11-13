@@ -840,7 +840,7 @@ into tracked configuration examples, screenshots, or repository reports.
 
 ## Usage and budgets
 
-The sealed host ledger records measured OpenCode token usage. Configure a `usage` block to expose the Cost view, account mapping, and budgets. The dated built-in catalog prices DeepSeek and Meta models; custom prices can override it. Claude and Codex remain unmeasured per use and appear only as fixed plan fees. The web client, API, and CLI read the same ledger.
+The sealed host ledger records measured OpenCode token usage. Configure a `usage` block to expose the Cost view, account mapping, and budgets. The dated built-in catalog prices DeepSeek and Meta models; custom prices can override it. The ledger records Claude Code and Codex tokens for sessions whose hooks stream a transcript. Each figure states its coverage. Those records are not priced yet, so they count as unpriced steps. The web client, API, and CLI read the same ledger.
 
 ```json
 {
@@ -870,7 +870,7 @@ Every total carries an unpriced count. Clients mark incomplete priced totals wit
 
 Budgets are informational. The host shows spent against budget and marks `over budget`, but it never pauses, refuses, or hides a team, goal, or session because of spend.
 
-Only some work is measured. OpenCode team members and OpenCode sessions started from the local UI report usage. Claude Code, Codex, Grok, and OpenCode in a native terminal do not, so their sessions, and team members that use them, show `Unmeasured`. Unmeasured work is counted separately and is never added to a total as zero.
+OpenCode team members and OpenCode sessions started from the local UI report usage. Grok and OpenCode in a native terminal stay unmeasured, so their sessions, and team members that use them, show `Unmeasured`. Unmeasured work is counted separately and is never added to a total as zero.
 
 Headless team members record the model that was requested for them. If the provider substitutes another model, the ledger still prices the requested one.
 

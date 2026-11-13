@@ -11,6 +11,7 @@ import { writeSealed } from "../packages/host/src/vault.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { Manager } from "../packages/host/src/manager.js";
 import type { UsageRecord } from "../packages/host/src/usage.js";
+import { teamUsage } from "../packages/host/src/team-usage.js";
 
 // FIXTURE-START
 const NOW = new Date("2026-10-21T12:00:00.000Z");
@@ -483,5 +484,113 @@ test("a coverage record is kept as the worker wrote it", async () => {
     assert.equal(rawSession(store, "drain-maybe").final_drain, null, "an unknown final drain is stored as null");
     for (const id of ["bad-reason", "bad-coverage", "complete-reason"]) assert.equal(rawSession(store, id).journaled_coverage, null, `${id} is ignored`);
     subset(usage.summary(NOW).providers.claude, { partialSessions: 1 });
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+const teamOf = (runId: string, memberId: string) => ({ runId, memberId, taskId: "task-m", role: "implementer", revision: 1 });
+const memberRow = (id: string, status: "running" | "exited", team?: ReturnType<typeof teamOf>, extra: Record<string, unknown> = {}) =>
+  claudeRow(id, status, { ...(team ? { team } : {}), ...extra });
+
+test("a member sums every session it ran", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const { usage, store } = journalService(dir, key, {
+    "m-1": [claudeUsage("a1"), coverageEvent({ coverage: "complete" })],
+    "m-2": [claudeUsage("a2"), coverageEvent({ coverage: "complete" })],
+    "m-3": [claudeUsage("a3"), coverageEvent({ coverage: "complete" })],
+  });
+  try {
+    await usage.tick(["m-1", "m-2", "m-3"].map(id => memberRow(id, "exited", teamOf("run-m", "member-m"))));
+    subset(usage.member("run-m", "member-m"), { measured: true, coverage: "complete", messages: 3 });
+    const team = teamUsage([{ sessionId: "m-3", runId: "run-m", memberId: "member-m" }], "claude", usage);
+    assert.equal(team.members[0].usage?.messages, 3);
+    assert.equal(team.rollup.total.messages, 3);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("member coverage is the worst of its sessions", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const { usage, store } = journalService(dir, key, {
+    "a-open": [claudeUsage("ao")],
+    "a-done": [claudeUsage("ad"), coverageEvent({ coverage: "complete" })],
+    "b-done": [claudeUsage("bd"), coverageEvent({ coverage: "complete" })],
+    "b-stop": [claudeUsage("bs"), coverageEvent({ coverage: "partial", reason: "stopped-mid-turn" })],
+    "c-none": [coverageEvent({ coverage: "none", reason: "unsupported" })],
+  });
+  try {
+    await usage.tick([
+      memberRow("a-open", "running", teamOf("run-a", "m")), memberRow("a-done", "exited", teamOf("run-a", "m")),
+      memberRow("b-done", "exited", teamOf("run-b", "m")), memberRow("b-stop", "exited", teamOf("run-b", "m")),
+      memberRow("c-none", "exited", teamOf("run-c", "m")),
+    ]);
+    subset(usage.member("run-a", "m"), { measured: true, coverage: "partial", coverageReason: "running", messages: 2 });
+    subset(usage.member("run-b", "m"), { measured: true, coverage: "partial", coverageReason: "stopped-mid-turn", messages: 2 });
+    assert.deepEqual(usage.member("run-c", "m"), { measured: false, coverage: "none" });
+    assert.deepEqual(usage.member("run-x", "m"), { measured: false, coverage: "none" }, "a member with no session is unmeasured");
+    const rollup = teamUsage([
+      { sessionId: "a-done", runId: "run-a", memberId: "m" }, { sessionId: "b-stop", runId: "run-b", memberId: "m" },
+      { sessionId: "c-none", runId: "run-c", memberId: "m" },
+    ], "claude", usage).rollup;
+    assert.equal(rollup.partialMembers, 1, "a running gap is not counted, a stopped one is");
+    assert.equal(rollup.unmeasuredMembers, 1);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("an unavailable ledger marks the rollup", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const blocker = join(dir, "blocker");
+  writeFileSync(blocker, "a regular file, not a folder");
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const store = new EvidenceStore({ databasePath: join(blocker, "evidence.sqlite3"), vaultKey: key });
+    const usage = new UsageService(fixtureConfig(dir), key, {} as Manager, store);
+    const team = teamUsage([{ sessionId: "x", runId: "run-u", memberId: "m" }, { sessionId: "y" }], "claude", usage);
+    assert.equal(team.rollup.unavailable, true);
+    assert.equal(team.rollup.unmeasuredMembers, 2);
+    assert.equal(team.rollup.total.messages, 0);
+    assert.ok(team.members.every(member => !("usage" in member)));
+    store.close();
+  } finally { console.warn = warn; rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a mission attempt reads its own session", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const { usage, store } = journalService(dir, key, {
+    "mission-1": [claudeUsage("q1"), coverageEvent({ coverage: "complete" })],
+  });
+  try {
+    await usage.tick([claudeRow("mission-1", "exited")]);
+    const team = teamUsage([{ sessionId: "mission-1" }], "claude", usage);
+    subset(team.members[0].usage, { messages: 1, coverage: "complete", tokens: { input: 100 } });
+    subset(usage.session("mission-1"), { messages: 1 });
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("project usage reports spend by purpose", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const opencodeUsage = (messageId: string): JournalEvent => ({ type: "usage", data: {
+    provider: "opencode", providerId: "deepseek", modelId: "deepseek-flash", messageId, partId: messageId, modelSource: "reported",
+    completedAt: "2026-10-21T01:00:00.000Z", tokens: { input: 1000, output: 500, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0 } });
+  const openRow = (id: string, extra: Record<string, unknown>) => ({ id, provider: "opencode", projectId: "demo", createdAt: "2026-10-21T10:00:00.000Z",
+    status: "exited", teamModelProfile: { id: "ds", provider: "opencode" }, ...extra }) as unknown as UsageSessionRow;
+  const { usage, store } = journalService(dir, key, {
+    "p-plain": [opencodeUsage("p1")], "p-gate": [opencodeUsage("p2")], "p-solo": [opencodeUsage("p3")],
+  });
+  try {
+    await usage.tick([
+      openRow("p-plain", { team: teamOf("run-p", "member-p") }),
+      openRow("p-gate", { team: teamOf("run-g", "member-g"), purpose: "gate" }),
+      openRow("p-solo", { runtime: { nativeUi: "opencode" } }),
+    ]);
+    const detail = usage.project("demo", { now: NOW });
+    subset(detail, {
+      total: { usd: 0.006, unpriced: 0 },
+      byPurpose: {
+        work: { total: { usd: 0.002, unpriced: 0 }, members: 1 },
+        gate: { total: { usd: 0.002, unpriced: 0 }, members: 1 },
+        duel: { total: { usd: 0, unpriced: 0 }, members: 0 },
+        replay: { total: { usd: 0, unpriced: 0 }, members: 0 },
+      },
+    });
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { UsageTokens } from "./usage.js";
 import type { LedgerCoverageReason } from "./usage-store.js";
+import type { SessionPurpose } from "./types.js";
 
 export type Money = { usd: number; unpriced: number };
 export type Balance = { amount: number; currency: string; asOf: string; stale: boolean } | null;
@@ -26,6 +27,7 @@ export type DailyUsage = { tz: string; accounts: string[]; days: { date: string;
 export type ProjectUsage = { id: string; name: string; total: Money; month: Money & { unmeasured: number; partial: number }; unmeasured: number; partial: number; spark: number[] };
 export type ProjectUsageDetail = {
   id: string; name: string; total: Money; unmeasured: number; partial: number;
+  byPurpose: Record<SessionPurpose, { total: Money; members: number }>;
   byKind: { goals: number; teams: number; sessions: number; briefings: number };
   goals: { id: string; title: string; total: Money; tasks: number }[];
   teams: { id: string; title: string; goalId?: string; total: Money }[];

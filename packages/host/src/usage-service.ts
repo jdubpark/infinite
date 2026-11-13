@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Config, Provider } from "./types.js";
+import type { Config, Provider, SessionPurpose } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
 import { accountOf, periodStart, priceUsage, sumUsage, type Pricing, type UsageRecord, type UsageTokens, type UsageTotals } from "./usage.js";
@@ -9,7 +9,7 @@ import { EvidenceError } from "./evidence/types.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { UsageCoverage } from "./transcript-usage.js";
 import {
-  importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecord, writeSession,
+  SESSION_PURPOSES, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecord, writeSession,
   type LedgerCoverage, type LedgerCoverageReason, type LedgerHeader, type LedgerState, type SealedLedger, type StoredSession,
 } from "./usage-store.js";
 
@@ -367,6 +367,16 @@ export class UsageService {
   private projectRows(data: Snapshot, id: string) {
     return this.allMeasuredRecords(data).filter(row => row.projectId === id).map(row => ({ ...row, at: row.record.completedAt }));
   }
+  /** Measured member sessions of the project by purpose. Money is what the headline total counts for them. */
+  private byPurpose(data: Snapshot, id: string): Record<SessionPurpose, { total: Money; members: number }> {
+    const members = data.sessions.filter(session => session.projectId === id && session.runId !== undefined && session.memberId !== undefined);
+    return Object.fromEntries(SESSION_PURPOSES.map(purpose => {
+      const mine = members.filter(session => session.purpose === purpose);
+      const records = this.priced(mine.filter(measured).flatMap(session => data.bySession.get(session.sessionId) ?? []));
+      const distinct = new Set(mine.map(session => JSON.stringify([session.runId, session.memberId])));
+      return [purpose, { total: this.money(records), members: distinct.size }];
+    })) as Record<SessionPurpose, { total: Money; members: number }>;
+  }
   project(id: string, { tz = "UTC", now = new Date() }: { tz?: string; now?: Date } = {}) {
     this.dateKey(now.toISOString(), tz);
     const data = this.snapshot();
@@ -392,7 +402,7 @@ export class UsageService {
     }
     for (const [goalId, row] of goals) row.tasks = goalTasks.get(goalId)?.size ?? 0;
     const briefingMoney = this.money(grouped.briefings.flatMap(({ cost }) => cost ? [cost] : []));
-    return { id, name: this.resolvers.projectName(id) ?? id, total, unmeasured, partial: partialCount, byKind: { goals: [...goals.values()].reduce((n, g) => n + g.total.usd, 0), teams: grouped.teams.filter(row => !row.goalId).reduce((n, x) => n + x.total.usd, 0), sessions: grouped.sessions.reduce((n, x) => n + x.total.usd, 0), briefings: briefingMoney.usd }, goals: [...goals.values()], teams: grouped.teams, sessions: grouped.sessions, briefings: { total: briefingMoney, runs: briefings.length, unmeasured: briefings.filter(row => !row.record).length } };
+    return { id, name: this.resolvers.projectName(id) ?? id, total, unmeasured, partial: partialCount, byPurpose: this.byPurpose(data, id), byKind:{ goals: [...goals.values()].reduce((n, g) => n + g.total.usd, 0), teams: grouped.teams.filter(row => !row.goalId).reduce((n, x) => n + x.total.usd, 0), sessions: grouped.sessions.reduce((n, x) => n + x.total.usd, 0), briefings: briefingMoney.usd }, goals: [...goals.values()], teams: grouped.teams, sessions: grouped.sessions, briefings: { total: briefingMoney, runs: briefings.length, unmeasured: briefings.filter(row => !row.record).length } };
   }
   taskUsage(runId: string, taskId: string, revision: number): TaskUsage | undefined {
     let data: Snapshot;
@@ -425,6 +435,28 @@ export class UsageService {
     const session = data.sessions.find(item => item.sessionId === sessionId);
     if (!session || !measured(session)) return { measured: false, coverage: "none", ...(session?.reason ? { coverageReason: session.reason } : {}) };
     return { ...sumUsage(this.priced(data.bySession.get(sessionId) ?? [])), measured: true, coverage: session.coverage as "partial" | "complete", ...(session.reason ? { coverageReason: session.reason } : {}) };
+  }
+  /**
+   * A member's usage over every session it ran, in creation order. Its coverage is the worst of those sessions.
+   * A failed read is unavailable, like `session`.
+   */
+  member(runId: string, memberId: string): SessionUsage | UnmeasuredUsage {
+    if (!this.available()) return { measured: false, coverage: "none", unavailable: true };
+    let data: { sessions: StoredSession[]; records: { sessionId: string; record: UsageRecord }[] };
+    try {
+      data = this.store.read(db => {
+        const sessions = readSessions(db).filter(session => session.runId === runId && session.memberId === memberId);
+        return { sessions, records: readRecords(db, { sessionIds: sessions.map(session => session.sessionId) }) };
+      });
+    } catch {
+      return { measured: false, coverage: "none", unavailable: true };
+    }
+    const ordered = [...data.sessions].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.sessionId.localeCompare(b.sessionId));
+    const coverage = combineCoverage(ordered.map(session => ({ coverage: session.coverage, coverageReason: session.reason })));
+    if (coverage.coverage === "none") return { measured: false, coverage: "none" };
+    const measuredIds = new Set(ordered.filter(measured).map(session => session.sessionId));
+    const rows = data.records.filter(({ sessionId }) => measuredIds.has(sessionId)).map(({ record }) => record);
+    return { ...sumUsage(this.priced(rows)), measured: true, coverage: coverage.coverage as "partial" | "complete", ...(coverage.reason ? { coverageReason: coverage.reason } : {}) };
   }
   /** Sum over the measured sessions among `ids`; unmeasured ones contribute nothing. */
   sessions(ids: string[]): UsageTotals {

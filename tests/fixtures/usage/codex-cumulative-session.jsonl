@@ -1,0 +1,6 @@
+{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"thread_fixture_02","cli_version":"0.0.0-fixture"}}
+{"timestamp":"2026-01-01T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn_fixture_01","model":"model-fixture-a","effort":"medium"}}
+{"timestamp":"2026-01-01T00:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":60,"cached_input_tokens":10,"cache_write_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":5,"total_tokens":100}}}}
+{"timestamp":"2026-01-01T00:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":60,"cached_input_tokens":10,"cache_write_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":5,"total_tokens":100}}}}
+{"timestamp":"2026-01-01T00:00:03.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":30,"cache_write_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":20,"total_tokens":250}}}}
+{"timestamp":"2026-01-01T00:00:04.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":240,"cached_input_tokens":60,"cache_write_input_tokens":0,"output_tokens":160,"reasoning_output_tokens":40,"total_tokens":400}}}}

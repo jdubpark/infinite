@@ -485,10 +485,10 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine", "autonomy"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "fuse", "resources", "close", "sync", "pull", "team", "repo", "routine", "autonomy"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--autonomy"]);
-const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
+const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--host", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
 
 /**
  * The provider or client command that `handleClientCommand` dispatches on. A token that directly follows
@@ -715,6 +715,31 @@ export function evidenceStatusLines(status: import("./evidence/types.js").Eviden
   ];
 }
 
+/** Lines for `infinite fuse`, one per scope. Host text is cleaned before it reaches the terminal. */
+export function fuseLines(view: import("./fuse/service.js").FuseView): string[] {
+  const line = (name: string, scope: import("./fuse/service.js").FuseScopeView) => {
+    if (scope.state === "closed") return `${name}: closed, ${Number(scope.hour.launches)} of ${Number(scope.hour.limit)} launches in the last hour`;
+    const cause = scope.trip?.cause === "unmeasurable" ? "launch record unreadable, it closes once it can be read"
+      : scope.trip?.ownerClose ? "launch rate, the owner must close it" : "launch rate, it closes on its own";
+    return `${name}: open (${clean(cause)})`;
+  };
+  return [
+    line("Host", view.host),
+    ...view.projects.map(project => line(`Project ${clean(String(project.projectId))}`, project)),
+  ];
+}
+
+export type FuseCommand = { action: "view" } | { action: "close"; scope: { scope: "host" } | { scope: "project"; projectId: string } };
+const FUSE_USAGE = "Usage: infinite fuse [--json] | infinite fuse close --project ID | --host";
+/** `infinite fuse` reads the state. `infinite fuse close` takes exactly one of --project ID or --host. */
+export function parseFuseCommand(positional: readonly string[], options: Record<string, string | boolean>): FuseCommand {
+  const host = options["--host"] === true, project = options["--project"];
+  if (positional.length === 0 && !host && project === undefined) return { action: "view" };
+  if (positional.length !== 1 || positional[0] !== "close" || host === (project !== undefined)) throw new Error(FUSE_USAGE);
+  if (host) return { action: "close", scope: { scope: "host" } };
+  return { action: "close", scope: { scope: "project", projectId: String(project) } };
+}
+
 export function usageBars(values: number[]): string {
   const levels = "▁▂▃▄▅▆▇█", max = Math.max(0, ...values);
   return values.map(value => levels[max > 0 ? Math.max(0, Math.min(7, Math.floor(value / max * 7))) : 0]).join("");
@@ -830,6 +855,22 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const status = await api.json<import("./evidence/types.js").EvidenceDescription>("/evidence/status");
       if (options["--json"]) console.log(JSON.stringify(status, null, 2));
       else for (const line of evidenceStatusLines(status)) console.log(line);
+      return true;
+    }
+    if (command === "fuse") {
+      const fuseCommand = parseFuseCommand(positional, options);
+      if (fuseCommand.action === "view") {
+        const view = await api.json<import("./fuse/service.js").FuseView>("/fuse");
+        if (options["--json"]) console.log(JSON.stringify(view, null, 2));
+        else for (const line of fuseLines(view)) console.log(line);
+        return true;
+      }
+      const closed = await api.json<{ result: string; view: import("./fuse/service.js").FuseView }>("/fuse/close", fuseCommand.scope);
+      if (options["--json"]) console.log(JSON.stringify(closed, null, 2));
+      else {
+        console.log(`Close result: ${clean(String(closed.result))}`);
+        for (const line of fuseLines(closed.view)) console.log(line);
+      }
       return true;
     }
     if (command === "resources") { await resources(api, options); return true; }

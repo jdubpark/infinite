@@ -1,6 +1,7 @@
 import { PROVIDER_NAMES, type Attention, type Prompt, type Provider } from "@infinite/attention";
 import type { Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
+import type { FuseService, FuseInterrupt } from "./fuse/service.js";
 
 type Row = { id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } } };
 type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean };
@@ -57,6 +58,7 @@ export class Notifier {
     private readonly teams?: Teams,
     private readonly goals?: { statuses(): GoalRow[] },
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
+    private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
   ) {}
   /** Lifecycle baselines are taken now, synchronously, so a change during the first interval is not absorbed as startup state. */
   start() { this.teamEvents(); this.goalEvents(); this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
@@ -95,13 +97,15 @@ export class Notifier {
     } catch {}
     const lifecycle = [...this.teamEvents(), ...this.goalEvents()];
     const storageDue = await this.storageEvents(Date.now());
-    if (!due.length && !lifecycle.length && !storageDue.length) return;
+    const fuseDue = this.fuseEvents();
+    if (!due.length && !lifecycle.length && !storageDue.length && !fuseDue.length) return;
     const devices = this.store.list();
     if (!devices.length) return;
     const messages = [
       ...due.flatMap((row) => devices.map((d) => this.message(row, d.token))),
       ...lifecycle.flatMap((item) => devices.map((d) => this.lifecycleMessage(item, d.token))),
       ...storageDue.flatMap((item) => devices.map((d) => this.storageMessage(item, d.token))),
+      ...fuseDue.flatMap((item) => devices.map((d) => this.fuseMessage(item, d.token))),
     ];
     let tickets: Awaited<ReturnType<PushSender>>;
     try {
@@ -110,6 +114,8 @@ export class Notifier {
       console.warn(`push: sender failed (${(error as Error).name})`);
       return;
     }
+    // A trip is marked only after the sender accepted the batch, so a failed send is offered again.
+    if (fuseDue.length) this.fuse?.markAnnounced(fuseDue.map((item) => item.tripId));
     const failures = new Set<string>();
     tickets.forEach((ticket, i) => {
       if (ticket.status !== "error") return;
@@ -148,6 +154,21 @@ export class Notifier {
       this.storageStatus.set(volume.label, { previous: volume.fullness, warningArmed, criticalArmed });
     }
     return due;
+  }
+  /** Open spend-fuse trips the owner has not been told about. Nothing is read or marked unless the event is enabled. */
+  private fuseEvents(): FuseInterrupt[] {
+    if (!this.fuse || !this.enabled("autonomy-interrupt")) return [];
+    try { return this.fuse.interrupts(); } catch { return []; }
+  }
+  private fuseMessage(item: FuseInterrupt, to: string) {
+    const cause = item.cause === "unmeasurable" ? "its launch record cannot be read" : "it reached its launch limit for the last hour";
+    const closing = item.cause === "unmeasurable" ? "It closes once the record can be read."
+      : item.ownerClose ? "It stays open until you close it." : "It closes on its own as launches leave the last hour.";
+    return {
+      to, title: "Spend fuse open", body: `Launches paused for ${item.label}: ${cause}. ${closing}`,
+      data: { url: "/teams", ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+      priority: "high" as const, collapseId: `interrupt:fuse:${item.projectId ?? "host"}`,
+    };
   }
   private storageMessage(item: StorageAlert, to: string) {
     const count = (value: number) => value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M` : value >= 1_000 ? `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}K` : String(Math.round(value));

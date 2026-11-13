@@ -251,6 +251,68 @@ repository-scoped App credential. The refspec is an exact commit SHA to
 point is durability: work survives workspace removal and loss of the host disk. See
 [Head publication](teams.md#head-publication).
 
+## Request intake
+
+Intake lets the owner start a mission from a Linear issue and follow it in a Slack
+thread. See [intake](intake.md) for the flow.
+
+Only the owner causes work, and the rule holds for both the intake service and the
+Slack surface:
+
+- An issue starts a mission only when its creator is the owner's Linear user ID,
+  `intake.linear.creatorId`. When a Slack thread is required, the thread must also
+  hold a message from the owner's Slack user ID, `intake.slack.ownerUserId`, that
+  mentions Linear's agent and was sent before the issue was filed.
+- The bot acts only on `app_mention` events from the owner's Slack user in a thread
+  bound to a record. A mention or reply from anyone else in a bound thread is
+  dropped before anything is stored; the surface keeps only a count of dropped
+  events. Nothing from that message reaches the record, the mission, or an agent.
+- The thread the issue links is read once, at admission. The objective keeps only
+  the owner's own messages from it. Messages from anyone else, and bot messages,
+  are read at admission to check authorship and are not stored, shown to agents,
+  or logged. The Slack surface also reads the bound thread to find its own posts
+  after an uncertain send; it stores nothing from that read.
+- A skipped issue's title and description are not stored. Its record keeps the
+  issue's IDs, URL, times, and skip reason, and no text from the issue.
+
+The bot posts only into the thread a record is bound to. Every outbound Slack
+function takes an intake record and reads its thread; none takes a channel ID
+from an inbound event. Linear comments go only to the issue whose record they
+belong to. Neither surface changes a Linear issue's state, assignee, or labels,
+and neither approves a provider permission or marks work complete. Results are
+labelled as agent reports.
+
+Host paths and addresses do not leave the host through intake. Before any Slack
+message or Linear comment is made, a `file://` URL, and a path that starts with a
+configured directory, a host root (`/srv/`, `/opt/`, `/run/`, `/etc/`, `/Users/`,
+`/home/`, `/tmp/`, `/private/tmp/`, `/private/var/`, `/var/folders/`), `~/`, or a
+Windows drive, becomes `[local path omitted]` when it is at the start of the text or
+after any character other than a letter, a digit, or one of `. _ ~ % / -`.
+Repeated slashes and `./` segments do not hide a path. Then every IPv4 literal
+becomes `[address omitted]`, which also hides four-part version numbers.
+
+Slack and Linear credentials are regular files with mode `0600`, outside
+`stateDir`, `runDir`, `teams.workspaceDir`, and every project path. The host reads
+them for its own requests. They never enter an agent's environment. Loopback HTTP
+endpoints are accepted only when `environment` is `"local"`; every other endpoint
+must be the official one. Slack uses Socket Mode, so the host has no inbound
+public endpoint, and Linear is polled.
+
+Errors are not shared as text. For an unexpected failure, the intake service's
+`lastError`, the Slack surface's `lastError`, and every failure a record keeps
+carry only the error's name and, when it has one, its code. The message and stack
+go to the host log only. Three known failures keep their own fixed text in shared
+places: a mission service refusal (`TeamError`), a Slack request failure
+(`SlackError`, whose text names only its code), and a Linear request failure
+(`LinearFailure`, whose text is fixed).
+
+Residual risk: the objective carries the Linear title and description, and the
+owner's Slack messages, to the coordinator and subteams. Anyone who can edit the
+issue before it is admitted can put instructions in its title or description. The
+coordinator is told that only the owner's words are instructions and that anything
+read through a connector is information. That is a prompt boundary, not a
+guarantee, and it does not stop an injected request from the owner's own account.
+
 ## Dependency audit
 
 The current lockfile's production host dependency audit reports zero known advisories. The full workspace audit reports 29 findings (19 high, 10 moderate), propagated from four transitive packages in the Expo 57 dependency tree: `braces`, `node-forge`, `uuid`, and `decode-uri-component`. Most are in build tooling; the Router URI decoder also requires review before native release. At the time of the check, the registry's latest `braces` and `node-forge` versions remained affected. A forced audit fix proposed incompatible SDK changes, so it was not applied. These findings remain open; the mobile debug build is not a security-reviewed release.

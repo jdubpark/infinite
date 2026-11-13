@@ -87,12 +87,10 @@ export class IntakeStore {
     return structuredClone(saved);
   }
 
-  forThread(thread: IntakeThread): IntakeRecord | undefined {
-    const bound = [...this.records.values()].filter(record =>
+  /** Every record bound to the thread except skipped ones, oldest first, in the same order as `list`. */
+  boundTo(thread: IntakeThread): IntakeRecord[] {
+    return this.list().filter(record =>
       record.state !== "skipped" && record.thread?.channelId === thread.channelId && record.thread.threadTs === thread.threadTs);
-    const newestFirst = bound.sort((a, b) => b.issueCreatedAt.localeCompare(a.issueCreatedAt) || b.issueId.localeCompare(a.issueId));
-    const preferred = newestFirst.find(record => record.state !== "finished") ?? newestFirst.find(record => record.state === "finished");
-    return preferred && structuredClone(preferred);
   }
 
   forMission(missionId: string): IntakeRecord | undefined {
@@ -115,8 +113,25 @@ export class IntakeStore {
     }
   }
 
+  /**
+   * Past 200 inbound entries, the oldest handled ones are dropped; an unhandled entry is still to be applied and stays.
+   * Past 400 messages, the oldest replies (`reply:` keys) that will not be sent again, `sent` or `failed`, are dropped.
+   * A `pending` reply, including one waiting for a retry, stays, and so does every other message: the Slack surface
+   * composes those from their keys, so dropping one would post it again. When nothing more may go, a list stays over its cap.
+   */
   private trim(record: IntakeRecord) {
-    if (record.inbound.length > 200) record.inbound.splice(0, record.inbound.length - 200);
-    if (record.messages.length > 400) record.messages.splice(0, record.messages.length - 400);
+    let inboundExcess = record.inbound.length - 200;
+    if (inboundExcess > 0) record.inbound = record.inbound.filter(entry => {
+      if (inboundExcess === 0 || !entry.handledAt) return true;
+      inboundExcess -= 1;
+      return false;
+    });
+    let excess = record.messages.length - 400;
+    if (excess <= 0) return;
+    record.messages = record.messages.filter(message => {
+      if (excess === 0 || !message.key.startsWith("reply:") || message.status === "pending") return true;
+      excess -= 1;
+      return false;
+    });
   }
 }

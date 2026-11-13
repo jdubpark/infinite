@@ -174,13 +174,20 @@ export function validateIntakeConfig(config: Config): void {
   if (!intake) return;
   if (!config.linear) throw new Error("Intake requires a host Linear credential");
   if (intake.requireSlackThread && !intake.slack) throw new Error("requireSlackThread needs intake.slack");
+  // Without a Slack block no thread is read or bound, so mirroring would leave the outcome nowhere.
+  if (intake.linear.commentsMirrorToSlack && !intake.slack) throw new Error("commentsMirrorToSlack needs intake.slack");
   const slack = intake.slack;
   if (slack) {
     if (intake.requireSlackThread && !slack.linearAgentUserId) throw new Error("requireSlackThread needs intake.slack.linearAgentUserId");
     if (slack.bindByMention && intake.requireSlackThread) throw new Error("bindByMention cannot be used with requireSlackThread");
-    const tokenMessage = "Slack token must be a private 0600 file outside runtime state and project workspaces";
-    assertPrivateCredentialFile(config, slack.appTokenFile, tokenMessage);
-    assertPrivateCredentialFile(config, slack.botTokenFile, tokenMessage);
+    const tokenMessage = "Slack token must be a nonempty private 0600 file outside runtime state and project workspaces";
+    for (const file of [slack.appTokenFile, slack.botTokenFile]) {
+      assertPrivateCredentialFile(config, file, tokenMessage);
+      try {
+        const token = readFileSync(file, "utf8").trim();
+        if (!token || token.length > 4096 || /\s/.test(token)) throw new Error();
+      } catch { throw new Error(tokenMessage); }
+    }
     const endpoint = new URL(slack.endpoint ?? SLACK_OFFICIAL_ENDPOINT);
     const local = config.environment === "local" && endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
     if ((!local && endpoint.href !== SLACK_OFFICIAL_ENDPOINT) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash)

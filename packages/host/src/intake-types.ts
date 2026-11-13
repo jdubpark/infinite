@@ -16,7 +16,8 @@ export const intakeConfigSchema = z.object({
     botTokenFile: z.string().refine(isAbsolute),
     teamId: z.string().regex(/^T[A-Z0-9]{2,20}$/),
     ownerUserId: z.string().regex(/^[UW][A-Z0-9]{2,20}$/),
-    linearAgentUserId: z.string().regex(/^[UWB][A-Z0-9]{2,20}$/).optional(),
+    // Mention markup names users only (`<@U…>` or `<@W…>`), so a bot ID would never match.
+    linearAgentUserId: z.string().regex(/^[UW][A-Z0-9]{2,20}$/).optional(),
     bindByMention: z.boolean().default(false),
     endpoint: z.url().optional(),
   }).strict().optional(),
@@ -41,7 +42,11 @@ export interface IntakeMessage {
   /** The last send may have reached Slack; look the key up in the thread before sending again. */
   uncertain?: boolean; nextAttemptAt?: string; ts?: string; error?: string;
 }
-export interface IntakeInbound { eventId: string; ts: string; text: string; receivedAt: string; handledAt?: string; outcome?: string }
+export interface IntakeInbound {
+  eventId: string; ts: string; text: string; receivedAt: string; handledAt?: string; outcome?: string;
+  /** The mission call chosen for this event, saved before the call; a replay performs exactly this call. */
+  call?: { action: "answer" | "steer" | "pause" | "resume" | "cancel"; decisionId?: string; text?: string; revision: number };
+}
 export interface IntakeComment { id: string; body: string; delivered: boolean; attempts: number; error?: string }
 export interface IntakeRecord {
   issueId: string; identifier: string; url: string; title: string; description: string;

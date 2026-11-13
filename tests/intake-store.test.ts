@@ -155,17 +155,16 @@ test("update detaches stored state from callback and nested references", () => {
   } finally { h.close(); }
 });
 
-test("forThread prefers the newest unfinished record and never returns a skipped one", () => {
+test("boundTo lists a thread's records oldest first and never a skipped one", () => {
   const h = setup();
   try {
     const store = h.open();
-    store.create(record(FINISHED, "2026-01-01T00:00:00.000Z", "finished", thread));
     store.create(record(STARTED, "2026-01-02T00:00:00.000Z", "started", thread));
-    store.create(record(SKIPPED, "2026-01-03T00:00:00.000Z", "skipped"));
-    assert.equal(store.forThread(thread)!.issueId, STARTED);
-    store.update(STARTED, r => { r.state = "finished"; });
-    assert.equal(store.forThread(thread)!.issueId, STARTED);
-    assert.equal(store.forThread({ channelId: "C0000000000", threadTs: "1.000002" }), undefined);
+    store.create(record(FINISHED, "2026-01-01T00:00:00.000Z", "finished", thread));
+    store.create(record(SKIPPED, "2026-01-03T00:00:00.000Z", "skipped", thread));
+    store.create(record(A, "2026-01-04T00:00:00.000Z", "queued", { channelId: "C0000000000", threadTs: "1.000002" }));
+    assert.deepEqual(store.boundTo(thread).map(item => item.issueId), [FINISHED, STARTED]);
+    assert.deepEqual(store.boundTo({ channelId: "C0000000001", threadTs: "1.000001" }), []);
   } finally { h.close(); }
 });
 
@@ -189,26 +188,70 @@ test("an issue ID that is not a UUID is refused", () => {
   finally { h.close(); }
 });
 
-test("update retains only the newest inbound entries and messages", () => {
+type Message = IntakeRecord["messages"][number];
+const message = (key: string, kind: Message["kind"], status: Message["status"] = "sent"): Message =>
+  ({ key, kind, text: "message", createdAt: "2026-01-01T00:00:00.000Z", status, attempts: 1 });
+const inbound = (eventId: string, handled: boolean): IntakeRecord["inbound"][number] =>
+  ({ eventId, ts: eventId, text: "inbound", receivedAt: "2026-01-01T00:00:00.000Z", ...(handled ? { handledAt: "2026-01-01T00:00:01.000Z" } : {}) });
+
+test("update retains the newest inbound entries, and past 400 messages drops only the oldest replies", () => {
   const h = setup();
   try {
     const store = h.open();
     store.create(record(A));
+    const composed = ["ack", "started", "q:decision-1", "result:1#1", "result:1#2", "status:blocked:3", "edit-note"];
     store.update(A, r => {
-      r.inbound = Array.from({ length: 201 }, (_, i) => ({
-        eventId: `event-${i}`, ts: `${i}`, text: "inbound", receivedAt: "2026-01-01T00:00:00.000Z",
-      }));
-      r.messages = Array.from({ length: 401 }, (_, i) => ({
-        key: `message-${i}`, kind: "status", text: "message", createdAt: "2026-01-01T00:00:00.000Z", status: "pending", attempts: 0,
-      }));
+      r.inbound = Array.from({ length: 201 }, (_, i) => inbound(`event-${i}`, true));
+      r.messages = [...composed.map(key => message(key, "status")), ...Array.from({ length: 400 }, (_, i) => message(`reply:event-${i}`, "reply"))];
     });
     const saved = store.get(A)!;
     assert.equal(saved.inbound.length, 200);
     assert.equal(saved.inbound[0]!.eventId, "event-1");
     assert.equal(saved.inbound.at(-1)!.eventId, "event-200");
     assert.equal(saved.messages.length, 400);
-    assert.equal(saved.messages[0]!.key, "message-1");
-    assert.equal(saved.messages.at(-1)!.key, "message-400");
+    assert.deepEqual(saved.messages.slice(0, composed.length).map(item => item.key), composed, "Composed messages are never trimmed");
+    assert.equal(saved.messages[composed.length]!.key, "reply:event-7", "The oldest replies go first");
+    assert.equal(saved.messages.at(-1)!.key, "reply:event-399");
+  } finally { h.close(); }
+});
+
+test("trimming keeps a pending reply and drops older sent and failed replies in its place", () => {
+  const h = setup();
+  try {
+    const store = h.open();
+    store.create(record(A));
+    // A pending reply with an error is one the pump will retry; a failed one is final.
+    const retried = { ...message("reply:retried", "reply", "pending"), error: "Slack request failed: ratelimited", nextAttemptAt: "2026-01-01T00:00:05.000Z" };
+    store.update(A, r => {
+      r.messages = [message("ack", "ack"), message("reply:failed", "reply", "failed"), message("reply:pending", "reply", "pending"), retried,
+        ...Array.from({ length: 400 }, (_, i) => message(`reply:event-${i}`, "reply"))];
+    });
+    const keys = store.get(A)!.messages.map(item => item.key);
+    assert.equal(keys.length, 400);
+    assert.deepEqual(keys.slice(0, 4), ["ack", "reply:pending", "reply:retried", "reply:event-3"], "Older sent and failed replies go first");
+    assert.equal(keys.at(-1), "reply:event-399");
+  } finally { h.close(); }
+});
+
+test("trimming never drops an unhandled inbound entry, and stays above the caps when nothing more may go", () => {
+  const h = setup();
+  try {
+    const store = h.open();
+    store.create(record(A));
+    store.update(A, r => { r.inbound = [inbound("unhandled", false), ...Array.from({ length: 201 }, (_, i) => inbound(`event-${i}`, true))]; });
+    const ids = store.get(A)!.inbound.map(item => item.eventId);
+    assert.equal(ids.length, 200);
+    assert.deepEqual(ids.slice(0, 2), ["unhandled", "event-2"], "The oldest handled entries go in its place");
+
+    store.create(record(B));
+    store.update(B, r => {
+      r.inbound = Array.from({ length: 205 }, (_, i) => inbound(`open-${i}`, false));
+      r.messages = [...Array.from({ length: 401 }, (_, i) => message(`status:blocked:${i}`, "status")), message("reply:new", "reply", "pending")];
+    });
+    const saved = store.get(B)!;
+    assert.equal(saved.inbound.length, 205, "Unhandled entries all stay");
+    assert.equal(saved.messages.length, 402, "Composed messages and a pending reply all stay");
+    assert.equal(saved.messages.at(-1)!.key, "reply:new");
   } finally { h.close(); }
 });
 

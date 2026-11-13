@@ -42,6 +42,8 @@ import { MissionService, missionBoard } from "./missions.js";
 import { IntakeStore } from "./intake-store.js";
 import { IntakeLinear } from "./intake-linear.js";
 import { IntakeService } from "./intake.js";
+import { IntakeSlackSurface } from "./intake-slack.js";
+import { SlackClient } from "./slack-client.js";
 import { createMissionSchema, missionActionSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { LinearService } from "./linear.js";
@@ -257,7 +259,12 @@ export function createApp(config: Config, key: Buffer) {
     return missions.create({ ...body, groupId: group.id }, body, origin);
   };
   // Intake exists only when configured; without it the intake route lists no records.
-  const intake = config.intake ? new IntakeService(config, new IntakeStore(config, key), missions, new IntakeLinear(linear), { create: createMission }) : undefined;
+  // One store serves the service and the Slack surface, so a record the service admits is the record the surface posts.
+  const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
+  const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint }) : undefined;
+  const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient }) : undefined;
+  // The Slack surface exists only with an intake Slack block; without one, intake runs on Linear alone.
+  const intakeSlack = intakeStore && intakeSlackClient ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
   // Native records written before executionLocation existed carry only the hybrid workspace.
@@ -783,7 +790,7 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
   app.get("/api/missions", (_req, res) => res.json({ missions: missions.list() }));
   app.get("/api/missions/:id", (req, res) => res.json(missions.get(id.parse(req.params.id))));
-  app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [] }));
+  app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [], ...intake?.status(), ...(intakeSlack ? { slack: intakeSlack.status() } : {}) }));
   app.post("/api/missions", requireRole(["owner"]), async (req, res) => res.json(await createMission(createMissionSchema.parse(req.body))));
   // Mission controls and answers are owner-only, so every recorded mission answer is the owner's.
   app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
@@ -1626,6 +1633,7 @@ export function createApp(config: Config, key: Buffer) {
     routines.start();
     missions.start();
     intake?.start();
+    void intakeSlack?.start().catch(() => undefined);
     handoffs.start();
     readings.start();
     // The timer checks each tick which projects follow GitHub, so one enrolled while the server runs is picked up too.
@@ -1649,6 +1657,7 @@ export function createApp(config: Config, key: Buffer) {
     routines.close();
     missions.close();
     intake?.close();
+    intakeSlack?.close();
     repositoryBriefings?.close();
     repositoryGraphs?.close();
     void understandingRuntime.close();
@@ -1663,6 +1672,6 @@ export function createApp(config: Config, key: Buffer) {
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

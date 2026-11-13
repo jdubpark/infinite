@@ -28,13 +28,16 @@ const appTokenFile = privateFile("slack-app-token");
 const botTokenFile = privateFile("slack-bot-token");
 const worldReadable = privateFile("slack-world-readable", 0o644);
 const insideStateDir = privateFile("state/slack-inside");
+const emptyToken = join(root, "slack-empty-token");
+writeFileSync(emptyToken, "\n");
+chmodSync(emptyToken, 0o600);
 
 const slack = {
   appTokenFile,
   botTokenFile,
   teamId: "T00000000",
   ownerUserId: "U00000000",
-  linearAgentUserId: "B00000000",
+  linearAgentUserId: "U11111111",
 };
 const base = {
   linear: { teamIds: [TEAM], creatorId: OWNER, label: "infinite" },
@@ -84,6 +87,18 @@ test("binding by mention excludes a required thread", () => assert.throws(() => 
 test("Slack token files are private and outside runtime state", () => {
   assert.throws(() => validate({ slack: { ...slack, botTokenFile: worldReadable } }), /private 0600 file/);
   assert.throws(() => validate({ slack: { ...slack, appTokenFile: insideStateDir } }), /private 0600 file/);
+});
+test("an empty Slack token file is refused", () => {
+  assert.throws(() => validate({ slack: { ...slack, botTokenFile: emptyToken } }), /nonempty private 0600 file/);
+  assert.throws(() => validate({ slack: { ...slack, appTokenFile: emptyToken } }), /nonempty private 0600 file/);
+});
+test("mirroring comments to Slack needs the Slack block", () => {
+  assert.throws(() => validate({ slack: undefined, requireSlackThread: false, linear: { ...base.linear, commentsMirrorToSlack: true } }), /commentsMirrorToSlack needs intake\.slack/);
+  assert.doesNotThrow(() => validate({ linear: { ...base.linear, commentsMirrorToSlack: true } }));
+});
+test("Linear's agent is a user ID, never a bot ID", () => {
+  assert.throws(() => parsed({ slack: { ...slack, linearAgentUserId: "B00000000" } }));
+  assert.doesNotThrow(() => parsed({ slack: { ...slack, linearAgentUserId: "W11111111" } }));
 });
 test("a loopback Slack endpoint is local-only", () => {
   assert.throws(() => validate({ slack: { ...slack, endpoint: "http://127.0.0.1:9/api" } }, { environment: "cloud" }), /official HTTPS endpoint/);

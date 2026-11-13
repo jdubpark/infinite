@@ -16,7 +16,7 @@ const issueNode = z.object({
   labels: z.object({ nodes: z.array(z.object({ name: z.string().max(200) })).max(250) }),
 });
 const comment = z.object({ id: z.uuid(), body: z.string().max(64000), issue: z.object({ id: z.uuid() }) });
-const candidateLimit = 200;
+const candidatePage = 200, candidatePages = 10;
 
 /**
  * Reads a Slack message link: a root link (`p` plus sixteen digits) or a reply link whose `thread_ts` names the root.
@@ -52,18 +52,40 @@ export function issueFacts(node: unknown): IntakeIssue {
   };
 }
 
+/** One malformed issue must not hold back the rest of the queue; it is left out and never admitted. */
+const facts = (nodes: unknown[]) => nodes.flatMap(node => { try { return [issueFacts(node)]; } catch { return []; } });
+
 /** Linear reads and comment writes for intake. The service re-checks every fact it gets back. */
 export class IntakeLinear {
   constructor(private readonly linear: Pick<LinearService, "request">) {}
 
-  /** Issues that may qualify. The query narrows by team, label, and creation time; the caller re-checks each one. */
-  async candidates(filter: { teamIds: string[]; label: string; createdAfter: string }): Promise<IntakeIssue[]> {
-    const data = await this.linear.request("InfiniteIntakeCandidates",
-      `query InfiniteIntakeCandidates($filter: IssueFilter!, $first: Int!) { issues(filter: $filter, includeArchived: true, first: $first) { nodes { ${issueFields} } } }`,
-      { filter: { team: { id: { in: filter.teamIds } }, labels: { some: { name: { eqIgnoreCase: filter.label } } }, createdAt: { gt: filter.createdAfter } }, first: candidateLimit });
-    const nodes = z.object({ issues: z.object({ nodes: z.array(z.unknown()).max(candidateLimit) }) }).parse(data).issues.nodes;
-    // One malformed issue must not hold back the rest of the queue; it is left out and never admitted.
-    return nodes.flatMap(node => { try { return [issueFacts(node)]; } catch { return []; } });
+  /**
+   * Issues that may qualify. The query narrows by team, label, creation time, and an open state, leaves archived issues
+   * out, and reads up to 10 pages of 200. `capped` is true when more pages remain; the caller re-checks each issue.
+   */
+  async candidates(filter: { teamIds: string[]; label: string; createdAfter: string }): Promise<{ issues: IntakeIssue[]; capped: boolean }> {
+    const variables = {
+      filter: { team: { id: { in: filter.teamIds } }, labels: { some: { name: { eqIgnoreCase: filter.label } } }, createdAt: { gt: filter.createdAfter },
+        state: { type: { nin: ["completed", "canceled"] } } },
+      first: candidatePage,
+    };
+    const page = z.object({ issues: z.object({
+      nodes: z.array(z.unknown()).max(candidatePage),
+      pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().max(1024).nullable() }),
+    }) });
+    const nodes: unknown[] = [];
+    let after: string | undefined;
+    for (let read = 0; read < candidatePages; read++) {
+      const data = await this.linear.request("InfiniteIntakeCandidates",
+        `query InfiniteIntakeCandidates($filter: IssueFilter!, $first: Int!, $after: String) { issues(filter: $filter, first: $first, after: $after) { nodes { ${issueFields} } pageInfo { hasNextPage endCursor } } }`,
+        { ...variables, ...(after ? { after } : {}) });
+      const { issues } = page.parse(data);
+      nodes.push(...issues.nodes);
+      if (!issues.pageInfo.hasNextPage) return { issues: facts(nodes), capped: false };
+      if (!issues.pageInfo.endCursor || issues.pageInfo.endCursor === after) throw new Error("Linear returned a page without a new cursor.");
+      after = issues.pageInfo.endCursor;
+    }
+    return { issues: facts(nodes), capped: true };
   }
 
   /**

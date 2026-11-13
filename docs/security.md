@@ -97,6 +97,12 @@ or answers a provider dialog, and the relaunch on a fallback is a new member.
 Price tables stay in private host configuration. Budget amounts, aggregated
 totals, and limit observations reach clients.
 
+## Evidence store at rest
+
+The evidence database follows the at-rest rule of contract C1 in the self-improving teams design. Its file is private (`0600`) in a private directory (`0700`). The host narrows a wider file mode on open, after the key check passes. Each payload is sealed with AES-256-GCM under a key that HKDF-SHA-256 derives from the vault key. The seal binds a payload to its table and row ID, so a payload copied into another row does not open.
+
+A plain column holds only an opaque ID, an enumeration, a number, or a time. A task ID, a path, and any text from a repository or a run are encrypted. When such a value must be matched, the row stores a blind index: a keyed HMAC-SHA-256 that keeps value classes apart. Event keys are stored the same way. The host refuses an existing file that fails the encrypted key check, an empty file included, and it never falls back to plaintext. Status reasons and log lines never name a path.
+
 ## Remote machine transport
 
 Optional remote access is restricted to single-tenant runners. A runner can accept encrypted direct WebSockets and connect outbound to a separate relay. Keep the runner's ordinary HTTP API private. Only the separate relay endpoint is intended for public HTTPS exposure; it forwards opaque frames and routing metadata rather than exposing runner administration. The supported public deployment puts Cloudflare Access in front of it: a service token is checked at Cloudflare's edge and the tunnel validates the Access JWT before forwarding, so unauthenticated traffic does not reach the server. Access is a spam and flood gate, not the application authentication; the paired device key still authenticates every channel. [Remote machine setup](remote-machines.md) defines pairing and deployment.

@@ -1145,3 +1145,306 @@ export function advanceEpoch(store: EvidenceStore, input: { profile: ProfileKey;
 - A knowledge snapshot reference other than `none`, a routing policy version other than `off`, and the `trial` shape.
 - `configId` on the usage session header. The usage capture design owns the header.
 - A route that lists epochs, and pruning of configuration rows that no outcome row references.
+
+---
+
+# Slice: projection
+
+Spec parts 3, 4, and 6, and the backfill of delivery order 2. A projector turns stored run events into one outcome row per attempt, one run summary per run, and one member result per member that has no task. A one-time backfill writes flagged rows for runs that predate emission. A read route returns a run's rows, also after its record is gone. It builds on the configuration identity slice, which must merge first.
+
+## Trust boundary, and what a review checks
+
+The module, the projector, and the backfill are host code. The projector is synchronous. Every event was built by the host from its own run record. These values in events originate from members: report kinds (enumerated), task and scout ids (the project manager chose them), owned paths in `task.planned`, changed paths in `repair.paths`, profile ids (checked against the lineup), a review's verdict and rubric scores (bounded integers), and a reported merge commit. A rating score comes from the owner.
+
+The rules for derived rows are spec part 3: "Plaintext columns hold opaque identifiers, enumerations, numbers, and times. Names from the repository or the run stay in the encrypted payload. A row never holds an objective, instructions, a summary, a rubric reason, a rating note, a path, or a URL." And umbrella C1: "A durable row holds identifiers, features, dispositions, counts, and costs. It holds no free text from the run." So the projector compares paths in memory and never writes one. A project id, task id, area, commit id, or tree id goes into a sealed payload. A match uses a blind index of class `project`, `task`, or `area`.
+
+The slice must survive:
+
+- **A projector that falls behind.** Rows arrive later. Every rule uses `seq` order and event times, never the clock at projection time.
+- **A blocked projector.** It writes no rows. A run deletion still stamps the run's existing rows through the module's `deleteRun` hook, and the outbox counts the lost events.
+- **A run deleted before its events were projected.** Rows keep what was projected, get `run_deleted_at`, and carry `gap`. A fact that never arrived stays unknown.
+- **Facts split across kinds.** `review.recorded` then `review.tree`; `repair.integrated` then `repair.paths`; a `member.stopped` with no `member.started`; `run.settled` before a late enrichment; `member.configured` late or never. Task 3 states each case.
+- **A store that is unavailable.** Nothing is written. The backfill and the retention sweep return at once.
+- **A retried page.** A page's rows and its cursor commit together. Every write is a set or a recount, never an increment, so a replayed event writes the same row.
+
+Outside this slice: cost and its coverage, delayed signals and the base branch scan, cells and the scorecard, roll-ups, the legacy import, the purge, and hostile event shapes, which the outbox refuses.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/outcome-rules.ts` (create) | Pure rules: types, dispositions and their precedence, levels, the block-code map, round links |
+| `packages/host/src/outcome-store.ts` (create) | The `outcomes` evidence module: schema, hooks, sealed row helpers, the run view, the retention sweep |
+| `packages/host/src/outcome-projector.ts` (create) | The `outcomes` projector |
+| `packages/host/src/outcome-backfill.ts` (create) | Rows from sealed run records that predate emission |
+| `packages/host/src/teams.ts` (modify) | Two lines: the block source in `block`, the recovery source in `startAutomaticRecovery` |
+| `packages/host/src/server.ts`, `packages/host/src/client.ts` (modify) | Registration, the backfill tick, the sweep, `GET /api/outcomes/runs/:runId`, `infinite usage outcomes --run ID` |
+| `docs/superpowers/specs/2026-11-12-outcome-ledger-design.md` (modify) | Part 1 table: the `run.revision-advanced` data |
+| `tests/outcome-{rules,store,projector,backfill}.test.ts` (create); `tests/team-events.test.ts`, `tests/teams.test.ts`, `tests/outcome-routes.test.ts` (modify) | Unit tests with a real store; the two sources, a full run, and the route |
+
+## Review Focus
+
+1. A review approves before a repair's paths arrive. Expect accepted yes and firstPass unknown, then firstPass set by `repair.paths`, also after the freeze.
+2. A run deleted while the projector is behind. Expect its rows kept, stamped, and flagged `gap`, and no table holding a path.
+3. A page that fails and is retried. Expect rows equal to a run without the failure.
+4. An attempt stopped as a host stop and then named as the source of a scope violation. Expect `out-of-scope`.
+5. A run that predates emission. Expect rows flagged `backfilled` that never overwrite an event-derived row.
+
+### Task 1: the outcome rules
+
+**Files:** `packages/host/src/outcome-rules.ts`, `tests/outcome-rules.test.ts`. Runs in parallel with Task 2.
+
+**Interfaces (produces):**
+
+```ts
+export type Disposition = "open" | "integrated" | "completed" | "escalated" | "stalled" | "no-report" | "question"
+  | "blocked" | "wrong-report" | "out-of-scope" | "limit" | "owner-stop" | "host-stop";
+export type Exclusion = "limit" | "owner" | "host"; export type Level = 0 | 1 | null;   // no, yes, unknown
+export type Flag = "backfilled" | "gap" | "empty-result" | "same-model-review";
+export type LinkState = "pending" | "attributed" | "clear" | "unknown";
+export interface RowState { role: "implementer" | "scout"; disposition: Disposition; accepted: Level; links: readonly LinkState[] }
+export interface Levels { integrated: Level; accepted: Level; firstPass: Level; held: Level }
+export const BLOCK_DISPOSITIONS: Readonly<Record<string, Disposition>>;
+export function stopDisposition(reason: MemberStopReason): Disposition;
+export function reportDisposition(kind: string): Disposition | undefined;
+export function exclusionOf(disposition: Disposition): Exclusion | undefined;
+export function replaces(current: Disposition, next: Disposition): boolean;
+export function levels(state: RowState): Levels;
+export function freezeAccepted(accepted: Level, lastReview: "approved" | "changes-requested" | undefined, status: string): Level;
+export function linkAfterPaths(owned: readonly string[] | undefined, changed: readonly string[] | "omitted"): LinkState;
+export function roundCounts(links: readonly LinkState[]): { run: number; attributed: number; unknown: number };
+```
+
+**Decisions:**
+
+- Dispositions and exclusions follow the spec part 3 table. `reportDisposition` maps `question` and `blocked`. Every other report kind gives undefined, because a consume event decides it.
+- `BLOCK_DISPOSITIONS`: `wrong-agent-report` is `wrong-report`. `task-scope-violation` and `read-only-role-changed-files` are `out-of-scope`. `integration-conflict`, `integration-changed-files`, `workspace-operation-failed`, `invalid-workspace-baseline`, and `workspace-copy-changed` are `host-stop`. Every other code changes no row. *(My call: the spec says "a workspace operation failure". These are the codes that `teams.ts` treats as one.)*
+- **Precedence.** `integrated` and `completed` replace any disposition except each other. `wrong-report` and `out-of-scope` replace `open` and `host-stop`, because a host stop is excluded only when the attempt did not cause it. Every other disposition replaces `open` only. *(My call: the strongest host receipt wins, and the halt loop's stop never hides the attempt's own fault.)*
+- **Levels.** Open, excluded, and scout rows: all unknown. A counted failure of an implementer: all no. An integrated row: integrated yes; accepted as stored; firstPass no when accepted is no or a link is `attributed`, yes when accepted is yes and every link is `clear`, else unknown; held no when accepted is no, else unknown. Held is never yes here: it needs the base branch scan.
+- `freezeAccepted` keeps a stored level. Otherwise it gives no when the last covering review requested changes and the status is not `cancelled`, else unknown.
+- `linkAfterPaths` uses `teamPathAllowed` from `team-workspace.ts`. Omitted changed paths, or owned paths that are unknown, give `unknown`. An empty change gives `clear`.
+- `roundCounts`: `run` counts every link, `attributed` counts `attributed`, and `unknown` counts `pending` and `unknown`. *(My call: `rounds.run` counts every correction round linked to the row, of any cause. The spec ties it to today's `reviewRounds`, which counts review rounds only. `outcome_rounds.cause` keeps the scorecard's choice open.)*
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-rules.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `dispositions follow the spec table` | The five stop reasons give `stalled`, `limit`, `no-report`, `owner-stop`, `host-stop`. `exclusionOf` gives `limit`, `owner`, `host` for the last three and undefined for `stalled`. `BLOCK_DISPOSITIONS["task-scope-violation"]` is `out-of-scope`, `["integration-conflict"]` is `host-stop`, and `["repair-limit"]` is undefined. `reportDisposition("result")` is undefined. |
+| `a later fact replaces an earlier one only by precedence` | `replaces("open", "stalled")` true. `("stalled", "owner-stop")` false. `("host-stop", "out-of-scope")` true. `("owner-stop", "out-of-scope")` false. `("host-stop", "integrated")` true. `("integrated", "host-stop")` false. |
+| `levels by row state` | Open, `owner-stop`, and a completed scout: all null. A stalled implementer: 0, 0, 0, 0. Integrated with accepted null and no links: 1, null, null, null. Accepted 1 with links `clear`, `clear`: 1, 1, 1, null. Accepted 1 with `pending`: firstPass null. Accepted null with `attributed`: firstPass 0. Accepted 0: 1, 0, 0, 0. |
+| `a freeze decides acceptance from the last covering review` | `changes-requested` at `ready-for-review` gives 0, at `cancelled` gives null. No review gives null. A stored 1 stays 1. |
+| `a round link follows the changed paths` | Owned `["packages/host/src"]` with change `["packages/host/src/a.ts"]` is `attributed`, with `["apps/web/b.ts"]` is `clear`, with `[]` is `clear`, and with `"omitted"` is `unknown`. Owned undefined is `unknown`. Owned `["."]` is `attributed`. Owned `["src"]` with `["src2/a.ts"]` is `clear`. |
+| `round counts` | `["pending", "attributed", "clear", "unknown"]` gives `{ run: 4, attributed: 1, unknown: 2 }`. |
+| `team prompts never import the ledger` | The import specifiers of `team-prompts.ts` match none of `outcome-`, `configuration-store`, `config-identity`, or `evidence/` (spec "Authority and safety"). |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-rules.test.ts` and the typecheck.
+
+### Task 2: the outcomes module
+
+**Files:** `packages/host/src/outcome-store.ts`, `tests/outcome-store.test.ts`. Runs in parallel with Task 1.
+
+**Interfaces (produces):** module `outcomes`, version 1. Plain columns hold ids, enumerations, numbers, and times. `payload` columns are sealed with `tx.seal(table, rowId, value)`.
+
+```sql
+CREATE TABLE outcomes (                     -- spec part 3, plus task_ref, session_id, and plain flags
+  outcome_id TEXT PRIMARY KEY,              -- runId ':' memberId
+  source TEXT NOT NULL, project_ref TEXT NOT NULL, task_ref TEXT NOT NULL,   -- blind indexes
+  run_id TEXT NOT NULL, revision INTEGER NOT NULL, member_id TEXT NOT NULL, session_id TEXT,
+  attempt_index INTEGER NOT NULL, inherited INTEGER NOT NULL, role TEXT NOT NULL,
+  profile_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, effort TEXT,
+  profile_epoch INTEGER NOT NULL, config_id TEXT, experiment_ref TEXT,
+  area_ref TEXT NOT NULL, kind TEXT, risk TEXT NOT NULL, feature_version INTEGER NOT NULL,
+  disposition TEXT NOT NULL, exclusion TEXT, flags TEXT NOT NULL,           -- sorted, comma-joined
+  integrated INTEGER, accepted INTEGER, first_pass INTEGER, held INTEGER,   -- 1, 0, NULL
+  started_at TEXT, ended_at TEXT, frozen_at TEXT, hold_until TEXT, run_deleted_at TEXT,
+  payload TEXT NOT NULL                     -- sealed OutcomePayload
+);
+CREATE TABLE outcome_rounds (run_id TEXT NOT NULL, revision INTEGER NOT NULL, round INTEGER NOT NULL,
+  cause TEXT NOT NULL, state TEXT NOT NULL,  -- started | answered | resolved | unknown
+  started_at TEXT NOT NULL, run_deleted_at TEXT, PRIMARY KEY (run_id, revision, round));
+CREATE TABLE outcome_round_links (outcome_id TEXT NOT NULL, run_id TEXT NOT NULL, revision INTEGER NOT NULL,
+  round INTEGER NOT NULL, state TEXT NOT NULL, PRIMARY KEY (outcome_id, revision, round));
+CREATE TABLE run_summaries (run_id TEXT PRIMARY KEY, source TEXT NOT NULL, project_ref TEXT NOT NULL,
+  revision INTEGER NOT NULL, status TEXT, block_code TEXT, flags TEXT NOT NULL,
+  created_at TEXT, settled_at TEXT, approved_at TEXT, run_deleted_at TEXT,
+  payload TEXT NOT NULL);                   -- sealed RunSummaryPayload
+CREATE TABLE member_results (result_id TEXT PRIMARY KEY, source TEXT NOT NULL, project_ref TEXT NOT NULL,
+  run_id TEXT NOT NULL, revision INTEGER NOT NULL, member_id TEXT NOT NULL, session_id TEXT,
+  role TEXT NOT NULL, profile_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, effort TEXT,
+  profile_epoch INTEGER NOT NULL, config_id TEXT, report_kind TEXT,
+  disposition TEXT NOT NULL,                -- open | reported | stalled | no-report | limit | owner-stop | host-stop
+  flags TEXT NOT NULL, started_at TEXT, ended_at TEXT, run_deleted_at TEXT,
+  payload TEXT NOT NULL);                   -- sealed { projectId, replaces? }
+CREATE TABLE backfill_runs (run_id TEXT PRIMARY KEY, at TEXT NOT NULL, rows INTEGER NOT NULL, skipped INTEGER NOT NULL);
+CREATE TABLE outcome_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);   -- 'last_seq'
+-- Indexes: outcomes (run_id), (session_id), (run_deleted_at); member_results (run_id); outcome_round_links (run_id).
+```
+
+```ts
+export const OUTCOMES_MODULE = "outcomes", OUTCOME_RETENTION_DAYS = 730;
+export const OUTCOME_KINDS: readonly string[];   // the 21 kinds of the Task 3 table, shared with the projector
+export type OutcomePayload = { projectId: string; taskId: string; area: string; featureMap: string;
+  goal?: { id: string; cycle: number }; missionId?: string;
+  replaces?: { memberId: string; cause: ReplacementCause }; failureKind?: string; baseCommit?: string;
+  lastReview?: "approved" | "changes-requested"; rounds: { run: number; attributed: number; unknown: number };
+  rubric?: { version: 1; correctness: number; cleanliness: number; extensibility: number; docs: number; reviewerProfileId: string };
+  ownerRating?: { score: number; at: string }; diff?: TeamTask["diffStat"]; wallMs?: number;
+  limitEvents: number; costCoverage: "none" };
+export type RunSummaryPayload = { projectId: string; goal?: { id: string; cycle: number }; missionId?: string;
+  counts?: RunSummaryCounts; attempts: Partial<Record<Disposition, number>>;
+  rounds: { total: number; attributed: number; unattributed: number; unknown: number };
+  currentBase?: string; reviewedHead?: string; reviewedTree?: string; mergeCommit?: string; deliveryMethod?: "merge" | "pull-request" };
+// OutcomeRow, RunSummaryRow, MemberResultRow: every column in camelCase, `flags: Flag[]`, and the opened payload.
+export function outcomeModule(options?: { now?: () => string }): EvidenceModule;
+export function readOutcome(db: EvidenceDb, outcomeId: string): OutcomeRow | undefined;   // also runOutcomes(db, runId)
+export function writeOutcome(tx: EvidenceTx, row: OutcomeRow): void;   // INSERT ... ON CONFLICT DO UPDATE, the whole row
+// readSummary/writeSummary and readMemberResult/writeMemberResult have the same shapes.
+export function runOutcomeView(store: EvidenceStore, runId: string): { summary?: RunSummaryRow; rows: OutcomeRow[]; members: MemberResultRow[] } | undefined;
+/** Removes the rows of runs deleted more than 730 days before `now`, at most `limit` runs per call. Never throws. */
+export function sweepExpiredOutcomes(store: EvidenceStore, now: string, limit?: number): number;
+```
+
+**Decisions:**
+
+- *(My call: `task_ref` and `session_id` are added for assignment grouping and the later cost refresh, and `flags` is plain because each flag is an enumeration.)* `payload.lastReview` is added for the freeze.
+- **Sentinels.** A field whose fact is missing holds `unknown` (profile id, provider, model), `(unknown)` (area: no mapped id or fallback area can spell it), risk `unknown`, feature version 0, attempt index 0, and epoch 0. Such a row carries `gap`. A member with no profile has profile id and model `default`. *(My call: the spec columns are NOT NULL, and the events carry these fields only when they exist.)*
+- **`deleteRun` hook**, in the delete transaction before the run's events are removed: sets `run_deleted_at = COALESCE(run_deleted_at, now)` on the run's rows in the four run tables. When the run still has an event whose kind is in `OUTCOME_KINDS` and whose `seq` is above `last_seq`, it adds `gap` to the run's rows and summary. It removes nothing: no row holds a path or text. `last_seq` is exact, because the projector writes it at every matching event, in `seq` order, in the same transaction as its rows.
+- **`runIds` hook** lists the runs whose summary or rows have no `run_deleted_at`. `EvidenceStore.sweep` then calls the hook for a run whose record file is gone, which repairs a deletion made while this module was unavailable. A stamped run is not listed again. *(My call: unlike the outbox module, this one lists runs, so the hourly sweep repairs a missed stamp.)*
+- **`counts`**: `outcomes`, `open`, `gap`, `backfilled`, `summaries`, `memberResults`.
+- **Retention.** A run's rows expire 730 days after `run_deleted_at` (owner decision of 2026-11-13). The rows of a live run never expire. One write removes the rows of at most `limit` runs (default 100) from all five run tables and `backfill_runs`, and logs one fixed line with the count. *(My call: a constant for now. The `teams.outcomes.retentionDays` key arrives with the signals slice, together with `holdDays` and the C11 digest rule.)*
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-store.test.ts`, with a temporary store as `tests/evidence-store.test.ts` builds it.
+
+| Test name | Assertions |
+|---|---|
+| `a row round-trips with its payload sealed` | A row with task `task-a` and project `example` reads back equal. The raw `payload` column contains neither string. `project_ref` equals `tx.index("project", "example")`. |
+| `deleting a run stamps its rows and removes none` | With rows in all five run tables and two events for run R, `store.deleteRun(R)` leaves every row, each with `run_deleted_at` equal to the injected `now`, and removes the events. |
+| `a run deleted with unseen events is flagged` | With `last_seq` 5 and R's events at `seq` 4 and 6 (kind `task.integrated`), R's rows and summary gain `gap`. A run whose events are all at or below 5 gains none. |
+| `the store sweep finds unstamped runs only` | `runIds` lists R before the deletion and not after. `store.sweep(() => false)` stamps a run that has rows and no events. |
+| `rows expire 730 days after their run was deleted` | With `run_deleted_at` `2024-01-01T00:00:00.000Z`: a sweep at `2025-12-30T23:59:59.999Z` removes nothing, and one at `2025-12-31T00:00:00.001Z` removes R from every table. A live run's rows stay. With `limit` 1 and two expired runs, one call removes one run. |
+| `the module reports its counts` | `describe().counts` has `outcomes.outcomes`, `outcomes.open`, and `outcomes.gap` with the expected numbers. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-store.test.ts` and the typecheck.
+
+### Task 3: the projector
+
+**Files:** `packages/host/src/outcome-projector.ts`, `tests/outcome-projector.test.ts`. Needs Tasks 1 and 2.
+
+**Interfaces (consumes):** Tasks 1 and 2, `epochAt` and `CONFIGURATIONS_MODULE` from the configuration identity slice, `profileIdentityKey`, `EvidenceStore.eventsIn`. **Interfaces (produces):** `export function outcomeProjector(store: EvidenceStore, options?: { log?: (line: string) => void }): EventProjector;` with name `outcomes`, module `outcomes`, and kinds `OUTCOME_KINDS`. To change the kinds later, rename the projector, as the outbox requires.
+
+**Decisions:** keys are `runId:memberId` for rows and member results, `runId` for summaries, `(runId, revision, round)` for rounds, and `(outcomeId, revision, round)` for links. After every change the projector recomputes `levels`, `exclusion`, and `payload.rounds` from the row's links, and stores `last_seq = event.seq`.
+
+| Kind | Effect |
+|---|---|
+| `run.created` | Summary: source `production`, `project_ref`, `created_at`, payload project, goal, mission |
+| `run.prepared` | Summary `currentBase` |
+| `member.started` | Implementer or scout: a new row, or fills the sentinel fields of a row an earlier event made. Profile from the data; epoch `epochAt(identity, startedAt)`; session; `replaces` gives `inherited` 1 and `attempt_index` the predecessor's plus one, or 2 without a predecessor row. Features from the run's `task.planned` (implementer) or `discovery.accepted` (scout) of the same revision, read with `eventsIn(tx, { runId, kinds })`; missing gives sentinels and `gap`. Other roles: a member result, `open` |
+| `member.configured` | `config_id` on the row or member result, whatever its state, when `configId` matches its components |
+| `member.reported` | `reportDisposition` by precedence. Member result: `reported` with `report_kind` |
+| `member.stopped` | `stopDisposition` by precedence. Member result: the same names, from `open` only |
+| `task.integrated` | `integrated`, `ended_at`, `baseCommit`, `diff`, `empty-result` without a commit. Summary `currentBase` |
+| `scout.completed`, `task.escalated` | `completed`; `escalated` |
+| `review.recorded` | Summary `reviewedHead`, `currentBase`. Integrated, unfrozen rows with this base: `lastReview`; when approved, accepted 1, `same-model-review` when the reviewer's model equals the row's, the kept rubric for the row's task, and summary `approved_at` |
+| `review.tree` | Summary `reviewedTree` when its head equals `reviewedHead` |
+| `repair.started` | Round `started`. A `pending` link for each integrated, unfrozen row whose base equals `currentBase`, or every such row when `currentBase` is unknown |
+| `repair.integrated` | Round `answered`. Links of rows with another base become `clear`. Without a commit, every `pending` link becomes `clear` and the round `resolved` |
+| `repair.paths` | Each `pending` link of the round takes `linkAfterPaths(owned, changed)`, owned paths from the row's `task.planned`. The round becomes `resolved`, or `unknown` with `pathsOmitted` |
+| `delivery.recorded` | Summary `deliveryMethod`, and `mergeCommit` for a merge |
+| `rating.recorded` | `ownerRating` on the row of the event's `memberId`, the latest `at` winning. No level changes |
+| `run.blocked` | Summary status and `block_code`. The source member's row takes `BLOCK_DISPOSITIONS[code]` by precedence |
+| `run.revision-advanced` | Summary revision. `baseChanged` clears `currentBase`. A recovery source acts as `run.blocked` |
+| `run.settled` | Freeze: each integrated row with no `frozen_at` gets the event's `at` and `freezeAccepted`. Summary status, `settled_at`, `counts`, attempts by disposition and rounds recounted from rows |
+| `run.deleted` | The stamp of the `deleteRun` hook |
+| `ledger.gap` | `gap` on the run's rows, member results, and summary. A row made later in the run copies it |
+
+- **Before and after a late fact.** Until `review.tree` arrives, the summary has no tree, and the scan slice reads that as unknown. A link stays `pending` until `repair.paths`, so firstPass stays unknown, and the late event resolves it even after the freeze, because the round predates the freeze. A row that an event other than `member.started` made holds sentinels and `gap`. `member.configured` fills `config_id` on an ended or frozen row. A freeze never changes integrated, and a later steer or continuation makes new rows only.
+- **Epochs.** When the `configurations` module is not ready, the projector throws, its page rolls back, and the cursor waits. *(My call: no row takes a guessed epoch, at the cost of a projector that waits for another module.)*
+- **No path or text is written.** Owned and changed paths are compared in memory and dropped.
+- At `run.settled`, when the integrated rows of the event's revision differ from `summary.integrated`, the projector logs one line with fixed words and the two numbers.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-projector.test.ts`, with a real store, an outbox, both modules, and both projectors. A helper builds events with `runEventKey` and flushes them.
+
+| Test name | Assertions |
+|---|---|
+| `a stalled attempt and its replacement` | Spec acceptance 1 as events: m1 stalls on `a`, m2 replaces it and integrates, m3 integrates `b`, an approval, `run.settled` `ready-for-review`. m1 is `stalled` with 0, 0, 0, 0 and attempt 1. m2 has 1, 1, 1, null, attempt 2, inherited 1. m3 has 1, 1, 1, null. Both have `frozen_at` equal to the settled `at`. |
+| `a repair is attributed to the task that owns its path` | Spec acceptance 4: `a` owns `a.txt`, `b` owns `b.txt`, changes requested, round 1 with `repair.paths` `["a.txt"]`, then an approval. Row `a`: accepted 1, firstPass 0, rounds `{ run: 1, attributed: 1, unknown: 0 }`. Row `b`: firstPass 1. |
+| `a late path event resolves a frozen row` | As above with `repair.paths` after `run.settled`. Before it, `b` has firstPass null. After it, 1, with `frozen_at` unchanged. |
+| `missing repair facts leave rounds unknown` | `pathsOmitted` gives both rows firstPass null and `unknown` 1. An unanswered round does the same. An answer without a commit gives firstPass 1. |
+| `a changes-requested review freezes as not accepted` | Settled `ready-for-review`: accepted 0, firstPass 0, held 0. Settled `cancelled`: all three null. |
+| `owner and host stops are excluded` | `member.stopped` `owner` gives `owner-stop`, exclusion `owner`, levels null. `host` gives `host-stop` and `host`. |
+| `a scope violation names its attempt` | A host stop and then `run.revision-advanced` with recovery source `task-scope-violation` for m gives `out-of-scope`, no exclusion, levels 0. `run.blocked` `integration-conflict` for m2 gives `host-stop`. `repair-limit` changes nothing. |
+| `a stop with no start writes a gap row` | Only `member.stopped` `stall`: role `implementer`, profile id `unknown`, attempt index 0, flags `gap`, disposition `stalled`. |
+| `configuration and epoch reach the row` | An epoch advanced before the start gives `profile_epoch` 2. A `member.configured` after `member.stopped` still sets `config_id`. |
+| `a same-model approval is flagged` | The reviewer's model equals m2's: m2 has `same-model-review`, m3 does not. |
+| `a replayed page writes the same rows` | A wrapper throws once at the fifth event. After the retry, every table equals that of an unfailed run. |
+| `a ledger gap marks the run` | Existing rows and the summary gain `gap`, and so does a row started later. |
+| `the summary keeps review and delivery facts` | Head H, tree T, merge M, settled `merged`: `approved_at`, payload `reviewedHead` H, `reviewedTree` T, `mergeCommit` M, attempts `{ integrated: 2 }`, and `counts` equal to the event's. A `review.tree` for another head changes nothing. |
+| `no table holds a path or text` | After the acceptance 4 events, no plain column and no opened payload contains `a.txt`. |
+| `members without a task get member results` | A reviewer that reports is `reported` with `report_kind` `review`. An integrator that stalls is `stalled`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-projector.test.ts` and the typecheck.
+
+### Task 4: the backfill
+
+**Files:** `packages/host/src/outcome-backfill.ts`, `tests/outcome-backfill.test.ts`. Needs Tasks 1 and 2. Runs in parallel with Task 3.
+
+**Interfaces (produces):**
+
+```ts
+/** Pure. Paths are read and dropped. */
+export function backfillRun(run: TeamRun, context: { map?: FeatureMap; epoch: (identity: string, at: string) => number; index: (cls: EvidenceIndexClass, value: string) => string }): { rows: OutcomeRow[]; summary: RunSummaryRow; skipped: number };
+/** At most `limit` runs, one write each. Never throws. */
+export function backfillTick(store: EvidenceStore, runs: () => TeamRun[], options: { mapOf: (projectId: string) => FeatureMap | undefined; limit?: number; now: () => string }): { written: number; remaining: number };
+```
+
+**Decisions:**
+
+- **What it reads.** The sealed run records the host holds, through `TeamService.understandingRecords()`. A run qualifies when the store has no `run.created` event for it (`store.hasEvent(runEventKey("run.created", id))`) and `backfill_runs` has no row. It reads no journal and runs no Git command.
+- **What it reconstructs**, per implementer or scout member, from `run.tasks` and each `run.continuations[].tasks` snapshot of the member's revision: `integrated` (a task with the member's id and status integrated), `completed` (a complete discovery task), `escalated` (`task.escalation.memberId`), `limit` (`task.limitSwitches[].memberId`), `stalled` (`stalledAt`, or the host's own `No activity for ` reason), and `question` or `blocked` (`report.kind`). Any other member is skipped and counted. Accepted is yes only under an approved review of the same snapshot (`run.review`, or the continuation's `review`), else unknown. It is never no. FirstPass is yes only with accepted yes and no correction round in the run (no `reviewRounds` above 0 and no check record with `round` above 0), else unknown. Held is unknown. `rounds` is `{ run: reviewRounds, attributed: 0, unknown: reviewRounds }`. *(My call: a record cannot show which review covered an attempt whose tasks a steer cleared, so the backfill claims less than the projector.)*
+- Features come from the snapshot's paths, with the project's current map. `attempt_index` is one plus the earlier members of the same revision, role, and task. `inherited` is 1 when such a member shares the cwd. `config_id` is null. Rubric and rating come from the task.
+- **Marking, so sources never mix silently (umbrella C6).** Every row and summary carries `backfilled`, and its source stays `production`, as spec delivery order 2 says. A later decision query must leave `backfilled` rows out or label them. Rows insert with `ON CONFLICT DO NOTHING`, so an event-derived row always wins. The projector applies later events to a backfilled row by the same precedence and keeps its flag and its non-sentinel fields.
+- **Bounded.** *(My call: at most 20 runs per tick.)* The server calls it after each outbox pass until `remaining` is 0, then stops for the life of the process.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-backfill.test.ts`, with `TeamRun` fixtures built as `tests/scorecard.test.ts` builds them.
+
+| Test name | Assertions |
+|---|---|
+| `an approved run backfills accepted rows` | Two integrated tasks, an approved review, no rounds: two rows with 1, 1, 1, null, flags `backfilled`, attempt 1. |
+| `a correction round leaves firstPass unknown` | `reviewRounds` 1: firstPass null and `unknown` 1 for both rows. |
+| `a steered run keeps its earlier attempt` | A continuation snapshot with `a` integrated by m1 and an approved review: m1 is integrated and accepted. |
+| `replacements number their attempts` | m1 stalled and m2 in the same cwd integrated: attempts 1 and 2, m2 inherited 1. |
+| `unknown endings are skipped and counted` | A stopped member with only an owner stop reason: no row, `skipped` 1. |
+| `the tick never overwrites and stops when done` | A run with `run.created` is untouched. An event row for R2's m1 stays as it was. A second tick writes nothing. With `limit` 1 and two runs: `written` 1, `remaining` 1. |
+| `no backfilled row holds a path` | No plain column or opened payload contains an owned path. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-backfill.test.ts` and the typecheck.
+
+### Task 5: the sources, the wiring, and the read route
+
+**Files:** `teams.ts`, `server.ts`, `client.ts`, the spec, `tests/team-events.test.ts`, `tests/teams.test.ts`, `tests/outcome-routes.test.ts`. Needs Tasks 3 and 4.
+
+**Decisions:**
+
+- **`block` in `teams.ts`.** The line `stored.ledgerBlockSource = sourceMember?.memberId` becomes `sourceMember?.memberId ?? pending?.source?.memberId`. An operation failure blocks through `block(stored, error)` with no source member, so `run.blocked` named no attempt. *(My call: a one-line fix in `teams.ts`, because the spec's `out-of-scope` disposition depends on it.)*
+- **`startAutomaticRecovery`.** Its `run.revision-advanced` data gains `sourceCode: source.code`, and `sourceMemberId: source.memberId` unless it is `unattributed`. A recovered scope violation emits no `run.blocked`, so this is the only event that names it. *(My call: without it, an automatic recovery turns the attempt's own fault into an excluded host stop.)* The spec's part 1 row gains "recovery source".
+- **`server.ts`.** After the configurations registration: `evidence.register(outcomeModule())` and `outbox.registerProjector(outcomeProjector(evidence))`. `advanceOutbox` then runs `backfillTick` until done. `sweepEvidence` also runs `sweepExpiredOutcomes(evidence, new Date().toISOString())`.
+- **`GET /api/outcomes/runs/:runId`** follows the role rule of `GET /api/usage/models`. It returns `runOutcomeView`, 404 when the run has no summary and no row, and 503 when the store is not ready. `infinite usage outcomes --run ID [--json]` prints one line per row: member, role, profile, disposition, and the four levels as yes, no, or unknown.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `an operation failure names its member` (team-events) | A task-scope violation with recovery exhausted, reached as `tests/teams.test.ts` reaches it: `run.blocked` has `sourceMemberId` equal to the implementer's. |
+| `an automatic recovery names its source` (team-events) | `run.revision-advanced` with cause `automatic-recovery` has `sourceCode` and `sourceMemberId`. |
+| `a full run projects its outcomes` (teams, host) | `fixture()` settles at `ready-for-review`. Two rows have 1, 1, 1, null, the summary status is `ready-for-review`, and member results exist for the project manager and the reviewer. |
+| `rows outlive a cancelled run` (outcome-routes, host) | Spec acceptance 3: a cancel with one running implementer, then `removeRun`. The route returns the row with exclusion `owner` and a `run_deleted_at`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement**, and amend the spec. **Step 4: Run** the four unit test files and `tests/team-events.test.ts`, then `tests/teams.test.ts` and `tests/outcome-routes.test.ts` on the host, then the typecheck.
+- [ ] **Step 5: The coordinator runs `npm run check`, requests the independent review, and commits.**
+
+## Not in this slice
+
+- Cost: tokens, `spentUsd`, `listUsd`, and coverage refreshed from the usage ledger. Rows carry `costCoverage: "none"` and `limitEvents: 0`.
+- Held yes, `landing`, `hold_until`, `outcome_signals`, the base branch scan, and the `scan-gap` flag. Held stays unknown unless accepted is no.
+- Cells, the scorecard switch-over, `GET /api/outcomes`, roll-ups, and blind indexes for goal and mission.
+- The legacy import, the `duel` and `replay` sources, `experiment_ref`, the `teams.outcomes` configuration keys, the purge, member results in the backfill, and remote access for the new route.

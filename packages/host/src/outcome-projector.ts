@@ -210,7 +210,11 @@ function memberReported(ctx: Ctx): void {
   if (isRowRole(role)) {
     const row = readOutcome(tx, outcomeId(event.runId, memberId)) ?? sentinelRow(ctx, memberId, role);
     const next = kind === undefined ? undefined : reportDisposition(kind);
-    if (next !== undefined && replaces(row.disposition, next)) row.disposition = next;
+    // A question or a blocker ends the attempt at its report.
+    if (next !== undefined && replaces(row.disposition, next)) {
+      row.disposition = next;
+      row.endedAt = event.at;
+    }
     saveRow(tx, row);
     return;
   }
@@ -218,6 +222,7 @@ function memberReported(ctx: Ctx): void {
   if (result.disposition === "open") {
     result.disposition = "reported";
     result.reportKind = kind ?? null;
+    result.endedAt = event.at;
   }
   writeMemberResult(tx, result);
 }
@@ -540,6 +545,8 @@ function applyBlock(ctx: Ctx, memberId: string, code: string): void {
   const row = readOutcome(ctx.tx, outcomeId(ctx.event.runId, memberId));
   if (!row || !replaces(row.disposition, next)) return;
   row.disposition = next;
+  // A stop that already ended the attempt keeps its time. An attempt that was still open ends at the block.
+  row.endedAt ??= ctx.event.at;
   saveRow(ctx.tx, row);
 }
 

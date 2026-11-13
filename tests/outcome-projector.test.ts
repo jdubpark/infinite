@@ -690,3 +690,34 @@ test("a later event keeps a backfilled row's unknown rounds", () => {
     h.close();
   }
 });
+
+test("a row that ends has an end time", () => {
+  const h = harness();
+  try {
+    h.flush([
+      created(RUN), prepared(RUN), planned(RUN, "a", ["a.txt"]), planned(RUN, "b", ["b.txt"]), planned(RUN, "c", ["c.txt"]),
+      started(RUN, "m-question", 2, { taskId: "a" }),
+      ev("member.reported", RUN, at(3), { memberId: "m-question", taskId: "a", data: { role: "implementer", reportKind: "question" } }),
+      // A host stop ends the attempt. The scope violation that follows names its fault and keeps that time.
+      started(RUN, "m-scope", 4, { taskId: "b" }), stopped(RUN, "m-scope", 5, "host", "implementer", "b"),
+      ev("run.blocked", RUN, at(6), { data: { code: "task-scope-violation", sourceMemberId: "m-scope" } }),
+      // A block that finds the attempt still open ends it at the block.
+      started(RUN, "m-wrong", 7, { taskId: "c" }),
+      ev("run.blocked", RUN, at(8), { data: { code: "wrong-agent-report", sourceMemberId: "m-wrong" } }),
+      started(RUN, "reviewer-1", 9, { role: "reviewer" }),
+      ev("member.reported", RUN, at(10), { memberId: "reviewer-1", data: { role: "reviewer", reportKind: "review" } }),
+    ]);
+    const question = rowOf(h.store, RUN, "m-question");
+    assert.equal(question?.disposition, "question");
+    assert.equal(question?.endedAt, at(3));
+    const scope = rowOf(h.store, RUN, "m-scope");
+    assert.equal(scope?.disposition, "out-of-scope");
+    assert.equal(scope?.endedAt, at(5));
+    const wrong = rowOf(h.store, RUN, "m-wrong");
+    assert.equal(wrong?.disposition, "wrong-report");
+    assert.equal(wrong?.endedAt, at(8));
+    assert.equal(resultOf(h.store, RUN, "reviewer-1")?.endedAt, at(10));
+  } finally {
+    h.close();
+  }
+});

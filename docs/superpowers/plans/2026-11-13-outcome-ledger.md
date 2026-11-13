@@ -1365,6 +1365,7 @@ export function sweepExpiredOutcomes(store: EvidenceStore, now: string, limit?: 
 - **The reviewed head, its tree, and its approval stay one fact.** A review of another head removes the stored tree, and a review that requests changes clears `approved_at`, so `approved_at` is set exactly when the reviewed head is approved. *(Ruling after the task review: the scan slice reads these three together.)*
 - **A rating never makes a row.** *(Ruling after the task review: a rating can arrive for a run that predates emission before its backfill runs. A sentinel row would then keep the backfilled row out for good.)*
 - **A settled status drops an earlier block code.** A run that was blocked, continued, and settled keeps no block code beside a status that is not `blocked`.
+- **Every ended row has an end time.** A report that sets a disposition (`question`, `blocked`) ends the row at the report. A block that sets one ends the row at the block, unless a stop ended it earlier. A member result that reports ends at its report. *(Ruling after the task review: a later read orders rows and cuts time windows by `ended_at`.)*
 - At `run.settled`, when the integrated rows of the event's revision differ from `summary.integrated`, the projector logs one line with fixed words and the two numbers.
 
 - [ ] **Step 1: Write the failing tests** in `tests/outcome-projector.test.ts`, with a real store, an outbox, both modules, and both projectors. A helper builds events with `runEventKey` and flushes them.
@@ -1391,6 +1392,7 @@ export function sweepExpiredOutcomes(store: EvidenceStore, now: string, limit?: 
 | `a review of a new head drops the old tree and approval` | Approved head H with tree T, then a changes-requested review of head H2: payload `reviewedHead` H2, no `reviewedTree`, `approved_at` null. A late `review.tree` for H changes nothing. |
 | `a rating for an unknown member writes no row` | `rating.recorded` for a member with no row: no outcome row exists for it afterwards. A rating for an existing row sets `ownerRating`. |
 | `a settled run drops an earlier block code` | `run.blocked` `repair-limit`, then `run.settled` `ready-for-review`: `block_code` null. `run.settled` with status `blocked` keeps the code. |
+| `a row that ends has an end time` | A `question` report at minute 3: `ended_at` is that time. A host stop at minute 5 and a scope violation block at minute 6: `out-of-scope` with `ended_at` of minute 5. A block that finds the row open: `wrong-report` with the block's time. A reviewer's report: its member result ends at the report. |
 | `a later event keeps a backfilled row's unknown rounds` | A row with flags `backfilled`, accepted 1, and one link of state `unknown` at revision 0, round 1 (written as Task 4 writes it): a `rating.recorded` for its member leaves firstPass null and rounds `{ run: 1, attributed: 0, unknown: 1 }`. |
 
 - [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-projector.test.ts` and the typecheck.

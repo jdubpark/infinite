@@ -199,7 +199,7 @@ export function backfillTick(store: EvidenceStore, runs: () => TeamRun[], option
     let written = 0;
     for (const run of ordered) {
       const seen: { outcome?: WriteOutcome } = {};
-      const done = store.tryWrite(tx => { seen.outcome = writeRun(tx, run, options); });
+      const done = store.tryWrite(tx => { seen.outcome = writeRun(store, tx, run, options); });
       if (!done) continue;
       written++;
       if (seen.outcome === "unreadable" && !loggedUnreadable) {
@@ -223,7 +223,7 @@ function ready(store: EvidenceStore): boolean {
 }
 
 /** Writes one run inside the caller's transaction. Store errors propagate and leave the run pending. */
-function writeRun(tx: EvidenceTx, run: TeamRun, options: { mapOf: (projectId: string) => FeatureMap | undefined; now: () => string }): WriteOutcome {
+function writeRun(store: EvidenceStore, tx: EvidenceTx, run: TeamRun, options: { mapOf: (projectId: string) => FeatureMap | undefined; now: () => string }): WriteOutcome {
   const map = options.mapOf(run.projectId);
   let result: ReturnType<typeof backfillRun>;
   try {
@@ -254,7 +254,13 @@ function writeRun(tx: EvidenceTx, run: TeamRun, options: { mapOf: (projectId: st
     if (result.summary.payload.goal) existing.payload.goal = result.summary.payload.goal;
     if (result.summary.payload.missionId) existing.payload.missionId = result.summary.payload.missionId;
     existing.createdAt ??= result.summary.createdAt;
-    if (!existing.flags.includes("backfilled")) existing.flags = [...existing.flags, "backfilled" as const].sort();
+    // The gap flag stood for the missing `run.created` facts. It stays only when the ledger recorded lost events,
+    // so that a later row of the run does not copy a gap that never was.
+    const lost = store.eventsIn(tx, { runId: run.id, kinds: ["ledger.gap"], after: 0, limit: 1 }).events.length > 0;
+    const flags = new Set<Flag>(existing.flags);
+    flags.add("backfilled");
+    if (!lost) flags.delete("gap");
+    existing.flags = [...flags].sort();
     writeSummary(tx, existing);
   }
   for (let round = 1; round <= result.rounds; round++) {

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { configurationModule } from "../packages/host/src/configuration-store.js";
 import type { EvidenceIndexClass } from "../packages/host/src/evidence/crypto.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
 import { backfillRun, backfillTick } from "../packages/host/src/outcome-backfill.js";
 import { type OutcomeRow, type RunSummaryRow, outcomeModule, readOutcome, readSummary, writeOutcome, writeSummary } from "../packages/host/src/outcome-store.js";
 import { runEventKey } from "../packages/host/src/run-events.js";
@@ -295,15 +296,24 @@ test("a summary that an event made first takes the record's facts", () => {
     });
     store.write(tx => {
       writeSummary(tx, eventMade("run-early", "unknown"));
+      writeSummary(tx, eventMade("run-lost", "unknown"));
       writeSummary(tx, eventMade("run-known", "project-z"));
     });
+    // This run really lost events: the ledger says so, and its flag stays.
+    const stored = new EventOutbox(store).flush([{
+      key: runEventKey("ledger.gap", "run-lost", ["first"]), runId: "run-lost", revision: 1, at: AT, kind: "ledger.gap", data: { v: 1, dropped: 3 },
+    }]);
+    assert.equal(stored.stored, true);
     const options = { mapOf: () => undefined, now: () => AT };
-    assert.deepEqual(backfillTick(store, () => [approvedRun("run-early"), approvedRun("run-known")], options), { written: 2, remaining: 0 });
+    const runs = () => [approvedRun("run-early"), approvedRun("run-lost"), approvedRun("run-known")];
+    assert.deepEqual(backfillTick(store, runs, options), { written: 3, remaining: 0 });
 
     const early = store.read(db => readSummary(db, "run-early"));
     assert.equal(early?.payload.projectId, "project-a");
     assert.equal(early?.createdAt, AT);
-    assert.deepEqual(early?.flags, ["backfilled", "gap"]);
+    // The flag stood for the missing `run.created` facts. The record supplied them, and no event was lost.
+    assert.deepEqual(early?.flags, ["backfilled"]);
+    assert.deepEqual(store.read(db => readSummary(db, "run-lost"))?.flags, ["backfilled", "gap"]);
     assert.equal(early?.status, "ready-for-review");
     assert.equal(early?.settledAt, "2026-11-12T08:00:00.000Z");
     assert.ok(store.read(db => readOutcome(db, "run-early:m1")));

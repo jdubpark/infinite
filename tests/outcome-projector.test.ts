@@ -811,6 +811,19 @@ test("a report read after a halt's stop still counts", () => {
     const second = rowOf(h.store, RUN, "m2");
     assert.equal(second?.disposition, "blocked");
     assert.equal(second?.exclusion, null);
+
+    // A member with no task follows the same rule: a report read after the halt's stop still stands.
+    h.flush([
+      started(RUN, "reviewer-1", 6, { role: "reviewer" }), stopped(RUN, "reviewer-1", 7, "host", "reviewer"),
+      ev("member.reported", RUN, at(8), { memberId: "reviewer-1", data: { role: "reviewer", reportKind: "review" } }),
+      started(RUN, "integrator-1", 6, { role: "integrator" }), stopped(RUN, "integrator-1", 7, "stall", "integrator"),
+      ev("member.reported", RUN, at(8), { memberId: "integrator-1", data: { role: "integrator", reportKind: "result" } }),
+    ]);
+    const reviewer = resultOf(h.store, RUN, "reviewer-1");
+    assert.equal(reviewer?.disposition, "reported");
+    assert.equal(reviewer?.reportKind, "review");
+    assert.equal(reviewer?.endedAt, at(7));
+    assert.equal(resultOf(h.store, RUN, "integrator-1")?.disposition, "stalled");
   } finally {
     h.close();
   }

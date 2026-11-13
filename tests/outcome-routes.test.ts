@@ -233,6 +233,10 @@ test("a host with no events for a run rebuilds its rows at the next start", { ti
     assert.ok(view.body.summary.flags.includes("backfilled"), JSON.stringify(view.body.summary));
     assert.equal(view.body.summary.payload.projectId, run.projectId);
     assert.equal(view.body.summary.status, "ready-for-review");
+    // Only an event sets the settle time, so an event made this summary first and the backfill completed it.
+    assert.notEqual(view.body.summary.settledAt, null, JSON.stringify(view.body.summary));
+    assert.notEqual(view.body.summary.createdAt, null);
+    assert.equal(view.body.summary.flags.includes("gap"), false, "the record supplied the facts the flag stood for");
     assert.equal(view.body.rows.length, 2);
     for (const row of view.body.rows) {
       assert.ok(row.flags.includes("backfilled"), JSON.stringify(row));

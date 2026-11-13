@@ -203,8 +203,10 @@ export function createApp(config: Config, key: Buffer) {
     },
   });
   teams.useEvidence(evidence);
-  // The one-time outcome backfill. Its first tick runs here, before any timer can fire, so no event of a run that
-  // predates emission is projected before that run's rows. It then runs after each outbox pass until no run is left.
+  // The one-time outcome backfill. Its first tick runs here, before any timer can fire, so no member event of a run
+  // that predates emission is projected before that run's rows. (The constructor above can already have emitted a
+  // `run.blocked` for a record that the restart blocked; it makes only a summary, which the backfill completes.)
+  // The tick then runs after each outbox pass until no run is left.
   let outcomeBackfillDone = false;
   const backfillOutcomes = () => {
     if (outcomeBackfillDone) return;

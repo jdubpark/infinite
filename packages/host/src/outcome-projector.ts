@@ -220,10 +220,11 @@ function memberReported(ctx: Ctx): void {
     return;
   }
   const result = readMemberResult(tx, outcomeId(event.runId, memberId)) ?? sentinelResult(ctx, memberId, role);
-  if (result.disposition === "open") {
+  // As for a row, a report that is read after a halt's stop was written before it, and still stands.
+  if (result.disposition === "open" || result.disposition === "host-stop" || result.disposition === "owner-stop") {
     result.disposition = "reported";
     result.reportKind = kind ?? null;
-    result.endedAt = event.at;
+    result.endedAt ??= event.at;
   }
   writeMemberResult(tx, result);
 }

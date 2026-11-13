@@ -69,6 +69,7 @@ Another design may add event kinds under its own prefix and register a projector
 | Kind | Emitted in | Data |
 |---|---|---|
 | `run.created` | `createRun` | project, base commit, purpose, goal, mission |
+| `run.prepared` | `createRun` (prepare completion) | base commit |
 | `plan.accepted` | `consume` (`plan`) | task count, plan digest |
 | `task.planned` | `consume` (`plan`), once per task | profile, owned paths, features |
 | `discovery.accepted` | `consume` (`explore`) | per scout task: profile |
@@ -89,6 +90,7 @@ Another design may add event kinds under its own prefix and register a projector
 | `run.revision-advanced` | `steer`, `action`, `continueRun`, `startAutomaticRecovery`, `resumeVerificationRecovery`, `consume` (moved base) | cause, base commit changed |
 | `run.settled` | `save`, `retire` | status, run summary counts |
 | `run.deleted` | `deleteRecord` | |
+| `ledger.gap` | `flushOutbox`, after a stored flush | dropped count |
 
 `save` already detects every status change for retention. It emits `run.settled` when the status becomes `ready-for-review`, `merged`, `no-change`, or `cancelled`, and `retire` emits it when it removes a blocked run's workspace. The reason classes of `member.stopped` are `stall`, `limit`, `no-report`, `owner` (pause, cancel, steer), and `host` (a halt for another member's block or an automatic recovery, a deadline, the attempt limit, a runtime retirement). Two events need a new best-effort Git read: the integrator commit's changed paths, and the reviewed head's tree id.
 

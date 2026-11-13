@@ -706,10 +706,23 @@ test("a read that never ends leaves a bounded number in flight", async () => {
     const scheduler = internal(teams) as unknown as { enrich(stored: unknown, read: (signal: AbortSignal) => Promise<undefined>): void; record(id: string): unknown };
     const stored = scheduler.record(f.run.id);
     let started = 0;
-    // Under a launcher the host cannot signal, a stalled read never settles.
-    for (let index = 0; index < 20; index++) scheduler.enrich(stored, () => { started += 1; return new Promise<undefined>(() => {}); });
-    await new Promise(resolve => setTimeout(resolve, 50));
-    assert.equal(started, 16, "the seventeenth read is not started");
+    const release: (() => void)[] = [];
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+    try {
+      // Under a launcher the host cannot signal, a stalled read does not settle.
+      for (let index = 0; index < 20; index++) scheduler.enrich(stored, () => { started += 1; return new Promise<undefined>(resolve => release.push(() => resolve(undefined))); });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(started, 16, "the seventeenth read is not started");
+      assert.equal(warnings.filter(line => line.includes("Ledger reads are waiting")).length <= 1, true, "the skip is said once at most");
+      // Once the reads end, their places are free again.
+      for (const end of release) end();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      scheduler.enrich(stored, () => { started += 1; return Promise.resolve(undefined); });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(started, 17, "a new read starts after the stalled ones end");
+    } finally { console.warn = warn; }
   } finally { store.close(); f.close(); }
 });
 

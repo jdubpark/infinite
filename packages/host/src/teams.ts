@@ -59,6 +59,7 @@ const REMOVAL_RETRY_MS = 5 * 60_000;
 const EVIDENCE_WAIT_MS = 24 * 3600_000;
 /** Ledger-only reads that may be pending in one service. A read that never ends keeps its place. */
 const ENRICH_LIMIT = 16;
+let enrichSkipLogged = false;
 const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
 /** Event kinds whose drop has been logged; one line per kind for the life of the process. */
 const droppedEventKinds = new Set<string>();
@@ -4394,7 +4395,11 @@ export class TeamService {
     if (!this.options?.events) return;
     // Under a launcher the host cannot signal, a stalled read may never end. A fixed number may be pending, so a
     // stall leaves a bounded number behind. One more is skipped, and its event is absent.
-    if (this.enrichments >= ENRICH_LIMIT) return;
+    if (this.enrichments >= ENRICH_LIMIT) {
+      // A skip is not a failed read, so it is said once.
+      if (!enrichSkipLogged) { enrichSkipLogged = true; console.warn("Ledger reads are waiting on earlier reads that have not ended; some run events are skipped."); }
+      return;
+    }
     this.enrichments += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30000);

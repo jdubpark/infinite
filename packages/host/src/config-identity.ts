@@ -91,8 +91,25 @@ const FIXTURES: { run: TeamRun; work: TeamTask | TeamScout }[] = [
 
 const promptCache = new Map<string, string>();
 const guidanceCache = new Map<string, string>();
+/** A read in flight and the callers that wait for its result. A caller leaves the set when its own deadline ends its wait. */
+type GuidanceRead = { waiters: Set<(digest: string | undefined) => void> };
 /** Reads in flight, by workspace and commit. A read leaves only when its child has ended. */
-const guidanceReads = new Map<string, Promise<string | undefined>>();
+const guidanceReads = new Map<string, GuidanceRead>();
+/** Callers that wait for a free place. Each is woken when a read ends, and leaves when its own deadline ends its wait. */
+const placeWaiters = new Set<() => void>();
+
+/**
+ * Waits in `waiters` until a value arrives or the signal aborts, and then leaves the set. The stalled read holds no
+ * reference to a caller that gave up, so callers of a read that never ends do not add up.
+ */
+function waitIn<T>(waiters: Set<(value: T | undefined) => void>, signal: AbortSignal): Promise<T | undefined> {
+  return new Promise(resolve => {
+    const done = (value: T | undefined) => { waiters.delete(done); signal.removeEventListener("abort", onAbort); resolve(value); };
+    const onAbort = () => done(undefined);
+    waiters.add(done);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 /**
  * The fixture renders of `teamPrompt`. The report command holds the Node path and the reporter's own file path,
@@ -159,23 +176,24 @@ export function guidanceDigest(entries: readonly { path: string; object: string 
  */
 export async function readGuidanceDigest(workspace: string, commit: string, prefix: TeamCommand | undefined, signal: AbortSignal): Promise<string | undefined> {
   const key = JSON.stringify([workspace, commit]);
-  const aborted = new Promise<undefined>(resolve => {
-    if (signal.aborted) resolve(undefined);
-    else signal.addEventListener("abort", () => resolve(undefined), { once: true });
-  });
   for (;;) {
     const cached = guidanceCache.get(key);
     if (cached !== undefined) return cached;
     if (signal.aborted) return undefined;
     let read = guidanceReads.get(key);
     if (read === undefined && guidanceReads.size < GUIDANCE_READS_LIMIT) {
-      read = guidanceRead(workspace, commit, prefix, key);
-      guidanceReads.set(key, read);
-      void read.then(() => { guidanceReads.delete(key); });
+      const started: GuidanceRead = { waiters: new Set() };
+      read = started;
+      guidanceReads.set(key, started);
+      void guidanceRead(workspace, commit, prefix, key).then(digest => {
+        guidanceReads.delete(key);
+        for (const waiter of [...started.waiters]) waiter(digest);
+        for (const waiter of [...placeWaiters]) waiter();
+      });
     }
-    if (read !== undefined) return Promise.race([read, aborted]);
+    if (read !== undefined) return waitIn(read.waiters, signal);
     // No place is free. Wait for one, or for this caller's deadline, and look again.
-    await Promise.race([...guidanceReads.values(), aborted]);
+    await waitIn(placeWaiters as Set<(value: undefined) => void>, signal);
   }
 }
 

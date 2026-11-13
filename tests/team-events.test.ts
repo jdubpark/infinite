@@ -1240,3 +1240,139 @@ test("a changes-requested review records its verdict", async () => {
     assert.equal("rubric" in recorded.data, false);
   } finally { store.close(); f.close(); }
 });
+
+test("a failing check starts a repair caused by the check", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    checkScene(f, [{ command: process.execPath, args: ["-e", "process.exit(3)"] }]);
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const stored = internal(teams).record(f.run.id) as { run: TeamRun; pending?: unknown };
+    internal(teams).check(stored);
+    await waitFor(() => eventsOfKind(store, f.run.id, "repair.started").length > 0, "the repair starts");
+    await teams.idle();
+    const [checked] = eventsOfKind(store, f.run.id, "check.finished");
+    const [repair] = eventsOfKind(store, f.run.id, "repair.started");
+    assert.ok(checked && repair, "both events are stored");
+    assert.deepEqual(repair.data, { v: 1, round: 1, cause: "check", headCommit: f.run.baseCommit });
+    assert.ok(repair.seq > checked.seq, "the repair follows the check that caused it");
+  } finally { store.close(); f.close(); }
+});
+
+test("a changes-requested review comes before its repair", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const reviewer = await reviewScene(f, { kind: "review", verdict: "changes-requested", summary: "Fix the file" });
+    f.writeTeam({ checkHead: f.run.baseCommit });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, reviewer);
+    await waitFor(() => eventsOfKind(store, f.run.id, "repair.started").length > 0, "the repair starts");
+    await teams.idle();
+    const [recorded] = eventsOfKind(store, f.run.id, "review.recorded");
+    const [repair] = eventsOfKind(store, f.run.id, "repair.started");
+    assert.ok(recorded && repair, "both events are stored");
+    assert.ok(recorded.seq < repair.seq, "the review precedes its repair");
+    assert.equal(recorded.revision, repair.revision, "one revision");
+    assert.deepEqual(repair.data, { v: 1, round: 1, cause: "review", headCommit: f.run.baseCommit });
+  } finally { store.close(); f.close(); }
+});
+
+test("a repair past its limit starts no round", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    checkScene(f, [{ command: process.execPath, args: ["-e", "process.exit(3)"] }]);
+    f.run.round = 2;
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const stored = internal(teams).record(f.run.id) as { run: TeamRun; pending?: unknown };
+    internal(teams).check(stored);
+    await waitFor(() => stored.pending === undefined && stored.run.status === "blocked", "the run blocks at the limit");
+    await teams.idle();
+    assert.equal(stored.run.round, 2, "no round is added");
+    assert.equal(eventsOfKind(store, f.run.id, "repair.started").length, 0);
+  } finally { store.close(); f.close(); }
+});
+
+test("an integrator result answers its round with its changed paths", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
+    writeFileSync(join(cwd, "fix.txt"), "fixed\n");
+    f.run.headCommit = f.run.baseCommit;
+    f.run.round = 1;
+    f.run.tasks = [];
+    const member = { ...f.run.members[0]!, memberId, role: "integrator" as const, cwd, status: "reported" as const,
+      report: { kind: "result" as const, summary: "Fixed the file" } };
+    f.run.members = [member];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, member);
+    await waitFor(() => stored.pending === undefined, "the integration completes");
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "repair.integrated");
+    assert.ok(event, "repair.integrated is stored");
+    assert.equal(event.memberId, memberId);
+    assert.equal(event.revision, 1);
+    assert.equal(event.data.round, 1);
+    assert.match(String(event.data.commit), /^[0-9a-f]{40}$/);
+    assert.equal(event.data.headCommit, stored.run.headCommit);
+    assert.equal(event.data.baseCommit, f.run.baseCommit);
+    assert.deepEqual(event.data.paths, ["fix.txt"]);
+    assert.equal(eventsOfKind(store, f.run.id, "task.integrated").length, 0);
+  } finally { store.close(); f.close(); }
+});
+
+test("a round-zero integrator records no repair", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
+    writeFileSync(join(cwd, "fix.txt"), "fixed\n");
+    f.run.headCommit = f.run.baseCommit;
+    f.run.round = 0;
+    f.run.tasks = [];
+    const member = { ...f.run.members[0]!, memberId, role: "integrator" as const, cwd, status: "reported" as const,
+      report: { kind: "result" as const, summary: "Moved the base" } };
+    f.run.members = [member];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, member);
+    await waitFor(() => stored.pending === undefined, "the integration completes");
+    await teams.idle();
+    assert.equal(eventsOfKind(store, f.run.id, "repair.integrated").length, 0);
+  } finally { store.close(); f.close(); }
+});
+
+test("a rating records the score once per request", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const memberId = randomUUID();
+    f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "integrated", memberId }];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const requestId = randomUUID();
+    teams.rateTask(f.run.id, "a", { requestId, score: 4, note: "Useful" });
+    teams.rateTask(f.run.id, "a", { requestId, score: 4, note: "Useful" });
+    await teams.idle();
+    const rated = eventsOfKind(store, f.run.id, "rating.recorded");
+    assert.equal(rated.length, 1, "a replayed request stores one event");
+    assert.equal(rated[0]!.taskId, "a");
+    assert.equal(rated[0]!.memberId, memberId);
+    assert.deepEqual(rated[0]!.data, { v: 1, score: 4 });
+    teams.rateTask(f.run.id, "a", { requestId: randomUUID(), score: 2 });
+    await teams.idle();
+    assert.equal(eventsOfKind(store, f.run.id, "rating.recorded").length, 2, "a new request is a new fact");
+    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Useful"), false, "a rating note is never stored");
+  } finally { store.close(); f.close(); }
+});

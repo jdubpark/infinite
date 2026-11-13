@@ -1041,6 +1041,7 @@ export class TeamService {
     const rating = { score: input.score as 1 | 2 | 3 | 4 | 5, ...(input.note ? { note: input.note } : {}), at: timestamp() };
     task.ownerRating = rating;
     (stored.ratings ??= {})[input.requestId] = { fingerprint, result: rating };
+    this.emitWith(stored, "rating.recorded", [input.requestId], { taskId, memberId: task.memberId, revision: task.revision }, () => ({ score: input.score }));
     this.event(stored, `The owner rated task ${taskId}.`); this.save(stored);
     return task;
   }
@@ -4146,6 +4147,8 @@ export class TeamService {
         if (report.disposition === "pull-request" && run.delivery?.mode === "pr") {
           stored.deliveryAttempt = undefined;
           run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl!, summary: report.summary, reportedAt: timestamp() };
+          this.emitWith(stored, "delivery.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => ({
+            method: "pull-request", headCommit: report.headCommit }));
           run.status = "ready-for-review"; run.reason = undefined;
           if (run.recovery) run.recovery.status = "complete";
           if (run.deliveryRecovery) run.deliveryRecovery.status = "complete";
@@ -4209,6 +4212,8 @@ export class TeamService {
           await this.enqueue(() => {
             if (this.closed) return;
             run.deliveryReceipt = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, mergeCommit: report.mergeCommit, summary: report.summary, reportedAt: timestamp() };
+            this.emitWith(stored, "delivery.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => ({
+              method: "merge", headCommit: report.headCommit, mergeCommit: report.mergeCommit }));
             this.save(stored);
           });
           await captureDeliveryBaseline(run.workspace, member.cwd, member.baseCommit, report.mergeCommit, this.config.teams?.commandPrefix, signal);
@@ -4223,10 +4228,12 @@ export class TeamService {
           if (recovery && recovery.attempts > 0 && recovery.status !== "complete" && !inspected)
             throw new TeamError(409, "delivery-reconciliation-required", "An automatic recovery requires structured remote evidence before a delivery repair can change the reviewed head.");
           stored.deliveryAttempt = undefined;
-          this.repair(stored, `Delivery requires a scoped repair before checks and independent review run again. No merge was reported.\n${report.summary}`);
+          this.repair(stored, `Delivery requires a scoped repair before checks and independent review run again. No merge was reported.\n${report.summary}`, "delivery");
         } else if (report.kind === "pull-request") {
           stored.deliveryAttempt = undefined;
           run.pullRequest = { revision: run.revision, headCommit: report.headCommit, pullRequestUrl: report.pullRequestUrl, summary: report.summary, reportedAt: timestamp() };
+          this.emitWith(stored, "delivery.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => ({
+            method: "pull-request", headCommit: report.headCommit }));
           run.status = "ready-for-review"; run.reason = undefined;
           if (run.recovery) run.recovery.status = "complete";
           if (run.deliveryRecovery) run.deliveryRecovery.status = "complete";
@@ -4272,7 +4279,7 @@ export class TeamService {
         });
         if (report.verdict === "changes-requested") {
           for (const task of run.tasks) if (task.status === "integrated") task.reviewRounds = (task.reviewRounds ?? 0) + 1;
-          this.repair(stored, report.summary);
+          this.repair(stored, report.summary, "review");
         }
         else run.status = "reviewing";
       }, member); return;
@@ -4292,7 +4299,7 @@ export class TeamService {
       const change = commit ? {
         nameStatus: await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-M", "-z", run.baseCommit, head, "--"]),
         numstat: await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-M", "-z", run.baseCommit, head, "--"]),
-        taskPaths: task ? await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", member.baseCommit, commit, "--"]) : undefined,
+        taskPaths: task || (member.role === "integrator" && this.options?.events) ? await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", member.baseCommit, commit, "--"]) : undefined,
       } : undefined;
       return { commit, head, diff: diff?.exitCode === 0 ? diff.stdout : undefined,
         changes: change ? changeIndex(change.nameStatus, change.numstat, head, timestamp()) : undefined,
@@ -4310,15 +4317,23 @@ export class TeamService {
           commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,
         }));
       }
+      if (member.role === "integrator" && run.round > 0) {
+        this.emitWith(stored, "repair.integrated", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({
+          round: run.round, commit, headCommit: head, baseCommit: run.baseCommit,
+          ...(!commit ? { paths: [] } : changedPaths && !changedPaths.truncated ? pathField(changedPaths.paths) : { pathsOmitted: true }),
+        }));
+      }
       if (member.role === "implementer" || member.role === "integrator") this.retentionState(stored).integratedAt[member.memberId] = this.retentionNow();
       this.event(stored, `${member.title} reported a result; its validated changes were integrated.`);
       run.status = "implementing";
     }, member, "integration");
   }
-  private repair(stored: Stored, feedback: string) {
+  private repair(stored: Stored, feedback: string, cause: "check" | "review" | "delivery") {
     if (stored.halt || ["paused", "cancelled"].includes(stored.run.status)) return;
     if (stored.run.round >= 2) { this.block(stored, new TeamError(409, "repair-limit", repairLimitReason)); return; }
     stored.run.round++; stored.run.review = undefined; stored.checkHead = undefined;
+    const round = stored.run.round;
+    this.emitWith(stored, "repair.started", [stored.run.revision, round], {}, () => ({ round, cause, headCommit: stored.run.headCommit }));
     this.prepareMember(stored, "integrator", undefined, feedback);
   }
   /** The checks the host runs after integration: established by the plan, or configured for the project. */
@@ -4396,7 +4411,7 @@ export class TeamService {
           prior.headCommit === head && (prior.phase ?? "verification") === (result.phase ?? "verification") &&
           prior.command.command === result.command.command && JSON.stringify(prior.command.args) === JSON.stringify(result.command.args)));
         if (repeated) this.block(stored, new TeamError(409, "repeated-check-failure", repeatedCheckFailureReason));
-        else this.repair(stored, `Configured verification failed:\n${JSON.stringify(results)}`);
+        else this.repair(stored, `Configured verification failed:\n${JSON.stringify(results)}`, "check");
       }
     });
   }

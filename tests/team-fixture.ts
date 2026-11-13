@@ -10,6 +10,7 @@ import type { ProjectSourceService } from "../packages/host/src/project-source.j
 import type { RepositoryGraphs } from "../packages/host/src/repository-graphs.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamService } from "../packages/host/src/teams.js";
+import type { EventOutbox } from "../packages/host/src/evidence/outbox.js";
 
 export const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], {
   cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
@@ -159,13 +160,13 @@ process.exit(child.status ?? 1);
   };
   const settled = (id: string) => waitFor(() => get(id), run => ["ready-for-review", "merged", "blocked"].includes(run.status), 90000);
   const directServices: TeamService[] = [];
-  const openTeamService = async (serviceOptions: { source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">; graphs?: Pick<RepositoryGraphs, "refresh">; onMerged?: (projectId: string) => void; start?: boolean } = {}) => {
+  const openTeamService = async (serviceOptions: { source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">; graphs?: Pick<RepositoryGraphs, "refresh">; onMerged?: (projectId: string) => void; start?: boolean; events?: EventOutbox } = {}) => {
     await host.stopApi();
     if (serviceOptions.source) host.config.projects.find(project => project.id === "rehearsal")!.source = { mode: "github", repository: "example/app", baseBranch: "main" };
     const key = readFileSync(host.config.keyFile);
     const manager = new Manager(host.config, key);
     const service = new TeamService(host.config, key, manager, (_projectId, start) => start(), undefined, undefined,
-      { ...(serviceOptions.source ? { source: serviceOptions.source } : {}), ...(serviceOptions.graphs ? { graphs: serviceOptions.graphs } : {}), ...(serviceOptions.onMerged ? { onMerged: serviceOptions.onMerged } : {}) });
+      { ...(serviceOptions.source ? { source: serviceOptions.source } : {}), ...(serviceOptions.graphs ? { graphs: serviceOptions.graphs } : {}), ...(serviceOptions.onMerged ? { onMerged: serviceOptions.onMerged } : {}), ...(serviceOptions.events ? { events: serviceOptions.events } : {}) });
     if (serviceOptions.start !== false) service.start();
     directServices.push(service);
     return service;

@@ -776,3 +776,207 @@ test("a transcript replaced mid-turn is not complete", () => {
   // Positive control: when A's last hook closes its turn, the same sequence is complete.
   assert.deepEqual(run(true), { coverage: "complete", records: 2, provider: "claude" });
 });
+
+// ---- The final drain, after the provider exited ----------------------------------------------
+
+test("the final drain reads rows written after the last hook", () => {
+  const usage: UsageRecord[] = [];
+  const watch = watchFor("claude", usage);
+  const started = watch.hook(turnFor())!;
+  const rowA = claudeRow("msg_1");
+  watch.post({ path: PATH, offset: 0, text: rowA, drain: started.drain });
+  mark(watch, PATH, bytes(rowA), started.drain);
+  assert.equal(watch.reading, true);
+  const final = watch.drainFinal();
+  assert.deepEqual(final, { path: PATH, after: bytes(rowA), drain: 2, secondaries: true });
+  const rowB = claudeRow("msg_2");
+  watch.post({ path: PATH, offset: bytes(rowA), text: rowB, drain: final!.drain });
+  mark(watch, PATH, bytes(rowA) + bytes(rowB), final!.drain);
+  assert.deepEqual(watch.finish(true, true), { coverage: "complete", records: 2, provider: "claude", finalDrain: "complete" });
+  assert.equal(usage.length, 2);
+});
+
+test("an idle stop with no new bytes stays complete", () => {
+  const watch = watchFor("claude");
+  const started = watch.hook(turnFor())!;
+  const text = claudeRow("msg_1");
+  watch.post({ path: PATH, offset: 0, text, drain: started.drain });
+  mark(watch, PATH, bytes(text), started.drain);
+  const final = watch.drainFinal()!;
+  mark(watch, PATH, bytes(text), final.drain);
+  assert.deepEqual(watch.finish(true, true), { coverage: "complete", records: 1, provider: "claude", finalDrain: "complete" });
+});
+
+test("a final drain after a mid-turn hook stays stopped-mid-turn", () => {
+  const watch = watchFor("claude");
+  const started = watch.hook(turnFor(PATH, "claude", false))!;
+  const rowA = claudeRow("msg_1");
+  watch.post({ path: PATH, offset: 0, text: rowA, drain: started.drain });
+  mark(watch, PATH, bytes(rowA), started.drain);
+  const final = watch.drainFinal()!;
+  const rowB = claudeRow("msg_2");
+  watch.post({ path: PATH, offset: bytes(rowA), text: rowB, drain: final.drain });
+  mark(watch, PATH, bytes(rowA) + bytes(rowB), final.drain);
+  assert.deepEqual(watch.finish(true, true), { coverage: "partial", reason: "stopped-mid-turn", records: 2, provider: "claude", finalDrain: "complete" });
+});
+
+test("a final drain that does not reach the end is incomplete", () => {
+  const watch = watchFor("claude");
+  const started = watch.hook(turnFor())!;
+  const rowA = claudeRow("msg_1");
+  watch.post({ path: PATH, offset: 0, text: rowA, drain: started.drain });
+  mark(watch, PATH, bytes(rowA), started.drain);
+  const final = watch.drainFinal()!;
+  const rowB = claudeRow("msg_2");
+  watch.post({ path: PATH, offset: bytes(rowA), text: rowB, drain: final.drain });
+  assert.deepEqual(watch.finish(true, true), { coverage: "partial", reason: "drain-incomplete", records: 2, provider: "claude", finalDrain: "incomplete" });
+
+  const unread = watchFor("claude");
+  const first = unread.hook(turnFor())!;
+  unread.post({ path: PATH, offset: 0, text: rowA, drain: first.drain });
+  mark(unread, PATH, bytes(rowA), first.drain);
+  unread.drainFinal();
+  assert.deepEqual(unread.finish(true, true), { coverage: "partial", reason: "drain-incomplete", records: 1, provider: "claude", finalDrain: "incomplete" });
+});
+
+test("a skipped final drain is visible", () => {
+  const text = claudeRow("msg_1");
+
+  const complete = watchFor("claude");
+  const started = complete.hook(turnFor())!;
+  complete.post({ path: PATH, offset: 0, text, drain: started.drain });
+  mark(complete, PATH, bytes(text), started.drain);
+  assert.deepEqual(complete.finish(true, true), { coverage: "complete", records: 1, provider: "claude", finalDrain: "skipped" });
+
+  const midTurn = watchFor("claude");
+  const startedMid = midTurn.hook(turnFor(PATH, "claude", false))!;
+  midTurn.post({ path: PATH, offset: 0, text, drain: startedMid.drain });
+  mark(midTurn, PATH, bytes(text), startedMid.drain);
+  assert.deepEqual(midTurn.finish(true, true), { coverage: "partial", reason: "drain-skipped", records: 1, provider: "claude", finalDrain: "skipped" });
+
+  const unmarked = watchFor("claude");
+  const startedUnmarked = unmarked.hook(turnFor())!;
+  unmarked.post({ path: PATH, offset: 0, text, drain: startedUnmarked.drain });
+  assert.deepEqual(unmarked.finish(true, true), { coverage: "partial", reason: "drain-skipped", records: 1, provider: "claude", finalDrain: "skipped" });
+
+  const plainStop = watchFor("claude");
+  const startedPlain = plainStop.hook(turnFor(PATH, "claude", false))!;
+  plainStop.post({ path: PATH, offset: 0, text, drain: startedPlain.drain });
+  mark(plainStop, PATH, bytes(text), startedPlain.drain);
+  assert.deepEqual(plainStop.finish(true), { coverage: "partial", reason: "stopped-mid-turn", records: 1, provider: "claude" });
+});
+
+test("an end mark for the last hook's drain does not complete the final drain", () => {
+  const text = claudeRow("msg_1");
+
+  const stale = watchFor("claude");
+  const first = stale.hook(turnFor())!;
+  stale.post({ path: PATH, offset: 0, text, drain: first.drain });
+  stale.drainFinal();
+  mark(stale, PATH, bytes(text), first.drain);
+  assert.deepEqual(stale.finish(true, true), { coverage: "partial", reason: "drain-incomplete", records: 1, provider: "claude", finalDrain: "incomplete" });
+
+  const fresh = watchFor("claude");
+  const firstFresh = fresh.hook(turnFor())!;
+  fresh.post({ path: PATH, offset: 0, text, drain: firstFresh.drain });
+  const finalFresh = fresh.drainFinal()!;
+  mark(fresh, PATH, bytes(text), finalFresh.drain);
+  assert.deepEqual(fresh.finish(true, true), { coverage: "complete", records: 1, provider: "claude", finalDrain: "complete" });
+});
+
+test("the final drain starts once and ends hook handling", () => {
+  const run = (late: boolean) => {
+    const watch = watchFor("claude");
+    const started = watch.hook(turnFor())!;
+    const text = claudeRow("msg_1");
+    watch.post({ path: PATH, offset: 0, text, drain: started.drain });
+    mark(watch, PATH, bytes(text), started.drain);
+    const final = watch.drainFinal()!;
+    assert.equal(watch.drainFinal(), undefined);
+    if (late) assert.equal(watch.hook(turnFor(PATH, "claude", false)), undefined);
+    mark(watch, PATH, bytes(text), final.drain);
+    return watch.finish(true, true);
+  };
+  assert.deepEqual(run(true), run(false));
+  assert.deepEqual(run(true), { coverage: "complete", records: 1, provider: "claude", finalDrain: "complete" });
+});
+
+test("no transcript means no final drain", () => {
+  const watch = watchFor("claude");
+  assert.equal(watch.reading, false);
+  assert.equal(watch.drainFinal(), undefined);
+  assert.equal(watch.hook({ subagent: true, turnEnd: false }), undefined);
+  assert.equal(watch.reading, false);
+  assert.equal(watch.drainFinal(), undefined);
+  assert.deepEqual(watch.finish(true, true), { coverage: "none", reason: "no-transcript", records: 0, provider: "claude" });
+});
+
+test("the watch accepts nothing after the closing finish", () => {
+  const usage: UsageRecord[] = [];
+  const watch = watchFor("claude", usage);
+  const started = watch.hook(turnFor())!;
+  const text = claudeRow("msg_1");
+  watch.post({ path: PATH, offset: 0, text, drain: started.drain });
+  mark(watch, PATH, bytes(text), started.drain);
+  assert.deepEqual(watch.finish(true, true), { coverage: "complete", records: 1, provider: "claude", finalDrain: "skipped" });
+  assert.equal(watch.post({ path: PATH, offset: bytes(text), text: claudeRow("msg_2"), drain: started.drain }), undefined);
+  assert.equal(watch.hook(turnFor()), undefined);
+  assert.equal(watch.drainFinal(), undefined);
+  assert.equal(usage.length, 1);
+});
+
+test("a SessionEnd after a stop request keeps the turn boundary", () => {
+  const sessionEnd: WatchHook = { ...turnFor(), sessionEnd: true };
+  const run = (firstTurnEnd: boolean, stop: boolean, last: WatchHook) => {
+    const watch = watchFor("claude");
+    const first = watch.hook(turnFor(PATH, "claude", firstTurnEnd))!;
+    const text = claudeRow("msg_1");
+    watch.post({ path: PATH, offset: 0, text, drain: first.drain });
+    if (stop) watch.stopRequested();
+    const lastDrain = watch.hook(last)!;
+    mark(watch, PATH, bytes(text), lastDrain.drain);
+    return watch.finish(true);
+  };
+  assert.deepEqual(run(false, true, sessionEnd), { coverage: "partial", reason: "stopped-mid-turn", records: 1, provider: "claude" });
+  assert.deepEqual(run(true, true, sessionEnd), { coverage: "complete", records: 1, provider: "claude" });
+  assert.deepEqual(run(false, false, sessionEnd), { coverage: "complete", records: 1, provider: "claude" });
+  assert.deepEqual(run(false, true, turnFor()), { coverage: "complete", records: 1, provider: "claude" });
+});
+
+test("the final drain reads a grown secondary", () => {
+  const sub = claudeRow("msg_s1");
+  const grown = claudeRow("msg_s2");
+  const run = (readGrown: boolean) => {
+    const watch = watchFor("claude");
+    const started = watch.hook(turnFor())!;
+    const primary = claudeRow("msg_1");
+    watch.post({ path: PATH, offset: 0, text: primary, drain: started.drain });
+    watch.post({ path: PATH, offset: bytes(primary), end: true, drain: started.drain, secondaries: listing(SUB, bytes(sub)) });
+    watch.post({ path: PATH, secondary: SUB, offset: 0, text: sub, drain: started.drain });
+    watch.post({ path: PATH, secondary: SUB, offset: bytes(sub), end: true, drain: started.drain });
+    const final = watch.drainFinal()!;
+    const reply = watch.post({ path: PATH, offset: bytes(primary), end: true, drain: final.drain, secondaries: listing(SUB, bytes(sub) + bytes(grown)) });
+    assert.deepEqual(reply?.secondaries, [{ name: SUB, after: bytes(sub) }]);
+    if (readGrown) {
+      watch.post({ path: PATH, secondary: SUB, offset: bytes(sub), text: grown, drain: final.drain });
+      watch.post({ path: PATH, secondary: SUB, offset: bytes(sub) + bytes(grown), end: true, drain: final.drain });
+    }
+    return watch.finish(true, true);
+  };
+  assert.deepEqual(run(true), { coverage: "complete", records: 3, provider: "claude", finalDrain: "complete" });
+  assert.deepEqual(run(false), { coverage: "partial", reason: "secondary-missing", records: 2, provider: "claude", finalDrain: "complete" });
+});
+
+test("a Codex final drain completes the cumulative total", () => {
+  const watch = watchFor("codex");
+  const started = watch.hook(turnFor(PATH, "codex"))!;
+  const text = requestRow("resp_1", 1150);
+  watch.post({ path: PATH, offset: 0, text, drain: started.drain });
+  mark(watch, PATH, bytes(text), started.drain);
+  const final = watch.drainFinal()!;
+  assert.deepEqual(final, { path: PATH, after: bytes(text), drain: 2 });
+  const total = totalRow(1150);
+  watch.post({ path: PATH, offset: bytes(text), text: total, drain: final.drain });
+  mark(watch, PATH, bytes(text) + bytes(total), final.drain);
+  assert.deepEqual(watch.finish(true, true), { coverage: "complete", records: 1, provider: "codex", finalDrain: "complete" });
+});

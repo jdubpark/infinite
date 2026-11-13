@@ -461,3 +461,238 @@ private flushOutbox(stored: Stored): boolean;
 
 - Member, task, check, review, repair, delivery, and rating events.
 - `configId`, task features on `task.planned`, and any projector.
+
+---
+
+# Slice: member and task events
+
+Spec part 1, the emission half, for the member and task kinds. It also delivers the inputs of spec part 2: the `features` key of a project's team configuration, the optional `kind` and `risk` labels of a plan task, and features on `task.planned`. It builds on the run events slice and uses its `emit`, `flushOutbox`, `Stored` fields, `runEventKey`, and test helpers unchanged.
+
+## Trust boundary, and what a review checks
+
+`TeamService` is host code. It builds every event from its own run record, after its own validation. These fields originate from a member or a provider:
+
+- A report's kind. The member chooses it and `teamReportSchema` parses it. Stored as an enumerated code.
+- Task and scout ids, owned paths, and the `kind` and `risk` labels. The project manager chooses them. `teamTaskPlanSchema`, `validateTeamPlan`, and the goal scope check them. Ids go into the envelope `taskId`, and scout ids also into `discovery.accepted`. Owned paths go into `task.planned`. Labels enter features as a claim, and `risk` can only raise.
+- An `agentProfileId` or an escalation target. A member chooses it and the run's lineup checks it. Umbrella C1 counts a profile id as an enumeration.
+- A provider limit's message and reset time, titles, instructions, summaries, questions, and escalation reasons. Never stored.
+
+The rule: event data holds counts, booleans, enumerated codes, host-issued ids, profile ids, timestamps the record stores, and commit hashes. It holds no free text, prompt, or file content. It holds paths only where spec part 1 names them, and for this slice that is `task.planned`: "profile, owned paths, features". The spec's rule for derived rows binds the projector: "A row never holds an objective, instructions, a summary, a rubric reason, a rating note, a path, or a URL." The store seals event data and deletes it with its run (umbrella C1).
+
+The slice must survive: owned paths larger than the store's 16 KiB data limit, a stop barrier that reads the same member on every tick, a launch that re-enters after a restart, a crash between a state change and its `save`, and a service built without `events`. Outside it: how a projector turns events into dispositions, `configId` and profile epochs, and hostile event shapes, which `emit` and the outbox already refuse.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/run-events.ts` (modify) | Pure helpers: `planDigest`, `pathField`, `profileIdentity`, the stop reasons, the replacement causes |
+| `packages/host/src/team-types.ts` (modify) | `features` on `teamProjectSchema`; `kind` and `risk` on `teamTaskPlanSchema` |
+| `packages/host/src/team-prompts.ts` (modify) | One plan-prompt sentence for the labels; `teamContext` leaves out the feature map |
+| `packages/host/src/teams.ts` (modify) | `emitWith`, `linkReplacement`, `memberStopped`, `Stored.ledgerReplaces`, the `readMemberJournal` signature, the emission sites |
+| `tests/run-events.test.ts`, `tests/task-features.test.ts`, `tests/team-prompts.test.ts` (modify) | Helper, schema, prompt, and context tests |
+| `tests/team-events.test.ts` (modify) | Service tests with a real store |
+| `docs/teams.md` (modify) | The `features` key, in one short paragraph |
+
+## Event kinds
+
+Every key is `runEventKey(kind, runId, parts)`. A completion callback runs at most once per operation: a failed operation keeps its intent and blocks the run, and a restart keeps that intent blocked. So no key needs a time.
+
+| Kind | Emitted in | Key parts | `data` besides `v` | Why the key is unique and stable |
+|---|---|---|---|---|
+| `plan.accepted` | `consume`, `plan` | `[revision]` | `taskCount`, `planDigest`, `parallelism` | One plan per revision: `step` starts a project manager only while `run.tasks` is empty, and every path that empties it advances the revision |
+| `task.planned` | same, once per task | `[revision, taskId]` | `profileId?`, `paths` or `pathsOmitted`, `features` | `validateTeamPlan` refuses a repeated task id |
+| `discovery.accepted` | `consume`, `explore` | `[revision]` | `parallelism`, `scouts` | `consume` refuses a second discovery in a run |
+| `member.started` | `launch` | `[memberId]` | `role`, `purpose`, `sessionId`, `startedAt`, `baseCommit`, profile identity, `unavailable?`, `replaces?` | A host-issued UUID. Only a permission coordinator is queued twice, and it emits nothing |
+| `member.reported` | `readMemberJournal` | `[memberId]` | `role`, `reportKind` | Same id. The first report read wins |
+| `member.stopped` | `replaceStalledMember`, `switchLimitedMember`, `retireMember`, `step` (halt loop, exit branch) | `[memberId]` | `role`, `reason`, `detail?`, `reported` | Same id. The first stop wins |
+| `task.integrated` | `consume`, implementer `result` | `[revision, taskId]` | `commit?`, `headCommit`, `baseCommit`, `memberBaseCommit`, `diff?` | An integrated task never returns to pending in its revision |
+| `scout.completed` | `consume`, `findings` | `[revision, taskId]` | none | A complete scout never runs again |
+| `task.escalated` | `consume`, `escalate` | `[revision, taskId]` | `fromProfileId?`, `toProfileId` | `consume` refuses a second escalation of a task |
+| `task.limit-switched` | `switchLimitedMember` | `[memberId]` of the stopped member | `role`, `fromProfileId`, `toProfileId` | A switched member is stopped and never switched again |
+
+## Review Focus
+
+1. A stop barrier that drains the same revision on every tick. Expect one `member.stopped` per member, with its first reason.
+2. A plan task whose owned paths serialize to more than 12 KiB. Expect `task.planned` stored with its features and `pathsOmitted: true`.
+3. A service without `events`. Expect no `ledgerReplaces` key in any sealed record. The prompt sentence and the schema fields are the only visible changes.
+4. A project with a feature map. Expect no `features` key in any member's context file.
+5. A permission coordinator's turns. Expect no member event.
+
+### Task 1: plan, task, and discovery events, with the feature inputs
+
+**Interfaces (consumes):** `emit`, `Stored`, `runEventKey` from run events. `taskFeatures`, `featureMapSchema`, `TASK_KINDS`, `FeatureMap` from task features.
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/run-events.ts
+/** SHA-256 hex of the JSON of one tuple per task, in order:
+ *  [id, title, instructions, agentProfileId ?? null, paths, dependsOn, kind ?? null, risk ?? null]. */
+export function planDigest(tasks: readonly TeamTaskPlan[]): string;
+export const PATH_FIELD_BUDGET = 12 * 1024;
+/** `{ paths }` when the UTF-8 JSON of the list is at most `budget` bytes, else `{ pathsOmitted: true }`. */
+export function pathField(paths: readonly string[], budget?: number): { paths: string[] } | { pathsOmitted: true };
+
+// packages/host/src/team-types.ts
+// teamProjectSchema gains:  features: featureMapSchema.optional()
+// teamTaskPlanSchema gains: kind: z.enum(TASK_KINDS).optional(), risk: z.literal("elevated").optional()
+
+// packages/host/src/teams.ts
+/** Calls `build` only with `options.events`, then `emit`. Never throws: a throwing `build` drops the event
+ *  and logs one line per kind, with fixed words only. */
+private emitWith(stored: Stored, kind: string, keyParts: readonly (string | number)[],
+  ids: { memberId?: string; taskId?: string; revision?: number }, build: () => Record<string, unknown>): void;
+```
+
+**Decisions:**
+
+- Every site in this slice calls `emitWith`. Data that needs work (digests, features, path bounds) is then built only when the ledger is on, and a fault in it never reaches the run.
+- **The map.** A site reads `(run.handoff?.project ?? this.config.projects.find(p => p.id === run.projectId)?.team)?.features`, the expression `launch` uses for `configuredProject`. Features are fixed at acceptance, as spec part 2 says.
+- **`plan.accepted`.** In the completion callback of the `plan` branch of `consume`, after `run.status = "implementing"` and its `this.event`, at the end of the callback. `operation` saves right after the callback. Ids `{ memberId: member.memberId, revision: member.revision }`. Data: `taskCount: run.tasks.length`, `planDigest: planDigest(run.tasks)`, `parallelism: run.parallelism` after `applyProjectManagerCapacity`. *(My call: the digest covers every planned field, so two different plans never share it. The draft hashed id, profile, paths, and `dependsOn` only.)*
+- **`task.planned`.** Right after `plan.accepted`, once per task in `run.tasks` order, which is dependency order. Ids `{ taskId: task.id, revision: member.revision }`. Data: `profileId: task.agentProfileId` (absent on a single-provider run), `...pathField(task.paths)`, and `features: taskFeatures({ role: "implementer", paths: task.paths, kind: task.kind, risk: task.risk }, map)`. Features are computed from the full list even when the paths are omitted. `dependsOn`, the title, and the instructions are not stored. *(My call: the store refuses data over 16 KiB, and 32 owned paths of 300 multi-byte characters exceed it. Omitting the list keeps the event, and the projector then counts the task's rounds as unknown.)*
+- **`discovery.accepted`.** In the completion callback of the `explore` branch, after `run.status = "discovering"`. Ids as `plan.accepted`. Data: `parallelism: run.parallelism`, and `scouts: run.discovery.tasks.map(scout => ({ taskId: scout.id, profileId: scout.agentProfileId, features: taskFeatures({ role: "scout", paths: [] }, map) }))`. *(My call: the spec lists only the profile. A scout row needs area, kind, risk, and featureVersion too, and features are fixed at acceptance.)*
+- **Schema.** Both new keys are optional. `repo-enrollment.ts` parses `teamProjectSchema` too, so the owner can set a map through the enrollment route. `z.toJSONSchema` in `team-mcp.ts` picks up the plan labels by itself.
+- **Prompt.** One sentence follows the `Report {"kind":"plan",…}` sentence in the project-manager branch of `teamPrompt`: `Each task may add "kind" (feature, fix, refactor, test, docs, or investigation) and "risk":"elevated" when it touches authorization, money, data migration, or deployment.` No prompt names a token, a prefix, or an area. *(My call: the labels and this sentence apply with or without `events`. They are plan inputs, as `dependsOn` is.)*
+- **Context.** `teamContext` leaves out `features` from `configuredProject` and from `authority.handoff.project`. Today it spreads the whole project object into every member's context file. *(My call: a member that reads the elevated tokens can shape its owned paths around them, and umbrella C4 says a model never lowers risk.)*
+
+- [ ] **Step 1: Write the failing tests.** Service tests drive `step` through the private-method cast that `tests/teams.test.ts` uses, set `f.config.projects[0].team` where a test needs checks or a map, and wait for an operation with `waitFor` from `tests/helpers.ts`. `kindEvents(runId, kind)` filters `events(runId)`.
+
+| Test name | Assertions |
+|---|---|
+| `a plan digest covers every planned field` (run-events) | Equal lists give one 64-character hex digest. A changed `instructions`, a changed `kind`, and a swapped task order each give another. |
+| `a path list over its byte budget is omitted` (run-events) | `pathField(["a.ts"])` is `{ paths: ["a.ts"] }`. With budget 10, `["abcdef"]` (10 bytes) is kept and `["abcdefg"]` is `{ pathsOmitted: true }`. |
+| `project configuration and plan tasks accept feature inputs` (task-features) | `teamProjectSchema` parses `{ checks: [cmd], features: { areas: [{ id: "host", paths: ["packages/host"] }] } }` and refuses an area id `mixed`. `teamTaskPlanSchema` accepts `kind: "fix"` and `risk: "elevated"`, and refuses `kind: "chore"` and `risk: "normal"`. |
+| `the project manager may label kind and raise risk` (team-prompts) | The project-manager prompt contains `"risk":"elevated"` and `feature, fix, refactor, test, docs, or investigation`. An implementer prompt does not. |
+| `a member context never carries the feature map` (team-prompts) | `teamContext` for a handoff run whose project has a map, given a configured project with the same map, serializes with no `"features"` and no `"elevatedTokens"`. `checks` is still present. |
+| `an accepted plan records the plan and each task with its features` | With the map `host: ["packages/host"]`, the project manager reports task `a` (`["packages/host/src/auth/session.ts"]`, `kind: "fix"`) and task `b` (`["docs/teams.md"]`, depends on `a`). The store has one `plan.accepted` at revision 1 with `taskCount` 2, a 64-hex `planDigest`, and `parallelism` 4. It has `task.planned` for `a` and then `b`. `a` has the path, `profileId` absent, and features `{ role: "implementer", area: "host", kind: "fix", risk: "elevated", featureVersion: 1 }` with a 64-hex `featureMap`. `b` has area `docs/`, kind null, and risk `normal`. |
+| `oversized owned paths leave the task event without them` | One task owns 32 paths of 296 `é` characters, a slash, and an index. Its `task.planned` has `pathsOmitted: true`, no `paths`, and features with area set. |
+| `discovery records each scout with its profile` | On a run with `mixedLineup`, an explore report with scouts `s1` (`spark-high`) and `s2` (`astra-xhigh`) stores one `discovery.accepted` whose `scouts` are `s1` then `s2`, each with features `{ role: "scout", area: "none", kind: "investigation", risk: "normal" }`. |
+| `a refused plan records no plan` | A plan whose task depends on itself blocks the run. The store has no `plan.accepted` and no `task.planned`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement**, and add the paragraph to `docs/teams.md`.
+- [ ] **Step 4: Run** `node --import tsx --test tests/run-events.test.ts tests/task-features.test.ts tests/team-prompts.test.ts tests/team-events.test.ts`, then `npm run typecheck -w @infinite/host`.
+
+### Task 2: member starts and reports, with replacement links
+
+**Interfaces (consumes):** task 1.
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/run-events.ts
+export type ReplacementCause = "stall" | "limit" | "escalation" | "answer";
+export interface ProfileIdentity { profileId?: string; provider: string; model?: string; effort?: string }
+/** Umbrella C7's profile identity. `effort` is the profile's effort, or its variant for OpenCode. */
+export function profileIdentity(profile: TeamModelProfile | undefined, provider: Provider): ProfileIdentity;
+
+// packages/host/src/teams.ts
+type Stored = { /* existing fields */
+  /** The member each queued replacement continues, until it starts. Written only with `options.events`. */
+  ledgerReplaces?: Record<string, { memberId: string; cause: ReplacementCause }>;
+};
+/** Records that `next` continues `previous`. A no-op without `options.events`. */
+private linkReplacement(stored: Stored, next: TeamMember, previous: TeamMember, cause: ReplacementCause): void;
+/** Was `(run, member, exited, singlePage)`. */
+private readMemberJournal(stored: Stored, member: TeamMember, exited?: boolean, singlePage?: boolean): { page: ReturnType<Manager["events"]>; limit: LimitSwitch | undefined };
+```
+
+**Decisions:**
+
+- **Gap: the replaced member.** Spec part 1 puts "replaced member and cause" on `member.started`, and the run record keeps no such link. The fact is known where a replacement is created, and `launch` runs later. The smallest change is `Stored.ledgerReplaces`, written by `linkReplacement` and read by `member.started`. *(My call: a `Stored` field, not the draft's `TeamMember.replaces`, so a service without events and every `TeamView` stay as they are. Deriving the link from a shared working copy cannot tell a non-implementer's limit switch, which leaves only a text reason.)*
+- `linkReplacement` is called after `run.members.push(next)` in four places, each followed by a save: the completion callback of `replaceStalledMember` (`stall`), the completion callback of `switchLimitedMember` (`limit`), the completion callback of the `escalate` branch of `consume` (`escalation`), and the answered-decision loop of `step`, before its `this.save(stored)` (`answer`).
+- **`member.started`.** In `launch`, after `member.startedAt ??= timestamp()` and the turn update, before the last `this.save(stored)`. Ids `{ memberId, taskId: member.taskId, revision: member.revision }`. Data: `role`; `purpose: "work"`, the constant `run.created` uses; `sessionId`; `startedAt: member.startedAt`; `baseCommit: member.baseCommit`; `...profileIdentity(member.modelProfile, member.provider ?? run.provider)`; `unavailable: true` only when the launch returned `unavailable`; `replaces: stored.ledgerReplaces?.[member.memberId]`. Then the entry is deleted, and the map is deleted when it is empty. *(My call: the spec does not list `sessionId`. Spec part 3 refreshes cost "for one of the attempt's sessions", and only this event ties a session to an attempt.)*
+- **Permission coordinators emit no member kind.** *(My call: spec part 6 leaves the permission coordinator out because it "has its own decision records". It is also the only member that gets a new session per turn, so a member-id key would keep only its first turn.)*
+- **`member.reported`.** `readMemberJournal` takes `stored`. It emits after `member.report`, `status`, `reportedAt`, `stalledAt`, and the `stoppedReason` clear are set, before `break`. Ids `{ memberId, taskId: member.taskId, revision: member.revision }`. Data: `role`, `reportKind: member.report.kind`. In `step` and `replaceStalledMember` a save follows in the same synchronous path. In the stop barrier the loop's final save persists the report and the event together, so a crash loses both, and the next read emits again.
+- A barrier that reads past a consumed report can overwrite `member.report`. The ledger keeps the first kind, by key.
+
+- [ ] **Step 1: Write the failing tests** in `tests/team-events.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `a launch records member.started once` | With `mixedLineup`, a queued implementer on `spark-high` for task `a` (cwd the fixture workspace) launches on `step`. One `member.started` has `memberId`, `taskId` `a`, and revision 1, with data `role` `implementer`, `purpose` `work`, the member's `sessionId`, `startedAt` equal to the record's, `baseCommit` the fixture base, `profileId` `spark-high`, `provider` `opencode`, `model` `meta/muse-spark-1.3-contributor`, `effort` `high`, and no `replaces`. A second `step` and a restart add none. |
+| `a report records member.reported with its kind` | The fixture project manager reports a plan. One `member.reported` has its `memberId` and data `{ v: 1, role: "project-manager", reportKind: "plan" }`. |
+| `an answered replacement names the member it replaces` | As `an answered implementer waits for a slot…` in `tests/teams.test.ts`: after the answer and a `step`, the sealed `ledgerReplaces[next]` is `{ memberId: waiting.memberId, cause: "answer" }`. After the launching `step`, `member.started.data.replaces` equals it, and the sealed record has no `ledgerReplaces`. |
+| `a service without an outbox records no replacement link` | The same flow with `openTeam()`: no sealed record read after either `step` has `ledgerReplaces`. |
+| `a permission coordinator emits no member event` | A queued permission coordinator launches and its report is read. The store has no `member.started` and no `member.reported` for it. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** the four test files of task 1 and the typecheck.
+
+### Task 3: member stops
+
+**Interfaces (consumes):** task 2.
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/run-events.ts
+export const MEMBER_STOP_REASONS = ["stall", "limit", "no-report", "owner", "host"] as const;
+export type MemberStopReason = typeof MEMBER_STOP_REASONS[number];
+export type MemberStopDetail = "pause" | "cancel" | "steer" | "block" | "retired";
+
+// packages/host/src/teams.ts
+/** Emits `member.stopped` with data { role, reason, detail?, reported: Boolean(member.report) }.
+ *  A no-op for a permission coordinator or without `options.events`. */
+private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReason, detail?: MemberStopDetail): void;
+```
+
+**Decisions:**
+
+- Ids for every stop: `{ memberId, taskId: member.taskId, revision: member.revision }`. The classes follow spec part 1: `owner` is a pause, cancel, or steer. `host` is a halt for a block (another member's block, an automatic recovery, a deadline, the attempt limit) and a runtime retirement.
+- **`replaceStalledMember`.** After the `if (limit) { … }` branch and before the delivery check. The exit is confirmed and the drained journal holds no report and no limit. Reason `stall`. Every later path saves synchronously: `block`, `operation`, or a throw that `step` turns into `block`.
+- **`switchLimitedMember`.** After `member.stoppedReason = …`, below the permission-coordinator branch. Reason `limit`. The same save argument holds.
+- **`retireMember`.** In both branches, right after the line that sets `status`, `stoppedReason`, and `retirement`, before `block` or `save`. Reason `host`, detail `retired`.
+- **`step`, exit branch.** After `member.status = "stopped"`, before `this.block(… "missing-agent-report" …)`. Reason `no-report`.
+- **`step`, halt loop.** Each iteration over `membersToStop` captures the member's status first. A `finally` around the iteration body, because the body uses `continue`, calls `memberStopped` when the status became `stopped` in that iteration: reason `host` when `stored.halt` is `block`, else `owner`, and detail `stored.halt`. A member that reported but was never consumed (status `reported` behind an earlier task, or a report the barrier read) gets `reported: true`. A member already `stopped` is skipped, so a barrier that reads the revision on every tick adds nothing. The save after the loop persists the states and the events together.
+- The answered-decision loop's `prior.status = "stopped"` emits no stop. Its question report ended the attempt.
+
+- [ ] **Step 1: Write the failing tests** in `tests/team-events.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `a stalled member's stop names the stall` | An implementer on task `a` with `stalledAt` set and an exited session is replaced on `step`. Its `member.stopped` data is `{ v: 1, role: "implementer", reason: "stall", reported: false }`. After the replacement launches, its `member.started.data.replaces` is `{ memberId: old, cause: "stall" }`. |
+| `a limit stop without a fallback names the limit` | A provider-limit signal (as `tests/teams.test.ts` appends one) on a run with no lineup. `member.stopped` has reason `limit`, and `run.blocked` has code `provider-limit`. |
+| `an owner cancel stops members as owner stops` | `cancel` with one running implementer, then `step`. Its `member.stopped` has reason `owner`, detail `cancel`, and `reported: false`. |
+| `a reported member that a halt stops is marked reported` | A member with status `reported`, a `result` report, and `exitConfirmedAt`, then `pause` and `step`. Its `member.stopped` has reason `owner`, detail `pause`, and `reported: true`. |
+| `a sibling block stops the other members as host stops` | Running implementers on `a` and `b`. `a` reports `blocked`, and two `step` calls drain the revision. `b` has `member.stopped` with reason `host` and detail `block`. `a` has `member.reported` with `reportKind` `blocked` and no `member.stopped`. |
+| `a member that exits without a report keeps its first reason` | An implementer whose session exited with an empty journal. After `step` it has `member.stopped` with reason `no-report`. After two more `step` calls that drain its revision, the store still has exactly one `member.stopped` for it. |
+| `a retired reviewer's stop is a host stop` | With `retireTeamRuntime` stubbed on the fixture manager and the reviewer at the checked head, `retireMember` stores `member.stopped` with role `reviewer`, reason `host`, detail `retired`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** the four test files of task 1 and the typecheck.
+
+### Task 4: task outcomes
+
+**Interfaces (consumes):** tasks 1 to 3. No new interface.
+
+**Decisions:**
+
+- **`task.integrated`.** In the completion callback of the `result` branch of `consume`, inside `if (task)`, after `task.changedPaths` is set or deleted. Integrators have no task and emit none here. Ids `{ memberId, taskId: task.id, revision: member.revision }`. Data: `commit` (absent when the result changed nothing, the spec's `empty-result`), `headCommit: head`, `baseCommit: run.baseCommit`, `memberBaseCommit: member.baseCommit`, `diff: task.diffStat` (absent when Git refused the read). Not the summary, not `changedPaths`.
+- **`scout.completed`.** In the completion callback of the `findings` branch, after `scout.status = "complete"`. Ids `{ memberId, taskId: scout.id, revision: member.revision }`. No data.
+- **`task.escalated`.** In the completion callback of the `escalate` branch, right after `task.escalation = …` and before `newMember`. A throwing `newMember` blocks the run and the escalation stays on the task, so the event matches the record. Ids `{ memberId, taskId: task.id, revision: member.revision }`. Data: `fromProfileId: task.escalation.fromProfileId`, `toProfileId: task.escalation.toProfileId`. Not the reason.
+- **`task.limit-switched`.** In the completion callback of `switchLimitedMember`, after `run.members.push(next)`, for every role. Ids `{ memberId: member.memberId, taskId: member.taskId, revision: member.revision }`. Data: `role`, `fromProfileId: from.id`, `toProfileId: fallback.id`. Not `limit.message` or `limit.resetsAt`, which a provider reported. *(My call: every role, as the draft says. The spec names no role, and the integrator, reviewer, and delivery attempts need the fact for member results.)*
+
+- [ ] **Step 1: Write the failing tests** in `tests/team-events.test.ts`. A member's working copy comes from `prepareMemberWorkspace` in `packages/host/src/team-workspace.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `an integrated result records its commit, head, and diff counts` | The implementer of task `a` (paths `["a.txt"]`) writes one line to `a.txt` and reports `result`. `task.integrated` has `taskId` `a`, its `memberId`, and revision 1, with a 40-hex `commit` equal to `task.commit`, `headCommit` equal to `run.headCommit`, `baseCommit` and `memberBaseCommit` the fixture base, and `diff` `{ added: 1, removed: 0, files: 1, docs: false, tests: false }`. |
+| `an empty result records no commit` | The same with no file written: no `commit`, and `headCommit` is the fixture base. |
+| `a completed scout records scout.completed` | With `mixedLineup` and scout `s1` running, a `findings` report stores `scout.completed` with `taskId` `s1`, its `memberId`, and data `{ v: 1 }`. |
+| `an escalation records both profiles and links the new member` | With `mixedLineup` plus an escalation pool holding `astra-escalation`, the `spark-high` implementer of `a` escalates. `task.escalated` has data `{ v: 1, fromProfileId: "spark-high", toProfileId: "astra-escalation" }`. The new member's `member.started.data.replaces` is `{ memberId: old, cause: "escalation" }`. |
+| `a limit switch records both profiles and links the new member` | With `limitLineup`, the `haiku` implementer of `a` hits a provider limit. The store has `member.stopped` with reason `limit`, and `task.limit-switched` with data `{ v: 1, role: "implementer", fromProfileId: "haiku", toProfileId: "deepseek-light" }`. The new member's `replaces` has cause `limit`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** the four test files of task 1, then `node --import tsx --test tests/teams.test.ts tests/team-delivery.test.ts tests/team-member-retire.test.ts` on the host, then the typecheck.
+- [ ] **Step 5: The coordinator runs `npm run check`, requests the independent review, and commits.**
+
+## Not in this slice
+
+- The check, review, repair, delivery, and rating kinds, and the emission-coverage test.
+- `configId` and the profile epoch on `member.started`. The configuration identity slice adds them.
+- `attempt_index` and `inherited`. The projection derives both from the `replaces` chain, and a predecessor that started before this slice has no `member.started`.
+- Any projector, and the `team-prompts.ts` import guard of the authority rules.

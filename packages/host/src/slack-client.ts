@@ -107,7 +107,7 @@ export class SlackClient implements IntakeThreadReader {
       if (typeof frame.envelope_id !== "string") return;
       const envelopeId = frame.envelope_id;
       // Every envelope with an ID goes through the handler; only its resolution acknowledges it.
-      const envelope = toEnvelope(envelopeId, frame.payload);
+      const envelope = toEnvelope(envelopeId, frame.type, frame.payload);
       Promise.resolve()
         .then(() => handle(envelope))
         .then(() => ack(current, envelopeId), () => undefined);
@@ -211,7 +211,9 @@ function threadMessage(raw: Record<string, any>): SlackThreadMessage {
   });
 }
 
-function toEnvelope(envelopeId: string, payload: Record<string, any> | undefined): SlackEnvelope {
+/** Only an events_api envelope carries an event; any other envelope type is delivered with its ID alone. */
+function toEnvelope(envelopeId: string, type: unknown, payload: Record<string, any> | undefined): SlackEnvelope {
+  if (type !== "events_api") return { envelopeId };
   const event = payload?.event;
   return defined({
     envelopeId,

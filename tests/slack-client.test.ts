@@ -167,7 +167,7 @@ test("an envelope of another type reaches the handler and is acknowledged only w
   const connection = client.connect(async envelope => { seen.push(envelope); if (fail) throw new Error("handler failed"); });
   t.after(() => connection.close());
   await waitFor(async () => connection.connected(), connected => connected);
-  const first = await slack.emitRaw("interactive", { type: "block_actions" });
+  const first = await slack.emitRaw("interactive", { type: "block_actions", event: { type: "message", channel: binding.channelId, ts: "1700000100.000001", text: "not an event" } });
   await waitFor(async () => slack.acks(), acks => acks.includes(first));
   const delivered = seen.find(envelope => envelope.envelopeId === first);
   assert.ok(delivered);

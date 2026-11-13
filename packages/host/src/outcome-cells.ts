@@ -134,7 +134,8 @@ export function cellKey(row: OutcomeRow, by: readonly CellDimension[]): Record<s
     key.profile = row.profileId;
     key.provider = row.provider;
     key.model = row.model;
-    key.effort = row.effort ?? "none";
+    // A missing effort adds no entry: OpenCode allows the variant `none`, which is another identity.
+    if (row.effort !== null) key.effort = row.effort;
     key.epoch = String(row.profileEpoch);
   }
   if (dimensions.has("area")) {

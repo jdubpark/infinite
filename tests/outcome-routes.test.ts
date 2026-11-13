@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { teamLineupSchema } from "../packages/host/src/team-types.js";
 import { startHost, waitFor } from "./helpers.js";
-import { fixture } from "./team-fixture.js";
+import { fixture, mixedLineup } from "./team-fixture.js";
 
 const coordinator = { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" };
 const lineup = {
@@ -267,7 +267,8 @@ test("display cells over a full run", { timeout: 120000 }, async () => {
     assert.equal(cells.body.unreadable, 0);
     assert.equal(cells.body.cells.reduce((sum: number, cell: { attempts: number }) => sum + cell.attempts, 0), implementerRows);
     for (const cell of cells.body.cells) {
-      assert.deepEqual(Object.keys(cell.key).sort(), ["effort", "epoch", "model", "profile", "provider"]);
+      // This fixture's members have no effort, and a missing effort adds no key entry.
+      assert.deepEqual(Object.keys(cell.key).sort(), ["epoch", "model", "profile", "provider"]);
       assert.deepEqual(cell.sources, ["production"]);
     }
 
@@ -306,4 +307,28 @@ test("the outcomes command prints cells", { timeout: 120000 }, async () => {
     await f.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("an advanced epoch retires a profile's scorecard row", { timeout: 180000 }, async () => {
+  const lineup = structuredClone(mixedLineup);
+  lineup.implementers = [lineup.implementers[0]!, { id: "deepseek-high", label: "DeepSeek implementer", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light", dataUse: "contributor" }];
+  const f = await fixture("usage", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const settled = await f.settled(created.body.id);
+    assert.equal(settled.status, "ready-for-review", JSON.stringify(settled));
+    const profiles = (body: { rows: { profileId: string }[] }) => body.rows.map(row => row.profileId).sort();
+    const before = await waitFor(() => f.host.fetchApi("/usage/models"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    assert.deepEqual(profiles(before.body), ["deepseek-high", lineup.implementers[0]!.id].sort());
+
+    // The owner says the backend behind this profile changed. No attempt has started under the new epoch, so the
+    // old history must not stand as the profile's row.
+    const advanced = await f.host.fetchApi("/outcomes/epochs", "owner", { profileId: "deepseek-high", requestId: randomUUID() });
+    assert.equal(advanced.status, 200, JSON.stringify(advanced.body));
+    assert.equal(advanced.body.epoch, 2);
+    const after = await f.host.fetchApi("/usage/models");
+    assert.equal(after.status, 200, JSON.stringify(after.body));
+    assert.deepEqual(profiles(after.body), [lineup.implementers[0]!.id]);
+  } finally { await f.close(); }
 });

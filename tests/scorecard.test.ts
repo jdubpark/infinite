@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { wilsonInterval } from "../packages/host/src/scorecard.js";
-import { scorecardFromRows, type ProfileIdentityOf } from "../packages/host/src/scorecard.js";
+import { scorecardFromRows, type CurrentEpochOf, type ProfileIdentityOf } from "../packages/host/src/scorecard.js";
 import type { CostLookup, SessionCost } from "../packages/host/src/outcome-cells.js";
 import type { OutcomePayload, OutcomeRow } from "../packages/host/src/outcome-store.js";
 import { exclusionOf, type Disposition, type Flag, type Level } from "../packages/host/src/outcome-rules.js";
@@ -99,7 +99,7 @@ function stalledRow(overrides: Partial<Omit<OutcomeRow, "payload">> & { payload?
 
 const label = () => undefined;
 
-function scorecardOf(rows: OutcomeRow[], options: { cost?: CostLookup; minAttempts?: number; role?: string; identity?: ProfileIdentityOf } = {}) {
+function scorecardOf(rows: OutcomeRow[], options: { cost?: CostLookup; minAttempts?: number; role?: string; identity?: ProfileIdentityOf; epoch?: CurrentEpochOf } = {}) {
   return scorecardFromRows(rows, { role: options.role ?? "implementer", label, ...options });
 }
 
@@ -224,6 +224,25 @@ test("one row per profile id, newest epoch only", () => {
   assert.equal(retired.rows.length, 1);
   assert.equal(retired.rows[0]!.attempts, 1, "The model that ran later is the only one counted");
   assert.equal(scorecardOf([...modelA, ...modelB, lateA], { identity: () => undefined }).rows[0]!.attempts, 3);
+
+  // The owner advanced the epoch and no attempt has started under it: the old rows are all there is, and they
+  // must not stand as the profile's row.
+  assert.deepEqual(scorecardOf(oldEpoch, { epoch: () => 2 }).rows, []);
+  assert.equal(scorecardOf(oldEpoch, { epoch: () => 1 }).rows[0]!.attempts, 3);
+  const current = scorecardOf([...oldEpoch, ...newEpoch, late], { epoch: () => 2 });
+  assert.equal(current.rows.length, 1);
+  assert.equal(current.rows[0]!.attempts, 2);
+  // The epoch is asked once per identity, with the identity's own fields.
+  const asked: unknown[] = [];
+  scorecardOf([...oldEpoch, ...newEpoch], { epoch: identity => { asked.push(identity); return 2; } });
+  assert.deepEqual(asked, [{ provider: "claude", model: "model-a", effort: null }]);
+
+  // A missing effort and the literal effort `none` are two identities. OpenCode allows the variant `none`.
+  const noEffort = [1, 2].map(() => integratedRow({ profileId: "oc", provider: "opencode", effort: null }));
+  const namedNone = [1, 2, 3].map(() => integratedRow({ profileId: "oc", provider: "opencode", effort: "none" }));
+  const named = (effort: string | null): ProfileIdentityOf => () => ({ provider: "opencode", model: "model-a", effort });
+  assert.equal(scorecardOf([...noEffort, ...namedNone], { identity: named(null) }).rows[0]!.attempts, 2);
+  assert.equal(scorecardOf([...noEffort, ...namedNone], { identity: named("none") }).rows[0]!.attempts, 3);
 });
 
 test("profiles with nothing counted are left out", () => {

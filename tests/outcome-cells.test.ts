@@ -257,7 +257,14 @@ test("keys never merge epochs, identities, or maps", () => {
   assert.deepEqual(pooled.key, {});
   assert.equal(pooled.attempts, 2);
 
-  assert.equal(cellKey(row({ effort: null }), ["profile"]).effort, "none");
+  // A missing effort adds no entry. OpenCode allows the variant `none`, which is its own identity and its own cell.
+  assert.equal("effort" in cellKey(row({ effort: null }), ["profile"]), false);
+  assert.equal(cellKey(row({ effort: "none" }), ["profile"]).effort, "none");
+  const efforts = buildCells([row({ effort: null }), row({ effort: "none" })], query({ by: ["profile"] }));
+  assert.equal(efforts.length, 2);
+  for (const use of ["decision", "display"] as const) {
+    assert.equal(buildCells([row({ effort: null }), row({ effort: "none" })], query({ use, by: ["profile"] })).length, 2, use);
+  }
 });
 
 test("sources stay apart where C6 says", () => {

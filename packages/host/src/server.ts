@@ -44,7 +44,7 @@ import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryR
 import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
 import { profileIdentity } from "./run-events.js";
 import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cells.js";
-import { productionRows, queryCells } from "./outcome-reads.js";
+import { currentEpochs, productionRows, queryCells } from "./outcome-reads.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
 import { createRoutineSchema, routineActionSchema } from "./routine-types.js";
@@ -665,7 +665,9 @@ export function createApp(config: Config, key: Buffer) {
       // Only implementers and scouts have outcome rows. Another role gives an empty scorecard without a read.
       if (role !== "implementer" && role !== "scout") return void res.json(scorecardFromRows([], { role, label: () => undefined, cost: sessionCost }));
       const { rows } = productionRows(evidence, role);
-      return void res.json(scorecardFromRows(rows, { role, label: profileLabels(), identity: configuredIdentity, cost: sessionCost }));
+      // The current epoch of each identity comes from the store, so an epoch the owner advanced never keeps its old rows.
+      const epoch = currentEpochs(evidence, new Date().toISOString());
+      return void res.json(scorecardFromRows(rows, { role, label: profileLabels(), identity: configuredIdentity, epoch, cost: sessionCost }));
     } catch (error) {
       if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
       throw error;

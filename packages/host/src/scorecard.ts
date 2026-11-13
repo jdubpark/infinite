@@ -18,9 +18,13 @@ export type Scorecard = { rubricVersion: 1; minAttempts: number; sources: Source
 /** The identity that the configured lineup gives a profile id now. Undefined when the lineup does not have the id. */
 export type ProfileIdentityOf = (profileId: string) => { provider: string; model: string; effort: string | null } | undefined;
 
-type Group = { profileId: string; provider: string; epoch: number; identity: string; newest: number; rows: OutcomeRow[] };
+/** The current epoch of an identity, from the profile epochs the owner declared. */
+export type CurrentEpochOf = (identity: { provider: string; model: string; effort: string | null }) => number | undefined;
 
-const identityOf = (provider: string, model: string, effort: string | null) => JSON.stringify([provider, model, effort ?? "none"]);
+type Group = { profileId: string; provider: string; model: string; effort: string | null; epoch: number; identity: string; newest: number; rows: OutcomeRow[] };
+
+/** Null stays null: a missing effort and the literal effort `none`, which OpenCode allows, are two identities. */
+const identityOf = (provider: string, model: string, effort: string | null) => JSON.stringify([provider, model, effort]);
 
 /** Between identities of an id that the lineup no longer has: the newest rowTime, then the smaller identity string. */
 function preferred(candidate: Group, current: Group): boolean {
@@ -88,7 +92,7 @@ function suggestionsOf(rows: readonly SuggestableRow[], role: string): Suggestio
 }
 
 /** One row per profile id, from production rows of one role. Reads the display use of each row. */
-export function scorecardFromRows(rows: readonly OutcomeRow[], options: { role: string; label: (profileId: string) => string | undefined; identity?: ProfileIdentityOf; cost?: CostLookup; minAttempts?: number }): Scorecard {
+export function scorecardFromRows(rows: readonly OutcomeRow[], options: { role: string; label: (profileId: string) => string | undefined; identity?: ProfileIdentityOf; epoch?: CurrentEpochOf; cost?: CostLookup; minAttempts?: number }): Scorecard {
   const minAttempts = options.minAttempts ?? MIN_COUNTED_ROWS;
   const groups = new Map<string, Group>();
   for (const row of rows) {
@@ -96,15 +100,23 @@ export function scorecardFromRows(rows: readonly OutcomeRow[], options: { role: 
     if (row.profileId === "default" || row.profileId === "unknown") continue;
     const identity = identityOf(row.provider, row.model, row.effort);
     const key = JSON.stringify([row.profileId, identity, row.profileEpoch]);
-    const group = groups.get(key) ?? { profileId: row.profileId, provider: row.provider, epoch: row.profileEpoch, identity, newest: -Infinity, rows: [] };
+    const group = groups.get(key) ?? { profileId: row.profileId, provider: row.provider, model: row.model, effort: row.effort, epoch: row.profileEpoch, identity, newest: -Infinity, rows: [] };
     group.rows.push(row);
     group.newest = Math.max(group.newest, timeOf(row));
     groups.set(key, group);
   }
-  // Within one identity the higher epoch is always the newer one: an attempt keeps the epoch it started in, so an
-  // attempt from before an advance can end after it, and its end time must not bring the retired epoch back.
+  // Within one identity only the current epoch counts. An attempt keeps the epoch it started in, so an attempt from
+  // before an advance can end after it, and its end time must not bring the retired epoch back. And the owner can
+  // advance an epoch before any new attempt starts: the old rows are then all there is, and they must not stand as
+  // the profile's row. Without an epoch lookup, the highest epoch among the rows stands in for the current one.
+  const currentEpoch = new Map<string, number | undefined>();
   const candidates = new Map<string, Group>();
   for (const group of groups.values()) {
+    if (!currentEpoch.has(group.identity)) {
+      currentEpoch.set(group.identity, options.epoch?.({ provider: group.provider, model: group.model, effort: group.effort }));
+    }
+    const epoch = currentEpoch.get(group.identity);
+    if (epoch !== undefined && group.epoch !== epoch) continue;
     const key = JSON.stringify([group.profileId, group.identity]);
     const current = candidates.get(key);
     if (!current || group.epoch > current.epoch) candidates.set(key, group);

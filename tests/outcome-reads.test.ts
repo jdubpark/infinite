@@ -7,7 +7,8 @@ import { join } from "node:path";
 import { CellQueryRefused } from "../packages/host/src/outcome-cells.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { EvidenceError } from "../packages/host/src/evidence/types.js";
-import { productionRows, queryCells } from "../packages/host/src/outcome-reads.js";
+import { advanceEpoch, configurationModule } from "../packages/host/src/configuration-store.js";
+import { currentEpochs, productionRows, queryCells } from "../packages/host/src/outcome-reads.js";
 import {
   type OutcomeRow,
   outcomeModule,
@@ -354,5 +355,36 @@ test("cells come from the store", () => {
   } finally {
     store?.close();
     f.close();
+  }
+});
+
+test("the current epoch comes from the store", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = readyStore(f);
+    store.register(configurationModule());
+    const identity = { provider: "opencode", model: "model-one", effort: "high" };
+    assert.equal(currentEpochs(store, NOW)(identity), 1);
+    advanceEpoch(store, { profile: identity, requestId: "request-1", now: "2026-11-12T00:00:00.000Z" });
+    const lookup = currentEpochs(store, NOW);
+    assert.equal(lookup(identity), 2);
+    assert.equal(lookup({ ...identity, effort: null }), 1, "another identity keeps its own epoch");
+    // An epoch that starts after `now` is not current yet.
+    advanceEpoch(store, { profile: identity, requestId: "request-2", now: "2026-11-14T00:00:00.000Z" });
+    assert.equal(currentEpochs(store, NOW)(identity), 2);
+  } finally {
+    store?.close();
+    f.close();
+  }
+
+  const bare = fixture();
+  let unready: EvidenceStore | undefined;
+  try {
+    unready = readyStore(bare);
+    assert.throws(() => currentEpochs(unready!, NOW), (error: unknown) => error instanceof EvidenceError && error.code === "unavailable");
+  } finally {
+    unready?.close();
+    bare.close();
   }
 });

@@ -61,7 +61,9 @@ values have to be written into the config. The planned values for the first
 instance are `{"minAvailableMemoryGiB": 8, "maxLoadPerCpu": 1.5}`.
 
 On Linux, available memory is `MemAvailable` from `/proc/meminfo`, which counts
-reclaimable cache. Other platforms use free memory. The reading is refreshed at
+reclaimable cache. Other platforms use free memory. On macOS the gate reads free
+memory, which undercounts available memory, so a floor sized for Linux can hold
+every automatic launch on a Mac host. The reading is refreshed at
 most every 2 seconds. A held launch carries a reason that starts with
 `Waiting for host capacity:` and names the measured value and the limit.
 
@@ -71,5 +73,3 @@ A second instance is a second host process on the same machine, with its own
 names, state, and Slack app. The commissioning steps (names, accounts and
 directories, rendered service templates, the sudoers check, the relay entry, and
 the acceptance checks) are in [`deploy/ubuntu/instances.md`](../deploy/ubuntu/instances.md).
-That runbook is on a separate branch and merges separately; until it merges, the
-link does not resolve.

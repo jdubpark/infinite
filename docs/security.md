@@ -263,13 +263,16 @@ Slack surface:
   events. Nothing from that message reaches the record, the mission, or an agent.
 - The thread the issue links is read once, at admission. Its messages, the
   owner's and other people's, are kept in the mission objective as background.
-  Each line is labelled `owner` or `other`, and bot messages are left out. The
+  The host labels every line of every message `owner` or `other`, so no line of a
+  teammate's message can read as the owner's, and bot messages are left out. The
   coordinator is told that this text is information, never instructions, and that
   only the owner's words are instructions. The Slack surface also reads the bound
   thread to find its own posts after an uncertain send; it stores nothing from that
   read.
 - So text that teammates wrote in the linked thread is stored in the host's sealed
   mission state and shown to coordinator and subteam agents.
+- A skipped issue's title and description are not stored. Its record keeps the
+  issue's IDs, URL, times, and skip reason, and no text from the issue.
 
 The bot posts only into the thread a record is bound to. Every outbound Slack
 function takes an intake record and reads its thread; none takes a channel ID
@@ -277,6 +280,13 @@ from an inbound event. Linear comments go only to the issue whose record they
 belong to. Neither surface changes a Linear issue's state, assignee, or labels,
 and neither approves a provider permission or marks work complete. Results are
 labelled as agent reports.
+
+Host paths and addresses do not leave the host through intake. Before any Slack
+message or Linear comment is made, paths under the instance's configured
+directories and under `/srv/`, `/opt/`, `/run/`, and `/etc/` become
+`[local path omitted]`, the home and temporary paths that shared Linear text
+already drops are dropped too, and every IPv4 address becomes
+`[address omitted]`.
 
 Slack and Linear credentials are regular files with mode `0600`, outside
 `stateDir`, `runDir`, `teams.workspaceDir`, and every project path. The host reads
@@ -288,9 +298,10 @@ public endpoint, and Linear is polled.
 Errors are not shared as text. For an unexpected failure, the intake service's
 `lastError`, the Slack surface's `lastError`, and every failure a record keeps
 carry only the error's name and, when it has one, its code. The message and stack
-go to the host log only. Two known refusals keep their own fixed text in shared
-places: a mission service refusal (`TeamError`) and a Slack request failure
-(`SlackError`, whose text names only its code).
+go to the host log only. Three known failures keep their own fixed text in shared
+places: a mission service refusal (`TeamError`), a Slack request failure
+(`SlackError`, whose text names only its code), and a Linear request failure
+(`LinearFailure`, whose text is fixed).
 
 Residual risk: the objective carries the Linear title and description, and the
 Slack thread, to the coordinator and subteams. Anyone who can write to the issue

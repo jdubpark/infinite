@@ -19,6 +19,7 @@ const NOT_STARTED = "This request has not started yet.";
 const NO_REASON = "No reason was recorded.";
 const UNEXPECTED = "The request could not be applied.";
 const ACTIONS = new Set(["status", "pause", "resume", "cancel"]);
+const QUESTION = /^Q(\d+)(?!\w)\s*/i;
 
 interface Outcome { outcome: string; reply?: string }
 type SavedCall = NonNullable<IntakeInbound["call"]>;
@@ -221,8 +222,12 @@ export class IntakeSlackSurface {
       add("ack", "ack", `Started on ${title}. I'll post questions and the result here.\nReply with a mention to answer or steer.`);
     } else if (draft.state === "queued" && draft.holdReason === "max-active") {
       add("ack", "ack", `Queued ${title}. It starts when a running request finishes. I'll post questions and the result here.`);
+    } else if (draft.state === "queued" && draft.holdReason) {
+      // Posted once: the key exists after the first hold, so a later hold reason posts nothing.
+      add("ack", "ack", `Received ${title}. It has not started: ${draft.holdReason}\nI'll post questions and the result here once it starts.`);
     }
-    if (draft.state === "started" && draft.messages.find(message => message.key === "ack")?.text.startsWith("Queued ")) {
+    const ack = draft.messages.find(message => message.key === "ack");
+    if (draft.state === "started" && ack && !ack.text.startsWith("Started on ")) {
       add("started", "started", `Started on ${draft.identifier}.`);
     }
     if (mission) {
@@ -238,7 +243,7 @@ export class IntakeSlackSurface {
         add(`status:blocked:${mission.revision}`, "status", `Blocked: ${mission.reason ?? NO_REASON}\nFile a follow-up with Linear's agent in this thread.`);
       }
       if (mission.status === "cancelled") {
-        add(`status:cancelled:${mission.revision}`, "status", `Cancelled: ${mission.reason ?? NO_REASON}`);
+        add(`status:cancelled:${mission.revision}`, "status", `Cancelled: ${mission.reason ?? NO_REASON}\nFile a follow-up with Linear's agent in this thread.`);
       }
       if (mission.status === "paused" && draft.closure) {
         add(`status:paused:${mission.revision}`, "status", `Paused: ${draft.closure.reason}\nReply with a mention and "resume" or "cancel".`);
@@ -384,19 +389,56 @@ export class IntakeSlackSurface {
     const thread: IntakeThread = { channelId: event.channel, threadTs: event.threadTs ?? event.ts };
     const text = this.commandText(event.text ?? "");
     const eventId = envelope.eventId ?? envelope.envelopeId;
-    const record = this.store.forThread(thread);
-    if (!record) {
+    const bound = this.store.boundTo(thread);
+    if (bound.length === 0) {
       if (slack.bindByMention && this.bind(thread, text)) return;
       this.droppedCount += 1;
       return;
     }
     const ts = event.ts;
-    this.store.update(record.issueId, draft => {
-      if (draft.inbound.some(item => item.eventId === eventId)) return;
-      const accepted: IntakeInbound = { eventId, ts, text, receivedAt: now() };
+    const duplicate = (record: IntakeRecord) => record.inbound.some(item => item.eventId === eventId || item.ts === ts);
+    // A redelivered event, or a second event for the same message, is dropped with no write and no reply.
+    if (bound.some(duplicate)) return;
+    const target = this.target(bound, text);
+    this.store.update(target.record.issueId, draft => {
+      if (duplicate(draft)) return;
+      const accepted: IntakeInbound = { eventId, ts, text: target.text, receivedAt: now() };
+      if (target.reply) {
+        // Settled here: nothing is applied to any mission, and the reply says why.
+        accepted.handledAt = now();
+        accepted.outcome = target.outcome;
+        addParts(this.config, draft, `reply:${eventId}`, "reply", target.reply, now());
+      }
       draft.inbound.push(accepted);
     });
-    void this.drain(record.issueId);
+    void this.drain(target.record.issueId);
+  }
+
+  /**
+   * The record a reply belongs to, among the records bound to its thread (oldest first): the one whose questions hold a
+   * leading `Qn`; the one a leading identifier names, with the identifier removed; the one unfinished record; or the
+   * newest finished one. With more than one unfinished record and neither prefix, nothing is applied, and the newest
+   * unfinished record keeps the reply naming the open identifiers. A `Qn` no record holds gets the unknown-question reply.
+   */
+  private target(bound: IntakeRecord[], text: string): { record: IntakeRecord; text: string; outcome?: string; reply?: string } {
+    const unfinished = bound.filter(record => record.state !== "finished");
+    const fallback = unfinished.length > 0 ? unfinished.at(-1)! : bound.at(-1)!;
+    const leading = QUESTION.exec(text);
+    if (leading) {
+      const n = Number(leading[1]);
+      const holder = bound.find(record => record.questions.some(question => question.n === n));
+      return holder ? { record: holder, text } : { record: fallback, text, outcome: "unknown-question", reply: `There is no question Q${n}.` };
+    }
+    for (const record of bound) {
+      const named = new RegExp(`^${escapeRegExp(record.identifier)}(?=$|[\\s:,])`, "i").exec(text);
+      if (named) return { record, text: text.slice(named[0].length).replace(/^\s*[:,]?\s*/, "") };
+    }
+    if (unfinished.length > 1) {
+      const open = unfinished.map(record => record.identifier).join(", ");
+      return { record: fallback, text, outcome: "ambiguous",
+        reply: `More than one request is open in this thread: ${open}. Start your reply with an identifier or a question number.` };
+    }
+    return { record: fallback, text };
   }
 
   private commandText(text: string): string {
@@ -467,7 +509,7 @@ export class IntakeSlackSurface {
     }
     if (ACTIONS.has(lower)) return { outcome: lower, call: { action: lower as "pause" | "resume" | "cancel" } };
     const open = mission.decisions.filter(decision => !decision.answer);
-    const leading = /^Q(\d+)(?!\w)\s*/i.exec(text);
+    const leading = QUESTION.exec(text);
     if (open.length === 0) {
       if (leading || /^\d+$/.test(text)) return { outcome: "already-answered", reply: ALREADY_ANSWERED };
       return { outcome: "steered", call: { action: "steer", text } };
@@ -517,6 +559,7 @@ export class IntakeSlackSurface {
       return { outcome: OUTCOMES[saved.action] };
     } catch (error) {
       if (error instanceof TeamError) return { outcome: "refused", reply: error.message };
+      this.logFailure(record.issueId, "action", error, record.identifier);
       return { outcome: "error", reply: UNEXPECTED };
     }
   }

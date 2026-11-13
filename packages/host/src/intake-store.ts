@@ -87,12 +87,10 @@ export class IntakeStore {
     return structuredClone(saved);
   }
 
-  forThread(thread: IntakeThread): IntakeRecord | undefined {
-    const bound = [...this.records.values()].filter(record =>
+  /** Every record bound to the thread except skipped ones, oldest first, in the same order as `list`. */
+  boundTo(thread: IntakeThread): IntakeRecord[] {
+    return this.list().filter(record =>
       record.state !== "skipped" && record.thread?.channelId === thread.channelId && record.thread.threadTs === thread.threadTs);
-    const newestFirst = bound.sort((a, b) => b.issueCreatedAt.localeCompare(a.issueCreatedAt) || b.issueId.localeCompare(a.issueId));
-    const preferred = newestFirst.find(record => record.state !== "finished") ?? newestFirst.find(record => record.state === "finished");
-    return preferred && structuredClone(preferred);
   }
 
   forMission(missionId: string): IntakeRecord | undefined {
@@ -115,8 +113,18 @@ export class IntakeStore {
     }
   }
 
+  /**
+   * Keeps the newest 200 inbound entries. Past 400 messages, only replies (`reply:` keys) are dropped, oldest first:
+   * the Slack surface composes every other message from its key, so dropping one would post it again.
+   */
   private trim(record: IntakeRecord) {
     if (record.inbound.length > 200) record.inbound.splice(0, record.inbound.length - 200);
-    if (record.messages.length > 400) record.messages.splice(0, record.messages.length - 400);
+    let excess = record.messages.length - 400;
+    if (excess <= 0) return;
+    record.messages = record.messages.filter(message => {
+      if (excess === 0 || !message.key.startsWith("reply:")) return true;
+      excess -= 1;
+      return false;
+    });
   }
 }

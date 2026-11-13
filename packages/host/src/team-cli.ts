@@ -9,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamDeliveryReconcileSchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
 import { describeSource } from "./client.js";
+import { autonomyModeSchema } from "./autonomy.js";
 import type { ProjectSourceStatus } from "./project-source.js";
 import { captureWorkspace } from "./workspace-checkpoint.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
@@ -584,7 +585,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
       console.log(JSON.stringify(result, null, 2));
       return true;
     }
-    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--source github|laptop] [--teamwork PATH|none] [--setup-json JSON] [--check-json JSON] [--delivery merge|pr|review] [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase] [--linear-team UUID] [--linear-project UUID]");
+    if (positional[0] !== "init" || positional.length > 2) throw new Error("Usage: infinite repo init [DIRECTORY] [--project ID] [--source github|laptop] [--teamwork PATH|none] [--setup-json JSON] [--check-json JSON] [--delivery merge|pr|review] [--repository OWNER/REPO] [--base-branch BRANCH] [--merge-method squash|merge|rebase] [--linear-team UUID] [--linear-project UUID] [--autonomy supervised|autonomous]");
     const requestedDirectory = canonicalDirectory(positional[1] ?? process.cwd());
     const gitResult = gitRootOrNonGit(requestedDirectory);
     const defaultsPath = join(stateDir, "directory-defaults.json");
@@ -593,7 +594,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const explicitLinearTeam = options["--linear-team"] === undefined ? undefined : z.uuid().parse(String(options["--linear-team"]));
     const explicitLinearProject = options["--linear-project"] === undefined ? undefined : z.uuid().parse(String(options["--linear-project"]));
     if ("nonGit" in gitResult) {
-      const unsupported = ["--project", "--source", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit"].filter(flag => options[flag] !== undefined);
+      const unsupported = ["--project", "--source", "--teamwork", "--setup-json", "--check-json", "--handoff", "--request-id", "--delivery", "--repository", "--base-branch", "--merge-method", "--permissions", "--permission-scope", "--permission-limit", "--autonomy"].filter(flag => options[flag] !== undefined);
       if (unsupported.length) throw new Error(`This directory is not a Git repository, so ${unsupported.join(", ")} cannot be used here. Run repo init in a Git repository for enrollment, or use only --linear-team and --linear-project to save directory defaults.`);
       if (!explicitLinearTeam && explicitLinearProject && !inheritedDefault?.teamId)
         throw new Error("--linear-project requires --linear-team or an inherited directory Linear team.");
@@ -622,8 +623,12 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const linearProject = explicitLinearProject;
     const handoff = String(options["--handoff"] ?? "auto");
     if (handoff !== "auto" && handoff !== "off") throw new Error("--handoff must be auto or off.");
+    const autonomyOption = options["--autonomy"] === undefined ? undefined : autonomyModeSchema.safeParse(String(options["--autonomy"]));
+    if (autonomyOption && !autonomyOption.success) throw new Error("--autonomy must be supervised or autonomous.");
+    const autonomy = autonomyOption?.data;
     const me = await api.json<any>("/me");
     if (me.teams?.repoEnrollment !== 1) throw new Error("This host does not support repository enrollment. Upgrade the host before running repo init.");
+    if (autonomy && me.teams?.autonomyMode !== 1) throw new Error("This host does not support autonomy modes. Upgrade the host before using --autonomy.");
     const mappings = readPrivateJson(mappingsPath, {}) as Record<string, unknown>;
     const key = `${config.origin}\n${root}`;
     const stored = mappings[key];
@@ -705,13 +710,13 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     const sendLinear = Boolean(linearTeam || linearProject || (!targetLinear && rootDefault));
     const sourceSupported = me.teams?.projectSource === 1;
     const enrolledSource: ProjectSource = sourceSupported ? projectSource : { mode: "laptop" };
-    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}) };
+    const body: Record<string, any> = { requestId, revision: target.revision, team: { ...projectConfig, handoff, ...(delivery ? { delivery } : {}), ...(permissions ? { permissions } : {}) }, ...(sourceSupported ? { source: projectSource } : {}), ...(sendLinear && effectiveLinear ? { linear: effectiveLinear } : {}), ...(teamwork !== undefined ? { teamwork } : {}), ...(autonomy ? { autonomy } : {}) };
     // After a lost reply, inherited settings may already be the host's mapping.
     // An omitted mapping preserves that value; compare that intent while replay
     // still sends the original receipt body and request ID unchanged.
     const linearIntent = (request: Record<string, any>) => request.linear === undefined ? targetLinear ?? null : request.linear;
     const teamworkIntent = (request: Record<string, any>) => request.teamwork === undefined ? target.teamwork ?? null : request.teamwork;
-    requestId = body.requestId = resumePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(prior.source) === JSON.stringify(body.source) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)), requestId, options["--request-id"] !== undefined, rawArgs);
+    requestId = body.requestId = resumePendingIntent(receiptsPath, `${key}:repo-init:`, `/projects/${selected}/team`, prior => JSON.stringify(prior.team) === JSON.stringify(body.team) && JSON.stringify(prior.source) === JSON.stringify(body.source) && JSON.stringify(linearIntent(prior)) === JSON.stringify(linearIntent(body)) && JSON.stringify(teamworkIntent(prior)) === JSON.stringify(teamworkIntent(body)) && prior.autonomy === body.autonomy, requestId, options["--request-id"] !== undefined, rawArgs);
     if (uploadSource) {
       assertSourceUnchanged();
       process.stderr.write(`[Infinite] Request ${requestId}\n`);
@@ -769,7 +774,7 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     }
     if (explicitProject || uploadSource) { config.projectId = selected; privateJson(configPath, config); }
     const sourceSnapshot = uploadSource && !head.commit ? "empty cloud baseline" : uploadSource ? `local commit ${head.commit}` : detail.sync?.appliedManifest ? "existing cloud checkout retained" : "configured project checkout";
-    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, teamwork: output.teamwork, revision: output.revision, execution: output.execution, projectSource: enrolledSource, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source: sourceSnapshot }, null, 2));
+    console.log(JSON.stringify({ kind: "repository", id: selected, name: clean(output.name), path: clean(output.path), team: output.team, linear: output.linear, teamwork: output.teamwork, revision: output.revision, execution: output.execution, autonomy: output.autonomy, autonomySource: output.autonomySource, projectSource: enrolledSource, ...(linearDefaultsFrom ? { linearDefaultsFrom } : {}), source: sourceSnapshot }, null, 2));
     return true;
   }
   const [subcommand, id, ...rest] = positional;

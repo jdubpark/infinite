@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { writeSealed, unseal } from "./vault.js";
+import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { TeamService, TeamError } from "./teams.js";
 import { createGoalSchema, goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, type CreateGoal, type ProductGoal } from "./goal-types.js";
 import type { Config } from "./types.js";
@@ -17,7 +18,7 @@ type Stored = {
   goal: ProductGoal;
   fingerprint: string;
   receipts: Record<string, string>;
-  launch?: { request: CreateTeam; context: TeamGoalContext };
+  launch?: { request: CreateTeam; context: TeamGoalContext; autonomy?: AutonomyMode };
   control?: PendingControl;
   extensionIntent?: GoalExtensionIntent;
 };
@@ -163,7 +164,7 @@ export class GoalService {
         ...fields, parallelism: 4, maxTotalMinutes: request.maxTotalMinutes ?? request.maxMinutes, linearTracking: Boolean(project.linear), id: requestId, revision: 1, status: "running", createdAt, updatedAt: createdAt,
         deadlineAt: new Date(Date.parse(createdAt) + request.maxMinutes * 60000).toISOString(),
         ceilingAt: new Date(Date.parse(createdAt) + (request.maxTotalMinutes ?? request.maxMinutes) * 60000).toISOString(),
-        lineup: structuredClone(this.config.teams!.lineup!), cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
+        lineup: structuredClone(this.config.teams!.lineup!), autonomy: autonomyOf(project), cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
       } };
       this.event(stored, "Goal approved. The coordinator can select and build work within its scope and limits.");
       this.records.set(requestId, stored); this.save(stored);
@@ -428,9 +429,9 @@ export class GoalService {
   }
   private async launch(stored: Stored) {
     const pending = stored.launch!;
-    const team = await this.teams.createForGoal(pending.request, pending.context, stored.goal.lineup, stored.goal.linearTracking === true);
+    const team = await this.teams.createForGoal(pending.request, pending.context, stored.goal.lineup, stored.goal.linearTracking === true, autonomyOf(pending));
     if (this.closed) return;
-    if (!stored.goal.cycles.some(cycle => cycle.teamId === team.id)) stored.goal.cycles.push({ teamId: team.id, cycle: pending.context.cycle, goalRevision: pending.context.revision, status: team.status, startedAt: team.createdAt, memberCount: team.members.length });
+    if (!stored.goal.cycles.some(cycle => cycle.teamId === team.id)) stored.goal.cycles.push({ teamId: team.id, cycle: pending.context.cycle, goalRevision: pending.context.revision, status: team.status, startedAt: team.createdAt, memberCount: team.members.length, autonomy: autonomyOf(pending) });
     stored.goal.activeTeamId = team.id; stored.goal.stopReason = undefined; stored.goal.deadlineContinuation = false; stored.launch = undefined;
     this.event(stored, `Started feature ${pending.context.cycle}. The coordinator will inspect evidence before choosing work.`);
     this.refresh(stored, team); this.save(stored);
@@ -471,7 +472,7 @@ export class GoalService {
       if (goal.status === "paused" || terminal.has(goal.status)) {
         try {
           const team = this.teams.get(stored.launch.request.requestId);
-          if (!goal.cycles.some(cycle => cycle.teamId === team.id)) goal.cycles.push({ teamId: team.id, cycle: stored.launch.context.cycle, goalRevision: stored.launch.context.revision, status: team.status, startedAt: team.createdAt, memberCount: team.members.length });
+          if (!goal.cycles.some(cycle => cycle.teamId === team.id)) goal.cycles.push({ teamId: team.id, cycle: stored.launch.context.cycle, goalRevision: stored.launch.context.revision, status: team.status, startedAt: team.createdAt, memberCount: team.members.length, autonomy: autonomyOf(stored.launch) });
           goal.activeTeamId = team.id; this.setControl(stored, goal.status === "paused" ? "pause" : "cancel");
         } catch (error) { if (!(error instanceof TeamError) || error.code !== "team-not-found") throw error; }
         stored.launch = undefined; this.save(stored);
@@ -571,7 +572,9 @@ export class GoalService {
       deadlineAt: goal.deadlineAt, maxMembers: Math.min(60, goal.maxMembers - goal.memberCount), ...(parent ? { parentRunId: parent.teamId } : {}),
       extendMinutes: goal.extendMinutes ?? 0, ceilingAt: ceilingOf(goal) };
     const objective = [goal.objective, ...goal.steering.map(value => `User direction: ${value.text}`)].join("\n\n");
-    stored.launch = { context, request: { requestId: randomUUID(), projectId: goal.projectId, provider: goal.lineup.coordinator.provider, useConfiguredLineup: true, title: `${goal.title} · ${cycle}`.slice(0, 100), objective, parallelism: goal.parallelism } };
+    // Every cycle of a goal keeps the goal's pinned mode; a goal with no pin is supervised.
+    const autonomy = autonomyOf(goal);
+    stored.launch = { context, autonomy, request: { requestId: randomUUID(), projectId: goal.projectId, provider: goal.lineup.coordinator.provider, useConfiguredLineup: true, title: `${goal.title} · ${cycle}`.slice(0, 100), objective, parallelism: goal.parallelism } };
     this.save(stored); await this.launch(stored);
   }
 }

@@ -23,7 +23,7 @@ import { connectRemoteAccess } from "./remote-access.js";
 import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { ProjectSourceError, ProjectSourceService } from "./project-source.js";
 import { MirroredProjects } from "./mirrored-projects.js";
-import { RepoEnrollmentService, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
+import { RepoEnrollmentService, autonomyChangeSchema, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
 import { HandoffService } from "./handoffs.js";
 import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
@@ -584,7 +584,7 @@ export function createApp(config: Config, key: Buffer) {
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
-      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       goals: { enabled: goals.enabled() },
       missions: { enabled: missions.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
@@ -904,6 +904,13 @@ export function createApp(config: Config, key: Buffer) {
     projectConfigChanges.add(projectId);
     try { res.json(await enrollment.put(projectId, body)); }
     finally { projectConfigChanges.delete(projectId); }
+  });
+  app.put("/api/projects/:id/autonomy", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    const body = autonomyChangeSchema.parse(req.body);
+    if (runtimeSecurity(config.deployment).tenancy !== "single-tenant")
+      throw new TeamError(403, "single-tenant-required", "Repository enrollment requires a single-tenant host.");
+    res.json(await enrollment.setAutonomy(projectId, body));
   });
   app.get("/api/projects/:id/files", async (req, res) => {
     res.json(await desktopFiles.list(projectSchema.parse(req.params.id), z.string().max(4096).default("").parse(req.query.path),

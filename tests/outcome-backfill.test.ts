@@ -1,0 +1,296 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { configurationModule } from "../packages/host/src/configuration-store.js";
+import type { EvidenceIndexClass } from "../packages/host/src/evidence/crypto.js";
+import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import { backfillRun, backfillTick } from "../packages/host/src/outcome-backfill.js";
+import { type OutcomeRow, outcomeModule, readOutcome, readSummary, writeOutcome } from "../packages/host/src/outcome-store.js";
+import { runEventKey } from "../packages/host/src/run-events.js";
+import type { TeamContinuation, TeamMember, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
+
+const AT = "2026-11-13T00:00:00.000Z";
+const PATH_MARKER = "secret-path";
+
+const index = (cls: EvidenceIndexClass, value: string) => `${cls}:${value}`;
+const context = { epoch: () => 1, index };
+
+function member(memberId: string, taskId: string | undefined, extra: Partial<TeamMember> = {}): TeamMember {
+  return {
+    runId: "run-1", memberId, sessionId: `session-${memberId}`, revision: 1, role: "implementer", taskId,
+    title: memberId, status: "reported", cwd: "/work/a", baseCommit: "base", prompt: "prompt", cursor: 0,
+    stopRequestId: "stop", startedAt: AT, reportedAt: AT, ...extra,
+  } as TeamMember;
+}
+
+function task(id: string, memberId: string | undefined, extra: Partial<TeamTask> = {}): TeamTask {
+  return {
+    id, title: id, instructions: "do the work", paths: [`packages/host/src/${id}.ts`], dependsOn: [], revision: 1,
+    status: "integrated", memberId, commit: "a".repeat(40), ...extra,
+  } as TeamTask;
+}
+
+function run(extra: Partial<TeamRun> = {}): TeamRun {
+  return {
+    id: "run-1", projectId: "project-a", provider: "claude", title: "Run", objective: "Objective", parallelism: 2,
+    revision: 1, status: "ready-for-review", createdAt: AT, updatedAt: AT, workspace: "/work", branch: "branch",
+    baseCommit: "base", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0,
+    ...extra,
+  } as TeamRun;
+}
+
+/** Two integrated implementers under an approved review of the same snapshot. */
+function approvedRun(id: string): TeamRun {
+  return run({
+    id,
+    tasks: [task("a", "m1"), task("b", "m2")],
+    members: [member("m1", "a"), member("m2", "b")],
+    review: { verdict: "approved", summary: "Looks right.", revision: 1 },
+  });
+}
+
+test("an approved run backfills accepted rows", () => {
+  const result = backfillRun(approvedRun("run-1"), context);
+  assert.equal(result.rows.length, 2);
+  assert.equal(result.skipped, 0);
+  for (const row of result.rows) {
+    assert.deepEqual([row.integrated, row.accepted, row.firstPass, row.held], [1, 1, 1, null]);
+    assert.deepEqual(row.flags, ["backfilled"]);
+    assert.equal(row.attemptIndex, 1);
+    assert.equal(row.source, "production");
+    assert.equal(row.disposition, "integrated");
+  }
+  assert.deepEqual(result.summary.flags, ["backfilled"]);
+  assert.equal(result.summary.source, "production");
+});
+
+test("a correction round leaves firstPass unknown", () => {
+  const source = approvedRun("run-1");
+  source.tasks.forEach(item => { item.reviewRounds = 1; });
+  const result = backfillRun(source, context);
+  assert.equal(result.rows.length, 2);
+  for (const row of result.rows) {
+    assert.deepEqual([row.integrated, row.accepted, row.firstPass, row.held], [1, 1, null, null]);
+    assert.deepEqual(row.payload.rounds, { run: 1, attributed: 0, unknown: 1 });
+  }
+});
+
+test("a steered run keeps its earlier attempt", () => {
+  const continuation: TeamContinuation = {
+    revision: 1, requestId: "00000000-0000-4000-8000-000000000001", at: AT, reason: "steer", headCommit: "b".repeat(40),
+    tasks: [task("a", "m1")], review: { verdict: "approved", summary: "Approved before the steer.", revision: 1 },
+  };
+  const source = run({
+    revision: 2,
+    tasks: [task("b", "m2", { revision: 2 })],
+    continuations: [continuation],
+    members: [member("m1", "a", { revision: 1 }), member("m2", "b", { revision: 2 })],
+  });
+  const result = backfillRun(source, context);
+  const first = result.rows.find(row => row.memberId === "m1");
+  assert.ok(first, "the earlier attempt keeps its row");
+  assert.equal(first.disposition, "integrated");
+  assert.equal(first.accepted, 1);
+  assert.equal(first.revision, 1);
+});
+
+test("replacements number their attempts", () => {
+  const source = run({
+    tasks: [task("a", "m2")],
+    members: [
+      member("m1", "a", { stalledAt: AT, status: "stopped", reportedAt: undefined }),
+      member("m2", "a", { startedAt: "2026-11-13T00:05:00.000Z" }),
+    ],
+  });
+  const result = backfillRun(source, context);
+  const first = result.rows.find(row => row.memberId === "m1");
+  const second = result.rows.find(row => row.memberId === "m2");
+  assert.ok(first && second);
+  assert.equal(first.disposition, "stalled");
+  assert.equal(first.attemptIndex, 1);
+  assert.equal(first.inherited, false);
+  assert.equal(second.disposition, "integrated");
+  assert.equal(second.attemptIndex, 2);
+  assert.equal(second.inherited, true);
+});
+
+test("unknown endings are skipped and counted", () => {
+  const source = run({
+    tasks: [task("a", undefined, { status: "pending", commit: undefined })],
+    members: [member("m1", "a", { status: "stopped", stoppedReason: "stopped by owner", reportedAt: undefined })],
+  });
+  const result = backfillRun(source, context);
+  assert.deepEqual(result.rows, []);
+  assert.equal(result.skipped, 1);
+});
+
+test("the tick never overwrites and stops when done", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infinite-backfill-"));
+  try {
+    const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(dir, "state")), vaultKey: randomBytes(32) });
+    store.register(outcomeModule());
+    store.register(configurationModule());
+    const options = { mapOf: () => undefined, limit: 1, now: () => AT };
+
+    // R1 has a run.created event, so it is not a backfill candidate.
+    store.write(tx => store.appendEvent(tx, {
+      key: runEventKey("run.created", "run-1"), runId: "run-1", revision: 1, at: AT, kind: "run.created", data: { v: 1 },
+    }));
+
+    // R2 has an event-derived row for m1 that must survive the tick unchanged. It has no run.created event.
+    const seeded: OutcomeRow = {
+      ...backfillRun(approvedRun("run-2"), context).rows[0],
+      disposition: "host-stop", exclusion: "host", integrated: null, accepted: null, flags: [],
+    };
+    store.write(tx => writeOutcome(tx, seeded));
+    const before = store.read(db => readOutcome(db, "run-2:m1"));
+    assert.ok(before, "the event-derived row is stored");
+
+    const runs = () => [run({ id: "run-1", tasks: [task("a", "m1")], members: [member("m1", "a")] }), approvedRun("run-2"), approvedRun("run-3")];
+    assert.deepEqual(backfillTick(store, runs, options), { written: 1, remaining: 1 });
+    assert.deepEqual(backfillTick(store, runs, options), { written: 1, remaining: 0 });
+    assert.deepEqual(backfillTick(store, runs, options), { written: 0, remaining: 0 });
+
+    const after = store.read(db => readOutcome(db, "run-2:m1"));
+    assert.deepEqual(after, before);
+    assert.equal(store.read(db => readOutcome(db, "run-1:m1")), undefined);
+    assert.equal(store.read(db => readSummary(db, "run-1")), undefined);
+    assert.ok(store.read(db => readOutcome(db, "run-3:m1")));
+    store.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("no backfilled row holds a path", () => {
+  const dir = mkdtempSync(join(tmpdir(), "infinite-backfill-"));
+  try {
+    const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(dir, "state")), vaultKey: randomBytes(32) });
+    store.register(outcomeModule());
+    store.register(configurationModule());
+    const source = run({
+      id: "run-p",
+      tasks: [task("a", "m1", { paths: [`packages/host/src/${PATH_MARKER}.ts`] })],
+      members: [member("m1", "a", { cwd: `/work/checkout-${PATH_MARKER}` })],
+      review: { verdict: "approved", summary: "Approved.", revision: 1 },
+    });
+    assert.deepEqual(backfillTick(store, () => [source], { mapOf: () => undefined, now: () => AT }), { written: 1, remaining: 0 });
+    const plain = store.read(db => JSON.stringify([db.all("SELECT * FROM outcomes"), db.all("SELECT * FROM run_summaries")]));
+    const opened = store.read(db => JSON.stringify([readOutcome(db, "run-p:m1"), readSummary(db, "run-p")]));
+    assert.ok(opened.includes("integrated"), "the row was written");
+    assert.equal(plain.includes(PATH_MARKER), false, "no plain column holds a path");
+    assert.equal(opened.includes(PATH_MARKER), false, "no opened payload holds a path");
+    store.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function openStore(withConfigurations = true): { store: EvidenceStore; close: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "infinite-backfill-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(join(dir, "state")), vaultKey: randomBytes(32) });
+  store.register(outcomeModule());
+  if (withConfigurations) store.register(configurationModule());
+  return { store, close: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
+}
+
+test("unknown rounds are stored as links", () => {
+  const { store, close } = openStore();
+  try {
+    const rounds = approvedRun("run-rounds");
+    rounds.tasks.forEach(item => { item.reviewRounds = 2; });
+    const plain = approvedRun("run-plain");
+    assert.deepEqual(backfillTick(store, () => [rounds, plain], { mapOf: () => undefined, now: () => AT }), { written: 2, remaining: 0 });
+
+    const roundRows = store.read(db => db.all<{ revision: number; round: number; state: string; cause: string; started_at: string; run_deleted_at: string | null }>(
+      "SELECT revision, round, state, cause, started_at, run_deleted_at FROM outcome_rounds WHERE run_id=? ORDER BY round", "run-rounds"));
+    assert.deepEqual(roundRows.map(row => [row.revision, row.round, row.state, row.cause, row.started_at, row.run_deleted_at]),
+      [[0, 1, "unknown", "unknown", AT, null], [0, 2, "unknown", "unknown", AT, null]]);
+
+    const links = store.read(db => db.all<{ outcome_id: string; state: string; revision: number }>(
+      "SELECT outcome_id, state, revision FROM outcome_round_links WHERE run_id=? ORDER BY outcome_id, round", "run-rounds"));
+    assert.equal(links.length, 4, "two inserted rows, two links each");
+    assert.ok(links.every(link => link.state === "unknown" && link.revision === 0));
+    assert.deepEqual([...new Set(links.map(link => link.outcome_id))].sort(), ["run-rounds:m1", "run-rounds:m2"]);
+
+    assert.equal(store.read(db => db.get("SELECT count(*) AS n FROM outcome_rounds WHERE run_id=?", "run-plain"))?.n, 0);
+    assert.equal(store.read(db => db.get("SELECT count(*) AS n FROM outcome_round_links WHERE run_id=?", "run-plain"))?.n, 0);
+  } finally {
+    close();
+  }
+});
+
+test("an unreadable record is marked and never blocks the rest", () => {
+  const { store, close } = openStore();
+  try {
+    const bad = run({ id: "run-bad", members: "not-an-array" as unknown as TeamMember[] });
+    const good = approvedRun("run-good");
+    const options = { mapOf: () => undefined, limit: 1, now: () => AT };
+    const runs = () => [bad, good];
+    assert.deepEqual(backfillTick(store, runs, options), { written: 1, remaining: 1 });
+    const marked = store.read(db => db.get<{ rows: number; skipped: number }>("SELECT rows, skipped FROM backfill_runs WHERE run_id=?", "run-bad"));
+    assert.deepEqual({ ...marked }, { rows: 0, skipped: -1 });
+    assert.equal(store.read(db => readSummary(db, "run-bad")), undefined);
+    assert.equal(store.read(db => readOutcome(db, "run-bad:m1")), undefined);
+    assert.deepEqual(backfillTick(store, runs, options), { written: 1, remaining: 0 });
+    assert.deepEqual(backfillTick(store, runs, options), { written: 0, remaining: 0 });
+    assert.ok(store.read(db => readOutcome(db, "run-good:m1")));
+  } finally {
+    close();
+  }
+});
+
+test("a record with a missing field is marked, not left pending", () => {
+  const { store, close } = openStore();
+  try {
+    // A legacy record: the types require these fields, and an old record can lack them.
+    const noSession = approvedRun("run-no-session");
+    delete (noSession.members[0] as Partial<TeamMember>).sessionId;
+    const noCreation = approvedRun("run-no-creation");
+    delete (noCreation as Partial<TeamRun>).createdAt;
+    noCreation.members.forEach(item => { delete (item as Partial<TeamMember>).startedAt; });
+    const good = approvedRun("run-good");
+    const options = { mapOf: () => undefined, limit: 1, now: () => AT };
+    const runs = () => [noSession, noCreation, good];
+    assert.deepEqual(backfillTick(store, runs, options), { written: 1, remaining: 2 });
+    assert.deepEqual(backfillTick(store, runs, options), { written: 1, remaining: 1 });
+    for (const id of ["run-no-session", "run-no-creation"]) {
+      const marked = store.read(db => db.get<{ rows: number; skipped: number }>("SELECT rows, skipped FROM backfill_runs WHERE run_id=?", id));
+      assert.deepEqual({ ...marked }, { rows: 0, skipped: -1 }, id);
+      assert.equal(store.read(db => readSummary(db, id)), undefined, id);
+      assert.equal(store.read(db => readOutcome(db, `${id}:m1`)), undefined, id);
+    }
+    assert.deepEqual(backfillTick(store, runs, options), { written: 1, remaining: 0 });
+    assert.ok(store.read(db => readOutcome(db, "run-good:m1")), "a record that cannot be written never keeps a later run out");
+  } finally {
+    close();
+  }
+});
+
+test("active runs come first, and a module that is not ready ends the tick", () => {
+  const { store, close } = openStore();
+  try {
+    const settled = approvedRun("run-settled");
+    const active = approvedRun("run-active");
+    active.status = "implementing";
+    const options = { mapOf: () => undefined, limit: 1, now: () => AT };
+    assert.deepEqual(backfillTick(store, () => [settled, active], options), { written: 1, remaining: 1 });
+    assert.ok(store.read(db => readOutcome(db, "run-active:m1")), "the active run is written first");
+    assert.equal(store.read(db => readSummary(db, "run-settled")), undefined);
+  } finally {
+    close();
+  }
+
+  const unready = openStore(false);
+  try {
+    let called = false;
+    const runs = () => { called = true; return [approvedRun("run-x")]; };
+    assert.deepEqual(backfillTick(unready.store, runs, { mapOf: () => undefined, now: () => AT }), { written: 0, remaining: 0 });
+    assert.equal(called, false, "runs() is not called while the configurations module is not ready");
+  } finally {
+    unready.close();
+  }
+});

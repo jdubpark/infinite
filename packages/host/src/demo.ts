@@ -18,7 +18,12 @@ if (withHooks) writeFileSync(transcriptPath, "", { mode: 0o600 });
 let records = 0;
 function transcribe(type: "user" | "assistant", content: unknown) {
   if (!withHooks) return;
-  appendFileSync(transcriptPath, JSON.stringify({ type, uuid: `demo-${process.pid}-${++records}`, timestamp: new Date().toISOString(), message: { role: type, content } }) + "\n");
+  const n = ++records;
+  // Assistant rows carry the usage a provider reports on each request. The counts are fixed.
+  const message = type === "assistant"
+    ? { id: `msg-demo-${process.pid}-${n}`, role: type, model: "rehearsal-model", content, usage: { input_tokens: 120, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }
+    : { role: type, content };
+  appendFileSync(transcriptPath, JSON.stringify({ type, uuid: `demo-${process.pid}-${n}`, timestamp: new Date().toISOString(), message }) + "\n");
 }
 async function post(body: Record<string, unknown>) {
   await relay("claude", JSON.stringify({ session_id: "demo", transcript_path: transcriptPath, cwd: process.cwd(), permission_mode: "default", ...body }),
@@ -119,4 +124,12 @@ else {
   let tick = 0;
   setInterval(() => console.log(`[${new Date().toISOString()}] Checkpoint ${++tick} · process still running`), 3000);
 }
-process.on("SIGTERM", () => { console.log("Rehearsal stopped."); process.exit(0); });
+process.on("SIGTERM", () => {
+  console.log("Rehearsal stopped.");
+  // Queued hooks reach the worker before the exit, but the wait never runs past 3 seconds.
+  const deadline = setTimeout(() => process.exit(0), 3000);
+  void chain.finally(() => {
+    clearTimeout(deadline);
+    process.exit(0);
+  });
+});

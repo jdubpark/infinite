@@ -45,17 +45,22 @@ export function findCodexRollout(home: string, threadId: string): string | undef
 }
 
 /** Streams `path` from `after` until the worker stops asking or the chunk budget is spent. */
-async function stream(options: RelayOptions, path: string, after: number) {
+async function stream(options: RelayOptions, path: string, after: number, drain?: number) {
   if (!path.endsWith(".jsonl")) return;
   let fd: number;
   try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch { return; }
   try {
     if (!fstatSync(fd).isFile()) return;
     const buffer = Buffer.alloc(CHUNK);
+    const echo = drain === undefined ? {} : { drain };
     let offset = after;
     for (let chunks = 0; chunks < MAX_CHUNKS; chunks++) {
+      // A fresh size on every pass. The end mark is sent only when the acknowledged cursor is at that size.
       const size = fstatSync(fd).size;
-      if (offset >= size) return;
+      if (offset >= size) {
+        if (offset === size) await post(options, "transcript", JSON.stringify({ path, offset, end: true, ...echo }));
+        return;
+      }
       const length = readSync(fd, buffer, 0, Math.min(CHUNK, size - offset), offset);
       if (!length) return;
       // Chunks end on a UTF-8 boundary so the worker can decode each one on its own.
@@ -67,7 +72,8 @@ async function stream(options: RelayOptions, path: string, after: number) {
       }
       if (end <= 0) end = length;
       const text = buffer.toString("utf8", 0, end);
-      const reply = await post(options, "transcript", JSON.stringify({ path, offset, text }));
+      // A chunk never carries the end flag. The end mark follows only after the cursor reaches a fresh size.
+      const reply = await post(options, "transcript", JSON.stringify({ path, offset, text, ...echo }));
       const next = typeof reply?.after === "number" ? reply.after : undefined;
       // The worker names where it is; a mismatch resynchronizes, a repeat stops the loop.
       if (next === undefined || next === offset) return;
@@ -92,8 +98,11 @@ export async function relay(route: string, body: string, options: RelayOptions) 
   const reply = await post(options, route, payload);
   const wanted = reply?.transcript;
   if (wanted && typeof wanted === "object" && typeof (wanted as { path?: unknown }).path === "string" &&
-      Number.isSafeInteger((wanted as { after?: unknown }).after) && (wanted as { after: number }).after >= 0)
-    await stream(options, (wanted as { path: string }).path, (wanted as { after: number }).after);
+      Number.isSafeInteger((wanted as { after?: unknown }).after) && (wanted as { after: number }).after >= 0) {
+    const drain = (wanted as { drain?: unknown }).drain;
+    await stream(options, (wanted as { path: string }).path, (wanted as { after: number }).after,
+      Number.isSafeInteger(drain) ? drain as number : undefined);
+  }
 }
 
 const entry = process.argv[1] ?? "";

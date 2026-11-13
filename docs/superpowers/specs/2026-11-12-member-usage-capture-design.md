@@ -147,7 +147,7 @@ A hook payload only names the transcript. No usage comes from the payload.
 
 Each session has a coverage value and a fixed reason code. The worker appends one `usage-coverage` journal record when the provider process exits.
 
-- `none`: no usage record arrived. Reasons: `hooks-off`, `no-usage-fields`, `unsupported`.
+- `none`: no usage record arrived. Reasons: `hooks-off`, `no-transcript`, `no-usage-fields`, `unsupported`.
 - `partial`: at least one usage record arrived and a gap is possible. Reasons: `running`, `stopped-mid-turn`, `drain-incomplete`, `secondary-missing`, `child-threads`, `row-dropped`.
 - `complete`: the last drain before provider exit reached the end marker for the primary transcript and for every listed secondary transcript, and that drain ran at a turn end or a session end.
 

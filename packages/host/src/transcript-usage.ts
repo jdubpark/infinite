@@ -18,6 +18,7 @@ const CLAUDE_COUNT_KEYS = ["input", "output", "thinking", "cacheRead", "cacheWri
 
 const MAX_MESSAGES = 4096;
 const MAX_TURNS = 256;
+const MAX_REQUESTS = 4096;
 const CLASSES = ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const;
 
 const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -69,6 +70,14 @@ export class UsageTail {
   private total: number | undefined;
   private cumulative: UsageTokens | undefined;
   private cumulativeAt: string | undefined;
+  private rows = 0;
+  private records = 0;
+  private requestTokens = 0;
+  private childThreads = false;
+  private rejected = 0;
+  /** Codex request totals by response id, so a repeated response counts once. */
+  private readonly requests = new Map<string, { total: number; tokens: UsageTokens }>();
+  private requestOverflow = false;
 
   constructor(options: UsageTailOptions) {
     this.options = options;
@@ -76,13 +85,16 @@ export class UsageTail {
 
   /** One parsed transcript row. Returns the usage records to journal now. Never throws. */
   push(row: unknown): UsageRecord[] {
+    this.rows += 1;
+    let records: UsageRecord[] = [];
     try {
       const value = object(row);
-      if (!value) return [];
-      return this.options.provider === "claude" ? this.pushClaude(value) : this.pushCodex(value);
+      if (value) records = this.options.provider === "claude" ? this.pushClaude(value) : this.pushCodex(value);
     } catch {
-      return [];
+      records = [];
     }
+    this.records += records.length;
+    return records;
   }
 
   /**
@@ -90,6 +102,54 @@ export class UsageTail {
    * its thread, holding the last cumulative total. Claude yields nothing. Never throws.
    */
   finish(): UsageRecord[] {
+    const records = this.fallbackRecords();
+    this.records += records.length;
+    return records;
+  }
+
+  /** Codex: the last cumulative total seen, for the coverage check of a later phase. */
+  cumulativeTotal(): number | undefined {
+    return this.total;
+  }
+
+  /** Rows pushed since construction. */
+  rowCount(): number {
+    return this.rows;
+  }
+
+  /** Usage records returned by push and finish since construction. */
+  recordCount(): number {
+    return this.records;
+  }
+
+  /** Codex: the sum of total tokens over the request records returned so far. */
+  requestTotal(): number {
+    return this.requestTokens;
+  }
+
+  /** Codex: a row of type "inter_agent_communication_metadata" was seen. */
+  sawChildThreads(): boolean {
+    return this.childThreads;
+  }
+
+  /** Usage-bearing rows that yielded no record and changed no cumulative snapshot. */
+  rejectedCount(): number {
+    return this.rejected;
+  }
+
+  /**
+   * False when the usage cannot be reconciled: request rows whose total is not the last cumulative
+   * total, a response id table that overflowed, or a cumulative-only conversation with no thread id.
+   */
+  reconciled(): boolean {
+    if (this.options.provider !== "codex") return true;
+    if (this.requestOverflow) return false;
+    if (this.sawRequestRows) return this.total !== undefined && this.requestTokens === this.total;
+    // A cumulative-only conversation needs its thread id to write its snapshot.
+    return !this.total || this.threadId !== undefined;
+  }
+
+  private fallbackRecords(): UsageRecord[] {
     const threadId = this.threadId;
     if (this.options.provider !== "codex" || this.sawRequestRows || !threadId || !this.cumulative || !this.cumulativeAt) return [];
     const model = this.modelOf(this.lastTurnModel);
@@ -100,21 +160,20 @@ export class UsageTail {
     })];
   }
 
-  /** Codex: the last cumulative total seen, for the coverage check of a later phase. */
-  cumulativeTotal(): number | undefined {
-    return this.total;
-  }
-
   private pushClaude(row: Record<string, unknown>): UsageRecord[] {
     if (row.type !== "assistant") return [];
     const message = object(row.message);
-    const messageId = text(message?.id);
-    const modelId = text(message?.model);
     const usage = object(message?.usage);
+    // Usage-bearing: a message with usage, from a real model rather than a synthetic one.
+    if (!message || !usage || (typeof message.model === "string" && message.model.startsWith("<"))) return [];
+    const messageId = text(message.id);
+    const modelId = text(message.model);
     const completedAt = text(row.timestamp);
-    if (!messageId || !modelId || modelId.startsWith("<") || !usage || !completedAt) return [];
     const parsed = claudeCounts(usage);
-    if (!parsed) return [];
+    if (!messageId || !modelId || !completedAt || !parsed) {
+      this.rejected += 1;
+      return [];
+    }
 
     // Merge raw counts by maximum, then derive classes, so no class mixes two rows.
     const seen = this.messages.get(messageId);
@@ -142,6 +201,10 @@ export class UsageTail {
 
   private pushCodex(row: Record<string, unknown>): UsageRecord[] {
     const payload = object(row.payload);
+    if (row.type === "inter_agent_communication_metadata") {
+      this.childThreads = true;
+      return [];
+    }
     if (row.type === "session_meta") {
       this.threadId ??= text(payload?.id);
       return [];
@@ -171,9 +234,24 @@ export class UsageTail {
     const messageId = text(payload?.response_id);
     const completedAt = text(row.timestamp);
     const usage = object(payload?.usage);
-    if (!messageId || !completedAt || !usage) return [];
-    const tokens = codexTokens(usage);
-    if (!tokens) return [];
+    const tokens = usage ? codexTokens(usage) : undefined;
+    const total = usage?.total_tokens;
+    if (!messageId || !completedAt || !tokens || !isCount(total)) {
+      this.rejected += 1;
+      return [];
+    }
+    // A response counts once. A larger total for the same response replaces its record: the record holds the
+    // whole new snapshot, and only the difference joins the reconciliation total.
+    const seen = this.requests.get(messageId);
+    if (seen && total <= seen.total) return [];
+    const delta = seen ? { input: tokens.input - seen.tokens.input, output: tokens.output - seen.tokens.output, reasoning: tokens.reasoning - seen.tokens.reasoning, cacheRead: tokens.cacheRead - seen.tokens.cacheRead, cacheWrite: tokens.cacheWrite - seen.tokens.cacheWrite } : tokens;
+    if (CLASSES.some(key => delta[key] < 0)) {
+      this.rejected += 1;
+      return [];
+    }
+    if (!seen && this.requests.size >= MAX_REQUESTS) this.requestOverflow = true;
+    else this.requests.set(messageId, { total, tokens });
+    this.requestTokens += total - (seen?.total ?? 0);
     const turnId = text(payload?.turn_id);
     const model = this.modelOf(turnId ? this.turnModels.get(turnId) : undefined);
     const nativeId = text(payload?.thread_id);
@@ -184,14 +262,18 @@ export class UsageTail {
     })];
   }
 
-  /** Holds the snapshot of the largest valid cumulative total. A repeat, a decrease, or an invalid row changes nothing. */
+  /** Holds the snapshot of the largest valid cumulative total. A repeat or a decrease changes nothing; an invalid row is counted. */
   private cumulativeRow(row: Record<string, unknown>, payload: Record<string, unknown>): void {
     const total = object(object(payload.info)?.total_token_usage);
+    if (!total) return;
     const completedAt = text(row.timestamp);
-    if (!total || !completedAt) return;
     const tokens = codexTokens(total);
     const totalTokens = total.total_tokens;
-    if (!tokens || !isCount(totalTokens) || totalTokens <= (this.total ?? 0)) return;
+    if (!completedAt || !tokens || !isCount(totalTokens)) {
+      this.rejected += 1;
+      return;
+    }
+    if (totalTokens <= (this.total ?? 0)) return;
     this.total = totalTokens;
     this.cumulative = tokens;
     this.cumulativeAt = completedAt;
@@ -212,4 +294,43 @@ export class UsageTail {
 /** The dedupe key of a record: `${provider}:${messageId}`. */
 export function usageRecordKey(record: UsageRecord): string {
   return `${record.provider}:${record.messageId}`;
+}
+
+export type UsageCoverage = "none" | "partial" | "complete";
+export type UsageCoverageReason = "hooks-off" | "no-transcript" | "no-usage-fields" | "unsupported"
+  | "row-dropped" | "drain-incomplete" | "stopped-mid-turn" | "secondary-missing" | "child-threads";
+
+export interface UsageCoverageInput {
+  /** The session's provider. */
+  provider: string;
+  /** At least one provider hook arrived. */
+  hooks: boolean;
+  rows: number;
+  records: number;
+  /** A transcript line was discarded for its size. */
+  dropped: boolean;
+  /** The last drain before exit. Undefined when no drain ran. */
+  lastDrain?: { complete: boolean; turnEnd: boolean };
+  /** A hook from a subagent arrived. */
+  subagents: boolean;
+  /** Codex child-thread rows were seen. */
+  childThreads: boolean;
+  /** Codex: `requestTotal()` differs from `cumulativeTotal()`. */
+  totalMismatch: boolean;
+}
+
+const COVERED_PROVIDERS = new Set(["claude", "codex", "demo"]);
+
+/** The coverage of one session. The first matching rule decides, and only `complete` claims every usage row. */
+export function usageCoverage(input: UsageCoverageInput): { coverage: UsageCoverage; reason?: UsageCoverageReason } {
+  if (!COVERED_PROVIDERS.has(input.provider)) return { coverage: "none", reason: "unsupported" };
+  if (!input.hooks) return { coverage: "none", reason: "hooks-off" };
+  if (input.rows === 0) return { coverage: "none", reason: "no-transcript" };
+  if (input.records === 0) return { coverage: "none", reason: "no-usage-fields" };
+  if (input.dropped || input.totalMismatch) return { coverage: "partial", reason: "row-dropped" };
+  if (!input.lastDrain || !input.lastDrain.complete) return { coverage: "partial", reason: "drain-incomplete" };
+  if (!input.lastDrain.turnEnd) return { coverage: "partial", reason: "stopped-mid-turn" };
+  if (input.subagents) return { coverage: "partial", reason: "secondary-missing" };
+  if (input.childThreads) return { coverage: "partial", reason: "child-threads" };
+  return { coverage: "complete" };
 }

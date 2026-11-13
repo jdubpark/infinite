@@ -5,6 +5,12 @@ import { claimControl, startHost, waitFor } from "./helpers.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
 
+/** The journal events of one type. The events route's `types` filter does not list every type, so this filters the page. */
+async function journalEvents(host: Awaited<ReturnType<typeof startHost>>, id: string, type: string): Promise<any[]> {
+  const page = await host.fetchApi(`/sessions/${id}/events?limit=200`);
+  return page.body.events.filter((event: any) => event.type === type);
+}
+
 test("chat is the provider's own conversation record, delivered over the hook relay", { timeout: 60000 }, async () => {
   const host = await startHost({ config: { attention } });
   try {
@@ -50,6 +56,50 @@ test("without a transcript the chat still shows delivered prompts and never fabr
     const chat = await waitFor(() => host.fetchApi(`/sessions/${id}/messages`), (r) => r.body.messages.length >= 2, 10000);
     assert.equal(chat.body.source, "recording");
     assert.deepEqual(chat.body.messages.map((m: any) => [m.role, m.text]), [["user", "Initial request"], ["user", "A plain follow-up"]]);
+  } finally {
+    await host.stop();
+  }
+});
+
+test("a rehearsal turn journals its usage, and its exit journals the coverage of the session", { timeout: 60000 }, async () => {
+  const host = await startHost({ config: { attention } });
+  try {
+    const id = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Usage", prompt: "hook dialog" });
+    const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+    const control = await claimControl(host, id, "owner");
+    const answer = await host.fetchApi(`/sessions/${id}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
+    assert.equal(answer.body.result, "closed");
+    await waitFor(() => host.fetchApi(`/sessions/${id}/messages`), (r) => r.body.messages.some((m: any) => m.role === "assistant" && /Removed the build directory/.test(m.text)), 15000);
+    await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() }, control.headers);
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.status === "exited", 15000);
+    const usage = await journalEvents(host, id, "usage");
+    assert.ok(usage.some((e: any) => e.data.provider === "claude" && e.data.modelId === "rehearsal-model" && e.data.tokens.input === 120 && e.data.tokens.output === 30));
+    const coverage = await journalEvents(host, id, "usage-coverage");
+    assert.equal(coverage.length, 1);
+    // The last hook is Stop, a turn end, and its end marker reached the end of the file. Nothing
+    // else makes the session partial, so the coverage is complete.
+    assert.equal(coverage[0].data.coverage, "complete");
+    assert.equal(coverage[0].data.reason, undefined);
+    assert.equal(coverage[0].data.provider, "demo");
+  } finally {
+    await host.stop();
+  }
+});
+
+test("a rehearsal without hooks journals no usage and coverage none for hooks-off", { timeout: 60000 }, async () => {
+  const host = await startHost({ config: { attention } });
+  try {
+    const id = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Plain usage", prompt: "Initial request" });
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.status === "running", 15000);
+    const control = await claimControl(host, id, "owner");
+    await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() }, control.headers);
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.status === "exited", 15000);
+    assert.equal((await journalEvents(host, id, "usage")).length, 0);
+    const coverage = await journalEvents(host, id, "usage-coverage");
+    assert.equal(coverage.length, 1);
+    assert.deepEqual([coverage[0].data.coverage, coverage[0].data.reason], ["none", "hooks-off"]);
   } finally {
     await host.stop();
   }

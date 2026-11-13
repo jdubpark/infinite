@@ -275,6 +275,42 @@ test("a record with a missing field is marked, not left pending", () => {
   }
 });
 
+test("a backfilled failure has the levels of any counted failure", () => {
+  const source = run({
+    tasks: [
+      task("a", "m-done"),
+      task("b", undefined, { status: "pending", commit: undefined,
+        escalation: { toProfileId: "strong", reason: "needs a stronger model", memberId: "m-escalated", at: AT } }),
+      task("c", undefined, { status: "pending", commit: undefined,
+        limitSwitches: [{ toProfileId: "other", reason: "provider limit", memberId: "m-limit", at: AT }] }),
+      task("d", undefined, { status: "pending", commit: undefined }),
+    ],
+    members: [
+      member("m-stalled", "a", { stalledAt: AT, status: "stopped", reportedAt: undefined }),
+      member("m-done", "a"),
+      member("m-escalated", "b"),
+      member("m-limit", "c"),
+      member("m-question", "d", { report: { kind: "question", question: "Which way?", options: [] } as TeamMember["report"] }),
+    ],
+    review: { verdict: "changes-requested", summary: "Not yet.", revision: 1 },
+  });
+  const result = backfillRun(source, context);
+  const levelsOf = (memberId: string) => {
+    const row = result.rows.find(item => item.memberId === memberId);
+    assert.ok(row, memberId);
+    assert.deepEqual(row.flags, ["backfilled"], memberId);
+    return [row.disposition, row.exclusion, row.integrated, row.accepted, row.firstPass, row.held];
+  };
+  // Spec part 4: a counted failure is no on every level. That follows from the disposition, not from a review.
+  assert.deepEqual(levelsOf("m-stalled"), ["stalled", null, 0, 0, 0, 0]);
+  assert.deepEqual(levelsOf("m-escalated"), ["escalated", null, 0, 0, 0, 0]);
+  assert.deepEqual(levelsOf("m-question"), ["question", null, 0, 0, 0, 0]);
+  // An excluded row has no levels.
+  assert.deepEqual(levelsOf("m-limit"), ["limit", "limit", null, null, null, null]);
+  // An integrated row never claims a refusal: the record cannot show which review covered it.
+  assert.deepEqual(levelsOf("m-done"), ["integrated", null, 1, null, null, null]);
+});
+
 test("a changes-requested review is not kept", () => {
   const source = approvedRun("run-1");
   source.review = { verdict: "changes-requested", summary: "Not yet.", revision: 1 };

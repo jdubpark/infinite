@@ -73,6 +73,7 @@ export function outcomeProjector(store: EvidenceStore, options?: { log?: (line: 
         throw new Error("The configurations module is unavailable.");
       }
       apply({ tx, store, event, log });
+      refreshAttempts(tx, event.runId);
       tx.run(
         "INSERT INTO outcome_state (key, value) VALUES ('last_seq', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         event.seq,
@@ -510,9 +511,7 @@ function runSettled(ctx: Ctx): void {
     saveRow(tx, row);
   }
   const rows = runOutcomes(tx, event.runId);
-  const attempts: Partial<Record<Disposition, number>> = {};
-  for (const row of rows) attempts[row.disposition] = (attempts[row.disposition] ?? 0) + 1;
-  summary.payload.attempts = attempts;
+  summary.payload.attempts = attemptsOf(rows);
   summary.payload.rounds = roundTotals(tx, event.runId);
   // A block code names the block that stopped the run. A run that settles without one keeps no code.
   if (status !== "blocked") summary.blockCode = null;
@@ -521,6 +520,26 @@ function runSettled(ctx: Ctx): void {
   if (counts && integrated !== counts.integrated) {
     ctx.log(`Outcome rows for revision ${event.revision} count ${integrated} integrated; the run summary counts ${counts.integrated}.`);
   }
+}
+
+function attemptsOf(rows: readonly OutcomeRow[]): Partial<Record<Disposition, number>> {
+  const attempts: Partial<Record<Disposition, number>> = {};
+  for (const row of rows) attempts[row.disposition] = (attempts[row.disposition] ?? 0) + 1;
+  return attempts;
+}
+
+/**
+ * Keeps a settled summary's attempts current. An owner cancel settles the run before the halt loop stops its
+ * members, so a row can still change after the settle. The summary is written only when the counts changed.
+ */
+function refreshAttempts(tx: EvidenceTx, runId: string): void {
+  const summary = readSummary(tx, runId);
+  if (!summary || summary.settledAt === null) return;
+  const attempts = attemptsOf(runOutcomes(tx, runId));
+  const text = (counts: Partial<Record<Disposition, number>>) => JSON.stringify(Object.entries(counts).sort(([a], [b]) => (a < b ? -1 : 1)));
+  if (text(attempts) === text(summary.payload.attempts)) return;
+  summary.payload.attempts = attempts;
+  writeSummary(tx, summary);
 }
 
 function ledgerGap({ tx, event }: Ctx): void {

@@ -183,6 +183,10 @@ test("rows outlive a cancelled run", { timeout: 120000 }, async () => {
     assert.equal(implementer.disposition, "owner-stop");
     assert.notEqual(implementer.runDeletedAt, null);
     assert.notEqual(view.body.summary.runDeletedAt, null);
+    // The cancel settled the run before the halt stopped the member, and the summary still counts the stop.
+    assert.equal(view.body.summary.status, "cancelled");
+    assert.equal(view.body.summary.payload.attempts["owner-stop"], 1, JSON.stringify(view.body.summary.payload.attempts));
+    assert.equal(view.body.summary.payload.attempts.open, undefined);
   } finally { await f.close(); }
 });
 

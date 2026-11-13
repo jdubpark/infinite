@@ -867,3 +867,41 @@ test("a run deleted while the projector is behind keeps and flags its rows", () 
     h.close();
   }
 });
+
+test("a stop after the settle updates the summary's attempts", () => {
+  const h = harness();
+  try {
+    // An owner cancel settles the run first; the halt loop stops its members afterwards.
+    h.flush([
+      created(RUN), prepared(RUN), planned(RUN, "a", ["a.txt"]),
+      started(RUN, "m1", 2, { taskId: "a" }),
+      settled(RUN, 3, "cancelled"),
+    ]);
+    assert.deepEqual(summaryOf(h.store, RUN)?.payload.attempts, { open: 1 });
+    h.flush([stopped(RUN, "m1", 4, "owner", "implementer", "a")]);
+    assert.deepEqual(summaryOf(h.store, RUN)?.payload.attempts, { "owner-stop": 1 });
+    h.flush([ev("rating.recorded", RUN, at(5), { memberId: "m1", taskId: "a", data: { score: 3 } })]);
+    assert.deepEqual(summaryOf(h.store, RUN)?.payload.attempts, { "owner-stop": 1 });
+
+    // A backfilled failure keeps the levels of a counted failure when a later event touches it.
+    const run = "run-backfilled-failure";
+    h.store.write(tx => {
+      writeOutcome(tx, {
+        outcomeId: `${run}:m1`, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: run, revision: 1,
+        memberId: "m1", sessionId: null, attemptIndex: 1, inherited: false, role: "implementer", profileId: "p",
+        provider: "claude", model: "m-1", effort: null, profileEpoch: 1, configId: null, experimentRef: null,
+        kind: null, risk: "normal", featureVersion: 1, disposition: "stalled", exclusion: null,
+        flags: ["backfilled"], integrated: 0, accepted: 0, firstPass: 0, held: 0, startedAt: null,
+        endedAt: null, frozenAt: null, holdUntil: null, runDeletedAt: null,
+        payload: {
+          projectId: "example", taskId: "a", area: "core", featureMap: "default",
+          rounds: { run: 0, attributed: 0, unknown: 0 }, limitEvents: 0, costCoverage: "none",
+        },
+      });
+    });
+    h.flush([ev("rating.recorded", run, at(6), { memberId: "m1", taskId: "a", data: { score: 2 } })]);
+    assert.deepEqual(levelsOf(rowOf(h.store, run, "m1")), [0, 0, 0, 0]);
+  } finally {
+    h.close();
+  }
+});

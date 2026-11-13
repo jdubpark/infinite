@@ -23,6 +23,7 @@ import {
   TerminalSquare,
   Target,
   Users,
+  Waypoints,
   WifiOff,
 } from "lucide-react";
 import { useApi, ago, ApiError, isControlRefusal, isMissionManaged, missionManagedLine, names, pendingLabel, sourceLabel, type ControlLease, type Me, type ProjectDetail, type ProjectSourceStatus, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
@@ -41,6 +42,7 @@ import { useSessionControl } from "./session-control";
 import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamView } from "./teams";
 import { GoalCreate, GoalDetail, GoalList, GoalPicker, clearGoalRequests, type ProductGoal } from "./goals";
 import { CostPage, CostPicker } from "./cost";
+import { SwarmView } from "./swarm/SwarmView";
 import "./style.css";
 
 const time = (value: string) =>
@@ -74,6 +76,7 @@ function App() {
   const [bootstrapError, setBootstrapError] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [swarmFocus, setSwarmFocus] = useState(false);
   useEffect(() => {
     let current = true;
     setBootstrapError(false);
@@ -172,8 +175,12 @@ function App() {
       </main>
     );
   const active = sessions.filter((s) => s.status === "running").length;
+  // The Swarm view is the landing page: it fills the main area at the root route and at #/swarm.
+  const swarmShown = route.swarm || !(selected || creating || route.teams || route.goals || route.cost);
+  const swarm = <SwarmView me={me} sessions={sessions} teams={teams} fresh={host.fresh && (!me.teams || teamFeed.fresh)} stale={host.stale || Boolean(me.teams && teamFeed.stale)} seen={host.seen}
+    view={route.swarmView} setView={route.navigateSwarm} openSession={route.navigate} openTeam={route.navigateTeam} onCreate={me.role === "owner" ? route.create : undefined} focus={swarmFocus} setFocus={setSwarmFocus} />;
   return (
-    <div className={`app ${selected || creating || route.teams || route.goals || route.cost ? "has-detail" : ""}`}>
+    <div className={`app ${selected || creating || route.teams || route.goals || route.cost || route.swarm ? "has-detail" : ""}${swarmShown && swarmFocus ? " swarm-focus" : ""}`}>
       <aside className="sidebar">
         <Mark />
         <MachinePicker />
@@ -182,7 +189,8 @@ function App() {
           <ShieldCheck size={15} />
         </div>
         <nav className="workspace-navigation" aria-label="Workspace views">
-          <button aria-current={!route.teams && !route.goals && !route.cost ? "page" : undefined} onClick={() => route.navigate(null)}><TerminalSquare size={16} />Sessions</button>
+          <button aria-current={route.swarm ? "page" : undefined} onClick={() => route.navigateSwarm()}><Waypoints size={16} />Swarm</button>
+          <button aria-current={!route.teams && !route.goals && !route.cost && !route.swarm ? "page" : undefined} onClick={() => route.navigate(null)}><TerminalSquare size={16} />Sessions</button>
           <button aria-current={route.teams ? "page" : undefined} onClick={() => route.navigateTeam(null)}><Users size={16} />Teams</button>
           <button aria-current={route.goals ? "page" : undefined} onClick={() => route.navigateGoal(null)}><Target size={16} />Goals</button>
           {me.usage?.enabled && <button aria-current={route.cost ? "page" : undefined} onClick={() => route.navigateCost()}><Coins size={16} />Cost</button>}
@@ -261,7 +269,7 @@ function App() {
             <span>Workspace</span>
             <ChevronRight size={13} />
             <strong>
-              {route.cost ? (route.costProjectId ? "Project cost" : route.costView === "models" ? "Models" : "Cost") : route.creatingGoal ? "New goal" : route.goalId ? "Goal" : route.goals ? "Goals" : route.creatingTeam ? "New team" : route.teamId ? "Team" : route.teams ? "Teams" : creating ? "New session" : selected ? "Session" : "Overview"}
+              {route.cost ? (route.costProjectId ? "Project cost" : route.costView === "models" ? "Models" : "Cost") : route.creatingGoal ? "New goal" : route.goalId ? "Goal" : route.goals ? "Goals" : route.creatingTeam ? "New team" : route.teamId ? "Team" : route.teams ? "Teams" : creating ? "New session" : selected ? "Session" : "Swarm"}
             </strong>
           </div>
           <div className="refresh-status">
@@ -279,7 +287,7 @@ function App() {
             {host.seen ? "This device is offline or the host is unreachable. Showing the last received state. Work may still be running; controls are disabled until a fresh connection arrives." : "Can’t reach the host. Sessions haven’t loaded; controls are disabled until a fresh connection arrives."}
           </div>
         )}
-        {route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
+        {route.swarm ? swarm : route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
           <Create
             me={me}
             done={route.navigate}
@@ -294,78 +302,7 @@ function App() {
             tab={route.tab}
             setTab={route.selectTab}
           />
-        ) : (
-          <div className="overview">
-            <div className="overview-title">
-              <h1>Room to step away.</h1>
-              <p>
-                Your work stays with the host.
-                <br />
-                Open a session to catch up or give it a new direction.
-              </p>
-            </div>
-            <div className="overview-rule">
-              <span>
-                {active} active {active === 1 ? "session" : "sessions"}
-              </span>
-              <span>
-                {me.environment === "local"
-                  ? "Running on this computer"
-                  : "Running on your cloud server"}
-              </span>
-            </div>
-            {sessions.length ? (
-              sessions.map((session) => (
-                <button
-                  className="overview-session"
-                  key={session.id}
-                  onClick={() => route.navigate(session.id)}
-                >
-                  <span className={`provider-avatar ${session.provider}`}>
-                    {names[session.provider]?.slice(0, 1)}
-                  </span>
-                  <span>
-                    <strong>{session.title}</strong>
-                    <small>
-                      {names[session.provider]} · started{" "}
-                      {time(session.createdAt)}
-                      {session.archivedAt ? " · archived" : ""}
-                    </small>
-                  </span>
-                  <span className="session-status">
-                    <span className={`dot ${session.status}`} />
-                    {sessionStatus(session)}
-                  </span>
-                  <ArrowUpRight size={20} />
-                </button>
-              ))
-            ) : (
-              <div className="empty-workspace">
-                <TerminalSquare size={42} strokeWidth={1.2} />
-                <h2>A session that stays.</h2>
-                <p>
-                  Start a rehearsal to test disconnects without using an AI
-                  provider, or launch an installed agent.
-                </p>
-                {me.role === "owner" && (
-                  <button className="primary" onClick={route.create}>
-                    Start a session
-                    <Plus size={17} />
-                  </button>
-                )}
-              </div>
-            )}
-            <div className="overview-bottom">
-              <ShieldCheck size={20} />
-              <p>
-                <strong>A private connection to your work.</strong>
-                <br />
-                Session records are encrypted at rest. The execution host can
-                read active work.
-              </p>
-            </div>
-          </div>
-        )}
+        ) : swarm}
       </main>
     </div>
   );

@@ -16,9 +16,11 @@
     "lucide-react": "^0.468.0",
     "@fontsource/instrument-sans": "^5.2.0",
     "@infinite/remote": "0.1.0",
-    "@infinite/attention": "0.1.0"
+    "@infinite/attention": "0.1.0",
+    "d3-force": "^3.0.1"
   },
   "devDependencies": {
+    "@types/d3-force": "^3.0.10",
     "@types/react": "~19.2.2",
     "@types/react-dom": "~19.2.0",
     "@vitejs/plugin-react": "^5.1.0",

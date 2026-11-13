@@ -16,7 +16,8 @@ import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
-import { MAX_OUTBOX_EVENTS, runEventKey, runSummaryCounts } from "./run-events.js";
+import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
+import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
@@ -58,6 +59,8 @@ const EVIDENCE_WAIT_MS = 24 * 3600_000;
 const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
 /** Event kinds whose drop has been logged; one line per kind for the life of the process. */
 const droppedEventKinds = new Set<string>();
+/** Event kinds whose build failed; one line per kind for the life of the process. */
+const unbuiltEventKinds = new Set<string>();
 function deliveryInspectionHash(report: DeliveryReconciliationReport) {
   return digest({ headCommit: report.headCommit, repository: report.repository, branch: report.branch,
     baseHeadCommit: report.baseHeadCommit, disposition: report.disposition, remoteHeadCommit: report.remoteHeadCommit });
@@ -87,6 +90,8 @@ type Stored = {
   handoffPolicy?: HandoffPolicy;
   goalExtensions?: Record<string, { deadlineAt: string; ceilingAt: string }>;
   ratings?: Record<string, { fingerprint: string; result: TeamTask["ownerRating"] }>;
+  /** The member each queued replacement continues, until it starts. Written only with `options.events`. */
+  ledgerReplaces?: Record<string, { memberId: string; cause: ReplacementCause }>;
 };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const timestamp = () => new Date().toISOString();
@@ -719,6 +724,33 @@ export class TeamService {
       }
       outbox.push(event);
     } catch { /* A run event never changes the run. */ }
+  }
+  /** Builds the data only when the ledger is on, then emits. A failed build drops the event and never reaches the run. */
+  private emitWith(stored: Stored, kind: string, keyParts: readonly (string | number)[],
+    ids: { memberId?: string; taskId?: string; revision?: number }, build: () => Record<string, unknown>): void {
+    if (!this.options?.events) return;
+    let data: Record<string, unknown>;
+    try { data = build(); }
+    catch {
+      if (!unbuiltEventKinds.has(kind)) {
+        unbuiltEventKinds.add(kind);
+        console.warn(`A run event of kind ${kind} could not be built; the run continues without it.`);
+      }
+      return;
+    }
+    this.emit(stored, kind, keyParts, ids, data);
+  }
+  /** Records that `next` continues `previous`, until `next` starts. A no-op without `options.events`. */
+  private linkReplacement(stored: Stored, next: TeamMember, previous: TeamMember, cause: ReplacementCause): void {
+    if (!this.options?.events) return;
+    (stored.ledgerReplaces ??= {})[next.memberId] = { memberId: previous.memberId, cause };
+  }
+  /** Records why a member stopped. Callers emit only on the transition to `stopped`, so the first stop is the stored one. A permission coordinator emits nothing. */
+  private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReason, detail?: MemberStopDetail): void {
+    if (member.role === "permission-coordinator") return;
+    this.emitWith(stored, "member.stopped", [member.memberId],
+      { memberId: member.memberId, taskId: member.taskId, revision: member.revision },
+      () => ({ role: member.role, reason, ...(detail ? { detail } : {}), reported: Boolean(member.report) }));
   }
   /** Sends the outbox to the store. True when nothing is left waiting. Never throws. */
   private flushOutbox(stored: Stored, afterGap = false): boolean {
@@ -1481,11 +1513,13 @@ export class TeamService {
       catch (error) {
         if (!this.mutation(stored, "retire-member", body)) return this.view(stored);
         member.status = "stopped"; member.stoppedReason = "Recording failed; runtime retired after confirmed process exit"; member.retirement = retirement;
+        this.memberStopped(stored, member, "host", "retired");
         this.block(stored, error, member);
         return this.view(stored);
       }
       if (!this.mutation(stored, "retire-member", body)) return this.view(stored);
       member.status = "stopped"; member.stoppedReason = "Recording failed; runtime retired after confirmed process exit"; member.retirement = retirement;
+      this.memberStopped(stored, member, "host", "retired");
       if (run.reason === runtimeUnavailableReason) run.reason = undefined;
       this.event(stored, `The owner authorized retirement of reviewer ${member.memberId} at ${member.baseCommit}. Operator claim, not host-verified: ${JSON.stringify(body.text.slice(0, 500))}. The original journal and reports are retained.`);
       this.save(stored);
@@ -2379,7 +2413,9 @@ export class TeamService {
           member.role === "permission-coordinator" && member.status === "waiting" ||
           drainRevision !== undefined && member.revision === drainRevision) &&
           !(drainRevision !== undefined && member.revision === drainRevision && member.status !== "waiting" && terminalPermissionCoordinator(run, member)));
+        const halt = stored.halt;
         for (const member of membersToStop) {
+          const statusBefore = member.status;
           try {
             if (member.role === "permission-coordinator" && member.status === "waiting") {
               member.status = "stopped"; member.report = undefined; continue;
@@ -2401,10 +2437,14 @@ export class TeamService {
               if (member.role === "permission-coordinator") member.status = "unavailable";
               all = false; continue;
             }
-            const { page } = this.readMemberJournal(run, member, false, true);
+            const { page } = this.readMemberJournal(stored, member, false, true);
             member.status = "stopped";
             if (page.more || member.cursor < stopped.seq) all = false;
           } catch { all = false; member.status = "unavailable"; }
+          finally {
+            if (statusBefore !== "stopped" && member.status === "stopped")
+              this.memberStopped(stored, member, halt === "block" ? "host" : "owner", halt);
+          }
         }
         const safePendingRecovery = Boolean(run.recovery?.status === "stopping" && stored.pending &&
           (recoverableOperationFailure(stored, stored.pending) || recoverableUnattributedResult(stored, stored.pending)));
@@ -2455,7 +2495,7 @@ export class TeamService {
             if (decisionChanged || member.status !== before) this.save(stored);
             continue;
           }
-          const { page, limit } = this.readMemberJournal(run, member);
+          const { page, limit } = this.readMemberJournal(stored, member);
           if (!member.report && limit) {
             await this.switchLimitedMember(stored, member, limit);
             if (stored.pending || run.status === "blocked") return;
@@ -2518,6 +2558,7 @@ export class TeamService {
                 this.event(stored, "The permission coordinator exited without a decision; the provider request remains with the user."); this.save(stored); continue;
               }
               member.status = "stopped";
+              this.memberStopped(stored, member, "no-report");
               this.block(stored, new TeamError(409, "missing-agent-report", "An agent exited without a valid structured report. Its task is unresolved."), member); return;
             }
             // A member back from an outage may come back straight into a prompt; it is running again.
@@ -2565,6 +2606,7 @@ export class TeamService {
         // A limit substitution may have pinned a fallback profile on another provider.
         next.provider = next.modelProfile?.provider ?? prior.provider ?? run.provider;
         prior.status = "stopped"; run.members.push(next);
+        this.linkReplacement(stored, next, prior, "answer");
         if (prior.role === "delivery" && stored.deliveryAttempt?.memberId === prior.memberId)
           stored.deliveryAttempt.memberId = next.memberId;
         const task = prior.role === "scout" ? run.discovery?.tasks.find(item => item.id === prior.taskId) : run.tasks.find(item => item.id === prior.taskId);
@@ -3606,7 +3648,8 @@ export class TeamService {
    * A limit acts only on the whole journal: a report or recovery in an unread tail wins.
    * After a confirmed exit, drain the tail even without a limit before considering replacement.
    */
-  private readMemberJournal(run: TeamRun, member: TeamMember, exited = false, singlePage = false) {
+  private readMemberJournal(stored: Stored, member: TeamMember, exited = false, singlePage = false) {
+    const run = stored.run;
     let page: ReturnType<Manager["events"]>, limit: LimitSwitch | undefined;
     do {
       page = this.manager.events(member.sessionId, member.cursor, 200, new Set(["team-report", "signal"]));
@@ -3625,6 +3668,8 @@ export class TeamService {
         if (envelope.runId !== run.id || envelope.memberId !== member.memberId || envelope.revision !== member.revision) continue;
         member.report = envelope.report; member.status = "reported"; member.reportedAt = timestamp(); member.stalledAt = undefined;
         if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined;
+        if (member.role !== "permission-coordinator") this.emitWith(stored, "member.reported", [member.memberId],
+          { memberId: member.memberId, taskId: member.taskId, revision: member.revision }, () => ({ role: member.role, reportKind: envelope.report.kind }));
         break;
       }
     } while (!singlePage && !member.report && (exited || limit) && page.more);
@@ -3651,7 +3696,7 @@ export class TeamService {
       }
       member.status = "unavailable"; run.reason = "An agent could not be stopped. Release its input control or inspect its terminal before integration."; this.save(stored); return;
     }
-    const { page, limit } = this.readMemberJournal(run, member, true);
+    const { page, limit } = this.readMemberJournal(stored, member, true);
     if (member.report) { this.save(stored); return; }
     if (page.more || member.cursor < exited.seq) { member.status = "unavailable"; this.save(stored); return; }
     if (limit) {
@@ -3659,6 +3704,7 @@ export class TeamService {
       if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined;
       await this.switchLimitedMember(stored, member, limit); return;
     }
+    this.memberStopped(stored, member, "stall");
     // A delivery member may already have published; a replacement must not repeat it unseen.
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery agent stalled after a publication attempt. Inspect the remote branch and PR before replacing it.")); return;
@@ -3677,6 +3723,7 @@ export class TeamService {
       if (task) { task.memberId = next.memberId; task.status = "running"; }
       if (scout) scout.memberId = next.memberId;
       run.members.push(next);
+      this.linkReplacement(stored, next, member, "stall");
       this.event(stored, `${member.title} stalled with no activity for ${minutes} minutes; its workspace was preserved and a replacement continues the assignment.`);
     });
   }
@@ -3704,6 +3751,7 @@ export class TeamService {
       this.save(stored);
       return;
     }
+    this.memberStopped(stored, member, "limit");
     // A delivery member may already have published; a replacement must not repeat it unseen.
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;
@@ -3739,6 +3787,10 @@ export class TeamService {
         if (decision && decision.status === "reviewing") decision.coordinatorMemberId = next.memberId;
       }
       run.members.push(next);
+      this.linkReplacement(stored, next, member, "limit");
+      this.emitWith(stored, "task.limit-switched", [member.memberId], { memberId: member.memberId, taskId: member.taskId, revision: member.revision }, () => ({
+        role: member.role, fromProfileId: from.id, toProfileId: fallback.id,
+      }));
       this.event(stored, `${from.label} hit a ${name} ${kind}${resets ? ` (resets ${resets})` : ""}; ${task?.title ?? member.title} continues on ${fallback.label}${editing ? " with partial work preserved" : ""}.`);
     });
   }
@@ -3885,6 +3937,17 @@ export class TeamService {
     member.startedAt ??= timestamp();
     const turn = member.turns?.at(-1);
     if (turn?.sessionId === member.sessionId) turn.startedAt = member.startedAt;
+    const replaces = stored.ledgerReplaces?.[member.memberId];
+    if (member.role !== "permission-coordinator") this.emitWith(stored, "member.started", [member.memberId],
+      { memberId: member.memberId, taskId: member.taskId, revision: member.revision }, () => ({
+        role: member.role, purpose: "work", sessionId: member.sessionId, startedAt: member.startedAt, baseCommit: member.baseCommit,
+        ...profileIdentity(member.modelProfile, member.provider ?? run.provider),
+        ...(result.status === "unavailable" ? { unavailable: true } : {}), ...(replaces ? { replaces } : {}),
+      }));
+    if (stored.ledgerReplaces) {
+      delete stored.ledgerReplaces[member.memberId];
+      if (!Object.keys(stored.ledgerReplaces).length) delete stored.ledgerReplaces;
+    }
     this.save(stored);
   }
   private applyProjectManagerCapacity(stored: Stored, requested?: number) {
@@ -3935,6 +3998,13 @@ export class TeamService {
         run.discovery = { revision: run.revision, summary: report.summary, tasks: report.tasks.map(task => ({ ...task, status: "pending" })) };
         run.status = "discovering";
         this.event(stored, `The coordinator requested ${report.tasks.length} read-only discovery tasks.`);
+        const map = (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features;
+        this.emitWith(stored, "discovery.accepted", [member.revision], { memberId: member.memberId, revision: member.revision }, () => ({
+          parallelism: run.parallelism,
+          scouts: (run.discovery?.tasks ?? []).map(scout => ({
+            taskId: scout.id, profileId: scout.agentProfileId, features: taskFeatures({ role: "scout", paths: [] }, map),
+          })),
+        }));
       }, member); return;
     }
     if (report.kind === "findings") {
@@ -3943,6 +4013,7 @@ export class TeamService {
       this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
         scout.status = "complete"; scout.summary = report.summary; scout.evidence = report.evidence;
         this.event(stored, `${member.title} returned evidence without changing its working copy.`);
+        this.emitWith(stored, "scout.completed", [member.revision, scout.id], { memberId: member.memberId, taskId: scout.id, revision: member.revision }, () => ({}));
       }, member); return;
     }
     if (report.kind === "escalate") {
@@ -3952,9 +4023,12 @@ export class TeamService {
         throw new TeamError(409, "invalid-escalation", "An implementer may escalate once to a different profile in the approved escalation pool.");
       this.operation(stored, "result", signal => assertMemberScope(member.cwd, member.baseCommit, task.paths, this.config.teams?.commandPrefix, signal), () => {
         task.escalation = { ...(member.modelProfile ? { fromProfileId: member.modelProfile.id } : {}), toProfileId: profile.id, reason: report.reason, memberId: member.memberId, at: timestamp() };
+        this.emitWith(stored, "task.escalated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
+          fromProfileId: task.escalation?.fromProfileId, toProfileId: task.escalation?.toProfileId,
+        }));
         const next = this.newMember(run, "implementer", member.cwd, member.baseCommit, task.id, undefined, profile);
         next.prompt = teamPrompt(run, "implementer", task, `The previous implementer requested escalation: ${report.reason}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`, next.provider ?? run.provider, next.modelProfile);
-        run.members.push(next); task.memberId = next.memberId; task.status = "running";
+        run.members.push(next); this.linkReplacement(stored, next, member, "escalation"); task.memberId = next.memberId; task.status = "running";
         run.status = "implementing";
         this.event(stored, `${task.title} escalated to ${profile.label}; the stopped member's partial work was preserved.`);
       }, member); return;
@@ -4001,6 +4075,15 @@ export class TeamService {
         }
         run.status = "implementing";
         this.event(stored, `Project manager planned ${run.tasks.length} tasks.`);
+        const map = (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features;
+        this.emitWith(stored, "plan.accepted", [member.revision], { memberId: member.memberId, revision: member.revision }, () => ({
+          taskCount: run.tasks.length, planDigest: planDigest(run.tasks), parallelism: run.parallelism,
+        }));
+        for (const task of run.tasks) this.emitWith(stored, "task.planned", [member.revision, task.id], { taskId: task.id, revision: member.revision }, () => ({
+          profileId: task.agentProfileId,
+          ...pathField(task.paths),
+          features: taskFeatures({ role: "implementer", paths: task.paths, kind: task.kind, risk: task.risk }, map),
+        }));
       }, member); return;
     }
     if (report.kind === "delivery-reconciliation") {
@@ -4213,6 +4296,9 @@ export class TeamService {
       if (task) {
         task.status = "integrated"; task.commit = commit; task.summary = report.summary; task.diffStat = diffStat(diff);
         if (changedPaths) task.changedPaths = changedPaths; else delete task.changedPaths;
+        this.emitWith(stored, "task.integrated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
+          commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,
+        }));
       }
       if (member.role === "implementer" || member.role === "integrator") this.retentionState(stored).integratedAt[member.memberId] = this.retentionNow();
       this.event(stored, `${member.title} reported a result; its validated changes were integrated.`);

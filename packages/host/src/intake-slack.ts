@@ -7,7 +7,7 @@ import type { TeamService } from "./teams.js";
 import { TeamError } from "./teams.js";
 import { SlackError, type SlackClient, type SlackEnvelope } from "./slack-client.js";
 import { splitSlackText } from "./slack-text.js";
-import { failureSummary } from "./intake.js";
+import { failureSummary, outboundText } from "./intake.js";
 
 const IDENTITY_RETRY_MS = 30_000;
 const RETRY_DELAYS_MS = [5_000, 30_000, 120_000];
@@ -37,9 +37,12 @@ const sameThread = (a: IntakeThread | undefined, b: IntakeThread | undefined) =>
 const mentionsIdentifier = (text: string, identifier: string) =>
   new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(identifier)}(?![A-Za-z0-9])`).test(text);
 
-/** Adds the text as one pending message, or as numbered parts when it is longer than one Slack message. */
-function addParts(draft: IntakeRecord, key: string, kind: IntakeMessageKind, text: string, createdAt: string) {
-  const parts = splitSlackText(text);
+/**
+ * Adds the text as one pending message, or as numbered parts when it is longer than one Slack message. Every part of
+ * every kind is made here, after the outbound filter has removed host paths and addresses.
+ */
+function addParts(config: Config, draft: IntakeRecord, key: string, kind: IntakeMessageKind, text: string, createdAt: string) {
+  const parts = splitSlackText(outboundText(config, text));
   parts.forEach((part, index) => {
     const partKey = parts.length > 1 ? `${key}#${index + 1}` : key;
     if (draft.messages.some(message => message.key === partKey)) return;
@@ -77,7 +80,7 @@ export class IntakeSlackSurface {
 
   private readonly log: (line: string, error: unknown) => void;
 
-  constructor(config: Config, private readonly store: IntakeStore, private readonly missions: MissionService,
+  constructor(private readonly config: Config, private readonly store: IntakeStore, private readonly missions: MissionService,
     private readonly teams: Pick<TeamService, "get">, private readonly client: SlackClient,
     options: { log?: (line: string, error: unknown) => void } = {}) {
     this.slack = config.intake?.slack;
@@ -211,7 +214,7 @@ export class IntakeSlackSurface {
     const at = now();
     const has = (key: string) => draft.messages.some(message => message.key === key || message.key.startsWith(`${key}#`));
     const add = (key: string, kind: IntakeMessageKind, text: string) => {
-      if (!has(key)) addParts(draft, key, kind, text, at);
+      if (!has(key)) addParts(this.config, draft, key, kind, text, at);
     };
     const title = `${draft.identifier} "${draft.title}"`;
     if (draft.state === "started") {
@@ -226,7 +229,7 @@ export class IntakeSlackSurface {
       for (const decision of mission.decisions) {
         if (decision.answer || has(`q:${decision.id}`)) continue;
         const n = this.questionNumber(draft, decision.id);
-        addParts(draft, `q:${decision.id}`, "question", questionText(decision)(n), at);
+        addParts(this.config, draft, `q:${decision.id}`, "question", questionText(decision)(n), at);
       }
       if (mission.status === "ready-for-review" && mission.result) {
         add(`result:${mission.result.revision}`, "result", this.resultText(mission));
@@ -435,7 +438,7 @@ export class IntakeSlackSurface {
       if (!item || item.handledAt) return;
       item.handledAt = now();
       item.outcome = outcome;
-      if (reply) addParts(draft, `reply:${entry.eventId}`, "reply", reply, now());
+      if (reply) addParts(this.config, draft, `reply:${entry.eventId}`, "reply", reply, now());
     });
   }
 

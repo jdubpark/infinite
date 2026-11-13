@@ -60,6 +60,9 @@ const delay = (ms: number) => new Promise(done => setTimeout(done, ms));
 const OWNER = "U00000000", TEAMMATE = "U00000002", BOT = "U00000001";
 const BINDING: IntakeThread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
 const OTHER: IntakeThread = { channelId: "C0000000001", threadTs: "1700000000.000200" };
+const THIRD: IntakeThread = { channelId: "C0000000002", threadTs: "1700000000.000300" };
+/** A configured project path that no general path rule covers. */
+const PROJECT_PATH = "/data/instances/work/api";
 const ISSUE = randomUUID();
 const NOW = new Date().toISOString();
 const ACK = 'Started on TEST-1 "Export fails on empty rows". I\'ll post questions and the result here.\nReply with a mention to answer or steer.';
@@ -96,7 +99,7 @@ async function surfaceFor(services: Services, stateRoot: string, options: { bind
   for (const thread of [BINDING, OTHER]) slack.seedThread(thread, [{ user: OWNER, text: "Export fails on empty rows" }]);
   const realClient = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000 });
   const client = options.wrapClient ? options.wrapClient(realClient) : realClient;
-  const config = { intake: {
+  const config = { stateDir: join(stateRoot, "intake"), runDir: join(stateRoot, "run"), projects: [{ id: "api", name: "API", path: PROJECT_PATH }], intake: {
     linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
     slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
       bindByMention: options.bindByMention ?? false, endpoint: slack.endpoint },
@@ -740,4 +743,38 @@ test("a delivery failure that is not Slack's keeps no part of the error's text",
     await waitFor(async () => s.store.get(ISSUE)!.messages[0]?.status, status => status === "sent", 60000);
     assert.ok(log.calls.some(call => call.error === leak && call.line === "Intake Slack deliver failed for TEST-1."), "The log received the error itself");
   } finally { await close(); }
+});
+
+test("questions, results, and blocked reasons reach Slack without host paths or addresses", { timeout: 60000 }, async () => {
+  const leak = `/srv/infinite-data/instances/work/workspaces/api/src/a.ts, ${PROJECT_PATH}/src/b.ts and 192.0.2.7`;
+  const leaks = (text: string) => ["/srv/infinite-data", PROJECT_PATH, "192.0.2.7"].filter(value => text.includes(value));
+  const base = { revision: 1, decisions: [], subtasks: [], steering: [], events: [] };
+  const missions = new Map<string, Mission>([
+    ["m-question", { ...base, id: "m-question", status: "needs-input",
+      decisions: [{ id: "d1", question: `Keep ${leak}?`, options: ["Keep", `Move it from ${leak}`] }] } as unknown as Mission],
+    ["m-result", { ...base, id: "m-result", status: "ready-for-review", result: { revision: 1, summary: `Changed ${leak}. Docs: https://example.com/opt/x` },
+      subtasks: [{ id: "a", status: "done", teamStatus: "ready-for-review", teamId: "team-a" }] } as unknown as Mission],
+    ["m-blocked", { ...base, id: "m-blocked", status: "blocked", reason: `Cannot reach ${leak}` } as unknown as Mission],
+  ]);
+  const services = {
+    missions: { peek: (id: string) => missions.get(id), onChange: () => () => undefined } as unknown as MissionService,
+    teams: { get: () => ({ pullRequest: { pullRequestUrl: "https://github.com/example/api/pull/1" } }) } as unknown as TeamService,
+  };
+  const stateRoot = mkdtempSync(join(tmpdir(), "intake-outbound-"));
+  const s = await surfaceFor(services, stateRoot);
+  try {
+    s.slack.seedThread(THIRD, [{ user: OWNER, text: "Export fails on empty rows" }]);
+    const second = randomUUID(), third = randomUUID();
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: "m-question" }));
+    s.store.create(intakeRecord(second, "started", { thread: OTHER, missionId: "m-result", identifier: "TEST-2" }));
+    s.store.create(intakeRecord(third, "started", { thread: THIRD, missionId: "m-blocked", identifier: "TEST-3" }));
+    await s.surface.start();
+    for (const thread of [BINDING, OTHER, THIRD]) await waitFor(async () => s.texts(thread), list => list.length === 2, 15000);
+    const stored = [ISSUE, second, third].flatMap(id => s.store.get(id)!.messages.map(message => message.text));
+    const posted = [BINDING, OTHER, THIRD].flatMap(thread => s.texts(thread));
+    for (const text of [...stored, ...posted]) assert.deepEqual(leaks(text), [], text);
+    assert.equal(s.texts(BINDING)[1], "Q1: Keep [local path omitted] [local path omitted] and [address omitted]?\n1. Keep   2. Move it from [local path omitted] [local path omitted] and [address omitted]\nReply with a mention and your answer.");
+    assert.equal(s.texts(OTHER)[1], "Ready for review (agent report):\nChanged [local path omitted] [local path omitted] and [address omitted]. Docs: https://example.com/opt/x\nPull request: https://github.com/example/api/pull/1");
+    assert.match(s.texts(THIRD)[1], /^Blocked: Cannot reach \[local path omitted\]/);
+  } finally { await s.close(); rmSync(stateRoot, { recursive: true, force: true }); }
 });

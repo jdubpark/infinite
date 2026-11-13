@@ -1347,6 +1347,39 @@ The first command revokes delegation for a current run. The second disables it
 for future runs. Both require an owner client. Pausing, cancelling or steering a
 run prevents its old pending decisions from being applied.
 
+## Autonomy mode
+
+Each project has an autonomy mode. The mode is `supervised` or `autonomous`.
+
+In this release the host only stores and shows the mode. Nothing reads it yet, so no behaviour changes.
+
+Each new run, goal, and cycle records the project's mode when it starts. A change applies from the next run or cycle. A run already in progress keeps its mode.
+
+An enrolled repository without a saved mode uses the host default. The default is `autonomous` unless the operator sets `autonomy.defaultMode` in the host configuration file. A project that is not enrolled reads as `supervised`.
+
+Read the mode:
+
+```sh
+infinite autonomy mode PROJECT
+```
+
+Change it:
+
+```sh
+infinite autonomy mode PROJECT supervised
+infinite autonomy mode PROJECT autonomous
+```
+
+Set it when enrolling:
+
+```sh
+infinite repo init --autonomy supervised
+```
+
+Omit `--autonomy` on a later `repo init` to keep the saved mode.
+
+Only the owner can change the mode, from the paired owner CLI. Members, other roles, and browser sessions cannot.
+
 ## Configuration
 
 Each new run gets a folder named from its UTC creation date, a slug of its

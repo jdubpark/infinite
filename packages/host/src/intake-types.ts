@@ -7,7 +7,7 @@ import { projectGroupIdSchema } from "./project-group-types.js";
 export const intakeConfigSchema = z.object({
   linear: z.object({
     teamIds: z.array(z.uuid()).min(1).max(20),
-    creatorId: z.uuid().optional(),
+    creatorId: z.uuid(),
     label: z.string().trim().min(1).max(80),
     commentsMirrorToSlack: z.boolean().default(false),
   }).strict(),

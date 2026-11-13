@@ -16,6 +16,7 @@ import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
+import type { Blackboard } from "./evidence/blackboard.js";
 import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
@@ -48,6 +49,8 @@ type TeamServiceOptions = {
   volumeUsage?: (path: string) => Promise<VolumeUsage>;
   /** Run events for the evidence store. Without it no record gains a ledger field and nothing is emitted. */
   events?: EventOutbox;
+  /** Host entries and launch sizes for the blackboard. Without it no entry is written and no size is recorded. */
+  entries?: Blackboard;
 };
 type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
   /** When a record removal first waited for its events to reach the evidence store. */
@@ -530,6 +533,8 @@ export class TeamService {
     }
     // Events a previous process sealed but did not store go out now. Nothing is saved here.
     if (this.options?.events) for (const stored of this.records.values()) if (stored.outbox?.length) this.flushOutbox(stored);
+    // Entries that a previous process did not store are written now. Settled runs keep their next save. Nothing is saved here.
+    for (const stored of this.records.values()) if (activeTeamRun(stored.run.status)) this.options?.entries?.mirror(stored.run);
   }
   /** The usage ledger this service prices member usage from; its tick also drives the ledger's reads. */
   useUsage(service: UsageService) { this.usage = service; }
@@ -682,6 +687,7 @@ export class TeamService {
     stored.run.updatedAt = timestamp();
     writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored);
     if (this.options?.events) this.flushOutbox(stored);
+    this.options?.entries?.mirror(stored.run);
   }
   /** Emits run.blocked or run.settled when the run status differs from the status the ledger last saw. */
   private emitStatusEvents(stored: Stored, statusAt: string) {
@@ -3925,7 +3931,9 @@ export class TeamService {
         this.save(stored);
       }
       const configuredProject = stored.run.handoff?.project ?? this.config.projects.find(project => project.id === stored.run.projectId)?.team;
-      await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run)), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
+      const launchSeq = this.options?.entries?.launchMark(stored.run.id);
+      const contextBytes = await writeTeamContext(member.cwd, { ...teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run)), assignment: assignment(member), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.config.teams?.commandPrefix);
+      this.options?.entries?.recordLaunch(stored.run, member, { launchSeq, promptBytes: Buffer.byteLength(member.prompt, "utf8"), contextBytes });
     }
     let result;
     const request = { requestId: member.sessionId, provider: member.provider ?? stored.run.provider,

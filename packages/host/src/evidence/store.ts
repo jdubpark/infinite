@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { chmodSync, closeSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { types } from "node:util";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { EVIDENCE_KEY_VERSION, blindIndex, canonicalJson, deriveEvidenceKey, openRow, sealRow } from "./crypto.js";
 import {
@@ -228,8 +229,9 @@ export class EvidenceStore {
     const tx: EvidenceTx = {
       ...this.view(db, guard),
       run: (sql, ...params) => {
+        const values = plainParameters(params);
         guard();
-        const result = db.prepare(checkedSql(sql)).run(...params);
+        const result = db.prepare(checkedSql(sql)).run(...values);
         return { changes: Number(result.changes), lastInsertRowid: Number(result.lastInsertRowid) };
       },
       exec: sql => {
@@ -467,12 +469,14 @@ export class EvidenceStore {
   private view(db: DatabaseSync, guard: () => void): EvidenceDb {
     return {
       get: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
+        const values = plainParameters(params);
         guard();
-        return db.prepare(checkedSql(sql)).get(...params) as R | undefined;
+        return db.prepare(checkedSql(sql)).get(...values) as R | undefined;
       },
       all: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
+        const values = plainParameters(params);
         guard();
-        return db.prepare(checkedSql(sql)).all(...params) as R[];
+        return db.prepare(checkedSql(sql)).all(...values) as R[];
       },
       open: <R>(table: string, rowId: string, sealed: string) => {
         guard();
@@ -764,7 +768,7 @@ function skipPast(sql: string, end: string, from: number): number {
  * BEGIN is refused inside a transaction. When BEGIN succeeds nothing was open, so the probe is rolled back.
  * Any other BEGIN failure counts as ended, so the write fails closed.
  */
-function transactionOpen(db: DatabaseSync): boolean {
+export function transactionOpen(db: DatabaseSync): boolean {
   const flag = (db as { isTransaction?: unknown }).isTransaction;
   if (typeof flag === "boolean") return flag;
   try {
@@ -774,6 +778,21 @@ function transactionOpen(db: DatabaseSync): boolean {
   }
   rollback(db);
   return false;
+}
+
+/**
+ * Copies each bound value into a plain value before anything runs. A null, number, bigint, or string is kept as
+ * it is, and bytes are copied into a new buffer. Any other value is refused without reading its properties or
+ * calling its code, so binding a statement never runs caller code and never ends the transaction.
+ */
+function plainParameters(params: readonly unknown[]): SQLInputValue[] {
+  return params.map(value => {
+    if (value === null || typeof value === "number" || typeof value === "bigint" || typeof value === "string") {
+      return value;
+    }
+    if (types.isUint8Array(value)) return Buffer.from(value);
+    throw new TypeError("Evidence SQL parameters must be null, a number, a bigint, a string, or bytes.");
+  });
 }
 
 function assertTransactionOpen(db: DatabaseSync): void {

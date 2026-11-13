@@ -613,6 +613,30 @@ test("a changed definition blocks the projector", () => {
     second.close();
     second = undefined;
 
+    const sameKindsOtherModule = fixture();
+    try {
+      third = open(sameKindsOtherModule);
+      third.register(probeModule());
+      const seeded = new EventOutbox(third);
+      seeded.registerProjector({ name: "p", module: "probe", kinds: ["task.integrated"], project: () => undefined });
+      assert.deepEqual(seeded.flush([ev("k-seed", "task.integrated")]), { stored: true, refused: 0 });
+      third.close();
+      third = open(sameKindsOtherModule);
+      third.register(probeModule());
+      third.register({ name: "other", version: 1, readVersion: 1, migrate: () => undefined });
+      const moved = new EventOutbox(third);
+      moved.registerProjector({ name: "p", module: "other", kinds: ["task.integrated"], project: () => undefined });
+      assert.deepEqual(moved.advance(), {
+        projected: 0,
+        pending: true,
+        blocked: [{ name: "p", reason: "definition-changed" }],
+      });
+    } finally {
+      third?.close();
+      third = undefined;
+      sameKindsOtherModule.close();
+    }
+
     const reordered = fixture();
     try {
       third = open(reordered);
@@ -645,6 +669,94 @@ test("a changed definition blocks the projector", () => {
     third?.close();
     second?.close();
     first?.close();
+    f.close();
+  }
+});
+
+test("deleting a run counts every matching event when the cursor is not trusted", (t) => {
+  t.mock.method(console, "warn", () => undefined);
+  const lostOf = (store: EvidenceStore) => store.describe().counts["event-outbox.lost"];
+  const cursorRow = (store: EvidenceStore, name: string) =>
+    store.read(db => db.get<{ seq: number; definition: string }>("SELECT seq, definition FROM projector_cursors WHERE name=?", name));
+
+  const aboveWater = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(aboveWater);
+    store.register(probeModule());
+    const outbox = new EventOutbox(store);
+    outbox.registerProjector({
+      name: "p-cursor",
+      module: "probe",
+      kinds: ["task.integrated"],
+      project: (tx, event) => insertProbe(tx, event, "p-cursor"),
+    });
+    assert.deepEqual(outbox.flush([ev("k-base", "run.created", { runId: "run-base" })]), { stored: true, refused: 0 });
+    store.write(tx => tx.run("UPDATE projector_cursors SET seq = 100 WHERE name = 'p-cursor'"));
+    assert.deepEqual(outbox.flush([ev("k-x", "task.integrated", { runId: "run-x" })]), { stored: true, refused: 0 });
+    assert.equal(lostOf(store), 0);
+    assert.equal(store.deleteRun("run-x"), true);
+    assert.equal(lostOf(store), 1, "a matching event above an untrusted cursor is counted");
+    store.close();
+    store = undefined;
+  } finally {
+    store?.close();
+    aboveWater.close();
+  }
+
+  const otherDefinition = fixture();
+  try {
+    let first: EvidenceStore | undefined = open(otherDefinition);
+    first.register(probeModule());
+    const seedStore = first;
+    seedStore.write(tx => {
+      seedStore.appendEvent(tx, ev("k-d1", "run.created", { runId: "run-d" }));
+      seedStore.appendEvent(tx, ev("k-d2", "run.created", { runId: "run-d" }));
+    });
+    const seeded = new EventOutbox(first);
+    seeded.registerProjector({ name: "p-def", module: "probe", kinds: ["task.integrated"], project: () => undefined });
+    assert.deepEqual(seeded.flush([ev("k-seed", "task.integrated", { runId: "run-d" })]), { stored: true, refused: 0 });
+    first.close();
+    first = undefined;
+
+    store = open(otherDefinition);
+    store.register(probeModule());
+    const changed = new EventOutbox(store);
+    changed.registerProjector({ name: "p-def", module: "probe", kinds: ["run.created"], project: () => undefined });
+    const before = cursorRow(store, "p-def");
+    assert.equal(lostOf(store), 0);
+    assert.equal(store.deleteRun("run-d"), true);
+    assert.equal(lostOf(store), 2, "both matching events are counted under the registered definition");
+    assert.deepEqual(cursorRow(store, "p-def"), before, "the stored seq and definition do not change");
+  } finally {
+    store?.close();
+    otherDefinition.close();
+  }
+});
+
+test("a blocked projector is logged once", (t) => {
+  const f = fixture();
+  const warn = t.mock.method(console, "warn", () => undefined);
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(probeModule());
+    const outbox = new EventOutbox(store);
+    outbox.registerProjector({ name: "p-once", module: "probe", kinds: ["task.integrated"], project: () => undefined });
+    assert.deepEqual(outbox.flush([ev("k-once", "task.integrated")]), { stored: true, refused: 0 });
+    store.write(tx => tx.run("UPDATE projector_cursors SET seq = 100 WHERE name = 'p-once'"));
+    warn.mock.resetCalls();
+    for (let i = 0; i < 3; i += 1) {
+      assert.deepEqual(outbox.advance(), {
+        projected: 0,
+        pending: true,
+        blocked: [{ name: "p-once", reason: "cursor-ahead" }],
+      });
+    }
+    assert.equal(warn.mock.callCount(), 1);
+    assert.equal(String(warn.mock.calls[0].arguments[0]).includes("p-once"), true);
+  } finally {
+    store?.close();
     f.close();
   }
 });

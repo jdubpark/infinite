@@ -143,9 +143,11 @@ export class EventOutbox {
    */
   private recordLoss(tx: EvidenceTx, runId: string): void {
     for (const projector of this.projectors) {
-      const cursor = tx.get<{ seq: number }>("SELECT seq FROM projector_cursors WHERE name=?", projector.name)?.seq ?? 0;
+      // A stored cursor counts only when advance would trust it. Otherwise every matching event is unseen.
+      const state = cursorOf(tx, projector);
+      const cursor = state.trusted ? state.seq : 0;
       const unseen = tx.all<{ kind: string }>("SELECT kind FROM run_events WHERE run_id=? AND seq > ?", runId, cursor);
-      const lost = unseen.filter(row => matches(projector.kinds, row.kind)).length;
+      const lost = unseen.filter(event => matches(projector.kinds, event.kind)).length;
       tx.run(
         "INSERT INTO projector_cursors (name, seq, definition, lost) VALUES (?, 0, ?, ?) "
         + "ON CONFLICT(name) DO UPDATE SET lost = lost + excluded.lost",
@@ -213,21 +215,12 @@ export class EventOutbox {
     let outcome: AdvanceResult | undefined;
     let block: BlockReason | undefined;
     const committed = this.store.tryWrite(tx => {
-      const row = tx.get<{ seq: number; definition: string }>(
-        "SELECT seq, definition FROM projector_cursors WHERE name=?",
-        projector.name,
-      );
-      if (row !== undefined && row.definition !== projector.definition) {
-        block = "definition-changed";
+      const state = cursorOf(tx, projector);
+      if (!state.trusted) {
+        block = state.reason;
         return;
       }
-      const cursor = row?.seq ?? 0;
-      const highWater = tx.get<{ seq: number }>("SELECT seq FROM sqlite_sequence WHERE name='run_events'")?.seq ?? 0;
-      if (cursor > highWater) {
-        block = "cursor-ahead";
-        return;
-      }
-      const read = this.store.eventsIn(tx, { after: cursor, limit: page });
+      const read = this.store.eventsIn(tx, { after: state.seq, limit: page });
       let matched = 0;
       for (const event of read.events) {
         if (!matches(projector.kinds, event.kind)) continue;
@@ -261,6 +254,24 @@ export class EventOutbox {
     this.blocked.set(name, reason);
     console.warn(`Event projector ${name} is blocked: ${reason}.`);
   }
+}
+
+type CursorState = { trusted: true; seq: number } | { trusted: false; reason: BlockReason };
+
+/**
+ * The one rule for trusting a stored cursor. The stored definition matches the projector's, and the cursor
+ * is not past the highest sequence number the event table has issued. A projector with no row starts at zero.
+ */
+function cursorOf(tx: EvidenceTx, projector: Registered): CursorState {
+  const row = tx.get<{ seq: number; definition: string }>(
+    "SELECT seq, definition FROM projector_cursors WHERE name=?",
+    projector.name,
+  );
+  if (row === undefined) return { trusted: true, seq: 0 };
+  if (row.definition !== projector.definition) return { trusted: false, reason: "definition-changed" };
+  const highWater = tx.get<{ seq: number }>("SELECT seq FROM sqlite_sequence WHERE name='run_events'")?.seq ?? 0;
+  if (row.seq > highWater) return { trusted: false, reason: "cursor-ahead" };
+  return { trusted: true, seq: row.seq };
 }
 
 /**

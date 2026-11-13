@@ -373,6 +373,45 @@ test("retention keeps a record while its events wait, for at most a day", async 
   } finally { bad.close(); f.close(); }
 });
 
+test("a run behaves the same with an unavailable store as with no ledger", async () => {
+  type Step = { status: string; revision: number; reason?: string; blockCode?: string };
+  const drive = async (withLedger: boolean) => {
+    const f = schedulerFixture();
+    const good = openStore(f, f.key);
+    good.close();
+    const bad = withLedger ? openStore(f, randomBytes(32)) : undefined;
+    try {
+      f.writeTeam();
+      const teams = f.openTeam(bad ? { events: new EventOutbox(bad) } : undefined);
+      const trace: Step[] = [];
+      const record = (view: { status: string; revision: number; reason?: string; blockCode?: string }) =>
+        trace.push({ status: view.status, revision: view.revision, reason: view.reason, blockCode: view.blockCode });
+      let revision = 1;
+      const step = async (run: () => Promise<{ revision: number; status: string; reason?: string; blockCode?: string }>) => {
+        const view = await run();
+        revision = view.revision;
+        record(view);
+      };
+      await step(() => teams.pause(f.run.id, { requestId: randomUUID(), revision }));
+      // The fixture has no real provider to stop its member, so the stop the scheduler would record is set here before the resume.
+      const paused = internal(teams).record(f.run.id) as { run: { members: { status: string }[] }; halt?: string };
+      paused.run.members.forEach(member => { member.status = "stopped"; });
+      paused.halt = undefined;
+      await step(() => teams.resume(f.run.id, { requestId: randomUUID(), revision }));
+      await step(() => teams.steer(f.run.id, { requestId: randomUUID(), revision, text: "Prefer the smaller change." }));
+      await step(() => teams.cancel(f.run.id, { requestId: randomUUID(), revision }));
+      const sealed = f.readRecord<{ run: { events: { text: string }[] }; outbox?: unknown[] }>("team", f.run.id);
+      return { trace, texts: sealed.run.events.map(event => event.text), sealed };
+    } finally { bad?.close(); f.close(); }
+  };
+  const plain = await drive(false);
+  const unavailable = await drive(true);
+  assert.deepEqual(unavailable.trace, plain.trace, "status, revision, reason, and blockCode match after every step");
+  assert.deepEqual(unavailable.texts, plain.texts, "the run's event messages match");
+  assert.equal("outbox" in plain.sealed, false, "a service without an outbox writes no outbox key");
+  assert.ok(Array.isArray(unavailable.sealed.outbox) && unavailable.sealed.outbox.length > 0, "the events wait in the sealed record");
+});
+
 test("a deleted run's last event is projected before its events are removed", async () => {
   const f = schedulerFixture();
   const store = openStore(f, f.key);
@@ -385,9 +424,11 @@ test("a deleted run's last event is projected before its events are removed", as
     f.run.members.forEach(member => { member.status = "stopped"; });
     f.writeTeam();
     const teams = f.openTeam({ events: outbox });
+    // server.ts attaches the store this way; removeRun must then do the whole deletion itself.
+    teams.useEvidence(store);
     await teams.removeRun(f.run.id);
-    assert.deepEqual(projected, [`run.deleted:${f.run.id}`]);
-    store.deleteRun(f.run.id);
+    assert.deepEqual(projected, [`run.deleted:${f.run.id}`], "the probe saw run.deleted exactly once");
+    assert.deepEqual(store.events({ runId: f.run.id, limit: 100 }).events, [], "no event for the run remains in the store");
     assert.equal(store.describe().counts["event-outbox.lost"], 0);
   } finally { store.close(); f.close(); }
 });

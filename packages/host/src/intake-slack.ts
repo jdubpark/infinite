@@ -359,7 +359,7 @@ export class IntakeSlackSurface {
   }
 
   private async apply(record: IntakeRecord, entry: IntakeInbound): Promise<void> {
-    const { outcome, reply } = await this.act(record, entry.text, entry.eventId);
+    const { outcome, reply } = await this.act(record, entry);
     this.store.update(record.issueId, draft => {
       const item = draft.inbound.find(candidate => candidate.eventId === entry.eventId);
       if (!item || item.handledAt) return;
@@ -369,20 +369,22 @@ export class IntakeSlackSurface {
     });
   }
 
-  private async act(record: IntakeRecord, text: string, eventId: string): Promise<Outcome> {
+  private async act(record: IntakeRecord, entry: IntakeInbound): Promise<Outcome> {
+    const text = entry.text;
     if (record.state === "finished") return { outcome: "finished", reply: FINISHED };
     const mission = record.missionId ? this.missions.peek(record.missionId) : undefined;
     if (!mission) return { outcome: "not-started", reply: NOT_STARTED };
-    const requestId = deterministicUuid("intake-slack-event", eventId);
+    const requestId = deterministicUuid("intake-slack-event", entry.eventId);
     const id = mission.id;
+    const call = (run: (revision: number) => unknown) => this.missionAction(record.issueId, entry, id, run);
     try {
       const lower = text.toLowerCase();
-      if (ACTIONS.has(lower)) return await this.missionCommand(record, mission, lower, requestId);
+      if (ACTIONS.has(lower)) return await this.missionCommand(record, mission, lower, requestId, call);
       const open = mission.decisions.filter(decision => !decision.answer);
       const leading = /^Q(\d+)(?!\w)\s*/i.exec(text);
       if (open.length === 0) {
         if (leading || /^\d+$/.test(text)) return { outcome: "already-answered", reply: ALREADY_ANSWERED };
-        await this.missionAction(id, revision => this.missions.steer(id, { requestId, revision, text }, "slack"));
+        await call(revision => this.missions.steer(id, { requestId, revision, text }, "slack"));
         return { outcome: "steered" };
       }
       let decision: MissionDecision;
@@ -401,18 +403,16 @@ export class IntakeSlackSurface {
       const choice = /^\d+$/.test(remainder) ? Number(remainder) : undefined;
       const answer = choice !== undefined && choice >= 1 && choice <= decision.options.length ? decision.options[choice - 1] : remainder;
       const decisionId = decision.id;
-      await this.missionAction(id, revision => this.missions.answer(id, decisionId, { requestId, revision, text: answer }, "slack"));
+      await call(revision => this.missions.answer(id, decisionId, { requestId, revision, text: answer }, "slack"));
       return { outcome: "answered" };
     } catch (error) {
-      // The request ID is derived from the event, so a conflict means this event already reached the mission
-      // (a restart before its handled mark was written). The stored receipt covers the revision it was applied at.
-      if (error instanceof TeamError && error.code === "request-conflict") return { outcome: "already-applied" };
       if (error instanceof TeamError) return { outcome: "refused", reply: error.message };
       return { outcome: "error", reply: UNEXPECTED };
     }
   }
 
-  private async missionCommand(record: IntakeRecord, mission: Mission, command: string, requestId: string): Promise<Outcome> {
+  private async missionCommand(record: IntakeRecord, mission: Mission, command: string, requestId: string,
+    call: (run: (revision: number) => unknown) => Promise<void>): Promise<Outcome> {
     const id = mission.id;
     if (command === "status") {
       const open = mission.decisions.filter(decision => !decision.answer).flatMap(decision => {
@@ -421,24 +421,43 @@ export class IntakeSlackSurface {
       });
       return { outcome: "status", reply: [mission.status, ...open].join("\n") };
     }
-    if (command === "pause") await this.missionAction(id, revision => this.missions.pause(id, { requestId, revision }));
-    else if (command === "resume") await this.missionAction(id, revision => this.missions.resume(id, { requestId, revision }));
-    else await this.missionAction(id, revision => this.missions.cancel(id, { requestId, revision }));
+    if (command === "pause") await call(revision => this.missions.pause(id, { requestId, revision }));
+    else if (command === "resume") await call(revision => this.missions.resume(id, { requestId, revision }));
+    else await call(revision => this.missions.cancel(id, { requestId, revision }));
     return { outcome: command };
   }
 
-  /** Runs one mission call against the current revision, retrying once when the revision moved first. */
-  private async missionAction(missionId: string, call: (revision: number) => unknown): Promise<void> {
+  /**
+   * Runs one mission call at the revision stored on the entry, so a replay after a crash meets the mission's recorded receipt.
+   * The revision is stored before the call; a stale revision is replaced by the current one and the call is retried once.
+   */
+  private async missionAction(issueId: string, entry: IntakeInbound, missionId: string, call: (revision: number) => unknown): Promise<void> {
+    let revision = entry.revision ?? this.currentRevision(missionId);
     for (let attempt = 1; ; attempt++) {
-      const revision = this.missions.peek(missionId)?.revision;
-      if (revision === undefined) throw new TeamError(404, "mission-not-found", "This mission does not exist.");
+      this.rememberRevision(issueId, entry.eventId, revision);
       try {
         await call(revision);
         return;
       } catch (error) {
-        if (attempt === 1 && error instanceof TeamError && error.code === "stale-mission-revision") continue;
+        if (attempt === 1 && error instanceof TeamError && error.code === "stale-mission-revision") {
+          revision = this.currentRevision(missionId);
+          continue;
+        }
         throw error;
       }
     }
+  }
+
+  private currentRevision(missionId: string): number {
+    const mission = this.missions.peek(missionId);
+    if (!mission) throw new TeamError(404, "mission-not-found", "This mission does not exist.");
+    return mission.revision;
+  }
+
+  private rememberRevision(issueId: string, eventId: string, revision: number): void {
+    this.store.update(issueId, draft => {
+      const item = draft.inbound.find(candidate => candidate.eventId === eventId);
+      if (item && !item.handledAt) item.revision = revision;
+    });
   }
 }

@@ -8,7 +8,7 @@ import { splitSlackText } from "../packages/host/src/slack-text.js";
 import { IntakeSlackSurface } from "../packages/host/src/intake-slack.js";
 import { IntakeStore } from "../packages/host/src/intake-store.js";
 import { SlackClient } from "../packages/host/src/slack-client.js";
-import type { IntakeRecord, IntakeThread } from "../packages/host/src/intake-types.js";
+import { deterministicUuid, type IntakeRecord, type IntakeThread } from "../packages/host/src/intake-types.js";
 import type { MissionOrigin } from "../packages/host/src/mission-types.js";
 import type { Config } from "../packages/host/src/types.js";
 import { waitFor } from "./helpers.js";
@@ -286,10 +286,12 @@ test("a lost send response yields one message", { timeout: 60000 }, async () => 
   } finally { await s.close(); await h.close(); }
 });
 
-test("a restart applies a stored reply once and posts an unconfirmed message once", { timeout: 60000 }, async () => {
+test("a restart applies a stored reply once and finds its unconfirmed message in the thread", { timeout: 60000 }, async () => {
   const h = harness(); const services = h.open(); const s = await surfaceFor(services, h.root);
   try {
     const { id } = await services.missions.create(h.create(), undefined, origin(ISSUE));
+    // The first post reached Slack, but the record never recorded it: the thread holds the message under its key.
+    const posted = await s.client.post(BINDING, ACK, "ack");
     s.store.create(intakeRecord(ISSUE, "started", {
       thread: BINDING, missionId: id,
       messages: [{ key: "ack", kind: "ack", text: ACK, createdAt: NOW, status: "pending", attempts: 1, uncertain: true }],
@@ -298,16 +300,30 @@ test("a restart applies a stored reply once and posts an unconfirmed message onc
     await s.surface.start();
     await waitFor(async () => services.missions.peek(id)!, mission => mission.steering.length === 1, 30000);
     await waitFor(async () => s.store.get(ISSUE)!.messages[0].status, status => status === "sent", 20000);
-    s.surface.close();
-    s.store.update(ISSUE, record => { for (const entry of record.inbound) { delete entry.handledAt; delete entry.outcome; } });
-    const second = new IntakeSlackSurface({ intake: { slack: { bindByMention: false, ownerUserId: OWNER, teamId: "T00000000" } } } as unknown as Config,
-      s.store, services.missions, services.teams, s.client);
-    await second.start();
-    await delay(1500);
-    second.close();
     assert.equal(services.missions.peek(id)!.steering.length, 1, "The stored reply applies once");
-    assert.equal(s.slack.posts(BINDING).length, 1, "The unconfirmed message is posted once");
+    assert.equal(s.slack.posts(BINDING).length, 1, "The unconfirmed message is found in the thread, not posted again");
+    assert.equal(s.store.get(ISSUE)!.messages[0].ts, posted.ts, "The lookup records the message's ts");
   } finally { await s.close(); await h.close(); }
+});
+
+test("an entry that reached the mission before a crash is applied once, with no refusal", { timeout: 60000 }, async () => {
+  const { sh, s, close } = await scriptedSurface();
+  try {
+    const { id } = await sh.create();
+    s.store.create(intakeRecord(ISSUE, "started", {
+      thread: BINDING, missionId: id,
+      inbound: [{ eventId: "Ev-crash", ts: "1700000100.888888", text: "also cover the CSV export", receivedAt: NOW }],
+    }));
+    // The crash: the mission took the reply at this revision, and the surface stopped before it marked the entry handled.
+    const before = sh.get(id).revision;
+    await sh.missions.steer(id, { requestId: deterministicUuid("intake-slack-event", "Ev-crash"), revision: before, text: "also cover the CSV export" }, "slack");
+    s.store.update(ISSUE, record => { record.inbound[0].revision = before; });
+    await s.surface.start();
+    await waitFor(async () => s.store.get(ISSUE)!.inbound[0].handledAt, handled => Boolean(handled), 30000);
+    assert.equal(sh.get(id).steering.length, 1, "The reply applies once");
+    assert.equal(sh.get(id).revision, before + 1, "The replay advances the revision once");
+    assert.deepEqual(s.texts(), [ACK], "A replayed reply posts no refusal");
+  } finally { await close(); }
 });
 
 test("a reply to a finished request gets one line", { timeout: 60000 }, async () => {
@@ -503,6 +519,7 @@ test("a question with no options takes the owner's text literally", { timeout: 9
     const answered = await until(() => sh.get(id), mission => Boolean(mission.decisions[0].answer));
     assert.equal(answered.decisions[0].answer, "2");
     assert.equal(answered.decisions[0].id, asked.decisions[0].id);
+    assert.ok(answered.events.some(event => event.text === "The owner answered the coordinator's question from Slack."));
   } finally { await close(); }
 });
 
@@ -529,7 +546,7 @@ test("with two questions open, Qn addresses one and plain text answers the oldes
     await s.slack.emit(mention("Q2 yes"));
     await until(() => sh.get(id), mission => mission.decisions[1].answer === "yes");
     assert.equal(sh.get(id).decisions[0].answer, undefined, "Qn leaves the oldest question open");
-    await s.slack.emit(mention("2"));
-    await until(() => sh.get(id), mission => mission.decisions[0].answer === "Write blanks");
+    await s.slack.emit(mention("skip them"));
+    await until(() => sh.get(id), mission => mission.decisions[0].answer === "skip them");
   } finally { await close(); }
 });

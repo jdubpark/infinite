@@ -19,6 +19,8 @@ const MAX_THREAD_MESSAGES = 1000;
 const MAX_THREAD_PAGES = 50;
 const MAX_RECONNECT_DELAY_MS = 60_000;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+/** Read methods take their arguments from a form body; write methods such as chat.postMessage take JSON. */
+const FORM_METHODS = new Set(["auth.test", "conversations.replies", "apps.connections.open"]);
 
 /** Slack's Web API and Socket Mode, with bot and app tokens read from files on every call. */
 export class SlackClient implements IntakeThreadReader {
@@ -179,12 +181,13 @@ export class SlackClient implements IntakeThreadReader {
   private async call(method: string, kind: "bot" | "app", body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, any>> {
     const secret = this.token(kind);
     const timeout = AbortSignal.timeout(this.options.timeoutMs ?? 10_000);
+    const form = FORM_METHODS.has(method);
     let response: Response;
     try {
       response = await fetch(`${this.endpoint}/${method}`, {
         method: "POST", redirect: "error",
-        headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json; charset=utf-8" },
-        body: JSON.stringify(body),
+        headers: { Authorization: `Bearer ${secret}`, "Content-Type": form ? "application/x-www-form-urlencoded" : "application/json; charset=utf-8" },
+        body: form ? new URLSearchParams(Object.entries(body).filter(([, value]) => value !== undefined).map(([name, value]) => [name, String(value)])).toString() : JSON.stringify(body),
         signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
       });
     } catch (error) {

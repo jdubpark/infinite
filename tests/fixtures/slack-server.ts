@@ -12,6 +12,8 @@ interface StoredMessage {
 }
 
 const bindingKey = (channelId: string, threadTs: string) => `${channelId}:${threadTs}`;
+/** Methods whose arguments Slack reads only from a form body; a JSON body is refused, as Slack ignores its arguments. */
+const FORM_METHODS = new Set(["auth.test", "conversations.replies", "apps.connections.open"]);
 /** Slack timestamps are microseconds since the epoch written as `seconds.micros`; comparing them as integers keeps order exact. */
 const toMicros = (ts: string) => {
   const [seconds, fraction = ""] = ts.split(".");
@@ -61,7 +63,12 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
       calls.push({ method, token });
       if (down) { reply(503, { ok: false, error: "service_unavailable" }); return; }
       if (limited) { response.writeHead(429, { "Content-Type": "text/plain", "Retry-After": "30" }).end("ratelimited"); return; }
-      const body = JSON.parse(await readBody(request) || "{}");
+      const raw = await readBody(request);
+      let body: Record<string, any>;
+      if (FORM_METHODS.has(method)) {
+        if (!(request.headers["content-type"] ?? "").startsWith("application/x-www-form-urlencoded")) { reply(200, { ok: false, error: "invalid_arguments" }); return; }
+        body = Object.fromEntries(new URLSearchParams(raw));
+      } else body = JSON.parse(raw || "{}");
       const appMethod = method === "apps.connections.open";
       if (appMethod ? !token.startsWith("xapp-") : !token.startsWith("xoxb-")) { reply(200, { ok: false, error: "invalid_auth" }); return; }
       switch (method) {

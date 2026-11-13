@@ -9,6 +9,8 @@ import type { Config } from "./types.js";
 import type { CreateTeam, TeamGoalContext, TeamView } from "./team-types.js";
 import { addRollups, emptyRollup, type UsageRollup } from "./team-usage.js";
 import type { LinearService } from "./linear.js";
+import { applyFuseReason } from "./fuse/rules.js";
+import type { FuseGate } from "./fuse/types.js";
 
 type Action = { requestId: string; revision: number };
 /** `parallelism` remains readable only so a pre-migration queued owner control can be discarded safely. */
@@ -41,6 +43,7 @@ export class GoalService {
   private timer?: NodeJS.Timeout;
   private closed = false;
   private tickQueued = false;
+  private fuse?: FuseGate;
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly teams: TeamService, private readonly linear?: LinearService) {
     this.directory = join(config.stateDir, "goals");
@@ -63,6 +66,8 @@ export class GoalService {
       this.saved.set(id, digest(stored));
     }
   }
+  /** The launch-rate fuse. A service without one starts every cycle it would have started before. */
+  useFuse(fuse: FuseGate) { this.fuse = fuse; }
   enabled() {
     const lineup = this.config.teams?.lineup;
     return Boolean(lineup && lineup.coordinator.tier === "strong" && lineup.reviewer.tier === "strong");
@@ -563,6 +568,9 @@ export class GoalService {
       this.event(stored, goal.reason); this.save(stored); return;
     }
     if (!trackingReady) return;
+    const fuse = applyFuseReason(goal, this.fuse?.check({ projectId: goal.projectId }));
+    if (fuse.changed) { if (fuse.wait) this.event(stored, goal.reason!); this.save(stored); }
+    if (fuse.wait) return;
     const parent = [...goal.cycles].reverse().find(cycle => ["ready-for-review", "merged"].includes(cycle.status));
     const cycle = goal.cycles.length + 1;
     const sourceIssue = goal.linear?.issue;

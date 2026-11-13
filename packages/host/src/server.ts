@@ -29,6 +29,7 @@ import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
+import { EventOutbox } from "./evidence/outbox.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
@@ -175,9 +176,11 @@ export function createApp(config: Config, key: Buffer) {
   const ownerServices: { goals?: GoalService; missions?: MissionService; handoffs?: HandoffService } = {};
   // A store that cannot open stays unavailable with a fixed reason. It never blocks the host, a run, or a removal.
   const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(config.stateDir), vaultKey: key });
+  const outbox = new EventOutbox(evidence);
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
     graphs: repositoryGraphs,
+    events: outbox,
     onMerged: id => void projectSource.refresh(id).then(status => {
       sourceChanged(id);
       if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
@@ -201,7 +204,15 @@ export function createApp(config: Config, key: Buffer) {
   // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
   const sweepEvidence = () => evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
   let evidenceSweep: NodeJS.Timeout | undefined;
-  const closeEvidence = () => { clearInterval(evidenceSweep); evidence.close(); };
+  // A projector that fell behind catches up without waiting for the next event. Each pass is bounded.
+  const advanceOutbox = () => {
+    for (let pass = 0; pass < 20; pass++) {
+      const result = outbox.advance();
+      if (!result.pending || result.blocked.length > 0) break;
+    }
+  };
+  let outboxTimer: NodeJS.Timeout | undefined;
+  const closeEvidence = () => { clearInterval(evidenceSweep); clearInterval(outboxTimer); evidence.close(); };
   missions.useUsage(usage);
   usage.useResolvers({
     goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },
@@ -1583,6 +1594,9 @@ export function createApp(config: Config, key: Buffer) {
     sweepEvidence();
     evidenceSweep = setInterval(sweepEvidence, 60 * 60 * 1000);
     evidenceSweep.unref();
+    advanceOutbox();
+    outboxTimer = setInterval(advanceOutbox, 60 * 1000);
+    outboxTimer.unref();
   });
   server.once("close", () => {
     teams.close();

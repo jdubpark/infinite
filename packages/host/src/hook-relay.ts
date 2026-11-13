@@ -6,6 +6,7 @@
 // the file from the worker's byte cursor in bounded chunks until the worker has caught up.
 import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { FINAL_DRAIN_MS } from "./final-drain.js";
 import { MAX_SECONDARY_FILES, MAX_SECONDARY_PASSES, SECONDARY_ID, SECONDARY_NAME, type SecondaryListing } from "./transcript-secondary.js";
 
 const CHUNK = 192 * 1024;
@@ -203,14 +204,21 @@ export async function relay(route: string, body: string, options: RelayOptions) 
     } catch { /* forwarded as received */ }
   }
   const reply = await post(options, route, payload);
-  const wanted = reply?.transcript;
+  // Only a claude transcript has subagent files.
+  await serve(options, reply?.transcript, route === "claude");
+}
+
+/**
+ * Streams the transcript a worker reply asks for. `secondariesAllowed` says whether this route may list subagent
+ * files. The listing rides on the primary end mark, when the reply asks for it.
+ */
+async function serve(options: RelayOptions, wanted: unknown, secondariesAllowed: boolean) {
   if (wanted && typeof wanted === "object" && typeof (wanted as { path?: unknown }).path === "string" &&
       Number.isSafeInteger((wanted as { after?: unknown }).after) && (wanted as { after: number }).after >= 0) {
     const path = (wanted as { path: string }).path;
     const drain = (wanted as { drain?: unknown }).drain;
     const echo = Number.isSafeInteger(drain) ? drain as number : undefined;
-    // Only a claude transcript has subagent files. The listing rides on the primary end mark, when one is sent.
-    const asks = route === "claude" && (wanted as { secondaries?: unknown }).secondaries === true;
+    const asks = secondariesAllowed && (wanted as { secondaries?: unknown }).secondaries === true;
     const listed: { scan?: Scan } = {};
     const endFields = asks ? () => {
       listed.scan = scanSecondaries(path);
@@ -221,14 +229,21 @@ export async function relay(route: string, body: string, options: RelayOptions) 
   }
 }
 
+/** The final drain: asks the `drain` route what to read, then streams it as a hook-started drain does. */
+export async function drain(options: RelayOptions): Promise<void> {
+  const reply = await post(options, "drain", "{}");
+  await serve(options, reply?.transcript, true);
+}
+
 const entry = process.argv[1] ?? "";
 if (/hook-relay\.(?:ts|js)$/.test(entry)) {
   const route = process.argv[2] ?? "codex";
   const url = process.env.INFINITE_HOOK_URL;
   const token = process.env.INFINITE_HOOK_TOKEN;
-  const deadline = setTimeout(() => process.exit(0), 4000);
+  const deadline = setTimeout(() => process.exit(0), route === "drain" ? FINAL_DRAIN_MS : 4000);
   const main = async () => {
     if (!url || !token) return;
+    if (route === "drain") return drain({ url, token });
     let body = process.argv[3];
     if (!body) {
       body = "";

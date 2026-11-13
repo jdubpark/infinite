@@ -12,3 +12,5 @@ Defaults:infinite-host !log_allowed, !log_denied
 infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/claude *, /usr/local/libexec/infinite/codex *, /usr/local/libexec/infinite/codex-app-server *, /usr/local/libexec/infinite/grok *, /usr/local/libexec/infinite/opencode *, /usr/local/libexec/infinite/demo *, /usr/local/libexec/infinite/jevcode *
 # Optional code graph extraction; the wrapper restricts roots, executable and budget.
 infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/repository-graph *
+# The final transcript drain after a provider exits. No arguments: the worker's reply names the file.
+infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/transcript-drain ""

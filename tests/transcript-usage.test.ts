@@ -242,6 +242,12 @@ test("usage coverage follows the rule table", () => {
   assert.deepEqual(usageCoverage({ ...complete, secondary: "complete" }), { coverage: "complete" });
   assert.deepEqual(usageCoverage({ ...complete, secondary: "missing" }), partial("secondary-missing"));
   assert.deepEqual(usageCoverage({ ...complete, childThreads: true }), partial("child-threads"));
+  assert.deepEqual(usageCoverage({ ...complete, finalDrain: "skipped" }), { coverage: "complete" });
+  assert.deepEqual(usageCoverage({ ...complete, finalDrain: "skipped", lastDrain: { complete: true, turnEnd: false } }), partial("drain-skipped"));
+  assert.deepEqual(usageCoverage({ ...complete, finalDrain: "skipped", lastDrain: { complete: false, turnEnd: true } }), partial("drain-skipped"));
+  assert.deepEqual(usageCoverage({ ...complete, finalDrain: "skipped", lastDrain: undefined }), partial("drain-skipped"));
+  assert.deepEqual(usageCoverage({ ...complete, finalDrain: "incomplete", lastDrain: { complete: false, turnEnd: true } }), partial("drain-incomplete"));
+  assert.deepEqual(usageCoverage({ ...complete, finalDrain: "skipped", dropped: true }), partial("row-dropped"));
 });
 
 test("the tail counts rows, records, and request totals", () => {

@@ -357,6 +357,8 @@ delivery.
 
 Each integration records what changed. The run's `changes` lists the files changed from its base to its recorded head, each with a status of added, modified, removed, or renamed and its line counts (`null` for binary files). It holds up to 400 files and sets `truncated` when more changed. Each integrated task's `changedPaths` lists the paths its own change touched, up to 200, with its own `truncated` flag. Git reads for these fields are best-effort: if Git refuses or fails a read, the field is absent and integration still succeeds.
 
+Runs also write run events to the evidence store: `run.created`, `run.blocked`, and `run.settled`, with a summary of the run's counts when it settles. Each run keeps its events in a small outbox inside its record until the store accepts them, and a restart does not lose them. The events only record what the run did. A run behaves the same whether or not its events are stored, and a store that stays unavailable never stops or changes a run.
+
 ## Workspace retention
 
 Team workspaces are host-managed temporary copies. By default, merged and
@@ -642,6 +644,12 @@ repository alone. Its owner-managed knowledge links require an explicit linked
 search; `global` is not included automatically. An Infinite context link does not
 create a brain link. Each surface grants only its named kind of context, and
 neither grants filesystem or network permissions.
+
+A project's `team` object may set `features`, a private feature map of areas, each an `id` with
+repository-relative path prefixes, plus optional `elevated` prefixes and `elevatedTokens`. The host reads it when a
+plan is accepted and records each task's area, kind, and risk in its run events. It never sends the map to a member:
+member context files and prompts leave it out. A plan task may add `kind` and `risk: "elevated"` as labels; a label
+can raise risk but never lower it. The key has no default, so a project without a map keeps its configuration as it was.
 
 ## Let an ordinary session request a team
 

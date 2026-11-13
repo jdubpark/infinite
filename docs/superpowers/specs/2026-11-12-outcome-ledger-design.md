@@ -56,7 +56,7 @@ The design uses approach 3, because capture cannot be backfilled. It uses approa
 
 `TeamService` gets a private `emit(stored, kind, ids, data)` that appends an event to `stored.outbox`, a new field of the sealed record. `save` writes the sealed record, appends the outbox to the store, and clears what it appended. On start, the service appends each loaded record's outbox again. That is the reconciliation pass of umbrella C1. An append is idempotent by key, so a crash between the two writes loses nothing and duplicates nothing.
 
-`deleteRecord` flushes the outbox before it removes the file. When that flush fails, it removes the run's clones and keeps the sealed record, and a later tick tries again. A record is removed only after its outbox is empty.
+`deleteRecord` emits `run.deleted`, flushes the outbox, and advances the projectors once before it removes the file. Retention waits for the store: when the flush fails, or a projector that is not blocked is still behind, it keeps the sealed record and a later tick tries again. It waits at most 24 hours from its first held attempt (`retention.evidenceHeldAt`), then removes the record and logs one line. A blocked projector does not hold a deletion, because it cannot catch up without a repair. An owner's explicit removal does not wait: it tries the flush and the advance once, then removes the record whatever the result.
 
 *(My call: a persisted outbox, not a pass that re-derives lost events. `steer` and `repair` erase facts from the record, so re-derivation cannot be complete.)*
 

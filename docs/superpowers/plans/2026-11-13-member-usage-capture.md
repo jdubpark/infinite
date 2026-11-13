@@ -598,3 +598,276 @@ In `tests/chat.test.ts`:
 - The final drain (phase 2c). A member stopped mid-turn stays `partial`.
 - Codex child threads. They stay `partial` with `child-threads`.
 - Any ledger or client change (phase 3).
+
+---
+
+# Phase 2c: the final drain
+
+Spec part 2, "Final drain", part 3 (coverage), and owner decision 3, settled on 2026-11-13: the wrapper is added. Owner decision 2, Codex hooks on by default, was withdrawn the same day on the result of spike S2 (Task 4). A provider that the host stops mid-turn fires no further hook, so the rows it wrote after its last hook never reach the worker. In this phase the worker starts the relay once in drain mode after the provider exits, and serves it for at most 10 seconds. The drain reuses the transcript route, drain ids, end marks, and the secondary listing, so the watch has no second read path. A session stopped mid-turn stays `partial` with `stopped-mid-turn`, and a drain that could not run is visible in the coverage record. Member launch, hook payloads, the 4 second hook deadline, the pass budgets, the relay's path checks, and the usage ledger do not change.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/final-drain.ts` (create) | The 10 second limit, the drain command for a profile, and one run of it |
+| `packages/host/src/sudo-profile.ts` (create), `packages/host/src/launch.ts` (modify) | `sudoShape`, the one check of a sudo profile's arguments, shared by `teamModelLaunch` and `drainLaunch` |
+| `packages/host/src/hook-relay.ts` (modify) | Drain mode: ask the worker what to read, then stream as a hook does |
+| `deploy/ubuntu/transcript-drain.sh` (create) | The root-owned wrapper that runs the relay in drain mode as the agent account |
+| `deploy/ubuntu/infinite.sudoers`, `deploy/ubuntu/README.md` (modify) | The sudoers line and the install step |
+| `packages/host/src/transcript-watch.ts` (modify) | Start the final drain, keep the turn boundary across a stop, state the drain in the coverage record |
+| `packages/host/src/transcript-usage.ts` (modify) | The `drain-skipped` reason |
+| `packages/host/src/hooks.ts` (modify) | The `drain` route |
+| `packages/host/src/worker.ts` (modify) | Run the drain after the exit record, serve its posts, then journal coverage |
+| `packages/host/src/demo.ts` (modify) | A row written after the last hook, and an early drain post |
+| `packages/host/src/config.ts`, `packages/host/src/cli.ts` (modify) | The comment and the `doctor` warning that say what the Codex hook flag allows (Task 4) |
+| `README.md`, `docs/architecture.md`, `docs/security.md`, the 2026-10-04 attention spec, the usage capture spec (modify) | The drain, the reason code, and the corrected statements about the Codex hook flag |
+| `tests/final-drain.test.ts` (create); `tests/transcript.test.ts`, `tests/transcript-watch.test.ts`, `tests/transcript-usage.test.ts`, `tests/chat.test.ts` (modify) | Tests |
+
+## Wire protocol
+
+1. **Start.** The relay in drain mode posts the body `{}` to the `drain` hook route. While the drain window is open, the worker answers `{ transcript: { path, after, drain, secondaries? } }` from `TranscriptWatch.drainFinal()`. Otherwise it answers 204, and the relay exits.
+2. **Stream.** Exactly as a hook-started drain: chunks and the text-less end mark go to `transcript` with the reply's `drain`, the listing rides on the primary end mark when the reply asks, and the wanted secondaries follow.
+
+What differs from a hook-started drain:
+
+- The start route and body. There is no provider payload, no Codex rollout lookup, and no stdin.
+- The relay lists secondaries when the reply asks, whatever the route. The watch asks only for a Claude transcript.
+- The relay's process deadline is 10 seconds, not 4. The pass budgets (64 primary, 128 secondary) do not change.
+- The drain takes the turn boundary of the last provider hook, not one of its own.
+- The worker serves it only after provider exit, in one window that ends when the relay process exits (after its last end mark) or 10 seconds pass. A second start inside the window returns the same drain with the current cursor.
+
+## Review Focus
+
+1. **The drain cannot run:** a sudo deployment without the wrapper, or with an old sudoers file that refuses it. Expect no wait for the limit, `finalDrain: "skipped"`, `drain-skipped` for a session that needed the drain, and `complete` for a session stopped idle at a clean turn end. (Tasks 1, 2, 3.)
+2. **`SessionEnd` after a host stop.** A provider stopped mid-turn fires `SessionEnd` on its way out. Expect `partial` with `stopped-mid-turn`, also when the final drain reaches the end of the file. (Task 2.)
+3. **A drain that hangs.** Expect the window to close at 10 seconds, the process to get `SIGTERM`, later posts to be refused, and one coverage record after the last usage record. (Tasks 1, 2, 3.)
+4. **A drain post that is not the worker's own:** one sent while the provider runs, a second start, or an end mark from an orphaned hook relay. Expect the first to change nothing, the second to return the same drain and reset nothing, and the last to give no evidence. A start that arrives before the worker's relay must not keep that relay from reading. (Tasks 2, 3.)
+5. **An idle stop with nothing new.** A member stopped after a clean turn end, whose final drain finds no new bytes. Expect `complete` with `finalDrain: "complete"`. (Tasks 2, 3.)
+
+### Task 1: the drain process
+
+**Files:** create `final-drain.ts`, `sudo-profile.ts`, `deploy/ubuntu/transcript-drain.sh`, `tests/final-drain.test.ts`. Modify `hook-relay.ts`, `launch.ts`, `deploy/ubuntu/infinite.sudoers`, `deploy/ubuntu/README.md`, `tests/transcript.test.ts`.
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/final-drain.ts (node built-ins and a type import of AgentProfile only)
+/** The longest a final drain runs: the worker's window and the relay's process deadline. */
+export const FINAL_DRAIN_MS = 10_000;
+/** The wrapper's file name, beside the provider wrapper that a sudo profile names. */
+export const DRAIN_WRAPPER = "transcript-drain";
+/** The command that runs the relay in drain mode in the provider's account. Undefined when it cannot run. */
+export function drainLaunch(profile: AgentProfile, relayPath: string): { command: string; args: string[] } | undefined;
+/** Runs the command once. Resolves when it exits, fails to start, or `limitMs` passes. Never rejects. */
+export function runFinalDrain(launch: { command: string; args: string[] }, env: Record<string, string>, limitMs?: number): Promise<void>;
+
+// packages/host/src/hook-relay.ts
+/** The final drain: asks the `drain` route what to read, then streams it as a hook-started drain does. */
+export async function drain(options: RelayOptions): Promise<void>;
+```
+
+`deploy/ubuntu/transcript-drain.sh`, in full:
+
+```sh
+#!/bin/sh
+# The final transcript drain: after a provider exits, the worker runs the hook relay once more as the
+# agent account. It takes no arguments. The worker's authenticated reply names the transcript, and
+# sudo's env_keep passes the hook address and token.
+set -eu
+umask 077
+ulimit -c 0
+if [ "$#" -ne 0 ]; then
+  printf 'transcript-drain takes no arguments\n' >&2
+  exit 64
+fi
+export PATH=/usr/local/bin:/usr/bin:/bin
+exec /usr/local/bin/node /opt/infinite/packages/host/dist/hook-relay.js drain
+```
+
+`deploy/ubuntu/infinite.sudoers` gains, after the `repository-graph` line:
+
+```
+# The final transcript drain after a provider exits. No arguments: the worker's reply names the file.
+infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/transcript-drain ""
+```
+
+**Decisions:**
+
+- **Same account.** When `profile.command` does not match `/(^|\/)sudo$/`, `drainLaunch` returns `{ command: process.execPath, args: [relayPath, "drain"] }`, with `"--import", import.meta.resolve("tsx")` first when `relayPath` ends in `.ts`, as `buildLaunch` does. The relay runs in the worker's account, which is the provider's. A command that is not sudo but switches account is treated the same way. Its relay cannot open the file, so its drain starts and reads nothing. *(My call: the code already tells the two shapes apart by the sudo pattern.)*
+- **Another account.** For a sudo profile, the options before `--` must be only `-n`, `--non-interactive`, `-H`, `--set-home`, `-u USER`, `--user USER`, `-g GROUP`, or `--group GROUP`: the check `teamModelLaunch` makes. Move that check into one shared function, `sudoShape` in `packages/host/src/sudo-profile.ts` (node built-ins only), and do not copy it. `teamModelLaunch` keeps its error messages. The executable after `--` must be absolute. The wrapper is `join(dirname(executable), DRAIN_WRAPPER)`, and it is present when `statSync(wrapper).isFile()`. The command is `profile.command` with `["-n", ...the other options in order, "--", wrapper]`. A missing wrapper or any other shape returns undefined. *(My call: the wrapper sits beside the provider wrapper the owner installed, so no config field is added. A profile without `-n` still gets it, so sudo never waits for a password.)*
+- sudo refuses a command its policy does not list and exits at once. The relay then never posts `drain`, and the watch reports the drain as `skipped` (Task 2). The worker waits only until the process exits.
+- `runFinalDrain` spawns with `stdio: "ignore"` and exactly the given env. At `limitMs` (default `FINAL_DRAIN_MS`) it resolves and sends `SIGTERM`. sudo passes the signal to the relay. A throwing spawn or an `error` event resolves at once.
+- `drain(options)` posts `{}` to `drain` and handles the reply as `relay` handles a hook reply. Move the transcript block of `relay` into one function that both call. For `relay`, listing stays limited to the `claude` route. For `drain`, the reply's `secondaries: true` decides.
+- The entry block: when `process.argv[2]` is `drain`, the deadline is `FINAL_DRAIN_MS` (imported from `final-drain.ts`), no body is read from argv or stdin, and it calls `drain`. Other routes do not change.
+- The wrapper follows `agent-wrapper.sh`: `set -eu`, `umask 077`, `ulimit -c 0`, a fixed `PATH`, and absolute paths. It refuses every argument with exit 64, and the sudoers `""` allows none. It does not load `agent-env.sh`, because the drain needs no project secret.
+- `deploy/ubuntu/README.md`, in the paragraph that installs `agent-wrapper.sh`: install `transcript-drain.sh` as `/usr/local/libexec/infinite/transcript-drain`, `root:root`, mode `0755`, then reinstall the sudoers file with `visudo -cf`. Without it, sudo sessions report `finalDrain: "skipped"`.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | File | Assertions |
+|---|---|---|
+| `the drain relay asks the worker what to read and streams it like a hook` | `tests/transcript.test.ts` | With `fakeSecondaryWorker` extended to record its first request: that request goes to `/drain` with body `"{}"`. Its reply names drain 9 with `secondaries: true`. The posts are the primary chunk with `drain: 9`, the end mark with `drain: 9` and the listing, then each wanted secondary's chunk and mark with `drain: 9`. |
+| `the drain relay lists secondaries only when the reply asks` | same | A reply without `secondaries` gives an end mark with no `secondaries` key. |
+| `the drain relay does nothing when the worker has nothing to drain` | same | A 204 reply: exactly one request, to `/drain`, and no `transcript` post. |
+| `a same-account profile drains with the relay itself` | `tests/final-drain.test.ts` | For `{ command: "claude", args: [] }` and `/opt/infinite/packages/host/dist/hook-relay.js`: `{ command: process.execPath, args: [that path, "drain"] }`. For a `.ts` relay, `args[0]` is `--import` and the last two are the path and `drain`. |
+| `a sudo profile drains through the wrapper beside its provider` | same | A temporary folder holds files `claude` and `transcript-drain`. `{ command: "/usr/bin/sudo", args: ["-H", "-u", "agent", "--", <folder>/claude, "--model", "m"] }` gives `{ command: "/usr/bin/sudo", args: ["-n", "-H", "-u", "agent", "--", <folder>/transcript-drain] }`. With `-n` already in the profile, `-n` appears once. |
+| `a missing wrapper or an unknown sudo shape skips the drain` | same | Undefined for: no wrapper file; a folder named `transcript-drain`; `-E` before `--`; no `--`; a relative executable. |
+| `a drain that outlives the limit is stopped` | same | A node child that writes its pid to a file and never exits, with `limitMs` 300: the promise resolves within 2,000 ms, and the pid is gone within 2,000 ms after that. |
+| `a drain resolves when its process exits or cannot start` | same | A child that exits with code 3, with `limitMs` 10,000, resolves within 3,000 ms. A missing command resolves and never rejects. |
+| `the drain wrapper takes no arguments` | same | `/bin/sh deploy/ubuntu/transcript-drain.sh extra` exits 64 with `no arguments` on stderr. The script's last line is the `exec` line above. |
+| `sudoers allows the drain wrapper only without arguments` | same | The file holds the line above, and no line names `transcript-drain` with `*`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `node --import tsx --test tests/final-drain.test.ts tests/transcript.test.ts`, then `npm run typecheck -w @infinite/host`. Neither file starts a server. The existing relay tests must pass unchanged.
+
+### Task 2: the watch decides the final drain
+
+**Files:** modify `transcript-watch.ts`, `transcript-usage.ts`, `tests/transcript-watch.test.ts`, `tests/transcript-usage.test.ts`.
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/transcript-watch.ts
+export type FinalDrainState = "complete" | "incomplete" | "skipped";
+export interface CoverageRecord {
+  coverage: UsageCoverage; reason?: UsageCoverageReason; records: number; provider: string;
+  /** Present only when `finish` was told a drain was owed and a primary transcript was open. */
+  finalDrain?: FinalDrainState;
+}
+export interface WatchHook {
+  // subagent, turnEnd, and transcript do not change
+  /** The hook is the provider's `SessionEnd`. */
+  sessionEnd?: boolean;
+}
+export class TranscriptWatch {
+  /** A primary transcript is open, so a final drain has a file to read. */
+  get reading(): boolean;
+  /** The host asked the provider to stop. Idempotent. */
+  stopRequested(): void;
+  /** Starts the final drain on the current transcript, once per session. */
+  drainFinal(): { path: string; after: number; drain: number; secondaries?: true } | undefined;
+  /** With `finalDrain` true, the provider exited and a drain was owed: the record states it, and the watch closes. */
+  finish(hooks: boolean, finalDrain?: boolean): CoverageRecord;
+}
+
+// packages/host/src/transcript-usage.ts
+export type UsageCoverageReason = /* the existing codes */ | "drain-skipped";
+export interface UsageCoverageInput { /* existing fields, and: */ finalDrain?: "complete" | "incomplete" | "skipped" }
+```
+
+**Decisions:**
+
+- `drainFinal()` returns undefined when no primary transcript is open, or after a closing `finish`. The final drain is created once. While the watch is open, a later call returns the same drain: its id, the primary transcript's current cursor as `after`, and `secondaries` as the first start had it. It starts no new drain and resets no evidence. *(Decided after review: any process of the agent's account holds the hook token and can post a start first. A start that returned nothing would then keep the worker's own relay from reading the rows after the last hook.)* End evidence holds only for the cursor it was posted at, so an end mark posted before later bytes arrived does not complete the drain. The first call goes through `receiveHook` with `subagent: false`, the current path and provider, and the last hook's `turnEnd` (false when none), and keeps the new drain's id as the final drain. `Current` keeps its provider for this. Only a `claude` transcript asks for secondaries.
+- After `drainFinal()`, `hook()` returns undefined and changes nothing. *(My call: the provider has exited, so a late hook cannot describe a turn.)* Posts work as today: a chunk at the cursor is applied whatever its drain, and only a mark with the final drain's id gives evidence.
+- The final drain is the last drain. A final drain that started and did not reach the end gives `drain-incomplete`, even when the last hook's drain was complete. *(My call: once the relay reads after exit, a cut-off drain may have left rows unread, and the watch cannot tell "nothing new" from "not read".)*
+- The final drain takes the last provider hook's turn boundary. After a hook that was not a turn boundary, a final drain that reaches the end gives `stopped-mid-turn`, as the spec requires. After a clean turn boundary it gives `complete`, with or without new bytes. *(My call: after exit the file stops growing, and a request after a clean turn end that fired no hook is not a case the providers are known to produce.)*
+- **`SessionEnd` after a stop.** `stopRequested()` sets a sticky flag. A hook with `sessionEnd: true` after it takes the `turnEnd` of the hook before it instead of its own. A turn-end signal after the stop still closes the turn. Without a stop request, `SessionEnd` keeps its Phase 2b meaning. *(My call: Claude Code may run its `SessionEnd` hook when it gets `SIGTERM`, which proves the process is ending, not that the turn ended. A `Stop` hook overtaken by the stop request still proves the turn ended, and the rehearsal relies on that.)*
+- `finalDrain` in the record: `skipped` when no final drain started; `complete` when the final drain is the current drain and the existing `complete(current)` test holds; `incomplete` otherwise. It describes the primary transcript. Secondaries keep their own reason.
+- `finish(hooks, true)` closes the watch: later `hook`, `post`, and `drainFinal` return undefined, so no usage record follows the coverage record. `finish(hooks)` keeps today's behavior, so the Phase 2a and 2b tests do not change.
+- `usageCoverage` gains one row. Rows 6 to 8 become:
+
+| Order | Condition | Result |
+|---|---|---|
+| 6 | `finalDrain` is `skipped`, and `lastDrain` is missing, not complete, or not at a turn end | `partial`, `drain-skipped` |
+| 7 | no `lastDrain`, or `lastDrain.complete` is false | `partial`, `drain-incomplete` |
+| 8 | `lastDrain.turnEnd` is false | `partial`, `stopped-mid-turn` |
+
+  The other rows keep their order. *(My call: the spec has no reason for a drain that could not run. A distinct reason tells the owner that a wrapper is missing, in phase 3's sessions-by-reason view, without a new column. A skipped drain after a clean idle stop loses nothing the watch can know of, so that session stays `complete`, and only `finalDrain` shows the skip.)*
+
+- [ ] **Step 1: Write the failing tests** in `tests/transcript-watch.test.ts`, with the existing helpers. Row A and row B are two `claudeRow` values. Every `finish` below is `finish(true, true)` unless stated.
+
+| Test name | Assertions |
+|---|---|
+| `the final drain reads rows written after the last hook` | A turn-end hook, row A, and a mark for drain 1. `reading` is true. `drainFinal()` returns `{ path, after: bytes(A), drain: 2, secondaries: true }`. Row B and a mark for drain 2 at the end: `{ coverage: "complete", records: 2, provider: "claude", finalDrain: "complete" }`, and `onUsage` got both records. |
+| `an idle stop with no new bytes stays complete` | A complete turn-end drain, `drainFinal()`, and a mark for drain 2 at the same cursor: `complete`, `records: 1`, `finalDrain: "complete"`. |
+| `a final drain after a mid-turn hook stays stopped-mid-turn` | The first test with `turnEnd: false`: `{ coverage: "partial", reason: "stopped-mid-turn", records: 2, provider: "claude", finalDrain: "complete" }`. |
+| `a final drain that does not reach the end is incomplete` | A complete turn-end drain, `drainFinal()`, and row B with no mark: `partial`, `drain-incomplete`, `finalDrain: "incomplete"`. The same with no post after `drainFinal()`. |
+| `a skipped final drain is visible` | No `drainFinal()`. A complete turn-end drain: `complete`, `finalDrain: "skipped"`. A complete drain from a `turnEnd: false` hook: `partial`, `drain-skipped`. A turn-end drain with no mark: `partial`, `drain-skipped`. The mid-turn case with `finish(true)`: `partial`, `stopped-mid-turn`, and no `finalDrain` key. |
+| `an end mark for the last hook's drain does not complete the final drain` | A turn-end hook and row A with no mark, then `drainFinal()`. A mark at the cursor for drain 1: `partial`, `drain-incomplete`, `finalDrain: "incomplete"`. A mark for drain 2 instead: `complete`. |
+| `the final drain starts once and ends hook handling` | Row B is posted between two `drainFinal()` calls. The second returns the same `drain` id, with `after` at the new cursor. `hook(turnFor(PATH, "claude", false))` after it returns undefined, and the record equals the one without that hook. |
+| `an early start cannot keep the worker's relay from reading` | A turn-end hook, row A, and a mark for drain 1. A first `drainFinal()` returns drain 2, and a text-less end mark for drain 2 is posted at the cursor. A second `drainFinal()` returns drain 2 with the same cursor. Row B and a mark for drain 2 at the new cursor: `{ coverage: "complete", records: 2, provider: "claude", finalDrain: "complete" }`. Without that last mark: `partial`, `drain-incomplete`, `finalDrain: "incomplete"`. |
+| `a second start after the closing finish returns nothing` | After `finish(true, true)`, `drainFinal()` is undefined. |
+| `no transcript means no final drain` | Before a transcript hook, `reading` is false and `drainFinal()` is undefined, also after a subagent hook. The record is `{ coverage: "none", reason: "no-transcript", records: 0, provider: "claude" }`, with no `finalDrain` key. |
+| `the watch accepts nothing after the closing finish` | After `finish(true, true)`, a chunk at the cursor returns undefined and adds no usage record, and `hook` and `drainFinal` return undefined. |
+| `a SessionEnd after a stop request keeps the turn boundary` | Each case posts row A after its first hook, ends with a mark at the cursor for the last drain, and uses `finish(true)`. `turnEnd: false` hook, `stopRequested()`, then `{ ...turnFor(), sessionEnd: true }`: `partial`, `stopped-mid-turn`. Turn-end hook, `stopRequested()`, the same `SessionEnd`: `complete`. `turnEnd: false` hook, `SessionEnd`, no stop request: `complete`. `turnEnd: false` hook, `stopRequested()`, `turnFor()`: `complete`. |
+| `the final drain reads a grown secondary` | A turn-end drain lists `agent-a.jsonl` at size N and reads it to its end. `drainFinal()`. The primary mark for drain 2 lists it at `N + M` and returns `secondaries: [{ name: "agent-a.jsonl", after: N }]`. A secondary chunk of M bytes and its mark for drain 2: `complete`, `records: 3`, `finalDrain: "complete"`. Without that secondary mark: `partial`, `secondary-missing`, `finalDrain: "complete"`. |
+| `a Codex final drain completes the cumulative total` | A Codex turn-end drain of `requestRow("resp_1", 1150)` with its mark. `drainFinal()` returns `{ path, after, drain: 2 }` with no `secondaries` key. `totalRow(1150)` and a mark for drain 2: `{ coverage: "complete", records: 1, provider: "codex", finalDrain: "complete" }`. |
+
+In `tests/transcript-usage.test.ts`, `usage coverage follows the rule table` adds: `skipped` with a complete turn-end `lastDrain` gives `complete`; `skipped` with `turnEnd: false`, with `complete: false`, and with no `lastDrain` each give `drain-skipped`; `incomplete` with `complete: false` gives `drain-incomplete`; `skipped` with `dropped` gives `row-dropped`.
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `node --import tsx --test tests/transcript-watch.test.ts tests/transcript-usage.test.ts`, then `npm run typecheck -w @infinite/host`. Every existing test in both files must pass unchanged.
+
+### Task 3: the worker runs the drain
+
+**Interfaces (consumes):** Tasks 1 and 2.
+
+**Files:** modify `hooks.ts`, `worker.ts`, `demo.ts`, `tests/chat.test.ts`, `docs/architecture.md`, `docs/security.md`, and the spec.
+
+**Decisions:**
+
+- `HookRoute` and `ROUTES` in `hooks.ts` gain `drain`.
+- In `onHook`, above the `state.status !== "running"` gate, and in place of the old `transcript` line below it:
+
+  ```ts
+  if (route === "drain") { const started = drainOpen ? transcriptWatch.drainFinal() : undefined; return started ? { transcript: started } : undefined; }
+  if (route === "transcript") return state.status === "running" || drainOpen ? onTranscript(body) : undefined;
+  ```
+
+  Provider hooks and reports keep the status gate, so after exit they are dropped or refused as today.
+- `onHook` passes `sessionEnd: event === "SessionEnd"` to `transcriptWatch.hook`. `deliver` calls `transcriptWatch.stopRequested()` just before `child.kill("SIGTERM")`, and `handoff-stop` calls it before `stopHandoffProcesses`.
+- **`exited` order.** (1) Native, hybrid, and executor shutdown, as today. (2) `flush`, the exited state, `publish`, the `lifecycle` exited record, and `persist`, as today. (3) In an async continuation that never rejects, `await finalDrain()`. (4) Unless the provider is `opencode`, append `usage-coverage` from `transcriptWatch.finish(hooksReady, true)`, then `persist`. (5) Start the 1.5 second exit timer, so the hook server closes after the drain. Each step catches its own failure. *(My call, which changes the Phase 2a order: the session reads `exited` the moment the provider is gone, so every existing gate keeps refusing input, reports, and provider hooks during the drain. Only the drain's posts are served. Readers that need coverage wait for the coverage record, not the exit record.)*
+- `finalDrain()` returns at once when `hookServer` is null or `transcriptWatch.reading` is false. It returns when `drainLaunch(profile, relayPath)` is undefined: the watch then reports `skipped`. Otherwise it sets `drainOpen = true`, awaits `runFinalDrain(launch, env)`, and sets `drainOpen = false` in `finally`. `env` holds `PATH` and `HOME` when the worker has them, `INFINITE_HOOK_URL: hookServer.url`, and `INFINITE_HOOK_TOKEN: hookToken`, and nothing else.
+- After the window closes, a `transcript` post gets 204 with no cursor, so a late relay stops, and its bytes are never read. The closed watch refuses them as well.
+- The drain also runs for a handoff source. *(My call: the relay opens only transcript files and the loopback socket, and writes nothing in the project.)*
+- The rows the drain reads become chat messages too, journaled after the exit record.
+- `demo.ts`: `transcribe` takes an optional message id. With `late-row` in the request, the `SIGTERM` handler waits for the hook chain as today (at most 3 seconds), then appends one assistant row with id `msg-demo-<pid>-late`, model `rehearsal-model`, usage `input_tokens: 120`, `output_tokens: 30`, both cache counts 0, and the text "Stopped before the reply was finished.", posts no hook, and exits. With `drain-early` in the request, the chain calls `drain({ url, token })` once, right after the first `UserPromptSubmit` hook.
+- `docs/architecture.md`, after the sentence on subagent usage: after the provider exits, the worker runs the relay once more in drain mode, for at most 10 seconds, so rows written after the last hook still reach chat and usage. On the Ubuntu deployment it runs through the root-owned `transcript-drain` wrapper. `docs/security.md`, in the transcript bullet: the wrapper takes no arguments, the worker's authenticated reply names the file, and the path checks do not change.
+- The spec: part 3 gains `drain-skipped` among the `partial` reasons, says the coverage record follows the final drain and carries `finalDrain`, and acceptance 4 reads `drain-skipped` for the case without the drain. Owner decisions 2 and 3 record the 2026-11-13 decisions.
+
+- [ ] **Step 1: Write the failing tests** in `tests/chat.test.ts`. Each waits for exactly one `usage-coverage` event, not for `exited` alone.
+
+| Test name | Assertions |
+|---|---|
+| `a rehearsal turn journals its usage, and its exit journals the coverage of the session` (modify) | Also `finalDrain` is `"complete"`. |
+| `a rehearsal subagent's usage is journaled from its own transcript` (modify) | Also `finalDrain` is `"complete"`. |
+| `a rehearsal without hooks journals no usage and coverage none for hooks-off` (modify) | The record has no `finalDrain` key. |
+| `a rehearsal stopped mid-turn journals the row written after its last hook` | Prompt `hook dialog late-row`, stopped while the dialog is open. A `usage` event has message id `msg-demo-<pid>-late`, with `tokens.input` 120 and `tokens.output` 30. Coverage is `partial`, `stopped-mid-turn`, `finalDrain: "complete"`. The `lifecycle` exited event and every `usage` event have a lower `seq` than the coverage event. Chat holds "Stopped before the reply was finished." |
+| `a sudo profile drains through the wrapper beside it, and skips without one` | A temporary folder holds an executable `sudo` script that appends `"$*"` to a log, drops its options through `--`, and runs the rest. It also holds `demo` and `transcript-drain` scripts that run the demo and the relay in drain mode with `--import tsx`. The demo profile is `<folder>/sudo` with `["-n", "-u", "test-agent", "--", <folder>/demo]`. The late-row session journals the late row, is `stopped-mid-turn` with `finalDrain: "complete"`, and the log holds the line `-n -u test-agent -- <folder>/transcript-drain`. With `transcript-drain` deleted, a second session has no late-row usage, is `partial` with `drain-skipped` and `finalDrain: "skipped"`, and adds no drain line to the log. |
+| `a drain post while the provider runs changes nothing` | Prompt `hook dialog drain-early`, answered, then stopped. "Removed the build directory" reaches chat, and coverage is `complete` with `finalDrain: "complete"`. |
+| `a drain that hangs is stopped at its limit and the session still closes` | The sudo stand-in runs a `transcript-drain` script that posts nothing and sleeps for 60 seconds. A late-row session stopped mid-turn: one coverage event, `partial`, `drain-skipped`, `finalDrain: "skipped"`, no late-row usage. The coverage event follows the exited event by at least 9 and less than 14 seconds. The sleeping process is gone, and the worker process that started it ends within 5 seconds. |
+| `a sudo policy that refuses the wrapper skips the drain at once` | The wrapper file exists, and the sudo stand-in exits 1 for it. A late-row session stopped mid-turn: `partial`, `drain-skipped`, `finalDrain: "skipped"`, no late-row usage, and the coverage event follows the exited event by less than 3 seconds. A session that ends at a clean turn boundary under the same refusal: `complete` with `finalDrain: "skipped"`. |
+
+- [ ] **Step 2: The coordinator runs `tests/chat.test.ts` and confirms the new tests fail.** It starts a host.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `node --import tsx --test tests/transcript-watch.test.ts tests/final-drain.test.ts`, then `npm run typecheck -w @infinite/host`.
+- [ ] **Step 5: The coordinator runs `tests/chat.test.ts` three times in a row, then `npm run check`, requests the independent review, and commits.**
+
+### Task 4: withdrawn. Codex hooks stay off, and the docs say why
+
+The owner decided on 2026-11-13 that Codex hooks are on by default. Spike S2 ran the same day against the real Codex CLI (version 0.167, eight turns, in the member sandbox with network off), and the decision was withdrawn on its result.
+
+- The injected `-c hooks.*` are accepted, fire outside the command sandbox, and reach the loopback hook server. The transcript relay streams the session file.
+- `--dangerously-bypass-hook-trust` is not limited to the hooks the host injects. With it, hooks that the working directory defines also ran, without review. Without it no hook ran, the host's own included. The flag persists no trust.
+- So `DEFAULT_HOOKS` stays `{ claude: true, codex: false }`, and no deployment turns Codex hooks on while they need the flag.
+
+What this task does instead. The coordinator makes these edits:
+
+- `docs/security.md`, `docs/architecture.md`, `README.md`, and two sentences of `docs/superpowers/specs/2026-10-04-mobile-attention-brief-design.md` no longer say that the flag applies only to the host's hooks. They state what the spike found.
+- The comment on `DEFAULT_HOOKS` in `config.ts` gives the reason. The `doctor` line in `cli.ts` becomes a warning: "Warning: Codex hooks are on. They run with --dangerously-bypass-hook-trust, which also lets hooks defined in a session's working directory run without review. Use them only with repositories you trust."
+- No test changes. `tests/host-launch.test.ts` pins the default as it is.
+
+Codex usage capture without the flag is separate work: reading the transcript from the `notify` route with hooks off, or host-recorded trust for the host's own hooks.
+
+Tasks 1 and 2 touch separate files and can run in parallel. Task 3 runs last.
+
+## Not in this phase
+
+- Installing the wrapper and the new sudoers file on the execution host. Until then, sudo sessions report `finalDrain: "skipped"`.
+- The ledger and clients (phase 3): reading coverage that now follows the exit record, keeping `finalDrain`, and showing `drain-skipped`.
+- A larger pass budget for the drain.
+- Confirming whether Claude Code runs `SessionEnd` on `SIGTERM`.
+- Codex usage capture. Codex hooks stay off (Task 4), so a Codex session keeps coverage `none` with `hooks-off` until capture has a route that needs no bypass flag.
+- Codex child threads, native Codex sessions, and OpenCode.

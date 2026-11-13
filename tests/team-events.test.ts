@@ -1,10 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { EventOutbox, type OutboxEvent } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { RunEvent } from "../packages/host/src/evidence/types.js";
 import { MAX_OUTBOX_EVENTS } from "../packages/host/src/run-events.js";
+import { DEFAULT_TEAM_RETENTION, type TeamRun } from "../packages/host/src/team-types.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
@@ -38,6 +41,8 @@ type Internal = {
   save(stored: unknown): void;
   record(id: string): unknown;
   block(stored: unknown, error: unknown, member?: unknown): void;
+  step(stored: unknown): Promise<void>;
+  retire(stored: unknown): Promise<void>;
 };
 const internal = (teams: TeamService) => teams as unknown as Internal;
 
@@ -179,5 +184,210 @@ test("run creation emits run.created", async () => {
     assert.equal(event.data.projectId, "fixture");
     assert.equal(event.data.purpose, "work");
     assert.equal(event.data.lineup, false);
+  } finally { store.close(); f.close(); }
+});
+
+async function waitFor(check: () => boolean, message: string, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.fail(message);
+}
+
+test("steering advances the revision and says why", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const steered = await teams.steer(f.run.id, { requestId: randomUUID(), revision: 1, text: "Narrow the scope to the parser." });
+    assert.equal(steered.revision, 2);
+    const [event] = eventsOfKind(store, f.run.id, "run.revision-advanced");
+    assert.ok(event, "the new revision is stored");
+    assert.equal(event.revision, 2);
+    assert.deepEqual(event.data, { v: 1, cause: "steer", fromRevision: 1, baseChanged: false });
+  } finally { store.close(); f.close(); }
+});
+
+test("a continuation, a resume, and a recovery each name their cause", async () => {
+  {
+    const f = schedulerFixture();
+    const store = openStore(f, f.key);
+    try {
+      f.run.members[0]!.status = "stopped";
+      f.run.status = "blocked"; f.run.blockCode = "agent-blocked"; f.run.reason = "The implementer reported a blocker.";
+      f.run.headCommit = f.run.baseCommit;
+      f.writeTeam();
+      const teams = f.openTeam({ events: new EventOutbox(store) });
+      await teams.continueRun(f.run.id, { requestId: randomUUID(), revision: 1 });
+      const [event] = eventsOfKind(store, f.run.id, "run.revision-advanced");
+      assert.equal(event?.revision, 2);
+      assert.deepEqual(event?.data, { v: 1, cause: "continue", fromRevision: 1, baseChanged: false });
+    } finally { store.close(); f.close(); }
+  }
+  {
+    const f = schedulerFixture();
+    const store = openStore(f, f.key);
+    try {
+      f.run.status = "paused";
+      f.writeTeam();
+      const teams = f.openTeam({ events: new EventOutbox(store) });
+      await teams.resume(f.run.id, { requestId: randomUUID(), revision: 1 });
+      const [event] = eventsOfKind(store, f.run.id, "run.revision-advanced");
+      assert.equal(event?.revision, 2);
+      assert.deepEqual(event?.data, { v: 1, cause: "resume", fromRevision: 1, baseChanged: false });
+    } finally { store.close(); f.close(); }
+  }
+  {
+    const f = schedulerFixture();
+    const store = openStore(f, f.key);
+    try {
+      const member = f.run.members[0]!;
+      member.status = "stopped";
+      member.report = { kind: "blocked", summary: "The implementer is blocked." };
+      const source = { code: "agent-blocked", memberId: member.memberId, revision: 1, reportKind: "blocked" as const,
+        reason: member.report.summary, at: new Date().toISOString() };
+      f.run.recovery = { attempts: 1, status: "stopping", source };
+      f.run.status = "planning"; f.run.blockCode = "agent-blocked"; f.run.reason = source.reason;
+      f.run.headCommit = f.run.baseCommit;
+      f.writeTeam();
+      const teams = f.openTeam({ events: new EventOutbox(store) });
+      const scheduler = internal(teams);
+      await scheduler.step(scheduler.record(f.run.id));
+      const [event] = eventsOfKind(store, f.run.id, "run.revision-advanced");
+      assert.equal(event?.revision, 2);
+      assert.deepEqual(event?.data, { v: 1, cause: "automatic-recovery", fromRevision: 1, baseChanged: false });
+    } finally { store.close(); f.close(); }
+  }
+});
+
+test("preparing a run records its base commit", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    // The fixture project has no checks; the team may establish its own, as a project without configured checks needs.
+    Object.assign(f.config.projects[0]!, { team: { checks: [], establishChecks: true } });
+    Object.assign(f.config.agents, { demo: { command: process.execPath, args: [] } });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const created = await teams.create({ requestId: randomUUID(), projectId: "fixture", provider: "demo",
+      title: "Inspect the fixture", objective: "Report the fixture state", parallelism: 1 });
+    await waitFor(() => eventsOfKind(store, created.id, "run.prepared").length === 1, "the preparation is stored");
+    const [event] = eventsOfKind(store, created.id, "run.prepared");
+    assert.equal(event!.data.baseCommit, f.readRecord<{ run: TeamRun }>("team", created.id).run.baseCommit);
+  } finally { store.close(); f.close(); }
+});
+
+test("removing a blocked run's workspace settles it", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, blockedHours: 1 };
+    f.run.status = "blocked"; f.run.blockCode = "agent-blocked"; f.run.reason = "The implementer reported a blocker.";
+    f.run.headCommit = f.run.baseCommit;
+    f.run.members.forEach(member => { member.status = "stopped"; });
+    f.writeTeam({ retention: { status: "blocked", statusAt: "2020-01-01T00:00:00.000Z", integratedAt: {}, removalErrors: {} } });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    await scheduler.retire(scheduler.record(f.run.id));
+    await teams.idle();
+    const settled = eventsOfKind(store, f.run.id, "run.settled");
+    assert.equal(settled.length, 1);
+    assert.equal(settled[0]!.data.status, "blocked");
+    assert.deepEqual(Object.keys(settled[0]!.data.summary as object).sort(), [...SUMMARY_KEYS].sort());
+    await scheduler.retire(scheduler.record(f.run.id));
+    await teams.idle();
+    assert.equal(eventsOfKind(store, f.run.id, "run.settled").length, 1, "a later pass adds no second event");
+  } finally { store.close(); f.close(); }
+});
+
+test("a workspace removal that cannot be saved leaves no settled event", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, blockedHours: 1 };
+    f.run.status = "blocked"; f.run.blockCode = "agent-blocked"; f.run.reason = "The implementer reported a blocker.";
+    f.run.headCommit = f.run.baseCommit;
+    f.run.members.forEach(member => { member.status = "stopped"; });
+    f.writeTeam({ retention: { status: "blocked", statusAt: "2020-01-01T00:00:00.000Z", integratedAt: {}, removalErrors: {} } });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const restore = f.blockRecordWrites("team", f.run.id);
+    try { await scheduler.retire(scheduler.record(f.run.id)); }
+    finally { restore(); }
+    assert.equal(eventsOfKind(store, f.run.id, "run.settled").length, 0, "the store holds no settled event");
+    const sealed = f.readRecord<{ outbox?: OutboxEvent[]; run: TeamRun }>("team", f.run.id);
+    assert.equal(sealed.run.workspaceRemovedAt, undefined, "the removal did not start");
+    assert.equal((sealed.outbox ?? []).filter(event => event.kind === "run.settled").length, 0, "the sealed outbox holds no settled event");
+    await scheduler.retire(scheduler.record(f.run.id));
+    await teams.idle();
+    const settled = eventsOfKind(store, f.run.id, "run.settled");
+    assert.equal(settled.length, 1);
+    assert.equal(settled[0]!.data.status, "blocked");
+  } finally { store.close(); f.close(); }
+});
+
+test("an owner removes a run while the store is unavailable", async () => {
+  const f = schedulerFixture();
+  const good = openStore(f, f.key);
+  good.close();
+  const bad = openStore(f, randomBytes(32));
+  try {
+    f.run.status = "cancelled";
+    f.run.members.forEach(member => { member.status = "stopped"; });
+    f.writeTeam();
+    await f.openTeam({ events: new EventOutbox(bad) }).removeRun(f.run.id);
+    assert.equal(existsSync(join(f.config.stateDir, "teams", `${f.run.id}.sealed`)), false);
+  } finally { bad.close(); f.close(); }
+});
+
+test("retention keeps a record while its events wait, for at most a day", async () => {
+  const f = schedulerFixture();
+  const good = openStore(f, f.key);
+  good.close();
+  const bad = openStore(f, randomBytes(32));
+  const outbox = new EventOutbox(bad);
+  const sealedPath = join(f.config.stateDir, "teams", `${f.run.id}.sealed`);
+  try {
+    f.config.teams!.retention = { ...DEFAULT_TEAM_RETENTION, cancelledMinutes: 1 };
+    f.run.status = "cancelled";
+    f.run.members.forEach(member => { member.status = "stopped"; });
+    rmSync(dirname(f.run.workspace), { recursive: true, force: true });
+    f.run.workspaceRemovedAt = "2020-01-01T00:00:00.000Z";
+    f.writeTeam({ retention: { status: "cancelled", statusAt: "2020-01-01T00:00:00.000Z", integratedAt: {}, removalErrors: {} } });
+
+    const first = f.openTeam({ events: outbox });
+    const firstScheduler = internal(first);
+    await firstScheduler.retire(firstScheduler.record(f.run.id));
+    assert.equal(existsSync(sealedPath), true, "the record is kept while its events wait");
+    const held = f.readRecord<{ retention: { evidenceHeldAt?: string } }>("team", f.run.id).retention.evidenceHeldAt;
+    assert.ok(held, "the first held attempt is recorded");
+
+    const sealed = f.readRecord<{ retention: Record<string, unknown> }>("team", f.run.id);
+    f.writeTeam({ ...sealed, retention: { ...sealed.retention, evidenceHeldAt: new Date(Date.now() - 25 * 3600000).toISOString() } });
+    const later = f.openTeam({ events: outbox });
+    const laterScheduler = internal(later);
+    await laterScheduler.retire(laterScheduler.record(f.run.id));
+    assert.equal(existsSync(sealedPath), false, "past a day the record is removed although its events still wait");
+  } finally { bad.close(); f.close(); }
+});
+
+test("a deleted run's last event is projected before its events are removed", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  const projected: string[] = [];
+  try {
+    store.register({ name: "probe", version: 1, readVersion: 1, migrate() {}, runIds: () => [] });
+    const outbox = new EventOutbox(store);
+    outbox.registerProjector({ name: "probe", module: "probe", kinds: ["run.deleted"], project: (_tx, event) => { projected.push(event.key); } });
+    f.run.status = "cancelled";
+    f.run.members.forEach(member => { member.status = "stopped"; });
+    f.writeTeam();
+    const teams = f.openTeam({ events: outbox });
+    await teams.removeRun(f.run.id);
+    assert.deepEqual(projected, [`run.deleted:${f.run.id}`]);
+    store.deleteRun(f.run.id);
+    assert.equal(store.describe().counts["event-outbox.lost"], 0);
   } finally { store.close(); f.close(); }
 });

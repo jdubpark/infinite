@@ -48,9 +48,13 @@ type TeamServiceOptions = {
   /** Run events for the evidence store. Without it no record gains a ledger field and nothing is emitted. */
   events?: EventOutbox;
 };
-type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string> };
+type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
+  /** When a record removal first waited for its events to reach the evidence store. */
+  evidenceHeldAt?: string };
 /** How long a failed workspace removal waits before the scheduler tries it again. */
 const REMOVAL_RETRY_MS = 5 * 60_000;
+/** A run's record waits at most this long for its events to reach the evidence store before retention removes it. */
+const EVIDENCE_WAIT_MS = 24 * 3600_000;
 const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
 /** Event kinds whose drop has been logged; one line per kind for the life of the process. */
 const droppedEventKinds = new Set<string>();
@@ -947,8 +951,22 @@ export class TeamService {
     this.removalTasks.add(task);
     return true;
   }
-  private async deleteRecord(stored: Stored) {
+  private async deleteRecord(stored: Stored, waitForEvidence: boolean) {
     const finalView = this.view(stored);
+    if (this.options?.events) {
+      this.emit(stored, "run.deleted", [], {}, { status: stored.run.status });
+      const flushed = this.flushOutbox(stored);
+      const advanced = this.options.events.advance();
+      // A blocked projector cannot catch up without a repair, so it does not hold the deletion.
+      if (!flushed || advanced.pending && advanced.blocked.length === 0) {
+        const retention = this.retentionState(stored);
+        retention.evidenceHeldAt ??= this.retentionNow();
+        const heldFor = (this.options.now?.() ?? Date.now()) - Date.parse(retention.evidenceHeldAt);
+        if (waitForEvidence && heldFor < EVIDENCE_WAIT_MS)
+          throw new TeamError(503, "team-evidence-pending", "The team's run events are not yet in the evidence store; its record is kept until they are stored.");
+        console.warn("Run events for a removed team were not stored; its record is removed anyway.");
+      }
+    }
     try { this.persistRetiredRunId(stored.run.id); }
     catch { throw new TeamError(500, "team-record-removal-failed", "The settled team's deletion tombstone could not be saved; its record was kept."); }
     try { await rmAsync(join(this.directory, `${stored.run.id}.sealed`), { force: true }); }
@@ -976,7 +994,7 @@ export class TeamService {
         this.event(stored, "Workspaces removed by the owner through removeRun after the run settled.");
         this.save(stored);
       }
-      return this.deleteRecord(stored);
+      return this.deleteRecord(stored, false);
     });
   }
   rateTask(id: string, taskId: string, input: { requestId: string; score: number; note?: string }) {
@@ -1202,7 +1220,7 @@ export class TeamService {
         // The refresh above has released its working-tree hold by now, so the ordinary project gate still applies:
         // it keeps a run from preparing while repository setup changes and lets a sync apply see the start.
         return this.startInProject(run.projectId, prepareWorkspace);
-      }, workspace => { Object.assign(run, workspace); run.headCommit = workspace.baseCommit; stored.prepared = true; this.event(stored, "Isolated project ready. Starting the project manager."); });
+      }, workspace => { Object.assign(run, workspace); run.headCommit = workspace.baseCommit; stored.prepared = true; this.emit(stored, "run.prepared", [], {}, { baseCommit: run.baseCommit }); this.event(stored, "Isolated project ready. Starting the project manager."); });
       return this.view(stored);
     });
   }
@@ -1243,6 +1261,7 @@ export class TeamService {
         this.event(stored, "User steering superseded automatic recovery; its original report remains recorded as evidence.");
       }
       stored.run.revision++; stored.run.steering.push({ text: body.text, revision: stored.run.revision, at: timestamp() });
+      this.emit(stored, "run.revision-advanced", [stored.run.revision], {}, { cause: "steer", fromRevision: stored.run.revision - 1, baseChanged: false });
       stored.run.status = "planning"; stored.halt = "steer"; stored.run.reason = "Stopping earlier members before planning the updated request."; stored.run.blockCode = undefined;
       stored.run.tasks = []; stored.run.review = undefined; stored.run.round = 0; stored.checkHead = undefined;
       stored.run.brief = undefined; stored.run.noChange = undefined;
@@ -1597,6 +1616,7 @@ export class TeamService {
           member.role === "permission-coordinator" && member.status === "waiting") member.status = "stopped";
       next.run.continuations = [...(next.run.continuations ?? []), continuation];
       next.run.revision = nextRevision;
+      this.emit(next, "run.revision-advanced", [nextRevision], {}, { cause: "continue", fromRevision: nextRevision - 1, baseChanged: false });
       next.run.tasks = [];
       next.run.review = undefined;
       next.run.round = 0;
@@ -1646,6 +1666,7 @@ export class TeamService {
     next.verificationRecovery = undefined;
     next.halt = undefined;
     next.run.revision++; next.run.tasks = []; next.run.review = undefined; next.run.round = 0; next.checkHead = undefined;
+    this.emit(next, "run.revision-advanced", [next.run.revision], {}, { cause: "verification-recovery", fromRevision: next.run.revision - 1, baseChanged: false });
     next.run.brief = undefined; next.run.noChange = undefined;
     if (next.run.discovery && !next.run.discovery.completedAt) next.run.discovery.completedAt = timestamp();
     next.run.status = "planning"; next.run.reason = undefined; next.run.blockCode = undefined;
@@ -1678,6 +1699,7 @@ export class TeamService {
         if (run.status !== "paused" && !this.canResume(stored)) { this.save(stored); return this.view(stored); }
         // Pausing stopped native agents. Replan from the confirmed integration head, preserving stopped copies for inspection.
         run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
+        this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "resume", fromRevision: run.revision - 1, baseChanged: false });
         run.brief = undefined; run.noChange = undefined;
         if (run.discovery && !run.discovery.completedAt) run.discovery.completedAt = timestamp();
         await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
@@ -2046,6 +2068,7 @@ export class TeamService {
         ...(run.brief ? { brief: structuredClone(run.brief) } : {}),
       }];
       run.revision = nextRevision;
+      this.emit(stored, "run.revision-advanced", [nextRevision], {}, { cause: "automatic-recovery", fromRevision: nextRevision - 1, baseChanged: false });
       run.tasks = [];
       run.review = undefined;
       run.round = 0;
@@ -2224,7 +2247,7 @@ export class TeamService {
             this.event(stored, `Workspaces removed under the retention policy after this ${run.status} run settled. See docs/teams.md.`);
           try { this.save(stored); } catch (error) { console.warn("Could not persist a removed team workspace marker.", error); }
           if (run.status === "cancelled" && !run.goal && !run.missionId && !this.ownerPreventsRemoval(run) && !this.hasPendingPreparationFrom(stored) && await this.membersSettled(stored)) {
-            try { await this.deleteRecord(stored); }
+            try { await this.deleteRecord(stored, true); }
             catch (error) { await this.reportRemovalFailure(stored, "record", error); }
           }
         },
@@ -2297,7 +2320,7 @@ export class TeamService {
         }
         if (completionChanged) try { this.save(stored); } catch (error) { console.warn("Could not persist a completed team workspace removal.", error); }
         if (run.status === "cancelled" && !run.goal && !run.missionId && retentionMs !== undefined && elapsed >= retentionMs && await this.membersSettled(stored)) {
-          try { await this.deleteRecord(stored); }
+          try { await this.deleteRecord(stored, true); }
           catch (error) { await this.reportRemovalFailure(stored, "record", error); }
         }
         return;
@@ -2306,12 +2329,16 @@ export class TeamService {
       if (this.needsPublication(stored)) { this.startPublication(stored); return; }
 
       run.workspaceRemovedAt = this.retentionNow();
+      // The key names the fact, not the time, so a retried removal stores the same event once.
+      const settledKey = runEventKey("run.settled", run.id, [run.revision, "blocked", "workspace-removed"]);
+      if (run.status === "blocked") this.emit(stored, "run.settled", [run.revision, "blocked", "workspace-removed"], {}, { status: "blocked", summary: runSummaryCounts(run) });
       const startedAt = run.workspaceRemovedAt, previousEvents = run.events.slice();
       this.event(stored, "Workspace removal under the retention policy started.");
       try { this.save(stored); }
       catch (error) {
         run.workspaceRemovedAt = undefined;
         run.events = previousEvents;
+        if (stored.outbox) stored.outbox = stored.outbox.filter(event => event.key !== settledKey);
         console.warn("Could not persist a started team workspace removal.", error);
         return;
       }
@@ -4056,6 +4083,7 @@ export class TeamService {
           }];
           run.workspace = result.workspace; run.baseCommit = result.baseHeadCommit; run.headCommit = result.baseHeadCommit;
           run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
+          this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "moved-base", fromRevision: previousRevision, baseChanged: true });
           run.brief = undefined; run.noChange = undefined; stored.deliveryAttempt = undefined;
           const attempts = run.deliveryRecovery?.attempts ?? run.recovery?.attempts ?? 0;
           run.deliveryRecovery = { attempts, status: "replanning", revision: run.revision, headCommit: run.headCommit,

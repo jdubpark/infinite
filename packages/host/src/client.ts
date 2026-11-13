@@ -868,7 +868,8 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         throw error;
       }
       if (options["--json"]) console.log(JSON.stringify(result, null, 2));
-      else console.log(`Profile ${clean(result.profileId)} (${[result.provider, result.model, result.effort].map(value => clean(value ?? "none")).join(" ")}) is in epoch ${result.epoch} since ${clean(result.since)}.`);
+      // A missing model or effort is left out: `none` is a real OpenCode variant, and must not stand for "no effort".
+      else console.log(`Profile ${clean(result.profileId)} (${[result.provider, result.model, result.effort].filter((value): value is string => value !== null).map(clean).join(" ")}) is in epoch ${result.epoch} since ${clean(result.since)}.`);
       return true;
     }
     if (command === "cost" && positional[0] === "plan") {

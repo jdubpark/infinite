@@ -330,5 +330,19 @@ test("an advanced epoch retires a profile's scorecard row", { timeout: 180000 },
     const after = await f.host.fetchApi("/usage/models");
     assert.equal(after.status, 200, JSON.stringify(after.body));
     assert.deepEqual(profiles(after.body), [lineup.implementers[0]!.id]);
+
+    // A run that starts after the advance is stamped with the new epoch, and the profile's row starts again from
+    // those attempts only. This holds only if the projector's stamp and the route's lookup use the same identity.
+    const second = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(second.status), JSON.stringify(second.body));
+    const again = await f.settled(second.body.id);
+    assert.equal(again.status, "ready-for-review", JSON.stringify(again));
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${again.id}`, "owner"), response => response.status === 200 && response.body.rows.length > 0, 30000);
+    const fresh = view.body.rows.filter((row: { profileId: string }) => row.profileId === "deepseek-high");
+    assert.ok(fresh.length > 0, JSON.stringify(view.body.rows));
+    for (const row of fresh) assert.equal(row.profileEpoch, 2, JSON.stringify(row));
+    const restarted = await waitFor(() => f.host.fetchApi("/usage/models"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    const deepseek = restarted.body.rows.find((row: { profileId: string }) => row.profileId === "deepseek-high");
+    assert.equal(deepseek.attempts, fresh.length, "only the attempts of the new epoch count");
   } finally { await f.close(); }
 });

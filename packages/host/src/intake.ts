@@ -66,6 +66,12 @@ export function intakeObjective(issue: IntakeIssue, thread: SlackThreadMessage[]
   return parts.join("\n\n").slice(0, objectiveLimit);
 }
 
+/** A Slack timestamp (`seconds.fraction`) as whole epoch milliseconds, so comparisons never depend on float rounding. */
+function slackMilliseconds(ts: string): number {
+  const [seconds, fraction = "0"] = ts.split(".");
+  return Number(seconds) * 1000 + Number(fraction.slice(0, 3).padEnd(3, "0"));
+}
+
 function outcomeBody(mission: Mission): string {
   if (mission.status === "ready-for-review")
     return sharedText(`Infinite agent report: ready for review.${mission.result?.summary ? `\n\n${mission.result.summary}` : ""}`);
@@ -78,6 +84,7 @@ export class IntakeService {
   private unsubscribe?: () => void;
   private closed = false;
   private inFlight?: Promise<void>;
+  private lastError?: { at: string; step: string; message: string };
   private readonly pollMs: number;
 
   constructor(
@@ -136,20 +143,30 @@ export class IntakeService {
   }
 
   private async cycle(): Promise<void> {
-    await this.attempt(() => this.admit());
-    await this.attempt(() => this.startQueued());
+    await this.attempt("admit", () => this.admit());
+    await this.attempt("start", () => this.startQueued());
     for (const record of this.store.list())
       if (record.state === "started" && record.missionId) {
         const mission = this.missions.peek(record.missionId);
         if (mission) this.observe(mission);
       }
-    await this.attempt(() => this.watch());
-    await this.attempt(() => this.deliver());
+    await this.attempt("watch", () => this.watch());
+    await this.attempt("deliver", () => this.deliver());
   }
 
-  /** A failing step or item is logged by its next retry, never by a rejection, so the rest of the cycle still runs. */
-  private async attempt(run: () => unknown): Promise<void> {
-    try { await run(); } catch { /* retried on a later cycle */ }
+  /** Each failure is kept as `lastError` and its work is retried on a later cycle; a rejection never escapes a cycle. */
+  private async attempt(step: string, run: () => unknown, identifier?: string): Promise<void> {
+    try { await run(); } catch (error) { this.fail(step, error, identifier); }
+  }
+
+  private fail(step: string, error: unknown, identifier?: string): void {
+    const text = sharedText(error instanceof Error ? error.message : "The step failed.").slice(0, 500);
+    this.lastError = { at: new Date().toISOString(), step, message: identifier ? `${identifier}: ${text}` : text };
+  }
+
+  /** The newest failure of any step; the cycle keeps running past it. */
+  status(): { lastError?: { at: string; step: string; message: string } } {
+    return this.lastError ? { lastError: { ...this.lastError } } : {};
   }
 
   private async admit(): Promise<void> {
@@ -160,7 +177,7 @@ export class IntakeService {
     for (const issue of candidates) {
       if (this.closed) return;
       if (!this.qualifies(issue, enabledAt) || this.store.get(issue.id)) continue;
-      await this.attempt(() => this.admitIssue(issue));
+      await this.attempt("admit", () => this.admitIssue(issue), issue.identifier);
     }
   }
 
@@ -188,7 +205,10 @@ export class IntakeService {
         if (Date.now() - Date.parse(issue.createdAt) < threadUnreadableMs) return;
         return this.skip(issue, "thread-unreadable");
       }
-      if (!this.mentionsAgent(read, issue)) return this.skip(issue, "no-owner-mention");
+      // With a creator, the owner must have mentioned the agent before filing. Without one, the thread alone decides:
+      // the newest mention of the agent before filing must be the owner's.
+      const authored = creatorId !== undefined ? this.ownerMentionedBeforeFiling(read, issue) : this.newestMentionIsOwners(read, issue);
+      if (!authored) return this.skip(issue, "no-owner-mention");
       messages = read;
     } else if (issue.thread && this.options.threads) {
       // Background only: a failed or unreadable read admits the issue without a thread section, with no wait or retry.
@@ -197,7 +217,8 @@ export class IntakeService {
     const rule = [
       `label "${intake.linear.label}"`,
       ...(creatorId !== undefined ? ["owner creator"] : []),
-      ...(intake.requireSlackThread ? ["owner Slack mention"] : []),
+      ...(creatorId !== undefined && intake.requireSlackThread ? ["owner Slack mention"] : []),
+      ...(creatorId === undefined ? [`newest Slack mention of Linear's agent before creation is the owner's`] : []),
     ].join(", ");
     const now = new Date().toISOString();
     const request: CreateMission = {
@@ -221,12 +242,24 @@ export class IntakeService {
     } catch { return undefined; }
   }
 
-  private mentionsAgent(thread: SlackThreadMessage[], issue: IntakeIssue): boolean {
-    const slack = this.config.intake!.slack;
-    if (slack?.linearAgentUserId === undefined) return false;
-    const mention = `<@${slack.linearAgentUserId}>`;
-    return thread.some(message => message.user === slack.ownerUserId && message.botId === undefined
-      && message.text.includes(mention) && Number(message.ts) * 1000 >= Date.parse(issue.createdAt));
+  /** Mentions of Linear's agent by humans, timestamped strictly before the issue was filed, oldest first. */
+  private mentionsBeforeFiling(thread: SlackThreadMessage[], issue: IntakeIssue): SlackThreadMessage[] {
+    const agent = this.config.intake!.slack?.linearAgentUserId;
+    if (agent === undefined) return [];
+    const mention = `<@${agent}>`, filed = Date.parse(issue.createdAt);
+    return thread
+      .filter(message => message.botId === undefined && message.text.includes(mention) && slackMilliseconds(message.ts) < filed)
+      .sort((a, b) => slackMilliseconds(a.ts) - slackMilliseconds(b.ts));
+  }
+
+  private ownerMentionedBeforeFiling(thread: SlackThreadMessage[], issue: IntakeIssue): boolean {
+    const owner = this.config.intake!.slack?.ownerUserId;
+    return this.mentionsBeforeFiling(thread, issue).some(message => message.user === owner);
+  }
+
+  private newestMentionIsOwners(thread: SlackThreadMessage[], issue: IntakeIssue): boolean {
+    const newest = this.mentionsBeforeFiling(thread, issue).at(-1);
+    return newest !== undefined && newest.user === this.config.intake!.slack?.ownerUserId;
   }
 
   private skip(issue: IntakeIssue, reason: IntakeSkipReason): void {
@@ -257,8 +290,13 @@ export class IntakeService {
           if (!this.mirrors(next)) next.comments.started = { id: randomUUID(), body: sharedText(startedBody), delivered: false, attempts: 0 };
         });
       } catch (error) {
-        // A refusal is kept as the hold reason; any other failure leaves the record queued for the next cycle.
+        // A refusal is the hold reason. Any other failure is kept with its message, and the record stays queued for the next cycle.
         if (error instanceof TeamError) this.hold(record.issueId, error.message);
+        else {
+          this.fail("start", error, record.identifier);
+          const reason = error instanceof Error ? error.message : "The step failed.";
+          this.hold(record.issueId, `The start failed and will be retried: ${sharedText(reason).slice(0, 200)}`);
+        }
       }
     }
   }
@@ -286,14 +324,14 @@ export class IntakeService {
     if (this.closed || !finishedStatuses.has(mission.status)) return;
     const record = this.store.forMission(mission.id);
     if (!record || record.state !== "started") return;
-    this.attemptSync(() => this.store.update(record.issueId, next => {
+    this.attemptSync("observe", () => this.store.update(record.issueId, next => {
       next.state = "finished";
       if (!this.mirrors(next)) next.comments.outcome = { id: randomUUID(), body: outcomeBody(mission), delivered: false, attempts: 0 };
-    }));
+    }), record.identifier);
   }
 
-  private attemptSync(run: () => unknown): void {
-    try { run(); } catch { /* retried on a later cycle */ }
+  private attemptSync(step: string, run: () => unknown, identifier?: string): void {
+    try { run(); } catch (error) { this.fail(step, error, identifier); }
   }
 
   private async watch(): Promise<void> {
@@ -301,10 +339,10 @@ export class IntakeService {
     if (watched.length === 0) return;
     let states: Map<string, IntakeIssue | "deleted">;
     try { states = await this.linear.states(watched.map(record => record.issueId)); }
-    catch { return; } // A failed read changes nothing.
+    catch (error) { this.fail("watch", error); return; } // A failed read changes no issue.
     for (const record of watched) {
       if (this.closed) return;
-      await this.attempt(() => this.watchRecord(record, states.get(record.issueId)));
+      await this.attempt("watch", () => this.watchRecord(record, states.get(record.issueId)), record.identifier);
     }
   }
 
@@ -336,17 +374,18 @@ export class IntakeService {
         try {
           await this.linear.comment(record.issueId, { id: pending.id, body: pending.body });
         } catch (error) {
-          const message = error instanceof Error ? error.message : "The Linear comment could not be sent.";
-          this.attemptSync(() => this.store.update(record.issueId, next => {
+          const message = sharedText(error instanceof Error ? error.message : "The Linear comment could not be sent.").slice(0, 500);
+          this.fail("deliver", error, record.identifier);
+          this.attemptSync("deliver", () => this.store.update(record.issueId, next => {
             const comment = next.comments[kind];
             if (comment) { comment.attempts += 1; comment.error = message; }
-          }));
+          }), record.identifier);
           break;
         }
-        this.attemptSync(() => this.store.update(record.issueId, next => {
+        this.attemptSync("deliver", () => this.store.update(record.issueId, next => {
           const comment = next.comments[kind];
           if (comment) { comment.delivered = true; comment.attempts += 1; delete comment.error; }
-        }));
+        }), record.identifier);
       }
     }
   }

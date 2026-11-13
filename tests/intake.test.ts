@@ -76,7 +76,8 @@ async function setup(options: { groupId?: string; maxActive?: number; requireSla
   /** A default issue: created after enable, owned by the owner, labelled, with a thread that mentions the agent. */
   const issue = (overrides: Partial<IntakeFixtureIssue> = {}, offset = 2000): IntakeFixtureIssue => {
     const thread = addThread(offset, ownerMention);
-    return linearServer.file({ createdAt: new Date(enabled + 1000).toISOString(), attachmentUrls: [thread.link], ...overrides });
+    // The default owner mention is at enabled + 2000 and the issue is filed at enabled + 3000, so the mention precedes filing.
+    return linearServer.file({ createdAt: new Date(enabled + 3000).toISOString(), attachmentUrls: [thread.link], ...overrides });
   };
   return {
     h: built, scripted: built as ReturnType<typeof scriptedMissionHarness>, store, missions, threads, control, linear, linearServer, config, enabled, intake, service, addThread, issue,
@@ -134,18 +135,94 @@ test("an unlabelled owner issue, an archived one, a closed one, and one older th
   } finally { await ctx.close(); }
 });
 
-test("a thread without the owner's mention of Linear's agent is skipped", { timeout: 60000 }, async () => {
+test("a thread without the owner's mention of Linear's agent before filing is skipped", { timeout: 60000 }, async () => {
   const ctx = await setup();
   try {
     // A teammate's mention of the agent does not count.
-    const teammate = ctx.addThread(3000, root => [{ ts: root, user: TEAMMATE_SLACK, text: `<@${AGENT_SLACK}> export this` }]);
-    // The owner's mention is timestamped before the issue existed, so it does not count either.
-    const early = ctx.addThread(4000, root => [{ ts: slackTs(ctx.enabled + 500), user: OWNER_SLACK, text: `<@${AGENT_SLACK}> export this` }, { ts: root, user: OWNER_SLACK, text: "no mention" }]);
-    const teammateIssue = ctx.linearServer.file({ createdAt: ctx.iso(1000), attachmentUrls: [teammate.link] });
-    const earlyIssue = ctx.linearServer.file({ createdAt: ctx.iso(1000), attachmentUrls: [early.link] });
+    const teammate = ctx.addThread(2000, root => [{ ts: root, user: TEAMMATE_SLACK, text: `<@${AGENT_SLACK}> export this` }]);
+    // The owner's mention is timestamped after the issue was filed, so it does not count either.
+    const late = ctx.addThread(4000, root => [{ ts: root, user: OWNER_SLACK, text: `<@${AGENT_SLACK}> export this` }]);
+    const teammateIssue = ctx.linearServer.file({ createdAt: ctx.iso(3000), attachmentUrls: [teammate.link] });
+    const lateIssue = ctx.linearServer.file({ createdAt: ctx.iso(3000), attachmentUrls: [late.link] });
     await ctx.intake.poll();
     assert.equal(viewOf(ctx, teammateIssue.id)!.skipReason, "no-owner-mention");
-    assert.equal(viewOf(ctx, earlyIssue.id)!.skipReason, "no-owner-mention", "An owner mention before the issue was created does not count");
+    assert.equal(viewOf(ctx, lateIssue.id)!.skipReason, "no-owner-mention", "An owner mention after filing does not count");
+  } finally { await ctx.close(); }
+});
+
+test("an owner's mention counts only when it is before filing: before admits, equal and after are skipped", { timeout: 120000 }, async () => {
+  const ctx = await setup();
+  try {
+    const before = ctx.issue({}, 2000);
+    const equal = ctx.addThread(3000, ownerMention);
+    const equalIssue = ctx.linearServer.file({ createdAt: ctx.iso(3000), attachmentUrls: [equal.link] });
+    const after = ctx.addThread(4000, ownerMention);
+    const afterIssue = ctx.linearServer.file({ createdAt: ctx.iso(3000), attachmentUrls: [after.link] });
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, before.id)!.state, "started", "A mention before filing admits");
+    assert.equal(viewOf(ctx, equalIssue.id)!.skipReason, "no-owner-mention", "A mention at the filing instant does not admit");
+    assert.equal(viewOf(ctx, afterIssue.id)!.skipReason, "no-owner-mention", "A mention after filing does not admit");
+  } finally { await ctx.close(); }
+});
+
+test("without creatorId, a mention made after filing does not admit a teammate's issue", { timeout: 60000 }, async () => {
+  const ctx = await setup({ creator: false });
+  try {
+    const late = ctx.addThread(4000, ownerMention);
+    const issue = ctx.linearServer.file({ createdAt: ctx.iso(3000), creatorId: randomUUID(), attachmentUrls: [late.link] });
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, issue.id)!.skipReason, "no-owner-mention");
+    assert.equal(ctx.linearServer.comments(issue.id).length, 0);
+  } finally { await ctx.close(); }
+});
+
+test("without creatorId, a teammate's issue in a thread where the owner mentioned the agent earlier and the teammate later is skipped and nothing is written to it", { timeout: 60000 }, async () => {
+  const ctx = await setup({ creator: false });
+  try {
+    const thread = ctx.addThread(2000, root => [
+      { ts: root, user: OWNER_SLACK, text: `<@${AGENT_SLACK}> file this` },
+      { ts: slackTs(ctx.enabled + 2500), user: TEAMMATE_SLACK, text: `<@${AGENT_SLACK}> file this too` },
+    ]);
+    const issue = ctx.linearServer.file({ createdAt: ctx.iso(3000), creatorId: randomUUID(), attachmentUrls: [thread.link] });
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, issue.id)!.skipReason, "no-owner-mention", "The newest mention before filing is a teammate's");
+    assert.equal(ctx.linearServer.comments(issue.id).length, 0, "Nothing is written to the skipped issue");
+    assert.equal(ctx.missions.list().length, 0);
+  } finally { await ctx.close(); }
+});
+
+test("without creatorId, the owner's issue where the owner's mention is the newest before creation starts one mission", { timeout: 60000 }, async () => {
+  const ctx = await setup({ creator: false });
+  try {
+    const thread = ctx.addThread(2000, root => [
+      { ts: slackTs(ctx.enabled + 1500), user: TEAMMATE_SLACK, text: `<@${AGENT_SLACK}> an earlier request` },
+      { ts: root, user: OWNER_SLACK, text: `<@${AGENT_SLACK}> file this` },
+    ]);
+    const issue = ctx.linearServer.file({ createdAt: ctx.iso(3000), attachmentUrls: [thread.link] });
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, issue.id)!.state, "started");
+    const started = ctx.missions.peek(missionRequestId(issue.id))!;
+    assert.equal(started.events[0].text.startsWith(`Mission started by intake from TEST-1: label "infinite", newest Slack mention of Linear's agent before creation is the owner's.`), true);
+    assert.equal(ctx.missions.list().length, 1);
+  } finally { await ctx.close(); }
+});
+
+test("with creatorId, a teammate-created issue is skipped even when the thread qualifies", { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const issue = ctx.issue({ creatorId: randomUUID() });
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, issue.id)!.skipReason, "creator-mismatch");
+    assert.equal(ctx.missions.list().length, 0);
+  } finally { await ctx.close(); }
+});
+
+test("with creatorId, an issue Linear reports without a creator is skipped", { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const issue = ctx.issue({ creatorId: null });
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, issue.id)!.skipReason, "creator-mismatch");
   } finally { await ctx.close(); }
 });
 
@@ -175,7 +252,7 @@ test("an unreadable thread is retried, then recorded as skipped after 60 minutes
   try {
     const first = ctx.addThread(2000, ownerMention);
     ctx.threads.unreadable.add(first.root);
-    const firstIssue = ctx.linearServer.file({ createdAt: ctx.iso(1000), attachmentUrls: [first.link] });
+    const firstIssue = ctx.linearServer.file({ createdAt: ctx.iso(3000), attachmentUrls: [first.link] });
     await ctx.intake.poll();
     assert.equal(viewOf(ctx, firstIssue.id), undefined, "An unreadable thread records nothing in its first hour");
     ctx.threads.unreadable.delete(first.root);
@@ -185,7 +262,7 @@ test("an unreadable thread is retried, then recorded as skipped after 60 minutes
     mock.timers.enable({ apis: ["Date"], now: ctx.enabled + 2000 });
     const second = ctx.addThread(3000, ownerMention);
     ctx.threads.unreadable.add(second.root);
-    const secondIssue = ctx.linearServer.file({ createdAt: ctx.iso(1000), attachmentUrls: [second.link] });
+    const secondIssue = ctx.linearServer.file({ createdAt: ctx.iso(3000), attachmentUrls: [second.link] });
     await ctx.intake.poll();
     assert.equal(viewOf(ctx, secondIssue.id), undefined, "Still within the hour");
     mock.timers.tick(61 * MINUTE);
@@ -232,7 +309,7 @@ test("a restart between the record and the mission yields one mission", { timeou
 test("a fourth request queues behind three and starts when one waits on the owner", { timeout: 300000 }, async () => {
   const ctx = await setup({ maxActive: 3 });
   try {
-    const issues = [1, 2, 3, 4].map(n => ctx.issue({ createdAt: ctx.iso(1000 + n) }, 2000 + n * 10));
+    const issues = [1, 2, 3, 4].map(n => ctx.issue({ createdAt: ctx.iso(3000 + n) }, 2000 + n * 10));
     await ctx.intake.poll();
     const states = () => ctx.list().map(view => view.state);
     assert.deepEqual(states(), ["started", "started", "started", "queued"]);
@@ -536,4 +613,86 @@ test("a malformed Linear node leaves its issue unchanged, and another issue's cl
     assert.equal(ctx.missions.peek(missionRequestId(closed.id))!.status, "paused");
     assert.equal(ctx.missions.peek(missionRequestId(closed.id))!.reason, "The Linear issue was closed.");
   } finally { await ctx.close(); }
+});
+
+test("a start that fails for another reason keeps its message as the hold reason, and a later cycle starts it", { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const issue = ctx.issue();
+    ctx.control.blocked = new Error("The checkout went missing at /tmp/inf-checkout");
+    await ctx.intake.poll();
+    const failed = viewOf(ctx, issue.id)!;
+    assert.equal(failed.state, "queued");
+    assert.equal(failed.holdReason, "The start failed and will be retried: The checkout went missing at [local path omitted]");
+    assert.equal(ctx.intake.status().lastError?.step, "start");
+    assert.equal(ctx.missions.list().length, 0);
+    ctx.control.blocked = undefined;
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, issue.id)!.state, "started");
+    assert.equal(viewOf(ctx, issue.id)!.holdReason, undefined);
+  } finally { await ctx.close(); }
+});
+
+test("one unexpected admission failure for one issue does not stop the other issues in the cycle and is reported", { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    // Reads run in candidate order, so the failing read belongs to the first issue.
+    const failing = ctx.issue({}, 2000);
+    const healthy = ctx.issue({}, 2100);
+    ctx.threads.failNext = 1;
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, failing.id), undefined, "The failed issue records nothing and is retried");
+    assert.equal(viewOf(ctx, healthy.id)!.state, "started", "The other issue is admitted in the same cycle");
+    const error = ctx.intake.status().lastError!;
+    assert.equal(error.step, "admit");
+    assert.match(error.message, /^TEST-1: /);
+    assert.ok(error.at);
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, failing.id)!.state, "started", "The failed issue is admitted on the next cycle");
+  } finally { await ctx.close(); }
+});
+
+test("a started intake service records a mission's outcome from the mission change, before any further poll", { timeout: 120000 }, async () => {
+  const ctx = await setup();
+  const live = ctx.service();
+  try {
+    const issue = ctx.issue();
+    await ctx.intake.poll();
+    live.start();
+    await live.poll(); // joins the start-up cycle, so the next change is observed by the listener alone
+    const id = missionRequestId(issue.id);
+    await ctx.missions.cancel(id, { requestId: randomUUID(), revision: ctx.missions.peek(id)!.revision });
+    const record = ctx.store.get(issue.id)!;
+    assert.equal(record.state, "finished", "The cancelled mission finishes the record without a poll");
+    assert.match(record.comments.outcome!.body, /^Infinite agent report: cancelled\./);
+  } finally { live.close(); await ctx.close(); }
+});
+
+test("a malformed creator field keeps an issue out of candidates, and states leaves it out", { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const neverAdmitted = ctx.issue({}, 2000);
+    ctx.linearServer.malformCreator(neverAdmitted.id);
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, neverAdmitted.id), undefined, "Candidates skip a node whose creator is malformed");
+    const started = ctx.issue({}, 2100);
+    await ctx.intake.poll();
+    assert.equal(viewOf(ctx, started.id)!.state, "started");
+    ctx.linearServer.malformCreator(started.id);
+    ctx.linearServer.edit(started.id, { stateType: "completed" });
+    await ctx.intake.poll();
+    assert.equal(ctx.store.get(started.id)!.closure, undefined, "States leaves the malformed node out, so nothing is read as closed");
+    assert.equal(ctx.missions.peek(missionRequestId(started.id))!.status, "planning");
+  } finally { await ctx.close(); }
+});
+
+test("issueFacts reads a missing creator as no creator and rejects a malformed one", () => {
+  const node = {
+    id: randomUUID(), identifier: "TEST-9", url: "https://linear.example.invalid/issue/TEST-9", title: "Title", description: null,
+    createdAt: "2026-11-13T09:00:00.000Z", updatedAt: "2026-11-13T09:00:00.000Z", archivedAt: null, team: { id: randomUUID() },
+    state: { type: "started" }, labels: { nodes: [{ name: "infinite" }] }, attachments: { nodes: [] },
+  };
+  assert.equal(issueFacts({ ...node, creator: null }).creatorId, undefined);
+  assert.equal(issueFacts(node).creatorId, undefined);
+  assert.throws(() => issueFacts({ ...node, creator: { id: "not-a-uuid" } }));
 });

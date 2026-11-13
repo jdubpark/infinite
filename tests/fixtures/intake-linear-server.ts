@@ -26,7 +26,7 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
   const issues = new Map<string, IntakeFixtureIssue>(), comments = new Map<string, IntakeFixtureComment>();
   const calls: { operation: string; variables: Record<string, any> }[] = [];
   let loseNext = false, unavailableValue = false, count = 0;
-  const malformed = new Set<string>();
+  const malformed = new Set<string>(), malformedCreator = new Set<string>();
   const now = options.clock ?? (() => Date.now());
   const stamp = () => new Date(now()).toISOString();
 
@@ -35,7 +35,7 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
     createdAt: issue.createdAt, updatedAt: issue.updatedAt, archivedAt: issue.archivedAt,
     team: { id: issue.teamId }, state: { type: issue.stateType },
     labels: { nodes: issue.labels.map(name => ({ name })) },
-    creator: issue.creatorId ? { id: issue.creatorId } : null,
+    creator: malformedCreator.has(issue.id) ? { id: "not-a-uuid" } : issue.creatorId ? { id: issue.creatorId } : null,
     attachments: { nodes: issue.attachmentUrls.map(url => ({ url })) },
   });
   const server = createServer(async (request, response) => {
@@ -110,6 +110,8 @@ export async function startIntakeLinearServer(options: { clock?: () => number } 
     },
     /** Returns the issue's node in a shape that intake cannot read; the issue still exists. */
     corrupt(id: string) { malformed.add(id); },
+    /** Gives the issue a creator field that is not a Linear user ID. */
+    malformCreator(id: string) { malformedCreator.add(id); },
     /** Deletes an issue; later state reads omit it. */
     remove(id: string) { issues.delete(id); },
     /** Comments on an issue, oldest first. */

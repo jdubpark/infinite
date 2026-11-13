@@ -9,11 +9,14 @@ export interface IntakeIssue {
 }
 
 const issueFields = "id identifier url title description createdAt updatedAt archivedAt team { id } state { type } labels { nodes { name } } creator { id } attachments { nodes { url } }";
+// Creator and thread fields are read only in issueFacts, next to the query text that asks for them.
 const issueNode = z.object({
   id: z.uuid(), identifier: z.string().min(1).max(100), url: z.url().max(2048), title: z.string().min(1).max(512),
   description: z.string().max(64000).nullable(), createdAt: z.iso.datetime(), updatedAt: z.iso.datetime(), archivedAt: z.iso.datetime().nullable(),
   team: z.object({ id: z.uuid() }), state: z.object({ type: z.string().min(1).max(40) }),
   labels: z.object({ nodes: z.array(z.object({ name: z.string().max(200) })).max(250) }),
+});
+const creatorAndThreadNode = z.object({
   creator: z.object({ id: z.uuid() }).nullable().optional(),
   attachments: z.object({ nodes: z.array(z.object({ url: z.string().max(4096) })).max(250) }),
 });
@@ -39,12 +42,13 @@ export function parseSlackThreadLink(url: string): IntakeThread | undefined {
 /** The only place that knows Linear's field names for an issue's creator and its Slack thread link. */
 export function issueFacts(node: unknown): IntakeIssue {
   const parsed = issueNode.parse(node);
-  const thread = parsed.attachments.nodes.map(attachment => parseSlackThreadLink(attachment.url)).find((value): value is IntakeThread => value !== undefined);
+  const { creator, attachments } = creatorAndThreadNode.parse(node);
+  const thread = attachments.nodes.map(attachment => parseSlackThreadLink(attachment.url)).find((value): value is IntakeThread => value !== undefined);
   return {
     id: parsed.id, identifier: parsed.identifier, url: parsed.url, title: parsed.title, description: parsed.description ?? "",
     createdAt: parsed.createdAt, updatedAt: parsed.updatedAt, archivedAt: parsed.archivedAt,
     teamId: parsed.team.id, stateType: parsed.state.type, labels: parsed.labels.nodes.map(label => label.name),
-    ...(parsed.creator ? { creatorId: parsed.creator.id } : {}),
+    ...(creator ? { creatorId: creator.id } : {}),
     ...(thread ? { thread } : {}),
   };
 }

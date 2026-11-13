@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../packages/host/src/types.js";
@@ -59,6 +59,26 @@ test("the enable time is set once and survives a reopen", () => {
   } finally { h.close(); }
 });
 
+test("a failed first enable-time write can be retried on the same store", () => {
+  const h = setup();
+  const intakeDirectory = join(h.root, "state", "intake");
+  const metaFile = join(h.root, "state", "intake", "meta.sealed");
+  const store = h.open();
+  try {
+    rmSync(intakeDirectory, { recursive: true });
+    writeFileSync(intakeDirectory, "temporary filesystem blocker");
+    assert.throws(() => store.enabledAt());
+    rmSync(intakeDirectory, { force: true });
+
+    const recovered = store.enabledAt();
+    assert.ok(existsSync(metaFile), "the retry must publish sealed metadata");
+    assert.equal(h.open().enabledAt(), recovered);
+  } finally {
+    rmSync(intakeDirectory, { recursive: true, force: true });
+    h.close();
+  }
+});
+
 test("records survive a reopen and come back oldest first", () => {
   const h = setup();
   try {
@@ -85,6 +105,53 @@ test("a returned record is a copy", () => {
     const got = store.get(A)!;
     got.state = "finished";
     assert.equal(store.get(A)!.state, "queued");
+  } finally { h.close(); }
+});
+
+test("create detaches stored state from the input record and nested references", () => {
+  const h = setup();
+  try {
+    const store = h.open();
+    const input = record(A);
+    const externalThread = { ...thread };
+    input.thread = externalThread;
+    store.create(input);
+
+    input.state = "finished";
+    externalThread.channelId = "C0000000001";
+    assert.equal(store.get(A)!.state, "queued");
+    assert.deepEqual(store.get(A)!.thread, thread);
+  } finally { h.close(); }
+});
+
+test("update detaches stored state from callback and nested references", () => {
+  const h = setup();
+  try {
+    const store = h.open();
+    store.create(record(A));
+    const externalThread = { ...thread };
+    let retained: IntakeRecord | undefined;
+    let notifications = 0;
+    store.onChange(() => { notifications += 1; });
+    store.update(A, changed => {
+      retained = changed;
+      changed.state = "started";
+      changed.thread = externalThread;
+    });
+
+    const afterUpdate = store.get(A)!;
+    retained!.state = "finished";
+    retained!.thread!.threadTs = "2.000002";
+    externalThread.channelId = "C0000000001";
+
+    const afterAliasMutation = store.get(A)!;
+    assert.equal(afterAliasMutation.state, "started");
+    assert.deepEqual(afterAliasMutation.thread, thread);
+    assert.equal(afterAliasMutation.updatedAt, afterUpdate.updatedAt);
+    assert.equal(notifications, 1);
+    const reopened = h.open().get(A)!;
+    assert.equal(reopened.state, "started");
+    assert.deepEqual(reopened.thread, thread);
   } finally { h.close(); }
 });
 

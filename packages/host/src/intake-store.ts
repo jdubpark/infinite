@@ -44,9 +44,10 @@ export class IntakeStore {
       this.enabledAtValue = unseal<{ enabledAt: string }>(this.key, metaScope, readFileSync(this.metaFile, "utf8")).enabledAt;
       return this.enabledAtValue;
     }
-    this.enabledAtValue = now();
-    writeSealed(this.metaFile, this.key, metaScope, { enabledAt: this.enabledAtValue });
-    return this.enabledAtValue;
+    const enabledAt = now();
+    writeSealed(this.metaFile, this.key, metaScope, { enabledAt });
+    this.enabledAtValue = enabledAt;
+    return enabledAt;
   }
 
   list(): IntakeRecord[] {
@@ -73,9 +74,10 @@ export class IntakeStore {
   update(issueId: string, change: (record: IntakeRecord) => void): IntakeRecord {
     const current = this.records.get(issueId);
     if (!current) throw new Error("This issue does not have an intake record.");
-    const saved = structuredClone(current);
-    change(saved);
-    if (saved.issueId !== issueId) throw new Error("An intake record issue ID cannot be changed.");
+    const changed = structuredClone(current);
+    change(changed);
+    if (changed.issueId !== issueId) throw new Error("An intake record issue ID cannot be changed.");
+    const saved = structuredClone(changed);
     saved.updatedAt = now();
     this.trim(saved);
     writeSealed(join(this.recordsDirectory, `${issueId}.sealed`), this.key, recordScope(issueId), saved);

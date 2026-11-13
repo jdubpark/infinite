@@ -1482,3 +1482,257 @@ export function backfillTick(store: EvidenceStore, runs: () => TeamRun[], option
 - Held yes, `landing`, `hold_until`, `outcome_signals`, the base branch scan, and the `scan-gap` flag. Held stays unknown unless accepted is no.
 - Cells, the scorecard switch-over, `GET /api/outcomes`, roll-ups, and blind indexes for goal and mission.
 - The legacy import, the `duel` and `replay` sources, `experiment_ref`, the `teams.outcomes` configuration keys, the purge, member results in the backfill, and remote access for the new route.
+
+# Slice: scorecard switch-over
+
+Spec part 7 and delivery order 3, with acceptance 2 and 7. `GET /api/usage/models` reads outcome rows instead of run records and keeps the `ModelUsage` shape. An in-process cells query serves the `display` and `decision` uses. `GET /api/outcomes` returns display cells, and `infinite usage outcomes` prints them. It builds on the projection slice, which must merge first.
+
+**The assignment query and the rows query wait.** *(My call: nothing in this repository reads them yet, and the assignment query's total cost needs the usage ledger. This slice puts every rule they share with cells into `rowUse`, so each later query adds a reader and no rule.)*
+
+**The numbers change on purpose.** Spec part 7 names three changes: an attempt integrated before a steer, a resume, or a continuation now counts; an attempt of a deleted run stays; owner stops and host stops leave the denominator. The rules below add five more. A running attempt leaves the denominator, because `attempts` is ended rows. A profile's row shows its newest identity and epoch only. A scout's rate is its completed share. Review rounds count correction rounds of every cause (`rounds.run`). Minutes run to the integration event, not to the report. `docs/teams.md` lists all eight.
+
+## Trust boundary, and what a review checks
+
+The readers are host code over rows that the projector wrote. Query parameters come from any paired device (owner, controller, or viewer), which is the role rule of `GET /api/usage/models` today. No member holds a device key: a member reaches only its session worker's report endpoint. There is no MCP surface. These values in rows originate from members: task ids, area names (the host derives them from owned paths that the project manager chose), profile ids (checked against the lineup), rubric scores, and report kinds. Cost comes from the usage service. It is evidence as relayed by the agent's account (umbrella C5), never a host receipt.
+
+Privacy follows spec part 3 and umbrella C1. A SQL filter matches a project only through `db.index("project", id)`. A project id or an area name enters a cell key only after `db.open` inside the host. Responses go to paired devices only, and `/api/outcomes` stays off the relay allow-list. `team-prompts.ts` and `team-mcp.ts` import no reader, and a test asserts it (umbrella C9 rule 3).
+
+The slice must survive:
+
+- **A store that is unavailable, or an `outcomes` module that is not ready.** Both reads answer 503 with `code: "evidence-unavailable"`. `/api/usage` is unaffected. The host never crashes.
+- **An unreadable payload.** The row is left out and counted in `unreadable`. One damaged row never empties the Cost view.
+- **A session whose usage is gone.** The row is left out of every cost figure, never counted as zero.
+- **A `decision` query that names `legacy`.** It is refused before any read.
+- **A projector that is mid-page.** Reads use the read-only connection, so they see committed pages only.
+
+Outside this slice: stored cost and its coverage, `listUsd`, signals and held yes, roll-ups, the legacy import, rows of the `duel` and `replay` sources, and every client change.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/outcome-cells.ts` (create) | Pure: the query check, row use per `display` and `decision`, cell keys, counts, the Wilson interval, spreads |
+| `packages/host/src/outcome-store.ts` (modify) | `selectOutcomes`: filtered rows with opened payloads |
+| `packages/host/src/outcome-reads.ts` (create) | `queryCells` and `productionRows`: the readiness check, the window, the read |
+| `packages/host/src/scorecard.ts` (rewrite) | `ModelUsage` from rows. Suggestions unchanged |
+| `packages/host/src/server.ts`, `packages/host/src/client.ts` (modify) | The two routes, the cost lookup, labels, `infinite usage outcomes` |
+| `docs/teams.md`, `docs/superpowers/specs/2026-11-12-outcome-ledger-design.md` (modify) | The scorecard's source and the eight changes; part 7 amended with the additive fields |
+| `tests/outcome-cells.test.ts`, `tests/outcome-reads.test.ts` (create); `tests/scorecard.test.ts` (rewrite); `tests/outcome-rules.test.ts`, `tests/usage-routes.test.ts`, `tests/outcome-routes.test.ts`, `tests/teams.test.ts`, `tests/client-args.test.ts` (modify) | Pure rules, reads with a real store, the scorecard, the routes on a host |
+
+## Review Focus
+
+1. A `decision` cell that counts what it must not: an integrated row that is not frozen, a `backfilled` or `gap` row, or the acceptance of a `same-model-review` row. Expect each one in `withheld` or with unknown levels (Task 1, `a decision withholds what it cannot use`).
+2. Unknown shown as a number: a missing or partly priced session counted as zero cost, a profile with no counted attempt sent with `rate` 0 or NaN, or a scout at 0%. Expect the row left out of the spread, no `ModelUsage` row, and the completed share (Task 1, `cost spreads use complete costs only`; Task 3, `profiles with nothing counted are left out`, `a scout's rate is its completed share`).
+3. Two epochs, two identities behind one profile id, or two feature maps of one project in one cell or one `ModelUsage` row (Task 1, `keys never merge epochs, identities, or maps`; Task 3, `one row per profile id, newest epoch only`).
+4. A `ModelUsage` number that moves for a reason the intro does not list. Expect today's cost medians for the same sessions and spec acceptance 2 (Task 4, `the scorecard keeps measured cost`, `a steered run keeps its integrated attempts in the scorecard`).
+5. A store or module that is not ready. Expect 503 from both reads, no crash, and `/api/usage` still 200 (Task 4, `the ledger reads answer 503 when the store is unavailable`).
+
+### Task 1: the cell rules
+
+**Files:** `packages/host/src/outcome-cells.ts`, `tests/outcome-cells.test.ts`, and one test in `tests/outcome-rules.test.ts`. Runs first. Tasks 2 and 3 need it.
+
+**Interfaces (consumes):** `OutcomeRow` from `outcome-store.ts`; `Exclusion`, `Level`, `Levels` from `outcome-rules.ts`. **Interfaces (produces):**
+
+```ts
+export type Source = "production" | "duel" | "replay" | "legacy";
+export const SOURCES: readonly Source[];
+export type CellUse = "display" | "decision";
+export type CellDimension = "project" | "profile" | "area" | "kind" | "risk";
+export type CellQuery = { use: CellUse; sources: Source[]; by: CellDimension[]; role: "implementer" | "scout"; projectId?: string; days?: number };
+export type LevelCount = { yes: number; no: number; unknown: number; rate: number | null; interval: [number, number] | null };
+export type Spread = { n: number; median: number; iqr: [number, number] };
+export type ExclusionCounts = { limit: number; owner: number; host: number; duel: number };
+export type Cell = {
+  key: Record<string, string>; sources: Source[]; from: string | null; to: string | null;
+  attempts: number; open: number; excluded: ExclusionCounts;
+  withheld: { backfilled: number; gap: number; unfrozen: number };
+  flagged: { backfilled: number; gap: number; "empty-result": number; "same-model-review": number };
+  levels: { integrated: LevelCount; accepted: LevelCount; firstPass: LevelCount; held: LevelCount };
+  completed?: LevelCount;                          // role "scout" only
+  tokens: Spread | null; spentUsd: Spread | null; listUsd: Spread | null; minutes: Spread | null;
+  ownerRating: { mean: number; n: number } | null; enough: boolean;
+};
+export type SessionCost = { usd: number; tokens: number; complete: boolean };
+export type CostLookup = (sessionId: string) => SessionCost | undefined;
+export type RowUse = { kind: "open" } | { kind: "excluded"; exclusion: Exclusion }
+  | { kind: "withheld"; reason: "backfilled" | "gap" | "unfrozen" } | { kind: "counted"; levels: Levels; completed: boolean };
+export type CellRefusal = "no-sources" | "legacy-in-decision" | "decision-without-profile";
+export class CellQueryRefused extends Error { constructor(readonly code: CellRefusal) }
+export const MIN_COUNTED_ROWS = 10;
+export function checkCellQuery(query: CellQuery): void;                 // throws CellQueryRefused
+export function rowUse(row: OutcomeRow, use: CellUse): RowUse;
+export function wilsonInterval(successes: number, attempts: number): [number, number] | null;
+export function median(values: readonly number[]): number | null;
+export function spread(values: readonly number[]): Spread | null;
+export function levelCount(values: readonly Level[]): LevelCount;
+export function isMetered(provider: string): boolean;
+export function completeCost(row: OutcomeRow, cost: CostLookup | undefined): SessionCost | undefined;
+export function rowMinutes(row: OutcomeRow): number | undefined;
+export function rowTime(row: OutcomeRow): string | null;              // endedAt ?? startedAt
+export function cellKey(row: OutcomeRow, by: readonly CellDimension[]): Record<string, string>;
+/** Calls checkCellQuery. Ignores `projectId` and `days`, which the reader applies. */
+export function buildCells(rows: readonly OutcomeRow[], query: CellQuery, cost?: CostLookup): Cell[];
+```
+
+**Decisions:**
+
+- `checkCellQuery` refuses, in this order: no source (`no-sources`); a `decision` that names `legacy` (`legacy-in-decision`, umbrella C6); a `decision` without `profile` in `by` (`decision-without-profile`). *(My call: a cell that pools profiles pools their epochs, and the umbrella vocabulary says two epochs never share a statistic. A display may pool, and its key then names no profile.)* `by` is a set, so a repeat is ignored.
+- **One bucket per row.** `rowUse` takes the first match: (1) `decision` and flag `backfilled`: withheld. (2) `decision` and flag `gap`: withheld. (3) disposition `open`: open. (4) an exclusion: excluded by its class. (5) `decision`, disposition `integrated`, and `frozenAt` null: withheld as `unfrozen` (spec part 7). (6) Otherwise counted. A counted failure counts as soon as it ends, in both uses (spec part 7). `completed` is true for disposition `completed`.
+- **Levels of a counted row** are the stored levels. In a `decision`, a row flagged `same-model-review` has accepted, firstPass, and held unknown (umbrella C9 rule 4). *(My call for held: held yes includes accepted yes.)*
+- **Flags.** `backfilled`: display counts it and reports it in `flagged`; decision withholds it. *(My call: the backfill rebuilds rows from records that lost facts, and its accepted is never no, so a decision would see the failures without the rejections.)* `gap`: the same. *(My call: a dropped event can leave a wrong disposition, not only an unknown level.)* `empty-result`: integrated in both uses (spec part 4), and reported. `same-model-review`: stored levels in display, the rule above in decision, and reported. `flagged` counts counted rows only. `scan-gap` arrives with the signals slice and needs no read rule, because the projector keeps held unknown.
+- **Keys.** `profile` adds `profile`, `provider`, `model`, `effort` (`none` when null), and `epoch`. `area` adds `area` and `featureMap`. Any of `area`, `kind`, or `risk` adds `featureVersion`. `project` adds `project`. `kind` is `none` when null. Project, area, and feature map come from the opened payload; numbers are decimal strings. *(My call: one profile id can name another model in another lineup, and `default` names a different model on each provider. Spec part 7: two feature maps of one project never share a cell while `area` is in `by`.)* A cell whose key has no `project` pools projects as numbers only (umbrella C9 rule 9).
+- **Sources.** `production` and `duel` rows share a cell. A `replay` or `legacy` row adds `source` to its key, so it never shares a cell with another source. `cell.sources` lists the sources present, sorted. *(My call: umbrella C6 calls production and duel real work. Replay is a prior, and legacy is an unauthenticated claim.)* A row whose source or role the query does not name is dropped.
+- **Counts.** *(My call: `withheld`, `flagged`, and `completed` are additive `Cell` fields, so no left-out row is silent, umbrella C6.)* `attempts` is the counted rows. A `LevelCount` counts yes, no, and unknown over counted rows. `rate` is `yes / (yes + no)`, null when that is 0. `interval` is `wilsonInterval(yes, yes + no)`, today's function moved unchanged from `scorecard.ts` (95%, spec part 4). `enough` is `attempts >= MIN_COUNTED_ROWS` (spec part 4). For role `scout` the four levels are zero counts with null rate and interval, and `completed` counts a completed row as yes and any other counted row as no (spec part 4).
+- **Spreads** use counted rows. *(My call: a cell describes attempts, so a failed attempt's cost counts. The scorecard keeps its medians over integrated rows.)* `tokens` uses rows that have a `completeCost`. `spentUsd` uses the same rows when `isMetered(provider)`, which is true for `opencode` only (today's rule, umbrella C5). `listUsd` is null until the owner decides on list prices. `minutes` uses `rowMinutes`: `max(0, endedAt − startedAt)` in minutes, when both exist. *(My call: the projector never writes `payload.wallMs`.)* The rows a spread left out are `attempts − n`. Quartiles interpolate linearly between closest ranks at position `(n − 1) · p`. *(My call: the default of R and NumPy. The median then equals today's for an even count.)*
+- `completeCost` is undefined without a lookup, without a session id, when the lookup gives undefined, or when `complete` is false. A missing fact never becomes a zero (spec failure modes, "Late usage").
+- `from` and `to` are the earliest and latest `rowTime` over every row of the cell, in any bucket, and null when no row has a time. *(My call: the spec types them as strings, but a sentinel row can have no time, and an invented time would mislead.)* `ownerRating` is the mean of `payload.ownerRating.score` over counted rows. Cells sort by their key entries in key order.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-cells.test.ts`, with `OutcomeRow` literals from one helper.
+
+| Test name | Assertions |
+|---|---|
+| `statistics give exact numbers` | `wilsonInterval(7, 10)` rounds to `[0.3968, 0.8922]`, and `(0, 0)` is null. `median([])` is null, and `median([3, 1, 2, 4])` is 2.5. `spread([])` is null. `spread([5])` is `{ n: 1, median: 5, iqr: [5, 5] }`. `spread([4, 1, 3, 2])` is `{ n: 4, median: 2.5, iqr: [1.75, 3.25] }`. `spread([5, 1, 4, 2, 3])` is `{ n: 5, median: 3, iqr: [2, 4] }`. `levelCount([1, 1, 0, null])` has yes 2, no 1, unknown 1, rate 2/3, and interval `wilsonInterval(2, 3)`. `levelCount([null])` has null rate and interval. |
+| `a query is refused in a fixed order` | A `decision` with sources `["production", "legacy"]` and `by: ["profile"]` throws code `legacy-in-decision`. A `decision` with `by: ["area"]` throws `decision-without-profile`. Sources `[]` throws `no-sources`. A `display` of `["legacy"]` with `by: []` passes. |
+| `display counts every row once` | One profile: open, `limit`, `owner-stop`, `host-stop`, `stalled`, integrated with accepted 1 and firstPass 1, integrated with accepted null, and `stalled` flagged `backfilled`. The display cell: attempts 4, open 1, excluded `{ limit: 1, owner: 1, host: 1, duel: 0 }`, withheld all 0, integrated yes 2 no 2 unknown 0 rate 0.5, accepted yes 1 no 2 unknown 1, firstPass yes 1 no 2 unknown 1, held yes 0 no 2 unknown 2, `flagged.backfilled` 1, enough false. |
+| `a decision withholds what it cannot use` | The same rows by `profile`, with the accepted row frozen and the other not: attempts 2, withheld `{ backfilled: 1, gap: 0, unfrozen: 1 }`, accepted yes 1 no 1 unknown 0. A frozen integrated row flagged `gap` is withheld as `gap`. An open row flagged `backfilled` is withheld, not open. A frozen `same-model-review` row with accepted 1 and firstPass 1 counts integrated yes and accepted, firstPass, and held unknown, and its display cell keeps accepted yes. A `stalled` row with `frozenAt` null counts. |
+| `keys never merge epochs, identities, or maps` | By `profile`: `light` at epochs 1 and 2 gives two cells with `epoch` `"1"` and `"2"`. Profile `default` on `claude` and on `codex` gives two cells. By `area`: project `x` with feature maps `default` and `abc` gives two cells, whose keys hold `area`, `featureMap`, and `featureVersion`. By `kind`: kind null gives `kind: "none"` and a `featureVersion`, and no `featureMap`. By `[]`: one cell with key `{}`. Effort null gives `effort: "none"`. |
+| `sources stay apart where C6 says` | A production row and a duel row of one profile give one cell with sources `["duel", "production"]`. A legacy row and a replay row give their own cells with `key.source` `legacy` and `replay`. A query for `["production"]` drops the duel row. A scout row in an implementer query is dropped. |
+| `cost spreads use complete costs only` | Lookup: `s1` gives `{ usd: 0.5, tokens: 1000, complete: true }`, `s2` gives `{ usd: 0.2, tokens: 400, complete: false }`, `s3` gives undefined. Four counted `opencode` rows on `s1`, `s2`, `s3`, and no session: `tokens` n 1 median 1000, `spentUsd` n 1 median 0.5. The same rows on `codex`: `tokens` n 1, `spentUsd` null. Without a lookup both are null. `listUsd` is null in every case. |
+| `minutes, ratings, and times` | Start 10:00 and end 10:30 gives 30. An end before the start gives 0. No end leaves the row out of `minutes`. Ratings 4 and 2 give `{ mean: 3, n: 2 }`, and none gives null. `from` and `to` are the earliest and latest `endedAt ?? startedAt`, and both are null when no row has a time. |
+| `scouts report completion` | Three completed, one stalled, and one open scout: attempts 4, open 1, `completed` yes 3 no 1 unknown 0 rate 0.75, and each of the four levels `{ yes: 0, no: 0, unknown: 0, rate: null, interval: null }`. |
+| `enough needs ten counted rows` | Nine counted rows and five open rows: false. Ten counted rows: true. |
+| `team prompts never import the ledger` (extended, `tests/outcome-rules.test.ts`) | The forbidden list gains `scorecard`. The import specifiers of `team-mcp.ts` match neither `outcome-` nor `scorecard`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-cells.test.ts tests/outcome-rules.test.ts` and the typecheck.
+
+### Task 2: the outcome reads
+
+**Files:** `packages/host/src/outcome-store.ts` (one export), `packages/host/src/outcome-reads.ts`, `tests/outcome-reads.test.ts`. Needs Task 1. Runs in parallel with Task 3.
+
+**Interfaces (consumes):** Task 1's `CellQuery`, `Cell`, `CostLookup`, `checkCellQuery`, `buildCells`; `EvidenceStore.read` and `status`; `OUTCOMES_MODULE`; `EvidenceError`. **Interfaces (produces):**
+
+```ts
+// outcome-store.ts
+export type OutcomeFilter = { sources: readonly string[]; role: "implementer" | "scout"; projectRef?: string; since?: string };
+/** Rows in `outcome_id` order. A row whose payload does not open is counted and left out. */
+export function selectOutcomes(db: EvidenceDb, filter: OutcomeFilter): { rows: OutcomeRow[]; unreadable: number };
+// outcome-reads.ts
+export type CellsResult = { cells: Cell[]; unreadable: number };
+export function queryCells(store: EvidenceStore, query: CellQuery, options: { now: string; cost?: CostLookup }): CellsResult;
+/** Source `production` only, for the scorecard. */
+export function productionRows(store: EvidenceStore, role: "implementer" | "scout"): { rows: OutcomeRow[]; unreadable: number };
+```
+
+**Decisions:**
+
+- `selectOutcomes` runs one SELECT with `source IN (…)`, `role = ?`, and, when given, `project_ref = ?` and `COALESCE(ended_at, started_at) >= ?`. A row with neither time is outside every window. It never filters on `run_deleted_at`, because a deleted run's rows count (spec part 7). Each payload opens in its own `try`. Empty `sources` returns no rows and runs no statement.
+- `queryCells`, in order: (1) `checkCellQuery`, so a refusal throws before any read. (2) The `outcomes` module must be `ready` in `store.status().modules`, else it throws `EvidenceError("unavailable", …)`. (3) `since` is `now` minus `days` × 86,400,000 ms, as an ISO string, when `days` is set. (4) Inside one `store.read`, `projectRef` is `db.index("project", projectId)`, then `selectOutcomes`. (5) `buildCells`. `productionRows` runs (2) and reads sources `["production"]`.
+- When `unreadable` is above 0, the reader logs one fixed line once per process: `Outcome reads skipped unreadable rows.` *(My call: one damaged row must not empty the Cost view. The count travels in `CellsResult`.)*
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-reads.test.ts`, with a temporary store and the module registered as `tests/outcome-store.test.ts` does. Rows are written with `writeOutcome`.
+
+| Test name | Assertions |
+|---|---|
+| `rows are read by source and role, with their payload` | A production implementer row, a duel implementer row, and a production scout row. Sources `["production"]` with role `implementer` return the first only, with `payload.projectId` `alpha`. |
+| `a project filter matches the blind index` | Rows of projects `alpha` and `beta`: the `projectRef` of `alpha` returns one row. No plain column of either row contains `alpha` or `beta`. |
+| `a window uses the end time, or the start time` | Now `2026-11-13T00:00:00.000Z`, days 7: a row ended `2026-11-06T00:00:00.000Z` is in, one ended `2026-11-05T23:59:59.999Z` is out, an open row started `2026-11-10T00:00:00.000Z` is in, and a row with neither time is out. Without `days`, all four are in. |
+| `an unreadable payload is counted` | One row's `payload` is overwritten with `"x"` through `tx.run`. The other row returns and `unreadable` is 1. `queryCells` returns `unreadable` 1 beside its cells. |
+| `a refused query never reads` | On a store with no `outcomes` module, a `decision` that names `legacy` throws `CellQueryRefused`, not `EvidenceError`. |
+| `a module that is not ready is unavailable` | With no module registered, and with a store whose path cannot open, `queryCells` and `productionRows` throw `EvidenceError` with code `unavailable`. |
+| `a deleted run's rows still count` | A row with `run_deleted_at` set appears in `productionRows`. |
+| `cells come from the store` | Rows of two profiles, display, `by: ["profile"]`: two cells whose attempts match the written rows. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-reads.test.ts tests/outcome-store.test.ts` and the typecheck.
+
+### Task 3: the scorecard from rows
+
+**Files:** `packages/host/src/scorecard.ts` (rewrite), `tests/scorecard.test.ts` (rewrite). Needs Task 1. Runs in parallel with Task 2.
+
+**Interfaces (consumes):** Task 1's `rowUse`, `median`, `wilsonInterval`, `isMetered`, `completeCost`, `rowMinutes`, `rowTime`, `MIN_COUNTED_ROWS`, `CostLookup`, `ExclusionCounts`, `Source`; `OutcomeRow`. **Interfaces (produces):**
+
+```ts
+export type ModelRow = {   // every field of today's ModelRow, same names and types, plus `excluded`
+  profileId: string; label: string; provider: string; role: string; metered: boolean;
+  attempts: number; integrated: number; rate: number; rateInterval: [number, number] | null;
+  medianUsd: number | null; medianTokens: number | null; usdPerMTok: number | null;
+  medianMinutes: number | null; meanReviewRounds: number | null;
+  rubric: { correctness: number; cleanliness: number; extensibility: number; docs: number; n: number } | null;
+  owner: { mean: number; n: number } | null; enough: boolean; excluded: ExclusionCounts };
+export type Suggestion = { text: string; profileId: string; comparedTo: string; role: string; n: [number, number] };   // unchanged
+export type Scorecard = { rubricVersion: 1; minAttempts: number; sources: Source[]; rows: ModelRow[]; suggestions: Suggestion[] };
+export { wilsonInterval } from "./outcome-cells.js";
+export function scorecardFromRows(rows: readonly OutcomeRow[], options: { role: string; label: (profileId: string) => string | undefined; cost?: CostLookup; minAttempts?: number }): Scorecard;
+```
+
+`scorecard(runs, usage)` and its `TaskUsage` callback type are removed. `server.ts` is their only caller, and Task 4 changes it.
+
+**Decisions:**
+
+- Rows with source `production` and role `options.role` are used, and every other row is dropped. `sources` is `["production"]` (spec part 7). `rowUse(row, "display")` sorts each row into open, excluded, or counted.
+- Rows with profile id `default` or `unknown` are left out. *(My call: today's scorecard skips a member with no profile, and `unknown` names no model. Both stay visible in cells.)*
+- **One row per profile id.** Rows group by profile id, provider, model, effort, and epoch. For each profile id, the group whose newest `rowTime` is latest is used, then the higher epoch on a tie, then the identity string. *(My call: the web keys its table by `profileId`, and the Mac's `id` is `profileId/role`, so a profile id gets one row. Two epochs never share a statistic. After an epoch advance or a model change behind one id, the row restarts; older groups stay in cells by profile.)*
+- A group with no counted row gives no `ModelUsage` row. *(My call: today every row had an attempt. The Mac decodes `rate` as a non-optional `Double`, NaN serializes as null, and a 0% would present nothing as failure.)*
+- **Success** is integrated yes for an implementer and disposition `completed` for a scout. The `integrated` field carries the success count. *(My call: spec part 4 defines a scout rate as its completed share. A scout's levels are none, not no, so part 7's "integrated yes" would show every scout at 0%.)*
+- **Fields.** `attempts`: counted rows. `rate`: success over attempts. `rateInterval`: `wilsonInterval(success, attempts)`. `metered`: `isMetered(provider)`. `medianUsd` and `medianTokens`: over success rows that have a `completeCost`, when metered, else null. `usdPerMTok`: as today. `medianMinutes`: over the `rowMinutes` of success rows. `meanReviewRounds`: the mean of `payload.rounds.run` over success rows (spec part 7). *(My call: correction rounds of every cause, as the ledger defines a round; `docs/teams.md` says so. `outcome_rounds.cause` allows a review-only count later.)* `rubric`: means over success rows with a version 1 `payload.rubric`. `owner`: the mean of `payload.ownerRating.score` over success rows. `enough`: attempts at or above `minAttempts`, default `MIN_COUNTED_ROWS`. `excluded`: the group's excluded rows by class. `label`: `options.label(id) ?? id`.
+- Suggestions keep today's loop and text. Rows sort by `profileId`.
+
+- [ ] **Step 1: Write the failing tests** in `tests/scorecard.test.ts`, replacing the `TeamRun` fixtures with `OutcomeRow` literals. Keep the `wilsonInterval` assertions of `Wilson interval and tiny samples retain interval without suggestion`.
+
+| Test name | Assertions |
+|---|---|
+| `counted attempts leave open and excluded rows out` | Profile `light`: two integrated, one stalled, one `owner-stop`, one `limit`, one open. Attempts 3, integrated 2, rate 2/3, `rateInterval` `wilsonInterval(2, 3)`, excluded `{ limit: 1, owner: 1, host: 0, duel: 0 }`, sources `["production"]`. |
+| `metered medians use complete costs of integrated rows` | An `opencode` profile: integrated rows on `s1` (complete, 0.002 USD, 1504 tokens), `s2` (not complete), and `s3` (no usage), and a stalled row on `s4` (complete). `medianUsd` 0.002, `medianTokens` 1504, `usdPerMTok` 0.002 / 1504 × 1,000,000. A `codex` profile with complete cost: `metered` false, `medianUsd` and `medianTokens` null. |
+| `rounds, rubric, ratings, and minutes come from integrated rows` | Two integrated rows with `rounds.run` 0 and 2, rubric correctness 4 and 2, ratings 5 and 3, and minutes 30 and 10; a stalled row with `rounds.run` 5. `meanReviewRounds` 1, rubric correctness 3 with n 2, owner `{ mean: 4, n: 2 }`, `medianMinutes` 20. An integrated row with no end time is left out of minutes only. |
+| `one row per profile id, newest epoch only` | `fast`: three rows at epoch 1 ended 2026-11-01 and two at epoch 2 ended 2026-11-10 give one row with attempts 2. `fast` on model A and then model B, both at epoch 1, gives B's rows only. |
+| `profiles with nothing counted are left out` | A profile with only open rows, one with only excluded rows, and rows with profile id `default` or `unknown`: no rows. |
+| `a scout's rate is its completed share` | Role `scout`: three completed and one stalled give integrated 3, attempts 4, rate 0.75. |
+| `other sources and roles are dropped` | A duel row and a scout row change nothing in an implementer scorecard. Role `reviewer` gives rows `[]`. |
+| `labels come from the lookup` | The lookup gives `Light` for `light` and undefined for `other`: labels `Light` and `other`. |
+| `suggestions keep today's rule` | Today's `enough metered profiles with overlapping intervals produce an advisory`, ported to rows, gives the same text and `n`. |
+| `enough needs ten counted attempts` | Nine: false. Ten: true. `minAttempts` is 10. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/scorecard.test.ts` and the typecheck.
+
+### Task 4: the routes, the CLI, and the docs
+
+**Files:** `server.ts`, `client.ts`, `docs/teams.md`, the spec, `tests/usage-routes.test.ts`, `tests/outcome-routes.test.ts`, `tests/teams.test.ts`, `tests/client-args.test.ts`. Needs Tasks 2 and 3.
+
+**Interfaces (consumes):** `queryCells`, `productionRows`, `CellsResult`, `CellQueryRefused`, `scorecardFromRows`, `UsageService.session`, `lineupProfiles`, `teams.list()`. **Interfaces (produces):** `GET /api/usage/models` (same query, same shape, plus top-level `sources` and per-row `excluded`); `GET /api/outcomes?project=&role=&by=&sources=&days=` returning `{ use: "display"; query: { role; by; sources; projectId?; days? }; cells: Cell[]; unreadable: number }`; `export function outcomeCellLines(result: CellsResult): string[]` in `client.ts`.
+
+**Decisions:**
+
+- **Cost lookup.** `sessionId => { const found = usage.session(sessionId); return found.measured ? { usd: found.cost, tokens: input + output + reasoning + cacheRead + cacheWrite, complete: found.pricing.unknown === 0 } : undefined; }`. This is today's callback, with `complete` in place of `unpriced === 0`. Both routes pass it. *(My call: the usage ledger is not on this branch. A row keeps its `session_id`, and the usage service keeps a session's records after the session and its run are deleted, so cost outlives both. A session it never measured, or lost in a rebuild from journals, is left out and never counted as zero. When the usage ledger lands, stored cost replaces the lookup.)*
+- **The two additive fields.** `sources` sits at the top of the response and `excluded` on each row. *(My call: the sources name the whole response, and exclusions belong to a profile, as in a cell.)*
+- **Labels.** Built per request: the configured lineup's labels, then the newest label in the held run records' members, then the profile id. *(My call: a row stores no label, and this keeps today's labels.)*
+- **`GET /api/usage/models`.** The query schema is unchanged. A role other than `implementer` or `scout` returns `scorecardFromRows([], …)` without a read. Otherwise `productionRows`, then `scorecardFromRows`. `EvidenceError` `unavailable` answers 503 `{ code: "evidence-unavailable", error }`. *(My call: not an empty scorecard and not a fallback to run records. Empty rows would say "no attempts yet", and the old scorecard counts by other rules, so each would present unknown as a number. The web shows "The scorecard could not be loaded" with a retry, and the phone keeps its last good value and marks it stale.)* Any other error reaches the error handler as a 500.
+- **`GET /api/outcomes`.** A strict query: `project` matches `/^[a-z0-9-]{1,80}$/`; `role` is `implementer` (default) or `scout`; `by` is a comma list of the five dimensions with no repeat, default `profile`, and an empty value means no dimension; `sources` is a comma list of the four sources, at least one, default `production`; `days` is an integer from 1 to 3650. The use is always `display`. An unknown project gives `cells: []`. It follows the role rule of `GET /api/usage/models`: every paired device. A zod error answers 400 through the existing handler, a `CellQueryRefused` answers 400 with its code, and an unavailable store answers 503 as above.
+- **CLI.** `infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json]` runs when nothing follows `outcomes` and `--run` is absent. `--by`, `--sources`, and `--days` join `CLIENT_STRING_OPTIONS`. `--json` prints the response. `outcomeCellLines` prints one line per cell: the key as `name=value` pairs through `clean`, then the sources, attempts, open, and excluded counts, and each level as `2 yes, 1 no, 0 unknown, 67% (21–94%)`, or `rate unknown`. A scout cell prints `completed` in place of the four levels. A cell that is not `enough` ends with `fewer than 10 counted attempts`. A last line reports unreadable rows when there are any, and an empty result prints `No outcome rows match.` A 503 prints `The evidence store is unavailable.` A 400 prints `The host refused the outcome query.`, followed by the response's `code` when it has one. The usage line names all three forms of the command.
+- **Docs.** `docs/teams.md`, "Model scorecard": the ledger as the source, the eight changes, `sources` and `excluded`, the 503, `GET /api/outcomes`, and the command. Spec part 7 is amended: the `Cell` fields `withheld`, `flagged`, and `completed`, the nullable `from` and `to`, `unreadable`, where `sources` and `excluded` sit in `ModelUsage`, the `decision-without-profile` refusal, and the deferred queries.
+- No change to `remote-access.ts`, the web, the phone, or the Mac. Swift's `JSONDecoder` and the two TypeScript clients ignore the added fields.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `a steered run keeps its integrated attempts in the scorecard` (teams, host) | Spec acceptance 2. `fixture()` settles at `ready-for-review`. The owner steers it, retrying `team-operation-running` as `accepted coordinator verification survives restart and a later plan that omits it` does, and it settles again. Every row that was integrated before the steer still has integrated 1 in `/outcomes/runs/:id`. The summed `integrated` of the `/usage/models` rows equals the number of rows with integrated 1 there (4 when `fixture()` plans two tasks in each revision), which is more than the current revision's integrated tasks in the run record (2), the number today's scorecard counts. |
+| `the scorecard keeps measured cost` (usage-service, host) | The existing `usage ledger prices OpenCode members, survives restart idempotently, and counts unmeasured sessions` passes with its assertions unchanged: `medianTokens` 1504 and `usdPerMTok` arrive through the row's session. A `waitFor` around the read is allowed. |
+| `display cells over a full run` (outcome-routes, host) | After `fixture()` settles, `/outcomes?by=profile` as a viewer gives 200. The summed attempts equal the run's implementer rows (2). Each key holds `profile`, `provider`, `model`, `effort`, and `epoch`, and each `sources` is `["production"]`. `sources=legacy` gives 200 and `cells: []`. `by=owner`, `by=profile,profile`, `days=0`, and `role=reviewer` give 400. |
+| `the outcomes command prints cells` (outcome-routes, host) | `usage outcomes --by profile` prints one line per cell, each containing `attempts`. `--json` parses to an object with `cells`. `--days 0` exits non-zero with the refusal text. |
+| `the ledger reads answer 503 when the store is unavailable` (usage-routes, host) | Extends `a host with an unusable evidence location still serves and reports the store unavailable`: `/usage/models` and `/outcomes` give 503 with `code: "evidence-unavailable"`, `/usage` still gives 200, and `/usage/models?role=reviewer` gives 200 with rows `[]`. |
+| `cell lines show unknown beside every rate` (client-args) | Accepted `{ yes: 1, no: 0, unknown: 3, rate: 1, interval: [0.21, 1] }` prints `1 yes, 0 no, 3 unknown`. A null rate prints `rate unknown`. A key value with a control character prints a space there. `parseClientArgs` keeps the values of `--by`, `--sources`, and `--days`. |
+
+The existing `the encrypted channel carries the phone cost screen and owner plan edits` must pass unchanged.
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement**, and amend the docs and the spec. **Step 4: Run** `tests/client-args.test.ts` and the three unit test files of Tasks 1 to 3, then `tests/usage-routes.test.ts`, `tests/outcome-routes.test.ts`, the steering test in `tests/teams.test.ts`, and the named test in `tests/usage-service.test.ts` on the host, then the typecheck.
+- [ ] **Step 5: The coordinator runs `npm run check` once, requests the independent review, and commits.**
+
+## Not in this slice
+
+- The assignment query and the rows query (the router design and memory's imports read them).
+- Stored cost: tokens, `spentUsd`, and coverage from the usage ledger, which replace the lookup. `listUsd` waits for an owner decision on list prices.
+- Signals: held yes, landing, revert, `linked-fix`, `exclusion`, the hold window, and the `scan-gap` flag.
+- Roll-ups, the legacy import, rows of the `duel` and `replay` sources, and `experiment_ref`.
+- Relay access to `/api/outcomes`, and a cache for cell reads. Each Cost view poll opens every production row of one role.
+- A review-only count of review rounds from `outcome_rounds.cause`.
+- Client follow-ups for honesty, each its own change: show `excluded` beside `n` on the web, phone, and Mac Cost views; label the scout column "Completed"; name the 503 as "the outcome ledger is unavailable"; a cells view.
+- Rates for members that have no task (a spec non-goal).

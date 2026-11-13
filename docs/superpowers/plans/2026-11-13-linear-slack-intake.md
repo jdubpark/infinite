@@ -1057,3 +1057,41 @@ Not a worker task. The coordinator follows `deploy/ubuntu/instances.md` on the h
 | Part 4 connectors and delegated scope | 6 (runbook) |
 | Checks before building | 0, with config from 1 and the fallback in 9 |
 | Testing | 3, 4, 5, 8, 9, 10 |
+
+## Amendments made during execution
+
+The task text above is the plan as approved. Reviews changed the contract in these places. The code and `docs/intake.md` follow this list where it differs from a task's text.
+
+| Area | Plan text | As built | Why |
+|---|---|---|---|
+| Authorship (Tasks 1, 8) | `intake.linear.creatorId` optional; without it the Slack thread check is the authorship gate | `creatorId` is required; an issue with another creator, or none, is skipped with `creator-mismatch`; no thread-only gate | A thread check cannot tie the owner's mention to one issue, so a teammate's issue linking the same thread would pass |
+| Mention time (Task 8) | The owner's mention is "posted before the issue was created" | Compared as times, strictly before, exact to the microsecond | The first implementation compared the wrong way round |
+| Starting a mission (Task 8) | Intake calls `missions.create` | Intake starts missions through the same admission as `POST /api/missions` (replay, project resolution, handoff guard), passed as `IntakeService` `options.create` | Every other creating route applies the handoff guard |
+| Thread background (Task 8) | Not stated for `requireSlackThread: false` | A readable linked thread is background for the objective; an unreadable one admits the issue without it | The spec ties only the mention check to the flag |
+| Failures (Tasks 8, 9) | Not stated | No text of an unexpected error reaches a record, the API, Slack, or Linear; they carry the error's name and code, and the detail goes to the host log. `IntakeService` and `IntakeSlackSurface` take a `log` option and expose `status().lastError` | Error messages carry host paths and addresses |
+| Linear field names (Task 8) | `issueFacts` is the only place that knows the creator and thread fields | The query text and `issueFacts`; no module-level schema names them | A module-level schema repeated the names |
+| Store (Tasks 2, 8) | `IntakeStore.update` notifies listeners | `create` notifies too | The Slack surface reconciles on store changes |
+| Inbound replay (Tasks 1, 9) | `IntakeInbound` has no call record | `IntakeInbound.call?: { action, decisionId?, text?, revision }`, saved before the mission call and replayed exactly | A replay routed from current mission state could turn an applied answer into a steer |
+| Delivery (Task 9) | A send is marked uncertain after a failure; the Slack key is the local key | `uncertain` is saved before each post; the key sent to Slack is `ISSUE_ID:LOCAL_KEY` | A crash after Slack accepted a post sent it twice; two records in one thread could adopt each other's receipts |
+| Composition (Task 9) | Not stated | A failed composition is retried at 5 s, 30 s, 2 min, then every 10 min | A settled mission emits no further change, so the result could be lost |
+| Text split (Task 9) | Split at 3,000 characters | The splitter also reserves room for a closing fence | A part reached 3,003 characters |
+| Slack envelopes (Task 7) | Not stated for non-event envelopes | Every envelope with an ID reaches the handler and is acknowledged after it resolves; non-event envelopes carry only the ID | The brief's contract states no exception |
+| Pause reason (Task 3) | `pause(id, input, reason?)` | The reason is part of the request fingerprint | A retry with a different reason replayed the first result |
+| Launch gate (Task 4) | The hold sets the run's reason | The hold may replace no reason, an earlier hold, or the session-slot wait; any other reason stays | A session-slot wait hid the capacity hold |
+| Report text (Task 5) | "cut at a line boundary" | Cut at the last fitting line boundary after the first character; when none fits, the start of the first line is kept | A one-paragraph answer would otherwise become the marker alone |
+| Route (Task 10) | `GET /api/intake` gains `slack?: { connected, reason?, dropped }` | `{ records, lastError?, slack? }`; `slack` is the surface's whole status | The service's and the surface's newest failure need a reader |
+| End-to-end test (Task 10) | One test, "acknowledged, asked about, answered, and reported", on an answer-only issue | Two Slack tests: the answer-only issue is acknowledged and reported in its thread; a question reaches the thread and the owner's tagged reply, sent through Socket Mode, answers it | The planned test drove no question and no inbound event, so broken reply routing would have passed |
+| Thread background wording (Tasks 8, 10) | "No teammate message is stored or acted on" | A teammate's mention or reply in a bound thread is dropped before storage. The linked thread is read once at admission, and its lines, the owner's and other people's, are kept in the mission objective as labelled background | The spec puts the linked thread in the objective; the short rule described only the inbound path. Restricting the background to the owner's lines is an open owner decision |
+| Test seams (Tasks 3, 8) | `missionHarness` | Also `scriptedMissionHarness` (exported from `tests/mission-harness.ts`) and `inProcessHost({ configure })` | Real sessions cannot reach some mission states the tests need |
+| Publishing (Task 6) | The runbook's origin placeholder | The runbook publishes the instance on a distinct HTTPS listener port of the host's tailnet name | A separate service name needs tailnet setup the plan does not assume |
+| Thread lines (Task 8) | Each thread message is one labelled line | Every line of every message carries the host's `[owner]` or `[other]` label | A teammate's multi-line message could carry a line that began with `[owner]` |
+| Reply routing (Task 9) | Replies go to the newest unfinished record in the thread | A leading `Qn` or issue identifier names the record; with more than one unfinished record and neither prefix, nothing is applied and the host lists the open identifiers; duplicates are matched across the thread by event ID and message time | Question numbers are per thread, so an answer or `cancel` could land on the wrong request |
+| Outbound text (Tasks 8, 9) | Linear bodies pass the host's existing shared-text filter | One intake filter, for Linear and Slack, also removes paths under the instance's directories, project paths, `/srv/`, `/opt/`, `/run/`, `/etc/`, and IPv4 literals | The existing filter missed the deploy target's paths, and Slack had no filter |
+| Acknowledgement (Task 9) | Posted for `started`, or `queued` under `maxActive` | A request whose start is refused or fails gets one acknowledgement with the fixed reason, then a "started" line | A misconfigured group left every request silent |
+| Thread binding (Tasks 1, 8) | A linked thread is bound whenever the issue has one | Bound only when the host read it; `commentsMirrorToSlack` without a Slack block is refused | A record could suppress Linear comments for a thread the bot cannot post to |
+| Message trim (Task 2) | The oldest messages past 400 are dropped | Only reply messages are dropped | Dropping a composed message made the surface post it again, without end |
+| Candidate query (Task 8) | The first 200 labelled issues since the enable time, archived included | Open, unarchived issues only, read to the last page (at most 10 pages, reported when reached) | Finished issues stayed in the set, and a full first page could hide every new issue |
+| Slack calls (Task 7) | Every method sent as JSON | Read methods are form-encoded; posting stays JSON | Slack documents JSON bodies for write methods only |
+| Skipped records (Task 8) | A skipped record keeps the issue's title and description | It keeps neither | Nothing reads a skipped issue's text |
+| Instance templates (Task 6) | The renderer's template list | The transcript-drain wrapper is rendered; the instance sudoers permits neither `jevcode` nor `repository-graph` | The untracked wrappers named the first instance's release and roots |
+| Commissioning check 1 | One test issue filed by the owner | Two more, from a teammate's Slack accounts, before intake is enabled | One owner-filed issue cannot show whom Linear names when someone else files |

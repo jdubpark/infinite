@@ -295,6 +295,9 @@ that qualify and starts one mission per issue. It uses the instance's existing
 }
 ```
 
+`linear.creatorId` is required. It is the owner's Linear user ID, and an issue
+created by anyone else, or with no creator, is skipped.
+
 `slack` is optional. Without it, intake still starts missions and records
 outcomes in Linear, and the owner answers questions in the apps.
 
@@ -400,8 +403,18 @@ Socket Mode. It is part of the intake service.
 
 The intake record holds the channel ID and thread root timestamp taken from the
 issue's Slack link. Every outbound call takes an intake record, not a channel,
-so the surface has no way to post anywhere else. A thread may collect several
-intake records over time; replies go to the newest one that is not finished.
+so the surface has no way to post anywhere else. A thread is bound only when
+the host read it at admission, or when the owner bound it by mention; a record
+never holds a thread the bot could not read.
+
+A thread may collect several intake records over time. A reply that starts
+with `Qn` goes to the record that asked question `n`. A reply that starts with
+an issue identifier goes to that record. Any other reply goes to the one record
+that is not finished. When more than one record in the thread is not finished
+and the reply has neither prefix, the host changes nothing and answers with
+the open identifiers, so an answer or a `cancel` never lands on the wrong
+request. (Amended during implementation; the first draft sent every reply to
+the newest unfinished record.)
 
 The bot never posts in a thread that has no bound record, including to explain
 itself.
@@ -420,6 +433,12 @@ workspace ID equals `intake.slack.teamId`.
 
 Nothing is posted for progress. Text over about 3,000 characters is split on
 line boundaries without cutting a code block.
+
+A request that starts on its first attempt gets one acknowledgement. A request
+whose start is refused or fails gets one acknowledgement that carries the
+host's fixed reason, and a short "started" line when it later starts. Every
+posted text passes a filter that replaces host paths and addresses with a
+placeholder. (Amended during implementation.)
 
 In the thread it looks like this:
 
@@ -563,7 +582,8 @@ is not a new mechanism.
   owner's Linear user ID, and the label.
 - A GitHub App installation on the organization, limited to the repositories
   the instance works on, with its credential held only by the new instance.
-- One test issue filed through Linear's Slack agent, for the checks below.
+- Test issues filed through Linear's Slack agent, for the checks below: one by
+  the owner, and two from a teammate's Slack accounts.
 - Approval of the new instance's team command launcher.
 - Provider logins for the new agent account, and the list of providers and
   models allowed to see the organization's code.
@@ -579,8 +599,21 @@ outside this repository. Each outcome has a defined path:
 1. File one issue through Linear's Slack agent and read it through the API.
    Note which field holds the creator (a person, or an app acting for one) and
    how the Slack thread link is represented.
-   - If Linear attributes such issues to an app, check 4 in Part 2 is the gate
-     for authorship and check 3 is dropped.
+   - If Linear attributes such issues to an app rather than to the owner,
+     intake skips them (`creator-mismatch`) and admits nothing filed that way.
+     Check 3 is never dropped: a thread check alone cannot tie the owner's
+     mention to one issue, so a teammate's issue that links the same thread
+     would pass. An attribution rule is designed from what Linear actually
+     records before intake is used in that workspace. (Amended during
+     implementation; the first draft dropped check 3 in this case.)
+   - One issue filed by the owner cannot show whom Linear names when someone
+     else files. Also file one issue through Linear's Slack agent from a
+     teammate's Slack account that has a linked Linear account, and one from a
+     Slack account with no Linear account, in a thread where the owner
+     mentioned Linear's agent earlier. Intake is enabled only when neither
+     issue reports the owner as its creator. If either does, a teammate's
+     request would pass checks 3 and 4, and an attribution rule is designed
+     first. (Added during implementation.)
    - If the API exposes no thread link, a thread is bound when the owner
      mentions the bot in it with the identifier of an admitted issue that has
      no thread yet. Until then the outcome goes to Linear and the apps, and

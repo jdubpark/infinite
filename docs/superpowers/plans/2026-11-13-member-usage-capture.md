@@ -385,3 +385,216 @@ export class TranscriptWatch {
 
 - Secondary transcripts (phase 2b) and the final drain (phase 2c). Until then a session with subagents or a mid-turn stop is `partial`.
 - Any ledger or client change (phase 3).
+
+---
+
+# Phase 2b: secondary transcripts
+
+Spec part 2, "Secondary transcripts", and the `secondary-missing` rule of part 3. A Claude Code subagent writes its own transcript, and the session transcript does not hold its usage. This phase reads those files through the relay, so a session with subagents can be `complete`.
+
+## Confirmed layout
+
+Checked on local Claude Code data by name shapes and counts only, on 2026-11-13:
+
+- The primary transcript is `<project>/<session>.jsonl`. Its subagent transcripts are `<project>/<session>/subagents/agent-<name>.jsonl`, flat, with one `agent-<name>.meta.json` beside each. Every one of 1,244 names matches `/^agent-[A-Za-z0-9_-]{1,120}\.jsonl$/`.
+- A subagent row with `type: "assistant"` carries `message.id`, `message.model`, and `message.usage` in the shape the primary uses. Of 13,166 such rows, none lacked a field.
+- A subagent row's `sessionId` is the parent session.
+- Files per session: median 4, 90th percentile 45, maximum 124. Four of 87 sessions hold more than 64.
+- A file can be large. The median is 1.5 MB and the largest is about 2 GB.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/transcript-secondary.ts` (create) | The name pattern, the limits, and the wire types that the relay and the watch share. No imports |
+| `packages/host/src/hook-relay.ts` (modify) | List the secondary files on the primary end mark, and stream the ones the worker asks for |
+| `packages/host/src/transcript-watch.ts` (modify) | Read secondary files, keep their end evidence, and decide the secondary state |
+| `packages/host/src/transcript-usage.ts` (modify) | The coverage rule takes the secondary state |
+| `packages/host/src/hooks.ts` (modify) | The reply fields |
+| `packages/host/src/worker.ts` (modify) | Pass the wanted list through in the transcript reply |
+| `packages/host/src/demo.ts` (modify) | A rehearsal subagent transcript, for the end-to-end test |
+| `tests/transcript.test.ts`, `tests/transcript-watch.test.ts`, `tests/transcript-usage.test.ts`, `tests/chat.test.ts` (modify) | Tests |
+| `docs/architecture.md` (modify) | One sentence on subagent usage |
+
+## Wire protocol
+
+Every new field is optional. An old relay with a new worker, and a new relay with an old worker, behave as phase 2a does.
+
+1. **Ask.** The worker's hook reply is `{ transcript: { path, after, drain, secondaries: true } }` when the transcript's provider is `claude`.
+2. **Listing.** The relay streams the primary as today. When it sends the primary end mark, and the reply asked for secondaries, and the route is `claude`, the mark carries `secondaries: { files: [{ name, size, id }], total }`. `id` names the file's identity (device and inode) as an opaque string.
+3. **Wanted.** The worker answers the end mark with `{ after, secondaries: [{ name, after }] }`. The list holds the files it wants and the byte each starts at. It is absent when the worker wants none.
+4. **Stream.** For each wanted file the relay posts chunks `{ path, secondary: name, offset, text, drain }` and, when the acknowledged cursor is at a fresh size, the text-less end mark `{ path, secondary: name, offset, end: true, drain }`. `path` is always the primary path. The worker answers each post with `{ after }`.
+
+## Review Focus
+
+1. A subagent transcript that grows while the relay reads it. Expect no end mark before the cursor reaches a fresh size, exactly as for the primary.
+2. A session with more subagent files than the limit. Expect the first 64 by name to be read, and the session to be `partial` with `secondary-missing`.
+3. A listing or a post with a name outside the pattern (`../x.jsonl`, a path, a name the relay did not list). Expect the worker to read nothing from it and the relay to open nothing for it.
+4. A new worker on a resumed session whose folder already holds subagent files. Expect them to be read from byte 0, and each record to keep its provider message id, so the ledger can drop the repeat.
+5. A subagent hook with no listing at all (an old relay, or a layout the relay does not know). Expect `partial` with `secondary-missing`, never `complete`.
+
+### Task 1: the relay lists and streams secondary files
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/transcript-secondary.ts
+/** The file name of a Claude Code subagent transcript. */
+export const SECONDARY_NAME = /^agent-[A-Za-z0-9_-]{1,120}\.jsonl$/;
+/** The most secondary transcripts one session lists, streams, and reads. */
+export const MAX_SECONDARY_FILES = 64;
+/** `id` is the file's identity, `<device>:<inode>` in decimal. A new file under an old name has another id. */
+export const SECONDARY_ID = /^[0-9]{1,20}:[0-9]{1,20}$/;
+export interface SecondaryListing { files: { name: string; size: number; id: string }[]; total: number }
+export interface SecondaryRequest { name: string; after: number }
+
+// packages/host/src/hook-relay.ts
+/** The folder that holds a primary transcript's subagent transcripts: the primary path without `.jsonl`, then `subagents`. */
+export function secondaryFolder(primary: string): string;
+/** The secondary transcripts beside `primary`. Never throws. */
+export function listSecondaries(primary: string): SecondaryListing;
+
+// packages/host/src/hooks.ts
+export interface HookReply {
+  transcript?: { path: string; after: number; drain?: number; secondaries?: boolean };
+  after?: number;
+  /** The secondary transcripts the worker wants, on the reply to a primary end mark. */
+  secondaries?: SecondaryRequest[];
+}
+```
+
+**Decisions:**
+
+- **What the path checks are for.** The relay and every file it reads belong to the agent's account. A process in that account can read the same files and can write any transcript row, so no path check here is a boundary against it, and none claims to be. The checks keep an honest session from reading the wrong files by accident: a stray symbolic link, a renamed folder, a file swapped during a run. A race that needs a second process in the agent's account to replace a folder between two system calls is outside what they guard. *(My call after review round 2. The design already says usage from this path is the provider's record as relayed and not a host receipt. The primary transcript path has the same trust: the hook payload names it.)*
+- **The folder must be real.** The relay resolves the primary's directory with `realpathSync`, joins the session name and `subagents` to it, and uses that folder only when the folder's own real path is the same string. So neither the session folder nor `subagents` is a symbolic link. Otherwise the listing is `{ files: [], total: 0 }` and nothing is streamed. `secondaryFolder(primary)` stays the plain derived path, for a caller that only builds it. *(After review: a link in either component would let the relay list and read files outside the folder derived from the primary.)*
+- `listSecondaries` reads the folder with `readdirSync(folder, { withFileTypes: true })`. It keeps an entry that is a regular file by `entry.isFile()`, so a symbolic link and a directory are left out, and whose name matches `SECONDARY_NAME`. `total` is the count of kept entries. `files` holds the first `MAX_SECONDARY_FILES` in ascending name order (plain string comparison), each with the `size` from `lstatSync`. A file whose `lstatSync` throws, or is not a regular file, is left out of `files` and stays in `total`. Any other error, including a missing folder, gives `{ files: [], total: 0 }`. The relay reads each listed file's device and inode with `lstatSync(path, { bigint: true })`, keeps them for the open check, and sends them as the entry's `id`.
+- The relay builds the listing at the moment it builds the primary end mark, after the fresh size check, so the listing is newer than the last primary byte it sent.
+- The relay streams a wanted entry only when its `name` is in the listing it just sent and its `after` is a safe integer of at least 0. It reads at most `MAX_SECONDARY_FILES` entries of the reply, in the reply's order. It opens the file by name in the real folder with the flags the primary uses (`O_RDONLY | O_NOFOLLOW | O_NONBLOCK`), and continues only when the open file is a regular file with the device and inode it listed. *(After review: a folder replaced between the listing and the open cannot redirect the read.)* A name that appears twice in the reply is streamed once.
+- One loop serves the primary and a secondary. The primary keeps its budget of 64 passes. All secondaries of one relay run share a second budget of 128 passes, where a pass is one chunk or one end mark. When the budget is spent the relay stops, and the next hook continues from the worker's cursors. *(My call: 128 passes is about 24 MB, which bounds the time a hook can add. A resumed session with many old files catches up over a few hooks.)*
+- A secondary stream that stops early (a repeated cursor, a failed post, a shrunk file) does not stop the next wanted file.
+- The 4 second process deadline and the 1.5 second post timeout do not change.
+
+- [ ] **Step 1: Write the failing tests** in `tests/transcript.test.ts`. They use a fake `fetch`, as `fakeTranscriptWorker` does, and start no server. Extend that helper or add one beside it. The helper replies to the `claude` route with `{ transcript: { path, after, drain: 7, secondaries: true } }`, answers the primary end mark with a given wanted list, and acknowledges secondary chunks per name.
+
+| Test name | Assertions |
+|---|---|
+| `the relay lists secondary transcripts on the end mark when asked` | A temp folder holds `s.jsonl`, and in `s/subagents/`: `agent-b.jsonl` (10 bytes), `agent-a.jsonl` (20 bytes), `agent-a.meta.json`, `notes.jsonl`, a directory `agent-dir.jsonl`, and a symbolic link `agent-link.jsonl` to `agent-a.jsonl`. The primary end mark equals `{ path, offset, end: true, drain: 7, secondaries: { files: [{ name: "agent-a.jsonl", size: 20, id }, { name: "agent-b.jsonl", size: 10, id }], total: 2 } }`, where each `id` is that file's `<device>:<inode>` and the two differ. When the reply does not ask, the end mark has no `secondaries` key. When the folder is missing, the listing is `{ files: [], total: 0 }`. |
+| `the relay streams the secondary transcripts the worker asks for` | The worker wants `agent-a.jsonl` from 0 and `agent-b.jsonl` from 4. After the primary end mark the posts are, in order: the chunk `{ path, secondary: "agent-a.jsonl", offset: 0, text, drain: 7 }` with all 20 bytes, the mark `{ path, secondary: "agent-a.jsonl", offset: 20, end: true, drain: 7 }`, the chunk for `agent-b.jsonl` from offset 4 with its last 6 bytes, and its mark at offset 10. |
+| `the relay opens only the names it listed` | The worker wants `notes.jsonl`, `../s.jsonl`, `agent-missing.jsonl`, `agent-link.jsonl`, an entry whose `after` is `-1`, and the listed `agent-b.jsonl` twice. Only `agent-b.jsonl` is streamed, once. A spy on `openSync` (installed with `syncBuiltinESMExports`) sees exactly one open under the `subagents` folder, for `agent-b.jsonl`. |
+| `a symbolic link in the secondary folder path is not listed` | With `s/subagents` a symbolic link to a folder that holds `agent-x.jsonl`, the end mark's listing is `{ files: [], total: 0 }`. The same holds when `s` itself is a symbolic link to a folder that holds `subagents/agent-x.jsonl`. |
+| `a file replaced after the listing is not streamed` | The fake worker replaces `agent-a.jsonl` with a new file of the same name while it answers the end mark. No post carries `secondary: "agent-a.jsonl"`. Without the replacement, the same reply streams it. |
+| `a secondary that grows while it is read ends at the new size` | The file grows while its first chunk is in flight. A second chunk carries the new bytes, and the end mark is at the new size. |
+| `a route other than claude never lists` | A `codex` hook whose reply asks for secondaries gets an end mark with no `secondaries` key. |
+| `more than 64 secondary files are listed as a cut` | With more than 64 matching files, `total` is their count, and the names in `files` equal, in full and in order, the first 64 of the sorted names. |
+| `the secondary budget is shared and stops the stream` | One secondary of 25 MB and one small secondary, both wanted from 0. The posts with a `secondary` key number 128, none is an end mark, and none names the small file. |
+| `a secondary that stops early does not stop the next one` | The worker never advances its cursor for `agent-a.jsonl` and advances for `agent-b.jsonl`. `agent-a.jsonl` gets one chunk and no mark. `agent-b.jsonl` gets its chunk and its mark. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement** `transcript-secondary.ts`, the relay changes, and the `HookReply` fields.
+- [ ] **Step 4: Run** `node --import tsx --test tests/transcript.test.ts`, then `npm run typecheck -w @infinite/host`. The existing relay tests must pass unchanged, because every new field is optional.
+
+### Task 2: the watch reads secondary transcripts and decides coverage
+
+**Interfaces (consumes):** task 1.
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/transcript-watch.ts
+export class TranscriptWatch {
+  hook(input: WatchHook): { path: string; after: number; drain: number; secondaries?: true } | undefined;
+  post(body: unknown): { messages: TranscriptMessage[]; after: number; secondaries?: SecondaryRequest[] } | undefined;
+  finish(hooks: boolean): CoverageRecord;   // unchanged
+}
+/** Whether a hook closes a turn with nothing left running: the `SessionEnd` event, or a `turn-end` signal with no background task. */
+export function closesTurn(signals: readonly { kind: string; backgroundTasks?: number; failed?: boolean }[], event: string): boolean;
+
+// packages/host/src/transcript-usage.ts
+export type SecondaryState = "none" | "complete" | "missing";
+export interface UsageCoverageInput {
+  // `subagents: boolean` is replaced by:
+  /** `none`: no subagent hook arrived and no secondary transcript is known. `complete`: every known one reached its end in the last drain. */
+  secondary: SecondaryState;
+  // the other fields do not change
+}
+```
+
+**Decisions:**
+
+- `hook` adds `secondaries: true` when the hook's transcript provider is `claude`.
+- **A subagent hook never opens or replaces the primary transcript.** When a hook from a subagent names a file other than the primary the watch already reads, or the watch reads none yet, the watch treats the hook as naming no transcript. When it names the current primary, it starts a drain like any other hook. *(My call after the worker's report: the documented payload names the main transcript on every hook, and this rule keeps the watch correct if a payload ever names the subagent's own file.)*
+- The current transcript keeps a map from name to a secondary reader, and the last listing. A secondary reader is a `TranscriptTail` with `remember` 1, whose row observer feeds a `UsageTail` built with `{ provider: "claude", secondary: true }` and no requested model. Its chat messages are discarded, so `post` returns `messages: []` for every secondary post. Each reader keeps its own end evidence `{ drain, offset }`, its required size (the largest size any listing gave for its file), and the `id` of the file it first read.
+- **Listing.** A primary end mark creates the listing only when it is applied, its `drain` is the current drain, and it carries a `secondaries` value. A valid listing is an object whose `files` is an array of at most `MAX_SECONDARY_FILES` entries, each with a `name` that matches `SECONDARY_NAME`, a safe integer `size` of at least 0, and an `id` that matches `SECONDARY_ID`, with no repeated name, and whose `total` is a safe integer of at least `files.length`. An invalid value is recorded as a cut listing with no files.
+- For each listed file, the watch finds its reader or creates one, and raises the reader's required size to the listed size when that is larger. It creates no reader beyond `MAX_SECONDARY_FILES` for one primary transcript.
+- **A transcript is cut**, and stays cut, from the first listing that is invalid, or whose `total` is greater than `files.length`, or that names a file beyond the reader limit, or that gives a reader's file another `id`, or that gives it a size below its required size or below the bytes the reader has already read. *(After review round 3: a file can grow while the relay reads it, so the reader's offset can be past every listed size.)* A replaced or shortened file is not read again: its reader's offset belongs to bytes that no longer exist. *(After review round 2: a new file under an old name, with the old length, must not inherit the old cursor.)* The secondaries of a cut transcript are never complete. *(After review: a later empty listing must not erase the knowledge that files existed and were not read.)*
+- A listed file whose `size` equals its reader's offset, with no pending line, gets end evidence for this drain from the listing itself. *(My call: the listing is the relay's fresh size check, so a post per unchanged file adds nothing.)* A file whose `size` is greater than the offset loses any end evidence it had, and goes into the wanted list as `{ name, after: offset }`. Any other file gets neither.
+- The reply to the end mark carries `secondaries` only when the wanted list is not empty.
+- **Secondary posts.** A post whose `secondary` is a string belongs to that reader. An unknown name, or a `path` that is not the current primary, returns undefined. A chunk is applied only when its `offset` equals the reader's offset. A text-less end mark that is applied, and whose `drain` is the current drain, records the reader's end evidence. A chunk never records evidence.
+- **Secondary facts belong to a transcript.** Each transcript keeps its own: whether a subagent hook arrived while it was the primary, whether any listing reported a file or was invalid, its readers, and whether it is cut. A subagent hook that arrives before any transcript is open counts for the first transcript that opens. *(After review round 2: a later transcript's reader must not answer for an earlier transcript's subagent.)*
+- **Secondary state of one transcript:**
+  - `none` when it saw no subagent hook, has no reader, and no listing of it ever reported a file or was invalid.
+  - `complete` when it has at least one reader and its secondaries are complete.
+  - `missing` in every other case. A subagent hook with no reader is therefore `missing`.
+- **Secondary state of the session**, decided in `finish`: the worst state over the current transcript and every replaced one, where `missing` is worse than `complete`, and `complete` is worse than `none`.
+- The current transcript's secondaries are complete when the transcript is not cut, the last listing belongs to the current drain, the last hook started that drain, and every reader of the transcript is in that listing with end evidence for that drain at its present offset, an offset of at least its required size, and no pending line. *(After review: an end mark below the listed size, which a truncated file produces, proves nothing about the bytes that were listed.)*
+- **A turn end with background tasks is not a turn boundary.** `closesTurn(signals, event)` is true for the `SessionEnd` event, and for a `turn-end` signal that is not `failed` and whose `backgroundTasks` is 0 or absent. A failed turn end carries no task count, so it proves nothing about what still runs. `worker.ts` passes its result as `turnEnd`. A subagent that runs in the background keeps writing usage after the turn's last hook, so that turn end cannot prove that every row was read, and the session is `partial` with `stopped-mid-turn`. *(My call. Known cost: a session that leaves a background shell running is `partial` too, because the hook payload's task list is counted and not typed. Revisit when the task type is confirmed.)*
+- **Replaced transcript.** When the primary path changes, each reader of the old transcript is finished: its usage is journaled, its rows and records join the retired counts, and a dropped line, a discarded line, or a refused row sets the retired dropped fact. The old transcript's secondary state at that moment joins the retired state by the worst-state rule. The old transcript must also have ended at a boundary: when its last drain was complete and the last hook was not a turn boundary, the session's last drain counts as not at a turn end, and the session is `partial` with `stopped-mid-turn`. The new transcript starts with no readers, no listing, and no subagent hook. *(After review round 2: a later transcript's turn end must not answer for an earlier transcript that never reached one.)*
+- **Counts.** `rows` and `records` in the coverage input include every secondary reader. `dropped` is also true when a secondary reader dropped or discarded a line or refused a row.
+- `usageCoverage` returns `partial` with `secondary-missing` when `secondary` is `missing`. The rule order does not change: `secondary-missing` follows `stopped-mid-turn` and precedes `child-threads`.
+- `worker.ts`: `onTranscript` returns `{ after, secondaries }` when the watch's reply has a wanted list, and `{ after }` otherwise.
+- `demo.ts`: when the request contains `subagent`, the rehearsal writes one assistant row to `agent-rehearsal.jsonl` in the secondary folder of its transcript, before it writes its last assistant row. The row has `isSidechain: true`, a message id `msg-demo-sub-<pid>`, the model `rehearsal-sub-model`, and usage `input_tokens: 200`, `output_tokens: 50`, with both cache counts 0. It creates the folder with mode `0700` and the file with mode `0600`. It posts no extra hook.
+- `docs/architecture.md`: after the sentence that says subagent records are dropped from chat, add one sentence: a Claude Code subagent's usage is read from its own transcript file in the session's `subagents` folder, through the same relay, and never becomes chat.
+
+- [ ] **Step 1: Write the failing tests.**
+
+In `tests/transcript-watch.test.ts`. Add a helper for a subagent row: `claudeRow` with `isSidechain: true`. `N` is the byte length of that row.
+
+| Test name | Assertions |
+|---|---|
+| `a Claude hook asks for secondaries and a Codex hook does not` | The Claude hook returns `{ path, after: 0, drain: 1, secondaries: true }`. The Codex hook's result has no `secondaries` key. |
+| `a listed secondary is read and counted` | After a primary row and its chunk, the end mark with `secondaries: { files: [{ name: "agent-a.jsonl", size: N }], total: 1 }` returns `secondaries: [{ name: "agent-a.jsonl", after: 0 }]`. The secondary chunk returns `{ messages: [], after: N }`. After the secondary end mark, `finish(true)` is `{ coverage: "complete", records: 2, provider: "claude" }`. The second usage record has `secondary: true`, and the first does not. |
+| `an unchanged secondary needs no stream` | After the test above's drain, a second turn-end hook and a primary end mark with the same listing return no `secondaries` key, and `finish(true)` is `complete`. |
+| `a secondary that grew and was not read is partial` | The second drain's listing gives `size: N + 10`. With no secondary post, `finish(true)` is `partial` with `secondary-missing`. |
+| `a subagent hook with no secondary transcript is partial` | A hook with `subagent: true`, then a complete turn-end drain whose end mark carries `secondaries: { files: [], total: 0 }`. `finish(true)` is `partial` with `secondary-missing`. The same holds when the end mark carries no `secondaries` key. This replaces `a subagent hook makes the session partial`. |
+| `a subagent hook whose secondary is read is complete` | A hook with `subagent: true`, then a turn-end drain that lists and reads one secondary to its end. `finish(true)` is `complete`. |
+| `a session without subagents is complete with an empty listing` | No subagent hook, and an end mark with `secondaries: { files: [], total: 0 }`. `finish(true)` is `complete`. |
+| `a cut listing is partial` | A listing `{ files: [one file], total: 2 }` whose one file is read to its end gives `partial` with `secondary-missing`. |
+| `the watch keeps at most 64 secondary readers` | A first drain lists 64 names, each of size 0. A second drain lists 64 other names, each of size 5. The second reply's wanted list is absent. A post for a name of the second listing returns undefined, because no reader was created, and a post for a name of the first listing returns that reader's offset. `finish(true)` is `partial` with `secondary-missing`. |
+| `an invalid listing is a cut listing` | Each of these listings returns no wanted list and gives `secondary-missing` after a subagent hook: a `files` entry named `../x.jsonl`, an entry with `size: -1`, an entry with no `id`, an entry whose `id` is `abc`, 65 entries, a repeated name, a `total` below `files.length`, and a `secondaries` value that is a string. Each fixture is wrong in one way only, and the same shape with nothing wrong is accepted. |
+| `a secondary post for an unknown name or a wrong offset changes nothing` | A post for `agent-zz.jsonl` returns undefined. A chunk for a known name at a wrong offset returns `{ messages: [], after }` with the reader's own offset, and no usage record appears. |
+| `a secondary end mark for an older drain is ignored` | A secondary grows between two drains. In the second drain the worker asks for the new bytes and reads them. With an end mark that names the second drain, `finish(true)` is `complete`. With the same posts and an end mark that names the first drain, it is `partial` with `secondary-missing`. |
+| `a subagent hook never opens or replaces the primary transcript` | A subagent hook that names a file returns undefined before any primary hook, and again after the primary is open when it names another file. A subagent hook that names the primary returns the primary path and the current offset. The primary is read once: one usage record, and `finish(true).records` is 1. |
+| `a cut or invalid listing stays partial` | With no subagent hook, a listing `{ files: [], total: 3 }` and a listing that is a string each give `partial` with `secondary-missing`. Each still does after a later turn-end drain with a valid empty listing. |
+| `a secondary end mark below the listed size is not complete` | A listing gives one file of size N. An end mark for it at offset 0 in the current drain is acknowledged, and `finish(true)` is `partial` with `secondary-missing`. |
+| `a repeated listing with a larger size withdraws the evidence` | In one drain, a listing gives the file size 0, and a second end mark gives it size N. The second reply wants the file from 0. With no secondary bytes, `finish(true)` is `partial` with `secondary-missing`. |
+| `a file that shrank is not complete` | A file read to N has evidence. The next drain lists it at a smaller size. The reply does not want it, and `finish(true)` is `partial` with `secondary-missing`. |
+| `interleaved relay runs read a secondary once` | Two drains. The older run's chunk at offset 0 is applied. The newer run's chunk at offset 0 is not applied and returns the reader's offset. The older run's end mark gives no evidence, and the newer run's end mark does. `finish(true)` is `complete` with one secondary usage record. |
+| `a turn end with background tasks is not a turn boundary` | `closesTurn` is true for a `turn-end` signal with `backgroundTasks` 0, for one with no `backgroundTasks`, and for the `SessionEnd` event with no signal. It is false for a `turn-end` signal with `backgroundTasks` 2, for a `turn-end` signal with `failed: true`, and for any other signal and event. |
+| `a replaced secondary file cuts the transcript` | A file is read to its end and the session is `complete`. The next drain lists the same name and size with another `id`. The reply does not want it, and `finish(true)` is `partial` with `secondary-missing`. It stays so after a later drain lists the first `id` again. |
+| `a shortened secondary file cuts the transcript` | After `a file that shrank is not complete`, a later drain lists the file larger than before. The reply does not want it, a chunk posted for it is refused, and `finish(true)` is still `partial` with `secondary-missing`. |
+| `a file truncated below the bytes already read cuts the transcript` | A listing gives the file its first size. The reader takes a second chunk that the relay found while streaming, and ends past the listed size. The next drain lists the file at the first size again: the reply wants nothing. The drain after that lists it at the longer size: the reply wants nothing, a post for it is refused, and `finish(true)` is `partial` with `secondary-missing`. |
+| `a replaced transcript keeps its missing subagent` | Transcript A is open, gets a subagent hook, and has a complete turn-end drain with an empty listing. Transcript B opens, lists one file, reads it to its end, and ends its turn. `finish(true)` is `partial` with `secondary-missing`. |
+| `a transcript replaced mid-turn is not complete` | Transcript A has a complete drain from a hook that is not a turn boundary. Transcript B opens and has a complete turn-end drain. `finish(true)` is `partial` with `stopped-mid-turn`. When A's last hook is a turn boundary, the same sequence is `complete`. |
+| `a listing for an older drain is ignored` | A primary end mark that names an older drain and carries a listing creates no reader and returns no wanted list. |
+| `an unterminated last row in a secondary is not complete` | A secondary chunk with no final newline, then its end mark, gives `partial` with `secondary-missing`. |
+| `a refused usage row in a secondary makes the session partial` | A secondary row whose output count is a string gives `partial` with `row-dropped`. |
+| `a changed primary path retires its secondaries` | The first transcript has one secondary read to its end, and the second transcript has none and a complete drain with an empty listing. `finish(true)` is `complete` with `records` counting both transcripts. When the first transcript's secondary was listed and not read, `finish(true)` is `partial` with `secondary-missing`. |
+
+In `tests/transcript-usage.test.ts`, the rule table test uses `secondary: "none"` for the complete case, asserts `partial` with `secondary-missing` for `secondary: "missing"`, and asserts `complete` for `secondary: "complete"`.
+
+In `tests/chat.test.ts`:
+
+| Test name | Assertions |
+|---|---|
+| `a rehearsal subagent's usage is journaled from its own transcript` | A demo session with the prompt `hook dialog subagent` runs the dialog flow of the existing usage test and is stopped. The `usage` events include one with `secondary: true`, `modelId: "rehearsal-sub-model"`, `tokens.input` 200, and `tokens.output` 50. The single `usage-coverage` event is `complete` with no reason. No chat message holds the subagent row's text. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `node --import tsx --test tests/transcript-watch.test.ts tests/transcript-usage.test.ts tests/transcript.test.ts`, then `npm run typecheck -w @infinite/host`. `tests/chat.test.ts` starts a host, so the coordinator runs it.
+- [ ] **Step 5: The coordinator runs `tests/chat.test.ts` and `npm run check`, requests the independent review, and commits.**
+
+## Not in this phase
+
+- The final drain (phase 2c). A member stopped mid-turn stays `partial`.
+- Codex child threads. They stay `partial` with `child-threads`.
+- Any ledger or client change (phase 3).

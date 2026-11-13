@@ -300,6 +300,12 @@ export type UsageCoverage = "none" | "partial" | "complete";
 export type UsageCoverageReason = "hooks-off" | "no-transcript" | "no-usage-fields" | "unsupported"
   | "row-dropped" | "drain-incomplete" | "stopped-mid-turn" | "secondary-missing" | "child-threads";
 
+/**
+ * The subagent transcripts of one session. `none`: no subagent hook and no secondary transcript was ever read.
+ * `complete`: every secondary transcript that was known reached its end in the last drain. `missing`: otherwise.
+ */
+export type SecondaryState = "none" | "complete" | "missing";
+
 export interface UsageCoverageInput {
   /** The session's provider. */
   provider: string;
@@ -311,8 +317,8 @@ export interface UsageCoverageInput {
   dropped: boolean;
   /** The last drain before exit. Undefined when no drain ran. */
   lastDrain?: { complete: boolean; turnEnd: boolean };
-  /** A hook from a subagent arrived. */
-  subagents: boolean;
+  /** The subagent transcripts of the session. */
+  secondary: SecondaryState;
   /** Codex child-thread rows were seen. */
   childThreads: boolean;
   /** Codex: `requestTotal()` differs from `cumulativeTotal()`. */
@@ -330,7 +336,7 @@ export function usageCoverage(input: UsageCoverageInput): { coverage: UsageCover
   if (input.dropped || input.totalMismatch) return { coverage: "partial", reason: "row-dropped" };
   if (!input.lastDrain || !input.lastDrain.complete) return { coverage: "partial", reason: "drain-incomplete" };
   if (!input.lastDrain.turnEnd) return { coverage: "partial", reason: "stopped-mid-turn" };
-  if (input.subagents) return { coverage: "partial", reason: "secondary-missing" };
+  if (input.secondary === "missing") return { coverage: "partial", reason: "secondary-missing" };
   if (input.childThreads) return { coverage: "partial", reason: "child-threads" };
   return { coverage: "complete" };
 }

@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import type { SecondaryRequest } from "./transcript-secondary.js";
 
 export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "mission-report" | "team-handoff" | "transcript";
 const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "mission-report", "team-handoff", "transcript"]);
@@ -13,10 +14,15 @@ export class HookPayloadError extends Error {
  * sees the relay's empty stdout, so a reply can never become a hook decision.
  */
 export interface HookReply {
-  /** Send the transcript file at `path` from byte `after` to the `transcript` route. `drain` names the drain every post echoes. */
-  transcript?: { path: string; after: number; drain?: number };
+  /**
+   * Send the transcript file at `path` from byte `after` to the `transcript` route. `drain` names the drain every
+   * post echoes. `secondaries` asks the relay to list the subagent transcripts on the primary end mark.
+   */
+  transcript?: { path: string; after: number; drain?: number; secondaries?: boolean };
   /** Acknowledged transcript bytes; the relay continues from here. */
   after?: number;
+  /** The secondary transcripts the worker wants, on the reply to a primary end mark. */
+  secondaries?: SecondaryRequest[];
 }
 
 export function startHookServer(opts: {

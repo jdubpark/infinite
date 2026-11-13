@@ -759,17 +759,45 @@ test("a comment that fails with an unexpected error keeps no part of its message
   } finally { await ctx.close(); }
 });
 
-test("outbound text drops host paths and addresses, and keeps links and branch names", () => {
+test("outbound text drops every path form at one boundary, then addresses, and keeps links and branch names", () => {
   const config = { stateDir: "/srv/infinite-data/instances/work/state", runDir: "/run/infinite-work", teams: { workspaceDir: "/data/instances/work/teams" },
-    projects: [{ id: "api", name: "API", path: "/data/instances/work/api" }] } as unknown as Config;
+    projects: [{ id: "api", name: "API", path: "/data/instances/work/api" }, { id: "web", name: "Web", path: "/data/state" }] } as unknown as Config;
+  const omitted = "[local path omitted]";
   const cases: [string, string][] = [
-    ["/srv/infinite-data/instances/work/workspaces/api/src/a.ts", "[local path omitted]"],
-    ["Edited /data/instances/work/api/src/b.ts and path=/data/instances/work/teams/run-1", "Edited [local path omitted] and path=[local path omitted]"],
-    ["Read /etc/infinite-work/config.json, then `/opt/infinite-work/bin/x`", "Read [local path omitted] then `[local path omitted]`"],
-    ["Scratch in /tmp/build-1", "Scratch in [local path omitted]"],
+    // Configured directories and host roots.
+    ["/srv/infinite-data/instances/work/workspaces/api/src/a.ts", omitted],
+    ["Edited /data/instances/work/api/src/b.ts and path=/data/instances/work/teams/run-1", `Edited ${omitted} and path=${omitted}`],
+    ["Read /etc/infinite-work/config.json, then `/opt/infinite-work/bin/x`", `Read ${omitted}, then \`${omitted}\``],
+    ["Socket at /run/infinite-work/api.sock", `Socket at ${omitted}`],
+    ["Scratch in /tmp/build-1", `Scratch in ${omitted}`],
+    ["Log at /tmp/build/out.log!", `Log at ${omitted}!`],
+    ["/home/dev/projects/app/README.md", omitted],
+    ["/private/tmp/build/out.log and /private/var/db/x", `${omitted} and ${omitted}`],
+    ["Cache: /var/folders/ab/T/build", `Cache: ${omitted}`],
+    ["Data in /srv/app/data;", `Data in ${omitted};`],
+    // The boundary: only at the start or after a character that cannot continue a name, URL path, or longer path.
+    ["feature/tmp/fix", "feature/tmp/fix"],
+    ["https://example.com/tmp/api/pull/1", "https://example.com/tmp/api/pull/1"],
+    ["https://example.com/home/page", "https://example.com/home/page"],
+    ["Docs at https://example.com/opt/x", "Docs at https://example.com/opt/x"],
+    ["(/srv/app/x)", `(${omitted})`],
+    ["path:/srv/app/x", `path:${omitted}`],
+    // Repeated slashes and `./` segments do not hide a root or a configured directory.
+    ["/./srv//app/x", omitted],
+    ["Wrote /data/./state/x and //data//state/y", `Wrote ${omitted} and ${omitted}`],
+    // Home, Windows drives, and file URLs.
+    ["Notes in ~/notes/todo.md", `Notes in ${omitted}`],
+    ["Built C:\\build\\out.log", `Built ${omitted}`],
+    ["Saved to \"D:\\work\\out.txt\"", `Saved to "${omitted}"`],
+    ["file:///srv/app/x", omitted],
+    ["See file://server/share/notes.txt.", `See ${omitted}.`],
+    ["Open FILE:///srv/app/x", `Open ${omitted}`],
+    // A trailing run of punctuation stays in the text.
+    ["(/srv/app/x).", `(${omitted}).`],
+    ["Under /srv/app/x?!", `Under ${omitted}?!`],
+    // Addresses after paths; links and branch names are kept.
     ["Host 192.0.2.7:8080 answered; 192.0.2.8.", "Host [address omitted]:8080 answered; [address omitted]."],
     ["Pull request: https://github.com/example/api/pull/1", "Pull request: https://github.com/example/api/pull/1"],
-    ["Docs at https://example.com/opt/x", "Docs at https://example.com/opt/x"],
     ["Branch: example/web infinite/web-change", "Branch: example/web infinite/web-change"],
   ];
   for (const [input, expected] of cases) assert.equal(outboundText(config, input), expected, input);

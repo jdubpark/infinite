@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
-import { LinearFailure, sharedText } from "./linear.js";
+import { LinearFailure } from "./linear.js";
 import { SlackError } from "./slack-client.js";
 import { IntakeLinear, type IntakeIssue } from "./intake-linear.js";
 import { deterministicUuid, missionRequestId, type IntakeRecord, type IntakeSkipReason, type IntakeThread, type IntakeThreadReader, type IntakeView, type SlackThreadMessage } from "./intake-types.js";
@@ -95,15 +95,25 @@ export function failureSummary(error: unknown): string {
 }
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Every path form starts at the start of the text or after a character that cannot continue a name, a URL path, or a longer path. */
+const pathStart = "(?<![A-Za-z0-9._~%/-])";
+/** A path runs to whitespace or a quote or angle bracket; a trailing run of punctuation is given back to the text. */
 const pathRest = "[^\\s<>\"'`]*";
-/** A leading `/` of a host root counts only at the start or after a character that cannot be part of a URL or a longer path. */
-const hostRoots = new RegExp(`(^|[^A-Za-z0-9\\-._~:/?#\\[\\]@!$&'()*+,;=%])/(?:srv|opt|run|etc)/${pathRest}`, "g");
+/** The trailing run of `) ] , ; : . ! ?`, found by a scan from the end so a long run costs linear time. */
+const trailingPunctuation = (path: string) => {
+  let end = path.length;
+  while (end > 0 && ")],;:.!?".includes(path[end - 1])) end -= 1;
+  return path.slice(end);
+};
+const hostRoots = [["srv"], ["opt"], ["run"], ["etc"], ["Users"], ["home"], ["tmp"], ["private", "tmp"], ["private", "var"], ["var", "folders"]];
+/** `/` and the segments, with repeated slashes and `./` segments tolerated before each one, so `/./srv//app` is under `/srv/`. */
+const segmentsPattern = (segments: string[]) => `/${segments.map(segment => `(?:\\.?/)*${escapeRegExp(segment)}`).join("/")}`;
 const octet = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
 const ipv4 = new RegExp(`(?<![\\d.])(?:${octet}\\.){3}${octet}(?!\\.?\\d)`, "g");
 
 /**
- * Text intake sends to Slack or Linear. Paths under the instance's configured directories and under the host roots
- * `/srv/`, `/opt/`, `/run/`, and `/etc/` are replaced, then everything `sharedText` removes, then every IPv4 literal.
+ * Text intake sends to Slack or Linear. A `file://` URL, a path under one of the instance's configured directories or a
+ * host root, a `~/` path, and a Windows drive path are replaced, each only at the path boundary, then every IPv4 literal.
  */
 export function outboundText(config: Config, value: string): string {
   const directories = [config.stateDir, config.runDir, config.teams?.workspaceDir,
@@ -112,12 +122,17 @@ export function outboundText(config: Config, value: string): string {
     .map(directory => resolve(directory))
     .filter(directory => directory.length > 1)
     .sort((a, b) => b.length - a.length);
-  let text = value;
-  // A configured directory is a path only where its leading `/` is not glued to a name or another slash, so a URL keeps its path.
-  for (const directory of directories)
-    text = text.replace(new RegExp(`(?<![A-Za-z0-9._~%/-])${escapeRegExp(directory)}${pathRest}`, "g"), "[local path omitted]");
-  text = text.replace(hostRoots, "$1[local path omitted]");
-  return sharedText(text).replace(ipv4, "[address omitted]");
+  const forms = [
+    "[Ff][Ii][Ll][Ee]://",
+    ...directories.map(directory => segmentsPattern(directory.split("/").filter(Boolean))),
+    ...hostRoots.map(root => `${segmentsPattern(root)}/`),
+    "~/",
+    "[A-Za-z]:\\\\",
+  ];
+  const paths = new RegExp(`${pathStart}(?:${forms.join("|")})${pathRest}`, "g");
+  return value
+    .replace(paths, path => `[local path omitted]${trailingPunctuation(path)}`)
+    .replace(ipv4, "[address omitted]");
 }
 
 function outcomeBody(config: Config, mission: Mission): string {

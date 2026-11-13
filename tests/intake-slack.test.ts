@@ -828,8 +828,8 @@ test("questions, results, and blocked reasons reach Slack without host paths or 
     const stored = [ISSUE, second, third].flatMap(id => s.store.get(id)!.messages.map(message => message.text));
     const posted = [BINDING, OTHER, THIRD].flatMap(thread => s.texts(thread));
     for (const text of [...stored, ...posted]) assert.deepEqual(leaks(text), [], text);
-    assert.equal(s.texts(BINDING)[1], "Q1: Keep [local path omitted] [local path omitted] and [address omitted]?\n1. Keep   2. Move it from [local path omitted] [local path omitted] and [address omitted]\nReply with a mention and your answer.");
-    assert.equal(s.texts(OTHER)[1], "Ready for review (agent report):\nChanged [local path omitted] [local path omitted] and [address omitted]. Docs: https://example.com/opt/x\nPull request: https://github.com/example/api/pull/1");
+    assert.equal(s.texts(BINDING)[1], "Q1: Keep [local path omitted], [local path omitted] and [address omitted]?\n1. Keep   2. Move it from [local path omitted], [local path omitted] and [address omitted]\nReply with a mention and your answer.");
+    assert.equal(s.texts(OTHER)[1], "Ready for review (agent report):\nChanged [local path omitted], [local path omitted] and [address omitted]. Docs: https://example.com/opt/x\nPull request: https://github.com/example/api/pull/1");
     assert.match(s.texts(THIRD)[1], /^Blocked: Cannot reach \[local path omitted\]/);
   } finally { await s.close(); rmSync(stateRoot, { recursive: true, force: true }); }
 });

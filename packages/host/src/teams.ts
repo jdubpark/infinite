@@ -2010,7 +2010,7 @@ export class TeamService {
     stored.run.reason = stored.run.stopReason === "deadline" ? "The goal reached its deadline. Active work is being stopped and retained for inspection."
       : stored.run.stopReason === "member-limit" ? "The goal reached this run's agent attempt limit. Active work is being stopped and retained for inspection."
         : error instanceof TeamError ? error.message : genericOperationFailureReason;
-    if (this.options?.events) stored.ledgerBlockSource = sourceMember?.memberId;
+    if (this.options?.events) stored.ledgerBlockSource = sourceMember?.memberId ?? pending?.source?.memberId;
     this.event(stored, stored.run.reason); this.save(stored); this.trackBlocked(stored);
   }
   private async startAutomaticDeliveryRecovery(stored: Stored, trackingReady: boolean) {
@@ -2115,7 +2115,7 @@ export class TeamService {
         ...(run.brief ? { brief: structuredClone(run.brief) } : {}),
       }];
       run.revision = nextRevision;
-      this.emit(stored, "run.revision-advanced", [nextRevision], {}, { cause: "automatic-recovery", fromRevision: nextRevision - 1, baseChanged: false });
+      this.emit(stored, "run.revision-advanced", [nextRevision], {}, { cause: "automatic-recovery", fromRevision: nextRevision - 1, baseChanged: false, sourceCode: source.code, sourceMemberId: source.memberId === "unattributed" ? undefined : source.memberId });
       run.tasks = [];
       run.review = undefined;
       run.round = 0;

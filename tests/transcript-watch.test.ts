@@ -888,17 +888,58 @@ test("the final drain starts once and ends hook handling", () => {
   const run = (late: boolean) => {
     const watch = watchFor("claude");
     const started = watch.hook(turnFor())!;
-    const text = claudeRow("msg_1");
-    watch.post({ path: PATH, offset: 0, text, drain: started.drain });
-    mark(watch, PATH, bytes(text), started.drain);
+    const rowA = claudeRow("msg_1");
+    watch.post({ path: PATH, offset: 0, text: rowA, drain: started.drain });
+    mark(watch, PATH, bytes(rowA), started.drain);
     const final = watch.drainFinal()!;
-    assert.equal(watch.drainFinal(), undefined);
+    const rowB = claudeRow("msg_2");
+    watch.post({ path: PATH, offset: bytes(rowA), text: rowB, drain: final.drain });
+    // A second start is the same drain, read from the current cursor.
+    assert.deepEqual(watch.drainFinal(), { path: PATH, after: bytes(rowA) + bytes(rowB), drain: final.drain, secondaries: true });
     if (late) assert.equal(watch.hook(turnFor(PATH, "claude", false)), undefined);
-    mark(watch, PATH, bytes(text), final.drain);
+    mark(watch, PATH, bytes(rowA) + bytes(rowB), final.drain);
     return watch.finish(true, true);
   };
   assert.deepEqual(run(true), run(false));
-  assert.deepEqual(run(true), { coverage: "complete", records: 1, provider: "claude", finalDrain: "complete" });
+  assert.deepEqual(run(true), { coverage: "complete", records: 2, provider: "claude", finalDrain: "complete" });
+});
+
+test("an early start cannot keep the worker's relay from reading", () => {
+  const run = (endMarkAfterRows: boolean) => {
+    const usage: UsageRecord[] = [];
+    const watch = watchFor("claude", usage);
+    const started = watch.hook(turnFor())!;
+    const rowA = claudeRow("msg_1");
+    watch.post({ path: PATH, offset: 0, text: rowA, drain: started.drain });
+    mark(watch, PATH, bytes(rowA), started.drain);
+    // An early caller starts the final drain and posts an end mark at the old cursor.
+    const early = watch.drainFinal()!;
+    assert.equal(early.drain, 2);
+    mark(watch, PATH, bytes(rowA), early.drain);
+    // The worker's own relay gets the same drain and reads the rows after the last hook.
+    const relay = watch.drainFinal()!;
+    assert.deepEqual(relay, { path: PATH, after: bytes(rowA), drain: 2, secondaries: true });
+    const rowB = claudeRow("msg_2");
+    watch.post({ path: PATH, offset: bytes(rowA), text: rowB, drain: relay.drain });
+    if (endMarkAfterRows) mark(watch, PATH, bytes(rowA) + bytes(rowB), relay.drain);
+    const record = watch.finish(true, true);
+    assert.equal(usage.length, 2);
+    return record;
+  };
+  assert.deepEqual(run(true), { coverage: "complete", records: 2, provider: "claude", finalDrain: "complete" });
+  assert.deepEqual(run(false), { coverage: "partial", reason: "drain-incomplete", records: 2, provider: "claude", finalDrain: "incomplete" });
+});
+
+test("a second start after the closing finish returns nothing", () => {
+  const watch = watchFor("claude");
+  const started = watch.hook(turnFor())!;
+  const text = claudeRow("msg_1");
+  watch.post({ path: PATH, offset: 0, text, drain: started.drain });
+  mark(watch, PATH, bytes(text), started.drain);
+  watch.drainFinal();
+  mark(watch, PATH, bytes(text), 2);
+  watch.finish(true, true);
+  assert.equal(watch.drainFinal(), undefined);
 });
 
 test("no transcript means no final drain", () => {

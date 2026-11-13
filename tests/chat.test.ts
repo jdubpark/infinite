@@ -239,3 +239,96 @@ test("a sudo profile drains through the wrapper beside it, and skips without one
     rmSync(folder, { recursive: true, force: true });
   }
 });
+
+/**
+ * Writes the stand-ins a sudo profile needs. The sudo stand-in logs its arguments and runs what follows `--`; with
+ * `refuseDrain` it exits 1 for the drain wrapper, as sudo does when its policy does not list the command.
+ */
+function sudoStandIns(folder: string, drainBody: string, refuseDrain: boolean) {
+  const tsx = import.meta.resolve("tsx");
+  const script = (name: string, body: string) => {
+    const path = join(folder, name);
+    writeFileSync(path, `#!/bin/sh\n${body}\n`, { mode: 0o700 });
+    chmodSync(path, 0o700);
+  };
+  const refusal = refuseDrain ? `case "$*" in *transcript-drain*) exit 1 ;; esac\n` : "";
+  script("sudo", `echo "$*" >> '${join(folder, "sudo.log")}'\n${refusal}while [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"`);
+  script("demo", `exec '${process.execPath}' --import '${tsx}' '${resolve("packages/host/src/demo.ts")}' "$@"`);
+  script("transcript-drain", drainBody);
+  return { command: join(folder, "sudo"), args: ["-n", "-u", "test-agent", "--", join(folder, "demo")] };
+}
+
+test("a drain that hangs is stopped at its limit and the session still closes", { timeout: 60000 }, async () => {
+  const folder = mkdtempSync(join(tmpdir(), "inf-drain-"));
+  try {
+    const pidFile = join(folder, "drain.pid");
+    const profile = sudoStandIns(folder, `echo $$ > '${pidFile}'\nexec sleep 60`, false);
+    const host = await startHost({ config: { attention }, agents: { demo: profile } });
+    try {
+      const id = randomUUID();
+      await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Hang", prompt: "hook dialog late-row" });
+      await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+      const control = await claimControl(host, id, "owner");
+      await host.fetchApi(`/sessions/${id}/stop`, "owner", { requestId: randomUUID() }, control.headers);
+      await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.status === "exited", 15000);
+      const coverage = await coverageEvent(host, id);
+      assert.deepEqual([coverage.data.coverage, coverage.data.reason, coverage.data.finalDrain], ["partial", "drain-skipped", "skipped"]);
+      assert.equal((await journalEvents(host, id, "usage")).some((e: any) => String(e.data.messageId).endsWith("-late")), false, "the hung drain read no late row");
+      const events = (await host.fetchApi(`/sessions/${id}/events?limit=200`)).body.events;
+      const exited = events.find((e: any) => e.type === "lifecycle" && e.data.status === "exited");
+      assert.ok(coverage.seq > exited.seq, "the coverage record follows the exit record");
+      const waited = Date.parse(coverage.at) - Date.parse(exited.at);
+      assert.ok(waited >= 9000 && waited < 14000, `the drain ran to its 10 second limit, not ${waited} ms`);
+      // The worker's exit is observed through the session status: the coverage record closes the watch before it exits.
+      await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.status === "exited", 5000);
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      const alive = await waitFor(async () => { try { process.kill(pid, 0); return true; } catch { return false; } }, (running) => !running, 2000);
+      assert.equal(alive, false, "the sleeping drain process is gone");
+    } finally {
+      await host.stop();
+    }
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test("a sudo policy that refuses the wrapper skips the drain at once", { timeout: 120000 }, async () => {
+  const folder = mkdtempSync(join(tmpdir(), "inf-drain-"));
+  try {
+    const profile = sudoStandIns(folder, "exit 0", true);
+    const host = await startHost({ config: { attention }, agents: { demo: profile } });
+    try {
+      // Stopped mid-turn: the refused drain leaves the late row unread, and the coverage record says so without waiting.
+      const midTurn = randomUUID();
+      await host.fetchApi("/sessions", "owner", { requestId: midTurn, provider: "demo", projectId: "rehearsal", title: "Refused", prompt: "hook dialog late-row" });
+      await waitFor(() => host.fetchApi(`/sessions/${midTurn}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+      const midControl = await claimControl(host, midTurn, "owner");
+      await host.fetchApi(`/sessions/${midTurn}/stop`, "owner", { requestId: randomUUID() }, midControl.headers);
+      await waitFor(() => host.fetchApi(`/sessions/${midTurn}`), (r) => r.body.status === "exited", 15000);
+      const midCoverage = await coverageEvent(host, midTurn);
+      assert.deepEqual([midCoverage.data.coverage, midCoverage.data.reason, midCoverage.data.finalDrain], ["partial", "drain-skipped", "skipped"]);
+      assert.equal((await journalEvents(host, midTurn, "usage")).some((e: any) => String(e.data.messageId).endsWith("-late")), false);
+      const events = (await host.fetchApi(`/sessions/${midTurn}/events?limit=200`)).body.events;
+      const exited = events.find((e: any) => e.type === "lifecycle" && e.data.status === "exited");
+      const waited = Date.parse(midCoverage.at) - Date.parse(exited.at);
+      assert.ok(waited >= 0 && waited < 3000, `a refused drain does not wait for the limit (${waited} ms)`);
+
+      // A clean turn boundary under the same refusal: nothing was owed beyond the last hook, so the session stays complete.
+      const clean = randomUUID();
+      await host.fetchApi("/sessions", "owner", { requestId: clean, provider: "demo", projectId: "rehearsal", title: "Clean", prompt: "hook dialog" });
+      const detail = await waitFor(() => host.fetchApi(`/sessions/${clean}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
+      const control = await claimControl(host, clean, "owner");
+      const answer = await host.fetchApi(`/sessions/${clean}/answer`, "owner", { requestId: randomUUID(), promptId: detail.body.attention.prompt.id, option: 0 }, control.headers);
+      assert.equal(answer.body.result, "closed");
+      await waitFor(() => host.fetchApi(`/sessions/${clean}/messages`), (r) => r.body.messages.some((m: any) => m.role === "assistant" && /Removed the build directory/.test(m.text)), 15000);
+      await host.fetchApi(`/sessions/${clean}/stop`, "owner", { requestId: randomUUID() }, control.headers);
+      await waitFor(() => host.fetchApi(`/sessions/${clean}`), (r) => r.body.status === "exited", 15000);
+      const cleanCoverage = await coverageEvent(host, clean);
+      assert.deepEqual([cleanCoverage.data.coverage, cleanCoverage.data.reason, cleanCoverage.data.finalDrain], ["complete", undefined, "skipped"]);
+    } finally {
+      await host.stop();
+    }
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+});

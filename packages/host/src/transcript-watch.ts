@@ -144,6 +144,8 @@ export class TranscriptWatch {
   private closed = false;
   /** The id of the final drain, once one started. */
   private finalDrain: number | undefined;
+  /** The reply that started the final drain. A later start repeats it from the current cursor. */
+  private finalStart: { path: string; after: number; drain: number; secondaries?: true } | undefined;
   /** What replaced transcripts held. Each fact stays sticky. `secondary` is the worst state of them all. */
   private readonly retired: { rows: number; records: number; dropped: boolean; gap: boolean; midTurn: boolean; secondary: SecondaryState; mismatch: boolean; childThreads: boolean } = {
     rows: 0, records: 0, dropped: false, gap: false, midTurn: false, secondary: "none", mismatch: false, childThreads: false,
@@ -178,16 +180,22 @@ export class TranscriptWatch {
 
   /**
    * Starts the final drain on the current transcript, once per session. It takes the turn boundary of the last
-   * provider hook. Undefined when no primary transcript is open, or after the drain started or the watch closed.
+   * provider hook. A later call while the watch is open returns the same drain, from the current cursor, and resets
+   * nothing: any process of the agent's account may post to the drain route first, and the worker's relay must still
+   * get the transcript. Undefined when no primary transcript is open, or after the watch closed.
    */
   drainFinal(): { path: string; after: number; drain: number; secondaries?: true } | undefined {
     return guard(undefined, () => {
       const current = this.current;
-      if (this.closed || !current || this.finalDrain !== undefined) return undefined;
+      if (this.closed || !current) return undefined;
+      if (this.finalStart) return { ...this.finalStart, after: current.tail.offset };
       const started = this.receiveHook({
         subagent: false, turnEnd: this.last?.turnEnd ?? false, transcript: { path: current.path, provider: current.provider },
       });
-      if (started) this.finalDrain = started.drain;
+      if (started) {
+        this.finalDrain = started.drain;
+        this.finalStart = started;
+      }
       return started;
     });
   }

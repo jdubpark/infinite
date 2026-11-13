@@ -173,8 +173,6 @@ export function validateIntakeConfig(config: Config): void {
   const intake = config.intake;
   if (!intake) return;
   if (!config.linear) throw new Error("Intake requires a host Linear credential");
-  if (!intake.linear.creatorId && !intake.requireSlackThread)
-    throw new Error("Intake needs a Linear creator ID or a required Slack thread to gate authorship");
   if (intake.requireSlackThread && !intake.slack) throw new Error("requireSlackThread needs intake.slack");
   const slack = intake.slack;
   if (slack) {

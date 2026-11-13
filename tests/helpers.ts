@@ -200,7 +200,7 @@ export async function claimControl(
 }
 
 /** An API served from this process, so a test can hold the sync queue open through the ProjectSync it returns. */
-export async function inProcessHost() {
+export async function inProcessHost(options?: { configure?: (config: Config) => void }) {
   const root = realpathSync(mkdtempSync("/tmp/inf-psync-guard-"));
   const workspace = join(root, "workspace"); mkdirSync(workspace);
   const key = randomBytes(32);
@@ -213,6 +213,7 @@ export async function inProcessHost() {
     projects: [{ id: "rehearsal", name: "Rehearsal", path: workspace }],
     tokens: roles.map(role => ({ id: role, label: role, role, hash: hashToken(tokens[role]) })),
   };
+  options?.configure?.(config);
   const host = createApp(config, key);
   await new Promise<void>(resolve => host.server.listen(0, "127.0.0.1", resolve));
   config.port = (host.server.address() as { port: number }).port;

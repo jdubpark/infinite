@@ -74,7 +74,7 @@ Outside the slice: what a mode enables (slices 2 to 7), and the evaluator condit
 1. A goal launch prepared before the upgrade replays after it. Expect its existing run with no `request-conflict`, and a `supervised` pin, because the mode stays out of the `createRun` fingerprint.
 2. A routine approved before this slice ticks after the upgrade, with a mode set and `autonomy.defaultMode` in the config. Expect no block and an unchanged `authority`.
 3. Records without the key. Expect an enrollment to read the host default, which is `autonomous` unless the config says otherwise. Expect a run, goal, cycle, or launch to read `supervised`, and the later cycles of an old goal to pin `supervised`. Expect no write at load.
-4. A mode change while a run is active or a cycle launch is prepared. Expect both to keep their pins, and the next run or cycle to take the new mode.
+4. A mode change while a run is active, a goal is running, or a cycle launch is prepared. Expect each to keep its pin. The next run and the next goal take the new mode. The later cycles of a running goal keep the goal's pinned mode.
 5. An unknown mode from a client, the CLI, or a sealed record. Expect 400 or a CLI error with nothing stored. Expect a stored unknown value to read as `supervised`.
 
 **Order.** Task 1 runs first. Tasks 2 and 3 then run in parallel, because they share no file. Task 4 follows Task 2 and can run beside Task 3.
@@ -180,7 +180,7 @@ class RepoEnrollmentService { setAutonomy(projectId: string, input: AutonomyChan
 ```ts
 export interface TeamRun { /* existing fields */; autonomy?: AutonomyMode }      // pinned at creation
 export interface ProductGoal { /* existing fields */; autonomy?: AutonomyMode }  // the mode the goal started in
-export interface GoalCycle { /* existing fields */; autonomy?: AutonomyMode }    // read when the cycle's launch is prepared
+export interface GoalCycle { /* existing fields */; autonomy?: AutonomyMode }    // the goal's pinned mode, copied when the cycle's launch is prepared
 createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup, linearTracking = false, autonomy: AutonomyMode = "supervised"): Promise<TeamView>;
 // createRun's internal parameter gains autonomy?: AutonomyMode.
 // goals.ts: Stored.launch?: { request: CreateTeam; context: TeamGoalContext; autonomy?: AutonomyMode }
@@ -192,9 +192,9 @@ createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup, li
 - `createRun` drops `autonomy` from `creationContext` beside `parallelismCeiling`, so the request fingerprint does not change. *(My call: the existing rule for host-derived values. A launch prepared before this slice must still find its run.)*
 - A replayed request returns the stored run with its pin. A continuation or resume keeps the run's pin. *(My call.)* `createForMission`, `createForHandoff`, `view`, and every other `teams.ts` function stay unchanged.
 - `GoalService.create` adds `autonomy: autonomyOf(project)` after `lineup` in the goal literal.
-- `GoalService.step` sets `stored.launch.autonomy` when it prepares a cycle. The value is `supervised` when `goal.autonomy` is absent, else `autonomyOf` of the goal's project. *(My call: C12 counts a goal recorded before the contract as supervised. Its later cycles stay supervised, so work in flight keeps today's behaviour.)*
+- `GoalService.step` sets `stored.launch.autonomy` when it prepares a cycle. The value is `autonomyOf(goal)`: the goal's own pin, and `supervised` when the goal has none. It does not read the project. *(Spec Part 2, as corrected on 2026-11-13: a goal keeps the mode it started in, so a change applies to the next run and the next goal. A goal recorded before the contract has no pin, so its later cycles stay supervised and work in flight keeps today's behaviour.)*
 - `GoalService.launch` passes `autonomyOf(pending)` to `createForGoal` and writes it on the new cycle. The branch of `step` that records an existing run for a paused or stopped goal writes `autonomyOf(stored.launch)`.
-- The cycle's mode is read once, when its launch is prepared. *(My call: a prepared launch is a started cycle, so a later change or restart applies to the next cycle.)*
+- The cycle's mode is copied once, when its launch is prepared, and a restart replays the prepared launch with the mode it recorded.
 - Loading migrates nothing, and no view adds a default. A record without a pin loads byte-identical and reads `supervised` through `autonomyOf`. *(My call: one reading rule for every later slice, and the smallest change to `teams.ts`.)*
 - Keys that appear: `run.autonomy` on every new run (`supervised` in a fixture without an overlay), `goal.autonomy` on every new goal, and `autonomy` on every new cycle and prepared launch. Routine records do not change.
 - C14's seam: a pin is computed only in `TeamService.createRun`, `GoalService.create`, and `GoalService.step`. C14 adds its eligible-evaluator check at those three points.
@@ -208,7 +208,7 @@ createForGoal(request: CreateTeam, goal: TeamGoalContext, lineup: TeamLineup, li
 | `the mode is not part of a run request's identity` | `createForGoal` with one request id, first with `supervised` and then with `autonomous`, gives the same run twice with no `request-conflict`. The pin stays `supervised`. |
 | `a mode change applies from the next run` | Run A starts with overlay `autonomous`. After the overlay becomes `supervised`, A's sealed record still has `autonomous`, and run B pins `supervised`. |
 | `a run recorded before this slice reads as supervised and is not rewritten` | The fixture run has no key. `autonomyOf(teams.get(id))` is `supervised`, and the sealed record has no `autonomy` key after `get`. |
-| `a goal records its start mode and each cycle reads the project` | With overlay `autonomous`, `create()` gives `goal.autonomy` `autonomous`. The first tick calls `createForGoal` with `autonomous`, and cycle 1 has `autonomous`. After the overlay becomes `supervised` and the stub settles cycle 1 as `ready-for-review`, cycle 2 is called and recorded with `supervised`. `goal.autonomy` stays `autonomous`. |
+| `a goal records its start mode and every cycle keeps it` | With overlay `autonomous`, `create()` gives `goal.autonomy` `autonomous`. The first tick calls `createForGoal` with `autonomous`, and cycle 1 has `autonomous`. After the overlay becomes `supervised` and the stub settles cycle 1 as `ready-for-review`, cycle 2 is still called and recorded with `autonomous`. The reverse holds too: a goal created under `supervised` keeps `supervised` cycles after the overlay becomes `autonomous`. |
 | `a prepared launch keeps its mode across a change and a restart` | A goal record holds `launch.autonomy: "autonomous"` with overlay `supervised`. A new `GoalService` calls `createForGoal` with `autonomous`, and the cycle records `autonomous`. |
 | `a goal recorded before this slice stays supervised` | A goal record and its launch have no key, with overlay `autonomous`. The call and cycle 1 use `supervised`, and so does cycle 2. `autonomyOf(goal)` is `supervised`. |
 

@@ -42,6 +42,19 @@ test("thread pages through replies and keeps the outbound key", async t => {
   assert.equal(last.key, "k");
 });
 
+test("a long thread keeps the root and the newest 999 replies, oldest first", async t => {
+  const { slack, client } = await setup();
+  t.after(() => slack.close());
+  slack.seedThread(binding, Array.from({ length: 1300 }, (_, index) => ({ user: "U00000000", text: `message ${index}` })));
+  const messages = await client.thread(binding);
+  assert.ok(messages !== "unreadable");
+  assert.equal(messages.length, 1000);
+  assert.equal(messages[0].text, "message 0");
+  assert.equal(messages[1].text, "message 301");
+  assert.equal(messages.at(-1)?.text, "message 1299");
+  assert.deepEqual(messages.slice(1).map(message => message.text), Array.from({ length: 999 }, (_, index) => `message ${index + 301}`));
+});
+
 test("a channel the bot is not in is unreadable, and an outage throws a transient error", async t => {
   const { slack, client } = await setup();
   t.after(() => slack.close());

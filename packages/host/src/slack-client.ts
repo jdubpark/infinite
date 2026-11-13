@@ -16,6 +16,7 @@ const DEFAULT_ENDPOINT = "https://slack.com/api";
 const UNREADABLE = new Set(["channel_not_found", "not_in_channel", "thread_not_found"]);
 const PAGE_LIMIT = 200;
 const MAX_THREAD_MESSAGES = 1000;
+const MAX_THREAD_PAGES = 50;
 const MAX_RECONNECT_DELAY_MS = 60_000;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
@@ -35,10 +36,16 @@ export class SlackClient implements IntakeThreadReader {
     return { teamId: data.team_id, userId: data.user_id, botId: data.bot_id };
   }
 
-  /** Reads the thread oldest first, at most 1,000 messages. A refusal Slack gives for the binding is `unreadable`; an outage throws. */
+  /**
+   * Returns the root message followed by the newest replies, oldest first, at most 1,000 in all.
+   * Pages forward to the end of the thread, reading at most 50 pages; a longer thread keeps the window read so far.
+   * A refusal Slack gives for the binding is `unreadable`; an outage throws.
+   */
   async thread(binding: IntakeThread): Promise<SlackThreadMessage[] | "unreadable"> {
-    const messages: SlackThreadMessage[] = [];
+    let root: SlackThreadMessage | undefined;
+    const recent: SlackThreadMessage[] = [];
     let cursor = "";
+    let pages = 0;
     do {
       let data: Record<string, any>;
       try {
@@ -50,13 +57,15 @@ export class SlackClient implements IntakeThreadReader {
         if (error instanceof SlackError && !error.transient && UNREADABLE.has(error.code)) return "unreadable";
         throw error;
       }
-      for (const message of Array.isArray(data.messages) ? data.messages : []) {
-        messages.push(threadMessage(message));
-        if (messages.length >= MAX_THREAD_MESSAGES) return messages;
-      }
+      pages++;
+      const page = (Array.isArray(data.messages) ? data.messages : []).map(threadMessage);
+      if (root === undefined && page.length > 0) root = page.shift();
+      recent.push(...page);
+      const keep = MAX_THREAD_MESSAGES - 1;
+      if (recent.length > keep) recent.splice(0, recent.length - keep);
       cursor = typeof data.response_metadata?.next_cursor === "string" ? data.response_metadata.next_cursor : "";
-    } while (cursor);
-    return messages;
+    } while (cursor && pages < MAX_THREAD_PAGES);
+    return root === undefined ? [] : [root, ...recent];
   }
 
   /** Posts into the bound thread. The key travels as message metadata so a lost response can be found later. */

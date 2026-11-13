@@ -696,3 +696,164 @@ private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReas
 - `configId` and the profile epoch on `member.started`. The configuration identity slice adds them.
 - `attempt_index` and `inherited`. The projection derives both from the `replaces` chain, and a predecessor that started before this slice has no `member.started`.
 - Any projector, and the `team-prompts.ts` import guard of the authority rules.
+
+---
+
+# Slice: check, review, repair, delivery events
+
+Spec part 1, the emission half, for the remaining core kinds: checks, reviews, correction rounds, deliveries, and owner ratings. It adds the two best-effort Git reads that spec part 1 asks for, and a coverage test that keeps the spec's event table and the emission sites in `TeamService` equal. It builds on the run events slice and on the member and task events slice (`emitWith`, `profileIdentity`, `pathField`, `memberStopped`, `MEMBER_STOP_REASONS`).
+
+## Trust boundary, and what a review checks
+
+`TeamService` is host code. It builds every event from its own run record, after its own validation. These fields originate from a member, a provider, or the owner:
+
+- A review's verdict and rubric scores. The reviewer chooses them, and `teamReportSchema` bounds a score to an integer from 1 to 5. The rubric's `why` text, the summary, and the UI evidence are never stored.
+- A delivery report's head commit, which `consume` requires to equal `run.headCommit`, and its merge commit, a hex id by schema. The merge commit is "Agent-reported delivery evidence" (`TeamRun.deliveryReceipt`), so the event records it as reported. The base branch scan of spec part 5 is what checks it. The pull request URL is never stored.
+- The changed paths of an integrator commit. A member wrote the files, and the host's own Git reads the names back. Spec part 1 names them: "`repair.integrated` | `consume` (integrator `result`) | commit, head, changed paths".
+- An owner rating's score. The note is never stored.
+- Check output and repair feedback. Never stored. Exit codes and statuses are host observations.
+
+The rule: event data holds counts, booleans, enumerated codes, host-issued ids, profile ids, timestamps the record stores, and commit and tree ids. It holds no free text, prompt, file content, or URL. It holds paths only in `repair.integrated`, as quoted above. The spec's rule for derived rows binds the projector: "A row never holds an objective, instructions, a summary, a rubric reason, a rating note, a path, or a URL." The store seals event data and deletes it with its run (umbrella C1).
+
+The slice must survive: a Git read that fails, times out, or is refused by the command prefix; a check that a pause interrupts; a merge whose baseline capture fails after its receipt; a repeated rating request; a repair at the round limit; and a service built without `events`. Outside it: how a projector attributes rounds, freezes rows, flags a same-model review, and matches landings.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/teams.ts` (modify) | The emission sites, the `cause` parameter of `repair`, `readTree`, the integrator's changed-path read |
+| `docs/superpowers/specs/2026-11-12-outcome-ledger-design.md` (modify) | Two rows in the part 1 table: `run.prepared` and `ledger.gap` |
+| `tests/team-events.test.ts` (modify) | Check, review, repair, and rating tests |
+| `tests/team-fixture.ts` (modify) | `openTeamService` passes `events` |
+| `tests/team-delivery.test.ts` (modify) | Delivery tests; `deliveryRecord` gains an `events` option |
+| `tests/run-event-coverage.test.ts` (create) | The coverage tests |
+| `tests/teams.test.ts` (modify) | One full-run test on the host |
+
+## Event kinds
+
+| Kind | Emitted in | Key parts | `data` besides `v` | Why the key is unique and stable |
+|---|---|---|---|---|
+| `check.finished` | `check`, completion callback | `[revision, round, startedAt]` of the first result | `round`, `headCommit`, `passed`, `expected`, `commands` | `startedAt` is stored in `run.checks` before the completion. Check operations run one at a time (`team-operation-running`), so no two share a first start |
+| `review.recorded` | `consume`, `review` | `[revision, memberId]` | `verdict`, `headCommit`, `baseCommit`, `tree?`, `reviewer`, `rubric?` | A reviewer member reports once |
+| `repair.started` | `repair` | `[revision, round]` | `round`, `cause`, `headCommit` | `round` rises by one per repair and resets only when the revision advances |
+| `repair.integrated` | `consume`, integrator `result` with `run.round > 0` | `[revision, round]` | `round`, `commit?`, `headCommit`, `baseCommit`, `paths` or `pathsOmitted` | One integrator result per round: a replaced integrator never reported |
+| `delivery.recorded` | `consume`: the `delivery` receipt write, `pull-request`, and a reconciled pull request | `[revision, memberId]` | `method`, `headCommit`, `mergeCommit?` | A delivery member reports once |
+| `rating.recorded` | `rateTask` | `[requestId]` | `score` | A replayed request returns before any change. A new request is a new fact |
+
+## Review Focus
+
+1. A tree or changed-path read that fails or is refused. Expect the review or integration to proceed and the field to be absent.
+2. A `changes-requested` review. Expect `review.recorded` before `repair.started`, in one revision, with round one higher than before.
+3. A merge report whose baseline capture fails. Expect `delivery.recorded` stored and the run blocked.
+4. A service without `events`. Expect no new key in a sealed record and no extra Git command.
+5. An emit call with a computed kind, or a spec row with no site. Expect the coverage test to fail.
+
+### Task 1: check and review events
+
+**Interfaces (consumes):** `emitWith`, `profileIdentity` from the member and task events slice.
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/teams.ts
+/** Best-effort `git rev-parse --verify <commit>^{tree}` in `run.workspace` through `teamCommand` and `teamGitArgs`,
+ *  30 s. A 40- or 64-hex stdout, else undefined. Never throws. */
+private async readTree(run: TeamRun, commit: string, signal: AbortSignal): Promise<string | undefined>;
+```
+
+**Decisions:**
+
+- **`check.finished`.** The first statement of the completion callback of `check`, before the guard that returns for a changed revision, a halt, or a pause. Skipped when `results` is empty. Ids `{ revision }`, the revision `check` captured. Data: `round: results[0].round`; `headCommit: head`; `expected: commands.length`; `passed`, true when every expected command ran and passed; `commands: results.map(r => ({ phase: r.phase ?? "verification", status: r.status, exitCode: r.exitCode ?? null }))`. Not the command, its arguments, or its output. The guard may then return: the checks ran, and `run.checks` keeps them. The operation saves after the callback. *(My call: a check operation that fails, for example when a check changed files, never reaches its completion and emits nothing. `run.blocked` carries its code, and `runSummaryCounts` counts its check records.)*
+- **`review.recorded`.** In the completion callback of the `review` branch of `consume`, after `run.review` is set and after the rubric loop, before the verdict branch. So it precedes the `repair.started` of a `changes-requested` verdict. Ids `{ memberId, revision: member.revision }`. Data: `verdict`; `headCommit: member.baseCommit`, the verified head; `baseCommit: run.baseCommit`; `tree` from the perform step, absent when the read failed; `reviewer: profileIdentity(reviewer, member.provider ?? run.provider)`, where `reviewer` is the `member.modelProfile ?? this.memberProfile(run, "reviewer")` that the rubric loop uses; `rubric`, one `{ taskId, correctness, cleanliness, extensibility, docs }` of scores per entry the loop stored in `task.rubric`, absent when none was stored. The projector sets `same-model-review` by comparing `reviewer.model` with the attempt's `member.started` model.
+- **The tree read.** The `review` branch's perform step becomes: `assertMemberReadOnly` as today, then `{ tree: this.options?.events ? await this.readTree(run, member.baseCommit, signal) : undefined }`. *(My call: the read runs only with `events`, so a service without the ledger runs exactly the commands it ran before, and command-prefix receipts in existing tests do not change.)*
+
+- [ ] **Step 1: Write the failing tests** in `tests/team-events.test.ts`. A check test sets `f.config.projects[0].team.checks`, and its run has one integrated task, no active member, `headCommit` equal to the base, and no `checkHead`.
+
+| Test name | Assertions |
+|---|---|
+| `a passing check records each command result` | Checks `[node -e ""]`. One `check.finished` at revision 1 with data `{ v: 1, round: 0, headCommit: base, passed: true, expected: 1, commands: [{ phase: "verification", status: "passed", exitCode: 0 }] }`. |
+| `a failing check records its exit code` | Checks `[node -e "process.exit(3)"]`. `passed` is false and `commands` is `[{ phase: "verification", status: "failed", exitCode: 3 }]`. |
+| `a check that a pause interrupts is still recorded` | A check that waits 30 s, and `pause` while it runs. `check.finished` has `passed: false` and one command with status `interrupted`. The run is `paused`. |
+| `an approved review records its verdict, tree, and kept scores` | With `mixedLineup`, tasks `a` and `b` integrated. `a`'s implementer has model `claude-opus-5-5`, the reviewer's model, and `b`'s has `gpt-6-astra`. The reviewer at the checked head approves with rubric entries for both. `review.recorded` has `verdict` `approved`, `headCommit` and `baseCommit` the base, `tree` equal to `git rev-parse <base>^{tree}`, `reviewer` `{ profileId: "opus-reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" }`, and `rubric` `[{ taskId: "b", correctness: 4, cleanliness: 3, extensibility: 5, docs: 2 }]`. The stored data contains none of the `why` strings. |
+| `a refused tree read leaves the tree out` | `config.teams.commandPrefix` is a script, built like `resultFailurePrefix` in `tests/team-fixture.ts`, that exits 1 when an argument ends in `^{tree}` and runs every other command. `review.recorded` has no `tree`, and `run.review.verdict` is `approved`. |
+| `a changes-requested review records its verdict` | `review.recorded` has `verdict` `changes-requested` and no `rubric`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `node --import tsx --test tests/run-events.test.ts tests/team-events.test.ts`, then `npm run typecheck -w @infinite/host`.
+
+### Task 2: repair, delivery, and rating events
+
+**Interfaces (consumes):** task 1, and `pathField` from the member and task events slice.
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/teams.ts
+/** Was `(stored, feedback)`. */
+private repair(stored: Stored, feedback: string, cause: "check" | "review" | "delivery"): void;
+
+// tests/team-fixture.ts
+openTeamService(serviceOptions?: { /* existing fields */ events?: EventOutbox }): Promise<TeamService>;
+```
+
+**Decisions:**
+
+- **`repair` causes.** The completion of `check` passes `check`, the completion of the `review` branch passes `review`, and the completion of `delivery-repair` passes `delivery`.
+- **`repair.started`.** In `repair`, after `round++` and the two resets, before `prepareMember`. The two early returns (a halt or a pause, and the round limit) emit nothing. Data: `round` (the new value), `cause`, `headCommit: run.headCommit`. The `operation` that `prepareMember` starts saves it. When `newMember` throws, the caller's completion blocks the run and saves it, and the round has no answer. Spec part 4 then counts one unknown round.
+- **`repair.integrated`.** In the completion callback of the `result` branch, after the `if (task)` block, when `member.role === "integrator"` and `run.round > 0`. Ids `{ memberId, revision: member.revision }`. Data: `round: run.round`; `commit`, absent when the integrator changed nothing; `headCommit: head`; `baseCommit: run.baseCommit`; and the paths. With no commit they are `{ paths: [] }`. With a read that succeeded and was not truncated they are `pathField(changedPaths.paths)`. Otherwise they are `{ pathsOmitted: true }`, because a truncated list can hide an owned path. *(My call: an integrator at round 0 carries a moved base, not a correction. It emits nothing here, and member results still see it through `member.started` and `member.reported`.)*
+- **The changed-path read.** In the `result` branch's perform step, the existing `taskPaths` read runs when `task` is set, as today, or when `member.role === "integrator"` and `this.options?.events` is set. It is the same `git diff --name-only --no-renames -z member.baseCommit commit` read. The completion still stores `changedPaths` on an implementer's task only.
+- **`delivery.recorded`.** Ids `{ memberId, revision: member.revision }` at three places. A merge: inside the `enqueue` in the perform step of the delivery branch, after `run.deliveryReceipt = …` and before its `this.save(stored)`, with data `{ method: "merge", headCommit: report.headCommit, mergeCommit: report.mergeCommit }`. The receipt is then recorded even when `captureDeliveryBaseline` fails afterwards and the run blocks. A pull request: in the completion callback, after `run.pullRequest = …`, with `{ method: "pull-request", headCommit: report.headCommit }`. A reconciled pull request: in the completion callback of `delivery-reconciliation`, in its `pull-request` disposition branch for `pr` mode, after `run.pullRequest = …`, with the same data. A delivery repair records `repair.started` instead.
+- **`rating.recorded`.** In `rateTask`, after `task.ownerRating` and `stored.ratings[requestId]` are set, before `this.save(stored)`. A replayed request returns earlier and emits nothing. Ids `{ taskId, memberId: task.memberId, revision: task.revision }`. Data: `score`. *(My call: the key is the owner's request id, which `rateTask` already uses for idempotency. A second rating of one task is then a second fact, and the projector keeps the latest by `at`.)*
+- `deliveryRecord` in `tests/team-delivery.test.ts` gains an `events` option and passes it to `openTeamService`. A test builds the store from `evidenceDatabasePath(f.host.config.stateDir)` and the fixture key file.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `a failing check starts a repair caused by the check` (team-events) | After the failing check of task 1, `repair.started` at revision 1 has data `{ v: 1, round: 1, cause: "check", headCommit: base }`, and its `seq` is above the `check.finished` `seq`. |
+| `a changes-requested review comes before its repair` (team-events) | `review.recorded` then `repair.started`, with `cause` `review` and `round` 1. |
+| `a repair past its limit starts no round` (team-events) | With `run.round` 2, a failing check blocks the run with `repair-limit`. The store has no `repair.started`. |
+| `an integrator result answers its round with its changed paths` (team-events) | With `run.round` 1, an integrator in a `prepareMemberWorkspace` copy writes `fix.txt` and reports `result`. `repair.integrated` has its `memberId`, revision 1, and data `round` 1, a 40-hex `commit`, `headCommit` equal to `run.headCommit`, `baseCommit` the base, and `paths` `["fix.txt"]`. The store has no `task.integrated`. |
+| `a round-zero integrator records no repair` (team-events) | The same with `run.round` 0: no `repair.integrated`. |
+| `a rating records the score once per request` (team-events) | `rateTask(id, "a", { requestId: R, score: 4, note: "Useful" })` twice gives one `rating.recorded` with `taskId` `a`, the task's `memberId`, and data `{ v: 1, score: 4 }`. No stored event contains `Useful`. A second request with score 2 gives a second event. |
+| `a pull-request report records the delivery without its URL` (team-delivery) | `deliveryRecord("pr", …)` and a `pull-request` report for `https://github.com/example/app/pull/7`. `delivery.recorded` has its `memberId`, revision 1, and data `{ v: 1, method: "pull-request", headCommit }`. No stored event contains `github.com`. |
+| `a merge receipt is recorded even when the baseline capture fails` (team-delivery) | `deliveryRecord("merge", …)` and a `delivery` report whose `mergeCommit` is 40 `a` characters, absent from the repository. The run blocks. `delivery.recorded` has `method` `merge`, `headCommit`, and that `mergeCommit`. |
+| `a reconciled pull request records the delivery` (team-delivery) | A `delivery-reconciliation` report with disposition `pull-request` in `pr` mode stores `delivery.recorded` with `method` `pull-request`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `node --import tsx --test tests/run-events.test.ts tests/team-events.test.ts`, then `tests/team-delivery.test.ts` on the host, then the typecheck.
+
+### Task 3: the emission-coverage test
+
+**Interfaces (consumes):** the spec file, `packages/host/src/teams.ts` as text, `teamReportSchema`, `MEMBER_STOP_REASONS`, `schedulerFixture()`. No production interface.
+
+**Decisions:**
+
+- **Spec amendment.** The part 1 table gains `run.prepared` (the prepare completion in `createRun`; base commit) and `ledger.gap` (`flushOutbox`, after a stored flush; dropped count). The run events slice emits both, and the table lacks them. The table then lists 23 kinds.
+- **Kinds.** The test takes the backticked kind in the first cell of each table row between `### Part 1.` and `### Part 2.` of the spec. It finds every `this.emit(` and `this.emitWith(` call in `teams.ts` and takes the second argument. Every call names its kind as a string literal. The one exception is the forwarding call inside `emitWith`, which the test allows by its exact text `this.emit(stored, kind,`. *(My call: a literal kind at every site is what makes a static check possible. A computed kind would hide a site.)*
+- **Report kinds.** A test sample exists for each kind of `teamReportSchema.options`, and each sample parses. A kind without a sample fails the test, so a new report kind needs a decision.
+- **Stop reasons.** `MEMBER_STOP_REASONS` must equal the backticked classes after "are" in the spec sentence that begins `The reason classes of \`member.stopped\``. Each reason must appear as a string literal in the arguments of some `this.memberStopped(` call.
+- **The full run.** One host test checks the happy path of spec acceptance 1, without the stall, through `server.ts`, which the run events slice wires to the outbox.
+
+- [ ] **Step 1: Write the tests**, and amend the spec table.
+
+| Test name | Assertions |
+|---|---|
+| `every spec event kind has an emission site, and every emitted kind is in the spec` (run-event-coverage) | The spec set and the source set are equal and hold 23 kinds, `run.prepared` and `ledger.gap` among them. Exactly one call has a non-literal kind, and its text is `this.emit(stored, kind,`. |
+| `every report kind reaches member.reported` (run-event-coverage) | The sample keys equal the 14 kinds of `teamReportSchema.options` (each option's `shape.kind.value`). For each kind, a fresh `schedulerFixture()` with an outbox, the fixture project manager's report of that sample, and one `step` give one `member.reported` whose `data.reportKind` is that kind. `readMemberJournal` accepts any valid report and `roleAcceptsReport` runs later in `consume`, so a kind the project manager may not send is still reported, and the run may then block. |
+| `every member.stopped reason has an emission site` (run-event-coverage) | The spec sentence gives `["stall", "limit", "no-report", "owner", "host"]`, equal to `MEMBER_STOP_REASONS`. Each appears as a literal in a `this.memberStopped(` call. |
+| `a full run stores its events in order` (teams, host) | `fixture()` settles at `ready-for-review`. After `f.host.stopApi()`, the store holds one each of `run.created`, `run.prepared`, `plan.accepted`, `check.finished` (`passed: true`), `review.recorded` (`approved`), and `run.settled` (`ready-for-review`); two `task.planned` and two `task.integrated`; and one `member.started` and one `member.reported` per member of the run. It holds no `member.stopped`, `repair.started`, or `ledger.gap`. By `seq`, `run.created` < `run.prepared` < `plan.accepted` < each `task.planned` < each `task.integrated` < `check.finished` < `review.recorded` < `run.settled`, and each member's `member.started` precedes its `member.reported`. |
+
+- [ ] **Step 2: Run the tests.** The first three must pass against the two event slices. Break each once on purpose (rename one emitted kind, remove one sample, change one stop reason) and confirm the matching test fails, then restore it.
+- [ ] **Step 3: Run** `node --import tsx --test tests/run-event-coverage.test.ts tests/team-events.test.ts`, then `tests/teams.test.ts` and `tests/team-delivery.test.ts` on the host, then the typecheck.
+- [ ] **Step 4: The coordinator runs `npm run check`, requests the independent review, and commits.**
+
+## Not in this slice
+
+- Any projector: round attribution, the freeze, the `same-model-review` flag, run summaries.
+- `check.finished` for a check operation that fails before its completion.
+- The base branch scan, landing, revert, and the hold window.
+- `configId` and the profile epoch.
+- The test that `team-prompts.ts` does not import the ledger. It arrives with the ledger module in the projection slice.

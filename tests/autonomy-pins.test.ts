@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { autonomyOf, type AutonomyMode } from "../packages/host/src/autonomy.js";
 import { GoalService } from "../packages/host/src/goals.js";
 import type { CreateGoal, ProductGoal } from "../packages/host/src/goal-types.js";
@@ -9,6 +11,7 @@ import type { Project } from "../packages/host/src/types.js";
 import type { CreateTeam, TeamGoalContext, TeamLineup, TeamRun, TeamView } from "../packages/host/src/team-types.js";
 import { emptyUsage } from "../packages/host/src/team-usage.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
+import { createTeamSchema, teamGoalContextSchema, teamLineupSchema } from "../packages/host/src/team-types.js";
 import { waitFor } from "./helpers.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
@@ -95,12 +98,62 @@ test("a mode change applies from the next run", async () => {
 test("a run recorded before this slice reads as supervised and is not rewritten", () => {
   const f = teamFixture();
   f.config.projects[0]!.autonomy = "autonomous";
+  // Runs written since the capacity ceiling existed carry it; the constructor migrates only runs without one.
+  f.run.parallelismCeiling = 4;
   f.writeTeam();
+  const file = join(f.config.stateDir, "teams", `${f.run.id}.sealed`), before = readFileSync(file);
   const teams = f.openTeam();
   try {
     assert.equal(autonomyOf(teams.get(f.run.id)), "supervised");
     assert.equal("autonomy" in f.readRecord<{ run: TeamRun }>("team", f.run.id).run, false);
+    assert.deepEqual(readFileSync(file), before, "Loading and reading a pre-slice run must not rewrite its sealed bytes");
   } finally { teams.close(); f.close(); }
+});
+
+test("a goal recorded before this slice is not rewritten at load", async () => {
+  const f = teamFixture();
+  f.config.projects[0]!.autonomy = "autonomous";
+  const goal = goalRecord(f);
+  f.writeRecord("goal", goal.id, { goal, receipts: {}, fingerprint: "fixture" });
+  const file = join(f.config.stateDir, "goals", `${goal.id}.sealed`), before = readFileSync(file);
+  const teams = stubTeams();
+  let goals: GoalService | undefined;
+  try {
+    goals = new GoalService(f.config, f.key, teams as unknown as TeamService);
+    assert.equal(autonomyOf((await goals.get(goal.id)).goal ?? {}), "supervised");
+    assert.deepEqual(readFileSync(file), before, "Loading a pre-slice goal must not rewrite its sealed bytes");
+  } finally { goals?.close(); f.close(); }
+});
+
+test("a goal launch prepared before this slice replays without a conflict", async () => {
+  const f = teamFixture();
+  f.config.projects[0]!.autonomy = "autonomous";
+  const runId = randomUUID(), request: CreateTeam = { ...teamRequest(), requestId: runId, useConfiguredLineup: true } as CreateTeam;
+  const context = goalContext(randomUUID());
+  // The fingerprint the code before this slice computed: the parsed request and the creation context
+  // (goal, then lineup, in that key order), with no autonomy key anywhere in the formula.
+  const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  const fingerprint = digest({ request: createTeamSchema.parse(request), goal: teamGoalContextSchema.parse(context), lineup: teamLineupSchema.parse(lineup) });
+  const run = { ...structuredClone(f.run), id: runId, provider: "claude" as const, title: request.title, objective: request.objective, parallelismCeiling: 1 } as TeamRun;
+  delete (run as { autonomy?: unknown }).autonomy;
+  f.writeRecord("team", runId, { run, prepared: true, fingerprint, receipts: {} });
+  const goal = goalRecord(f);
+  f.writeRecord("goal", goal.id, { goal, receipts: {}, fingerprint: "fixture", launch: { request, context } });
+  const teams = f.openTeam();
+  let goals: GoalService | undefined;
+  try {
+    goals = new GoalService(f.config, f.key, teams);
+    goals.start();
+    const recorded = await waitFor(() => f.readRecord<{ goal: ProductGoal }>("goal", goal.id), value => value.goal.cycles.length === 1, 5000);
+    assert.notEqual(recorded.goal.status, "blocked", recorded.goal.reason);
+    assert.equal(recorded.goal.cycles[0]!.teamId, runId);
+    assert.equal(recorded.goal.cycles[0]!.autonomy, "supervised");
+    assert.equal(autonomyOf(recorded.goal.cycles[0]!), "supervised");
+    const replayed = teams.get(runId);
+    assert.equal(replayed.id, runId);
+    assert.equal(autonomyOf(replayed), "supervised");
+    assert.equal(f.readRecord<{ run: TeamRun }>("team", runId).run.autonomy, undefined);
+  } finally { goals?.close(); teams.close(); f.close(); }
 });
 
 /** A stub team service: records each goal launch and returns views whose status the test sets. */

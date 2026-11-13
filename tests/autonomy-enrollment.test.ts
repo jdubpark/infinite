@@ -150,6 +150,38 @@ test("a mode change needs an applied enrollment", async () => {
   } finally { f.close(); }
 });
 
+test("a record that start-up did not apply cannot change its mode", async () => {
+  const f = fixture();
+  try {
+    await new RepoEnrollmentService(f.config(), f.key).put("example", enrollRequest(0));
+    // restore skips a record whose saved teamwork folder no longer resolves; get() still reads it.
+    writeSealed(f.file, f.key, "repo-enrollments", {
+      version: 1,
+      projects: { example: { path: realpathSync(f.projectPath), team: team(), revision: 1, teamwork: "../escape" } },
+      requests: {},
+    });
+    const sealedBefore = readFileSync(f.file);
+    const config = f.config();
+    const service = new RepoEnrollmentService(config, f.key);
+    assert.equal(config.projects[0].autonomy, undefined, "start-up did not apply the record");
+    const view = service.get("example");
+    assert.equal(view.autonomy, "supervised");
+    assert.equal(view.autonomySource, "not-enrolled");
+
+    await assert.rejects(service.setAutonomy("example", { requestId: randomUUID(), revision: 1, mode: "autonomous" }), (error: { code?: string; status?: number }) => error.code === "autonomy-requires-enrollment" && error.status === 409);
+    assert.deepEqual(readFileSync(f.file), sealedBefore, "nothing is sealed");
+    assert.equal(config.projects[0].autonomy, undefined, "the overlay stays absent");
+    assert.equal(service.get("example").autonomy, "supervised");
+    assert.equal(service.get("example").revision, 1);
+
+    const reenrolled = await service.put("example", { requestId: randomUUID(), revision: 1, team: team(), teamwork: null });
+    assert.equal(reenrolled.revision, 2);
+    const changed = await service.setAutonomy("example", { requestId: randomUUID(), revision: 2, mode: "autonomous" });
+    assert.equal(changed.autonomy, "autonomous");
+    assert.equal(changed.autonomySource, "saved");
+  } finally { f.close(); }
+});
+
 test("a mode change survives a restart", async () => {
   const f = fixture();
   try {

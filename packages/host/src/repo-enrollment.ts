@@ -155,6 +155,8 @@ export class RepoEnrollmentService {
     const current = this.store.projects[projectId];
     if (!current) throw new TeamError(409, "autonomy-requires-enrollment", "Only a repository enrolled with infinite repo init has an autonomy mode. Other projects stay supervised.");
     this.assertPathBinding(project, current);
+    // The overlay is set only when start-up (restore) or repo init (putLocked) applied the record.
+    if (project.autonomy === undefined) throw new TeamError(409, "autonomy-requires-enrollment", "Only a repository enrolled with infinite repo init has an autonomy mode. Other projects stay supervised.");
     if (change.revision !== current.revision) throw new TeamError(409, "stale-enrollment-revision", "The repository enrollment changed. Refresh it before saving.");
 
     const entry: StoredEnrollment = { ...current, autonomy: change.mode, revision: current.revision + 1 };

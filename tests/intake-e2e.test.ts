@@ -1,13 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import { inProcessHost, waitFor } from "./helpers.js";
 import { lineup } from "./mission-harness.js";
 import { startIntakeLinearServer } from "./fixtures/intake-linear-server.js";
 import { startSlackServer } from "./fixtures/slack-server.js";
-import type { IntakeThread } from "../packages/host/src/intake-types.js";
+import { unseal } from "../packages/host/src/vault.js";
+import type { IntakeRecord, IntakeThread } from "../packages/host/src/intake-types.js";
 import type { Config } from "../packages/host/src/types.js";
 
 const OWNER = "U00000000", AGENT = "U11111111";
@@ -18,26 +20,29 @@ const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd,
 const slackLink = (thread: IntakeThread) => `https://example.slack.com/archives/${thread.channelId}/p${thread.threadTs.replace(".", "")}`;
 
 /**
- * A real host through createApp, with Linear and (optionally) Slack fakes and one repository project the mission
- * fixture agent can answer from. Intake polls Linear every 30 seconds, so each issue is filed after the host starts.
+ * A real host through createApp, with Linear and (optionally) Slack fakes and two repository projects the mission
+ * fixture agent can work in. Intake polls Linear every 30 seconds, so each issue is filed after the host starts.
  */
 async function intakeHost(withSlack: boolean) {
   const root = realpathSync(mkdtempSync("/tmp/inf-intake-e2e-"));
   const receipts = join(root, "receipts");
   mkdirSync(receipts, { mode: 0o700 });
-  const repo = join(root, "api");
-  mkdirSync(repo);
-  writeFileSync(join(repo, "check.mjs"), "process.exit(0);\n");
-  git(repo, "init", "--initial-branch=main");
-  git(repo, "add", "check.mjs");
-  git(repo, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial api");
+  const repos = ["api", "web"].map(name => {
+    const path = join(root, name);
+    mkdirSync(path);
+    writeFileSync(join(path, "check.mjs"), "process.exit(0);\n");
+    git(path, "init", "--initial-branch=main");
+    git(path, "add", "check.mjs");
+    git(path, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", `Initial ${name}`);
+    return { id: name, path };
+  });
 
   const linear = await startIntakeLinearServer();
   const slack = withSlack ? await startSlackServer() : undefined;
   const agent = { command: process.execPath, args: [resolve("tests/fixtures/mission-agent.mjs"), "mission", receipts, "claude"] };
   const host = await inProcessHost({ configure: (config: Config) => {
     config.agents = { claude: agent, codex: agent };
-    config.projects = [{ id: "api", name: "API", path: repo, team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] } }];
+    config.projects = repos.map(repo => ({ id: repo.id, name: repo.id.toUpperCase(), path: repo.path, team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] } }));
     config.teams = { workspaceDir: join(root, "teams"), lineup };
     config.linear = { apiKeyFile: linear.apiKeyFile, endpoint: linear.endpoint };
     config.intake = {
@@ -50,7 +55,7 @@ async function intakeHost(withSlack: boolean) {
     };
   } });
   return {
-    host, linear, slack,
+    host, linear, slack, receipts,
     close: async () => {
       await host.stop();
       await slack?.close();
@@ -60,7 +65,7 @@ async function intakeHost(withSlack: boolean) {
   };
 }
 
-test("a Slack-filed issue is acknowledged, asked about, answered, and reported in its thread", { timeout: 150 * 1000 }, async () => {
+test("a Slack-filed answer-only issue is acknowledged and reported in its thread", { timeout: 150 * 1000 }, async () => {
   const world = await intakeHost(true);
   const { host, linear, slack } = world;
   try {
@@ -83,6 +88,54 @@ test("a Slack-filed issue is acknowledged, asked about, answered, and reported i
       "Infinite agent report: ready for review.",
     ]);
     // Every chat.postMessage call the bot made went into the bound thread: the fake keeps all posts, and only this thread was seeded.
+    const postCalls = slack!.calls.filter(call => call.method === "chat.postMessage").length;
+    assert.equal(postCalls, texts().length, "Each post the bot sent landed in the bound thread");
+  } finally {
+    await world.close();
+  }
+});
+
+test("a question reaches the thread and the owner's tagged reply answers it", { timeout: 210 * 1000 }, async () => {
+  const world = await intakeHost(true);
+  const { host, linear, slack, receipts } = world;
+  try {
+    // The fixture coordinator dispatches its subtasks once this file exists.
+    writeFileSync(join(receipts, "release-dispatch"), "go", { mode: 0o600 });
+    // The request's two subtasks run in two repositories, so the intake group holds both.
+    const group = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Shop", repos: ["api", "web"] });
+    assert.equal(group.status, 200, JSON.stringify(group.body));
+    host.config.intake!.mission.groupId = group.body.id;
+
+    slack!.seedThread(BINDING, [{ user: OWNER, text: `<@${AGENT}> file this: which response format should the endpoint use?` }]);
+    const issue = linear.file({ attachmentUrls: [slackLink(BINDING)] });
+    const texts = () => slack!.posts(BINDING).map(post => post.text);
+
+    await waitFor(async () => texts(), list => list.some(text => text.startsWith("Started on TEST-1")), 60000);
+    const question = await waitFor(async () => texts(), list => list.some(text => text.startsWith("Q1: The API subteam asks: Which response format should the endpoint use?")), 120000);
+    assert.ok(question.some(text => text === "Q1: The API subteam asks: Which response format should the endpoint use?\n1. JSON   2. Text\nReply with a mention and your answer."));
+
+    const { body: before } = await host.fetchApi("/intake");
+    const missionId = before.records[0].missionId as string;
+    const asked = await host.fetchApi(`/missions/${missionId}`);
+    assert.equal(asked.body.status, "needs-input");
+    assert.equal(asked.body.decisions.find((item: { answer?: string }) => !item.answer)?.options.join(","), "JSON,Text");
+
+    // The owner's tagged reply arrives on the Socket Mode connection, in the bound thread.
+    await slack!.emit({ type: "app_mention", user: OWNER, channel: BINDING.channelId, ts: "1700000900.000100", thread_ts: BINDING.threadTs, text: `<@${slack!.botUserId}> JSON` });
+
+    const answered = await waitFor(async () => (await host.fetchApi(`/missions/${missionId}`)).body,
+      mission => mission.decisions.some((item: { answer?: string }) => item.answer === "JSON"), 60000);
+    assert.ok(answered.decisions.some((item: { answer?: string }) => item.answer === "JSON"), "The mission decision holds the owner's answer");
+    assert.notEqual(answered.status, "ready-for-review");
+
+    // The record keeps the reply as handled; read from the sealed record, since the API does not expose inbound entries.
+    const sealed = unseal<IntakeRecord>(readFileSync(world.host.config.keyFile), `intake-record:${issue.id}`,
+      readFileSync(join(world.host.config.stateDir, "intake", "records", `${issue.id}.sealed`), "utf8"));
+    const reply = sealed.inbound.find(entry => entry.text === "JSON");
+    assert.ok(reply?.handledAt, "The owner's reply is recorded as handled");
+    assert.equal(reply?.outcome, "answered");
+
+    // Nothing was posted outside the bound thread.
     const postCalls = slack!.calls.filter(call => call.method === "chat.postMessage").length;
     assert.equal(postCalls, texts().length, "Each post the bot sent landed in the bound thread");
   } finally {

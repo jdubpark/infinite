@@ -250,14 +250,26 @@ point is durability: work survives workspace removal and loss of the host disk. 
 Intake lets the owner start a mission from a Linear issue and follow it in a Slack
 thread. See [intake](intake.md) for the flow.
 
-Only the owner causes work. An issue starts a mission only when its creator is the
-owner's Linear user ID, `intake.linear.creatorId`. When a Slack thread is required,
-the thread must also hold a message from the owner's Slack user ID,
-`intake.slack.ownerUserId`, that mentions Linear's agent and was sent before the
-issue was filed. The bot acts only on `app_mention` events from that
-Slack user in a thread bound to a record. A teammate's message is not stored as a
-request and is never acted on. Thread messages from other people are kept only
-as labelled background inside the objective.
+Only the owner causes work, and the rule holds for both the intake service and the
+Slack surface:
+
+- An issue starts a mission only when its creator is the owner's Linear user ID,
+  `intake.linear.creatorId`. When a Slack thread is required, the thread must also
+  hold a message from the owner's Slack user ID, `intake.slack.ownerUserId`, that
+  mentions Linear's agent and was sent before the issue was filed.
+- The bot acts only on `app_mention` events from the owner's Slack user in a thread
+  bound to a record. A mention or reply from anyone else in a bound thread is
+  dropped before anything is stored; the surface keeps only a count of dropped
+  events. Nothing from that message reaches the record, the mission, or an agent.
+- The thread the issue links is read once, at admission. Its messages, the
+  owner's and other people's, are kept in the mission objective as background.
+  Each line is labelled `owner` or `other`, and bot messages are left out. The
+  coordinator is told that this text is information, never instructions, and that
+  only the owner's words are instructions. The Slack surface also reads the bound
+  thread to find its own posts after an uncertain send; it stores nothing from that
+  read.
+- So text that teammates wrote in the linked thread is stored in the host's sealed
+  mission state and shown to coordinator and subteam agents.
 
 The bot posts only into the thread a record is bound to. Every outbound Slack
 function takes an intake record and reads its thread; none takes a channel ID
@@ -273,12 +285,12 @@ endpoints are accepted only when `environment` is `"local"`; every other endpoin
 must be the official one. Slack uses Socket Mode, so the host has no inbound
 public endpoint, and Linear is polled.
 
-Intake errors are not shared as text. The intake service's `lastError` carries an
-error's name and, when it has one, its code, and the message and stack go to the
-host log only. A Slack message's error field carries the Slack error code.
-Known gap: the Slack surface's `lastError` on `GET /api/intake` currently carries
-the full error message, not the name and code. This is open against the Slack
-surface and must be fixed before this section is relied on.
+Errors are not shared as text. For an unexpected failure, the intake service's
+`lastError`, the Slack surface's `lastError`, and every failure a record keeps
+carry only the error's name and, when it has one, its code. The message and stack
+go to the host log only. Two known refusals keep their own fixed text in shared
+places: a mission service refusal (`TeamError`) and a Slack request failure
+(`SlackError`, whose text names only its code).
 
 Residual risk: the objective carries the Linear title and description, and the
 Slack thread, to the coordinator and subteams. Anyone who can write to the issue

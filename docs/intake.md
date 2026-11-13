@@ -2,7 +2,7 @@
 
 Intake starts a mission from a Linear issue the owner files. It runs only when the
 host config has an `intake` block. Without one, no records are kept and
-`GET /api/intake` returns an empty list.
+`GET /api/intake` returns `{ "records": [] }`, with no `lastError` or `slack` member.
 
 ## What starts a mission
 
@@ -34,8 +34,11 @@ section, and nothing waits or retries.
 
 The objective is the Linear title, the description (up to 12,000 characters), a
 fixed note that only the owner's words are instructions, and the Slack thread as
-background. The thread is labelled by author and cut to fit the 24,000-character
-objective limit; the oldest lines go first. The mission title is the issue
+background. The thread is read once, at admission. Its lines are labelled `owner`
+or `other`, so other people's messages are kept in the objective, and bot messages
+are left out. The coordinator is told that this text is information, not
+instructions. The thread is cut to fit the 24,000-character objective limit; the
+oldest lines go first. See [security](security.md#request-intake). The mission title is the issue
 identifier and title, up to 100 characters.
 
 Admission saves the request before the mission starts and reuses it on every
@@ -56,7 +59,7 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `linear.creatorId` | UUID, required | The owner's Linear user ID. Issues from any other creator are skipped. |
 | `linear.label` | text, 1 to 80 characters, required | The label that marks an issue for intake. |
 | `linear.commentsMirrorToSlack` | boolean, default `false` | When `true` and a thread is bound, the two Linear comments are not posted; the Slack thread carries the same messages. |
-| `slack` | object, optional | The Slack surface. Without it, no bot posts and no thread is bound. |
+| `slack` | object, optional | The Slack surface. Without it, the bot posts nothing and receives no replies. Threads are still bound; see below. |
 | `slack.appTokenFile` | absolute path, required with `slack` | The Socket Mode app token. A regular `0600` file outside `stateDir`, `runDir`, `teams.workspaceDir`, and every project path. |
 | `slack.botTokenFile` | absolute path, required with `slack` | The bot token. The same file rules as `appTokenFile`. |
 | `slack.teamId` | `T` followed by 2 to 20 uppercase letters or digits, required with `slack` | The workspace. A token for another workspace stops the surface with a reason. |
@@ -75,6 +78,21 @@ Linear credentials are a separate block, `linear.apiKeyFile`, a `0600` file with
 the same location rules. Linear's endpoint must be its official HTTPS endpoint,
 or loopback HTTP when `environment` is `"local"`.
 
+### Thread binding without a Slack block
+
+A record binds the issue's Slack thread whenever the issue has a Slack message
+link among its attachments, whether or not `intake.slack` is configured. Admission
+saves that binding as it is found. The configuration schema requires
+`intake.slack` when `requireSlackThread` is on, so a binding without a Slack block
+happens only with `requireSlackThread` off. In that case the thread is read
+for the background only when a Slack surface exists, so it is not read at all
+without one. Nothing posts to a bound thread without the Slack surface.
+
+The binding still matters to `linear.commentsMirrorToSlack`. When it is `true` and
+a thread is bound, the two Linear comments are not written, even with no Slack
+block. The thread then receives nothing from the host. Keep that setting `false`
+unless `intake.slack` is configured.
+
 ## What the bot posts
 
 Every Slack message is posted into the thread a record is bound to. Nothing is
@@ -83,7 +101,10 @@ order as the mission moves:
 
 - an acknowledgement when the mission starts, or a queued notice while it waits;
 - a numbered question for each mission decision, with its options;
-- a status note when the mission is paused;
+- a status note when the mission is paused, but only when the record has a
+  `closure`, which is set when the Linear issue is deleted, archived, cancelled,
+  or closed. The note says why and asks for `resume` or `cancel`. A pause with no
+  closure posts nothing;
 - the result: `Answer (agent report):` for an answer-only request, and
   `Ready for review (agent report):` otherwise, followed by pull request and
   branch lines when a subteam published one;
@@ -141,9 +162,9 @@ it, so a lost response does not post a second comment. With
   Present only when `intake.slack` is configured. `dropped` counts inbound events
   that were refused, and `reason` says why the surface is not connected.
 
-The intake service summarises its errors as the error's name and code, and writes
-the full error to the host log. See [security](security.md#request-intake) for
-the one known exception on the Slack surface.
+Both surfaces summarise an unexpected error as its name and code, and write the
+full error to the host log. Refusals with fixed text, such as a mission refusal or
+a Slack request failure, keep that text. See [security](security.md#request-intake).
 
 ## Pre-build checks
 

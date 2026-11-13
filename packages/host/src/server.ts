@@ -30,6 +30,10 @@ import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EventOutbox } from "./evidence/outbox.js";
+import { EvidenceError } from "./evidence/types.js";
+import { advanceEpoch, configurationModule, configurationProjector, EpochRequestConflict } from "./configuration-store.js";
+import { profileKeyOf } from "./config-identity.js";
+import { lineupProfiles } from "./team-types.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
@@ -177,6 +181,9 @@ export function createApp(config: Config, key: Buffer) {
   // A store that cannot open stays unavailable with a fixed reason. It never blocks the host, a run, or a removal.
   const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(config.stateDir), vaultKey: key });
   const outbox = new EventOutbox(evidence);
+  // The module registers before its projector, which reads its tables.
+  evidence.register(configurationModule());
+  outbox.registerProjector(configurationProjector());
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
     graphs: repositoryGraphs,
@@ -628,6 +635,23 @@ export function createApp(config: Config, key: Buffer) {
     return void res.json({ accounts: usage.summary().accounts });
   });
   app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
+  // Advances one profile's epoch. The profile ID names one identity across the whole lineup.
+  app.post("/api/outcomes/epochs", requireRole(["owner"]), (req, res) => {
+    const body = z.object({ profileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), requestId: z.uuid() }).strict().parse(req.body);
+    const profile = config.teams?.lineup ? profileKeyOf(lineupProfiles(config.teams.lineup), body.profileId) : undefined;
+    if (profile === undefined) return void res.status(404).json({ code: "profile-not-found", error: "No configured profile has this ID." });
+    // The lineup schema gives one identity per profile ID, so this answer guards that rule and no loaded lineup reaches it.
+    if (profile === "ambiguous") return void res.status(409).json({ code: "profile-ambiguous", error: "This profile ID names more than one configuration. Give each its own ID." });
+    try {
+      const advanced = advanceEpoch(evidence, { profile, requestId: body.requestId, now: new Date().toISOString() });
+      return void res.json({ profileId: body.profileId, provider: profile.provider, model: profile.model, effort: profile.effort,
+        epoch: advanced.epoch, since: advanced.since, repeated: advanced.repeated });
+    } catch (error) {
+      if (error instanceof EpochRequestConflict) return void res.status(409).json({ code: "request-conflict", error: error.message });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
   app.post("/api/dictation/cleanup", requireRole(["owner", "controller"]), async (req, res) => {
     const body = z.object({ text: z.string().trim().min(1).max(32000) }).strict().parse(req.body);
     if (!dictationCleaner) return void res.status(503).json({ code: "dictation-unavailable", error: "This host has no dictation model configured." });

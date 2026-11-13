@@ -5,6 +5,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { type ConfigComponents, configId, promptVersion, readGuidanceDigest } from "../packages/host/src/config-identity.js";
 import { EventOutbox, type OutboxEvent } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { RunEvent } from "../packages/host/src/evidence/types.js";
@@ -607,6 +608,120 @@ test("a launch records member.started once", async () => {
       assert.equal(eventsOfKind(second, f.run.id, "member.started").length, 1, "a restart adds none");
     } finally { second.close(); }
   } finally { store.close(); f.close(); }
+});
+
+/** Queues one implementer on the `spark-high` profile of task `a`, as the launch tests do. */
+function queueImplementer(f: Fixture) {
+  const memberId = randomUUID(), sessionId = randomUUID();
+  const queued = { ...f.run.members[0]!, memberId, sessionId, role: "implementer" as const, title: "Implementer: a", taskId: "a",
+    provider: "opencode" as const, modelProfile: mixedLineup.implementers[0]!, status: "queued" as const, cursor: 0, prompt: "Write a.txt" };
+  f.run.members = [queued];
+  f.run.lineup = mixedLineup; f.run.status = "implementing"; f.run.parallelism = 2;
+  f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
+  f.writeTeam();
+  return memberId;
+}
+
+/** A command prefix that runs `git` unchanged unless the command is a guidance read (`diff-tree`), which `act` handles. */
+function guidancePrefix(act: string) {
+  return `const [command, ...args] = process.argv.slice(2);
+if (command === "git" && args.includes("diff-tree")) { ${act} }
+const { spawnSync } = require("node:child_process");
+const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 1);`;
+}
+
+test("a launched member records its configuration", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const memberId = queueImplementer(f);
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => eventsOfKind(store, f.run.id, "member.configured").length === 1, "member.configured is stored");
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "member.configured");
+    const profile = mixedLineup.implementers[0]!;
+    const guidance = await readGuidanceDigest(f.run.workspace, f.run.baseCommit, undefined, new AbortController().signal);
+    assert.ok(guidance !== undefined, "the fixture's guidance reads");
+    const version = promptVersion("implementer", "opencode", profile, true);
+    const components: ConfigComponents = { profile: { provider: "opencode", model: profile.model, effort: "high" },
+      promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" };
+    assert.equal(event!.memberId, memberId);
+    assert.equal(event!.taskId, "a");
+    assert.equal(event!.revision, 1);
+    assert.deepEqual(event!.data, { v: 1, configId: configId(components), provider: "opencode", model: profile.model, effort: "high",
+      promptVersion: version, guidance, knowledge: "none", routing: "off", shape: "team" });
+  } finally { store.close(); f.close(); }
+});
+
+test("a stalled guidance read does not delay the launch", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const memberId = queueImplementer(f);
+    f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", guidancePrefix(
+      "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3000);"), "unused"] };
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    // The step returns while the read still sleeps. A launch that awaited the read would return after it,
+    // with the configuration already stored, and the count below would be 1.
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => eventsOfKind(store, f.run.id, "member.started").length === 1, "member.started is stored");
+    const live = scheduler.record(f.run.id) as { run: TeamRun };
+    assert.equal(live.run.members.find(member => member.memberId === memberId)?.status, "running");
+    assert.equal(eventsOfKind(store, f.run.id, "member.configured").length, 0, "the read is still running");
+    await waitFor(() => eventsOfKind(store, f.run.id, "member.configured").length === 1, "the late configuration arrives", 6000);
+    await teams.idle();
+  } finally { store.close(); f.close(); }
+});
+
+test("a refused guidance read records no configuration", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    queueImplementer(f);
+    f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", guidancePrefix("process.exit(1);"), "unused"] };
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => eventsOfKind(store, f.run.id, "member.started").length === 1, "member.started is stored");
+    await teams.idle();
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await teams.idle();
+    assert.equal(eventsOfKind(store, f.run.id, "member.configured").length, 0, "no configuration is stored");
+    assert.equal(eventsOfKind(store, f.run.id, "member.started").length, 1, "the launch is stored");
+  } finally { store.close(); f.close(); }
+});
+
+test("a service without the ledger reads no guidance", async () => {
+  const logDir = mkdtempSync(join(tmpdir(), "inf-config-log-"));
+  const log = join(logDir, "commands.log");
+  const logging = `const { appendFileSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const [file, command, ...args] = process.argv.slice(1);
+appendFileSync(file, JSON.stringify([command, ...args]) + "\\n");
+const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 1);`;
+  try {
+    const f = schedulerFixture();
+    try {
+      queueImplementer(f);
+      f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", logging, log] };
+      f.writeTeam();
+      const teams = f.openTeam();
+      const scheduler = internal(teams);
+      await scheduler.step(scheduler.record(f.run.id));
+      await teams.idle();
+      await new Promise(resolve => setTimeout(resolve, 300));
+    } finally { f.close(); }
+    const commands = readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as string[]);
+    assert.ok(commands.length > 0, "the prefix ran during the launch");
+    assert.equal(commands.some(args => args.includes("diff-tree")), false, "no guidance read");
+  } finally { rmSync(logDir, { recursive: true, force: true }); }
 });
 
 test("a report records member.reported with its kind", async () => {

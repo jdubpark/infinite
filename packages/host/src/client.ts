@@ -486,7 +486,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
 
 const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
-const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
+const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--profile"]);
 const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
 
 /**
@@ -785,6 +785,26 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
       if (options["--json"]) console.log(JSON.stringify(sessions, null, 2));
       else printSessions(sessions, (await api.json<Me>("/me")).machine?.label || new URL(config.origin).hostname);
+      return true;
+    }
+    if (command === "usage" && positional[0] === "outcomes") {
+      const profileId = options["--profile"];
+      if (positional.length !== 2 || positional[1] !== "new-epoch" || typeof profileId !== "string" || !profileId)
+        throw new Error("Usage: infinite usage outcomes new-epoch --profile ID [--json]");
+      type Epoch = { profileId: string; provider: string; model: string | null; effort: string | null; epoch: number; since: string; repeated: boolean };
+      let result: Epoch;
+      try {
+        result = await api.json<Epoch>("/outcomes/epochs", { profileId, requestId: randomUUID() }, undefined, undefined, "POST");
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 403) throw new Error("Advancing a profile epoch requires an owner device key.");
+        if (error instanceof HttpError && error.status === 404) throw new Error(`No configured profile has ID \"${clean(profileId)}\". Check the lineup in the team settings.`);
+        if (error instanceof HttpError && error.status === 409 && error.code === "request-conflict") throw new Error("This request was already used for another profile. No epoch was advanced.");
+        if (error instanceof HttpError && error.status === 409) throw new Error(`Profile \"${clean(profileId)}\" names more than one configuration. Give each its own ID.`);
+        if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable. No epoch was advanced; retry later.");
+        throw error;
+      }
+      if (options["--json"]) console.log(JSON.stringify(result, null, 2));
+      else console.log(`Profile ${clean(result.profileId)} (${[result.provider, result.model, result.effort].map(value => clean(value ?? "none")).join(" ")}) is in epoch ${result.epoch} since ${clean(result.since)}.`);
       return true;
     }
     if (command === "cost" && positional[0] === "plan") {

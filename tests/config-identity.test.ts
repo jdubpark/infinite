@@ -10,10 +10,12 @@ import {
   memberConfiguration,
   parseGuidanceTree,
   profileIdentityKey,
+  profileKeyOf,
   promptVersion,
   readGuidanceDigest,
   type ConfigComponents,
 } from "../packages/host/src/config-identity.js";
+import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -53,6 +55,17 @@ test("a profile key leaves out the id and the label", () => {
   assert.match(key, HEX64);
   assert.notEqual(profileIdentityKey({ provider: "claude", model: "m", effort: null }), key);
   assert.equal(profileIdentityKey({ provider: "claude", model: "m", effort: "high" }), key);
+});
+
+test("a profile id names one identity, none, or an ambiguous one", () => {
+  const first = { id: "shared", label: "First", provider: "claude", model: "model-a", effort: "high" } as TeamModelProfile;
+  const twin = { ...first, label: "Twin" } as TeamModelProfile;
+  const other = { id: "shared", label: "Other", provider: "codex", model: "model-b", effort: "high" } as TeamModelProfile;
+  assert.deepEqual(profileKeyOf([first, twin], "shared"), { provider: "claude", model: "model-a", effort: "high" });
+  // The lineup schema refuses this lineup. The lookup still fails closed if one ever reaches it.
+  assert.equal(profileKeyOf([first, other], "shared"), "ambiguous");
+  assert.equal(profileKeyOf([first], "missing"), undefined);
+  assert.equal(profileKeyOf([], "shared"), undefined);
 });
 
 test("the prompt version is stable per role and provider", () => {

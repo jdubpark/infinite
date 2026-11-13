@@ -176,6 +176,7 @@ function isCanonicalTime(value: string): boolean {
   return !Number.isNaN(time) && new Date(time).toISOString() === value;
 }
 
-function optionalText(value: unknown): value is string | undefined {
-  return value === undefined || (typeof value === "string" && PROFILE_TEXT.test(value));
+/** A profile field a member lacks is absent or null. Both mean the same component value. */
+function optionalText(value: unknown): value is string | null | undefined {
+  return value === undefined || value === null || (typeof value === "string" && PROFILE_TEXT.test(value));
 }

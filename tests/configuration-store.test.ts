@@ -131,6 +131,32 @@ test("a configured member records its configuration once", () => {
   }
 });
 
+test("a profile field may be absent or null", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(configurationModule());
+    const outbox = setupOutbox(store);
+    // A member with no model and no effort: the emitter leaves both out, and an older or other emitter may send null.
+    const absent = configuredData({}, { model: null, effort: null });
+    delete absent.model;
+    delete absent.effort;
+    // The null form comes first, so the row's first-seen time proves that it was stored and not skipped.
+    outbox.flush([configuredEvent("member-null", "2026-11-13T01:00:00.000Z", configuredData({}, { model: null, effort: null }))]);
+    outbox.flush([configuredEvent("member-absent", "2026-11-13T02:00:00.000Z", absent)]);
+    const rows = configurationRows(store);
+    assert.equal(rows.length, 1, "both forms name one configuration");
+    assert.equal(rows[0]!.model, null);
+    assert.equal(rows[0]!.effort, null);
+    assert.equal(rows[0]!.config_id, configId(components({ model: null, effort: null })));
+    assert.equal(rows[0]!.first_seen_at, "2026-11-13T01:00:00.000Z");
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
 test("an event whose configId does not match is skipped", () => {
   const f = fixture();
   let store: EvidenceStore | undefined;

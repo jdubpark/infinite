@@ -36,6 +36,23 @@ export function profileIdentityKey(profile: ProfileKey): string {
   return sha256(canonicalJson({ provider: profile.provider, model: profile.model ?? null, effort: profile.effort ?? null }));
 }
 
+/**
+ * The identity that a profile id names among the given profiles. Undefined when no profile has the id, and
+ * "ambiguous" when its profiles differ in provider, model, or effort. The lineup schema refuses such a lineup,
+ * so "ambiguous" guards a rule that lives elsewhere.
+ */
+export function profileKeyOf(profiles: readonly TeamModelProfile[], profileId: string): ProfileKey | "ambiguous" | undefined {
+  const keys = new Map<string, ProfileKey>();
+  for (const profile of profiles) {
+    if (profile.id !== profileId) continue;
+    const identity = profileIdentity(profile, profile.provider);
+    const key: ProfileKey = { provider: identity.provider, model: identity.model ?? null, effort: identity.effort ?? null };
+    keys.set(profileIdentityKey(key), key);
+  }
+  if (keys.size === 0) return undefined;
+  return keys.size === 1 ? [...keys.values()][0]! : "ambiguous";
+}
+
 /** SHA-256 hex of the canonical JSON of exactly the six components (umbrella C7). */
 export function configId(components: ConfigComponents): string {
   return sha256(canonicalJson({

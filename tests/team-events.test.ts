@@ -45,6 +45,8 @@ type Internal = {
   step(stored: unknown): Promise<void>;
   retire(stored: unknown): Promise<void>;
   consume(stored: unknown, member: unknown): void;
+  launch(stored: unknown, member: unknown): Promise<void>;
+  readMemberJournal(stored: unknown, member: unknown): unknown;
 };
 const internal = (teams: TeamService) => teams as unknown as Internal;
 
@@ -554,5 +556,156 @@ test("a refused plan records no plan", async () => {
     assert.equal(stored.run.status, "blocked");
     assert.equal(eventsOfKind(store, f.run.id, "plan.accepted").length, 0);
     assert.equal(eventsOfKind(store, f.run.id, "task.planned").length, 0);
+  } finally { store.close(); f.close(); }
+});
+
+test("a launch records member.started once", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const memberId = randomUUID(), sessionId = randomUUID();
+    const queued = { ...f.run.members[0]!, memberId, sessionId, role: "implementer" as const, title: "Implementer: a", taskId: "a",
+      provider: "opencode" as const, modelProfile: mixedLineup.implementers[0]!, status: "queued" as const, cursor: 0, prompt: "Write a.txt" };
+    f.run.members = [queued];
+    f.run.lineup = mixedLineup; f.run.status = "implementing"; f.run.parallelism = 2;
+    f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => eventsOfKind(store, f.run.id, "member.started").length === 1, "member.started is stored");
+    const stored = f.readRecord<{ run: TeamRun }>("team", f.run.id).run.members[0]!;
+    const [event] = eventsOfKind(store, f.run.id, "member.started");
+    assert.equal(event!.memberId, memberId);
+    assert.equal(event!.taskId, "a");
+    assert.equal(event!.revision, 1);
+    assert.equal(event!.data.role, "implementer");
+    assert.equal(event!.data.purpose, "work");
+    assert.equal(event!.data.sessionId, sessionId);
+    assert.equal(event!.data.startedAt, stored.startedAt);
+    assert.equal(event!.data.baseCommit, f.run.baseCommit);
+    assert.equal(event!.data.profileId, "spark-high");
+    assert.equal(event!.data.provider, "opencode");
+    assert.equal(event!.data.model, "meta/muse-spark-1.3-contributor");
+    assert.equal(event!.data.effort, "high");
+    assert.equal("replaces" in event!.data, false);
+
+    await scheduler.step(scheduler.record(f.run.id));
+    await teams.idle();
+    assert.equal(eventsOfKind(store, f.run.id, "member.started").length, 1, "a second step adds none");
+    const second = openStore(f, f.key);
+    try {
+      const restarted = f.openTeam({ events: new EventOutbox(second) });
+      await internal(restarted).step(internal(restarted).record(f.run.id));
+      await restarted.idle();
+      assert.equal(eventsOfKind(second, f.run.id, "member.started").length, 1, "a restart adds none");
+    } finally { second.close(); }
+  } finally { store.close(); f.close(); }
+});
+
+test("a report records member.reported with its kind", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.writeTeam();
+    const pm = f.run.members[0]!;
+    f.report(pm.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: pm.memberId, revision: pm.revision,
+      report: { kind: "plan", summary: "One task", tasks: [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [] }] } });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => eventsOfKind(store, f.run.id, "member.reported").length === 1, "member.reported is stored");
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "member.reported");
+    assert.equal(event!.memberId, pm.memberId);
+    assert.deepEqual(event!.data, { v: 1, role: "project-manager", reportKind: "plan" });
+  } finally { store.close(); f.close(); }
+});
+
+test("an answered replacement names the member it replaces", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.run.missionId = randomUUID();
+    f.run.parallelismCeiling = 4;
+    const original = f.run.members[0], at = new Date().toISOString();
+    const active = { ...original, role: "implementer" as const, taskId: "a", startedAt: at, lastActivityAt: at };
+    const waiting = { ...original, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer" as const, taskId: "b", status: "waiting" as const,
+      report: { kind: "question" as const, question: "Continue?", options: ["Yes"] } };
+    f.run.members = [active, waiting]; f.run.status = "implementing"; f.run.parallelism = 2;
+    f.run.tasks = ["a", "b"].map((id, index) => ({ id, title: id, instructions: "Write the assigned file", paths: [`${id}.txt`], dependsOn: [],
+      status: index ? "waiting" as const : "running" as const, memberId: index ? waiting.memberId : active.memberId }));
+    f.run.decisions = [{ id: randomUUID(), memberId: waiting.memberId, revision: 1, question: "Continue?", options: ["Yes"], createdAt: at }];
+    f.state.attention.lastActivityAt = at;
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    await teams.setMissionParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 1 });
+    await teams.answer(f.run.id, f.run.decisions[0]!.id, { requestId: randomUUID(), revision: 1, text: "Yes" });
+    await scheduler.step(scheduler.record(f.run.id));
+    await teams.setMissionParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 2 });
+    await scheduler.step(scheduler.record(f.run.id));
+    const next = f.readRecord<{ run: TeamRun; ledgerReplaces?: Record<string, unknown> }>("team", f.run.id);
+    const replacement = next.run.members.find(member => member.taskId === "b" && member.status === "queued")!;
+    assert.ok(replacement, "the answered member has a queued replacement");
+    assert.deepEqual(next.ledgerReplaces?.[replacement.memberId], { memberId: waiting.memberId, cause: "answer" });
+
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => eventsOfKind(store, f.run.id, "member.started").some(event => event.memberId === replacement.memberId), "the replacement starts");
+    const [started] = eventsOfKind(store, f.run.id, "member.started").filter(event => event.memberId === replacement.memberId);
+    assert.deepEqual(started!.data.replaces, { memberId: waiting.memberId, cause: "answer" });
+    assert.equal("ledgerReplaces" in f.readRecord<Record<string, unknown>>("team", f.run.id), false, "the link is dropped once the replacement starts");
+  } finally { store.close(); f.close(); }
+});
+
+test("a service without an outbox records no replacement link", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.missionId = randomUUID();
+    f.run.parallelismCeiling = 4;
+    const original = f.run.members[0], at = new Date().toISOString();
+    const active = { ...original, role: "implementer" as const, taskId: "a", startedAt: at, lastActivityAt: at };
+    const waiting = { ...original, memberId: randomUUID(), sessionId: randomUUID(), role: "implementer" as const, taskId: "b", status: "waiting" as const,
+      report: { kind: "question" as const, question: "Continue?", options: ["Yes"] } };
+    f.run.members = [active, waiting]; f.run.status = "implementing"; f.run.parallelism = 2;
+    f.run.tasks = ["a", "b"].map((id, index) => ({ id, title: id, instructions: "Write the assigned file", paths: [`${id}.txt`], dependsOn: [],
+      status: index ? "waiting" as const : "running" as const, memberId: index ? waiting.memberId : active.memberId }));
+    f.run.decisions = [{ id: randomUUID(), memberId: waiting.memberId, revision: 1, question: "Continue?", options: ["Yes"], createdAt: at }];
+    f.state.attention.lastActivityAt = at;
+    f.writeTeam();
+    const teams = f.openTeam();
+    const scheduler = internal(teams);
+    await teams.setMissionParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 1 });
+    await teams.answer(f.run.id, f.run.decisions[0]!.id, { requestId: randomUUID(), revision: 1, text: "Yes" });
+    await scheduler.step(scheduler.record(f.run.id));
+    assert.equal("ledgerReplaces" in f.readRecord<Record<string, unknown>>("team", f.run.id), false);
+    await teams.setMissionParallelism(f.run.id, { requestId: randomUUID(), revision: 1, parallelism: 2 });
+    await scheduler.step(scheduler.record(f.run.id));
+    assert.equal("ledgerReplaces" in f.readRecord<Record<string, unknown>>("team", f.run.id), false);
+    assert.equal(f.readRecord<{ run: TeamRun }>("team", f.run.id).run.members.filter(member => member.taskId === "b").length, 2);
+  } finally { f.close(); }
+});
+
+test("a permission coordinator emits no member event", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const coordinator = { ...f.run.members[0]!, memberId: randomUUID(), sessionId: randomUUID(), role: "permission-coordinator" as const,
+      title: "Permission coordinator", provider: "claude" as const, status: "queued" as const, cursor: 0, prompt: "Review the request" };
+    f.run.members = [coordinator];
+    f.run.status = "implementing";
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun };
+    const member = stored.run.members[0]!;
+    await scheduler.launch(stored, member);
+    assert.ok(f.launches.some(launch => launch.requestId === coordinator.sessionId), "the coordinator launched");
+    f.report(coordinator.sessionId, { requestId: randomUUID(), runId: f.run.id, memberId: coordinator.memberId, revision: coordinator.revision,
+      report: { kind: "permission-decision", decisionId: randomUUID(), verdict: "escalate", summary: "Needs the owner" } });
+    scheduler.readMemberJournal(stored, member);
+    assert.equal(member.report?.kind, "permission-decision", "the coordinator's report was read");
+    await teams.idle();
+    assert.deepEqual(allEvents(store, f.run.id).filter(event => event.kind.startsWith("member.")), []);
   } finally { store.close(); f.close(); }
 });

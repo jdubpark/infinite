@@ -4245,8 +4245,12 @@ export class TeamService {
       if (member.baseCommit !== run.headCommit || stored.checkHead !== run.headCommit) { this.block(stored, new TeamError(409, "stale-review", "The reviewer did not review the currently verified integration commit.")); return; }
       if (run.brief?.uiChanges && report.verdict === "approved" && !report.uiEvidence)
         throw new TeamError(409, "ui-review-evidence-required", "Approval of UI changes requires the reviewer's evidence from inspecting the runnable interface.");
-      this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
+      this.operation(stored, "result", async signal => {
+        await assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal);
+        return { tree: this.options?.events ? await this.readTree(run, member.baseCommit, signal) : undefined };
+      }, ({ tree }) => {
         run.review = { verdict: report.verdict, summary: report.summary, revision: run.revision, ...(report.uiEvidence ? { uiEvidence: report.uiEvidence } : {}) };
+        const rubricKept: { taskId: string; correctness: number; cleanliness: number; extensibility: number; docs: number }[] = [];
         if (report.verdict === "approved" && report.rubric?.length) {
           const reviewer = member.modelProfile ?? this.memberProfile(run, "reviewer");
           for (const entry of report.rubric) {
@@ -4258,8 +4262,14 @@ export class TeamService {
               continue;
             }
             task.rubric = { version: 1, correctness: entry.correctness, cleanliness: entry.cleanliness, extensibility: entry.extensibility, docs: entry.docs, reviewerProfileId: reviewer?.id ?? "unknown" };
+            rubricKept.push({ taskId: task.id, correctness: entry.correctness.score, cleanliness: entry.cleanliness.score, extensibility: entry.extensibility.score, docs: entry.docs.score });
           }
         }
+        this.emitWith(stored, "review.recorded", [member.revision, member.memberId], { memberId: member.memberId, revision: member.revision }, () => {
+          const reviewer = member.modelProfile ?? this.memberProfile(run, "reviewer");
+          return { verdict: report.verdict, headCommit: member.baseCommit, baseCommit: run.baseCommit, tree,
+            reviewer: profileIdentity(reviewer, member.provider ?? run.provider), rubric: rubricKept.length ? rubricKept : undefined };
+        });
         if (report.verdict === "changes-requested") {
           for (const task of run.tasks) if (task.status === "integrated") task.reviewRounds = (task.reviewRounds ?? 0) + 1;
           this.repair(stored, report.summary);
@@ -4325,6 +4335,14 @@ export class TeamService {
     commands.push(...required.map(command => ({ command })));
     return commands;
   }
+  /** Best-effort `git rev-parse --verify <commit>^{tree}` in `run.workspace` through `teamCommand` and `teamGitArgs`, 30 s. A 40- or 64-hex stdout, else undefined. Never throws. */
+  private async readTree(run: TeamRun, commit: string, signal: AbortSignal): Promise<string | undefined> {
+    try {
+      const result = await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["rev-parse", "--verify", `${commit}^{tree}`]) }, run.workspace, signal, 30000, this.config.teams?.commandPrefix);
+      const tree = result.exitCode === 0 && !result.interrupted ? result.stdout.trim() : "";
+      return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tree) ? tree : undefined;
+    } catch { return undefined; }
+  }
   private check(stored: Stored) {
     const run = stored.run, revision = run.revision, head = run.headCommit!;
     const required = this.requiredChecks(run);
@@ -4358,6 +4376,14 @@ export class TeamService {
       if (!this.closed && !signal.aborted) await assertMemberReadOnly(run.workspace, head, this.config.teams?.commandPrefix, signal, "integration");
       return results;
     }, results => {
+      if (results.length) {
+        const first = results[0]!;
+        this.emitWith(stored, "check.finished", [revision, first.round ?? 0, first.startedAt ?? ""], { revision }, () => ({
+          round: first.round, headCommit: head, expected: commands.length,
+          passed: results.length === commands.length && results.every(result => result.status === "passed"),
+          commands: results.map(result => ({ phase: result.phase ?? "verification", status: result.status, exitCode: result.exitCode ?? null })),
+        }));
+      }
       if (revision !== run.revision || stored.halt || run.status === "paused" || run.status === "cancelled") return;
       if (results.length === commands.length && results.every(result => result.status === "passed")) {
         stored.checkHead = head; this.event(stored, "All configured verification commands passed against the integrated commit."); run.status = "reviewing";

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -50,6 +51,7 @@ type Internal = {
   readMemberJournal(stored: unknown, member: unknown): unknown;
   replaceStalledMember(stored: unknown, member: unknown): Promise<void>;
   switchLimitedMember(stored: unknown, member: unknown, limit: unknown): Promise<void>;
+  check(stored: unknown): void;
 };
 const internal = (teams: TeamService) => teams as unknown as Internal;
 
@@ -1077,5 +1079,164 @@ test("a limit switch records both profiles and links the new member", async () =
     const sealed = f.readRecord<{ run: TeamRun; ledgerReplaces?: Record<string, unknown> }>("team", f.run.id);
     const next = sealed.run.members.find(item => item.memberId !== memberId)!;
     assert.deepEqual(sealed.ledgerReplaces?.[next.memberId], { memberId, cause: "limit" });
+  } finally { store.close(); f.close(); }
+});
+
+/** A run with one integrated task and no active member, ready for a check. */
+function checkScene(f: Fixture, checks: { command: string; args: string[] }[]) {
+  const memberId = randomUUID();
+  f.config.projects[0]!.team = { checks };
+  f.run.headCommit = f.run.baseCommit;
+  f.run.members = [];
+  f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "integrated", memberId }];
+}
+
+test("a passing check records each command result", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    checkScene(f, [{ command: process.execPath, args: ["-e", ""] }]);
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const stored = internal(teams).record(f.run.id) as { run: TeamRun; pending?: unknown };
+    internal(teams).check(stored);
+    await waitFor(() => stored.pending === undefined, "the check completes");
+    await teams.idle();
+    const checked = eventsOfKind(store, f.run.id, "check.finished");
+    assert.equal(checked.length, 1);
+    assert.equal(checked[0]!.revision, 1);
+    assert.deepEqual(checked[0]!.data, { v: 1, round: 0, headCommit: f.run.baseCommit, passed: true, expected: 1,
+      commands: [{ phase: "verification", status: "passed", exitCode: 0 }] });
+  } finally { store.close(); f.close(); }
+});
+
+test("a failing check records its exit code", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    checkScene(f, [{ command: process.execPath, args: ["-e", "process.exit(3)"] }]);
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const stored = internal(teams).record(f.run.id) as { run: TeamRun; pending?: unknown };
+    internal(teams).check(stored);
+    await waitFor(() => stored.pending === undefined, "the check completes");
+    await teams.idle();
+    const [checked] = eventsOfKind(store, f.run.id, "check.finished");
+    assert.ok(checked, "check.finished is stored");
+    assert.equal(checked.data.passed, false);
+    assert.deepEqual(checked.data.commands, [{ phase: "verification", status: "failed", exitCode: 3 }]);
+  } finally { store.close(); f.close(); }
+});
+
+test("a check that a pause interrupts is still recorded", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    checkScene(f, [{ command: process.execPath, args: ["-e", "setTimeout(() => {}, 30000)"] }]);
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const stored = internal(teams).record(f.run.id) as { run: TeamRun; pending?: unknown };
+    internal(teams).check(stored);
+    await waitFor(() => stored.run.checks.some(check => check.status === "running"), "the check starts");
+    await teams.pause(f.run.id, { requestId: randomUUID(), revision: 1 });
+    await waitFor(() => stored.pending === undefined, "the interrupted check settles");
+    await teams.idle();
+    const [checked] = eventsOfKind(store, f.run.id, "check.finished");
+    assert.ok(checked, "check.finished is stored");
+    assert.equal(checked.data.passed, false);
+    assert.deepEqual(checked.data.commands, [{ phase: "verification", status: "interrupted", exitCode: null }]);
+    assert.equal(stored.run.status, "paused");
+  } finally { store.close(); f.close(); }
+});
+
+/** Two integrated tasks by two implementers, and a reviewer member, at the verified base commit. */
+async function reviewScene(f: Fixture, report: Record<string, unknown>) {
+  const implA = randomUUID(), implB = randomUUID(), reviewerId = randomUUID();
+  f.run.lineup = structuredClone(mixedLineup);
+  f.run.headCommit = f.run.baseCommit;
+  f.run.tasks = [
+    { id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "integrated", memberId: implA },
+    { id: "b", title: "Write b", instructions: "Write b.txt", paths: ["b.txt"], dependsOn: [], status: "integrated", memberId: implB },
+  ];
+  const base = { ...f.run.members[0]!, runId: f.run.id, revision: 1, status: "reported" as const, baseCommit: f.run.baseCommit };
+  const implementerA = { ...base, memberId: implA, role: "implementer" as const, taskId: "a", modelProfile: mixedLineup.coordinator };
+  const implementerB = { ...base, memberId: implB, role: "implementer" as const, taskId: "b", modelProfile: mixedLineup.implementers[1]! };
+  const reviewer = { ...base, memberId: reviewerId, role: "reviewer" as const, provider: "claude" as const,
+    modelProfile: mixedLineup.reviewer, cwd: await memberClone(f, reviewerId), report };
+  f.run.members = [implementerA, implementerB, reviewer] as TeamRun["members"];
+  return reviewer;
+}
+
+const rubricScore = (score: number) => ({ score, why: "Private rubric reason" });
+
+test("an approved review records its verdict, tree, and kept scores", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const reviewer = await reviewScene(f, { kind: "review", verdict: "approved", summary: "Looks right", rubric: [
+      { taskId: "a", correctness: rubricScore(3), cleanliness: rubricScore(3), extensibility: rubricScore(3), docs: rubricScore(3) },
+      { taskId: "b", correctness: rubricScore(4), cleanliness: rubricScore(3), extensibility: rubricScore(5), docs: rubricScore(2) },
+    ] });
+    f.writeTeam({ checkHead: f.run.baseCommit });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, reviewer);
+    await waitFor(() => stored.pending === undefined, "the review completes");
+    await teams.idle();
+    const [recorded] = eventsOfKind(store, f.run.id, "review.recorded");
+    assert.ok(recorded, "review.recorded is stored");
+    assert.equal(recorded.memberId, reviewer.memberId);
+    assert.equal(recorded.revision, 1);
+    const tree = execFileSync("git", ["rev-parse", `${f.run.baseCommit}^{tree}`], { cwd: f.run.workspace, encoding: "utf8" }).trim();
+    assert.deepEqual(recorded.data, { v: 1, verdict: "approved", headCommit: f.run.baseCommit, baseCommit: f.run.baseCommit, tree,
+      reviewer: { profileId: "opus-reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" },
+      rubric: [{ taskId: "b", correctness: 4, cleanliness: 3, extensibility: 5, docs: 2 }] });
+    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Private rubric reason"), false, "a rubric reason is never stored");
+    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Looks right"), false, "a review summary is never stored");
+  } finally { store.close(); f.close(); }
+});
+
+test("a refused tree read leaves the tree out", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const refusal = `const [command, ...args] = process.argv.slice(2);
+if (command === "git" && args.some(arg => arg.endsWith("^{tree}"))) process.exit(1);
+const { spawnSync } = require("node:child_process");
+const result = spawnSync(command, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 1);`;
+    const reviewer = await reviewScene(f, { kind: "review", verdict: "approved", summary: "Looks right" });
+    f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", refusal, "unused"] };
+    f.writeTeam({ checkHead: f.run.baseCommit });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, reviewer);
+    await waitFor(() => stored.pending === undefined, "the review completes");
+    await teams.idle();
+    const [recorded] = eventsOfKind(store, f.run.id, "review.recorded");
+    assert.ok(recorded, "review.recorded is stored");
+    assert.equal("tree" in recorded.data, false);
+    assert.equal(stored.run.review?.verdict, "approved");
+  } finally { store.close(); f.close(); }
+});
+
+test("a changes-requested review records its verdict", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const reviewer = await reviewScene(f, { kind: "review", verdict: "changes-requested", summary: "Fix the file" });
+    f.writeTeam({ checkHead: f.run.baseCommit });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, reviewer);
+    // The repair this verdict starts keeps the operation pending, so the stored event is the signal.
+    await waitFor(() => eventsOfKind(store, f.run.id, "review.recorded").length > 0, "the review is recorded");
+    const [recorded] = eventsOfKind(store, f.run.id, "review.recorded");
+    assert.ok(recorded, "review.recorded is stored");
+    assert.equal(recorded.data.verdict, "changes-requested");
+    assert.equal("rubric" in recorded.data, false);
   } finally { store.close(); f.close(); }
 });

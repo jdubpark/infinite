@@ -38,6 +38,7 @@
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  container: swarm / inline-size;
   color: var(--sw-ink);
   font-family: var(--sw-mono);
   font-size: 12px;
@@ -192,6 +193,8 @@ button.sw-glass { font: inherit; color: inherit; }
 
 /* Legend and inspector: one line each, always present. */
 .sw-legend {
+  flex: none;
+  max-width: 62%;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -288,6 +291,12 @@ button.sw-glass { font: inherit; color: inherit; }
 .sw-dim { color: var(--sw-ink-3); }
 .sw-num { color: var(--sw-ink); }
 
+/* The view carries its own freshness slot, so the paper top bar steps aside at desktop width. */
+@media (min-width: 701px) {
+  .app.swarm-shown .topbar {
+    display: none;
+  }
+}
 /* Focus mode hides the sidebar for wallboard use. */
 .app.swarm-focus {
   grid-template-columns: minmax(0, 1fr);
@@ -297,14 +306,18 @@ button.sw-glass { font: inherit; color: inherit; }
   display: none;
 }
 
-@media (max-width: 1000px) {
-  .sw-canvas { padding-left: 16px; padding-right: 16px; }
-  .swarm { --sw-inset-bottom: 136px; }
-  .sw-bottom { flex-direction: column; align-items: stretch; }
-  .sw-vitals { gap: 12px; padding: 0 14px; }
+/* Narrow canvas: the switch drops under the vitals and the legend stacks over the inspector. */
+@container swarm (max-width: 1040px) {
+  .sw-canvas { padding: 142px 16px 150px; }
+  .sw-top { flex-wrap: wrap; row-gap: 8px; }
+  .sw-top > .sw-spacer { display: none; }
+  .sw-vitals { flex: 1 1 100%; gap: 12px; padding: 0 14px; overflow: hidden; }
+  .sw-switch { margin-left: auto; }
+  .sw-bottom { flex-direction: column; align-items: stretch; gap: 8px; }
+  .sw-legend { max-width: none; }
+  .sw-inspector { flex: none; }
 }
-@media (max-width: 700px) {
-  .swarm { --sw-inset-top: 136px; }
-  .sw-top { flex-wrap: wrap; }
-  .sw-vitals { overflow-x: auto; max-width: 100%; }
+@container swarm (max-width: 640px) {
+  .sw-vitals { overflow-x: auto; }
+  .sw-meter-vital { display: none; }
 }

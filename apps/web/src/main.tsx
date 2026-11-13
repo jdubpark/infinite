@@ -180,7 +180,7 @@ function App() {
   const swarm = <SwarmView me={me} sessions={sessions} teams={teams} fresh={host.fresh && (!me.teams || teamFeed.fresh)} stale={host.stale || Boolean(me.teams && teamFeed.stale)} seen={host.seen}
     view={route.swarmView} setView={route.navigateSwarm} openSession={route.navigate} openTeam={route.navigateTeam} onCreate={me.role === "owner" ? route.create : undefined} focus={swarmFocus} setFocus={setSwarmFocus} />;
   return (
-    <div className={`app ${selected || creating || route.teams || route.goals || route.cost || route.swarm ? "has-detail" : ""}${swarmShown && swarmFocus ? " swarm-focus" : ""}`}>
+    <div className={`app ${selected || creating || route.teams || route.goals || route.cost || route.swarm ? "has-detail" : ""}${swarmShown ? " swarm-shown" : ""}${swarmShown && swarmFocus ? " swarm-focus" : ""}`}>
       <aside className="sidebar">
         <Mark />
         <MachinePicker />

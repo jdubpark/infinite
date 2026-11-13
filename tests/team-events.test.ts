@@ -47,6 +47,8 @@ type Internal = {
   consume(stored: unknown, member: unknown): void;
   launch(stored: unknown, member: unknown): Promise<void>;
   readMemberJournal(stored: unknown, member: unknown): unknown;
+  replaceStalledMember(stored: unknown, member: unknown): Promise<void>;
+  switchLimitedMember(stored: unknown, member: unknown, limit: unknown): Promise<void>;
 };
 const internal = (teams: TeamService) => teams as unknown as Internal;
 
@@ -707,5 +709,150 @@ test("a permission coordinator emits no member event", async () => {
     assert.equal(member.report?.kind, "permission-decision", "the coordinator's report was read");
     await teams.idle();
     assert.deepEqual(allEvents(store, f.run.id).filter(event => event.kind.startsWith("member.")), []);
+  } finally { store.close(); f.close(); }
+});
+
+const memberStops = (store: EvidenceStore, runId: string, memberId: string) =>
+  eventsOfKind(store, runId, "member.stopped").filter(event => event.memberId === memberId);
+
+test("a stalled member's stop names the stall", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    const member = stored.run.members[0]!;
+    member.stalledAt = new Date(Date.now() - 6 * 60000).toISOString();
+    member.stoppedReason = "No activity for 5 minutes";
+    f.state.status = "exited";
+    await scheduler.replaceStalledMember(stored, member);
+    await waitFor(() => (stored as { pending?: unknown }).pending === undefined, "the replacement is queued");
+    await teams.idle();
+    const stops = memberStops(store, f.run.id, member.memberId);
+    assert.equal(stops.length, 1);
+    assert.deepEqual(stops[0]!.data, { v: 1, role: "project-manager", reason: "stall", reported: false });
+    const sealed = f.readRecord<{ run: TeamRun; ledgerReplaces?: Record<string, unknown> }>("team", f.run.id);
+    const replacement = sealed.run.members.find(item => item.memberId !== member.memberId)!;
+    assert.deepEqual(sealed.ledgerReplaces?.[replacement.memberId], { memberId: member.memberId, cause: "stall" });
+  } finally { store.close(); f.close(); }
+});
+
+test("a limit stop without a fallback names the limit", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id);
+    const member = f.run.members[0]!;
+    f.state.status = "exited";
+    const limit = { kind: "provider-limit", limit: "usage", confidence: "corroborated", provider: "demo", source: "protocol",
+      message: "Usage exhausted", at: new Date().toISOString(), seq: 0 };
+    await scheduler.switchLimitedMember(stored, member, limit);
+    await teams.idle();
+    const stops = memberStops(store, f.run.id, member.memberId);
+    assert.equal(stops.length, 1);
+    assert.deepEqual(stops[0]!.data, { v: 1, role: "project-manager", reason: "limit", reported: false });
+    const [blocked] = eventsOfKind(store, f.run.id, "run.blocked");
+    assert.equal(blocked!.data.code, "provider-limit");
+    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Usage exhausted"), false, "a provider's limit message is never stored");
+  } finally { store.close(); f.close(); }
+});
+
+test("an owner cancel stops members as owner stops", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const member = f.run.members[0]!;
+    await teams.cancel(f.run.id, { requestId: randomUUID(), revision: 1 });
+    const scheduler = internal(teams);
+    await scheduler.step(scheduler.record(f.run.id));
+    await teams.idle();
+    const stops = memberStops(store, f.run.id, member.memberId);
+    assert.equal(stops.length, 1);
+    assert.deepEqual(stops[0]!.data, { v: 1, role: "project-manager", reason: "owner", detail: "cancel", reported: false });
+  } finally { store.close(); f.close(); }
+});
+
+test("a reported member that a halt stops is marked reported", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const member = f.run.members[0]!;
+    member.status = "reported";
+    member.report = { kind: "result", summary: "Done" } as TeamRun["members"][number]["report"];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    await teams.pause(f.run.id, { requestId: randomUUID(), revision: 1 });
+    const scheduler = internal(teams);
+    await scheduler.step(scheduler.record(f.run.id));
+    await teams.idle();
+    const stops = memberStops(store, f.run.id, member.memberId);
+    assert.equal(stops.length, 1);
+    assert.deepEqual(stops[0]!.data, { v: 1, role: "project-manager", reason: "owner", detail: "pause", reported: true });
+  } finally { store.close(); f.close(); }
+});
+
+test("a sibling block stops the other members as host stops", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id);
+    const member = f.run.members[0]!;
+    scheduler.block(stored, new TeamError(409, "wrong-agent-report", "An agent's report does not match its assigned role."));
+    await scheduler.step(stored);
+    await scheduler.step(stored);
+    await teams.idle();
+    const stops = memberStops(store, f.run.id, member.memberId);
+    assert.equal(stops.length, 1);
+    assert.deepEqual(stops[0]!.data, { v: 1, role: "project-manager", reason: "host", detail: "block", reported: false });
+  } finally { store.close(); f.close(); }
+});
+
+test("a member that exits without a report keeps its first reason", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const member = f.run.members[0]!;
+    f.state.status = "exited";
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => memberStops(store, f.run.id, member.memberId).length === 1, "the exit is stored");
+    const stops = memberStops(store, f.run.id, member.memberId);
+    assert.deepEqual(stops[0]!.data, { v: 1, role: "project-manager", reason: "no-report", reported: false });
+    await scheduler.step(scheduler.record(f.run.id));
+    await scheduler.step(scheduler.record(f.run.id));
+    await teams.idle();
+    assert.equal(memberStops(store, f.run.id, member.memberId).length, 1, "later ticks add no second stop");
+  } finally { store.close(); f.close(); }
+});
+
+test("a retired reviewer's stop is a host stop", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const member = f.run.members[0]!;
+    member.role = "reviewer";
+    f.run.headCommit = f.run.baseCommit;
+    f.writeTeam({ checkHead: f.run.baseCommit });
+    (f.manager as unknown as Record<string, unknown>).retireTeamRuntime = async () => ({ stoppedAt: new Date().toISOString(),
+      identity: "a".repeat(64), seq: 0, processes: [], unsignalable: [] });
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    await teams.retireMember(f.run.id, member.memberId, { requestId: randomUUID(), revision: 1, sessionId: member.sessionId,
+      identity: "a".repeat(64), text: "Retire the reviewer" });
+    await teams.idle();
+    const stops = memberStops(store, f.run.id, member.memberId);
+    assert.equal(stops.length, 1);
+    assert.deepEqual(stops[0]!.data, { v: 1, role: "reviewer", reason: "host", detail: "retired", reported: false });
   } finally { store.close(); f.close(); }
 });

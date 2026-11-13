@@ -58,3 +58,9 @@ export function profileIdentity(profile: TeamModelProfile | undefined, provider:
   const effort = "effort" in profile ? profile.effort : profile.variant;
   return { profileId: profile.id, provider, model: profile.model, ...(effort === undefined ? {} : { effort }) };
 }
+
+/** Why a member stopped, by the classes of spec part 1. */
+export const MEMBER_STOP_REASONS = ["stall", "limit", "no-report", "owner", "host"] as const;
+export type MemberStopReason = typeof MEMBER_STOP_REASONS[number];
+/** The halt or retirement behind a stop. */
+export type MemberStopDetail = "pause" | "cancel" | "steer" | "block" | "retired";

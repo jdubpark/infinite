@@ -16,7 +16,7 @@ import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
 import { type EvidenceStore, eventProblem } from "./evidence/store.js";
 import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
-import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type ReplacementCause } from "./run-events.js";
+import { MAX_OUTBOX_EVENTS, pathField, planDigest, profileIdentity, runEventKey, runSummaryCounts, type MemberStopDetail, type MemberStopReason, type ReplacementCause } from "./run-events.js";
 import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
@@ -744,6 +744,13 @@ export class TeamService {
   private linkReplacement(stored: Stored, next: TeamMember, previous: TeamMember, cause: ReplacementCause): void {
     if (!this.options?.events) return;
     (stored.ledgerReplaces ??= {})[next.memberId] = { memberId: previous.memberId, cause };
+  }
+  /** Records why a member stopped. Callers emit only on the transition to `stopped`, so the first stop is the stored one. A permission coordinator emits nothing. */
+  private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReason, detail?: MemberStopDetail): void {
+    if (member.role === "permission-coordinator") return;
+    this.emitWith(stored, "member.stopped", [member.memberId],
+      { memberId: member.memberId, taskId: member.taskId, revision: member.revision },
+      () => ({ role: member.role, reason, ...(detail ? { detail } : {}), reported: Boolean(member.report) }));
   }
   /** Sends the outbox to the store. True when nothing is left waiting. Never throws. */
   private flushOutbox(stored: Stored, afterGap = false): boolean {
@@ -1506,11 +1513,13 @@ export class TeamService {
       catch (error) {
         if (!this.mutation(stored, "retire-member", body)) return this.view(stored);
         member.status = "stopped"; member.stoppedReason = "Recording failed; runtime retired after confirmed process exit"; member.retirement = retirement;
+        this.memberStopped(stored, member, "host", "retired");
         this.block(stored, error, member);
         return this.view(stored);
       }
       if (!this.mutation(stored, "retire-member", body)) return this.view(stored);
       member.status = "stopped"; member.stoppedReason = "Recording failed; runtime retired after confirmed process exit"; member.retirement = retirement;
+      this.memberStopped(stored, member, "host", "retired");
       if (run.reason === runtimeUnavailableReason) run.reason = undefined;
       this.event(stored, `The owner authorized retirement of reviewer ${member.memberId} at ${member.baseCommit}. Operator claim, not host-verified: ${JSON.stringify(body.text.slice(0, 500))}. The original journal and reports are retained.`);
       this.save(stored);
@@ -2404,7 +2413,9 @@ export class TeamService {
           member.role === "permission-coordinator" && member.status === "waiting" ||
           drainRevision !== undefined && member.revision === drainRevision) &&
           !(drainRevision !== undefined && member.revision === drainRevision && member.status !== "waiting" && terminalPermissionCoordinator(run, member)));
+        const halt = stored.halt;
         for (const member of membersToStop) {
+          const statusBefore = member.status;
           try {
             if (member.role === "permission-coordinator" && member.status === "waiting") {
               member.status = "stopped"; member.report = undefined; continue;
@@ -2430,6 +2441,10 @@ export class TeamService {
             member.status = "stopped";
             if (page.more || member.cursor < stopped.seq) all = false;
           } catch { all = false; member.status = "unavailable"; }
+          finally {
+            if (statusBefore !== "stopped" && member.status === "stopped")
+              this.memberStopped(stored, member, halt === "block" ? "host" : "owner", halt);
+          }
         }
         const safePendingRecovery = Boolean(run.recovery?.status === "stopping" && stored.pending &&
           (recoverableOperationFailure(stored, stored.pending) || recoverableUnattributedResult(stored, stored.pending)));
@@ -2543,6 +2558,7 @@ export class TeamService {
                 this.event(stored, "The permission coordinator exited without a decision; the provider request remains with the user."); this.save(stored); continue;
               }
               member.status = "stopped";
+              this.memberStopped(stored, member, "no-report");
               this.block(stored, new TeamError(409, "missing-agent-report", "An agent exited without a valid structured report. Its task is unresolved."), member); return;
             }
             // A member back from an outage may come back straight into a prompt; it is running again.
@@ -3688,6 +3704,7 @@ export class TeamService {
       if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined;
       await this.switchLimitedMember(stored, member, limit); return;
     }
+    this.memberStopped(stored, member, "stall");
     // A delivery member may already have published; a replacement must not repeat it unseen.
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery agent stalled after a publication attempt. Inspect the remote branch and PR before replacing it.")); return;
@@ -3734,6 +3751,7 @@ export class TeamService {
       this.save(stored);
       return;
     }
+    this.memberStopped(stored, member, "limit");
     // A delivery member may already have published; a replacement must not repeat it unseen.
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { splitSlackText } from "../packages/host/src/slack-text.js";
 import { IntakeSlackSurface } from "../packages/host/src/intake-slack.js";
 import { IntakeStore } from "../packages/host/src/intake-store.js";
-import { SlackClient } from "../packages/host/src/slack-client.js";
+import { SlackClient, SlackError } from "../packages/host/src/slack-client.js";
 import { deterministicUuid, type IntakeRecord, type IntakeThread } from "../packages/host/src/intake-types.js";
 import type { MissionOrigin } from "../packages/host/src/mission-types.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -87,7 +87,10 @@ function intakeRecord(issueId: string, state: IntakeRecord["state"], extra: Part
   };
 }
 
-async function surfaceFor(services: Services, stateRoot: string, options: { bindByMention?: boolean; serverTeamId?: string; wrapClient?: (client: SlackClient) => SlackClient } = {}) {
+type LogLine = { line: string; error: unknown };
+const collector = () => { const calls: LogLine[] = []; return { calls, log: (line: string, error: unknown) => { calls.push({ line, error }); } }; };
+
+async function surfaceFor(services: Services, stateRoot: string, options: { bindByMention?: boolean; serverTeamId?: string; wrapClient?: (client: SlackClient) => SlackClient; log?: (line: string, error: unknown) => void } = {}) {
   const slack = await startSlackServer({ teamId: options.serverTeamId });
   // Every bound thread has its root, as in Slack; the fake stores posts only into a thread it knows.
   for (const thread of [BINDING, OTHER]) slack.seedThread(thread, [{ user: OWNER, text: "Export fails on empty rows" }]);
@@ -100,7 +103,7 @@ async function surfaceFor(services: Services, stateRoot: string, options: { bind
     mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3, requireSlackThread: true,
   } } as unknown as Config;
   const store = new IntakeStore({ stateDir: join(stateRoot, "intake") } as Config, randomBytes(32));
-  const surface = new IntakeSlackSurface(config, store, services.missions, services.teams, client);
+  const surface = new IntakeSlackSurface(config, store, services.missions, services.teams, client, { log: options.log ?? collector().log });
   return {
     slack, store, surface, client, realClient, config,
     texts: (binding: IntakeThread = BINDING) => slack.posts(binding).map(post => post.text),
@@ -461,7 +464,7 @@ const plan = (id: string, repoProjectId: string) =>
   ({ id, repoProjectId, title: `Subtask ${id}`, objective: `Do ${id}`, size: "solo" as const, parallelism: 1, dependsOn: [] as string[] });
 const teamOf = (mission: Mission, subtaskId: string) => mission.subtasks.find(item => item.id === subtaskId)?.teamId;
 
-async function scriptedSurface(options: { bindByMention?: boolean; wrapClient?: (client: SlackClient) => SlackClient; wrapTeams?: (teams: TeamService) => TeamService } = {}) {
+async function scriptedSurface(options: { bindByMention?: boolean; wrapClient?: (client: SlackClient) => SlackClient; wrapTeams?: (teams: TeamService) => TeamService; log?: (line: string, error: unknown) => void } = {}) {
   const sh = scripted();
   const stateRoot = mkdtempSync(join(tmpdir(), "intake-scripted-"));
   const teams = options.wrapTeams ? options.wrapTeams(sh.teams as unknown as TeamService) : sh.teams as unknown as TeamService;
@@ -658,7 +661,7 @@ test("two records in one thread keep their Slack receipts apart", { timeout: 900
 
 test("a result whose composition fails is retried for its record until it is posted", { timeout: 90000 }, async () => {
   let failing = true;
-  const { sh, s, close } = await scriptedSurface({ wrapTeams: teams => ({ get: (id: string) => {
+  const { sh, s, close } = await scriptedSurface({ log: collector().log, wrapTeams: teams => ({ get: (id: string) => {
     if (failing) { failing = false; throw new Error("The team service is unavailable."); }
     return teams.get(id);
   } }) as typeof teams });
@@ -673,9 +676,68 @@ test("a result whose composition fails is retried for its record until it is pos
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
     await s.surface.start();
     const error = await waitFor(async () => s.surface.status().lastError, message => message !== undefined, 15000);
-    assert.match(error!, /team service is unavailable/);
+    assert.equal(error, "TEST-1: Error", "The status carries the summary, not the message");
     assert.ok(!s.texts().some(text => text.startsWith("Answer (agent report)")), "No result is posted while composition fails");
     await waitFor(async () => s.texts(), list => list.includes("Answer (agent report):\nThe API already had the endpoint."), 30000);
     assert.equal(s.surface.status().lastError, undefined, "A later success clears the error");
+  } finally { await close(); }
+});
+
+test("a composition failure keeps no part of the error's text", { timeout: 90000 }, async () => {
+  const log = collector();
+  const leak = Object.assign(new Error("connect ECONNRESET 192.0.2.7 /srv/infinite-data/work/checkout"), { code: "ECONNRESET" });
+  const leaks = (text: string) => !text.includes("192.0.2.7") && !text.includes("/srv/infinite-data/work/checkout");
+  let failing = true;
+  const { sh, s, close } = await scriptedSurface({ log: log.log, wrapTeams: teams => ({ get: (id: string) => {
+    if (failing) { failing = false; throw leak; }
+    return teams.get(id);
+  } }) as typeof teams });
+  try {
+    const { id } = await sh.create();
+    await sh.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const teamId = (await until(() => sh.get(id), mission => Boolean(teamOf(mission, "a")))).subtasks[0].teamId!;
+    sh.set(teamId, { status: "no-change" });
+    await until(() => sh.get(id), mission => mission.subtasks[0].status === "done");
+    await sh.report(2, { kind: "result", summary: "The API already had the endpoint." });
+    await until(() => sh.get(id), mission => mission.status === "ready-for-review");
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
+    await s.surface.start();
+    const lastError = await waitFor(async () => s.surface.status().lastError, message => message !== undefined, 15000);
+    assert.equal(lastError, "TEST-1: Error (ECONNRESET)", "The status carries the summary and the identifier");
+    assert.ok(leaks(JSON.stringify(s.surface.status())), "The status holds no part of the error's text");
+    assert.ok(leaks(JSON.stringify(s.store.get(ISSUE))), "The stored record holds no part of the error's text");
+    await waitFor(async () => s.texts(), list => list.includes("Answer (agent report):\nThe API already had the endpoint."), 30000);
+    assert.ok(s.texts().every(leaks), "No post holds part of the error's text");
+    assert.ok(log.calls.some(call => call.error === leak && call.line === "Intake Slack compose failed for TEST-1."), "The log received the error itself");
+  } finally { await close(); }
+});
+
+test("a delivery failure that is not Slack's keeps no part of the error's text", { timeout: 90000 }, async () => {
+  const log = collector();
+  const leak = Object.assign(new Error("connect ECONNRESET 192.0.2.7 /srv/infinite-data/work/checkout"), { code: "ECONNRESET" });
+  const leaks = (text: string) => !text.includes("192.0.2.7") && !text.includes("/srv/infinite-data/work/checkout");
+  let calls = 0;
+  const { s, close } = await scriptedSurface({ log: log.log, wrapClient: real => ({
+    authTest: () => real.authTest(),
+    connect: handle => real.connect(handle),
+    thread: binding => real.thread(binding),
+    post: async (binding: IntakeThread, text: string, key: string) => {
+      calls += 1;
+      if (calls === 1) throw leak;
+      if (calls === 2) throw new SlackError("ratelimited", true);
+      return real.post(binding, text, key);
+    },
+  }) as unknown as SlackClient });
+  try {
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING }));
+    await s.surface.start();
+    const first = await waitFor(async () => s.store.get(ISSUE)!.messages[0]?.error, error => error !== undefined, 15000);
+    assert.equal(first, "Error (ECONNRESET)", "A non-Slack error is stored as its summary");
+    assert.ok(!JSON.stringify(s.store.get(ISSUE)).includes("192.0.2.7"), "The record holds no part of the error's text");
+    assert.ok(!JSON.stringify(s.surface.status()).includes("192.0.2.7"), "The status holds no part of the error's text");
+    const second = await waitFor(async () => s.store.get(ISSUE)!.messages[0]?.error, error => error === "Slack request failed: ratelimited", 60000);
+    assert.equal(second, "Slack request failed: ratelimited", "A Slack error is stored with Slack's code");
+    await waitFor(async () => s.store.get(ISSUE)!.messages[0]?.status, status => status === "sent", 60000);
+    assert.ok(log.calls.some(call => call.error === leak && call.line === "Intake Slack deliver failed for TEST-1."), "The log received the error itself");
   } finally { await close(); }
 });

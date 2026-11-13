@@ -7,6 +7,7 @@ import type { TeamService } from "./teams.js";
 import { TeamError } from "./teams.js";
 import { SlackError, type SlackClient, type SlackEnvelope } from "./slack-client.js";
 import { splitSlackText } from "./slack-text.js";
+import { failureSummary } from "./intake.js";
 
 const IDENTITY_RETRY_MS = 30_000;
 const RETRY_DELAYS_MS = [5_000, 30_000, 120_000];
@@ -25,7 +26,11 @@ type Routed = { outcome: string; reply?: string; call?: Omit<SavedCall, "revisio
 const OUTCOMES: Record<SavedCall["action"], string> = { answer: "answered", steer: "steered", pause: "pause", resume: "resume", cancel: "cancel" };
 
 const now = () => new Date().toISOString();
-const message = (error: unknown) => error instanceof Error ? error.message : String(error);
+/**
+ * Text from a caught error that a record, the API, or Slack may hold: the host's own refusal, or Slack's code. Anything
+ * else is a summary of its name and code, because its message can carry host paths or addresses.
+ */
+const errorText = (error: unknown) => error instanceof TeamError || error instanceof SlackError ? error.message : failureSummary(error);
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const sameThread = (a: IntakeThread | undefined, b: IntakeThread | undefined) =>
   Boolean(a && b && a.channelId === b.channelId && a.threadTs === b.threadTs);
@@ -70,9 +75,13 @@ export class IntakeSlackSurface {
   private readonly failures = new Map<string, string>();
   private unsubscribers: (() => void)[] = [];
 
+  private readonly log: (line: string, error: unknown) => void;
+
   constructor(config: Config, private readonly store: IntakeStore, private readonly missions: MissionService,
-    private readonly teams: Pick<TeamService, "get">, private readonly client: SlackClient) {
+    private readonly teams: Pick<TeamService, "get">, private readonly client: SlackClient,
+    options: { log?: (line: string, error: unknown) => void } = {}) {
     this.slack = config.intake?.slack;
+    this.log = options.log ?? ((line, error) => console.warn(line, error));
   }
 
   async start(): Promise<void> {
@@ -159,6 +168,24 @@ export class IntakeSlackSurface {
   }
 
   /** A successful reconcile clears the record's error and its pending composition retry. */
+  /** The record's identifier for messages and logs; undefined when the store cannot read it. */
+  private identifierOf(issueId: string): string | undefined {
+    try { return this.store.get(issueId)?.identifier; } catch { return undefined; }
+  }
+
+  /** Logs the error in full and keeps only its summary, prefixed with the identifier, for status. */
+  private noteFailure(issueId: string, step: string, error: unknown): void {
+    const identifier = this.identifierOf(issueId);
+    this.logFailure(issueId, step, error, identifier);
+    const summary = errorText(error);
+    this.failures.delete(issueId);
+    this.failures.set(issueId, identifier ? `${identifier}: ${summary}` : summary);
+  }
+
+  private logFailure(issueId: string, step: string, error: unknown, identifier = this.identifierOf(issueId)): void {
+    this.log(`Intake Slack ${step} failed${identifier ? ` for ${identifier}` : ""}.`, error);
+  }
+
   private settle(issueId: string): void {
     this.failures.delete(issueId);
     const retry = this.composeRetries.get(issueId);
@@ -168,8 +195,7 @@ export class IntakeSlackSurface {
 
   /** Records the error and retries this record's reconcile on the Slack retry schedule; the mission is never touched. */
   private fail(issueId: string, error: unknown): void {
-    this.failures.delete(issueId);
-    this.failures.set(issueId, message(error));
+    this.noteFailure(issueId, "compose", error);
     const retry = this.composeRetries.get(issueId) ?? { attempts: 0 };
     retry.attempts += 1;
     clearTimeout(retry.timer);
@@ -267,8 +293,7 @@ export class IntakeSlackSurface {
       }
     } catch (error) {
       // A failed store write leaves the message pending; the next change pumps again.
-      this.failures.delete(issueId);
-      this.failures.set(issueId, message(error));
+      this.noteFailure(issueId, "store", error);
     } finally {
       this.pumping.delete(issueId);
     }
@@ -319,10 +344,10 @@ export class IntakeSlackSurface {
 
   /** Called after the attempt was counted; schedules the next attempt or gives up. */
   private failed(issueId: string, key: string, error: unknown): void {
-    const code = error instanceof SlackError ? error.code : "error";
+    if (!(error instanceof SlackError)) this.logFailure(issueId, "deliver", error);
     const permanent = error instanceof SlackError && !error.transient;
     this.patch(issueId, key, item => {
-      item.error = code;
+      item.error = errorText(error);
       if (permanent) {
         item.status = "failed"; delete item.uncertain; delete item.nextAttemptAt;
         return;
@@ -397,8 +422,7 @@ export class IntakeSlackSurface {
       }
     } catch (error) {
       // A failed store write leaves the entry unhandled; it is applied again on the next event or start.
-      this.failures.delete(issueId);
-      this.failures.set(issueId, message(error));
+      this.noteFailure(issueId, "inbound", error);
     } finally {
       this.draining.delete(issueId);
     }

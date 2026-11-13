@@ -13,8 +13,8 @@ export class HookPayloadError extends Error {
  * sees the relay's empty stdout, so a reply can never become a hook decision.
  */
 export interface HookReply {
-  /** Send the transcript file at `path` from byte `after` to the `transcript` route. */
-  transcript?: { path: string; after: number };
+  /** Send the transcript file at `path` from byte `after` to the `transcript` route. `drain` names the drain every post echoes. */
+  transcript?: { path: string; after: number; drain?: number };
   /** Acknowledged transcript bytes; the relay continues from here. */
   after?: number;
 }

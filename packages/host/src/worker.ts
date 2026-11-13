@@ -41,7 +41,8 @@ import { startHookServer, HookPayloadError, type HookReply, type HookRoute } fro
 import { teamReportEnvelopeSchema, type TeamAssignment } from "./team-types.js";
 import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
-import { TranscriptTail, type TranscriptMessage } from "./transcript.js";
+import type { TranscriptMessage } from "./transcript.js";
+import { TranscriptWatch } from "./transcript-watch.js";
 import { buildLaunch } from "./launch.js";
 import { addProjectIdToLaunchEnv } from "./worker-env.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
@@ -309,7 +310,12 @@ let hooksReady = false;
 let teamReportReceipt: { requestId: string; digest: string } | undefined;
 // ---- Chat: the provider's own conversation record ------------------------------------------
 // The relay streams the transcript file from the worker's cursor; the worker never opens it.
-let transcript: { path: string; tail: TranscriptTail } | undefined;
+// The watch owns the byte reader, the usage reader, the drains, and the coverage facts.
+const transcriptWatch = new TranscriptWatch({
+  provider,
+  requestedModel: session.teamModelProfile?.model,
+  onUsage: record => { append("usage", { ...record }); },
+});
 const MESSAGE_FIELDS = new Set(["id", "role", "text", "toolName", "ts"]);
 /** Journals one chat message exactly as the provider recorded it; text is bounded at ingest. */
 function recordMessage(message: TranscriptMessage) {
@@ -320,11 +326,10 @@ function recordMessage(message: TranscriptMessage) {
   }
 }
 function onTranscript(body: unknown): HookReply | void {
-  const b = body as Record<string, unknown>;
-  if (!transcript || b.path !== transcript.path || typeof b.text !== "string") return;
-  // A chunk from elsewhere than the cursor is not applied; the reply tells the relay where to resume.
-  if (b.offset === transcript.tail.offset) for (const message of transcript.tail.ingest(b.text)) recordMessage(message);
-  return { after: transcript.tail.offset };
+  const reply = transcriptWatch.post(body);
+  if (!reply) return;
+  for (const message of reply.messages) recordMessage(message);
+  return { after: reply.after };
 }
 let handoffReceipt: string | undefined;
 let handoffStopping = false;
@@ -418,12 +423,17 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void
   }
   // The same authenticated primary hook names the conversation file; the reply asks the relay
   // for its bytes from where the worker left off.
-  let reply: HookReply | void = undefined;
+  // Every provider hook reaches the watch. Only the authenticated primary hook names the conversation file.
   const path = b.transcript_path;
-  if (nativeId !== undefined && typeof path === "string" && path.startsWith("/") && path.endsWith(".jsonl") && path.length <= 4096 && !/[\x00-\x1f]/.test(path)) {
-    if (transcript?.path !== path) transcript = { path, tail: new TranscriptTail(route === "claude" ? "claude" : "codex") };
-    reply = { transcript: { path, after: transcript.tail.offset } };
-  }
+  const transcriptPath = nativeId !== undefined && typeof path === "string" && path.startsWith("/") && path.endsWith(".jsonl") && path.length <= 4096 && !/[\x00-\x1f]/.test(path)
+    ? path
+    : undefined;
+  const started = transcriptWatch.hook({
+    subagent: b.agent_id !== undefined,
+    turnEnd: signals.some(signal => signal.kind === "turn-end") || event === "SessionEnd",
+    ...(transcriptPath !== undefined ? { transcript: { path: transcriptPath, provider: route === "claude" ? "claude" : "codex" } } : {}),
+  });
+  let reply: HookReply | void = started ? { transcript: started } : undefined;
   if (!hooksReady) {
     hooksReady = true;
     record({ kind: "hooks-ready", event: event.slice(0, 60) }, "hook");
@@ -1545,6 +1555,7 @@ server.listen(socketPath(runDir, session.id), async () => {
     const exited = (exitCode: number) => {
       native?.stop();
       void hybrid?.close().catch(() => {}); executor?.close();
+      try { if (provider !== "opencode") append("usage-coverage", { ...transcriptWatch.finish(hooksReady) }); } catch { /* A usage failure loses usage, never the exit record. */ }
       try {
         flush();
         controller = null;

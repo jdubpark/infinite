@@ -43,8 +43,14 @@ function toolText(name: string, input: unknown): string {
 
 /** One JSONL record to the chat messages it contains. Unknown or injected records yield none. */
 export function parseTranscriptRecord(raw: string, provider: TranscriptProvider, offset: number): TranscriptMessage[] {
-  let row: Json;
-  try { row = object(JSON.parse(raw)); } catch { return []; }
+  let row: unknown;
+  try { row = JSON.parse(raw); } catch { return []; }
+  return parseTranscriptRow(row, provider, offset);
+}
+
+/** One parsed transcript row to the chat messages it contains. Unknown or injected rows yield none. */
+export function parseTranscriptRow(value: unknown, provider: TranscriptProvider, offset: number): TranscriptMessage[] {
+  const row = object(value);
   const ts = string(row.timestamp);
   if (provider === "claude") {
     if (row.isSidechain || row.isMeta || row.isCompactSummary || row.isVisibleInTranscriptOnly) return [];
@@ -98,10 +104,20 @@ const MAX_PARTIAL_LINE = 4 * 1024 * 1024;
  */
 export class TranscriptTail {
   offset = 0;
+  /** True once a line was discarded because it exceeded the partial-line cap. */
+  dropped = false;
+  /** Complete lines that were not JSON. Whitespace-only lines do not count. */
+  discarded = 0;
   private partial = "";
   private readonly seen = new Set<string>();
   private readonly order: string[] = [];
-  constructor(readonly provider: TranscriptProvider, private readonly remember = 4096) {}
+  /** `onRow` sees each parsed row once, before chat messages are built. A throwing observer is ignored. */
+  constructor(readonly provider: TranscriptProvider, private readonly remember = 4096, private readonly onRow?: (row: unknown) => void) {}
+
+  /** True while an unterminated line waits for its newline. */
+  get pending(): boolean {
+    return this.partial.length > 0;
+  }
 
   /** Appends `text`, which must start at `this.offset`, and returns the new complete messages. */
   ingest(text: string): TranscriptMessage[] {
@@ -112,7 +128,15 @@ export class TranscriptTail {
     while ((newline = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
-      for (const message of parseTranscriptRecord(line, this.provider, this.offset)) {
+      let row: unknown;
+      try { row = JSON.parse(line); } catch {
+        if (line.trim()) this.discarded += 1;
+        continue;
+      }
+      if (this.onRow) {
+        try { this.onRow(row); } catch { /* An observer never stops chat. */ }
+      }
+      for (const message of parseTranscriptRow(row, this.provider, this.offset)) {
         if (this.seen.has(message.id)) continue;
         this.seen.add(message.id); this.order.push(message.id);
         if (this.order.length > this.remember) this.seen.delete(this.order.shift()!);
@@ -120,7 +144,11 @@ export class TranscriptTail {
       }
     }
     // A record that never ends is not a transcript; drop it rather than grow without bound.
-    this.partial = buffer.length > MAX_PARTIAL_LINE ? "" : buffer;
+    if (buffer.length > MAX_PARTIAL_LINE) {
+      buffer = "";
+      this.dropped = true;
+    }
+    this.partial = buffer;
     return messages;
   }
 }

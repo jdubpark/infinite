@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { UsageTail, usageRecordKey } from "../packages/host/src/transcript-usage.js";
+import { UsageTail, usageCoverage, usageRecordKey, type UsageCoverageInput } from "../packages/host/src/transcript-usage.js";
 import type { UsageRecord, UsageTokens } from "../packages/host/src/usage.js";
 
 const fixture = (name: string) => new URL(`./fixtures/usage/${name}`, import.meta.url);
@@ -222,4 +222,100 @@ test("usageRecordKey joins the provider and the message", () => {
   assert.ok(claude && codex);
   assert.equal(usageRecordKey(claude), "claude:msg_fixture_01");
   assert.equal(usageRecordKey(codex), "codex:resp_fixture_01");
+});
+
+test("usage coverage follows the rule table", () => {
+  const complete: UsageCoverageInput = { provider: "claude", hooks: true, rows: 5, records: 2, dropped: false, lastDrain: { complete: true, turnEnd: true }, subagents: false, childThreads: false, totalMismatch: false };
+  const none = (reason: string) => ({ coverage: "none", reason });
+  const partial = (reason: string) => ({ coverage: "partial", reason });
+  assert.deepEqual(usageCoverage(complete), { coverage: "complete" });
+  assert.deepEqual(usageCoverage({ ...complete, provider: "demo" }), { coverage: "complete" });
+  assert.deepEqual(usageCoverage({ ...complete, provider: "opencode" }), none("unsupported"));
+  assert.deepEqual(usageCoverage({ ...complete, hooks: false }), none("hooks-off"));
+  assert.deepEqual(usageCoverage({ ...complete, rows: 0 }), none("no-transcript"));
+  assert.deepEqual(usageCoverage({ ...complete, records: 0 }), none("no-usage-fields"));
+  assert.deepEqual(usageCoverage({ ...complete, dropped: true }), partial("row-dropped"));
+  assert.deepEqual(usageCoverage({ ...complete, totalMismatch: true }), partial("row-dropped"));
+  assert.deepEqual(usageCoverage({ ...complete, lastDrain: undefined }), partial("drain-incomplete"));
+  assert.deepEqual(usageCoverage({ ...complete, lastDrain: { complete: false, turnEnd: true } }), partial("drain-incomplete"));
+  assert.deepEqual(usageCoverage({ ...complete, lastDrain: { complete: true, turnEnd: false } }), partial("stopped-mid-turn"));
+  assert.deepEqual(usageCoverage({ ...complete, subagents: true }), partial("secondary-missing"));
+  assert.deepEqual(usageCoverage({ ...complete, childThreads: true }), partial("child-threads"));
+});
+
+test("the tail counts rows, records, and request totals", () => {
+  const tail = new UsageTail({ provider: "codex" });
+  pushFixture(tail, "codex-session.jsonl");
+  assert.equal(tail.rowCount(), 11);
+  assert.equal(tail.recordCount(), 3);
+  assert.equal(tail.requestTotal(), 2650);
+  assert.equal(tail.cumulativeTotal(), 2650);
+});
+
+test("child-thread rows are detected", () => {
+  const tail = new UsageTail({ provider: "codex" });
+  pushFixture(tail, "codex-session.jsonl");
+  assert.equal(tail.sawChildThreads(), false);
+  tail.push({ timestamp: "2026-01-01T00:00:05.000Z", type: "inter_agent_communication_metadata", payload: {} });
+  assert.equal(tail.sawChildThreads(), true);
+});
+
+test("reconciled holds when request totals match the last cumulative total", () => {
+  assert.equal(pushFixtureTail("codex-session.jsonl").reconciled(), true);
+  const missingTotal = new UsageTail({ provider: "codex" });
+  missingTotal.push(requestRow("resp_unreconciled_01", "turn_unreconciled", codexUsage));
+  assert.equal(missingTotal.reconciled(), false);
+  assert.equal(new UsageTail({ provider: "claude" }).reconciled(), true);
+});
+
+/** The usage tail of a fixture, with every row pushed. */
+function pushFixtureTail(name: string): UsageTail {
+  const tail = new UsageTail({ provider: "codex" });
+  pushFixture(tail, name);
+  return tail;
+}
+
+test("rejectedCount counts usage-bearing rows the parser refuses, and not repeats or synthetic rows", () => {
+  const claude = new UsageTail({ provider: "claude" });
+  claude.push(claudeRow("msg_ok", { output_tokens: 10 }));
+  claude.push(claudeRow("msg_ok", { output_tokens: 10 }));
+  claude.push(claudeRow("msg_bad", { output_tokens: "7" }));
+  claude.push(claudeRow("msg_synthetic", {}, { message: { id: "msg_synthetic", model: "<synthetic>", usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }));
+  claude.push({ type: "assistant", timestamp: "2026-01-01T00:00:00.000Z", message: "not an object" });
+  assert.equal(claude.rejectedCount(), 1);
+
+  const codex = new UsageTail({ provider: "codex" });
+  codex.push(requestRow("resp_bad", "turn_bad", { ...codexUsage, cached_input_tokens: 2000 }));
+  codex.push(countRow({ ...codexUsage, cached_input_tokens: 2000 }));
+  codex.push(countRow(codexUsage));
+  codex.push(countRow(codexUsage));
+  assert.equal(codex.rejectedCount(), 2);
+});
+
+test("a repeated response counts once, and a larger total for it replaces the record", () => {
+  const tail = new UsageTail({ provider: "codex" });
+  assert.equal(tail.push(requestRow("resp_dup", "turn_dup", codexUsage)).length, 1);
+  assert.deepEqual(tail.push(requestRow("resp_dup", "turn_dup", codexUsage)), []);
+  const larger = { input_tokens: 1500, cached_input_tokens: 300, cache_write_input_tokens: 0, output_tokens: 230, reasoning_output_tokens: 30, total_tokens: 1730 };
+  const grown = tail.push(requestRow("resp_dup", "turn_dup", larger));
+  assert.equal(grown.length, 1);
+  // The record under the same key holds the whole new snapshot. Only the difference joins the request total.
+  assert.deepEqual(grown[0]?.tokens, { input: 1200, output: 200, reasoning: 30, cacheRead: 300, cacheWrite: 0 });
+  assert.equal(grown[0]?.messageId, "resp_dup");
+  assert.equal(tail.requestTotal(), 1730);
+});
+
+test("an overflowing response table makes reconciled false from then on", () => {
+  const tail = new UsageTail({ provider: "codex" });
+  for (let index = 0; index < 4096; index++) tail.push(requestRow(`resp_bound_${index}`, "turn_bound", codexUsage));
+  tail.push(requestRow("resp_bound_overflow", "turn_bound", codexUsage));
+  assert.equal(tail.reconciled(), false);
+});
+
+test("a cumulative-only conversation is reconciled only once its thread id is known", () => {
+  const tail = new UsageTail({ provider: "codex" });
+  tail.push(countRow(codexUsage));
+  assert.equal(tail.reconciled(), false);
+  tail.push({ timestamp: "2026-01-01T00:00:00.000Z", type: "session_meta", payload: { id: "thread_meta_01" } });
+  assert.equal(tail.reconciled(), true);
 });

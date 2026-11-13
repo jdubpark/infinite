@@ -179,3 +179,209 @@ export function usageRecordKey(record: UsageRecord): string;
 - Journal records, coverage, secondary transcripts, and the final drain (phase 2).
 - The ledger in the evidence store, list prices, and limit events (phases 3 to 5).
 - A fixture recorder. The fixtures here are written by hand from the confirmed shapes.
+
+---
+
+# Phase 2a: the session worker journals usage and coverage
+
+Spec part 2 (one pass per row) and part 3 (coverage), for the primary transcript only. Secondary transcripts and the final drain follow in phases 2b and 2c. The usage ledger ignores these records until phase 3, because `UsageService.tick` reads `usage` records only from OpenCode sessions.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/transcript.ts` (modify) | `TranscriptTail` reports each parsed row to an observer and records a dropped line |
+| `packages/host/src/transcript-usage.ts` (modify) | Counters for coverage, child-thread detection, and the pure `usageCoverage` function |
+| `packages/host/src/hook-relay.ts` (modify) | An end marker when the relay reaches the end of the file |
+| `packages/host/src/types.ts` (modify) | The `usage-coverage` journal event type |
+| `packages/host/src/worker.ts` (modify) | Feed the usage tail, journal `usage` records, track the last drain, journal one `usage-coverage` record at provider exit |
+| `packages/host/src/demo.ts` (modify) | The rehearsal provider writes usage on its assistant rows |
+| `tests/transcript.test.ts`, `tests/transcript-usage.test.ts`, `tests/host-launch.test.ts` or `tests/attention-hooks.test.ts` (modify) | Tests, in the suites that already cover each file |
+
+## Review Focus
+
+1. A relay that stops at its chunk budget before the end of the file. Expect no end mark and coverage `partial` with `drain-incomplete`.
+7. Two hooks whose relays overlap. Expect the end mark of the first to leave the drain of the second open.
+2. A member that the host stops in the middle of a turn. Expect `partial` with `stopped-mid-turn`, also when the last drain reached the end of the file.
+3. A hook from a subagent, or Codex child-thread rows. Expect `partial`, never `complete`, because that usage is not captured yet.
+4. A session with hooks off, or with no hook before exit. Expect `none` with `hooks-off` and no `usage` record.
+5. A transcript line that exceeds the partial-line cap. Expect `partial` with `row-dropped`.
+6. An end marker for another path, or at another offset than the worker's cursor. Expect it to be ignored.
+
+### Task 1: observer, counters, coverage rule, end marker
+
+**Files:** `transcript.ts`, `transcript-usage.ts`, `hook-relay.ts`, and their tests. No change to `worker.ts`.
+
+**Interfaces (produces):**
+
+```ts
+// transcript.ts
+export class TranscriptTail {
+  constructor(provider: TranscriptProvider, remember?: number, onRow?: (row: unknown) => void);
+  /** True once a line was discarded because it exceeded the partial-line cap. */
+  dropped: boolean;
+}
+export function parseTranscriptRow(row: unknown, provider: TranscriptProvider, offset: number): TranscriptMessage[];
+// parseTranscriptRecord(raw, provider, offset) stays and calls parseTranscriptRow.
+
+// transcript-usage.ts
+export class UsageTail {
+  /** Rows pushed, and usage records returned by push and finish, since construction. */
+  rowCount(): number;
+  recordCount(): number;
+  /** Codex: the sum of total tokens over the request records returned so far. */
+  requestTotal(): number;
+  /** Codex: a row of type "inter_agent_communication_metadata" was seen. */
+  sawChildThreads(): boolean;
+}
+export type UsageCoverage = "none" | "partial" | "complete";
+export type UsageCoverageReason = "hooks-off" | "no-transcript" | "no-usage-fields" | "unsupported"
+  | "row-dropped" | "drain-incomplete" | "stopped-mid-turn" | "secondary-missing" | "child-threads";
+export interface UsageCoverageInput {
+  provider: string;                                  // the session's provider
+  hooks: boolean;                                    // at least one provider hook arrived
+  rows: number; records: number;
+  dropped: boolean;
+  lastDrain?: { complete: boolean; turnEnd: boolean };
+  subagents: boolean;                                // a hook from a subagent arrived
+  childThreads: boolean;
+  totalMismatch: boolean;                            // codex: requestTotal() differs from cumulativeTotal()
+}
+export function usageCoverage(input: UsageCoverageInput): { coverage: UsageCoverage; reason?: UsageCoverageReason };
+```
+
+**Decisions:**
+
+- `TranscriptTail.ingest` parses each complete line once. It calls `onRow` with the parsed value before it builds chat messages. A line that is not JSON calls nothing. An observer that throws is ignored.
+- `usageCoverage` returns the first match:
+
+| Order | Condition | Result |
+|---|---|---|
+| 1 | provider is not `claude`, `codex`, or `demo` | `none`, `unsupported` |
+| 2 | `hooks` is false | `none`, `hooks-off` |
+| 3 | `rows` is 0 | `none`, `no-transcript` |
+| 4 | `records` is 0 | `none`, `no-usage-fields` |
+| 5 | `dropped` or `totalMismatch` | `partial`, `row-dropped` |
+| 6 | no `lastDrain`, or `lastDrain.complete` is false | `partial`, `drain-incomplete` |
+| 7 | `lastDrain.turnEnd` is false | `partial`, `stopped-mid-turn` |
+| 8 | `subagents` | `partial`, `secondary-missing` |
+| 9 | `childThreads` | `partial`, `child-threads` |
+| 10 | otherwise | `complete`, no reason |
+
+- The relay marks the end of the file as its last step. After each acknowledged chunk it takes a fresh file size. Only when the acknowledged cursor equals that size does it post `{ path, offset, end: true }` with no text. A chunk never carries the mark, because the file can grow while the relay still streams. It sends no mark when it stops at `MAX_CHUNKS` or on a failed post.
+- The hook reply names a drain: `{ transcript: { path, after, drain } }`. The relay puts that `drain` on every transcript post of the stream. Two hooks can overlap, so a mark completes only the drain it belongs to.
+- `no-transcript` is a new reason code. The spec gains it in this pull request.
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | File | Assertions |
+|---|---|---|
+| `the tail reports each parsed row once` | `tests/transcript.test.ts` | Three lines in two chunks, one split across the chunks, one that is not JSON. The observer receives the two parsed rows in order, once each. Chat messages are unchanged. A throwing observer does not stop ingestion. |
+| `the tail records a dropped line` | same | A line longer than the partial-line cap sets `dropped`. A normal session leaves it false. |
+| `usage coverage follows the rule table` | `tests/transcript-usage.test.ts` | One assertion per row of the table, each built from a complete input that differs from the `complete` case in one field. |
+| `the tail counts rows, records, and request totals` | same | After the Codex fixture: `rowCount()` is its row count, `recordCount()` is 3, `requestTotal()` is 2650, and `cumulativeTotal()` is 2650. |
+| `child-thread rows are detected` | same | A row with `type: "inter_agent_communication_metadata"` sets `sawChildThreads()`. The fixtures leave it false. |
+| `the relay marks the end of the file` | the suite that already tests `relay` | With a fake `fetch` and a temporary file: no chunk post carries `end`, and every post carries the reply's `drain`. After the last acknowledged chunk, one text-less post carries `end: true` at the file size. When the file grows after a chunk, the new bytes go first and the mark follows them. When a post fails, the fake worker never advances, or the file needs more than `MAX_CHUNKS` chunks, no mark is posted. |
+
+- [ ] **Step 2: Run and confirm failure.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `tests/transcript.test.ts`, `tests/transcript-usage.test.ts`, the relay suite, and `npm run typecheck -w @infinite/host`.
+
+### Task 2: worker wiring
+
+**Files:** `types.ts`, `worker.ts`, `demo.ts`, and one integration test in the suite that already starts a rehearsal session with hooks.
+
+**Decisions:**
+
+- `Event["type"]` gains `"usage-coverage"`.
+- The worker keeps one `UsageTail` beside its `TranscriptTail`, created with it, with `provider` from the hook route and `requestedModel` from `session.teamModelProfile?.model` for Codex. The tail's observer pushes each row and appends every returned record as a `usage` journal record, exactly as the OpenCode path does.
+- **Drain tracking.** When a hook names the transcript, the worker starts a drain record with a new id: `{ id, complete: false, turnEnd }`. `turnEnd` is true when the mapped signals of that hook include `turn-end`, or the hook event is `SessionEnd`. A `transcript` post completes the drain when it has `end: true`, the current path, the current drain's id, and the tail's cursor stands at the end of what the post covers. A chunk is ingested before that test. Any other mark is ignored and answered like a chunk.
+- **A changed transcript path.** Before the worker replaces its transcript, it journals the old usage tail's `finish()` records and keeps the old row and record counts. An old drain that is missing or not complete sets a sticky gap, which makes the session `partial` with `drain-incomplete`.
+- **Subagents.** A hook whose payload has an `agent_id` sets a `subagents` flag.
+- **At provider exit**, inside `exited`, before the lifecycle record: append the records from `finish()`, then one `usage-coverage` record `{ coverage, reason?, records, provider }` from `usageCoverage`. A session with no usage tail appends the record too, so that `hooks-off` and `unsupported` are visible. An OpenCode session appends nothing. A failure here must not stop the exit path.
+- The rehearsal provider adds `message.id`, `message.model: "rehearsal-model"`, and a `message.usage` object with fixed small counts to each assistant row.
+
+- [ ] **Step 1: Write the failing integration test.** A rehearsal session with hooks runs one turn and exits. Its journal holds at least one `usage` record with `provider: "claude"`, `modelId: "rehearsal-model"`, and the fixed counts, and exactly one `usage-coverage` record. A second case with hooks off holds no `usage` record and one `usage-coverage` record with `coverage: "none"` and `reason: "hooks-off"`.
+- [ ] **Step 2: Run and confirm failure.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** the integration suite, `tests/usage-service.test.ts` (the ledger must not change), `tests/transcript.test.ts`, and the typecheck.
+- [ ] **Step 5: The coordinator runs `npm run check`, requests the independent review, and commits.**
+
+### Task 3: the transcript watch
+
+The independent review of Tasks 1 and 2 found sequences where a session could be marked `complete` with usage missing: bytes that arrive after an end mark, a later hook that names no transcript, an unterminated last row, a replaced Codex transcript with a total mismatch, a Codex session with request rows and no cumulative row, and a failed journal write. This task moves the drain and coverage state out of `worker.ts` into one class that a unit test can drive through each sequence. It supersedes the worker-level state of Task 2.
+
+**Files:** create `packages/host/src/transcript-watch.ts` and `tests/transcript-watch.test.ts`. Modify `transcript.ts`, `transcript-usage.ts`, `worker.ts`, `demo.ts`, `tests/chat.test.ts`.
+
+**Interfaces (produces):**
+
+```ts
+// transcript.ts, on TranscriptTail
+/** True while an unterminated line waits for its newline. */
+get pending(): boolean;
+/** Complete lines that were not JSON. Whitespace-only lines do not count. */
+discarded: number;
+
+// transcript-usage.ts, on UsageTail
+/** Codex: false when request records exist and their total is not the last cumulative total. Otherwise true. */
+reconciled(): boolean;
+
+// transcript-watch.ts
+export interface CoverageRecord { coverage: UsageCoverage; reason?: UsageCoverageReason; records: number; provider: string }
+export class TranscriptWatch {
+  constructor(options: { provider: string; requestedModel?: string; onUsage(record: UsageRecord): void });
+  /** Every provider hook. Returns what the relay must send when a primary hook names a transcript. */
+  hook(input: { subagent: boolean; turnEnd: boolean; transcript?: { path: string; provider: TranscriptProvider } }): { path: string; after: number; drain: number } | undefined;
+  /** One post to the transcript route: a chunk or an end mark. Undefined when the post is not for the current transcript. */
+  post(body: unknown): { messages: TranscriptMessage[]; after: number } | undefined;
+  /** The provider exited. Journals the last usage records and returns the coverage record. */
+  finish(hooks: boolean): CoverageRecord;
+}
+```
+
+**Decisions:**
+
+- **Hooks.** Every hook replaces the last-hook record `{ turnEnd, drain }`. `drain` is the new drain's id when the hook names a transcript, and absent otherwise. A hook from a subagent sets a sticky subagent flag. So any hook after a turn end, with or without a transcript path, ends that turn boundary.
+- **Drains.** A hook that names a transcript starts a drain with the next id. A new path first retires the current transcript.
+- **End evidence.** A chunk is applied only at the tail's cursor, and a chunk never creates evidence. A text-less post with `end: true` at the cursor stores `{ drain, offset }` when its `drain` is the current drain's id. Nothing else creates evidence.
+- **The drain is complete** only when the evidence names the current drain, its offset equals the tail's cursor, the tail has no pending line, and the last hook started that same drain. Bytes that arrive later move the cursor, so old evidence stops counting.
+- **Retiring a transcript** journals its `finish()` records, keeps its row and record counts, and keeps four sticky facts: a dropped or discarded line, a drain that was not complete, a failed reconciliation, and child threads.
+- **Usage writes.** The watch calls `onUsage` inside a guard. A throw sets a sticky write failure and never stops chat.
+- **Refused rows.** `UsageTail.rejectedCount()` counts rows that carry usage and that the parser refused. A Claude row carries usage when it is an `assistant` row with a `message.usage` object and a model that does not start with `<`. A Codex row carries usage when it is a `token_usage_record` row, or a `token_count` row with a `total_token_usage` object.
+- **Distinct requests.** The Codex tail keeps the total of each `response_id`, for at most 4,096 ids. A repeated id yields a record only when its total grew. That record holds the whole new snapshot under the same key, and `requestTotal()` sums distinct ids. Past the bound, `reconciled()` is false.
+- **A cumulative transcript with no thread id** cannot produce its snapshot record, so `reconciled()` is false for it.
+- **Coverage inputs.** `dropped` is true for a dropped line, a discarded line, a refused usage row, or a write failure, now or in a retired transcript. `totalMismatch` is true when any tail fails `reconciled()`. `lastDrain.complete` also needs every retired drain to have been complete. `lastDrain.turnEnd` is the last hook's `turnEnd`.
+- **Worker.** `worker.ts` keeps one `TranscriptWatch` and no drain state of its own. The hook handler calls `hook` for every provider hook, the transcript route calls `post` and journals the returned messages, and `exited` appends the coverage record from `finish(hooksReady)` unless the provider is `opencode`.
+- **Rehearsal provider.** On `SIGTERM` it waits for its queued hooks, for at most 3 seconds, before it exits. The integration test then needs no timing.
+
+- [ ] **Step 1: Write the failing tests** in `tests/transcript-watch.test.ts`. Build rows with the helpers of `tests/transcript-usage.test.ts`. `onUsage` pushes into an array.
+
+| Test name | Assertions |
+|---|---|
+| `a turn-end drain that reaches the end of the file is complete` | A turn-end hook, one chunk, then the text-less mark with the drain id. `finish(true)` gives `complete`, and the usage records arrived through `onUsage`. |
+| `a chunk never creates end evidence` | A chunk with `end: true` and the drain id, and no mark. `partial`, `drain-incomplete`. |
+| `a refused usage row makes the session partial` | A valid usage row and a distinct assistant row whose `output_tokens` is a string. `partial`, `row-dropped`. |
+| `a repeated response is counted once` | One Codex response twice with 100 tokens, and a cumulative total of 200. `partial`, `row-dropped`, and one usage record. |
+| `a cumulative transcript without a thread id is a gap` | Path A with cumulative rows, no `session_meta`, and a valid mark. Then a complete path B. `partial`, `row-dropped`. |
+| `bytes after the end mark reopen the drain` | Complete evidence, then one more applied chunk without `end`. `partial`, `drain-incomplete`. |
+| `an end mark for an older drain is ignored` | Hook A, then turn-end hook B. A mark with A's drain id leaves the session `partial`. A mark with B's id makes it `complete`. |
+| `a later hook without a transcript ends the turn boundary` | Complete evidence at a turn end, then a hook with `turnEnd: false` and no transcript. `partial`. |
+| `a later turn end needs its own evidence` | Complete, then a second turn-end hook. `partial` until a text-less mark at the cursor carries the second drain's id. |
+| `an unterminated last row is not complete` | A chunk whose last line has no newline, then the mark. `partial`, `drain-incomplete`, and that row yields no usage record. |
+| `a line that is not JSON makes the session partial` | `partial`, `row-dropped`. |
+| `a subagent hook makes the session partial` | A subagent hook, then a complete turn-end drain. `partial`, `secondary-missing`. |
+| `a changed path retires the old transcript` | Old path complete, new path complete: `complete`, and `records` counts both. Old path not complete: `partial`, `drain-incomplete`. An old Codex tail whose totals do not reconcile: `partial`, `row-dropped`. A retired Codex tail with only cumulative rows journals its snapshot at retirement. |
+| `a Codex session reconciles request totals` | Request rows with a matching cumulative row: `complete`. Request rows with no cumulative row: `partial`, `row-dropped`. A mismatch: `partial`, `row-dropped`. |
+| `a failed usage write is never complete` | `onUsage` throws once. `partial`, `row-dropped`. The chunk's chat messages are still returned. |
+| `a post for another path or offset changes nothing` | Another path returns undefined. A chunk at another offset is not ingested and returns the cursor. An end mark at another offset creates no evidence. |
+| `a session without a transcript reports why` | `finish(false)`: `none`, `hooks-off`. `finish(true)` with no transcript: `none`, `no-transcript`. Provider `grok`: `none`, `unsupported`. |
+| `chat messages are unchanged` | `post` returns the messages that `TranscriptTail.ingest` returns for the same text. |
+
+- [ ] **Step 2: Run and confirm failure.**
+- [ ] **Step 3: Implement**, and reduce `worker.ts` to the three calls.
+- [ ] **Step 4: Run** `tests/transcript-watch.test.ts`, `tests/chat.test.ts` three times in a row, `tests/transcript.test.ts`, `tests/transcript-usage.test.ts`, `tests/usage-service.test.ts`, `tests/host-launch.test.ts`, and the typecheck.
+
+## Not in this phase
+
+- Secondary transcripts (phase 2b) and the final drain (phase 2c). Until then a session with subagents or a mid-turn stop is `partial`.
+- Any ledger or client change (phase 3).

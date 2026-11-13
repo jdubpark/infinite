@@ -68,9 +68,14 @@ The design picks approach 3. The receipt holds without the judge, the judge's co
 **Landing set.** When the ledger records `landing`, the seed reads the landing commit `L` from the signal payload.
 
 - `merge-commit` and `merge-parent`: `S = {L}`, and the diff base `P` is `L`'s first parent.
-- `tree-equal`: `S` is the first-parent commits after the run's base commit `B` up to `L`, so a rebase merge of several commits is covered. `P = B`. It needs `merge-base --is-ancestor B L` and at most 50 commits in `S`, or the attempt is unmeasured with `over-bound`.
+- `tree-equal`: `S` is the first-parent commits after the run's base commit `B` up to `L`, so a rebase merge of several commits is covered. `P = B`. It needs `B` to be the first parent of the oldest commit of `S`, or the attempt is unmeasured with `stacked-base` (below), and at most 50 commits in `S`, or it is unmeasured with `over-bound`.
 
-**A run that started from another run's head.** A goal cycle, a mission subteam, or a follow-up run can start from a parent run's head that has not landed. Its landed diff then also holds the parent's lines. The seed checks `merge-base --is-ancestor B P` for the run's base commit `B`. When `B` is `P` or an ancestor of `P`, the diff from `P` to `L` is the run's own work. Otherwise only a `merge-parent` landing can be measured: its line-level blame names the commit that wrote each line, so only lines from the run's own integration commits are tracked, and every other landed line is left out. With any other landing the run's attempts are unmeasured with `stacked-base`. *(My call after review: a squash of two runs' work shows no line's writer, and counting a parent's lines against the child is the misattribution this design must not make.)*
+**A run that started from another run's head.** A goal cycle, a mission subteam, or a follow-up run can start from a parent run's head that has not landed. Its landed diff then also holds the parent's lines, and the seed must not count them. The check depends on the landing.
+
+- A landing with `S = {L}` (`merge-commit`, `merge-parent`): the seed runs `merge-base --is-ancestor B P` for the run's base commit `B`. When it holds, the parent's work is already in `P`, and the diff from `P` to `L` is the run's own. When it fails and `L`'s second parent is the run's reviewed head, the run's own commits are in the mirror: the seed blames EVERY landed file at `L` without `--first-parent`, not only the shared ones, and tracks only the lines that the run's own integration commits wrote. Every other landed line is left out. These blames count against the bounds of Part 10. When it fails and `L` has no such second parent, the run's attempts are unmeasured with `stacked-base`.
+- A `tree-equal` landing: `B` must be the first parent of the oldest commit of `S`. The seed checks this before the 50-commit bound, with `rev-list --first-parent --reverse B..L` and `rev-list --parents -n 1`. When `B` is not on `L`'s first-parent chain, `S` would hold commits that are not the run's: a parent that landed by a merge commit, or the whole branch. The attempts are then unmeasured with `stacked-base`.
+
+*(My call after review: a squash of two runs' work shows no line's writer, and counting a parent's lines against the child is the misattribution this design must not make.)*
 
 **Seed.** `diff-tree -r -z -M --name-status P L` lists the landed files. A file goes to an attempt only when the owned paths of exactly one task of the run match it (`teamPathAllowed`), among the run's rows with accepted yes. A file that the owned paths of two or more tasks match is **shared**, whatever the lengths of the matching paths: dependent tasks may own nested paths (`packages/host/src/team-workspace.ts`), and both may have written the file. A shared file, and a file no task owns, stays with the run. *(My call: path scope proves who could have written a file, and only a single owner proves who did. A longest-prefix rule would give a parent task's lines to the task that owns the nested path.)*
 
@@ -103,7 +108,7 @@ Each attempt with lines rewritten by `C` gets one `rewrite` signal (Part 5). Lin
 | Rebase merge on an unmoved base | `tree-equal` on the last replayed commit. `S` holds every replayed commit |
 | Rebase onto a moved base before merge | No landing unless the delivery reported the merge commit (rule 1). Otherwise `no-landing` |
 | The run merged a moved base before landing | Only `P` to `L` counts, so base commits the run took in are not its lines |
-| The run started from a parent run's unlanded head | Measured only with a `merge-parent` landing, from the run's own integration commits. Otherwise `stacked-base` |
+| The run started from a parent run's unlanded head | Measured only when the landing's second parent is the run's reviewed head, from the run's own integration commits. Otherwise `stacked-base` |
 | A later whole-file rename | Followed through `diff-tree -M` and blame. Not a rewrite |
 | A later move of lines to another file | Found with `-C`. Moved, not rewritten |
 | A formatting sweep | Ignored in later blames once the owner marks it. Until then its lines are unresolved and the measure cannot close. Whitespace-only edits are ignored by `-w` |
@@ -302,7 +307,7 @@ Validating hindsight tasks spends no model tokens. Trials on them are ordinary r
 All run in the host mirror through `teams.commandPrefix` and read only:
 
 - `rev-list --first-parent --reverse OLD..NEW` and `rev-list --parents -n 1 COMMIT`
-- `merge-base --is-ancestor BASE LANDING`
+- `merge-base --is-ancestor BASE COMMIT`
 - `diff-tree -r -z -M --name-status PARENT COMMIT`
 - `blame --porcelain -w -M --first-parent [--ignore-rev SHA]... COMMIT -- PATH`, the same with `-C`, and `blame --porcelain -w -M COMMIT -- PATH` for a `merge-parent` seed
 - `cat-file -s COMMIT:PATH`
@@ -357,7 +362,7 @@ The judge has no clone. The grading clone uses replay part 4's staging clone and
 13. Every display figure shows its n, its open and unmeasured counts by reason, and, for an inferred count, the judge's identity and calibration. No figure adds inferred and confirmed counts.
 14. Task A owns `src`, and task B, which depends on A, owns `src/widget.ts`. Both edit that file. With a squash landing its lines are on the run summary, and neither A's nor B's measure counts them. With a `merge-parent` landing each line goes to the task whose integration commit wrote it, and a line from a repair commit stays with the run.
 15. An inference that the owner rejects counts under `confirmed.unclear`, changes no level, and is gone from the review queue.
-16. A run starts from a parent run's head that never landed and lands by squash: its attempts are unmeasured with `stacked-base`. With a `merge-parent` landing only the lines of the run's own integration commits are tracked, and none of the parent's.
+16. A run starts from a parent run's head that never landed and lands by squash: its attempts are unmeasured with `stacked-base`, not `over-bound`. The parent lands by a merge commit and the child is then rebase-merged: `stacked-base`, and no line of the parent's merge is tracked for the child. With a landing whose second parent is the run's reviewed head, only the lines of the run's own integration commits are tracked, in single-owner files too, and none of the parent's.
 
 ## Owner decisions
 

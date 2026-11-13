@@ -1353,7 +1353,7 @@ Each project has an autonomy mode. The mode is `supervised` or `autonomous`.
 
 In this release the host only stores and shows the mode. Nothing reads it yet, so no behaviour changes.
 
-Each new run, goal, and cycle records the project's mode when it starts. A change applies from the next run or cycle. A run already in progress keeps its mode.
+Each new run and each new goal records the project's mode when it starts. A goal's cycles keep the goal's mode. A change applies to the next run and the next goal. A run or a goal already in progress keeps its mode.
 
 An enrolled repository without a saved mode uses the host default. The default is `autonomous` unless the operator sets `autonomy.defaultMode` in the host configuration file. A project that is not enrolled reads as `supervised`.
 

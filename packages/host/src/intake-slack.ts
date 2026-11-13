@@ -403,8 +403,13 @@ export class IntakeSlackSurface {
     }
     const ts = event.ts;
     const duplicate = (record: IntakeRecord) => record.inbound.some(item => item.eventId === eventId || item.ts === ts);
-    // A redelivered event, or a second event for the same message, is dropped with no write and no reply.
-    if (bound.some(duplicate)) return;
+    // A redelivered event, or a second event for the same message, is dropped with no write and no reply. An entry a
+    // failed store write left unhandled on the record that holds it is applied now.
+    const holders = bound.filter(duplicate);
+    if (holders.length > 0) {
+      for (const record of holders) if (record.inbound.some(item => !item.handledAt)) void this.drain(record.issueId);
+      return;
+    }
     const target = this.target(bound, text);
     this.store.update(target.record.issueId, draft => {
       if (duplicate(draft)) return;
@@ -472,7 +477,7 @@ export class IntakeSlackSurface {
         await this.apply(record, entry);
       }
     } catch (error) {
-      // A failed store write leaves the entry unhandled; it is applied again on the next event or start.
+      // A failed store write leaves the entry unhandled; it is applied again on the next event, a redelivery, or a start.
       this.noteFailure(issueId, "inbound", error);
     } finally {
       this.draining.delete(issueId);

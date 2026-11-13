@@ -295,6 +295,59 @@ test("a redelivered envelope yields one answer", { timeout: 90000 }, async () =>
   } finally { await close(); }
 });
 
+test("a redelivered event applies an entry that a failed store write left unhandled, exactly once", { timeout: 90000 }, async () => {
+  const { sh, s, close } = await scriptedSurface();
+  try {
+    const { id } = await sh.create();
+    s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: id }));
+    await s.surface.start(); await s.connected();
+    await waitFor(async () => s.texts(), list => list.length === 1);
+    // The write that marks an entry handled fails once per arming, after the entry's work was done.
+    const update = s.store.update.bind(s.store);
+    let armed = 0;
+    s.store.update = (issueId, change) => update(issueId, draft => {
+      const handled = draft.inbound.filter(item => item.handledAt).length;
+      change(draft);
+      if (armed > 0 && draft.inbound.filter(item => item.handledAt).length > handled) { armed -= 1; throw new Error("The disk is full."); }
+    });
+    const handledAt = (index: number) => s.store.get(ISSUE)!.inbound[index]?.handledAt;
+
+    // A mission action: the steer reached the mission, and the entry stayed unhandled.
+    const before = sh.get(id).revision;
+    armed = 1;
+    const steer = await s.slack.emit(mention("also cover the CSV export"));
+    await until(() => armed, left => left === 0);
+    await delay(300);
+    assert.equal(sh.get(id).steering.length, 1);
+    assert.equal(handledAt(0), undefined, "The failed write left the steer unhandled");
+    await s.slack.redeliver(steer);
+    await until(() => handledAt(0), handled => Boolean(handled), 10000);
+    assert.equal(sh.get(id).steering.length, 1, "The steer reaches the mission once");
+    assert.equal(sh.get(id).revision, before + 1, "The steer advances the revision once");
+    assert.equal(s.store.get(ISSUE)!.inbound[0].outcome, "steered");
+
+    // A reply: nothing was posted, and the redelivery posts it once.
+    const posts = s.texts().length;
+    armed = 1;
+    const status = await s.slack.emit(mention("status"));
+    await until(() => armed, left => left === 0);
+    await delay(300);
+    assert.equal(handledAt(1), undefined, "The failed write left the status request unhandled");
+    assert.equal(s.texts().length, posts, "No reply was composed");
+    await s.slack.redeliver(status);
+    await until(() => handledAt(1), handled => Boolean(handled), 10000);
+    await waitFor(async () => s.texts(), list => list.length === posts + 1, 10000);
+
+    // A redelivery of a handled event still does nothing.
+    await s.slack.redeliver(steer);
+    await s.slack.redeliver(status);
+    await delay(500);
+    assert.equal(s.texts().length, posts + 1, "The status reply is posted once");
+    assert.equal(sh.get(id).steering.length, 1);
+    assert.equal(s.store.get(ISSUE)!.inbound.length, 2);
+  } finally { await close(); }
+});
+
 test("a lost send response yields one message", { timeout: 60000 }, async () => {
   const h = harness(); const services = h.open(); const s = await surfaceFor(services, h.root);
   try {

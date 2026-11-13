@@ -26,7 +26,7 @@ export type SwarmTeam = {
   members: SwarmMember[]; tasks: SwarmTask[];
   checks: { status: "running" | "passed" | "failed" | "interrupted"; revision: number }[];
   decisions: { id: string; revision: number; answer?: string }[];
-  discovery?: unknown; review?: { revision: number }; pullRequest?: unknown; deliveryReceipt?: unknown;
+  discovery?: { revision: number }; review?: { revision: number }; pullRequest?: unknown; deliveryReceipt?: unknown;
   /** Owner delegation of routine one-shot permissions; absent on runs without it. */
   permissions?: { maxDecisions: number }; permissionsRevokedAt?: string;
   permissionDecisions?: { targetSessionId: string; promptId: number; status: string }[];

@@ -1,10 +1,10 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { UsageService, type UsageSessionRow } from "../packages/host/src/usage-service.js";
+import { UsageService, combineCoverage, ledgerCoverage, type UsageSessionRow } from "../packages/host/src/usage-service.js";
 import { EvidenceError } from "../packages/host/src/evidence/types.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { writeSealed } from "../packages/host/src/vault.js";
@@ -223,7 +223,7 @@ test("an unavailable store never throws", async () => {
     const usage = new UsageService(fixtureConfig(dir), key, { list: () => { throw new Error("no listing without a store"); } } as unknown as Manager, store);
     assert.equal(usage.available(), false);
     await usage.tick([]);
-    assert.deepEqual(usage.session("x"), { measured: false, unavailable: true });
+    assert.deepEqual(usage.session("x"), { measured: false, coverage: "none", unavailable: true });
     assert.throws(() => usage.summary(), (error: unknown) => error instanceof EvidenceError && error.code === "unavailable");
     const before = warnings.length;
     usage.recordBriefing("demo", "brief", "2026-10-21T05:00:00.000Z", null);
@@ -256,4 +256,232 @@ test("a new service resumes from the stored cursors", async () => {
       assert.equal((resumed.session("resume") as { messages: number }).messages, 3, "no total doubles");
     } finally { second.close(); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// Task 4: Claude Code, Codex, and coverage in every roll-up
+
+type JournalEvent = { type: string; data: unknown };
+/** A manager whose journals are arrays of events; the cursor is the position of the last event read. */
+function journalManager(journals: Record<string, JournalEvent[]>, reads: string[] = []): Manager {
+  return { events: (id: string, after: number, limit: number, types?: Set<string>) => {
+    reads.push(`${id}:${after}`);
+    const rest = (journals[id] ?? []).slice(after), batch = rest.slice(0, limit);
+    return {
+      events: batch.flatMap((event, index) => !types || types.has(event.type) ? [{ seq: after + index + 1, at: NOW.toISOString(), type: event.type, data: event.data }] : []),
+      cursor: after + batch.length,
+      more: rest.length > limit,
+    };
+  } } as unknown as Manager;
+}
+const claudeUsage = (messageId: string, extra: Record<string, unknown> = {}): JournalEvent => ({ type: "usage", data: {
+  provider: "claude", providerId: "claude", modelId: "model-a", messageId, partId: "", modelSource: "reported",
+  completedAt: "2026-10-21T01:00:00.000Z", tokens: { input: 100, output: 20, reasoning: 0, cacheRead: 1000, cacheWrite: 0 }, reportedCost: 0, ...extra } });
+const coverageEvent = (data: Record<string, unknown>): JournalEvent => ({ type: "usage-coverage", data });
+const claudeRow = (id: string, status: "running" | "exited", extra: Record<string, unknown> = {}) =>
+  ({ id, provider: "claude", projectId: "demo", createdAt: "2026-10-21T10:00:00.000Z", status, ...extra }) as unknown as UsageSessionRow;
+function journalService(dir: string, key: Buffer, journals: Record<string, JournalEvent[]>, config: Config = fixtureConfig(dir), reads?: string[]) {
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+  return { usage: new UsageService(config, key, journalManager(journals, reads), store), store };
+}
+const rawSession = (store: EvidenceStore, id: string) => store.read(db => db.get<{ exited: number; journaled_coverage: string | null; final_drain: string | null }>(
+  "SELECT exited, journaled_coverage, final_drain FROM usage_sessions WHERE session_id=?", id))!;
+
+test("ledger coverage follows the rule table", async t => {
+  const open = { provider: "claude" as const, measuredLaunch: false, closed: false, valid: 1, refused: 0 };
+  await t.test("row 1: a measured OpenCode launch is complete, and a refused row makes it partial", () => {
+    assert.deepEqual(ledgerCoverage({ provider: "opencode", measuredLaunch: true, closed: false, valid: 1, refused: 0 }), { coverage: "complete" });
+    assert.deepEqual(ledgerCoverage({ provider: "opencode", measuredLaunch: true, closed: false, valid: 1, refused: 1 }), { coverage: "partial", reason: "row-dropped" });
+  });
+  await t.test("row 2: any other OpenCode session and Grok are unsupported", () => {
+    assert.deepEqual(ledgerCoverage({ provider: "opencode", measuredLaunch: false, closed: true, valid: 1, refused: 0 }), { coverage: "none", reason: "unsupported" });
+    assert.deepEqual(ledgerCoverage({ provider: "grok", measuredLaunch: true, closed: true, valid: 1, refused: 0 }), { coverage: "none", reason: "unsupported" });
+  });
+  await t.test("row 3: a journaled record decides, and complete with a refused record is partial", () => {
+    assert.deepEqual(ledgerCoverage({ ...open, journaled: { coverage: "complete" } }), { coverage: "complete" });
+    assert.deepEqual(ledgerCoverage({ ...open, journaled: { coverage: "complete" }, refused: 1 }), { coverage: "partial", reason: "row-dropped" });
+    assert.deepEqual(ledgerCoverage({ ...open, journaled: { coverage: "partial", reason: "stopped-mid-turn" } }), { coverage: "partial", reason: "stopped-mid-turn" });
+  });
+  await t.test("row 4: an open session is running, partial with records and none without", () => {
+    assert.deepEqual(ledgerCoverage(open), { coverage: "partial", reason: "running" });
+    assert.deepEqual(ledgerCoverage({ ...open, valid: 0 }), { coverage: "none", reason: "running" });
+  });
+  await t.test("row 5: a closed session without a coverage record is drain-incomplete or unsupported", () => {
+    assert.deepEqual(ledgerCoverage({ ...open, closed: true }), { coverage: "partial", reason: "drain-incomplete" });
+    assert.deepEqual(ledgerCoverage({ ...open, closed: true, valid: 0 }), { coverage: "none", reason: "unsupported" });
+  });
+});
+
+test("a Claude session is measured from its journal", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const { usage, store } = journalService(dir, key, { "c-measured": [claudeUsage("m1"), claudeUsage("m2"), coverageEvent({ coverage: "complete" })] });
+  try {
+    await usage.tick([claudeRow("c-measured", "exited")]);
+    subset(usage.session("c-measured"), {
+      measured: true, coverage: "complete", messages: 2, cost: 0,
+      tokens: { input: 200, output: 40, reasoning: 0, cacheRead: 2000, cacheWrite: 0 },
+      pricing: { configured: 0, catalog: 0, provider: 0, unknown: 2 },
+    });
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a configured price does not price a Claude or Codex record", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const config = { stateDir: dir, usage: { prices: { "claude/model-a": { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } }, budgets: {}, accounts: {} } } as unknown as Config;
+  const { usage, store } = journalService(dir, key, { "c-priced": [claudeUsage("p1"), coverageEvent({ coverage: "complete" })] }, config);
+  try {
+    await usage.tick([claudeRow("c-priced", "exited")]);
+    subset(usage.session("c-priced"), { cost: 0, pricing: { unknown: 1 } });
+    subset(usage.summary(NOW).month.spent, { usd: 0, unpriced: 1 });
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a replay adds nothing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const { usage, store } = journalService(dir, key, {
+    A: [claudeUsage("m1"), claudeUsage("m2"), claudeUsage("m1"), claudeUsage("m2"), coverageEvent({ coverage: "complete" })],
+    B: [claudeUsage("m1"), claudeUsage("m2"), coverageEvent({ coverage: "complete" })],
+  });
+  try {
+    await usage.tick([claudeRow("A", "exited"), claudeRow("B", "exited")]);
+    subset(usage.summary(NOW).providers.claude, { recorded: { messages: 2 } });
+    subset(usage.session("A"), { measured: true, messages: 2 });
+    subset(usage.session("B"), { measured: true, coverage: "complete", messages: 0 });
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a session from before the upgrade is read again", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  try {
+    writeSealed(join(dir, "usage.sealed"), key, "usage", fixtureLedger());
+    const { usage, store } = journalService(dir, key, { "claude-a": [claudeUsage("old-1"), coverageEvent({ coverage: "complete" })] });
+    try {
+      await usage.tick([claudeRow("claude-a", "exited", { createdAt: "2026-10-19T00:00:00.000Z" })]);
+      subset(usage.session("claude-a"), { measured: true, coverage: "complete", messages: 1 });
+    } finally { store.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("partial sessions are counted beside unmeasured ones", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const { usage, store } = journalService(dir, key, {
+    "c-complete": [claudeUsage("p1"), coverageEvent({ coverage: "complete" })],
+    "c-partial": [claudeUsage("p2"), coverageEvent({ coverage: "partial", reason: "stopped-mid-turn" })],
+    "c-running": [claudeUsage("p3")],
+    "c-none": [coverageEvent({ coverage: "none", reason: "hooks-off" })],
+  });
+  try {
+    await usage.tick([claudeRow("c-complete", "exited"), claudeRow("c-partial", "exited"), claudeRow("c-running", "running"), claudeRow("c-none", "exited")]);
+    const summary = usage.summary(NOW);
+    subset(summary.providers.claude, { unmeasuredSessions: 1, partialSessions: 1 });
+    subset(summary.month, { partialSessions: 1 });
+    subset(usage.project("demo", { now: NOW }), { partial: 1 });
+    subset(usage.projects({ now: NOW }), { projects: [{ id: "demo", partial: 1, month: { partial: 1 } }] });
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a refused record makes a complete session partial", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const { usage, store } = journalService(dir, key, { refused: [
+    claudeUsage("r1"), claudeUsage("r2", { tokens: { input: 100, output: "7", reasoning: 0, cacheRead: 0, cacheWrite: 0 } }), coverageEvent({ coverage: "complete" }),
+  ] });
+  try {
+    await usage.tick([claudeRow("refused", "exited")]);
+    subset(usage.session("refused"), { measured: true, coverage: "partial", coverageReason: "row-dropped", messages: 1 });
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("aggregate coverage takes the first lasting gap", () => {
+  assert.deepEqual(combineCoverage([{ coverage: "complete" }, { coverage: "complete" }]), { coverage: "complete" });
+  assert.deepEqual(combineCoverage([{ coverage: "complete" }, { coverage: "partial", coverageReason: "running" }]), { coverage: "partial", reason: "running" });
+  assert.deepEqual(combineCoverage([
+    { coverage: "partial", coverageReason: "running" }, { coverage: "partial", coverageReason: "drain-incomplete" }, { coverage: "partial", coverageReason: "stopped-mid-turn" },
+  ]), { coverage: "partial", reason: "drain-incomplete" });
+  assert.equal(combineCoverage([{ coverage: "none", coverageReason: "unsupported" }]).coverage, "none");
+});
+
+test("task usage carries coverage", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const team = { runId: "run-x", memberId: "m1", taskId: "task-x", role: "implementer", revision: 1 };
+  const { usage, store } = journalService(dir, key, {
+    "t-complete": [claudeUsage("t1"), coverageEvent({ coverage: "complete" })],
+    "t-partial": [claudeUsage("t2"), coverageEvent({ coverage: "partial", reason: "drain-incomplete" })],
+  });
+  try {
+    await usage.tick([
+      claudeRow("t-complete", "exited", { team, createdAt: "2026-10-21T08:00:00.000Z" }),
+      claudeRow("t-partial", "exited", { team: { ...team, memberId: "m2" }, createdAt: "2026-10-21T09:00:00.000Z" }),
+    ]);
+    subset(usage.taskUsage("run-x", "task-x", 1), { coverage: "partial", coverageReason: "drain-incomplete", attempts: 2 });
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("usage after the exit record is still read", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const journals: Record<string, JournalEvent[]> = {
+    late: [claudeUsage("l1")],
+    early: [claudeUsage("e1"), coverageEvent({ coverage: "partial", reason: "stopped-mid-turn" })],
+  };
+  const reads: string[] = [];
+  const { usage, store } = journalService(dir, key, journals, fixtureConfig(dir), reads);
+  try {
+    await usage.tick([claudeRow("late", "exited"), claudeRow("early", "running")]);
+    subset(usage.session("late"), { measured: true, coverage: "partial", coverageReason: "running", messages: 1 });
+    assert.equal(rawSession(store, "late").exited, 0, "the exit record does not close a session whose journal may still grow");
+    subset(usage.session("early"), { coverage: "partial", coverageReason: "stopped-mid-turn" });
+    assert.equal(rawSession(store, "early").exited, 0);
+
+    journals.late.push(claudeUsage("l2"), coverageEvent({ coverage: "complete" }));
+    journals.early.push(claudeUsage("e2"));
+    await usage.tick([claudeRow("late", "exited"), claudeRow("early", "exited")]);
+    subset(usage.session("late"), { coverage: "complete", messages: 2 });
+    assert.equal(rawSession(store, "late").exited, 1, "the journaled record closes the session");
+    assert.equal(rawSession(store, "early").exited, 1, "the session closes on the first tick that lists it exited");
+
+    const before = reads.filter(read => read.startsWith("late:")).length;
+    await usage.tick([claudeRow("late", "exited")]);
+    assert.equal(reads.filter(read => read.startsWith("late:")).length, before, "a closed session is not read again");
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("an exited session without a coverage record closes after 60 seconds", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const { usage, store } = journalService(dir, key, { "timer-usage": [claudeUsage("t1")], "timer-none": [] });
+  const rows = [claudeRow("timer-usage", "exited"), claudeRow("timer-none", "exited")];
+  const start = Date.parse("2026-10-21T12:00:00.000Z");
+  mock.timers.enable({ apis: ["Date"], now: start });
+  try {
+    await usage.tick(rows);
+    subset(usage.session("timer-usage"), { coverage: "partial", coverageReason: "running" });
+    subset(usage.session("timer-none"), { measured: false, coverage: "none", coverageReason: "running" });
+
+    mock.timers.setTime(start + 59_000);
+    await usage.tick(rows);
+    assert.equal(rawSession(store, "timer-usage").exited, 0, "still open at 59 seconds");
+    subset(usage.session("timer-usage"), { coverage: "partial", coverageReason: "running" });
+
+    mock.timers.setTime(start + 60_000);
+    await usage.tick(rows);
+    assert.equal(rawSession(store, "timer-usage").exited, 1);
+    subset(usage.session("timer-usage"), { coverage: "partial", coverageReason: "drain-incomplete" });
+    subset(usage.session("timer-none"), { measured: false, coverage: "none", coverageReason: "unsupported" });
+  } finally { mock.timers.reset(); store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a coverage record is kept as the worker wrote it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const { usage, store } = journalService(dir, key, {
+    "drain-skipped": [claudeUsage("d1"), coverageEvent({ coverage: "partial", reason: "drain-skipped", finalDrain: "skipped", extra: 1 })],
+    "drain-maybe": [claudeUsage("d2"), coverageEvent({ coverage: "complete", finalDrain: "maybe" })],
+    "bad-reason": [claudeUsage("d3"), coverageEvent({ coverage: "partial", reason: "Not A Reason!" })],
+    "bad-coverage": [coverageEvent({ coverage: "full" })],
+    "complete-reason": [coverageEvent({ coverage: "complete", reason: "row-dropped" })],
+  });
+  try {
+    await usage.tick(["drain-skipped", "drain-maybe", "bad-reason", "bad-coverage", "complete-reason"].map(id => claudeRow(id, "exited")));
+    subset(usage.session("drain-skipped"), { measured: true, coverage: "partial", coverageReason: "drain-skipped" });
+    assert.equal(rawSession(store, "drain-skipped").final_drain, "skipped");
+    assert.equal(rawSession(store, "drain-maybe").final_drain, null, "an unknown final drain is stored as null");
+    for (const id of ["bad-reason", "bad-coverage", "complete-reason"]) assert.equal(rawSession(store, id).journaled_coverage, null, `${id} is ignored`);
+    subset(usage.summary(NOW).providers.claude, { partialSessions: 1 });
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

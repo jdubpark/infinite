@@ -61,7 +61,7 @@ test("an unreadable or misshapen ledger is discarded with a warning and the serv
         write(join(dir, "usage.sealed"));
         const usage = new UsageService({ stateDir: dir } as Config, key, manager, storeFor(dir, key));
         assert.equal(usage.summary().providers.opencode.spent?.messages, 0);
-        assert.deepEqual(usage.session("any"), { measured: false });
+        assert.deepEqual(usage.session("any"), { measured: false, coverage: "none" });
       } finally { rmSync(dir, { recursive: true, force: true }); }
     }
     assert.equal(warnings.length, 3, "One warning for each discarded ledger");
@@ -259,8 +259,8 @@ test("task usage separates same-id tasks by revision and preserves historical pr
     const manager = { list: () => sessions, events: (id: string) => { const record = records.get(id)!; return { events: [{ seq: 1, at: record.completedAt, type: "usage", data: record }], cursor: 1, more: false }; } } as unknown as Manager;
     const usage = new UsageService({ stateDir: dir, usage: { prices: {}, budgets: {} } } as Config, key, manager, storeFor(dir, key));
     await usage.tick(sessions as unknown as UsageSessionRow[]);
-    assert.deepEqual(usage.taskUsage("run-1", "edit", 2), { usd: 2, unpriced: 0, tokens: 24, attempts: 1, profiles: ["profile"] });
-    assert.deepEqual(usage.taskUsage("run-1", "edit", 1), { usd: 1, unpriced: 0, tokens: 24, attempts: 1, profiles: ["profile"] });
+    assert.deepEqual(usage.taskUsage("run-1", "edit", 2), { usd: 2, unpriced: 0, tokens: 24, attempts: 1, profiles: ["profile"], coverage: "complete" });
+    assert.deepEqual(usage.taskUsage("run-1", "edit", 1), { usd: 1, unpriced: 0, tokens: 24, attempts: 1, profiles: ["profile"], coverage: "complete" });
     assert.equal(usage.project("demo")!.total.usd, 3, "Project totals preserve spend across revisions");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

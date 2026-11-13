@@ -734,19 +734,48 @@ The slice must survive: a Git read that fails, times out, or is refused by the c
 | Kind | Emitted in | Key parts | `data` besides `v` | Why the key is unique and stable |
 |---|---|---|---|---|
 | `check.finished` | `check`, completion callback | `[revision, round, startedAt]` of the first result | `round`, `headCommit`, `passed`, `expected`, `commands` | `startedAt` is stored in `run.checks` before the completion. Check operations run one at a time (`team-operation-running`), so no two share a first start |
-| `review.recorded` | `consume`, `review` | `[revision, memberId]` | `verdict`, `headCommit`, `baseCommit`, `tree?`, `reviewer`, `rubric?` | A reviewer member reports once |
+| `review.recorded` | `consume`, `review` | `[revision, memberId]` | `verdict`, `headCommit`, `baseCommit`, `reviewer`, `rubric?` | A reviewer member reports once |
+| `review.tree` | after the `review` operation, outside it | `[revision, memberId]` | `headCommit`, `tree` | The same reviewer member. Emitted only when the tree read returns a tree |
 | `repair.started` | `repair` | `[revision, round]` | `round`, `cause`, `headCommit` | `round` rises by one per repair and resets only when the revision advances |
-| `repair.integrated` | `consume`, integrator `result` with `run.round > 0` | `[revision, round]` | `round`, `commit?`, `headCommit`, `baseCommit`, `paths` or `pathsOmitted` | One integrator result per round: a replaced integrator never reported |
+| `repair.integrated` | `consume`, integrator `result` with `run.round > 0` | `[revision, round]` | `round`, `commit?`, `headCommit`, `baseCommit` | One integrator result per round: a replaced integrator never reported |
+| `repair.paths` | after the integrator `result` operation, outside it | `[revision, round]` | `round`, `commit`, `paths` or `pathsOmitted` | The same round. Emitted only when the integrator produced a commit |
 | `delivery.recorded` | `consume`: the `delivery` receipt write, `pull-request`, and a reconciled pull request | `[revision, memberId]` | `method`, `headCommit`, `mergeCommit?` | A delivery member reports once |
 | `rating.recorded` | `rateTask` | `[requestId]` | `score` | A replayed request returns before any change. A new request is a new fact |
 
 ## Review Focus
 
-1. A tree or changed-path read that fails or is refused. Expect the review or integration to proceed and the field to be absent.
+1. A tree or changed-path read that fails, is refused, or stalls. Expect the review or integration to complete at the same moment as without `events`. Expect no `review.tree` for a failed tree read, and `repair.paths` with `pathsOmitted: true` for a failed path read.
 2. A `changes-requested` review. Expect `review.recorded` before `repair.started`, in one revision, with round one higher than before.
 3. A merge report whose baseline capture fails. Expect `delivery.recorded` stored and the run blocked.
 4. A service without `events`. Expect no new key in a sealed record and no extra Git command.
 5. An emit call with a computed kind, or a spec row with no site. Expect the coverage test to fail.
+
+## Ledger-only Git reads never sit inside a run operation
+
+*(Decided after review round 1. Where Task 1's "tree read" and Task 2's "changed-path read" below differ from this section, this section wins.)*
+
+An operation checks the run deadline after its perform step. A read that only the ledger needs, awaited in that step, can push a valid review or an integrator result past the deadline. The ledger would then change what the run does. Catching the read's errors does not help: a slow read is enough.
+
+- The `review` and `result` perform steps run exactly the commands they run without `events`. Neither starts or awaits a read that only the ledger needs.
+- `review.recorded` has no `tree`. `repair.integrated` has no `paths` and no `pathsOmitted`.
+- The two optional facts are enrichment events. Each is read after its operation is complete and saved, outside any pending operation and outside every deadline check:
+  - `review.tree`: key parts `[revision, memberId]`, ids `{ memberId, revision }`, data `{ headCommit, tree }`. Emitted only when `readTree` returns a tree. A failed or refused read emits nothing.
+  - `repair.paths`: key parts `[revision, round]`, ids `{ memberId, revision }`, data `{ round, commit, ...pathField(paths) }`. A failed or refused read gives `{ round, commit, pathsOmitted: true }`, so a projector can tell "unknown" from "not yet read". Emitted only when the integrator produced a commit. The read is the same `git diff --name-only --no-renames -z member.baseCommit commit` as an implementer's.
+- One private method starts an enrichment: `private enrich(stored: Stored, read: (signal: AbortSignal) => Promise<void>): void`. It returns at once. It does nothing without `events`. The read has a 30 second limit and never throws into the caller. Before it emits, it checks that the record is still the live one (`this.records.get(stored.run.id) === stored`). After it emits, it calls `flushOutbox(stored)`, so the event reaches the store without another save, and the next save seals whatever still waits. A crash before that loses only the enrichment, and the fact then reads as unknown.
+- A service without `events` runs no extra Git command at all.
+
+Tests (in `tests/team-events.test.ts`; they replace the tree and path assertions of the Task 1 and Task 2 tables):
+
+| Test name | Assertions |
+|---|---|
+| `the reviewed tree arrives as its own event` | After an approved review, `review.recorded` has no `tree`. A `review.tree` event follows, with `headCommit` the reviewed head and `tree` equal to `git rev-parse <head>^{tree}`. |
+| `a refused tree read stores no tree event` | With a command prefix that exits 1 for an argument ending in `^{tree}`: `review.recorded` is stored, `run.review.verdict` is `approved`, and after 500 ms the store has no `review.tree`. |
+| `a stalled tree read does not delay the review` | With a command prefix that sleeps 3 seconds for an argument ending in `^{tree}`: the review is applied and the run has no pending operation while the read still runs (assert before the 3 seconds pass), and `review.tree` arrives afterwards. |
+| `the repair's changed paths arrive as their own event` | With `run.round` 1, an integrator writes `fix.txt` and reports `result`. `repair.integrated` has `round` 1, a 40-hex `commit`, `headCommit`, and `baseCommit`, and no path field. A `repair.paths` event follows with `paths` `["fix.txt"]`. |
+| `a refused changed-path read marks the paths omitted` | With a command prefix that exits 1 for `diff --name-only`: the integration succeeds as without the ledger, and `repair.paths` has `pathsOmitted: true` and no `paths`. |
+| `a service without the ledger runs no ledger read` | Without `events`, a review and an integrator result run through a command prefix that logs each command. The log has no argument ending in `^{tree}` and no `diff --name-only` for the integrator's commit, and the sealed record has no `outbox`, `ledgerStatus`, or `ledgerReplaces` key. |
+
+The spec's part 1 table gains the rows `review.tree` and `repair.paths`, and its `review.recorded` and `repair.integrated` rows lose the tree and the changed paths. The coverage test then covers both new kinds.
 
 ### Task 1: check and review events
 

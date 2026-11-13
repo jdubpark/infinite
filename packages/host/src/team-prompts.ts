@@ -432,9 +432,10 @@ export type MissionOpenChildDecision = { subtaskId: string; teamId: string; deci
 /** A subteam's own account of its work, bounded for a mission message. */
 export type SubteamReport = { kind: "no-change" | "findings" | "result"; text: string };
 const subteamReportLimit = 4000, subteamReportMarker = "[truncated]";
+/** Cuts at the last line boundary that fits after the first character; without one, keeps as much of the first line as fits. The result ends with a newline and "[truncated]" and is at most 4,000 characters. */
 function boundedSubteamText(text: string) {
   if (text.length <= subteamReportLimit) return text;
-  // Room left after the newline and the marker; cut at the last line boundary inside it.
+  // Room left after the newline and the marker.
   const room = subteamReportLimit - 1 - subteamReportMarker.length;
   const boundary = text.lastIndexOf("\n", room);
   const head = (boundary > 0 ? text.slice(0, boundary) : text.slice(0, room)).trimEnd();

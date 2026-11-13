@@ -1602,6 +1602,28 @@ test("subteamReport prefers no-change, then the result summary, then findings, a
   assert.ok(long.endsWith("x\n[truncated]"), "The cut falls on a line boundary before the marker");
 });
 
+test("a report whose first line alone exceeds the bound keeps the start of that line", () => {
+  const view = (fields: Record<string, unknown>) => ({ tasks: [], ...fields }) as unknown as TeamView;
+  const evidence = [{ source: "export log", observation: "Rows 14, 90 and 212 were empty." }];
+  const oneLine = subteamReport(view({ noChange: { summary: "x".repeat(4000), evidence } }))!.text;
+  assert.equal(oneLine.length, 4000, "The kept text fills the bound exactly");
+  assert.equal(oneLine, `${"x".repeat(3988)}\n[truncated]`, "No newline fits, so the first 3,988 characters of the line are kept");
+  const boundary = subteamReport(view({ noChange: { summary: `${"a".repeat(100)}\n${"b".repeat(4000)}`, evidence: [] } }))!.text;
+  assert.equal(boundary, `${"a".repeat(100)}\n[truncated]`, "The cut ends at the last line boundary that fits, with no partial line after it");
+});
+
+test("subteamReport falls through empty result sources in order", () => {
+  const view = (fields: Record<string, unknown>) => ({ tasks: [], ...fields }) as unknown as TeamView;
+  const discovery = { revision: 1, summary: "The exports read the wrong table.", tasks: [] };
+  const cases: { name: string; team: Record<string, unknown>; expected: ReturnType<typeof subteamReport> }[] = [
+    { name: "a delivery receipt", team: { deliveryReceipt: { summary: "Merged the change." } }, expected: { kind: "result", text: "Merged the change." } },
+    { name: "ordered task summaries that skip missing ones", team: { tasks: [{ id: "a", summary: "First." }, { id: "b" }, { id: "c", summary: "Third." }] }, expected: { kind: "result", text: "First.\n\nThird." } },
+    { name: "an empty pull request summary and empty task summaries", team: { pullRequest: { summary: "" }, tasks: [{ id: "a", summary: "" }], discovery }, expected: { kind: "findings", text: "The exports read the wrong table." } },
+    { name: "no result source and no discovery", team: { tasks: [{ id: "a" }] }, expected: undefined },
+  ];
+  for (const { name, team, expected } of cases) assert.deepEqual(subteamReport(view(team)), expected, name);
+});
+
 test("an intake mission's prompt carries the answer-only guidance and an app mission's does not", { timeout: 60000 }, async () => {
   const h = scripted({ configure: config => {
     config.intake = { linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
@@ -1615,6 +1637,29 @@ test("an intake mission's prompt carries the answer-only guidance and an app mis
     await h.missions.create(missionRequest());
     const appPrompt = (await h.attempt(2)).prompt;
     assert.doesNotMatch(appPrompt, /Decide first whether the request changes code\./);
+  } finally { h.close(); }
+});
+
+test("answer-only guidance names only a mission repository and reaches resumed attempts", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const intake = await h.missions.create(missionRequest(), undefined, intakeOrigin);
+    const plain = await h.create();
+    const repos = [{ projectId: "api", name: "API", path: "/srv/infinite-data/api", teamReady: true }];
+    const context = (answerProjectId?: string) => ({ openChildDecisions: [], waiting: 0, answerProjectId });
+    const initial = (mission: Mission, answerProjectId?: string) => missionPromptWithMessageCount(mission, repos, [], 1, "claude", lineup.coordinator, context(answerProjectId)).prompt;
+    const resumed = (mission: Mission, answerProjectId?: string) => missionFollowUpPromptWithMessageCount(mission, repos, [], 2, "claude", lineup.coordinator, context(answerProjectId)).prompt;
+    assert.match(initial(intake, "api"), /dispatch exactly one solo subtask in repository api whose objective says/);
+    assert.match(resumed(intake, "api"), /Decide first whether the request changes code\.[\s\S]*dispatch exactly one solo subtask in repository api whose objective says/);
+    for (const answerProjectId of [undefined, "web"]) {
+      const first = initial(intake, answerProjectId), again = resumed(intake, answerProjectId);
+      assert.match(first, /dispatch exactly one solo subtask whose objective says to change no files/, `answerProjectId ${answerProjectId}`);
+      assert.doesNotMatch(first, /in repository/, `answerProjectId ${answerProjectId}`);
+      assert.match(again, /Decide first whether the request changes code\./, `answerProjectId ${answerProjectId}`);
+      assert.doesNotMatch(again, /in repository/, `answerProjectId ${answerProjectId}`);
+    }
+    assert.doesNotMatch(initial(plain, "api"), /Decide first whether the request changes code\./, "An app mission has no answer-only guidance");
+    assert.doesNotMatch(resumed(plain, "api"), /Decide first whether the request changes code\./, "An app mission has no answer-only guidance on resume");
   } finally { h.close(); }
 });
 

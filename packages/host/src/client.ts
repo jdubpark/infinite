@@ -799,7 +799,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         if (error instanceof HttpError && error.status === 403) throw new Error("Advancing a profile epoch requires an owner device key.");
         if (error instanceof HttpError && error.status === 404) throw new Error(`No configured profile has ID \"${clean(profileId)}\". Check the lineup in the team settings.`);
         if (error instanceof HttpError && error.status === 409 && error.code === "request-conflict") throw new Error("This request was already used for another profile. No epoch was advanced.");
-        if (error instanceof HttpError && error.status === 409) throw new Error(`Profile \"${clean(profileId)}\" names more than one configuration. Give each its own ID.`);
+        if (error instanceof HttpError && error.status === 409 && error.code === "profile-ambiguous") throw new Error(`Profile \"${clean(profileId)}\" names more than one configuration. Give each its own ID.`);
         if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable. No epoch was advanced; retry later.");
         throw error;
       }

@@ -14,6 +14,7 @@ import {
 } from "../packages/host/src/configuration-store.js";
 import { EventOutbox, type OutboxEvent } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
+import { EvidenceError } from "../packages/host/src/evidence/types.js";
 
 type Fixture = { root: string; path: string; key: Buffer; close: () => void };
 
@@ -247,6 +248,62 @@ test("a request id that belongs to another profile is refused", () => {
     const rows = store.read(db => db.all<{ identity: string }>("SELECT identity FROM profile_epochs"));
     assert.deepEqual(rows.map(row => row.identity), [profileIdentityKey(PROFILE)]);
     assert.equal(store.read(db => epochAt(db, profileIdentityKey(other), "2026-11-03T00:00:00.000Z")), 1);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("an epoch never starts before the one before it", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(configurationModule());
+    const identity = profileIdentityKey(PROFILE);
+    advanceEpoch(store, { profile: PROFILE, requestId: "77777777-7777-4777-8777-777777777777", now: "2026-11-10T00:00:00.000Z" });
+    // The clock stepped back. The new epoch must still be the one in effect from its start.
+    const next = advanceEpoch(store, { profile: PROFILE, requestId: "88888888-8888-4888-8888-888888888888", now: "2026-11-09T00:00:00.000Z" });
+    assert.equal(next.epoch, 3);
+    assert.equal(next.since, "2026-11-10T00:00:00.000Z");
+    assert.equal(store.read(db => epochAt(db, identity, "2026-11-10T00:00:00.000Z")), 3);
+    assert.equal(store.read(db => epochAt(db, identity, "2026-11-09T12:00:00.000Z")), 1);
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a module that is not ready is unavailable", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    // The module was never registered, as when its migration failed.
+    assert.throws(
+      () => advanceEpoch(store!, { profile: PROFILE, requestId: "99999999-9999-4999-8999-999999999999", now: "2026-11-01T00:00:00.000Z" }),
+      (error: unknown) => error instanceof EvidenceError && error.code === "unavailable",
+    );
+  } finally {
+    store?.close();
+    f.close();
+  }
+});
+
+test("a long model name is stored", () => {
+  const f = fixture();
+  let store: EvidenceStore | undefined;
+  try {
+    store = open(f);
+    store.register(configurationModule());
+    const outbox = setupOutbox(store);
+    // An OpenCode model name may hold 180 characters.
+    const model = `vendor/${"m".repeat(173)}`;
+    assert.equal(model.length, 180);
+    outbox.flush([configuredEvent("member-long", "2026-11-13T01:00:00.000Z", configuredData({}, { model }))]);
+    const rows = configurationRows(store);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.model, model);
   } finally {
     store?.close();
     f.close();

@@ -1,13 +1,14 @@
 import type { EventProjector } from "./evidence/outbox.js";
 import type { EvidenceStore } from "./evidence/store.js";
-import type { EvidenceDb, EvidenceModule, EvidenceTx, RunEvent } from "./evidence/types.js";
+import { EvidenceError, type EvidenceDb, type EvidenceModule, type EvidenceTx, type RunEvent } from "./evidence/types.js";
 import { type ConfigComponents, configId, type ProfileKey, profileIdentityKey } from "./config-identity.js";
 
 export const CONFIGURATIONS_MODULE = "configurations";
 const CONFIGURED_KIND = "member.configured";
 const DIGEST = /^[0-9a-f]{64}$/;
 const PROVIDER = /^[a-z][a-z0-9-]{0,31}$/;
-const PROFILE_TEXT = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/;
+/** A model name may hold 180 characters (the OpenCode profile rule). */
+const PROFILE_TEXT = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,179}$/;
 const DATA_KEYS = new Set([
   "v", "configId", "provider", "model", "effort", "promptVersion", "guidance", "knowledge", "routing", "shape",
 ]);
@@ -118,6 +119,11 @@ export function advanceEpoch(
   // `epochAt` compares times as strings, so a start time must be in the one form `toISOString` gives.
   if (typeof now !== "string" || !isCanonicalTime(now)) throw new TypeError("An epoch needs a start time.");
   const identity = profileIdentityKey(profile);
+  // A module that failed to migrate, or one a newer host wrote, is unavailable. Without this check its SQL error
+  // would reach the caller as a generic failure.
+  if (store.status().modules[CONFIGURATIONS_MODULE] !== "ready") {
+    throw new EvidenceError("unavailable", "The configurations module is unavailable.");
+  }
   return store.write(tx => {
     const stored = tx.get<{ identity: string; epoch: number; since: string }>(
       "SELECT identity, epoch, since FROM profile_epochs WHERE request_id=?",
@@ -125,11 +131,13 @@ export function advanceEpoch(
     );
     if (stored && stored.identity !== identity) throw new EpochRequestConflict();
     if (stored) return { epoch: stored.epoch, since: stored.since, repeated: true };
-    const top = tx.get<{ epoch: number }>(
-      "SELECT epoch FROM profile_epochs WHERE identity=? ORDER BY epoch DESC LIMIT 1",
+    const top = tx.get<{ epoch: number; since: string }>(
+      "SELECT epoch, since FROM profile_epochs WHERE identity=? ORDER BY epoch DESC LIMIT 1",
       identity,
     );
     const epoch = (top?.epoch ?? 1) + 1;
+    // An epoch never starts before the one before it, so a clock that stepped back cannot hide an epoch from `epochAt`.
+    const since = top !== undefined && top.since > now ? top.since : now;
     tx.run(
       "INSERT INTO profile_epochs (identity, epoch, provider, model, effort, since, request_id) "
       + "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -138,10 +146,10 @@ export function advanceEpoch(
       profile.provider,
       profile.model ?? null,
       profile.effort ?? null,
-      now,
+      since,
       requestId,
     );
-    return { epoch, since: now, repeated: false };
+    return { epoch, since, repeated: false };
   });
 }
 

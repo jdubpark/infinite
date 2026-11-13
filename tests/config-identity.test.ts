@@ -13,6 +13,7 @@ import {
   profileKeyOf,
   promptVersion,
   readGuidanceDigest,
+  renderedPrompts,
   type ConfigComponents,
 } from "../packages/host/src/config-identity.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
@@ -76,25 +77,50 @@ test("the prompt version is stable per role and provider", () => {
   assert.notEqual(promptVersion("implementer", "codex", undefined, true), first);
 });
 
+test("the report command is not part of the prompt version", () => {
+  // A provider without a report tool is told the reporter's path, which changes with every install directory.
+  const profile = { id: "light", label: "Light", provider: "opencode", model: "vendor/model-a", variant: "high" } as unknown as TeamModelProfile;
+  const rendered = renderedPrompts("implementer", "opencode", profile, true);
+  assert.ok(rendered.length > 0);
+  for (const text of rendered) {
+    assert.equal(text.includes(process.execPath), false, "no Node path");
+    assert.ok(text.includes("<report-command>"), "the command is a placeholder");
+  }
+  assert.match(promptVersion("implementer", "opencode", profile, true), HEX64);
+});
+
+test("the prompt version follows every profile field the prompt prints", () => {
+  const worker = { id: "deep", label: "Deep worker", provider: "claude", model: "model-x", effort: "high" } as TeamModelProfile;
+  const escalation = { ...worker, label: "Deep escalation" } as TeamModelProfile;
+  // The second profile is asked first: a cache keyed by less than the profile would give it the first one's version.
+  const escalationVersion = promptVersion("implementer", "claude", escalation, true);
+  const workerVersion = promptVersion("implementer", "claude", worker, true);
+  assert.notEqual(workerVersion, escalationVersion);
+  assert.equal(promptVersion("implementer", "claude", { ...worker }, true), workerVersion, "an equal profile object gives one version");
+  assert.equal(promptVersion("implementer", "claude", escalation, true), escalationVersion);
+});
+
 test("the guidance parser keeps guidance entries only", () => {
-  const entries: [string, string][] = [
-    ["100644", "AGENTS.md"],
-    ["100755", "packages/host/CLAUDE.md"],
-    ["100644", "docs/agents.md"],
-    ["160000", "vendor/AGENTS.md"],
-    ["100644", "src/MY-AGENTS.md"],
-    ["120000", "a/CLAUDE.md"],
+  const entries: [string, string, string][] = [
+    ["100644", "AGENTS.md", "O1"],
+    ["100755", "packages/host/CLAUDE.md", "O2"],
+    ["100644", "docs/agents.md", "O3"],
+    ["160000", "vendor/AGENTS.md", "O4"],
+    ["100644", "src/MY-AGENTS.md", "O5"],
+    ["120000", "a/CLAUDE.md", "O6"],
+    // Git quotes a path that holds a non-ASCII byte, so the output stays ASCII.
+    ["100644", '"d\\303\\251/AGENTS.md"', "O8"],
   ];
-  const ids = ["O1", "O2", "O3", "O4", "O5", "O6"];
-  const stdout = entries.map(([mode], index) => `:000000 ${mode} ${"0".repeat(40)} ${ids[index]} A\0${entries[index]![1]}\0`).join("")
-    + `:000000 100644 ${"0".repeat(40)} O7 M\0AGENTS.md\0`;
+  const line = (mode: string, path: string, object: string, status = "A") => `:000000 ${mode} ${"0".repeat(40)} ${object} ${status}\t${path}\n`;
+  const stdout = entries.map(([mode, path, object]) => line(mode, path, object)).join("") + line("100644", "AGENTS.md", "O7", "M");
   assert.deepEqual(parseGuidanceTree(stdout), [
+    { path: '"d\\303\\251/AGENTS.md"', object: "O8" },
     { path: "AGENTS.md", object: "O1" },
     { path: "a/CLAUDE.md", object: "O6" },
     { path: "packages/host/CLAUDE.md", object: "O2" },
   ]);
   assert.deepEqual(parseGuidanceTree(""), []);
-  assert.deepEqual(parseGuidanceTree("not a record\0AGENTS.md\0"), []);
+  assert.deepEqual(parseGuidanceTree("not a record\tAGENTS.md\n"), []);
 });
 
 test("the guidance digest is order-free and bound to content", () => {
@@ -185,6 +211,24 @@ test("a SHA-256 repository reads its guidance", async t => {
     assert.equal(commit.length, 64);
     const digest = await readGuidanceDigest(repo.dir, commit, undefined, new AbortController().signal);
     assert.equal(digest, guidanceDigest([{ path: "AGENTS.md", object: repo.git(["rev-parse", "HEAD:AGENTS.md"]) }]));
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test("a path with a non-ASCII character reads the same every time", async () => {
+  const repo = temporaryRepository();
+  try {
+    mkdirSync(join(repo.dir, "d\u00e9"));
+    writeFileSync(join(repo.dir, "d\u00e9", "AGENTS.md"), "nested guidance\n");
+    repo.git(["add", "."]);
+    repo.git(["commit", "-q", "-m", "non-ascii"]);
+    // Git prints the path in its quoted form, which is ASCII, so no output chunk can split a character.
+    const quoted = repo.git(["-c", "core.quotePath=true", "ls-tree", "-r", "--name-only", "HEAD"]).split("\n").find(path => path.includes("AGENTS.md"))!;
+    assert.match(quoted, /^"[\x20-\x7e]+\/AGENTS\.md"$/, "the path is quoted and ASCII");
+    const object = repo.git(["ls-tree", "-r", "HEAD"]).split("\n").find(row => row.includes("AGENTS.md"))!.split(/\s+/)[2]!;
+    const digest = await readGuidanceDigest(repo.dir, repo.git(["rev-parse", "HEAD"]), undefined, new AbortController().signal);
+    assert.equal(digest, guidanceDigest([{ path: quoted, object }]));
   } finally {
     repo.cleanup();
   }

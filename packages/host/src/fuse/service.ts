@@ -310,12 +310,18 @@ export class FuseService implements FuseGate {
       return;
     }
     const seq = this.seq + 1;
-    this.persist(seq, [], targets.map((trip): FuseTripRecord => ({ ...trip, announcedAt: now, seq })));
+    if (this.persist(seq, [], targets.map((trip): FuseTripRecord => ({ ...trip, announcedAt: now, seq })))) return;
+    // The announcement could not be written. It is kept in memory, or the trip would be sent again on every
+    // notifier tick for as long as writes fail. The next write that succeeds stores it.
+    for (const trip of targets) this.trips.set(trip.tripId, { ...trip, announcedAt: now });
   }
 
   /** Retries the load while no baseline is authoritative, and prunes the store. True when authoritative. */
   tick(): boolean {
     if (!this.authoritative) this.load();
+    // After a failed write the report would otherwise stay until the next launch. A write of the baseline as it
+    // is clears it as soon as the host can write again.
+    else if (this.writeFailedAt !== undefined) this.persist(this.seq + 1, [], []);
     this.prune();
     return this.authoritative;
   }
@@ -434,7 +440,9 @@ export class FuseService implements FuseGate {
     this.authoritative = true;
     this.unmeasurableId = undefined;
     this.adopt(next);
-    this.mirror(launches.filter(launch => settled.has(launch.launchId)), closedHeld);
+    // With a readable file, every trip of the merge goes to the store again. A row that an earlier failed mirror
+    // left behind the file is brought up to date at this restart.
+    this.mirror(launches.filter(launch => settled.has(launch.launchId)), file === undefined ? closedHeld : next.trips);
     return true;
   }
 
@@ -546,7 +554,9 @@ export class FuseService implements FuseGate {
       tx.run("DELETE FROM fuse_launches WHERE admitted_at < ?", now - LAUNCH_RETENTION_MS);
       tx.run("DELETE FROM fuse_trips WHERE closed_at IS NOT NULL AND closed_at < ?", now - TRIP_RETENTION_MS);
       // A failed mirror can leave a row open that the baseline has closed and dropped. It goes when it is old
-      // enough, unless the trip is still open in memory.
+      // enough, unless the trip is still open in memory. Without an authoritative baseline, memory says nothing
+      // about the store's rows, so they stay.
+      if (!this.authoritative) return;
       const open = new Set([...this.trips.values()].filter(trip => trip.closedAt === undefined).map(trip => trip.tripId));
       for (const row of tx.all<{ trip_id: string }>("SELECT trip_id FROM fuse_trips WHERE closed_at IS NULL AND opened_at < ?", now - TRIP_RETENTION_MS)) {
         if (!open.has(row.trip_id)) tx.run("DELETE FROM fuse_trips WHERE trip_id=?", row.trip_id);

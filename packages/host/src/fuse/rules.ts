@@ -35,7 +35,9 @@ export function rollingCount(
 ): number {
   let cutoff = Number.NEGATIVE_INFINITY;
   for (const trip of trips) {
-    if (trip.closedBy === "owner" && trip.closedAt !== undefined && trip.scope === scope && (scope === "host" || trip.projectId === projectId)) {
+    // A close stamped after now is not a cutoff yet: after a clock that stepped back, a cutoff in the future would
+    // leave every new launch uncounted until the clock passed it.
+    if (trip.closedBy === "owner" && trip.closedAt !== undefined && trip.closedAt <= now && trip.scope === scope && (scope === "host" || trip.projectId === projectId)) {
       cutoff = Math.max(cutoff, trip.closedAt);
     }
   }

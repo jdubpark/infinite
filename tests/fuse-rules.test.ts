@@ -52,6 +52,16 @@ test("the rolling hour counts the last hour after the last owner close", () => {
   assert.equal(rollingCount(mixed, [], "project", "a", now), 2);
 });
 
+test("a close stamped after now is not yet a cutoff", () => {
+  // The clock stepped back after an owner close. Until the clock passes that close again, it clears nothing:
+  // a cutoff in the future would leave every new launch uncounted.
+  const future = [trip({ tripId: "owner", scope: "project", projectId: "a", cause: "launch-rate", openedAt: now - 60_000, closedAt: now + HOUR_MS, closedBy: "owner", ownerClose: true })];
+  const recent = [launch("x", "a", now - 600_000), launch("y", "a", now - 1_000)];
+  assert.equal(rollingCount(recent, future, "project", "a", now), 2);
+  // Once the clock is past the close, it is the cutoff again.
+  assert.equal(rollingCount(recent, future, "project", "a", now + HOUR_MS + 1), 0);
+});
+
 test("a rate trip opens at the limit and closes below half", () => {
   assert.deepEqual(scopeState(launches("a", 29, now - 1_000), [], "project", "a", 30, now), { state: "closed" });
 

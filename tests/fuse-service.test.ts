@@ -248,7 +248,10 @@ test("an owner close clears launches stamped after it", () => {
     r.clock.now -= 90 * 60_000;
     assert.equal(fuse.close({ scope: "project", projectId: "p" }), "closed");
     assert.equal(fuse.check({ projectId: "p" }).state, "closed");
+    // A launch after the close counts again, as the first of a fresh count.
+    r.clock.now += 1000;
     assert.deepEqual(fuse.admit(launch("after")), { ok: true, launchId: "after" });
+    assert.equal(fuse.view().projects.find(project => project.projectId === "p")!.hour.launches, 1);
     assert.equal(fuse.check({ projectId: "p" }).state, "closed", "the close cleared the count, and no new trip opened");
   } finally { r.close(); }
 });
@@ -274,6 +277,65 @@ test("a failed write is visible and sends one interrupt", () => {
     rmSync(r.file, { recursive: true, force: true });
     assert.deepEqual(fuse.admit(launch("A")), { ok: true, launchId: "A" });
     assert.equal(fuse.view().writeFailedAt, undefined, "a successful write clears it");
+  } finally { r.close(); }
+});
+
+test("a failed write does not repeat a trip's push", () => {
+  const r = rig({ project: { launchesPerHour: 2 } });
+  try {
+    const fuse = service(r);
+    fuse.admit(launch("a1"));
+    fuse.admit(launch("a2"));
+    const [trip] = fuse.interrupts();
+    assert.ok(trip, "the trip waits to be announced");
+    // Writes fail from here on, as on a full disk.
+    rmSync(r.file, { force: true });
+    mkdirSync(r.file);
+    fuse.markAnnounced([trip.tripId]);
+    // The announcement could not be written. It is kept in memory, so the notifier does not send the trip again
+    // on every tick.
+    assert.equal(fuse.interrupts().some(item => item.tripId === trip.tripId), false);
+    const failed = fuse.interrupts();
+    assert.deepEqual(failed.map(item => item.cause), ["write-failed"]);
+    fuse.markAnnounced(failed.map(item => item.tripId));
+    assert.equal(fuse.interrupts().length, 0);
+  } finally { r.close(); }
+});
+
+test("a write failure clears when the host can write again", () => {
+  const r = rig();
+  try {
+    const fuse = service(r);
+    rmSync(r.file, { force: true });
+    mkdirSync(r.file);
+    assert.equal(fuse.admit(launch("A")).ok, false);
+    assert.notEqual(fuse.view().writeFailedAt, undefined);
+    assert.equal(fuse.tick(), true);
+    assert.notEqual(fuse.view().writeFailedAt, undefined, "the write still fails");
+    // The path works again. No launch arrives, and the next tick writes the baseline and clears the report.
+    rmSync(r.file, { recursive: true, force: true });
+    assert.equal(fuse.tick(), true);
+    assert.equal(fuse.view().writeFailedAt, undefined);
+    assert.ok(readBaseline(r.file, r.key), "the baseline file is back");
+    assert.equal(fuse.interrupts().length, 0);
+  } finally { r.close(); }
+});
+
+test("a restart heals a store row that a failed mirror left open", () => {
+  const r = rig({ project: { launchesPerHour: 2 } });
+  try {
+    const fuse = service(r);
+    fuse.admit(launch("a1"));
+    fuse.admit(launch("a2"));
+    const open = fuse.check({ projectId: "p" });
+    assertOpen(open);
+    r.store.close();
+    assert.equal(fuse.close({ scope: "project", projectId: "p" }), "closed");
+    // The file holds the close, and the store row is still open. A restart writes the close to the store.
+    restart(r);
+    const row = r.store.read(db => db.get<{ closed_at: number | null; closed_by: string | null }>("SELECT closed_at, closed_by FROM fuse_trips WHERE trip_id=?", open.tripId!));
+    assert.equal(row?.closed_by, "owner");
+    assert.notEqual(row?.closed_at, null);
   } finally { r.close(); }
 });
 

@@ -13,7 +13,7 @@ const skip = existsSync(executablePath) ? false : "Chromium for Playwright is no
 const harness = fileURLToPath(new URL("./fixtures/web-swarm-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1/swarm";
 
-type Control = { requests: string[]; view(view: "lanes" | "wall" | "graph"): void; poll(variant: { shuffleUpdated?: boolean; flipState?: boolean }): void };
+type Control = { requests: string[]; view(view: "lanes" | "wall" | "graph"): void; poll(variant: { shuffleUpdated?: boolean; flipState?: boolean; idle?: boolean }): void };
 // Page-side code reaches the harness through `window.swarm`; functions passed to the page cannot close over test helpers.
 
 describe("web swarm view", { skip }, () => {
@@ -72,6 +72,21 @@ describe("web swarm view", { skip }, () => {
       assert.ok(sent.some(path => path === "/projects/shop-api/graph/map"));
       assert.ok(sent.some(path => /^\/teams\/[0-9a-f-]+\/context$/.test(path)));
       assert.ok(sent.every(path => !path.includes("?")), "requests carry no query the host would not expect");
+    } finally { await page.close(); }
+  });
+
+  test("an idle host says so in every view and flags no code graph", async () => {
+    const page = await open();
+    try {
+      await page.evaluate(() => (window as unknown as { swarm: Control }).swarm.poll({ idle: true }));
+      // The missions feed empties on its own poll, a moment after the sessions and teams.
+      await page.waitForSelector(".sw-lanes .sw-none-live");
+      assert.equal(await count(page, "[data-agent]"), 0);
+      assert.equal(await count(page, ".sw-quiet .sw-quiet-row"), 2, "settled runs stay listed under the line");
+
+      await show(page, "wall", ".sw-wall .sw-none-live");
+      await show(page, "graph", ".sw-graph-empty");
+      assert.equal(await count(page, ".sw-graph-flag"), 0, "with no project drawn the legend flags nothing");
     } finally { await page.close(); }
   });
 

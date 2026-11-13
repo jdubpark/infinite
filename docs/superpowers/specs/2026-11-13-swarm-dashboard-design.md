@@ -599,3 +599,11 @@ on that release.
   mission is one collapsed row, and the host enforces the map's byte budget
   itself. The legend shows `context stale` while some context cannot be
   refreshed.
+- **Second review pass.** A re-review confirmed six of those fixes and found
+  four narrower gaps, all fixed with tests: the touch index now refuses a new
+  session while it is full of sessions being read, so it never grows past its
+  bound; a shell word that the shell would expand or splice is dropped whole;
+  a shell comment no longer hides the paths before it; and a failed context
+  request is tracked by its own path, so the stale flag clears only when that
+  request answers again. These last fixes were verified by tests and were not
+  re-reviewed.

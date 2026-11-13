@@ -1731,7 +1731,9 @@ for one session. These are observed tool inputs: they show what an agent's
 tools were pointed at, not that the agent used the content, and an observed
 edit is not a landed change. Only Claude Code and Codex record tool inputs;
 other providers answer `observable: false`. The index is in memory, bounded,
-and rebuilt on demand after a restart. See [Swarm view](swarm.md).
+and rebuilt on demand after a restart. `complete: false` means the index is
+still catching up, or is full of sessions being read and will admit this one
+on a later request. See [Swarm view](swarm.md).
 
 The continue request accepts exactly `requestId`, `revision`, and optional
 `text`; omit `text` when no direction is needed. A supplied direction is trimmed

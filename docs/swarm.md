@@ -116,11 +116,17 @@ touches.
 
 The touch index is in memory, incremental, and bounded: eight journal reads
 per session per request, four sessions read at a time across the host, 300
-files per session, 256 sessions. It is rebuilt on demand after a restart. The
+files per session, 256 sessions. When the index is full of sessions that are
+still being read, a further session is answered with `complete: false` and no
+files, and is admitted on a later request. Shell commands are read
+conservatively: only words written literally in the command count, and a
+command the recorder cut short counts for nothing. The index is rebuilt on
+demand after a restart. The
 view asks for team context every five seconds and for at most twelve solo or
 coordinator sessions per cycle, walking a longer list in turn. Each request
 stands alone; while one fails the legend shows `context stale` and the last
-received context stays drawn.
+received context stays drawn. The flag clears when that request answers again
+or its team or session leaves the view.
 
 ## Limits
 

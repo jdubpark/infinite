@@ -109,6 +109,26 @@ describe("web swarm view", { skip }, () => {
     } finally { await page.close(); }
   });
 
+  test("one failing context request leaves the rest drawn and shows as stale until it recovers", { timeout: 40000 }, async () => {
+    const page = await open();
+    try {
+      await show(page, "graph", '[data-node^="area:"]');
+      const reads = await count(page, "path.sw-g-read");
+      const legend = () => page.textContent(".sw-graph-legend");
+      assert.ok(!(await legend())?.includes("context stale"));
+      // The first team's context starts failing; every other request keeps answering.
+      await page.evaluate(() => {
+        const swarm = (window as unknown as { swarm: Control & { failing: RegExp | null } }).swarm;
+        const team = swarm.requests.find(path => /^\/teams\/[0-9a-f-]+\/context$/.test(path))!;
+        swarm.failing = new RegExp(`^${team}$`);
+      });
+      await page.waitForFunction(() => document.querySelector(".sw-graph-legend")?.textContent?.includes("context stale"), undefined, { timeout: 12000 });
+      assert.equal(await count(page, "path.sw-g-read"), reads, "the last received context stays drawn");
+      await page.evaluate(() => { (window as unknown as { swarm: { failing: RegExp | null } }).swarm.failing = null; });
+      await page.waitForFunction(() => !document.querySelector(".sw-graph-legend")?.textContent?.includes("context stale"), undefined, { timeout: 12000 });
+    } finally { await page.close(); }
+  });
+
   test("a hidden tab sends no swarm requests", async () => {
     const page = await open();
     try {

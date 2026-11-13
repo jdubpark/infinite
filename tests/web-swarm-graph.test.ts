@@ -238,6 +238,7 @@ test("a solo session's observed touches are drawn in its own project", () => {
 });
 
 test("session context is asked for a batch at a time and reaches every session", () => {
+  assert.equal(SESSION_BATCH, 12, "the request budget the design sets");
   const sessions = Array.from({ length: 30 }, (_, index) => `s${index}`);
   const seen = new Set<string>();
   let offset = 0;

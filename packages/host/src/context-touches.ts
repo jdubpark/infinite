@@ -78,9 +78,11 @@ function patchTexts(value: unknown, depth = 0): string[] {
 }
 
 /**
- * Splits a shell command into words, honouring quotes, so `cat "a file.ts"` is one word and not a
- * path followed by junk. A word that used a backslash escape is dropped, and an unclosed quote
- * discards the whole command: an ambiguous word must never become a path.
+ * Splits a shell command into the words that are literally written in it. Only whitespace and the
+ * command separators `;`, `&`, `|` end a word. Anything the shell would expand or splice
+ * (substitution, redirection, grouping, globs, variables, escapes) taints the whole word it
+ * touches, so `cat src/a.ts<(printf x)` and `cat $(printf p)src/a.ts` yield no path fragment.
+ * A comment is skipped to its line end, and an unclosed quote discards the whole command.
  */
 function shellWords(command: string): string[] {
   const words: string[] = [];
@@ -90,11 +92,12 @@ function shellWords(command: string): string[] {
     const char = command[index];
     if (quote) {
       if (char === quote) quote = undefined;
-      else if (char === "\\" && quote === '"') { tainted = true; index++; }
+      else if (quote === '"' && (char === "\\" || char === "$" || char === "`")) { tainted = true; if (char === "\\") index++; }
       else word += char;
     } else if (char === '"' || char === "'") { quote = char; inWord = true; }
-    else if (char === "\\") { tainted = true; inWord = true; index++; }
-    else if (/[\s;&|()<>]/.test(char)) flush();
+    else if (char === "#" && !inWord) { while (index + 1 < command.length && command[index + 1] !== "\n") index++; }
+    else if (/[\s;&|]/.test(char)) flush();
+    else if (/[\\$`()<>{}*?[\]~!]/.test(char)) { tainted = true; inWord = true; if (char === "\\") index++; }
     else { word += char; inWord = true; }
   }
   if (quote) return [];
@@ -181,13 +184,16 @@ export class ContextTouches {
       return { sessionId: source.sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false };
     }
     const state = this.stateFor(source.sessionId);
+    // The index is full of sessions that are still being read. Nothing is allocated for this one;
+    // it is told to come back, which keeps both the index and the wait queue within the bound.
+    if (!state) return { sessionId: source.sessionId, observable: true, complete: false, graphQueries: 0, files: [], truncated: false };
     state.lastUsed = ++this.clock;
-    state.inflight ??= this.advanceInTurn(state, source).finally(() => { state.inflight = undefined; this.evict(); });
+    state.inflight ??= this.advanceInTurn(state, source).finally(() => { state.inflight = undefined; });
     await state.inflight;
     return this.snapshot(source.sessionId, state);
   }
 
-  /** Sessions held in the index now. It can exceed the bound only while that many advances are in flight. */
+  /** Sessions held in the index now; never more than `maxSessions`. */
   get indexed(): number { return this.sessions.size; }
 
   /** One advance, inside the host-wide limit on concurrent journal reads. */
@@ -202,28 +208,25 @@ export class ContextTouches {
     }
   }
 
-  private stateFor(sessionId: string): SessionState {
+  /** The session's index entry, admitting a new one only when the index has room or an idle entry can make room. */
+  private stateFor(sessionId: string): SessionState | undefined {
     const existing = this.sessions.get(sessionId);
     if (existing) return existing;
+    while (this.sessions.size >= this.maxSessions) {
+      // Evict the least recently used session that is not being read.
+      let victim: [string, SessionState] | undefined;
+      for (const entry of this.sessions) {
+        if (entry[1].inflight) continue;
+        if (!victim || entry[1].lastUsed < victim[1].lastUsed) victim = entry;
+      }
+      if (!victim) return undefined;
+      this.sessions.delete(victim[0]);
+    }
     const created: SessionState = {
       cursor: 0, files: new Map(), graphQueries: 0, complete: false, truncated: false, lastUsed: 0,
     };
     this.sessions.set(sessionId, created);
-    this.evict(sessionId);
     return created;
-  }
-
-  /** Drops the least recently used idle sessions until the index is within its bound. Runs again whenever an advance ends. */
-  private evict(keep?: string): void {
-    while (this.sessions.size > this.maxSessions) {
-      let victim: [string, SessionState] | undefined;
-      for (const entry of this.sessions) {
-        if (entry[0] === keep || entry[1].inflight) continue;
-        if (!victim || entry[1].lastUsed < victim[1].lastUsed) victim = entry;
-      }
-      if (!victim) return;
-      this.sessions.delete(victim[0]);
-    }
   }
 
   private async advance(state: SessionState, source: TouchSource): Promise<void> {

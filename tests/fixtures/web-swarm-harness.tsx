@@ -13,6 +13,8 @@ const control = {
   /** `off` answers the context paths with 404, as a host that predates them does. */
   context: (new URLSearchParams(window.location.search).get("context") === "off" ? "off" : "on") as "on" | "off",
   variant: { shuffleUpdated: false, flipState: false } as Variant,
+  /** Requests whose path matches fail with a server error until this is cleared. */
+  failing: null as RegExp | null,
   view: (_view: SwarmViewName) => {},
   poll: (_variant: Partial<Variant>) => {},
 };
@@ -36,6 +38,7 @@ function fixture(): SwarmFixture {
 
 const host = (async (path: string) => {
   control.requests.push(path);
+  if (control.failing?.test(path)) throw new ApiError("The host failed.", 500);
   const data = fixture();
   if (path === "/missions") return { missions: data.missions };
   if (path === "/machine/resources") return { cpu: { usagePercent: 41 }, memory: { totalBytes: 64 * 2 ** 30, availableBytes: 30 * 2 ** 30 } };

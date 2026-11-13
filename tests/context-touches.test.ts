@@ -298,16 +298,24 @@ test("a truncated or quoted shell command invents no path", () => {
   // An escape or an unclosed quote makes the word ambiguous.
   assert.deepEqual(extractTouches("Bash", { command: "cat src/with\\ space.ts" }, CWD, always).reads, []);
   assert.deepEqual(extractTouches("Bash", { command: 'cat "src/open.ts' }, CWD, always).reads, []);
+  // What the shell would splice or expand is never read as a path, in whole or in part.
+  for (const command of ["cat src/a.ts<(printf x)", "cat $(printf prefix)src/a.ts", "cat `printf prefix`src/a.ts", "cat src/${NAME}.ts", "cat src/*.ts",
+    'cat "src/$NAME.ts"', "cat src/a.ts>src/b.ts", "(cat src/a.ts)", "cat {src/a.ts,src/b.ts}"])
+    assert.deepEqual(extractTouches("Bash", { command }, CWD, always).reads, [], command);
+  // A comment is not part of the command, even with an apostrophe in it.
+  assert.deepEqual(extractTouches("Bash", { command: "cat src/a.ts # don't change this\ncat src/b.ts" }, CWD, always).reads.sort(), ["src/a.ts", "src/b.ts"]);
+  // Separators end a word; a redirect written as its own word leaves its neighbours whole.
+  assert.deepEqual(extractTouches("Bash", { command: "cat src/a.ts|grep x;cat src/b.ts && cat src/c.ts > out.log" }, CWD, always).reads.sort(), ["src/a.ts", "src/b.ts", "src/c.ts"]);
   // Controls: plain and fully quoted paths are kept, and a cut command still counts its graph query.
   assert.deepEqual(extractTouches("Bash", { command: 'sed -n 1,20p "src/quoted.ts" && cat src/plain.ts' }, CWD, always).reads.sort(), ["src/plain.ts", "src/quoted.ts"]);
   assert.equal(extractTouches("Bash", { command: "graphify query routes --graph out/graph.json … [+9 chars]" }, CWD, always).graphQuery, true);
 });
 
-test("concurrent sessions are read a few at a time and the index returns to its bound", async () => {
-  let reading = 0, peak = 0;
-  const touches = new ContextTouches({
+test("concurrent sessions are read a few at a time and never outgrow the index", async () => {
+  let reading = 0, peak = 0, largest = 0;
+  const touches: ContextTouches = new ContextTouches({
     read: async (_sessionId, after) => {
-      reading++; peak = Math.max(peak, reading);
+      reading++; peak = Math.max(peak, reading); largest = Math.max(largest, touches.indexed);
       await new Promise((resolve) => setTimeout(resolve, 5));
       reading--;
       return { events: after === 0 ? [toolStart(1, "Read", { file_path: "src/a.ts" })] : [], cursor: 1, more: false };
@@ -319,7 +327,34 @@ test("concurrent sessions are read a few at a time and the index returns to its 
   const ids = Array.from({ length: 9 }, (_, index) => `s${index}`);
   const results = await Promise.all(ids.map((sessionId) => touches.session(source({ sessionId }))));
   assert.equal(peak, 2, "no more than two journals are read at once");
-  assert.ok(results.every((result) => result.complete && result.files.length === 1));
-  // While nine advances were in flight nothing could be evicted; once they end the index is trimmed.
+  // Three sessions fit. The other six are told to come back and nothing is allocated or read for them.
+  assert.equal(results.filter((result) => result.complete).length, 3);
+  assert.deepEqual(results.filter((result) => !result.complete).map((result) => [result.observable, result.files.length]), Array(6).fill([true, 0]));
+  assert.equal(largest, 3);
   assert.equal(touches.indexed, 3);
+  // Once the three are idle a refused session is admitted in place of the least recently used one.
+  const later = await touches.session(source({ sessionId: "s8" }));
+  assert.equal(later.complete, true);
+  assert.equal(touches.indexed, 3);
+});
+
+test("a journal read that throws frees its slot and the session can be read again", async () => {
+  let failures = 1, reading = 0;
+  const touches = new ContextTouches({
+    read: async (_sessionId, after) => {
+      reading++;
+      try {
+        if (failures-- > 0) throw new Error("journal unreadable");
+        return { events: after === 0 ? [toolStart(1, "Read", { file_path: "src/a.ts" })] : [], cursor: 1, more: false };
+      } finally { reading--; }
+    },
+    areas: noAreas,
+    maxConcurrent: 1,
+  });
+  await assert.rejects(touches.session(source({ sessionId: "a" })), /journal unreadable/);
+  // With one slot, a leaked slot would leave this call waiting forever.
+  const [again, other] = await Promise.all([touches.session(source({ sessionId: "a" })), touches.session(source({ sessionId: "b" }))]);
+  assert.equal(again.complete, true);
+  assert.equal(other.complete, true);
+  assert.equal(reading, 0);
 });

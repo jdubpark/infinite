@@ -117,19 +117,46 @@ test("a held launch stops no running session", { timeout: 90000 }, async () => {
   const host = flippable(healthy);
   let config!: Config;
   const h = missionHarness({ configure: c => { config = c; c.hostLoad = limits; }, hostProbe: host.probe });
-  const { missions } = h.open();
+  const { teams } = h.open();
   const observer = new Manager(config, readFileSync(config.keyFile), host.probe);
-  const running = async () => (await observer.list()).filter(session => session.status === "running" && session.title.startsWith("Mission coordinator")).length;
+  const running = async (title: string) => (await observer.list()).filter(session => session.status === "running" && session.title === title).length;
   try {
-    const created = await missions.create(h.create());
-    await waitFor(async () => h.coordinatorReceipts(), receipts => receipts.length === 1, 20000);
-    await waitFor(running, count => count === 1, 20000);
+    const first = await teams.create({ requestId: randomUUID(), projectId: "api", provider: "claude", useConfiguredLineup: true,
+      title: "Original run", objective: "Make an independent repository change", parallelism: 1 });
+    await waitFor(async () => teams.get(first.id), run => run.members.some(member => Boolean(member.startedAt)), 30000);
+    await waitFor(() => running("project-manager: Original run"), count => count === 1, 20000);
     host.set(starved);
-    assert.ok(observer.hostLoad.held(), "the gate is holding");
+    // The gate reuses its last reading for 2 s; wait past that TTL so the next launch reads the starved host.
+    await new Promise(done => setTimeout(done, 2500));
+    // A second automatic launch through the same service: its hold must be visible before the original session is checked.
+    const second = await teams.create({ requestId: randomUUID(), projectId: "web", provider: "claude", useConfiguredLineup: true,
+      title: "Held second run", objective: "Make an independent repository change", parallelism: 1 });
+    await waitFor(async () => teams.get(second.id), run => Boolean(run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)), 20000);
+    assert.equal(teams.get(second.id).members.filter(member => member.startedAt).length, 0, "the held member has not started");
     for (let tick = 0; tick < 3; tick++) {
       await new Promise(done => setTimeout(done, 500));
-      assert.equal(await running(), 1, `the coordinator keeps running on tick ${tick + 1}`);
+      assert.equal(await running("project-manager: Original run"), 1, `the original session keeps running on tick ${tick + 1}`);
     }
-    assert.equal(missions.peek(created.id)!.status, "planning", "the mission is still planning; the coordinator was not stopped");
+    assert.equal(teams.get(first.id).status !== "cancelled" && teams.get(first.id).status !== "blocked", true, "the original run was not stopped");
+  } finally { await h.close(); }
+});
+
+test("a session-slot wait gives way to the capacity hold, and the launch clears it", { timeout: 90000 }, async () => {
+  const host = flippable(healthy);
+  let config!: Config;
+  const h = missionHarness({ configure: c => { config = c; c.hostLoad = limits; c.maxSessions = 0; }, hostProbe: host.probe });
+  const { teams } = h.open();
+  try {
+    const created = await teams.create({ requestId: randomUUID(), projectId: "api", provider: "claude", useConfiguredLineup: true,
+      title: "Slot then capacity run", objective: "Make an independent repository change", parallelism: 1 });
+    await waitFor(async () => teams.get(created.id), run => run.reason === "Waiting for an available host session slot.", 20000);
+    host.set(starved);
+    await waitFor(async () => teams.get(created.id), run => Boolean(run.reason?.startsWith(HOST_LOAD_REASON_PREFIX)), 20000);
+    config.maxSessions = 24;
+    host.set(healthy);
+    await waitFor(async () => teams.get(created.id), run => run.members.some(member => Boolean(member.startedAt)), 30000);
+    const launched = teams.get(created.id);
+    assert.ok(!launched.reason?.startsWith(HOST_LOAD_REASON_PREFIX), "the capacity reason clears on launch");
+    assert.notEqual(launched.reason, "Waiting for an available host session slot.", "the session-slot reason clears on launch");
   } finally { await h.close(); }
 });

@@ -333,6 +333,13 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
     for (const [method, path] of [["POST", `/missions/${missionId}/answer/not-a-uuid`], ["GET", `/missions/${missionId}/steer`], ["GET", "/project-groups/Shop"], ["PUT", "/project-groups/Shop"], ["GET", "/project-groups/shop/understanding/extra"], ["POST", "/project-groups/shop/understanding"], ["GET", "/dictation/cleanup"]] as const)
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
+    // The Swarm graph reads its code map and touch sets over this channel. All three paths are GET only.
+    const contextTeam = randomUUID(), contextSession = randomUUID();
+    assert.deepEqual(await client.request("/projects/project/graph/map"), { count: 17, method: "GET", path: "/api/projects/project/graph/map" });
+    assert.deepEqual(await client.request(`/teams/${contextTeam}/context`), { count: 18, method: "GET", path: `/api/teams/${contextTeam}/context` });
+    assert.deepEqual(await client.request(`/sessions/${contextSession}/context`), { count: 19, method: "GET", path: `/api/sessions/${contextSession}/context` });
+    for (const [method, path] of [["POST", "/projects/project/graph/map"], ["GET", "/projects/project/graph"], ["POST", `/teams/${contextTeam}/context`], ["GET", "/teams/not-a-uuid/context"], ["POST", `/sessions/${contextSession}/context`]] as const)
+      await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
     runner.oversized();
     await assert.rejects(client.request("/me"), (error: RemoteError) => error.status === 413 && error.code === "response-too-large");
     const beforeRevoke = runner.requests.length;

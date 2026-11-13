@@ -178,6 +178,97 @@ def _current(root: Path) -> Path | None:
         return None
 
 
+MAX_MAP_AREAS = 120
+MAX_MAP_LINKS = 400
+MAX_MAP_BYTES = 262_144
+OTHER_AREA = "other"
+
+
+def _relative_source(value: Any) -> PurePosixPath | None:
+    if not isinstance(value, str) or not value or "\0" in value or value.startswith("/"):
+        return None
+    path = PurePosixPath(value)
+    if not path.name or any(part == ".." for part in path.parts):
+        return None
+    return path
+
+
+def _area_of(parts: tuple[str, ...], depth: int) -> str:
+    return "/".join(parts[:depth]) if parts else "."
+
+
+def _code_map(graph_path: Path) -> dict[str, Any] | None:
+    """Reduce a Graphify graph to directory areas and weighted cross-area links.
+
+    Returns None when the graph is missing, unreadable, or malformed. Callers keep
+    the receipt either way.
+    """
+    try:
+        graph = _read_json(graph_path)
+        if graph is None:
+            return None
+        nodes = graph.get("nodes")
+        edges = graph.get("edges") if "edges" in graph else graph.get("links", [])
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            return None
+        # Each mapped node is (id, source file). External and file-less nodes are not areas.
+        mapped: list[tuple[Any, PurePosixPath]] = []
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("external") is True:
+                continue
+            source = _relative_source(node.get("source_file"))
+            if source is not None:
+                mapped.append((node.get("id"), source))
+        if not mapped:
+            return {"areas": [], "links": [], "truncated": {"areas": False, "links": False}}
+        max_depth = max(len(source.parent.parts) for _, source in mapped)
+        depth = next((d for d in range(max_depth, 0, -1)
+                      if len({_area_of(s.parent.parts, d) for _, s in mapped}) <= MAX_MAP_AREAS), 1)
+        area_of_file = {source: _area_of(source.parent.parts, depth) for _, source in mapped}
+        file_counts: dict[str, set[PurePosixPath]] = {}
+        symbol_counts: dict[str, int] = {}
+        for _, source in mapped:
+            area = area_of_file[source]
+            file_counts.setdefault(area, set()).add(source)
+            symbol_counts[area] = symbol_counts.get(area, 0) + 1
+        overflow = len(symbol_counts) > MAX_MAP_AREAS
+        remap = {area: area for area in symbol_counts}
+        if overflow:
+            # Keep 119 real areas by symbol count; the rest share the `other` area.
+            ranked = sorted((a for a in symbol_counts if a != OTHER_AREA), key=lambda a: (-symbol_counts[a], a))
+            kept = set(ranked[:MAX_MAP_AREAS - 1])
+            remap = {area: area if area in kept else OTHER_AREA for area in symbol_counts}
+        areas: dict[str, dict[str, Any]] = {}
+        for area, files in file_counts.items():
+            target = remap[area]
+            entry = areas.setdefault(target, {"files": set(), "symbols": 0})
+            entry["files"].update(files)
+            entry["symbols"] += symbol_counts[area]
+        node_area: dict[str, str] = {}
+        for node_id, source in mapped:
+            if isinstance(node_id, str) and node_id not in node_area:
+                node_area[node_id] = remap[area_of_file[source]]
+        weights: dict[tuple[str, str], int] = {}
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            first, second = node_area.get(edge.get("source")), node_area.get(edge.get("target"))
+            if first is None or second is None or first == second:
+                continue
+            key = (first, second) if first < second else (second, first)
+            weights[key] = weights.get(key, 0) + 1
+        ranked_links = sorted(weights.items(), key=lambda item: (-item[1], item[0][0], item[0][1]))
+        return {
+            "areas": [{"id": area, "files": len(entry["files"]), "symbols": entry["symbols"]}
+                      for area, entry in sorted(areas.items())],
+            "links": [{"source": key[0], "target": key[1], "weight": weight}
+                      for key, weight in ranked_links[:MAX_MAP_LINKS]],
+            "truncated": {"areas": overflow, "links": len(ranked_links) > MAX_MAP_LINKS},
+        }
+    except Exception:
+        return None
+
+
 def _result(status: str, *, graph: Path | None = None, head: str | None = None,
             requested: str | None = None, mode: str | None = None,
             changed: int = 0, deleted: int = 0, affected: int = 0, reason: str | None = None,
@@ -190,6 +281,13 @@ def _result(status: str, *, graph: Path | None = None, head: str | None = None,
         result["reason"] = reason[:500]
     if warnings:
         result["warnings"] = list(dict.fromkeys(w[:200] for w in warnings))[:8]
+    if status in ("ready", "unchanged") and graph is not None:
+        code_map = _code_map(graph)
+        if code_map is not None:
+            if len(json.dumps(code_map, separators=(",", ":")).encode("utf-8")) > MAX_MAP_BYTES:
+                result["mapStatus"] = "too-large"
+            else:
+                result["map"] = code_map
     return result
 
 

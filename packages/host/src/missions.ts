@@ -15,6 +15,7 @@ import type { UsageService } from "./usage-service.js";
 import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory } from "./team-workspace.js";
 import { resumeFailed } from "./native-continuation.js";
+import { HOST_LOAD_REASON_PREFIX, LaunchHeldError, holdsHostLoadReason } from "./host-load.js";
 
 /** The mission's only view of projects; the project group service implements it. */
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
@@ -736,8 +737,17 @@ export class MissionService {
       this.config.teams?.workspaceDir, this.config.teams?.trustWorkspaces === true);
       if (this.closed) return;
       attempt.status = "running"; attempt.startedAt ??= now();
+      if (mission.reason?.startsWith(HOST_LOAD_REASON_PREFIX)) mission.reason = undefined;
       if (session.status === "unavailable") this.event(stored, "The coordinator runtime is unavailable; the mission is waiting for confirmed state.");
     } catch (error) {
+      if (error instanceof LaunchHeldError) {
+        // Only an empty reason or an earlier host-load hold is replaced; the event records the first hold, not each tick.
+        if (holdsHostLoadReason(mission.reason)) {
+          if (mission.reason === undefined) this.event(stored, `The coordinator launch is waiting: ${error.reason}`);
+          mission.reason = error.reason; this.save(stored);
+        }
+        return;
+      }
       if (error instanceof Error && /configured session limit/.test(error.message)) return;
       throw error;
     }

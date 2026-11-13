@@ -23,6 +23,7 @@ import { readEvents, unseal, writeSealed } from "./vault.js";
 import { workerCall } from "./ipc.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
+import { HostLoadGate, LaunchHeldError, readHostLoad, type HostLoadProbe } from "./host-load.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
@@ -176,6 +177,8 @@ const unavailable = (now = new Date().toISOString()): WorkerState => ({
 });
 export class Manager {
   private serial: Promise<unknown> = Promise.resolve();
+  /** Holds sessions the host starts for itself while the host is short of memory or overloaded. */
+  readonly hostLoad: HostLoadGate;
   private readonly handoffProjects = new Map<string, string>();
   reserveHandoff(projectId: string) {
     const project = this.config.projects.find(project => project.id === projectId);
@@ -210,8 +213,10 @@ export class Manager {
   constructor(
     readonly config: Config,
     readonly key: Buffer,
+    hostProbe: HostLoadProbe = readHostLoad,
   ) {
     assertRunnerDeployment(config);
+    this.hostLoad = new HostLoadGate(config.hostLoad, hostProbe);
     mkdirSync(join(config.stateDir, "sessions"), {
       recursive: true,
       mode: 0o700,
@@ -857,6 +862,11 @@ export class Manager {
     if (!project) throw new Error("Unknown project");
     if (request.provider === "demo" && !this.config.enableDemo)
       throw new Error("Demo is disabled");
+    // Only sessions the host starts for itself wait for capacity; an owner-started session is never held.
+    if (request.team) {
+      const hold = this.hostLoad.held();
+      if (hold) throw new LaunchHeldError(hold);
+    }
     if (
       (await this.list()).filter(
         (s) => s.status === "running" || s.status === "starting",

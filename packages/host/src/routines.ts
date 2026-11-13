@@ -22,6 +22,13 @@ type Stored = {
 };
 const now = () => new Date().toISOString();
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+/** Outcome settings change measurement and learning spend, never a routine's work (umbrella C11), so they are removed before hashing. */
+function digestedTeams(teams: Config["teams"]): Config["teams"] {
+  if (!teams || !("outcomes" in teams)) return teams;
+  const rest: Partial<NonNullable<Config["teams"]>> = { ...teams };
+  delete rest.outcomes;
+  return rest as Config["teams"];
+}
 const terminal = new Set<Routine["status"]>(["completed", "cancelled", "expired"]);
 const allowedSettled = new Set(["no-opportunity", "achieved"]);
 const maxRecords = 1000;
@@ -74,7 +81,7 @@ export class RoutineService {
     catch { throw new TeamError(409, "routine-project-missing", "The project path cannot be resolved. Routine approval requires an existing canonical project path."); }
     return digest({
       project: { path: canonicalPath, team: project.team, teamworkDir: project.teamworkDir, source: project.source, linear: project.linear },
-      teams: this.config.teams,
+      teams: digestedTeams(this.config.teams),
       source: this.config.source,
       linear: this.config.linear,
       agents: this.config.agents,

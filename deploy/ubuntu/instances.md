@@ -97,6 +97,22 @@ sudo install -d -o "infinite-$NAME-host" -g "infinite-$NAME-workspace" -m 2750 \
 sudo setfacl -d -m g::rwx,m::rwx "/srv/infinite-data/instances/$NAME/workspaces"
 sudo install -d -o root -g "infinite-$NAME-agent" -m 0750 \
   "/srv/infinite-data/instances/$NAME/github-app-tokens"
+sudo install -d -o "infinite-$NAME-host" -g "infinite-$NAME-workspace" -m 2770 \
+  "/srv/infinite-data/instances/$NAME/source-mirrors"
+sudo setfacl -d -m g::rwx,m::rwx "/srv/infinite-data/instances/$NAME/source-mirrors"
+```
+
+`source-mirrors` sits beside the team workspace root; the host keeps one bare
+mirror there for each GitHub-tracked project.
+
+Project directories are owned by the host account, so the agent account must
+trust repositories beneath this instance's workspace directory. Without the
+rule, Git refuses them with "dubious ownership". Run the command from a
+directory the agent account can read, and keep the wildcard quoted:
+
+```sh
+(cd / && sudo -H -u "infinite-$NAME-agent" git config --global --add safe.directory \
+  "/srv/infinite-data/instances/$NAME/workspaces/*")
 ```
 
 The generated paths include the team workspace, control state, agent home,
@@ -194,7 +210,7 @@ sudo install -o root -g root -m 0644 ".local/instance-$NAME/infinite-$NAME-githu
   "/etc/systemd/system/infinite-$NAME-github-refresh.timer"
 sudo install -o root -g root -m 0644 ".local/instance-$NAME/infinite-$NAME-tmpfiles.conf" \
   "/etc/tmpfiles.d/infinite-$NAME.conf"
-sudo install -d -o root -g root -m 0755 "/etc/infinite-$NAME"
+sudo install -d -o root -g "infinite-$NAME-host" -m 0750 "/etc/infinite-$NAME"
 sudo install -o "infinite-$NAME-host" -g "infinite-$NAME-host" -m 0600 \
   ".local/instance-$NAME/config.example.json" "/etc/infinite-$NAME/config.json"
 sudo install -d -o root -g root -m 0755 "/usr/local/libexec/infinite-$NAME/bin"
@@ -217,13 +233,26 @@ before adding secrets or live project paths. Check the port, origin, key path,
 state directory, team workspace, and command prefix. Start the refresh service
 once after configuring it; enable its timer only after it succeeds.
 
+Only root and the instance's host account can enter `/etc/infinite-NAME`, the
+same shape as the first instance's config directory.
+
+The skeleton's `teams.commandPrefix` names the team command launcher directly.
+A launcher that runs only as the agent account needs the same entry the
+provider wrappers use: set the prefix to `/usr/bin/sudo` with the arguments
+`-n -H -u infinite-NAME-agent -- /usr/local/libexec/infinite-NAME/team-command`.
+The rendered sudoers does not permit that path; the launcher's own sudoers
+entry is installed with the launcher, as described under the private host
+tools.
+
 ## Port, origin, and relay registration
 
 Use a distinct loopback port for the second API. The default is `4781`; the
 first instance continues to use its configured port. Check
 `tailscale serve status` and choose an unused HTTPS listener port for the
-second instance. Publish only through Tailscale Serve, with the HTTPS hostname
-and port equal to `origin`:
+second instance. Tailscale Serve accepts HTTPS listeners only on ports 443,
+8443, and 10000, so a host that already uses two of them has one left.
+Publish only through Tailscale Serve, with the HTTPS hostname and port equal
+to `origin`:
 
 ```sh
 sudo tailscale serve --bg --https=HTTPS_PORT http://127.0.0.1:4781
@@ -264,11 +293,17 @@ sudo node "/opt/infinite-$NAME/packages/host/dist/cli.js" connect-relay http://1
   --config "/etc/infinite-$NAME/config.json"
 sudo chown "infinite-$NAME-host:infinite-$NAME-host" "/etc/infinite-$NAME/config.json"
 sudo chmod 0600 "/etc/infinite-$NAME/config.json"
+sudo systemctl restart infinite-relay.service
 sudo systemctl restart "infinite-$NAME.service"
 ```
 
 `relay-add` writes a new registration key and the relay machine entry. Keep the
 key in the instance control account's private config area, mode `0600`.
+The relay reads its registrations when it starts, so restart it after
+`relay-add`; keep a private copy of `relay.json` first so a relay that does
+not come back can be restored. Machines already connected, the first instance
+included, reconnect on their own. Confirm afterward that both instances hold a
+relay connection.
 Add the new machine in the phone, Mac, and web clients. The laptop CLI can
 select it with `INFINITE_CLIENT_CONFIG` or `--client-config`; no CLI change is
 needed.
@@ -376,7 +411,14 @@ them to support the second instance before activation:
   starts.
 - The team command launcher runs Git, setup, and check commands as the
   instance agent account. Obtain owner approval before installing or enabling
-  it.
+  it. Give it this instance's `workspaces/`, `team-workspaces/`, and
+  `source-mirrors/` roots only, and one sudoers entry that lets
+  `infinite-NAME-host` run exactly that launcher as `infinite-NAME-agent`.
+  Before the service starts, check it through the host account: the
+  enrollment reads from a project are allowed, and a commit from a project, a
+  directory outside the instance, a direct run as the host account, a shell as
+  the agent account, and either instance's host account entering the other's
+  launcher are all refused.
 - Release pruning retains a valid rollback release for both instances and
   never removes the active release of either one.
 - Secrets sync stores the instance's Linear, Slack, GitHub App, and relay

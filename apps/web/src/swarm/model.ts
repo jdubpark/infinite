@@ -282,7 +282,8 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
     }, updatedAt: new Date(input.now).toISOString() });
   }
 
-  const rank = (swarm: Swarm) => (swarm.kind === "solo" ? 2 : swarm.waiting > 0 ? 0 : 1);
+  // Order never depends on state: a swarm that starts waiting on a person keeps its row. Its marks and the vitals carry that.
+  const rank = (swarm: Swarm) => (swarm.kind === "solo" ? 1 : 0);
   const live = built
     .map(item => item.swarm)
     .filter(swarm => swarm.live)

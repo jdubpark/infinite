@@ -170,7 +170,14 @@ export function SwarmView(props: SwarmViewProps) {
           {holdGlyph(selectedUnit.hold)}
           {terminalGlyph(selectedUnit.terminal)}
           <span className="sw-inspector-links"><button type="button" className="sw-link" onClick={() => openTeam(selectedUnit.id)}>team</button></span>
-        </> : <span className="sw-inspector-empty">–</span>}
+        </> : selection?.kind === "area" ? (() => {
+          // An area's ID is `area:<project>:<directory>`.
+          const [, project, ...path] = selection.id.split(":");
+          return <>
+            <span className="sw-inspector-fact"><small>area</small>{path.join(":")}</span>
+            <span className="sw-inspector-fact sw-dim">{project}</span>
+          </>;
+        })() : <span className="sw-inspector-empty">–</span>}
       </div>
     </div>
   </div>;

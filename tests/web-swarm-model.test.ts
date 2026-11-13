@@ -195,6 +195,17 @@ test("stable order", () => {
   const second = build(iso(9_000), iso(100)).live.map(swarm => swarm.id);
   assert.deepEqual(first, ["api", "checkout-v2"]);
   assert.deepEqual(second, first);
+
+  // A swarm that starts waiting on a person keeps its row: order follows creation time, never state.
+  const waiting = buildSwarm(input({
+    sessions: [session("s-a", { attention: attention("needs-you", { prompt: prompt(7) }) }), session("s-b", { attention: attention("working") })],
+    teams: [
+      team("checkout-v2", { createdAt: iso(5 * HOUR), members: [member("a", { sessionId: "s-a" })] }),
+      team("api", { createdAt: iso(1 * HOUR), members: [member("b", { sessionId: "s-b" })] }),
+    ],
+  }));
+  assert.equal(waiting.live.find(swarm => swarm.id === "checkout-v2")?.waiting, 1);
+  assert.deepEqual(waiting.live.map(swarm => swarm.id), first);
 });
 
 test("missions", () => {

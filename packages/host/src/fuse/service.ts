@@ -245,7 +245,28 @@ export class FuseService implements FuseGate {
     const closing = [...this.trips.values()]
       .filter(trip => trip.closedAt === undefined && trip.cause === "launch-rate" && trip.scope === scope && (scope === "host" || trip.projectId === projectId))
       .map((trip): FuseTripRecord => ({ ...trip, closedAt: now, closedBy: "owner", seq }));
-    if (closing.length === 0) return "not-open";
+    if (closing.length === 0) {
+      // A scope can be open with no recorded trip: every caller stops at the check, so a trip that the count alone
+      // opens (after a lowered limit, or after a clock that stepped back over an earlier close) is never written.
+      // The owner can still close it: the trip is recorded as opened and closed in one write.
+      const launches = [...this.launches.values()], trips = [...this.trips.values()];
+      const limit = scope === "host" ? this.limits.host : projectLimit(this.limits, projectId!);
+      const state = scopeState(launches, trips, scope, projectId, limit, now);
+      if (state.state !== "open" || state.cause !== "launch-rate") return "not-open";
+      closing.push({
+        tripId: randomUUID(),
+        scope,
+        ...(projectId === undefined ? {} : { projectId }),
+        cause: "launch-rate",
+        window: "hour",
+        openedAt: now,
+        closedAt: now,
+        closedBy: "owner",
+        ownerClose: state.ownerClose,
+        launches: rollingCount(launches, trips, scope, projectId, now),
+        seq,
+      });
+    }
     // A launch stamped after now still counts, and the close time is now. After a clock that stepped back, every
     // counted launch would lie after the close, and the close would clear nothing. So those launches move to now.
     const moved = [...this.launches.values()]

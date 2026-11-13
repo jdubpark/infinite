@@ -280,6 +280,33 @@ test("a failed write is visible and sends one interrupt", () => {
   } finally { r.close(); }
 });
 
+test("the owner can close a scope that is open without a recorded trip", () => {
+  const r = rig({ project: { launchesPerHour: 5 } });
+  try {
+    const fuse = service(r);
+    for (const id of ["a1", "a2", "a3", "a4"]) assert.equal(fuse.admit(launch(id)).ok, true);
+    // The limit is lowered below the count and the host restarts. The scope is open, and no trip was recorded,
+    // because every caller stops at the check.
+    r.store.close();
+    r.store = openStore(r, r.key);
+    const lowered = { ...r.config, autonomy: { fuse: { project: { launchesPerHour: 2 } } } } as Config;
+    const again = new FuseService({ config: lowered, key: r.key, store: r.store, sessionExists: id => r.live.has(id), now: () => r.clock.now });
+    const open = again.check({ projectId: "p" });
+    assertOpen(open);
+    assert.equal(open.tripId, undefined);
+    assert.equal(again.close({ scope: "project", projectId: "p" }), "closed");
+    assert.equal(again.check({ projectId: "p" }).state, "closed");
+    assert.equal(again.close({ scope: "project", projectId: "p" }), "not-open");
+    // The close is on record: the next trip that day needs the owner.
+    r.clock.now += 1000;
+    again.admit(launch("b1"));
+    again.admit(launch("b2"));
+    const next = again.check({ projectId: "p" });
+    assertOpen(next);
+    assert.equal(next.ownerClose, true);
+  } finally { r.close(); }
+});
+
 test("a failed write does not repeat a trip's push", () => {
   const r = rig({ project: { launchesPerHour: 2 } });
   try {

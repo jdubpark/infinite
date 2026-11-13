@@ -220,7 +220,7 @@ These designs add settings to the project team configuration and to the host `te
 | Spend fuse, attention, and digest settings (C13, C18) | no | They sit in the host `autonomy` block, which the digest never reads |
 | A merge policy written by the new delivery default | yes | It is the existing `project.team.delivery` |
 
-A setting that is out of the digest is removed from the digested object before hashing. A project without that setting then keeps its digest, and no active routine blocks at upgrade. A new key inside a digested object never uses a schema default, because parsing would write the key into the object and change the hash. The code applies the default at read.
+A setting that is out of the digest is removed from the digested object before hashing. A project without that setting then keeps its digest, and no active routine blocks at upgrade. A new key inside a digested object never adds a new schema default, because parsing would write the key into the object and change the hash. The code applies the default at read.
 
 ## Contracts added on 2026-11-13
 
@@ -228,7 +228,7 @@ The continuous autonomy amendment adds eight contracts. One principle governs th
 
 ### C12. Autonomy mode
 
-Each project is `supervised`, today's behaviour, or `autonomous`. The host default is `autonomous` for a repository enrolled with `infinite repo init`, and every other project is `supervised`. The mode lives in the enrollment record beside the team configuration, outside the routine authority digest. A run pins the mode it started with, and so does each goal cycle. The owner can change the mode at any time, and the change applies from the next run or cycle. A run, goal, or cycle recorded before this contract counts as `supervised`, and so does one whose lineup has no eligible evaluator (C14). Each contract states what it does per mode. The continuous autonomy design defines the record, the pin, and what autonomous mode enables.
+Each project is `supervised`, today's behaviour, or `autonomous`. The host default is `autonomous` for a repository enrolled with `infinite repo init`, and every other project is `supervised`. The mode lives in the enrollment record beside the team configuration, outside the routine authority digest. A run pins the mode it started with, and so does a goal, for all of its cycles. The owner can change the mode at any time. The change applies to the next run and the next goal, and a change to `supervised` also pauses a standing goal at its next cycle boundary. A run or goal recorded before this contract counts as `supervised`, for all of a goal's cycles, and so does one whose lineup has no eligible evaluator (C14). Each contract states what it does per mode. The continuous autonomy design defines the record, the pin, and what autonomous mode enables.
 
 ### C13. Spend fuse
 

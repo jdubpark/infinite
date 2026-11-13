@@ -317,10 +317,15 @@ export class MissionService {
     stored.receipts[body.requestId] = digest({ action, ...body });
     stored.mission.revision++;
   }
-  pause(id: string, input: Action, reason?: string) { return this.action(id, "pause", missionActionSchema.parse(input), reason); }
+  pause(id: string, input: Action, reason?: string) {
+    // A supplied reason joins the request fingerprint; an omitted one leaves the fingerprint as it was before reasons existed.
+    const body = { ...missionActionSchema.parse(input), ...(reason === undefined ? {} : { reason }) };
+    return this.action(id, "pause", body);
+  }
   resume(id: string, input: Action) { return this.action(id, "resume", missionActionSchema.parse(input)); }
   cancel(id: string, input: Action) { return this.action(id, "cancel", missionActionSchema.parse(input)); }
-  private action(id: string, action: "pause" | "resume" | "cancel", body: Action, reason?: string) {
+  private action(id: string, action: "pause" | "resume" | "cancel", body: Action & { reason?: string }) {
+    const reason = body.reason;
     return this.enqueue(() => {
       const stored = this.record(id), mission = stored.mission;
       if (this.replay(stored, action, body)) return this.view(stored);

@@ -1683,7 +1683,7 @@ test("an intake mission waiting on the owner past its original deadline still re
   } finally { h.close(); mock.timers.reset(); }
 });
 
-test("a paused intake mission resumes after its original deadline", { timeout: 60000 }, async () => {
+test("a paused intake mission with no subtask resumes to planning after its original deadline", { timeout: 60000 }, async () => {
   const h = scripted();
   mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
   try {
@@ -1695,6 +1695,52 @@ test("a paused intake mission resumes after its original deadline", { timeout: 6
     // No subtask exists yet, so the resumed mission settles back to planning rather than working.
     assert.equal(resumed.status, "planning");
   } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a paused intake mission resumes working after its original deadline", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(5), undefined, intakeOrigin);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const working = await until(() => h.get(id), mission => mission.status === "working" && Boolean(teamOf(mission, "a")));
+    const paused = await h.missions.pause(id, { requestId: randomUUID(), revision: working.revision }, "Waiting for the owner.");
+    assert.equal(paused.status, "paused");
+    mock.timers.tick(10 * 60000);
+    const resumed = await h.missions.resume(id, { requestId: randomUUID(), revision: paused.revision });
+    assert.equal(resumed.status, "working");
+    assert.equal(resumed.reason, undefined);
+    assert.ok(Date.parse(h.missions.peek(id)!.deadlineAt) - Date.now() > 4 * 60000, "The paused span is added back to the deadline");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a pause reason is part of the request fingerprint, and an identical retry replays", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.missions.create(missionRequest(30));
+    const requestId = randomUUID();
+    const first = await h.missions.pause(created.id, { requestId, revision: created.revision }, "Waiting for the owner.");
+    const pauseEvents = (mission: Mission) => mission.events.filter(event => event.text === "Mission paused: Waiting for the owner.").length;
+    assert.equal(pauseEvents(first), 1);
+    const replayed = await h.missions.pause(created.id, { requestId, revision: created.revision }, "Waiting for the owner.");
+    assert.equal(replayed.revision, first.revision, "An identical retry returns the first result");
+    assert.equal(pauseEvents(h.missions.peek(created.id)!), 1, "An identical retry records no second event");
+    await assert.rejects(h.missions.pause(created.id, { requestId, revision: created.revision }, "The Linear issue was closed."), (error: TeamError) => error.code === "request-conflict");
+    assert.equal(h.missions.peek(created.id)!.reason, "Waiting for the owner.", "A conflicting retry changes nothing");
+  } finally { h.close(); }
+});
+
+test("a pause without a reason keeps its fingerprint and replays as before", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.missions.create(missionRequest(30));
+    const requestId = randomUUID();
+    const first = await h.missions.pause(created.id, { requestId, revision: created.revision });
+    const replayed = await h.missions.pause(created.id, { requestId, revision: created.revision });
+    assert.equal(replayed.revision, first.revision);
+    assert.equal(replayed.status, "paused");
+    assert.equal(replayed.events.filter(event => event.text === "Mission paused.").length, 1, "An identical retry records no second event");
+  } finally { h.close(); }
 });
 
 test("an intake mission still expires on working time", { timeout: 60000 }, async () => {

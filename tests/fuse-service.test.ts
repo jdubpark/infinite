@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readConfig } from "../packages/host/src/config.js";
@@ -479,6 +479,56 @@ test("a launch that never starts is released and keeps its count", () => {
   } finally {
     r.close();
   }
+});
+
+test("a released launch retried after its hour counts again", () => {
+  const r = rig();
+  try {
+    const fuse = service(r);
+    assert.equal(fuse.admit(launch("A")).ok, true);
+    fuse.release("A");
+    // An idle hour passes with no write, so memory still holds the released launch with its old time.
+    r.clock.now += HOUR + 1;
+    fuse.tick();
+    const count = () => fuse.view().projects.find(project => project.projectId === "p")!.hour.launches;
+    assert.equal(count(), 0);
+    assert.deepEqual(fuse.admit(launch("A")), { ok: true, launchId: "A" });
+    assert.equal(count(), 1, "a retry outside the hour is a launch of this hour");
+    assert.equal(fuse.view().host.hour.launches, 1);
+    // Inside the hour a released launch keeps its time and is not counted twice.
+    fuse.release("A");
+    r.clock.now += 60_000;
+    assert.equal(fuse.admit(launch("A")).ok, true);
+    assert.equal(count(), 1);
+  } finally { r.close(); }
+});
+
+test("a project name is cleaned and bounded in an interrupt", () => {
+  const r = rig({ project: { launchesPerHour: 2 } });
+  try {
+    r.config.projects[0]!.name = `Proj\n\u001b[2Ject\u2028 ${"x".repeat(300)}`;
+    const fuse = service(r);
+    fuse.admit(launch("a1"));
+    fuse.admit(launch("a2"));
+    const [trip] = fuse.interrupts();
+    assert.ok(trip);
+    assert.equal(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(trip.label), false, "no control character reaches a push body");
+    assert.ok(trip.label.length <= 80);
+    assert.ok(trip.label.startsWith("Proj"));
+  } finally { r.close(); }
+});
+
+test("failed baseline writes leave no temporary files", () => {
+  const r = rig();
+  try {
+    const fuse = service(r);
+    rmSync(r.file, { force: true });
+    mkdirSync(r.file);
+    for (let index = 0; index < 5; index++) assert.equal(fuse.admit(launch(`A${index}`)).ok, false);
+    fuse.tick();
+    const leftovers = readdirSync(r.config.stateDir).filter(name => name.endsWith(".tmp"));
+    assert.deepEqual(leftovers, []);
+  } finally { r.close(); }
 });
 
 test("a failed baseline write refuses and changes nothing", () => {

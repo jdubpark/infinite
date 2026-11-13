@@ -162,8 +162,8 @@ test("a long project id is stored", () => {
   withDirectory((directory) => {
     const key = randomBytes(32);
     const file = join(directory, BASELINE_FILE);
-    // The host configuration sets no length limit on a project id.
-    const projectId = "p".repeat(300);
+    // The host configuration sets no length limit on a project id, so the baseline sets none either.
+    const projectId = "p".repeat(5000);
     const value = baseline({ launches: [launch("A", projectId, now)], trips: [trip({ tripId: "T", scope: "project", projectId, cause: "launch-rate", openedAt: now })] });
     assert.equal(writeBaseline(file, key, value), true);
     assert.deepEqual(readBaseline(file, key), value);

@@ -127,6 +127,12 @@ function limitsOf(fuse: FuseConfig | undefined): FuseLimits {
   };
 }
 
+/** A project name as one short line: the label goes into a push body, and the configuration sets no rule for it. */
+function plainLabel(name: string): string {
+  const line = name.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+  return [...line].slice(0, 80).join("") || "a project";
+}
+
 /** The subject a push is about: one per scope. A second trip for the same subject waits for the next UTC day. */
 function subjectOf(trip: FuseTripRecord): string {
   return trip.scope === "host" ? "host" : `project:${trip.projectId ?? ""}`;
@@ -219,7 +225,9 @@ export class FuseService implements FuseGate {
       profileId: launch.profileId,
       ...(launch.assignment === undefined ? {} : { assignment: launch.assignment }),
       state: "admitted",
-      admittedAt: prior?.state === "released" ? prior.admittedAt : now,
+      // A released launch keeps its time while that time is inside the hour, so a retry is not counted twice.
+      // Outside the hour it would not be counted at all, so it is a launch of this hour.
+      admittedAt: prior?.state === "released" && prior.admittedAt > now - HOUR_MS ? prior.admittedAt : now,
       seq,
     };
     const counted = [...launches.filter(item => item.launchId !== launchId), record];
@@ -307,7 +315,7 @@ export class FuseService implements FuseGate {
         tripId: trip.tripId,
         scope: trip.scope,
         ...(trip.projectId === undefined ? {} : { projectId: trip.projectId }),
-        label: trip.scope === "host" ? "the host" : (this.config.projects.find(project => project.id === trip.projectId)?.name ?? trip.projectId ?? ""),
+        label: trip.scope === "host" ? "the host" : plainLabel(this.config.projects.find(project => project.id === trip.projectId)?.name ?? trip.projectId ?? ""),
         cause: trip.cause,
         ownerClose: trip.ownerClose,
         openedAt: new Date(trip.openedAt).toISOString(),

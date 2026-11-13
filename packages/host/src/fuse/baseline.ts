@@ -15,8 +15,8 @@ const everyRoleListed: Exclude<LaunchRole, typeof LAUNCH_ROLES[number]> extends 
 void everyRoleListed;
 
 const id = z.string().min(1).max(128);
-/** The host configuration sets no length limit on a project id, so this one is wide. */
-const projectId = z.string().min(1).max(1024);
+/** The host configuration sets no length limit on a project id, so the baseline sets none either. */
+const projectId = z.string().min(1);
 const seq = z.number().int().min(0);
 const time = z.number().int();
 

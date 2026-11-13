@@ -6,6 +6,7 @@ import {
   writeSync,
   fsyncSync,
   renameSync,
+  rmSync,
   readFileSync,
   readdirSync,
   existsSync,
@@ -57,12 +58,18 @@ export function writeSealed(
   const temporary = `${file}.${randomBytes(8).toString("hex")}.tmp`;
   const fd = openSync(temporary, "wx", 0o600);
   try {
-    writeSync(fd, seal(key, scope, value));
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+    try {
+      writeSync(fd, seal(key, scope, value));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, file);
+  } catch (error) {
+    // A failed write must not leave its temporary file: a caller that retries would fill the directory.
+    try { rmSync(temporary, { force: true }); } catch { /* the write error is the one to report */ }
+    throw error;
   }
-  renameSync(temporary, file);
   const dir = openSync(dirname(file), "r");
   try {
     fsyncSync(dir);

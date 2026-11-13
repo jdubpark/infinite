@@ -505,6 +505,39 @@ test("storage alerts once on startup when already high and honor the host-storag
   } finally { Date.now = originalNow; enabled.stop(); disabled.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("a fuse interrupt whose push failed is offered again", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  store.add("controller", "ExponentPushToken[b]", "android");
+  let failing = true;
+  let sends = 0;
+  // The sender resolves even when the push service refuses a message: each message gets its own ticket.
+  const sender = async (messages: { to: string }[]) => { sends += 1; return messages.map(message => failing || message.to.endsWith("[b]") ? { status: "error" as const, message: "network" } : { status: "ok" as const, id: "x" }); };
+  const pending = [
+    { tripId: "trip-1", scope: "project" as const, projectId: "p", label: "Fixture", cause: "launch-rate" as const, ownerClose: true, openedAt: "2026-11-13T10:00:00.000Z" },
+    { tripId: "trip-2", scope: "host" as const, label: "the host", cause: "unmeasurable" as const, ownerClose: false, openedAt: "2026-11-13T10:00:00.000Z" },
+  ];
+  const marked: string[][] = [];
+  const fuse = { interrupts: () => pending.filter(trip => !marked.flat().includes(trip.tripId)), markAnnounced: (ids: readonly string[]) => { marked.push([...ids]); } };
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender as never, { detail: "minimal", events: ["autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  await notifier.tick();
+  assert.equal(sends, 1);
+  assert.deepEqual(marked, [], "no device received either trip, so neither is marked");
+  // The next attempt waits a minute, so an outage does not send on every tick.
+  await notifier.tick();
+  assert.equal(sends, 1);
+  // The minute has passed, and one device now receives its pushes. A trip that reached one device is announced.
+  (notifier as unknown as { fuseRetryAt: number }).fuseRetryAt = 0;
+  failing = false;
+  await notifier.tick();
+  assert.equal(sends, 2);
+  assert.deepEqual(marked, [["trip-1", "trip-2"]]);
+  await notifier.tick();
+  assert.equal(sends, 2, "announced trips are not sent again");
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("the notifier pushes one fuse interrupt and marks it announced", async () => {
   const dir = mkdtempSync("/tmp/inf-push-");
   const store = new PushStore(dir, randomBytes(32));

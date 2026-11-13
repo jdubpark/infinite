@@ -60,6 +60,8 @@ export class Notifier {
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
     private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
   ) {}
+  /** After a fuse push that reached no device, the time of the next attempt. */
+  private fuseRetryAt = 0;
   /** Lifecycle baselines are taken now, synchronously, so a change during the first interval is not absorbed as startup state. */
   start() { this.teamEvents(); this.goalEvents(); this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
   stop() { clearInterval(this.timer); }
@@ -114,8 +116,16 @@ export class Notifier {
       console.warn(`push: sender failed (${(error as Error).name})`);
       return;
     }
-    // A trip is marked only after the sender accepted the batch, so a failed send is offered again.
-    if (fuseDue.length) this.fuse?.markAnnounced(fuseDue.map((item) => item.tripId));
+    // The sender resolves even when the push service refuses a message, with one ticket per message. A trip is
+    // marked when at least one device received it, so a push that reached nobody is offered again.
+    if (fuseDue.length) {
+      const first = messages.length - fuseDue.length * devices.length;
+      const reached = fuseDue.filter((_item, index) =>
+        devices.some((_device, device) => tickets[first + index * devices.length + device]?.status === "ok"));
+      if (reached.length) this.fuse?.markAnnounced(reached.map((item) => item.tripId));
+      // A trip that reached nobody is tried again after a minute, not on every tick.
+      if (reached.length < fuseDue.length) this.fuseRetryAt = Date.now() + 60_000;
+    }
     const failures = new Set<string>();
     tickets.forEach((ticket, i) => {
       if (ticket.status !== "error") return;
@@ -157,7 +167,7 @@ export class Notifier {
   }
   /** Open spend-fuse trips the owner has not been told about. Nothing is read or marked unless the event is enabled. */
   private fuseEvents(): FuseInterrupt[] {
-    if (!this.fuse || !this.enabled("autonomy-interrupt")) return [];
+    if (!this.fuse || !this.enabled("autonomy-interrupt") || Date.now() < this.fuseRetryAt) return [];
     try { return this.fuse.interrupts(); } catch { return []; }
   }
   private fuseMessage(item: FuseInterrupt, to: string) {

@@ -43,6 +43,7 @@ import { missionReportEnvelopeSchema } from "./mission-types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import type { TranscriptMessage } from "./transcript.js";
 import { TranscriptWatch, closesTurn } from "./transcript-watch.js";
+import { drainLaunch, runFinalDrain } from "./final-drain.js";
 import { buildLaunch } from "./launch.js";
 import { addProjectIdToLaunchEnv } from "./worker-env.js";
 import { claudeConfigPath, recordClaudeTrust } from "./workspace-trust.js";
@@ -307,6 +308,8 @@ function blockShown(open: Prompt) {
 }
 
 let hooksReady = false;
+/** True only while the final drain runs: the relay may read the transcript after the provider exited. */
+let drainOpen = false;
 let teamReportReceipt: { requestId: string; digest: string } | undefined;
 // ---- Chat: the provider's own conversation record ------------------------------------------
 // The relay streams the transcript file from the worker's cursor; the worker never opens it.
@@ -388,8 +391,9 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void
     teamReportReceipt = { requestId: report.requestId, digest };
     return;
   }
+  if (route === "drain") { const started = drainOpen ? transcriptWatch.drainFinal() : undefined; return started ? { transcript: started } : undefined; }
+  if (route === "transcript") return state.status === "running" || drainOpen ? onTranscript(body) : undefined;
   if (state.status !== "running") return;
-  if (route === "transcript") return onTranscript(body);
   const signals =
     route === "claude"
       ? mapClaudeHook(body)
@@ -432,6 +436,7 @@ async function onHook(route: HookRoute, body: unknown): Promise<HookReply | void
   const started = transcriptWatch.hook({
     subagent: b.agent_id !== undefined,
     turnEnd: closesTurn(signals, event),
+    sessionEnd: event === "SessionEnd",
     ...(transcriptPath !== undefined ? { transcript: { path: transcriptPath, provider: route === "claude" ? "claude" : "codex" } } : {}),
   });
   let reply: HookReply | void = started ? { transcript: started } : undefined;
@@ -785,7 +790,10 @@ function deliver(
         tab: "\t",
       }[request.key],
     );
-  } else child.kill("SIGTERM");
+  } else {
+    transcriptWatch.stopRequested();
+    child.kill("SIGTERM");
+  }
   const result = append("input-result", {
     requestId: request.requestId,
     state: "delivered",
@@ -1215,6 +1223,7 @@ const server = createServer((socket) => {
           if (state.handoffQuiescence?.requestId === request.requestId) return state;
           if (state.status !== "running") throw new Error("The source exited without a verified handoff process receipt");
           handoffStopping = true;
+          transcriptWatch.stopRequested();
           try {
             await stopHandoffProcesses(child.pid, processes => append("lifecycle", { handoffStopIntent: { requestId: request.requestId, processes } }));
             state = { ...state, handoffQuiescence: { requestId: request.requestId, verifiedAt: new Date().toISOString(), scope: "process-group-and-observed-descendants" } };
@@ -1553,10 +1562,27 @@ server.listen(socketPath(runDir, session.id), async () => {
         if (snapshotBytes > 2 * 1024 * 1024) abortSnapshot?.(new Error("Snapshot output queue is full"));
       } else output(data);
     });
+    /** After the provider exited, the relay reads the transcript once more, for at most FINAL_DRAIN_MS. Never rejects. */
+    const finalDrain = async () => {
+      try {
+        if (!hookServer || !transcriptWatch.reading) return;
+        const launch = drainLaunch(profile, relayPath);
+        // Without a launch the watch records the drain as skipped.
+        if (!launch) return;
+        const drainEnv: Record<string, string> = {};
+        for (const name of ["PATH", "HOME"]) {
+          const value = process.env[name];
+          if (value !== undefined) drainEnv[name] = value;
+        }
+        drainEnv.INFINITE_HOOK_URL = hookServer.url;
+        drainEnv.INFINITE_HOOK_TOKEN = hookToken;
+        drainOpen = true;
+        try { await runFinalDrain(launch, drainEnv); } finally { drainOpen = false; }
+      } catch { /* A failed drain loses the rows it did not read; the coverage record says so. */ }
+    };
     const exited = (exitCode: number) => {
       native?.stop();
       void hybrid?.close().catch(() => {}); executor?.close();
-      try { if (provider !== "opencode") append("usage-coverage", { ...transcriptWatch.finish(hooksReady) }); } catch { /* A usage failure loses usage, never the exit record. */ }
       try {
         flush();
         controller = null;
@@ -1567,8 +1593,16 @@ server.listen(socketPath(runDir, session.id), async () => {
       } catch {
         recordingFailure();
       }
-      const finish = () => { if (handoffStopping) setTimeout(finish, 100); else void exitWorker(0); };
-      setTimeout(finish, 1500);
+      // The exit record is journaled before the drain: readers of `exited` see the gates refuse input during it.
+      void (async () => {
+        await finalDrain();
+        try {
+          if (provider !== "opencode") append("usage-coverage", { ...transcriptWatch.finish(hooksReady, true) });
+          persist();
+        } catch { /* A usage failure loses usage, never the exit record. */ }
+        const finish = () => { if (handoffStopping) setTimeout(finish, 100); else void exitWorker(0); };
+        setTimeout(finish, 1500);
+      })();
     };
     child.onExit(({ exitCode }) => {
       if (snapshotQueue) snapshotQueue.push(() => exited(exitCode));

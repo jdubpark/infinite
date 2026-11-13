@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { teamProjectSchema, teamTaskPlanSchema } from "../packages/host/src/team-types.js";
 import {
   featureMapDigest,
   featureMapSchema,
@@ -276,4 +277,21 @@ test("the feature map schema refuses bad maps", () => {
   }
   // A project may set only risk rules. An empty area list is valid.
   assert.equal(featureMapSchema.safeParse({ areas: [], elevated: ["packages/host/src/vault.ts"] }).success, true);
+});
+
+test("project configuration and plan tasks accept feature inputs", () => {
+  const command = { command: "npm", args: ["test"] };
+  const project = teamProjectSchema.parse({ checks: [command], features: { areas: [{ id: "host", paths: ["packages/host"] }] } });
+  assert.deepEqual(project.features, { areas: [{ id: "host", paths: ["packages/host"] }] });
+  assert.equal(teamProjectSchema.safeParse({ checks: [command], features: { areas: [{ id: "mixed", paths: ["packages/host"] }] } }).success, false);
+  assert.equal(teamProjectSchema.parse({ checks: [command] }).features, undefined, "features stays optional with no default");
+
+  const task = { id: "a", title: "Title", instructions: "Do it", paths: ["src/a.ts"], dependsOn: [] };
+  const labelled = teamTaskPlanSchema.parse({ ...task, kind: "fix", risk: "elevated" });
+  assert.equal(labelled.kind, "fix");
+  assert.equal(labelled.risk, "elevated");
+  assert.equal(teamTaskPlanSchema.parse(task).kind, undefined, "kind stays optional with no default");
+  assert.equal(teamTaskPlanSchema.parse(task).risk, undefined, "risk stays optional with no default");
+  assert.equal(teamTaskPlanSchema.safeParse({ ...task, kind: "chore" }).success, false);
+  assert.equal(teamTaskPlanSchema.safeParse({ ...task, risk: "normal" }).success, false);
 });

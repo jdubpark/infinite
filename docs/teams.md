@@ -357,6 +357,8 @@ delivery.
 
 Each integration records what changed. The run's `changes` lists the files changed from its base to its recorded head, each with a status of added, modified, removed, or renamed and its line counts (`null` for binary files). It holds up to 400 files and sets `truncated` when more changed. Each integrated task's `changedPaths` lists the paths its own change touched, up to 200, with its own `truncated` flag. Git reads for these fields are best-effort: if Git refuses or fails a read, the field is absent and integration still succeeds.
 
+Runs also write run events to the evidence store: `run.created`, `run.blocked`, and `run.settled`, with a summary of the run's counts when it settles. Each run keeps its events in a small outbox inside its record until the store accepts them, and a restart does not lose them. The events only record what the run did. A run behaves the same whether or not its events are stored, and a store that stays unavailable never stops or changes a run.
+
 ## Workspace retention
 
 Team workspaces are host-managed temporary copies. By default, merged and
@@ -642,6 +644,12 @@ repository alone. Its owner-managed knowledge links require an explicit linked
 search; `global` is not included automatically. An Infinite context link does not
 create a brain link. Each surface grants only its named kind of context, and
 neither grants filesystem or network permissions.
+
+A project's `team` object may set `features`, a private feature map of areas, each an `id` with
+repository-relative path prefixes, plus optional `elevated` prefixes and `elevatedTokens`. The host reads it when a
+plan is accepted and records each task's area, kind, and risk in its run events. It never sends the map to a member:
+member context files and prompts leave it out. A plan task may add `kind` and `risk: "elevated"` as labels; a label
+can raise risk but never lower it. The key has no default, so a project without a map keeps its configuration as it was.
 
 ## Let an ordinary session request a team
 
@@ -1707,12 +1715,25 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | --- | --- | --- |
 | `GET /api/teams` | None; returns `{teams}` | Any paired device |
 | `GET /api/teams/:id` | None; returns reports and check evidence | Any paired device |
+| `GET /api/teams/:id/context` | None; returns the files each member's recorded tool inputs pointed at | Any paired device |
 | `POST /api/teams` | `requestId`, `projectId`, `provider`, `title`, `objective`, optional `useConfiguredLineup` | Owner |
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
+
+The context response lists, for each member of the current revision and each
+earlier member still running, its repository-relative `files` with `reads`,
+`edits`, and `lastAt`, a `graphQueries` count, and `observable`, `complete`,
+and `truncated` flags. `GET /api/sessions/:id/context` returns the same shape
+for one session. These are observed tool inputs: they show what an agent's
+tools were pointed at, not that the agent used the content, and an observed
+edit is not a landed change. Only Claude Code and Codex record tool inputs;
+other providers answer `observable: false`. The index is in memory, bounded,
+and rebuilt on demand after a restart. `complete: false` means the index is
+still catching up, or is full of sessions being read and will admit this one
+on a later request. See [Swarm view](swarm.md).
 
 The continue request accepts exactly `requestId`, `revision`, and optional
 `text`; omit `text` when no direction is needed. A supplied direction is trimmed

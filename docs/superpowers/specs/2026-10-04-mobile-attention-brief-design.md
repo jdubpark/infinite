@@ -79,7 +79,7 @@ Codex hooks are command hooks only, so the host ships a relay: `packages/host/sr
 
 Injected per process with repeatable `-c` overrides appended after the profile's args:
 
-1. `-c 'hooks.PermissionRequest=[{hooks=[{type="command",command="node <relay> codex"}]}]'` and the same for `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SessionStart`, `Interrupt`; plus `--dangerously-bypass-hook-trust` so the injected hooks run without a persisted trust hash. The flag only affects hooks Infinite itself injects for this process. Whether `-c` accepts inline-table arrays for `hooks.*` is unconfirmed and is spike S2 (§11.4).
+1. `-c 'hooks.PermissionRequest=[{hooks=[{type="command",command="node <relay> codex"}]}]'` and the same for `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SessionStart`, `Interrupt`; plus `--dangerously-bypass-hook-trust` so the injected hooks run without a persisted trust hash. Spike S2 (2026-11-13) confirmed that `-c` accepts inline-table arrays for `hooks.*`. It refuted the intended scope of the flag: for this process it also lets hooks that the working directory defines run without review. Codex hooks therefore stay off by default (`docs/security.md`).
 2. `-c 'notify=["node","<relay>","codex-notify"]'` → `turn-end` with `last-assistant-message`. Confirmed payload shape from the Codex source.
 3. `-c 'tui.notifications=["agent-turn-complete","approval-requested","async-question"]' -c 'tui.notification_method="osc9"' -c 'tui.notification_condition="always"'` → the TUI writes OSC 9 sequences into the PTY; the worker registers an OSC 9 handler on xterm headless and turns each into a `notice` signal with `source: "osc"`. `approval-requested` opens a `permission` prompt if none is open; `async-question` opens a `question` prompt.
 
@@ -377,7 +377,7 @@ Both are recorded in this spec's decision register when run.
 - Hooks run inside the agent's environment; the token and URL are readable by the agent. Signals are evidence, never authority. No approval happens without a person's input. (§3.1)
 - The answer endpoint only presses keys the TUI already shows and checks the dialog before and after. It cannot approve a prompt that is not on screen.
 - Push bodies default to no content. Full detail is opt-in. Tokens and the Expo access token are stored encrypted or `0600`. Push adds the first outbound dependency from the host; it can be left disabled.
-- `--dangerously-bypass-hook-trust` applies only to hooks Infinite injects for that process; the person's own hooks keep their trust requirements. This is unverified until spike S2, and Codex hooks are off by default until then. The flag name is surfaced in `doctor` output so the person knows it is in use.
+- `--dangerously-bypass-hook-trust` applies to that one process and persists no trust. Spike S2 (2026-11-13) showed that it is not limited to the hooks Infinite injects: hooks that the working directory defines also run without review. Codex hooks stay off by default. The flag name is surfaced in `doctor` output so the person knows it is in use.
 - Signal payloads can contain file contents and commands; they are journaled encrypted and shown only to paired roles, as the recording already is.
 
 ## 13. Decision register

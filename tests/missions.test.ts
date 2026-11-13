@@ -1,13 +1,12 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { createServer as createNetServer } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
-import { stopSessionWorkers, waitFor } from "./helpers.js";
+import { waitFor } from "./helpers.js";
 import { inProcessHost } from "./helpers.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
@@ -17,81 +16,12 @@ import { createMissionReportEnvelope } from "../packages/host/src/team-report-cl
 import { missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, type MissionOpenChildDecision, type MissionMessage } from "../packages/host/src/team-prompts.js";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { git, lineup, missionHarness as harness } from "./mission-harness.js";
 import type { Config, Session } from "../packages/host/src/types.js";
 import type { CreateTeam, NativeContinuation, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
-import type { CreateMission, Mission, MissionReport } from "../packages/host/src/mission-types.js";
+import type { CreateMission, Mission, MissionOrigin, MissionReport } from "../packages/host/src/mission-types.js";
 import { emptyRollup, emptyUsage, type UsageRollup } from "../packages/host/src/team-usage.js";
 import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
-
-const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-const lineup: TeamLineup = {
-  coordinator: { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
-  implementers: [{ id: "light", label: "Light worker", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" }],
-  integrator: { id: "integrator", label: "Integrator", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" },
-  reviewer: { id: "reviewer", label: "Reviewer", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
-};
-
-/** Real team and mission services over real session workers, with a two-repository project behind a fake group lookup. */
-function harness() {
-  const root = realpathSync(mkdtempSync("/tmp/inf-mission-"));
-  const receipts = join(root, "receipts");
-  mkdirSync(receipts, { mode: 0o700 });
-  const repo = (name: string) => {
-    const path = join(root, name);
-    mkdirSync(path);
-    writeFileSync(join(path, "check.mjs"), `import { existsSync } from "node:fs";\nif (!existsSync("${name}.txt")) process.exit(1);\n`);
-    git(path, "init", "--initial-branch=main"); git(path, "add", "check.mjs");
-    git(path, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", `Initial ${name}`);
-    return path;
-  };
-  const api = repo("api"), web = repo("web");
-  const key = randomBytes(32), keyFile = join(root, "key");
-  writeFileSync(keyFile, key, { mode: 0o600 });
-  const agent = (provider: string) => ({ command: process.execPath, args: [resolve("tests/fixtures/mission-agent.mjs"), "mission", receipts, provider] });
-  const checks = [{ command: process.execPath, args: ["check.mjs"] }];
-  const config: Config = { port: 0, origin: "http://127.0.0.1", keyFile, stateDir: join(root, "state"), runDir: join(root, "run"), tokens: [],
-    environment: "local", enableDemo: true, maxSessions: 24, agents: { claude: agent("claude"), codex: agent("codex") },
-    projects: [{ id: "api", name: "API", path: api, team: { checks } }, { id: "web", name: "Web", path: web, team: { checks } }],
-    teams: { workspaceDir: join(root, "teams"), lineup } };
-  const at = new Date().toISOString();
-  const groups: ProjectGroupLookup = { get: id => {
-    if (id !== "shop") throw new TeamError(404, "project-group-not-found", "This project does not exist.");
-    return { id, name: "Shop", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: at, updatedAt: at,
-      repos: [
-        { projectId: "api", name: "API", path: api, checkouts: [{ projectId: "api", name: "API", path: api, primary: true, teamReady: true }] },
-        { projectId: "web", name: "Web", path: web, checkouts: [{ projectId: "web", name: "Web", path: web, primary: true, teamReady: true }] },
-      ] };
-  } };
-  let services: { teams: TeamService; missions: MissionService } | undefined;
-  const open = () => {
-    const manager = new Manager(config, key);
-    const teams = new TeamService(config, key, manager, (_project, start) => start());
-    const missions = new MissionService(config, key, manager, teams, groups);
-    teams.start(); missions.start();
-    services = { teams, missions };
-    return services;
-  };
-  const shut = () => { services?.missions.close(); services?.teams.close(); services = undefined; };
-  const coordinatorReceipts = () => readdirSync(receipts).filter(name => name.endsWith(".json"))
-    .map(name => JSON.parse(readFileSync(join(receipts, name), "utf8"))).filter(receipt => receipt.role === "mission-coordinator");
-  const create = (objective = "Add an endpoint to the API and call it from the web client"): CreateMission =>
-    ({ requestId: randomUUID(), groupId: "shop", objective, maxSubtasks: 8, maxMinutes: 30 });
-  const release = (name: string) => writeFileSync(join(receipts, name), "go", { mode: 0o600 });
-  const close = async () => {
-    const closing = services;
-    shut();
-    // A tick already under way can still launch a coordinator attempt or subteam member after close().
-    await closing?.missions.idle(); await closing?.teams.idle();
-    // Workers exit 1.5 s after their child. Sweep until none answers, so no worker or provider outlives the test.
-    for (let pass = 1; await stopSessionWorkers(config); pass++) {
-      if (pass === 8) throw new Error("Session workers still answer after the mission test stopped them");
-      await new Promise(done => setTimeout(done, 500));
-    }
-    await new Promise(done => setTimeout(done, 1700));
-    rmSync(root, { recursive: true, force: true });
-  };
-  return { root, api, web, open, shut, close, create, release, coordinatorReceipts, services: () => services! };
-}
 
 const until = (read: () => Mission, accepts: (mission: Mission) => boolean, timeout = 60000) => waitFor(async () => read(), accepts, timeout);
 const standaloneRequest = (projectId: string): CreateTeam => ({
@@ -1662,4 +1592,148 @@ test("a direction delivered between refused ones resets the refusal count in del
     assert.notEqual(h.get(id).status, "blocked", "Only two refusals follow the delivered direction");
     assert.equal(h.get(id).events.filter(event => /steer-subtask report was refused/.test(event.text)).length, 3);
   } finally { h.close(); }
+});
+
+const intakeOrigin: MissionOrigin = { kind: "intake", issueId: "issue-1", identifier: "TEST-1", url: "https://linear.example.invalid/issue/TEST-1", rule: 'label "infinite", owner creator' };
+const missionRequest = (maxMinutes = 30): CreateMission => ({ requestId: randomUUID(), groupId: "shop", objective: "Change the API", maxSubtasks: 8, maxMinutes });
+const timeLimitText = "The approved time limit has expired. Active subteams were cancelled; their workspaces remain available.";
+
+test("a saved mission notifies listeners, and peek returns it without usage", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const seen: string[] = [];
+    const off = h.missions.onChange(mission => seen.push(`${mission.id}:${mission.status}`));
+    const mission = await h.missions.create(missionRequest());
+    assert.ok(seen.includes(`${mission.id}:planning`));
+    assert.equal(h.missions.peek(mission.id)!.usage, undefined, "peek computes no usage");
+    assert.equal(h.missions.peek("00000000-0000-4000-8000-000000000000"), undefined, "peek is undefined for an unknown mission");
+    off();
+    await h.missions.pause(mission.id, { requestId: randomUUID(), revision: mission.revision });
+    assert.equal(seen.some(item => item === `${mission.id}:paused`), false, "A removed listener is not called again");
+  } finally { h.close(); }
+});
+
+test("a throwing listener does not break a save", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    h.missions.onChange(() => { throw new Error("listener"); });
+    const mission = await h.missions.create(missionRequest());
+    assert.equal(mission.status, "planning");
+    assert.equal(h.missions.peek(mission.id)!.status, "planning", "The save persisted before the listener ran");
+  } finally { h.close(); }
+});
+
+test("an intake mission records its origin and names the issue in its first event", { timeout: 30000 }, async () => {
+  const h = scripted();
+  try {
+    const mission = await h.missions.create(missionRequest(), undefined, intakeOrigin);
+    assert.deepEqual(mission.origin, intakeOrigin);
+    assert.match(mission.events[0].text, /^Mission started by intake from TEST-1: label "infinite", owner creator\./);
+    assert.equal(mission.events[0].text, `Mission started by intake from TEST-1: ${intakeOrigin.rule}. The coordinator will inspect the repositories and dispatch subtasks.`);
+    const plain = await h.missions.create(missionRequest());
+    assert.equal(plain.origin, undefined, "A mission started from the apps has no origin");
+    assert.equal(plain.events[0].text, "Mission approved. The coordinator will inspect the repositories and dispatch subtasks.");
+  } finally { h.close(); }
+});
+
+test("a Slack answer and a Slack steer are recorded as the owner's, with the source", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "question", question: "Which response format?", options: ["JSON", "Text"] });
+    const asked = await until(() => h.get(id), mission => mission.status === "needs-input");
+    const answered = await h.missions.answer(id, asked.decisions[0].id, { requestId: randomUUID(), revision: asked.revision, text: "JSON" }, "slack");
+    assert.equal(answered.decisions[0].answeredBy, "owner");
+    assert.equal(answered.decisions[0].answer, "JSON");
+    assert.ok(answered.events.some(event => event.text === "The owner answered the coordinator's question from Slack."));
+    const steered = await h.missions.steer(id, { requestId: randomUUID(), revision: answered.revision, text: "Keep the change small" }, "slack");
+    assert.ok(steered.events.some(event => event.text === "Owner direction recorded from Slack for the coordinator. Subtasks started later include it; the coordinator decides whether to forward it to running ones."));
+    assert.equal(steered.steering.at(-1)!.text, "Keep the change small");
+  } finally { h.close(); }
+});
+
+test("an intake pause carries its reason", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.missions.create(missionRequest(), undefined, intakeOrigin);
+    await h.attempt(1);
+    const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: created.revision }, "The Linear issue was closed.");
+    assert.equal(paused.status, "paused");
+    assert.equal(paused.reason, "The Linear issue was closed.");
+    assert.equal(paused.events.at(-1)!.text, "Mission paused: The Linear issue was closed.");
+    const resumed = await h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision });
+    assert.equal(resumed.reason, undefined, "Resuming clears the pause reason");
+  } finally { h.close(); }
+});
+
+test("an intake mission waiting on the owner past its original deadline still resumes work", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(5), undefined, intakeOrigin);
+    await h.report(1, { kind: "question", question: "Which response format?", options: ["JSON", "Text"] });
+    const asked = await until(() => h.get(id), mission => mission.status === "needs-input");
+    // Ten minutes pass while the owner is away, which is more than the five-minute limit.
+    mock.timers.tick(10 * 60000);
+    await new Promise(done => setTimeout(done, 1200));
+    assert.equal(h.missions.peek(id)!.status, "needs-input", "The stopped clock does not block the mission");
+    const answered = await h.missions.answer(id, asked.decisions[0].id, { requestId: randomUUID(), revision: asked.revision, text: "JSON" });
+    assert.ok(["planning", "working"].includes(answered.status), `The answered mission resumes work, not ${answered.status}`);
+    assert.ok(Date.parse(h.missions.peek(id)!.deadlineAt) - Date.now() > 4 * 60000, "The owner's wait is added back to the deadline");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a paused intake mission resumes after its original deadline", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5), undefined, intakeOrigin);
+    await h.attempt(1);
+    const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: created.revision }, "Waiting for the owner.");
+    mock.timers.tick(10 * 60000);
+    const resumed = await h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision });
+    // No subtask exists yet, so the resumed mission settles back to planning rather than working.
+    assert.equal(resumed.status, "planning");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("an intake mission still expires on working time", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const { id } = await h.missions.create(missionRequest(5), undefined, intakeOrigin);
+    await h.report(1, { kind: "dispatch", summary: "One API change", subtasks: [plan("a", "api")] });
+    const working = await until(() => h.get(id), mission => Boolean(teamOf(mission, "a")));
+    assert.equal(working.status, "working");
+    mock.timers.tick(6 * 60000);
+    const blocked = await until(() => h.get(id), mission => mission.status === "blocked");
+    assert.equal(blocked.reason, timeLimitText);
+    assert.ok(blocked.events.some(event => event.text === timeLimitText));
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("a mission started from the apps keeps the wall-clock deadline", { timeout: 60000 }, async () => {
+  const h = scripted();
+  mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });
+  try {
+    const created = await h.missions.create(missionRequest(5));
+    await h.attempt(1);
+    const paused = await h.missions.pause(created.id, { requestId: randomUUID(), revision: created.revision });
+    // Stop the tick, so no step can block the paused mission between the clock move and the resume.
+    h.missions.close();
+    mock.timers.tick(10 * 60000);
+    await assert.rejects(h.missions.resume(created.id, { requestId: randomUUID(), revision: paused.revision }), (error: TeamError) => error.code === "mission-deadline");
+  } finally { h.close(); mock.timers.reset(); }
+});
+
+test("subteams of an intake mission are not tracked in Linear", { timeout: 120000 }, async () => {
+  const h = harness({ configure: config => { config.projects[0].linear = { teamId: "T00000000" }; } });
+  try {
+    const { missions, teams } = h.open();
+    h.release("release-dispatch");
+    const created = await missions.create(h.create("HOLD-SUBTEAM so the subteam stays active"), undefined, intakeOrigin);
+    const running = await until(() => missions.get(created.id), mission => mission.subtasks[0]?.status === "running");
+    assert.equal(running.subtasks[0].repoProjectId, "api");
+    assert.equal(teams.get(running.subtasks[0].teamId!).linearTracking, false, "An intake mission's subteam is not Linear-tracked");
+  } finally { await h.close(); }
 });

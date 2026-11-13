@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { chmodSync, closeSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { types } from "node:util";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { EVIDENCE_KEY_VERSION, blindIndex, canonicalJson, deriveEvidenceKey, openRow, sealRow } from "./crypto.js";
 import {
@@ -118,7 +119,7 @@ type EventRow = {
 /** The sealed part of an event row. */
 type SealedEvent = { key: string; taskId?: string; data: Record<string, unknown> };
 
-type EventQuery = { runId?: string; kinds?: string[]; after?: number; limit: number };
+export type EventQuery = { runId?: string; kinds?: string[]; after?: number; limit: number };
 
 /**
  * The host's evidence database (umbrella contract C1). The host process is its only writer.
@@ -223,19 +224,21 @@ export class EvidenceStore {
     let active = true;
     const guard = () => {
       if (!active || this.db !== db) throw new EvidenceError("unavailable", "The evidence transaction has ended.");
+      assertTransactionOpen(db);
     };
     const tx: EvidenceTx = {
       ...this.view(db, guard),
       run: (sql, ...params) => {
+        const values = plainParameters(params);
         guard();
-        const result = db.prepare(checkedSql(sql)).run(...params);
+        const result = db.prepare(checkedSql(sql)).run(...values);
         return { changes: Number(result.changes), lastInsertRowid: Number(result.lastInsertRowid) };
       },
       exec: sql => {
         guard();
         db.exec(checkedSql(sql));
         // `exec` runs every statement in the text, so a later COMMIT shows only as an ended transaction.
-        assertInTransaction(db);
+        assertTransactionOpen(db);
       },
       seal: (table, rowId, value) => {
         guard();
@@ -253,7 +256,7 @@ export class EvidenceStore {
           throw new TypeError("An evidence write callback must be synchronous");
         }
         guard();
-        assertInTransaction(db);
+        assertTransactionOpen(db);
         commit(db);
         return result;
       } catch (error) {
@@ -285,16 +288,11 @@ export class EvidenceStore {
     if (!this.activeTx || tx !== this.activeTx) {
       throw new TypeError("appendEvent needs the transaction of the current evidence write");
     }
-    if (!validEvent(event)) throw new EvidenceError("invalid-event", "The event envelope is invalid.");
-    let data: string;
-    try {
-      data = canonicalJson(event.data);
-    } catch {
-      throw new EvidenceError("invalid-event", "Event data must be a JSON object.");
-    }
-    if (Buffer.byteLength(data, "utf8") > MAX_EVENT_DATA_BYTES) {
-      throw new EvidenceError("event-too-large", "Event data is larger than 16 KiB.");
-    }
+    assertTransactionOpen(this.ready());
+    const fault = examineEvent(event);
+    if (fault === "envelope") throw new EvidenceError("invalid-event", "The event envelope is invalid.");
+    if (fault === "data") throw new EvidenceError("invalid-event", "Event data must be a JSON object.");
+    if (fault === "too-large") throw new EvidenceError("event-too-large", "Event data is larger than 16 KiB.");
     const keyHmac = this.eventKeyHmac(event.key);
     const sealed: SealedEvent = {
       key: event.key,
@@ -321,43 +319,13 @@ export class EvidenceStore {
 
   /** Committed events in `seq` order. `limit` is clamped to 1 through 500. */
   events(query: EventQuery): { events: RunEvent[]; cursor: number; more: boolean } {
-    const after = query.after ?? 0;
-    if (!Number.isSafeInteger(after) || after < 0) {
-      throw new EvidenceError("invalid-event", "An event cursor must be a non-negative integer.");
-    }
-    if (query.runId !== undefined && typeof query.runId !== "string") {
-      throw new EvidenceError("invalid-event", "An event query run ID must be a string.");
-    }
-    const kinds = query.kinds;
-    if (kinds !== undefined
-      && (!Array.isArray(kinds) || kinds.length > MAX_EVENT_KINDS || kinds.some(kind => typeof kind !== "string"))) {
-      throw new EvidenceError("invalid-event", "An event query takes at most 32 kinds.");
-    }
-    const limit = clampLimit(query.limit);
-    return this.read(db => {
-      const where = ["seq > ?"];
-      const params: SQLInputValue[] = [after];
-      if (query.runId !== undefined) {
-        where.push("run_id = ?");
-        params.push(query.runId);
-      }
-      if (kinds !== undefined) {
-        where.push(`kind IN (${kinds.map(() => "?").join(", ")})`);
-        params.push(...kinds);
-      }
-      const rows = db.all<EventRow>(
-        "SELECT seq, key_hmac, run_id, revision, at, kind, member_id, encrypted_data FROM run_events "
-        + `WHERE ${where.join(" AND ")} ORDER BY seq LIMIT ?`,
-        ...params,
-        limit + 1,
-      );
-      const page = rows.slice(0, limit);
-      return {
-        events: page.map(row => toEvent(db, row)),
-        cursor: page.length > 0 ? page[page.length - 1].seq : after,
-        more: rows.length > limit,
-      };
-    });
+    const checked = checkEventQuery(query);
+    return this.read(db => readEvents(db, query, checked));
+  }
+
+  /** `events` through a given connection. A write transaction sees its own uncommitted rows this way. */
+  eventsIn(db: EvidenceDb, query: EventQuery): { events: RunEvent[]; cursor: number; more: boolean } {
+    return readEvents(db, query, checkEventQuery(query));
   }
 
   hasEvent(key: string): boolean {
@@ -466,10 +434,10 @@ export class EvidenceStore {
     if (typeof runId !== "string" || runId.length === 0) return "failed";
     try {
       this.write(tx => {
-        tx.run("DELETE FROM run_events WHERE run_id=?", runId);
         for (const { module } of this.readyModules()) {
           if (module.deleteRun) synchronousHook(module.deleteRun(tx, runId));
         }
+        tx.run("DELETE FROM run_events WHERE run_id=?", runId);
       });
       return "deleted";
     } catch (error) {
@@ -501,12 +469,14 @@ export class EvidenceStore {
   private view(db: DatabaseSync, guard: () => void): EvidenceDb {
     return {
       get: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
+        const values = plainParameters(params);
         guard();
-        return db.prepare(checkedSql(sql)).get(...params) as R | undefined;
+        return db.prepare(checkedSql(sql)).get(...values) as R | undefined;
       },
       all: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
+        const values = plainParameters(params);
         guard();
-        return db.prepare(checkedSql(sql)).all(...params) as R[];
+        return db.prepare(checkedSql(sql)).all(...values) as R[];
       },
       open: <R>(table: string, rowId: string, sealed: string) => {
         guard();
@@ -792,10 +762,41 @@ function skipPast(sql: string, end: string, from: number): number {
   return found === -1 ? sql.length : found + end.length;
 }
 
-/** A statement that ended the write's transaction. Node versions without `isTransaction` skip this check. */
-function assertInTransaction(db: DatabaseSync): void {
-  const inTransaction = (db as { isTransaction?: unknown }).isTransaction;
-  if (inTransaction === false) {
+/**
+ * Whether SQLite still has the write's transaction open. A statement can end it, for example an
+ * `INSERT OR ROLLBACK` that conflicts. Node versions with `isTransaction` answer directly. Without it, a plain
+ * BEGIN is refused inside a transaction. When BEGIN succeeds nothing was open, so the probe is rolled back.
+ * Any other BEGIN failure counts as ended, so the write fails closed.
+ */
+export function transactionOpen(db: DatabaseSync): boolean {
+  const flag = (db as { isTransaction?: unknown }).isTransaction;
+  if (typeof flag === "boolean") return flag;
+  try {
+    db.exec("BEGIN");
+  } catch (error) {
+    return error instanceof Error && /within a transaction/i.test(error.message);
+  }
+  rollback(db);
+  return false;
+}
+
+/**
+ * Copies each bound value into a plain value before anything runs. A null, number, bigint, or string is kept as
+ * it is, and bytes are copied into a new buffer. Any other value is refused without reading its properties or
+ * calling its code, so binding a statement never runs caller code and never ends the transaction.
+ */
+function plainParameters(params: readonly unknown[]): SQLInputValue[] {
+  return params.map(value => {
+    if (value === null || typeof value === "number" || typeof value === "bigint" || typeof value === "string") {
+      return value;
+    }
+    if (types.isUint8Array(value)) return Buffer.from(value);
+    throw new TypeError("Evidence SQL parameters must be null, a number, a bigint, a string, or bytes.");
+  });
+}
+
+function assertTransactionOpen(db: DatabaseSync): void {
+  if (!transactionOpen(db)) {
     throw new EvidenceError("invalid-statement", "An evidence statement ended the write's transaction.");
   }
 }
@@ -812,6 +813,44 @@ function commit(db: DatabaseSync): void {
   }
 }
 
+/**
+ * Why `appendEvent` would refuse this event, or undefined when it would accept it. Pure, and it never
+ * throws, so a caller can drop an event the store can never take before it starts a write.
+ */
+export function eventProblem(event: Omit<RunEvent, "seq">): "invalid-event" | "event-too-large" | undefined {
+  try {
+    const fault = examineEvent(event);
+    if (fault === "too-large") return "event-too-large";
+    return fault === undefined ? undefined : "invalid-event";
+  } catch {
+    // An envelope read that throws, such as a throwing getter, is never an event.
+    return "invalid-event";
+  }
+}
+
+type EventFault = "envelope" | "data" | "too-large";
+
+/**
+ * The check that `appendEvent` and `eventProblem` share. It makes the same property reads, in the same order,
+ * and the same single serialization pass that `appendEvent` made before the check was shared, so the stored row
+ * does not change. Errors from reading the envelope propagate. Data that cannot be serialized is a `data` fault.
+ */
+function examineEvent(event: Omit<RunEvent, "seq">): EventFault | undefined {
+  if (!validEvent(event)) return "envelope";
+  let data: string;
+  try {
+    data = canonicalJson(event.data);
+  } catch {
+    return "data";
+  }
+  return Buffer.byteLength(data, "utf8") > MAX_EVENT_DATA_BYTES ? "too-large" : undefined;
+}
+
+/** Whether a value is an event kind: lower-case segments joined by dots, at least two, at most 64 characters. */
+export function isEventKind(kind: unknown): kind is string {
+  return typeof kind === "string" && kind.length <= MAX_EVENT_KIND_LENGTH && EVENT_KIND.test(kind);
+}
+
 function validEvent(event: Omit<RunEvent, "seq">): boolean {
   if (!event || typeof event !== "object") return false;
   const { key, runId, revision, at, kind, memberId, taskId, data } = event;
@@ -819,7 +858,7 @@ function validEvent(event: Omit<RunEvent, "seq">): boolean {
     && typeof runId === "string" && OPAQUE_ID.test(runId)
     && Number.isSafeInteger(revision) && revision >= 1
     && typeof at === "string" && at.length <= MAX_AT_LENGTH && Number.isFinite(Date.parse(at))
-    && typeof kind === "string" && kind.length <= MAX_EVENT_KIND_LENGTH && EVENT_KIND.test(kind)
+    && isEventKind(kind)
     && (memberId === undefined || (typeof memberId === "string" && OPAQUE_ID.test(memberId)))
     && (taskId === undefined || (typeof taskId === "string" && taskId.length >= 1 && taskId.length <= MAX_TASK_ID_LENGTH))
     && isPlainObject(data);
@@ -829,6 +868,54 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
+}
+
+type CheckedEventQuery = { after: number; kinds?: string[]; limit: number };
+
+/** Reads the query's properties in the order `events` always did. The run ID is read again by `readEvents`. */
+function checkEventQuery(query: EventQuery): CheckedEventQuery {
+  const after = query.after ?? 0;
+  if (!Number.isSafeInteger(after) || after < 0) {
+    throw new EvidenceError("invalid-event", "An event cursor must be a non-negative integer.");
+  }
+  if (query.runId !== undefined && typeof query.runId !== "string") {
+    throw new EvidenceError("invalid-event", "An event query run ID must be a string.");
+  }
+  const kinds = query.kinds;
+  if (kinds !== undefined
+    && (!Array.isArray(kinds) || kinds.length > MAX_EVENT_KINDS || kinds.some(kind => typeof kind !== "string"))) {
+    throw new EvidenceError("invalid-event", "An event query takes at most 32 kinds.");
+  }
+  return { after, kinds, limit: clampLimit(query.limit) };
+}
+
+function readEvents(
+  db: EvidenceDb,
+  query: EventQuery,
+  checked: CheckedEventQuery,
+): { events: RunEvent[]; cursor: number; more: boolean } {
+  const where = ["seq > ?"];
+  const params: SQLInputValue[] = [checked.after];
+  if (query.runId !== undefined) {
+    where.push("run_id = ?");
+    params.push(query.runId);
+  }
+  if (checked.kinds !== undefined) {
+    where.push(`kind IN (${checked.kinds.map(() => "?").join(", ")})`);
+    params.push(...checked.kinds);
+  }
+  const rows = db.all<EventRow>(
+    "SELECT seq, key_hmac, run_id, revision, at, kind, member_id, encrypted_data FROM run_events "
+    + `WHERE ${where.join(" AND ")} ORDER BY seq LIMIT ?`,
+    ...params,
+    checked.limit + 1,
+  );
+  const page = rows.slice(0, checked.limit);
+  return {
+    events: page.map(row => toEvent(db, row)),
+    cursor: page.length > 0 ? page[page.length - 1].seq : checked.after,
+    more: rows.length > checked.limit,
+  };
 }
 
 function clampLimit(limit: number): number {

@@ -132,3 +132,160 @@ export function taskFeatures(
 ## Not in this slice
 
 - The `features` key in the project team configuration, the `kind` and `risk` fields of a plan task, and the prompt line. They arrive with the member and task events.
+
+---
+
+# Slice: event outbox
+
+Spec part 1, the storing and projecting half. A small module over the evidence store. Nothing calls it yet.
+
+**Events first, projections by cursor.** A flush stores events in one transaction. Each projector then advances from its own cursor over the event table, in its own transaction. *(After review: a projector can arrive after its events. A later slice ships the first projector, and a module can be unavailable for a while. A flush that projected only the events it inserted would never project those, and would still tell its caller to drop them. Capture cannot be backfilled, so storing an event must never wait for a projection.)*
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/evidence/outbox.ts` (create) | `EventOutbox`: the flush, the projector registry, the cursors, and `advance` |
+| `packages/host/src/evidence/store.ts` (modify) | Export the pure event check and the kind rule that `appendEvent` already applies, read events through a given connection, refuse any operation on a write whose transaction SQLite has ended, and call module delete hooks before a run's events are removed |
+| `tests/evidence-outbox.test.ts` (create) | Flush, cursor, and registry tests |
+| `tests/evidence-store.test.ts` (modify) | Tests for the two store changes |
+
+## Review Focus
+
+1. An event stored before its projector existed. Expect the projector to see it, once, when it advances.
+2. A projector that throws for one event. Expect its own batch to roll back with its cursor, the events to stay stored, and the other projectors to run. Expect it to project in order once it is fixed.
+3. An event the store can never accept, or one that cannot be read, in a list with good events. Expect the good events to be stored and the bad one counted.
+4. A repeated flush of the same events. Expect no second event row and no second projection.
+5. A closed or unavailable store, and a long backlog. Expect `flush` to return at once, without reading the events.
+
+### Task 1: the event check, the event reader, and the outbox
+
+**Interfaces (consumes):** `EvidenceStore` (`status`, `register`, `tryWrite`, `appendEvent`), `EvidenceTx`, `EvidenceDb`, `RunEvent` from INF-182 phase 1.
+
+**Interfaces (produces):**
+
+```ts
+// packages/host/src/evidence/store.ts
+/** Why `appendEvent` would refuse this event, or undefined when it would accept it. Pure, and it never throws. */
+export function eventProblem(event: Omit<RunEvent, "seq">): "invalid-event" | "event-too-large" | undefined;
+/** Whether a value is an event kind. The store and the outbox share this one rule. */
+export function isEventKind(kind: unknown): kind is string;
+export type EventQuery = { runId?: string; kinds?: string[]; after?: number; limit: number };
+export class EvidenceStore {
+  /** `events` through a given connection: the transaction of a write sees its own uncommitted rows. */
+  eventsIn(db: EvidenceDb, query: EventQuery): { events: RunEvent[]; cursor: number; more: boolean };
+}
+
+// packages/host/src/evidence/outbox.ts
+export type OutboxEvent = Omit<RunEvent, "seq">;
+export interface EventProjector {
+  /** Unique among projectors, /^[a-z][a-z0-9-]{0,39}$/. The outbox keeps one cursor under this name. */
+  name: string;
+  /** A module registered with the store. Its tables are the ones this projector writes. */
+  module: string;
+  /** Exact kinds such as "task.integrated", or a prefix that ends with a dot, such as "duel.". */
+  kinds: readonly string[];
+  /** Runs inside the projector's own transaction, once per matching event, in `seq` order. Must be synchronous. */
+  project(tx: EvidenceTx, event: RunEvent): void;
+}
+export type FlushResult = {
+  /** True when every accepted event is in the store. False means none of this flush was stored. */
+  stored: boolean;
+  /** Events the store can never accept. The caller drops them when `stored` is true. */
+  refused: number;
+};
+export type AdvanceResult = {
+  /** Matching events projected by the projectors that committed. */
+  projected: number;
+  /** True when some projector still has stored events it has not seen, or cannot run. */
+  pending: boolean;
+  /** Projectors that cannot run until someone repairs them. Each also counts as pending. */
+  blocked: { name: string; reason: "definition-changed" | "cursor-ahead" }[];
+};
+export class EventOutbox {
+  constructor(store: EvidenceStore);                       // one outbox per store: TypeError when the store already has the module
+  registerProjector(projector: EventProjector): void;   // TypeError on a bad projector
+  flush(events: readonly OutboxEvent[]): FlushResult;    // never throws
+  advance(limit?: number): AdvanceResult;                // never throws
+}
+```
+
+**Decisions:**
+
+- **`appendEvent` does not change.** One internal function examines an event with exactly the reads and the one serialization pass that `appendEvent` made before. `appendEvent` calls it once and throws the same three errors with the same messages. `eventProblem` calls the same function and maps a thrown error to `invalid-event`. *(After review: a second serialization pass changed the row stored for data with a stateful getter.)*
+- `isEventKind` holds the kind rule (the pattern and the 64-character limit) that the event check uses.
+- `eventsIn(db, query)` and `events(query)` share their code, and `events` makes exactly the property reads it made before, in the same order: its validation first, then the reads inside the reader callback. *(After review round 2: sharing the code must not change what `events` returns for any query object.)*
+- **A write's transaction must be alive for every operation.** Before each `run`, `exec`, `get`, `all`, `seal`, `open`, and `index` on a write's `tx`, and before `appendEvent`, the store checks that SQLite still has the transaction open. When it does not, the operation throws `EvidenceError("invalid-statement")` and runs nothing. SQLite ends a transaction by itself on a conflict clause such as `INSERT OR ROLLBACK` and on some failures (a full disk, an I/O error). Module code that caught such an error and kept writing would otherwise commit each later statement by itself. The check reads `isTransaction` where the runtime has it. Where it does not, the store tries a plain `BEGIN`: SQLite refuses one inside a transaction, and when it accepts one the store rolls it back and treats the write as ended. *(After review round 2. This is a defect in the store from INF-182 phase 1, and the cursor guarantee depends on it.)*
+- **Module delete hooks run before a run's events are removed**, in the same transaction, so a hook can still read them.
+- **Parameters are plain values.** `run`, `get`, and `all` take positional parameters only: null, a number, a bigint, a string, or bytes. The store copies them first (bytes into a new buffer), then makes its liveness check, then runs the statement with the copies. Any other parameter, such as an object of named bindings, is refused with a `TypeError` and nothing runs. So binding a statement runs no caller code. *(After review round 3: a named-binding object with a getter could end the transaction after the liveness check and before the statement ran.)*
+- **Who the guards protect against.** Module and projector code is host code that we write and review. The store's guards catch mistakes in that code: a statement that ends the transaction, an error that was caught and ignored, a wrong parameter. They are not a boundary against code written to defeat them, and a review does not need to prove one. *(My call after review round 3, confirmed by the owner on 2026-11-13.)*
+- **The outbox owns one evidence module**, `event-outbox`, version 1, with one table: `projector_cursors (name TEXT PRIMARY KEY, seq INTEGER NOT NULL, definition TEXT NOT NULL, lost INTEGER NOT NULL DEFAULT 0)`. The constructor registers it, and throws a `TypeError` when the store already has that module: a store has one outbox. A cursor is the `seq` of the last event its projector has passed.
+- **A projector's definition is bound to its name.** The definition is the SHA-256 hex of the canonical JSON of `{ module, kinds }` with `kinds` sorted. A projector's first committed write stores it with the cursor. When a stored row under the same name has another definition, the projector does not run: it is blocked with the reason `definition-changed`. To change what a projector matches, give it a new name and rebuild its rows in its module's migration. *(After review round 2: a projector that changed its kinds would inherit the old cursor and never see the events it newly matches.)*
+- **A cursor beyond the event sequence blocks its projector**, with the reason `cursor-ahead`. The high-water mark is the `seq` that SQLite keeps for `run_events` in `sqlite_sequence`, or 0 when it has none. It is not the largest stored `seq`, because a deleted run can leave that below a valid cursor.
+- A blocked projector is skipped, counts as pending, is listed in `blocked`, and stays blocked for the life of the outbox object. The outbox logs one line per name and reason, with fixed words only.
+- **Deleting a run wins, and the loss is recorded.** The store removes a run's events at once. The outbox module's `deleteRun` hook runs first: for each registered projector it counts the run's events after the projector's cursor whose kind the projector matches, and adds that count to the projector's `lost` column (it creates the row at cursor 0 when the projector has none). The module's `counts` hook reports `projectors` and `lost`, so `infinite evidence status` shows them. A cursor that `advance` would not trust is not trusted here either: when a projector's stored row has another definition, or a cursor above the high-water mark, the hook counts every event of the run that the projector matches, and it adds to `lost` without changing the stored cursor or definition. A caller that wants no loss calls `advance()` first and deletes when `pending` is false. The module's `runIds` hook returns an empty list. *(After review round 2: a run deleted while a projector was behind lost its projections without a trace. The run events slice makes retention deletes wait for the projectors, within a limit.)*
+- **`registerProjector`** throws a `TypeError` when the name does not match the pattern or is already registered, when the module is not registered with the store or is `store` or `event-outbox`, when `kinds` is empty or has more than 64 entries, when an entry is neither an event kind nor a prefix, or when `project` is not a function. A prefix ends with a dot, and adding one more segment to it gives an event kind by `isEventKind`. Projectors run in registration order.
+- A projector matches an event when one of its kinds equals the event kind, or is a prefix and the event kind starts with it.
+- **`flush(events)`**, in this order:
+  1. An empty list returns `{ stored: true, refused: 0 }` and touches nothing, the store included.
+  2. A store that is not `ready` returns `{ stored: false, refused: 0 }` before any event is read. *(After review: the caller flushes on every save, so an unavailable store must cost nothing per waiting event.)*
+  3. Each event is copied into a snapshot: the eight fields `key`, `runId`, `revision`, `at`, `kind`, `memberId`, `taskId`, `data` are each read once, and `data` is copied through its canonical JSON. No other property is read. An event whose snapshot throws, or for which `eventProblem` returns a value, is refused and counted. *(After review: a value that reads differently the second time, or an unrelated property that throws, must not fail a batch on every retry.)*
+  4. When every event is refused, the result is `{ stored: true, refused }` and no write happens.
+  5. One `store.tryWrite` appends every snapshot with `appendEvent`, in list order. A failed write returns `{ stored: false, refused: 0 }`.
+  6. After a stored write, `flush` calls `advance()` once and returns `{ stored: true, refused }`. The result never depends on a projector.
+- **`advance(limit = 500)`** clamps `limit` to 1 through 500. For each projector, in registration order:
+  - A projector whose module is not `ready` is skipped and counts as pending.
+  - One `store.tryWrite`: read the projector's cursor (0 when it has none); read `eventsIn(tx, { after: cursor, limit })`; call `project(tx, event)` for each matching event in order; when the page held any event, store the page's cursor as the projector's cursor.
+  - A projector that throws, or returns a thenable, fails its own write. Its rows and its cursor roll back together, the events stay stored, and the next projector still runs. A thenable's rejection is consumed.
+  - `projected` adds the matching events of each write that committed. `pending` is true when a write failed, a module was not ready, or a page reported more events.
+- **Exactly once, in order.** A projector's rows and its cursor commit together, and the cursor passes every event it read, matching or not. So a projector sees each matching event once, in `seq` order, whether the event came from this flush, an earlier flush, another writer, or a release that had no such projector. A new projector starts at the beginning of the event table.
+- A store that is not `ready` makes `advance` return `{ projected: 0, pending: true, blocked: [] }` when projectors exist, and `{ projected: 0, pending: false, blocked: [] }` when none do.
+- `flush` and `advance` catch every error. They log nothing themselves, because `tryWrite` logs one line per failure kind.
+- The caller bounds the list it passes. The team service keeps at most 2,000 waiting events per run.
+
+- [ ] **Step 1: Write the failing tests** in `tests/evidence-outbox.test.ts`. Each test builds a store in a fresh temporary directory with a 32-byte key, as `tests/evidence-store.test.ts` does, and registers a module `probe` with one table `probe_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, seq INTEGER NOT NULL, kind TEXT NOT NULL, who TEXT NOT NULL)`.
+
+| Test name | Assertions |
+|---|---|
+| `a flush stores events and advances matching projectors once` | A projector `p-tasks` for `task.integrated` inserts a row. Flush `run.created` and `task.integrated` for one run: the result is `{ stored: true, refused: 0 }`, `events({ runId, limit: 10 })` returns both in order, `probe_rows` has one row whose `seq` equals the stored `task.integrated` event's `seq`, and the projector's cursor equals the last stored `seq`. A second flush of the same list returns the same result and adds no event and no probe row. |
+| `an event stored before its projector existed is projected` | Flush two matching events with no projector. Register the projector and call `advance()`: the result is `{ projected: 2, pending: false }` and both rows exist, in `seq` order. Then append a third matching event directly with `store.write` and `appendEvent`, and flush that same event: the result is `{ stored: true, refused: 0 }` and its row exists once. |
+| `a projector failure rolls back its own batch only` | Projector `p-a` throws for the second of three matching events, after it wrote a row for the first. Projector `p-b` writes a row for each. After the flush: the result is `{ stored: true, refused: 0 }`, all three events are stored, `p-b` has three rows, `p-a` has none, and `p-a` has no cursor. After `p-a` stops throwing, `advance()` returns `{ projected: 3, pending: false }` and `p-a` has three rows in `seq` order. |
+| `an unavailable module is skipped and catches up later` | A module `broken` whose `migrate` throws is `unavailable`. With a projector on `broken`, a flush of a matching event returns `{ stored: true, refused: 0 }`, the event is stored, and `advance()` returns `pending: true`. After the store is closed and opened again with a `broken` module that migrates, a new outbox with the same projector name returns `{ projected: 1, pending: false }` from `advance()`. |
+| `an unavailable store leaves events waiting and reads none of them` | For a store opened with the wrong key, and for a closed store: a flush of an event whose `kind` getter counts its reads returns `{ stored: false, refused: 0 }` and the count is 0. `advance()` returns `{ projected: 0, pending: true }` with a projector registered beforehand on a ready store that was then closed. |
+| `a refused event is counted and does not block the others` | A list with a kind `Bad Kind`, an event whose data is over 16 KiB, an event whose `kind` getter throws, and one valid event gives `{ stored: true, refused: 3 }`, and only the valid event is stored. A list with only refused events gives `{ stored: true, refused: n }` and stores nothing. |
+| `an event is read once and only by its known fields` | A proxy counts every property read of an event: each of the eight known fields is read exactly once, and no other property is read. An event with an enumerable `extra` getter that throws is stored, and the getter was never called. An event whose `data.value` getter returns 1 on the first read and a BigInt on later reads is stored with `value` 1. The projector receives an event object with exactly the known fields and `seq`. |
+| `a prefix projector receives its kinds` | A projector with `kinds: ["duel."]` receives `duel.started` and `duel.resolved`, and does not receive `duels.other` or `run.created`. |
+| `projector registration is validated` | Each of these throws a `TypeError`: a name `Bad Name`, a repeated name, an unknown module, the module `store`, the module `event-outbox`, an empty `kinds`, 65 kinds, a kind `Bad Kind`, a prefix `.`, a prefix `duel..`, and a missing `project`. A projector with 64 kinds is accepted. Two projectors for one kind write their rows in registration order. |
+| `an async projector fails its own batch` | A projector writes a row and then returns a rejected promise. After the flush the events are stored, the projector has no row and no cursor, and no unhandled rejection is reported to the process. |
+| `advance works in pages` | Seven matching events are stored. `advance(3)` projects 3 with `pending: true` twice, and then 1 with `pending: false`. With three more events stored through the store, `advance(0)` projects exactly 1, because 0 is clamped to 1. With 501 more, `advance(9999)` projects 500 with `pending: true`, because the limit is clamped to 500. A page that holds only events the projector does not match projects 0 and moves the cursor to the page's last `seq`. |
+| `a cursor survives a restart` | After a flush advances a projector, the store is closed and opened again. A new outbox with the same projector returns `{ projected: 0, pending: false, blocked: [] }`, and a new matching event is projected once. No earlier event is projected again. |
+| `a changed definition blocks the projector` | A projector `p` for `run.created` advances past a stored `task.integrated` event. After a reopen, `p` registered for `task.integrated` is not run: `advance()` returns `pending: true` and `blocked: [{ name: "p", reason: "definition-changed" }]`, and its `project` was never called. The same name with the same module and the same kinds in another order is not blocked. The same name and kinds on another module is blocked. |
+| `a cursor beyond the event sequence blocks the projector` | A cursor row is written with `seq` 100 while the event table has one event. `advance()` returns `pending: true` and `blocked: [{ name, reason: "cursor-ahead" }]`, and nothing is projected. A cursor equal to the high-water mark, after the run that held the last events was deleted, is not blocked. |
+| `deleting a run records the events a projector never saw` | Two matching events and one non-matching event are stored for a run, with a projector registered and not advanced. `store.deleteRun(runId)` returns true. `store.describe().counts` then shows `event-outbox.lost` 2. `advance()` projects 0 with `pending: false`. A run deleted after its projector passed its events adds nothing to `lost`. |
+| `deleting a run counts every matching event when the cursor is not trusted` | With a cursor row moved above the high-water mark, a new matching event is stored and its run is deleted: `lost` rises by 1. With a projector whose stored definition differs from the registered one, a run with two events that the registered definition matches is deleted: `lost` rises by 2, and the stored `seq` and `definition` are unchanged. |
+| `a blocked projector is logged once` | With a blocked projector, three calls to `advance()` each list it in `blocked`, and `console.warn` was called once for it. |
+| `a second outbox on one store is refused` | `new EventOutbox(store)` twice on one store object throws a `TypeError` the second time. |
+| `an empty flush is a no-op` | An outbox over a stub store that counts every method call returns `{ stored: true, refused: 0 }` for `flush([])`, and no method was called after construction. |
+| `flush and advance never throw` | Each of these returns a result and does not throw: a closed store, a list that is not an array, a list that holds `null`, an array proxy whose `length` throws, a revoked proxy, a projector that throws a value that is not an `Error`, a flush called from inside a projector, and a store whose `status()` throws (a stub). |
+| `the event check matches appendEvent` | For a valid event, `eventProblem` is undefined, `appendEvent` stores it, and `events` reads back the same key, kind, and data. For a bad kind, `appendEvent` throws `invalid-event` with the message `The event envelope is invalid.`. For data with a cycle it throws `invalid-event` with `Event data must be a JSON object.`. For data over 16 KiB it throws `event-too-large` with `Event data is larger than 16 KiB.`. `eventProblem` returns the same code for each. For data whose getter counts its reads, `appendEvent` stores the value of the second read, as it did before this change. |
+
+In `tests/evidence-store.test.ts`:
+
+| Test name | Assertions |
+|---|---|
+| `a write that SQLite rolled back takes no further operation` | A module table has a unique column. In one write: insert row A; run `INSERT OR ROLLBACK` of a duplicate inside a `try`, and catch its error; then insert row B. The insert of B throws `invalid-statement`, the write fails, and neither A nor B is stored afterwards. After the rollback, `run`, `exec`, `get`, `all`, `seal`, `open`, `index`, `appendEvent`, and `eventsIn` each throw `invalid-statement`. |
+| `the transaction probe works without the runtime flag` | `transactionOpen`, exported for this test, is called with a stub connection that has no `isTransaction`. When `exec("BEGIN")` throws the nested-transaction error, it returns true. When `BEGIN` succeeds, it returns false and the stub received a `ROLLBACK`. When `BEGIN` throws any other error, it returns false. |
+| `a parameter that is not a plain value is refused` | `run`, `get`, and `all` each throw a `TypeError` for an object parameter, an array parameter, and a function parameter, and run nothing. With a named-binding object whose getter runs a conflicting `INSERT OR ROLLBACK`, the call throws, the getter was never called, and no row is committed. A `Uint8Array` parameter is stored, and changing the caller's array afterwards does not change the stored bytes. |
+| `module delete hooks see the run's events` | A module's `deleteRun` hook counts the run's rows in `run_events` and writes the count to its own table. After `deleteRun`, the stored count equals the events the run had, and the events are gone. With a second module whose hook throws, `deleteRun` returns false, the first hook's row is not stored, and the run's events remain. |
+| `events reads its query as before` | A query whose `runId` getter returns one id for its first three reads and another id afterwards returns the events of the second id, as it did before this slice. |
+
+- [ ] **Step 2: Run the tests and confirm they fail** for the reason each names.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `node --import tsx --test tests/evidence-outbox.test.ts tests/evidence-store.test.ts`, then `npm run typecheck -w @infinite/host`.
+- [ ] **Step 5: The coordinator runs `npm run check`, requests the independent review, and commits.**
+
+## Not in this slice
+
+- `Stored.outbox`, `emit`, and the flush calls in `TeamService`. They arrive with the run events.
+- Any projector. The projection slice registers the first one, and it starts from the beginning of the event table.
+- A scheduled `advance`. The run events slice calls it at start and on a timer.

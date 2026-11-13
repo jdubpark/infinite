@@ -3788,6 +3788,9 @@ export class TeamService {
       }
       run.members.push(next);
       this.linkReplacement(stored, next, member, "limit");
+      this.emitWith(stored, "task.limit-switched", [member.memberId], { memberId: member.memberId, taskId: member.taskId, revision: member.revision }, () => ({
+        role: member.role, fromProfileId: from.id, toProfileId: fallback.id,
+      }));
       this.event(stored, `${from.label} hit a ${name} ${kind}${resets ? ` (resets ${resets})` : ""}; ${task?.title ?? member.title} continues on ${fallback.label}${editing ? " with partial work preserved" : ""}.`);
     });
   }
@@ -4010,6 +4013,7 @@ export class TeamService {
       this.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.config.teams?.commandPrefix, signal), () => {
         scout.status = "complete"; scout.summary = report.summary; scout.evidence = report.evidence;
         this.event(stored, `${member.title} returned evidence without changing its working copy.`);
+        this.emitWith(stored, "scout.completed", [member.revision, scout.id], { memberId: member.memberId, taskId: scout.id, revision: member.revision }, () => ({}));
       }, member); return;
     }
     if (report.kind === "escalate") {
@@ -4019,6 +4023,9 @@ export class TeamService {
         throw new TeamError(409, "invalid-escalation", "An implementer may escalate once to a different profile in the approved escalation pool.");
       this.operation(stored, "result", signal => assertMemberScope(member.cwd, member.baseCommit, task.paths, this.config.teams?.commandPrefix, signal), () => {
         task.escalation = { ...(member.modelProfile ? { fromProfileId: member.modelProfile.id } : {}), toProfileId: profile.id, reason: report.reason, memberId: member.memberId, at: timestamp() };
+        this.emitWith(stored, "task.escalated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
+          fromProfileId: task.escalation?.fromProfileId, toProfileId: task.escalation?.toProfileId,
+        }));
         const next = this.newMember(run, "implementer", member.cwd, member.baseCommit, task.id, undefined, profile);
         next.prompt = teamPrompt(run, "implementer", task, `The previous implementer requested escalation: ${report.reason}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`, next.provider ?? run.provider, next.modelProfile);
         run.members.push(next); this.linkReplacement(stored, next, member, "escalation"); task.memberId = next.memberId; task.status = "running";
@@ -4289,6 +4296,9 @@ export class TeamService {
       if (task) {
         task.status = "integrated"; task.commit = commit; task.summary = report.summary; task.diffStat = diffStat(diff);
         if (changedPaths) task.changedPaths = changedPaths; else delete task.changedPaths;
+        this.emitWith(stored, "task.integrated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
+          commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,
+        }));
       }
       if (member.role === "implementer" || member.role === "integrator") this.retentionState(stored).integratedAt[member.memberId] = this.retentionNow();
       this.event(stored, `${member.title} reported a result; its validated changes were integrated.`);

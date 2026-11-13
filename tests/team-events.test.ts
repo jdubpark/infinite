@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { EventOutbox, type OutboxEvent } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
@@ -9,8 +9,9 @@ import type { RunEvent } from "../packages/host/src/evidence/types.js";
 import { MAX_OUTBOX_EVENTS } from "../packages/host/src/run-events.js";
 import { DEFAULT_TEAM_RETENTION, type TeamRun } from "../packages/host/src/team-types.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
+import { prepareMemberWorkspace } from "../packages/host/src/team-workspace.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
-import { mixedLineup } from "./team-fixture.js";
+import { limitLineup, mixedLineup } from "./team-fixture.js";
 
 const SUMMARY_KEYS = ["tasks", "integrated", "members", "round", "checks", "recoveries", "decisionsByOwner",
   "decisionsByCoordinator", "steering", "permissionEscalations", "continuations"];
@@ -854,5 +855,170 @@ test("a retired reviewer's stop is a host stop", async () => {
     const stops = memberStops(store, f.run.id, member.memberId);
     assert.equal(stops.length, 1);
     assert.deepEqual(stops[0]!.data, { v: 1, role: "reviewer", reason: "host", detail: "retired", reported: false });
+  } finally { store.close(); f.close(); }
+});
+
+/** A member's own clone at the run's base commit, prepared as a real attempt is. */
+async function memberClone(f: Fixture, memberId: string) {
+  return prepareMemberWorkspace(f.run.workspace, memberId, f.run.baseCommit, f.config.teams?.commandPrefix);
+}
+
+test("an integrated result records its commit, head, and diff counts", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
+    writeFileSync(join(cwd, "a.txt"), "one\n");
+    f.run.headCommit = f.run.baseCommit;
+    f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
+    const member = { ...f.run.members[0]!, memberId, role: "implementer" as const, taskId: "a", cwd, status: "reported" as const,
+      report: { kind: "result" as const, summary: "Wrote a.txt" } };
+    f.run.members = [member];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, member);
+    await waitFor(() => stored.pending === undefined, "the result is integrated");
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "task.integrated");
+    assert.ok(event, "task.integrated is stored");
+    assert.equal(event.memberId, memberId);
+    assert.equal(event.taskId, "a");
+    assert.equal(event.revision, 1);
+    const sealedTask = stored.run.tasks[0]!;
+    assert.equal(event.data.commit, sealedTask.commit);
+    assert.match(String(event.data.commit), /^[0-9a-f]{40}$/);
+    assert.equal(event.data.headCommit, stored.run.headCommit);
+    assert.equal(event.data.baseCommit, f.run.baseCommit);
+    assert.equal(event.data.memberBaseCommit, f.run.baseCommit);
+    assert.deepEqual(event.data.diff, { added: 1, removed: 0, files: 1, docs: false, tests: false });
+    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Wrote a.txt"), false, "a summary is never stored");
+    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("a.txt"), false, "owned paths are stored only by task.planned");
+  } finally { store.close(); f.close(); }
+});
+
+test("an empty result records no commit", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
+    f.run.headCommit = f.run.baseCommit;
+    f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
+    const member = { ...f.run.members[0]!, memberId, role: "implementer" as const, taskId: "a", cwd, status: "reported" as const,
+      report: { kind: "result" as const, summary: "Nothing to change" } };
+    f.run.members = [member];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, member);
+    await waitFor(() => stored.pending === undefined, "the empty result completes");
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "task.integrated");
+    assert.ok(event, "task.integrated is stored");
+    assert.equal("commit" in event.data, false);
+    assert.equal(event.data.headCommit, f.run.baseCommit);
+    assert.equal("diff" in event.data, false);
+  } finally { store.close(); f.close(); }
+});
+
+test("a completed scout records scout.completed", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.run.lineup = structuredClone(mixedLineup);
+    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
+    const member = { ...f.run.members[0]!, memberId, role: "scout" as const, taskId: "s1", cwd, status: "reported" as const,
+      report: { kind: "findings" as const, summary: "The parser reads paths", evidence: [] } };
+    f.run.members = [member];
+    f.run.discovery = { revision: f.run.revision, summary: "Scouts", tasks: [{ id: "s1", title: "Scout", instructions: "Read the parser",
+      agentProfileId: "spark-high", paths: [], dependsOn: [], status: "running", memberId }] };
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, member);
+    await waitFor(() => stored.pending === undefined, "the findings complete");
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "scout.completed");
+    assert.ok(event, "scout.completed is stored");
+    assert.equal(event.memberId, memberId);
+    assert.equal(event.taskId, "s1");
+    assert.deepEqual(event.data, { v: 1 });
+  } finally { store.close(); f.close(); }
+});
+
+test("an escalation records both profiles and links the new member", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    const escalation = { id: "astra-escalation", label: "Astra escalation", provider: "codex" as const, model: "gpt-6-astra", effort: "xhigh" as const, tier: "strong" as const };
+    f.run.lineup = { ...structuredClone(mixedLineup), escalations: [escalation] };
+    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
+    const profile = f.run.lineup.implementers[0]!;
+    f.run.headCommit = f.run.baseCommit;
+    f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
+    const member = { ...f.run.members[0]!, memberId, role: "implementer" as const, taskId: "a", cwd, provider: "opencode" as const,
+      modelProfile: profile, status: "reported" as const, report: { kind: "escalate" as const, reason: "Needs the stronger model", agentProfileId: escalation.id } };
+    // The escalating member is stopped by the time its replacement launches; the fixture's session must agree.
+    member.status = "stopped" as typeof member.status;
+    f.state.status = "exited";
+    f.run.members = [member];
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    scheduler.consume(stored, member);
+    await waitFor(() => stored.pending === undefined, "the escalation completes");
+    await teams.idle();
+    const [event] = eventsOfKind(store, f.run.id, "task.escalated");
+    assert.ok(event, "task.escalated is stored");
+    assert.equal(event.memberId, memberId);
+    assert.equal(event.taskId, "a");
+    assert.deepEqual(event.data, { v: 1, fromProfileId: "spark-high", toProfileId: escalation.id });
+    const sealed = f.readRecord<{ run: TeamRun; ledgerReplaces?: Record<string, unknown> }>("team", f.run.id);
+    const next = sealed.run.members.find(item => item.memberId !== memberId)!;
+    assert.deepEqual(sealed.ledgerReplaces?.[next.memberId], { memberId, cause: "escalation" });
+    await scheduler.step(scheduler.record(f.run.id));
+    await waitFor(() => eventsOfKind(store, f.run.id, "member.started").some(item => item.memberId === next.memberId), "the escalated member starts");
+    const [started] = eventsOfKind(store, f.run.id, "member.started").filter(item => item.memberId === next.memberId);
+    assert.deepEqual(started!.data.replaces, { memberId, cause: "escalation" });
+  } finally { store.close(); f.close(); }
+});
+
+test("a limit switch records both profiles and links the new member", async () => {
+  const f = schedulerFixture();
+  const store = openStore(f, f.key);
+  try {
+    f.run.lineup = structuredClone(limitLineup);
+    const memberId = randomUUID(), cwd = await memberClone(f, memberId);
+    const profile = f.run.lineup.implementers[0]!;
+    f.run.headCommit = f.run.baseCommit;
+    f.run.tasks = [{ id: "a", title: "Write a", instructions: "Write a.txt", paths: ["a.txt"], dependsOn: [], status: "running", memberId }];
+    const member = { ...f.run.members[0]!, memberId, role: "implementer" as const, taskId: "a", cwd, provider: "claude" as const,
+      modelProfile: profile, status: "running" as const, prompt: "Write a.txt" };
+    f.run.members = [member];
+    f.state.status = "exited";
+    f.writeTeam();
+    const teams = f.openTeam({ events: new EventOutbox(store) });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id) as { run: TeamRun; pending?: unknown };
+    const limit = { kind: "provider-limit", limit: "usage", confidence: "corroborated", provider: "claude", source: "protocol",
+      message: "Usage exhausted", at: new Date().toISOString(), seq: 0 };
+    await scheduler.switchLimitedMember(stored, member, limit);
+    await waitFor(() => stored.pending === undefined, "the limit switch completes");
+    await teams.idle();
+    const [switched] = eventsOfKind(store, f.run.id, "task.limit-switched");
+    assert.ok(switched, "task.limit-switched is stored");
+    assert.equal(switched.memberId, memberId);
+    assert.equal(switched.taskId, "a");
+    assert.deepEqual(switched.data, { v: 1, role: "implementer", fromProfileId: "haiku", toProfileId: "deepseek-light" });
+    const [stop] = memberStops(store, f.run.id, memberId);
+    assert.equal(stop!.data.reason, "limit");
+    assert.equal(JSON.stringify(allEvents(store, f.run.id)).includes("Usage exhausted"), false, "a provider's limit message is never stored");
+    const sealed = f.readRecord<{ run: TeamRun; ledgerReplaces?: Record<string, unknown> }>("team", f.run.id);
+    const next = sealed.run.members.find(item => item.memberId !== memberId)!;
+    assert.deepEqual(sealed.ledgerReplaces?.[next.memberId], { memberId, cause: "limit" });
   } finally { store.close(); f.close(); }
 });

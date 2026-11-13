@@ -23,6 +23,13 @@ colors:
   error: '#9d382a'
   terminal-surface: '#202923'
   terminal-ink: '#e4e9de'
+  instrument-canvas: '#1b2320'
+  instrument-ink: '#e6ebe3'
+  instrument-muted-ink: '#86938c'
+  state-needs-you: '#f2b23e'
+  state-in-review: '#6aaee6'
+  state-working: '#5ac98f'
+  state-fault: '#e5645a'
   glass: 'rgba(252,252,249,0.86)'
   glass-rim: 'rgba(34,42,39,0.10)'
   scrim: 'rgba(24,30,27,0.28)'
@@ -221,6 +228,8 @@ Forest green sits within a warm neutral palette; state colors identify actual op
 - **White** (`white`): primary-button text and the web composer interior.
 - **Placeholder** (`placeholder`): empty-field prompts on both clients.
 - **Terminal surface / ink** (`terminal-surface`, `terminal-ink`): the web terminal replay only.
+- **Instrument canvas / ink** (`instrument-canvas`, `instrument-ink`, `instrument-muted-ink`): the web Swarm view only. Its variables are scoped to that view.
+- **Agent state colours** (`state-needs-you`, `state-in-review`, `state-working`, `state-fault`): agent marks on the instrument canvas. Waiting, queued, reported, and stopped use neutral inks. Every state also has its own shape.
 
 Warnings use `warning-surface` with `warning-ink`; errors use `error`. Provider initials in the web overview have muted provider-specific fills. Those small identification accents do not define separate product themes.
 
@@ -300,6 +309,8 @@ A person runs a team through its coordinator, not its agents. Team agents leave 
 
 Native copy stays terse. Icons, counts, and chips carry state; sentences remain only where a decision or an honesty qualifier needs them, shortened to markers such as "agent claim", "not approval", and "Offline · last received".
 
+The web workspace navigation leads with Swarm, the landing view, followed by Sessions, Teams, Goals, and Cost.
+
 Web detail exposes Catch up, Full terminal, and Context. Native session detail exposes Chat, Activity, and Files; native team detail exposes Overview, Tasks, Agents, and Activity, with tasks as issue rows carrying an assignee avatar. Selected web tabs use the primary color and underline; the selected native segment is a raised lens. Labels stay in sentence case. The back control returns to the list.
 
 ### Session Record and Composer
@@ -307,6 +318,16 @@ Web detail exposes Catch up, Full terminal, and Context. Native session detail e
 The session heading starts with the title, then provider and process state. Execution location and process ID remain nearby. Web catch-up pairs the current screen with recent control activity and labels stale snapshots. Native detail includes the host address and successful check time. Connection warnings remain distinct from the process state shown in the record.
 
 A delivery receipt sits immediately above the composer. It describes delivery to the terminal and explicitly leaves agent execution unconfirmed. View-only devices do not receive active steering controls. Context carries its version and source explanation. These labels are part of the visual hierarchy because they determine how confidently the user can act.
+
+### Swarm View
+
+The Swarm view is the web client's instrument surface: a dark canvas, monospace labels, marks and numerals in place of prose. It is the one web view that leaves the paper sheet, and its palette is scoped to it. See [Swarm view](docs/swarm.md) for what each mark means.
+
+The canvas is flat content that runs edge to edge: lanes, tiles, and graph nodes carry no shadow and no blur. Controls that act on the whole view float above it as glass and content scrolls under them: the vitals strip, the view switch, the focus toggle, the legend, and the inspector. Web glass is a translucent fill with backdrop blur and saturation, a light rim with a brighter top edge, and one shared lift. Shapes are capsules. Glass never sits on glass. With reduced transparency, or without backdrop-filter support, glass becomes an opaque fill with the same rim.
+
+Agent state is carried by shape and colour together: filled disc for working, half disc for waiting, ringed disc with a mark for needs you, ringed disc for in review, dashed outline for queued, hollow disc for reported, small square for stopped, diamond for fault. The legend is always visible, each mark has an accessible name, and its tooltip states the state in words. This is how the view meets the State With Words rule while staying nearly free of text.
+
+Every region keeps its size. A blank slot keeps its space, rows keep their order between polls, and graph nodes keep their position when only state changes. A stale feed dims the canvas and fills a status slot that is always present.
 
 ## Do's and Don'ts
 
@@ -326,5 +347,6 @@ A delivery receipt sits immediately above the composer. It describes delivery to
 - **Don't** remove stale-view warnings while displaying cached session content.
 - **Don't** insert or remove lines, banners, or words in the flow for a temporary state such as loading, sending, a single failed poll, or a fresh receipt. Content should not jump up and down.
 - **Don't** substitute provider-colored page themes for the shared palette.
-- **Don't** treat the terminal’s dark surface as a delivered dark app theme.
+- **Don't** treat the terminal’s dark surface or the Swarm instrument canvas as a delivered dark app theme. The instrument canvas belongs to the Swarm view only.
+- **Don't** put glass on Swarm content, draw an agent state with colour alone, or let a Swarm mark imply completion, approval, or a merge.
 - **Don't** describe the inferred working-journal direction or seed assignment as user-approved visual identity.

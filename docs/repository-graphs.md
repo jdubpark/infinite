@@ -38,3 +38,23 @@ Nearby requests coalesce by project-root authority and lane. A newer head arrivi
 The last-good graph remains under the cache directory assigned to the configured builder identity. A member prompt includes a graph path only when its receipt head equals the member's prepared commit; otherwise it marks the graph unavailable or stale and directs the member to inspect source directly.
 
 Owners can read the bounded in-memory receipts at `GET /api/projects/:id/graph`. The response includes an enabled flag and receipts with lane, requested and successful heads, status, graph path, and refresh counts; receipts omit the source checkout path. The endpoint reports disabled when graph refresh is not configured or the project is outside the configured project filter.
+
+## Code map
+
+Each `ready` and `unchanged` builder receipt can carry a `map`. The builder reduces the graph file to directories, so the API process never opens a graph file. The map has three keys: `areas`, `links`, and `truncated`.
+
+- An area is a source file's directory, cut to the deepest depth that keeps at most 120 areas. The root directory is `.`. If even depth 1 has more than 120 areas, the 119 areas with the most symbols are kept and the rest fold into `other`.
+- Each area reports `files` (distinct source files) and `symbols` (graph nodes). External nodes and nodes without a relative `source_file` are skipped.
+- A link counts the graph edges whose ends fall in two different areas. Links are undirected, and the 400 heaviest are kept.
+- A map whose compact JSON exceeds 262144 bytes is dropped, and the receipt carries `mapStatus: "too-large"` instead.
+- A missing, unreadable, or malformed graph file produces no map. The receipt is otherwise unchanged.
+- The host parses the map with a strict schema. A map with unknown keys, more than 120 areas, more than 400 links, IDs that are longer than 300 characters or are not relative paths, or non-integer counts is dropped, and the receipt is kept. A directory name longer than 300 characters therefore drops the whole map.
+- The host checks the serialized size itself: a map over 262144 bytes is dropped and reported as `too-large`, whatever the builder says.
+- `status()` omits the map. The owner receipt endpoint stays small.
+
+Two host lookups read the map from memory:
+
+- `codeMap(projectId, lane)` returns the last authorized receipt of that lane that carried a map or reported `too-large`. A later failed or busy refresh does not clear it. A run lane with no such receipt falls back to the shared lane, and the response's `lane` names the lane used. The result is `disabled` for a project outside the graph filter, `unavailable` with `none-built`, or `unavailable` with `too-large`.
+- `areas(projectId)` returns the shared-lane area IDs, or `undefined` when the shared lane has no usable map.
+
+The HTTP endpoint is `GET /api/projects/:id/graph/map?lane=`. Its `lane` is `shared` (the default) or `run-<team id>`. Every paired role may read it, and it is admitted over the relay. It answers `disabled` when repository graphs are not configured. The web client's [Swarm view](swarm.md) reads the shared lane. Maps are kept in memory only: after a host restart the shared lane returns with startup reconciliation, and a run lane returns when one of its members next launches.

@@ -14,6 +14,8 @@ separate acceptance checks. See [Infinite Desktop](docs/desktop.md).
 
 The phone prototype uses a fixed light theme in both OS appearance modes. Phone layouts and enlarged Android text are in scope for that client; a native dark palette, tablet-specific layout, and iPhone native runtime verification remain future work.
 
+The web client opens on the Swarm view, a read-only, agent-centric picture of the active machine: every team run on its stage lanes, every agent as a tile, and the swarm linked to the code areas its agents touched. The phone remains the project and workspace view. See [Swarm view](docs/swarm.md).
+
 ## Stack
 React Native selected by the user for the phone. Implementation: TypeScript,
 Node.js worker host, React web client, Expo phone client, and SwiftUI/CryptoKit Mac

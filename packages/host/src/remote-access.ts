@@ -56,6 +56,10 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   const mission = /^\/api\/missions\/([^/]+)(?:\/(steer|pause|resume|cancel|answer\/([^/]+)))?$/.exec(url.pathname);
   if (mission && UUID.test(mission[1])) return method === "GET" ? !mission[2]
     : method === "POST" && Boolean(mission[2]) && (!mission[3] || UUID.test(mission[3]));
+  // Read-only context for the Swarm graph: directory names, file paths and counts, the class of data the file listing and session events already serve.
+  const teamContext = /^\/api\/teams\/([^/]+)\/context$/.exec(url.pathname);
+  if (teamContext) return method === "GET" && UUID.test(teamContext[1]);
+  if (method === "GET" && /^\/api\/projects\/[a-z0-9-]{1,80}\/graph\/map$/.test(url.pathname)) return true;
   const team = /^\/api\/teams\/([^/]+)(?:\/(steer|pause|resume|continue|cancel|decisions\/([^/]+)\/answer))?$/.exec(url.pathname);
   if (team && UUID.test(team[1])) return method === "GET" ? !team[2]
     : method === "POST" && Boolean(team[2]) && (!team[3] || UUID.test(team[3]));
@@ -72,7 +76,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (upload && UUID.test(upload[1]) && (upload[2] ? method === "POST" : ["PUT", "DELETE"].includes(method))) return true;
   const match = /^\/api\/sessions\/([^/]+)(?:\/([^/]+))?$/.exec(url.pathname);
   if (!match || !UUID.test(match[1])) return false;
-  return method === "GET" ? [undefined, "events", "messages", "summary", "file", "handoff"].includes(match[2])
+  return method === "GET" ? [undefined, "events", "messages", "summary", "file", "handoff", "context"].includes(match[2])
     : method === "DELETE" ? match[2] === undefined
       : method === "POST" && ["control", "input", "answer", "key", "stop", "resize", "resume", "archive"].includes(match[2]);
 }

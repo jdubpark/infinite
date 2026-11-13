@@ -1,0 +1,323 @@
+/*
+ * Swarm view: the instrument surface. These variables are scoped to `.swarm`, so the
+ * rest of the client keeps the paper palette. State colours pass the colour-vision
+ * separation and 3:1 contrast checks against the canvas; shape carries the same state.
+ */
+.swarm {
+  --sw-canvas: #1b2320;
+  --sw-raised: rgba(236, 242, 236, 0.04);
+  --sw-raised-2: rgba(236, 242, 236, 0.07);
+  --sw-ink: #e6ebe3;
+  --sw-ink-2: #a9b5ad;
+  --sw-ink-3: #86938c;
+  --sw-rule: rgba(230, 235, 227, 0.09);
+  --sw-rule-2: rgba(230, 235, 227, 0.16);
+
+  --sw-needs: #f2b23e;
+  --sw-review: #6aaee6;
+  --sw-working: #5ac98f;
+  --sw-waiting: #a9b5ad;
+  --sw-queued: #86938c;
+  --sw-reported: #c9d2cb;
+  --sw-stopped: #6b7871;
+  --sw-fault: #e5645a;
+
+  --sw-glass: rgba(236, 242, 236, 0.075);
+  --sw-glass-strong: rgba(236, 242, 236, 0.16);
+  --sw-glass-opaque: #28322d;
+  --sw-glass-rim: rgba(236, 242, 236, 0.14);
+  --sw-glass-edge: rgba(255, 255, 255, 0.26);
+  --sw-lift: 0 12px 32px rgba(0, 0, 0, 0.34), 0 2px 6px rgba(0, 0, 0, 0.22);
+
+  --sw-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sw-sans: "Instrument Sans", sans-serif;
+  --sw-inset-top: 86px;
+  --sw-inset-bottom: 88px;
+
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  container: swarm / inline-size;
+  color: var(--sw-ink);
+  font-family: var(--sw-mono);
+  font-size: 12px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+  background:
+    radial-gradient(1100px 560px at 14% -12%, rgba(90, 201, 143, 0.11), transparent 62%),
+    radial-gradient(900px 520px at 104% 112%, rgba(106, 174, 230, 0.09), transparent 60%),
+    var(--sw-canvas);
+}
+.swarm *:focus-visible {
+  outline: 2px solid var(--sw-review);
+  outline-offset: 2px;
+}
+
+/* Content runs edge to edge and scrolls under the glass. The inset keeps it clear at rest. */
+.sw-canvas {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  padding: var(--sw-inset-top) 28px var(--sw-inset-bottom);
+  transition: opacity 200ms ease-out;
+}
+.swarm.sw-stale .sw-canvas {
+  opacity: 0.55;
+}
+
+/* Glass: controls only. A translucent fill, blur, a light rim with a brighter top edge, one shared lift. */
+.sw-glass {
+  position: relative;
+  background: var(--sw-glass);
+  border: 1px solid var(--sw-glass-rim);
+  border-radius: 22px;
+  box-shadow: var(--sw-lift);
+  -webkit-backdrop-filter: blur(20px) saturate(170%);
+  backdrop-filter: blur(20px) saturate(170%);
+}
+.sw-glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(180deg, var(--sw-glass-edge), transparent 42%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  pointer-events: none;
+}
+.sw-capsule {
+  border-radius: 999px;
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .sw-glass { background: var(--sw-glass-opaque); }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .sw-glass {
+    background: var(--sw-glass-opaque);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+/* Floating bars. The bars pass clicks through; their capsules take them. */
+.sw-top,
+.sw-bottom {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  pointer-events: none;
+}
+.sw-top { top: 14px; }
+.sw-bottom { bottom: 14px; align-items: flex-end; }
+.sw-top > *,
+.sw-bottom > * {
+  pointer-events: auto;
+}
+.sw-spacer { flex: 1; }
+
+/* Vitals: numerals and marks in fixed slots. */
+.sw-vitals {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 46px;
+  padding: 0 18px;
+  min-width: 0;
+  white-space: nowrap;
+}
+.sw-vital {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--sw-ink);
+}
+.sw-vital small {
+  color: var(--sw-ink-3);
+  font-size: 11px;
+}
+.sw-vital-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--sw-rule-2);
+}
+.sw-status-slot {
+  min-width: 78px;
+  text-align: right;
+  color: var(--sw-ink-3);
+}
+.sw-stale .sw-status-slot {
+  color: var(--sw-needs);
+}
+
+/* Segmented view switch: the selected segment is a brighter lens. */
+.sw-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 46px;
+  padding: 4px;
+}
+.sw-switch button {
+  height: 38px;
+  min-width: 68px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--sw-ink-2);
+  font-family: var(--sw-mono);
+  font-size: 12px;
+}
+.sw-switch button[aria-pressed="true"] {
+  background: var(--sw-glass-strong);
+  color: var(--sw-ink);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+.sw-icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 999px;
+  color: var(--sw-ink-2);
+  cursor: pointer;
+}
+button.sw-glass { font: inherit; color: inherit; }
+
+/* Legend and inspector: one line each, always present. */
+.sw-legend {
+  flex: none;
+  max-width: 62%;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  min-height: 44px;
+  padding: 8px 16px;
+  color: var(--sw-ink-2);
+  font-size: 11px;
+}
+.sw-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.sw-inspector {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 46px;
+  padding: 0 8px 0 18px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sw-inspector-empty {
+  color: var(--sw-ink-3);
+}
+.sw-inspector-fact {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sw-inspector-fact small { color: var(--sw-ink-3); }
+.sw-inspector-links {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 4px;
+}
+.sw-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 34px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--sw-glass-strong);
+  color: var(--sw-ink);
+  font-family: var(--sw-mono);
+  font-size: 11px;
+}
+
+/* Marks. */
+.sw-mark { flex: none; display: block; overflow: visible; }
+.sw-mark-needs-you { color: var(--sw-needs); }
+.sw-mark-in-review { color: var(--sw-review); }
+.sw-mark-working { color: var(--sw-working); }
+.sw-mark-waiting { color: var(--sw-waiting); }
+.sw-mark-queued { color: var(--sw-queued); }
+.sw-mark-reported { color: var(--sw-reported); }
+.sw-mark-stopped { color: var(--sw-stopped); }
+.sw-mark-fault { color: var(--sw-fault); }
+.sw-mark-cut { stroke: var(--sw-canvas); fill: none; }
+.sw-mark-ring { fill: none; stroke: currentColor; stroke-width: 1; opacity: 0; transform-origin: 8px 8px; }
+@media (prefers-reduced-motion: no-preference) {
+  .sw-pulse .sw-mark-ring { animation: sw-ring 2.4s ease-out infinite; }
+}
+@keyframes sw-ring {
+  0% { opacity: 0.55; transform: scale(0.66); }
+  100% { opacity: 0; transform: scale(1.05); }
+}
+.sw-role {
+  display: inline-block;
+  min-width: 20px;
+  color: var(--sw-ink-2);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-decoration: none;
+  text-align: center;
+}
+
+/* Shared text roles. */
+.sw-title {
+  font-family: var(--sw-sans);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--sw-ink);
+}
+.sw-dim { color: var(--sw-ink-3); }
+.sw-num { color: var(--sw-ink); }
+
+/* The view carries its own freshness slot, so the paper top bar steps aside at desktop width. */
+@media (min-width: 701px) {
+  .app.swarm-shown .topbar {
+    display: none;
+  }
+}
+/* Focus mode hides the sidebar for wallboard use. */
+.app.swarm-focus {
+  grid-template-columns: minmax(0, 1fr);
+}
+.app.swarm-focus .sidebar,
+.app.swarm-focus .topbar {
+  display: none;
+}
+
+/* Narrow canvas: the switch drops under the vitals and the legend stacks over the inspector. */
+@container swarm (max-width: 1040px) {
+  .sw-canvas { padding: 142px 16px 150px; }
+  .sw-top { flex-wrap: wrap; row-gap: 8px; }
+  .sw-top > .sw-spacer { display: none; }
+  .sw-vitals { flex: 1 1 100%; gap: 12px; padding: 0 14px; overflow: hidden; }
+  .sw-switch { margin-left: auto; }
+  .sw-bottom { flex-direction: column; align-items: stretch; gap: 8px; }
+  .sw-legend { max-width: none; }
+  .sw-inspector { flex: none; }
+}
+@container swarm (max-width: 640px) {
+  .sw-vitals { overflow-x: auto; }
+  .sw-meter-vital { display: none; }
+}

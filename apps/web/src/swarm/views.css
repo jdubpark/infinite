@@ -1,0 +1,410 @@
+/*
+ * Layout for the Lanes and Wall views and the shell's vitals, meters, and inspector.
+ * Colour comes only from the --sw-* tokens in swarm.css. Lanes, rows, and tiles are flat:
+ * no shadows and no blur. Every slot has a fixed size so state changes never move content.
+ */
+
+.sw-lanes,
+.sw-wall {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* Lanes: one row per unit on fixed stage columns. */
+.sw-lane-row {
+  display: grid;
+  grid-template-columns: 160px repeat(7, minmax(72px, 1fr)) 156px;
+  align-items: center;
+  height: 56px;
+  min-width: 0;
+}
+.sw-lane-head {
+  height: 24px;
+}
+.sw-stage-label {
+  text-align: center;
+}
+.sw-lane-swarm {
+  margin-top: 26px;
+}
+.sw-solo-row {
+  height: 36px;
+}
+.sw-side {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  margin-right: 6px;
+}
+.sw-swarm-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 32px;
+  min-width: 0;
+}
+.sw-swarm-kind {
+  font-size: 11px;
+}
+.sw-count {
+  min-width: 9ch;
+  text-align: right;
+}
+.sw-cost {
+  min-width: 6ch;
+  text-align: right;
+}
+.sw-lane-label {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+  height: 100%;
+  padding-right: 12px;
+}
+.sw-unit-title {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--sw-ink);
+  font: inherit;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.sw-unit-title[aria-pressed="true"] {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.sw-unit-sub {
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sw-dep {
+  color: var(--sw-ink-3);
+}
+.sw-stage {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 100%;
+  min-width: 0;
+  padding: 0 4px;
+  overflow: hidden;
+}
+/* The track: a 2 px line through the cells, brighter up to the reached stage. */
+.sw-stage::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  margin-top: -1px;
+  background: var(--sw-rule-2);
+}
+.sw-stage.sw-reached::before {
+  background: var(--sw-ink-3);
+}
+/* The active stage carries a lens behind its marks. */
+.sw-stage.sw-active::after {
+  content: "";
+  position: absolute;
+  inset: 6px 2px;
+  z-index: -1;
+  border-radius: 10px;
+  background: var(--sw-raised-2);
+}
+.sw-stage > * {
+  position: relative;
+}
+.sw-lane-end {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+.sw-glyph-slot {
+  display: inline-flex;
+  flex: none;
+  justify-content: center;
+  width: 14px;
+}
+.sw-slots {
+  min-width: 3ch;
+  text-align: right;
+}
+.sw-more {
+  color: var(--sw-ink-3);
+  font-size: 11px;
+}
+.sw-marks {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+.sw-marks-row {
+  grid-column: 2 / 10;
+}
+
+/* Agent marks are buttons with the mark inside; the focus ring comes from swarm.css. */
+.sw-agent {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.sw-agent[aria-pressed="true"] {
+  background: var(--sw-glass-strong);
+}
+.sw-agent-earlier {
+  opacity: 0.55;
+}
+
+/* Check squares: passed filled, failed filled in the fault colour, running outlined. */
+.sw-checks {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+}
+.sw-check {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  box-sizing: border-box;
+  border-radius: 2px;
+}
+.sw-check-passed {
+  background: var(--sw-working);
+}
+.sw-check-failed {
+  background: var(--sw-fault);
+}
+.sw-check-running {
+  border: 1px solid var(--sw-ink-2);
+}
+
+/* Hold and terminal glyphs. Each keeps its own colour; the shape carries the meaning. */
+.sw-glyph {
+  display: inline-flex;
+  flex: none;
+}
+.sw-glyph-input { color: var(--sw-needs); }
+.sw-glyph-paused { color: var(--sw-waiting); }
+.sw-glyph-blocked { color: var(--sw-fault); }
+.sw-glyph-review-ready { color: var(--sw-review); }
+.sw-glyph-merge-reported { color: var(--sw-reported); }
+.sw-glyph-no-change,
+.sw-glyph-cancelled { color: var(--sw-stopped); }
+
+/* Quiet and ghost rows: one collapsed row each. */
+.sw-quiet {
+  display: flex;
+  flex-direction: column;
+  margin-top: 20px;
+}
+.sw-quiet-row {
+  height: 32px;
+}
+.sw-quiet-cell {
+  grid-column: 2 / 10;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.sw-ghost-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sw-group-label,
+.sw-older {
+  height: 24px;
+  line-height: 24px;
+}
+
+/* Wall: fixed tiles on an auto-fill grid. */
+.sw-wall-swarm {
+  margin-top: 22px;
+}
+.sw-wall-swarm:first-of-type {
+  margin-top: 6px;
+}
+.sw-wall-sections {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 26px;
+  margin-top: 10px;
+}
+.sw-wall-section {
+  min-width: 0;
+}
+.sw-wall-note {
+  height: 16px;
+  font-size: 11px;
+  text-align: right;
+}
+.sw-wall-unit {
+  height: 20px;
+  line-height: 20px;
+}
+.sw-wall-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.sw-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 132px;
+  height: 116px;
+  padding: 10px;
+  overflow: hidden;
+  border: 1px solid var(--sw-rule);
+  border-radius: 14px;
+  background: var(--sw-raised);
+  color: var(--sw-ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sw-tile[aria-pressed="true"] {
+  border-color: var(--sw-rule-2);
+  background: var(--sw-raised-2);
+}
+.sw-tile.sw-tile-needs {
+  border-color: var(--sw-needs);
+}
+.sw-tile-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 16px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sw-tile-band {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 18px;
+  overflow: hidden;
+}
+.sw-bar {
+  flex: none;
+  width: 2px;
+  background: var(--sw-ink-3);
+}
+.sw-model,
+.sw-tool {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sw-tool {
+  flex: 1;
+}
+.sw-age {
+  min-width: 3ch;
+  text-align: right;
+}
+.sw-tag {
+  flex: none;
+  padding: 0 3px;
+  border: 1px solid var(--sw-rule-2);
+  border-radius: 4px;
+  color: var(--sw-ink-3);
+  font-size: 10px;
+  line-height: 14px;
+}
+
+/* Vitals and meters. */
+.sw-count {
+  display: inline-block;
+}
+.sw-vital .sw-count {
+  min-width: 2ch;
+  text-align: right;
+}
+.sw-vital.sw-dim .sw-mark {
+  opacity: 0.4;
+}
+.sw-vital .sw-cost {
+  min-width: 5ch;
+}
+.sw-meter-vital {
+  gap: 6px;
+}
+.sw-meter {
+  display: inline-block;
+  width: 44px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--sw-rule-2);
+  overflow: hidden;
+}
+.sw-meter > span {
+  display: block;
+  height: 100%;
+  background: var(--sw-ink-2);
+}
+.sw-meter-vital.sw-dim .sw-meter > span {
+  background: none;
+}
+.sw-flag {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--sw-needs);
+  border-radius: 999px;
+  color: var(--sw-needs);
+  font-size: 11px;
+  line-height: 18px;
+}
+.sw-inspector-fact .sw-dim {
+  color: var(--sw-ink-3);
+}
+
+/* Empty canvas: a centred line and an optional action. */
+.sw-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}

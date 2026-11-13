@@ -95,6 +95,8 @@ export interface Project {
   teamworkDir?: string;
   /** Where the host's copy of this project comes from: GitHub (followed by the host) or laptop workspace sync. Absent means laptop. */
   source?: import("./team-types.js").ProjectSource;
+  /** Effective autonomy mode of an applied enrollment. Set only by RepoEnrollmentService; read with autonomyOf(). */
+  autonomy?: import("./autonomy.js").AutonomyMode;
 }
 export interface AgentProfile {
   command: string;
@@ -124,6 +126,8 @@ export interface Config {
     storageFloor?: import("./team-types.js").StorageFloor;
   };
   machine?: { id: string; label: string };
+  /** Operator default for an enrollment that has no saved mode. Only defaultMode exists in this block so far. */
+  autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
   /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */

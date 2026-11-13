@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
+import { createServer, type AddressInfo } from "node:net";
 import { SlackClient, SlackError, type SlackEnvelope } from "../packages/host/src/slack-client.js";
 import type { IntakeThread } from "../packages/host/src/intake-types.js";
 import { startSlackServer } from "./fixtures/slack-server.js";
@@ -40,6 +41,20 @@ test("thread pages through replies and keeps the outbound key", async t => {
   assert.equal(last.ts, ts);
   assert.equal(last.text, "bot reply");
   assert.equal(last.key, "k");
+});
+
+test("the root carries the binding's timestamp and a post sorts after explicitly timed replies", async t => {
+  const { slack, client } = await setup();
+  t.after(() => slack.close());
+  slack.seedThread(binding, [{ user: "U00000000", text: "root" }, { user: "U00000000", text: "later", ts: "1700000900.000000" }]);
+  const { ts } = await client.post(binding, "reply", "k");
+  const messages = await client.thread(binding);
+  assert.ok(messages !== "unreadable");
+  assert.equal(messages[0].ts, binding.threadTs);
+  assert.equal(messages[0].text, "root");
+  assert.equal(messages[1].ts, "1700000900.000000");
+  assert.equal(messages.at(-1)?.ts, ts);
+  assert.ok(Number(ts) > 1700000900);
 });
 
 test("a long thread keeps the root and the newest 999 replies, oldest first", async t => {
@@ -127,15 +142,41 @@ test("the client reconnects after the socket drops", async t => {
   assert.equal(received.at(-1)?.event?.type, "app_mention");
 });
 
-test("a socket address outside Slack is refused", async t => {
+test("a socket address outside Slack is refused before any TCP connection", async t => {
   const { slack, client } = await setup();
   t.after(() => slack.close());
-  slack.returnSocketAddress("wss://example.invalid/");
+  // A raw TCP listener on loopback counts every connection attempt. A client without the address check would dial it.
+  let attempts = 0;
+  const forbidden = createServer(socket => { attempts++; socket.destroy(); });
+  await new Promise<void>(resolve => forbidden.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>(resolve => forbidden.close(() => resolve())));
+  const { port } = forbidden.address() as AddressInfo;
+  slack.returnSocketAddress(`wss://127.0.0.1:${port}/`);
   const connection = client.connect(async () => undefined);
   t.after(() => connection.close());
-  await delay(300);
+  await delay(500);
   assert.equal(connection.connected(), false);
-  assert.equal(slack.socketOpens(), 0);
+  assert.equal(attempts, 0);
+});
+
+test("an envelope of another type reaches the handler and is acknowledged only when the handler resolves", async t => {
+  const { slack, client } = await setup();
+  t.after(() => slack.close());
+  let fail = false;
+  const seen: SlackEnvelope[] = [];
+  const connection = client.connect(async envelope => { seen.push(envelope); if (fail) throw new Error("handler failed"); });
+  t.after(() => connection.close());
+  await waitFor(async () => connection.connected(), connected => connected);
+  const first = await slack.emitRaw("interactive", { type: "block_actions" });
+  await waitFor(async () => slack.acks(), acks => acks.includes(first));
+  const delivered = seen.find(envelope => envelope.envelopeId === first);
+  assert.ok(delivered);
+  assert.equal(delivered.event, undefined);
+  fail = true;
+  const second = await slack.emitRaw("slash_commands", { command: "/infinite" });
+  await waitFor(async () => seen.map(envelope => envelope.envelopeId), ids => ids.includes(second));
+  await delay(200);
+  assert.ok(!slack.acks().includes(second));
 });
 
 test("tokens are read from their files on every call", async t => {

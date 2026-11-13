@@ -12,8 +12,12 @@ interface StoredMessage {
 }
 
 const bindingKey = (channelId: string, threadTs: string) => `${channelId}:${threadTs}`;
-/** Slack timestamps are strictly increasing in fixture order, so pages and posts sort the way Slack sorts them. */
-const tsFor = (n: number) => `${1_700_000_000 + n}.${String(n).padStart(6, "0")}`;
+/** Slack timestamps are microseconds since the epoch written as `seconds.micros`; comparing them as integers keeps order exact. */
+const toMicros = (ts: string) => {
+  const [seconds, fraction = ""] = ts.split(".");
+  return Number(seconds) * 1_000_000 + Number(fraction.padEnd(6, "0").slice(0, 6));
+};
+const fromMicros = (micros: number) => `${Math.floor(micros / 1_000_000)}.${String(micros % 1_000_000).padStart(6, "0")}`;
 
 /** A loopback fake of the Slack Web API and Socket Mode, with the failure modes the intake client must survive. */
 export async function startSlackServer(options: { teamId?: string; botUserId?: string } = {}) {
@@ -26,7 +30,10 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
   writeFileSync(appTokenFile, `${appToken}\n`, { mode: 0o600 });
   writeFileSync(botTokenFile, `${botToken}\n`, { mode: 0o600 });
 
-  let counter = 0;
+  // One clock for the whole fixture: every generated timestamp is later than every timestamp already in use.
+  let latest = toMicros("1700000000.000000");
+  const nextTs = () => fromMicros(++latest);
+  const observe = (ts: string) => { latest = Math.max(latest, toMicros(ts)); };
   const threads = new Map<string, StoredMessage[]>();
   const hidden = new Set<string>();
   const posts: StoredMessage[] = [];
@@ -34,7 +41,6 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
   const acked: string[] = [];
   const sent = new Map<string, string>();
   const sockets = new Set<WebSocket>();
-  let socketOpens = 0;
   let socketAddress: string | undefined;
   let loseNext = false, down = false, limited = false;
 
@@ -76,7 +82,7 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
         }
         case "chat.postMessage": {
           const message: StoredMessage = {
-            channel: body.channel, threadTs: body.thread_ts, ts: tsFor(++counter), text: body.text,
+            channel: body.channel, threadTs: body.thread_ts, ts: nextTs(), text: body.text,
             user: botUserId, botId, metadata: body.metadata,
           };
           // The post is stored before a lost response is dropped, so a retry can find it.
@@ -96,7 +102,6 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
 
   const socketServer = new WebSocketServer({ server: httpServer, path: "/socket" });
   socketServer.on("connection", socket => {
-    socketOpens++;
     sockets.add(socket);
     socket.on("message", raw => {
       const frame = JSON.parse(String(raw));
@@ -114,16 +119,29 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
   const endpoint = `http://127.0.0.1:${port}/api`;
 
   const connected = () => [...sockets].find(socket => socket.readyState === WebSocket.OPEN);
+  const sendFrame = async (envelopeId: string, frame: string) => {
+    const socket = connected();
+    if (!socket) throw new Error("No Slack Socket Mode connection is open");
+    sent.set(envelopeId, frame);
+    await new Promise<void>((resolve, reject) => socket.send(frame, error => error ? reject(error) : resolve()));
+    return envelopeId;
+  };
 
   return {
     endpoint, appTokenFile, botTokenFile, teamId, botUserId, botId,
-    /** Seeds a thread whose replies Slack would return. Timestamps are generated unless given. */
+    /**
+     * Seeds a thread whose replies Slack would return. The first message of an empty thread without a `ts` is the root
+     * and takes the binding's thread timestamp. Other messages without a `ts` get a timestamp later than every timestamp
+     * already in use, so they sort after everything seeded or posted before them.
+     */
     seedThread(binding: IntakeThread, messages: { user?: string; botId?: string; text: string; ts?: string; key?: string }[]) {
       const key = bindingKey(binding.channelId, binding.threadTs);
       const list = threads.get(key) ?? [];
       for (const message of messages) {
+        const ts = message.ts ?? (list.length === 0 ? binding.threadTs : nextTs());
+        observe(ts);
         list.push({
-          channel: binding.channelId, threadTs: binding.threadTs, ts: message.ts ?? tsFor(++counter), text: message.text,
+          channel: binding.channelId, threadTs: binding.threadTs, ts, text: message.text,
           ...(message.user ? { user: message.user } : {}), ...(message.botId ? { botId: message.botId } : {}),
           ...(message.key ? { metadata: { event_type: "infinite_intake", event_payload: { key: message.key } } } : {}),
         });
@@ -138,24 +156,23 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
     },
     /** Sends an events_api envelope on the open Socket Mode connection and resolves with its envelope ID once sent. */
     async emit(event: Record<string, unknown>, emitOptions: { teamId?: string; eventId?: string } = {}) {
-      const socket = connected();
-      if (!socket) throw new Error("No Slack Socket Mode connection is open");
       const envelopeId = randomUUID();
-      const frame = JSON.stringify({
+      return sendFrame(envelopeId, JSON.stringify({
         envelope_id: envelopeId, type: "events_api", accepts_response_payload: false,
         payload: { type: "event_callback", team_id: emitOptions.teamId ?? teamId, event_id: emitOptions.eventId ?? `Ev${randomUUID()}`, event },
-      });
-      sent.set(envelopeId, frame);
-      await new Promise<void>((resolve, reject) => socket.send(frame, error => error ? reject(error) : resolve()));
-      return envelopeId;
+      }));
+    },
+    /** Sends an envelope of any Socket Mode type with the given payload, for envelopes other than events_api. */
+    async emitRaw(type: string, payload: Record<string, unknown> = {}) {
+      const envelopeId = randomUUID();
+      return sendFrame(envelopeId, JSON.stringify({ envelope_id: envelopeId, type, accepts_response_payload: false, payload }));
     },
     acks() { return [...acked]; },
     /** Sends the same envelope again, as Slack does for an envelope that was not acknowledged. */
     async redeliver(envelopeId: string) {
-      const socket = connected();
       const frame = sent.get(envelopeId);
-      if (!socket || !frame) throw new Error("Cannot redeliver: no open connection or unknown envelope");
-      await new Promise<void>((resolve, reject) => socket.send(frame, error => error ? reject(error) : resolve()));
+      if (!frame) throw new Error("Cannot redeliver: unknown envelope");
+      await sendFrame(envelopeId, frame);
     },
     /** The next chat.postMessage is stored, then its HTTP response is dropped. */
     loseNextPostResponse() { loseNext = true; },
@@ -167,8 +184,6 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
     returnSocketAddress(url: string) { socketAddress = url; },
     /** Terminates the open Socket Mode connection, as Slack does before it reconnects a client. */
     dropSocket() { for (const socket of sockets) socket.terminate(); },
-    /** Count of WebSocket connections that reached the fixture. */
-    socketOpens() { return socketOpens; },
     get calls() { return calls; },
     async close() {
       for (const socket of sockets) socket.terminate();

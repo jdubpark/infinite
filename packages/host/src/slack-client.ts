@@ -106,8 +106,7 @@ export class SlackClient implements IntakeThreadReader {
       if (frame.type === "disconnect") { ready = false; current.close(); return; }
       if (typeof frame.envelope_id !== "string") return;
       const envelopeId = frame.envelope_id;
-      // Only events_api envelopes are handled here; other envelope types are acknowledged so Slack does not redeliver them.
-      if (frame.type !== "events_api") { ack(current, envelopeId); return; }
+      // Every envelope with an ID goes through the handler; only its resolution acknowledges it.
       const envelope = toEnvelope(envelopeId, frame.payload);
       Promise.resolve()
         .then(() => handle(envelope))

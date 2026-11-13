@@ -1739,6 +1739,7 @@ The existing `the encrypted channel carries the phone cost screen and owner plan
 - Signals: held yes, landing, revert, `linked-fix`, `exclusion`, the hold window, and the `scan-gap` flag.
 - Roll-ups, the legacy import, rows of the `duel` and `replay` sources, and `experiment_ref`.
 - Relay access to `/api/outcomes`, and a cache for cell reads. Each Cost view poll opens every production row of one role.
+- A scorecard row for an identity that only a pinned lineup uses. A goal, a mission, or a handoff policy can carry a lineup that gives a profile id another model than the configured lineup, for good. Its attempts stay in cells by profile and never reach the scorecard row of that id.
 - A review-only count of review rounds from `outcome_rounds.cause`.
 - Client follow-ups for honesty, each its own change: show `excluded` beside `n` on the web, phone, and Mac Cost views; label the scout column "Completed"; name the 503 as "the outcome ledger is unavailable"; a cells view.
 - Rates for members that have no task (a spec non-goal).

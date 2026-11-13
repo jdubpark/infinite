@@ -1745,7 +1745,7 @@ The numbers changed on purpose in these eight ways:
 2. An attempt of a deleted run counts.
 3. Owner stops and host stops leave the denominator.
 4. A running attempt is left out, because only ended attempts count.
-5. A profile's row shows one identity and one epoch only: the model the configured lineup gives that profile ID now, at its newest epoch. Older epochs, and an older model behind the same ID, stay in the ledger cells. After an epoch advance or a model change, the profile has no row until an attempt under the new one has ended, and a profile whose attempts are all still running or excluded has no row either.
+5. A profile's row shows one identity and one epoch only: the model the configured lineup gives that profile ID now, at its newest epoch. Older epochs, and an older model behind the same ID, stay in the ledger cells. After an epoch advance or a model change, the profile has no row until an attempt under the new one has ended, and a profile whose attempts are all still running or excluded has no row either. A lineup that a goal, a mission, or a handoff policy carries can give the same profile ID another model for good; those attempts stay in the ledger cells and never reach this row.
 6. A scout's rate is its completed share.
 7. Review rounds count correction rounds of every cause (`rounds.run`).
 8. Minutes run to the integration event, not to the report.

@@ -229,6 +229,8 @@ export function outcomeBackfill(store: EvidenceStore, runs: () => TeamRun[], opt
   return () => {
     if (done) return;
     const tick = backfillTick(store, runs, first ? { ...options, limit: Number.MAX_SAFE_INTEGER } : options);
+    // One fixed line: the first call writes one run after another before the host serves, and this explains the wait.
+    if (first && tick.written > 0) console.log(`Outcome backfill wrote ${tick.written} run(s) at start; ${tick.remaining} remain.`);
     first = false;
     if (tick.remaining === 0) done = true;
   };

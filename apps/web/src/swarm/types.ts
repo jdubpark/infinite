@@ -158,8 +158,9 @@ export interface SwarmTotals {
 }
 export interface SwarmModel {
   live: Swarm[];
-  /** Swarms with no live unit, updated in the last 72 hours, newest first, at most 12. */
-  quiet: Swarm[];
+  /** Units of swarms with no live unit, each updated in the last 72 hours, newest first, at most 12. They carry no agents. */
+  quiet: Unit[];
+  /** Quiet units not shown: older than 72 hours or beyond the limit. */
   quietOlder: number;
   totals: SwarmTotals;
 }

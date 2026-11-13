@@ -108,6 +108,7 @@ export function Graph({ model, selection, onSelect, openSession, contextAvailabl
         {data.codeGraph === "off" && <span className="sw-graph-flag">code graph off</span>}
         {data.codeGraph === "partial" && <span className="sw-graph-flag">code graph partial</span>}
         {data.unobserved > 0 && <span className="sw-graph-flag">{data.unobserved} no signal</span>}
+        {context.failing && <span className="sw-graph-flag" title="Some code context could not be refreshed; the last received context is shown.">context stale</span>}
         {dropped.map(text => <span key={text} className="sw-dim">{text}</span>)}
       </div>
       {data.nodes.length === 0 ? <div className="sw-graph-empty sw-dim">no live agents</div>
@@ -148,10 +149,11 @@ export function Graph({ model, selection, onSelect, openSession, contextAvailabl
                 event.stopPropagation();
                 select(node);
               };
-              return <g key={node.id} className={`sw-g-node${dim ? " sw-graph-dim" : ""}`} transform={`translate(${p.x},${p.y})`} data-node={node.id}
-                role="button" tabIndex={0} aria-label={label} aria-pressed={selected}
+              // A mission hub is a label for its units, not a control: its coordinator's mark beside it is the thing to select.
+              const semantics = clickable ? { role: "button", tabIndex: 0, "aria-pressed": selected, onKeyDown } : { role: "img" };
+              return <g key={node.id} className={`sw-g-node${dim ? " sw-graph-dim" : ""}${clickable ? "" : " sw-g-static"}`} transform={`translate(${p.x},${p.y})`} data-node={node.id}
+                aria-label={label} {...semantics}
                 onClick={event => { event.stopPropagation(); if (clickable) select(node); }}
-                onKeyDown={onKeyDown}
                 onDoubleClick={() => { if (agent?.sessionId) openSession(agent.sessionId); }}>
                 <title>{label}</title>
                 {node.kind === "agent" && agent && <>

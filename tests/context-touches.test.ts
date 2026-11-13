@@ -287,3 +287,39 @@ test("concurrent calls share one advance", async () => {
   assert.deepEqual(first.files, [{ path: "src/a.ts", reads: 2, edits: 0, lastAt: iso(2) }]);
   assert.deepEqual(second, first);
 });
+
+test("a truncated or quoted shell command invents no path", () => {
+  const always = () => true;
+  // The recorder cut this command; the last word may be the start of a longer file name.
+  assert.deepEqual(extractTouches("Bash", { command: "cat src/first.ts src/example.ts … [+20 chars]" }, CWD, always).reads, []);
+  // One quoted argument with a space is one word, and it is not a path.
+  assert.deepEqual(extractTouches("Bash", { command: 'cat "src/example.ts backup"' }, CWD, always).reads, []);
+  assert.deepEqual(extractTouches("Bash", { command: "cat 'src/example.ts backup' src/real.ts" }, CWD, always).reads, ["src/real.ts"]);
+  // An escape or an unclosed quote makes the word ambiguous.
+  assert.deepEqual(extractTouches("Bash", { command: "cat src/with\\ space.ts" }, CWD, always).reads, []);
+  assert.deepEqual(extractTouches("Bash", { command: 'cat "src/open.ts' }, CWD, always).reads, []);
+  // Controls: plain and fully quoted paths are kept, and a cut command still counts its graph query.
+  assert.deepEqual(extractTouches("Bash", { command: 'sed -n 1,20p "src/quoted.ts" && cat src/plain.ts' }, CWD, always).reads.sort(), ["src/plain.ts", "src/quoted.ts"]);
+  assert.equal(extractTouches("Bash", { command: "graphify query routes --graph out/graph.json … [+9 chars]" }, CWD, always).graphQuery, true);
+});
+
+test("concurrent sessions are read a few at a time and the index returns to its bound", async () => {
+  let reading = 0, peak = 0;
+  const touches = new ContextTouches({
+    read: async (_sessionId, after) => {
+      reading++; peak = Math.max(peak, reading);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      reading--;
+      return { events: after === 0 ? [toolStart(1, "Read", { file_path: "src/a.ts" })] : [], cursor: 1, more: false };
+    },
+    areas: noAreas,
+    maxSessions: 3,
+    maxConcurrent: 2,
+  });
+  const ids = Array.from({ length: 9 }, (_, index) => `s${index}`);
+  const results = await Promise.all(ids.map((sessionId) => touches.session(source({ sessionId }))));
+  assert.equal(peak, 2, "no more than two journals are read at once");
+  assert.ok(results.every((result) => result.complete && result.files.length === 1));
+  // While nine advances were in flight nothing could be evicted; once they end the index is trimmed.
+  assert.equal(touches.indexed, 3);
+});

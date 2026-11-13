@@ -32,8 +32,10 @@ for wallboard use. Escape clears the selection.
 
 A unit is **live** while it works, waits for input, is paused, or still has an
 agent that is queued, working, waiting, or holding a prompt. Other runs are
-**quiet**: they collapse to one row, stay for 72 hours, and are capped at 12.
-Vitals count agents of live swarms only.
+**quiet** and collapse to one row. A quiet run inside a live mission keeps its
+place in that mission. Runs of swarms with nothing live move to a quiet group,
+where each stays for 72 hours by its own age and at most 12 are shown. Vitals
+count agents of live swarms only.
 
 Rows keep their order between polls. Live swarms are ordered by creation time,
 newest first, with the solo group last. A swarm that starts waiting on a
@@ -113,8 +115,12 @@ an older host the Graph view draws the swarm without a code map or observed
 touches.
 
 The touch index is in memory, incremental, and bounded: eight journal reads
-per session per request, 300 files per session, 256 sessions. It is rebuilt on
-demand after a restart.
+per session per request, four sessions read at a time across the host, 300
+files per session, 256 sessions. It is rebuilt on demand after a restart. The
+view asks for team context every five seconds and for at most twelve solo or
+coordinator sessions per cycle, walking a longer list in turn. Each request
+stands alone; while one fails the legend shows `context stale` and the last
+received context stays drawn.
 
 ## Limits
 

@@ -24,6 +24,7 @@ function fixture(mode = "ready") {
     "bad-map": { map: { ...codeMap, areas: [{ id: "packages/host/src", files: 1.5, symbols: 2 }] } },
     "too-large": { mapStatus: "too-large" },
     "map-fail-a": { map: codeMap },
+    "many-areas": { map: { areas: Array.from({ length: 121 }, (_, index) => ({ id: `dir${index}`, files: 1, symbols: 1 })), links: [], truncated: { areas: false, links: false } } },
   };
   const script = String.raw`
 const fs = require("node:fs");
@@ -36,9 +37,12 @@ fs.writeFileSync(path.join(cache, "graph.json"), "{}\n");
 fs.appendFileSync(log, JSON.stringify({ ref, cache, seed: value("--seed-cache-dir"), repo: value("--repo") }) + "\n");
 fs.writeFileSync(${JSON.stringify(started)}, ref);
 if (ref === ${JSON.stringify(headA)}) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120);
+// Valid in shape and inside the receipt limit, yet over the map's own byte budget: 400 links with 300-character two-byte names.
+// Built here, because a command-line argument this large is refused on Linux.
+const hugeMap = mode !== "huge-map" ? {} : { map: { areas: [], links: Array.from({ length: 400 }, (_, index) => ({ source: "\u00e9".repeat(296) + String(index).padStart(4, "0"), target: "\u00e8".repeat(300), weight: 1 })), truncated: { areas: false, links: false } } };
 const failing = mode === "fail" || (mode === "map-fail-a" && ref === ${JSON.stringify(headA)});
 const status = failing ? "failed" : "ready";
-process.stdout.write(JSON.stringify({ status, requestedHead: ref, head: mode === "mismatch" ? ${JSON.stringify(headA)} : ref, graphPath: path.join(cache, "graph.json"), mode: "incremental", changedFiles: 1, deletedFiles: 0, ...${JSON.stringify(receiptExtras[mode] ?? {})} }) + "\n");
+process.stdout.write(JSON.stringify({ status, requestedHead: ref, head: mode === "mismatch" ? ${JSON.stringify(headA)} : ref, graphPath: path.join(cache, "graph.json"), mode: "incremental", changedFiles: 1, deletedFiles: 0, ...${JSON.stringify(receiptExtras[mode] ?? {})}, ...hugeMap }) + "\n");
 if (failing || mode === "nonzero-ready") process.exit(2);
 `;
   const projects = [{ id: "sample-project", name: "Sample", path: project, team: {} }] as Config["projects"];
@@ -163,6 +167,19 @@ test("codeMap falls back to the shared lane", { timeout: 15000 }, async () => {
     const own = f.service.codeMap("sample-project", "run-one");
     assert.equal(own.state === "ready" && own.lane, "run-one");
   } finally { f.service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the host enforces the map's byte budget and area cap itself", { timeout: 15000 }, async () => {
+  for (const [mode, expected] of [["huge-map", { state: "unavailable", reason: "too-large" }], ["many-areas", { state: "unavailable", reason: "none-built" }]] as const) {
+    const f = fixture(mode);
+    try {
+      const receipt = await f.service.refresh("sample-project", f.project, headB, "shared");
+      assert.equal(receipt.status, "ready", "the graph receipt itself stays usable");
+      assert.equal(receipt.map, undefined);
+      assert.deepEqual(f.service.codeMap("sample-project"), expected);
+      assert.equal(f.service.areas("sample-project"), undefined);
+    } finally { f.service.close(); rmSync(f.root, { recursive: true, force: true }); }
+  }
 });
 
 test("a failed refresh keeps the lane's last map", { timeout: 15000 }, async () => {

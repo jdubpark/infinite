@@ -590,3 +590,12 @@ on that release.
 - **Not drawn.** A mission coordinator's observed touches are requested but
   not drawn, because a coordinator belongs to no single project. The area
   inspector shows the path and project only.
+- **Review fixes.** An independent review found that shell extraction could
+  invent a path from a truncated or quoted command, that concurrent requests
+  could grow the touch index past its bound, that solo sessions lost their
+  project, that session context requests were not batched, and that one failed
+  context request discarded the others. Each is fixed with a regression test.
+  Quiet runs are now capped and aged one by one, a quiet run inside a live
+  mission is one collapsed row, and the host enforces the map's byte budget
+  itself. The legend shows `context stale` while some context cannot be
+  refreshed.

@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { Agent, AgentState, CodeMap, SessionTouches, Swarm, SwarmModel, SwarmTask, Unit } from "../apps/web/src/swarm/types";
-import { areaOf, areaOfOwned, buildGraph, GRAPH_BUDGET, type GraphData } from "../apps/web/src/swarm/graph-model";
+import { areaOf, areaOfOwned, buildGraph, contextRequests, GRAPH_BUDGET, nextBatch, SESSION_BATCH, type GraphData } from "../apps/web/src/swarm/graph-model";
 import { layoutGraph } from "../apps/web/src/swarm/graph-layout";
 
 // Fixtures use neutral names only (checkout-v2, packages/host/src, web).
@@ -224,4 +224,30 @@ test("layout depends on which nodes exist, not on agent state", () => {
   // Every placed node has its own position.
   const spots = new Set([...working.at.values()].map(point => `${point.x},${point.y}`));
   assert.equal(spots.size, working.at.size);
+});
+
+test("a solo session's observed touches are drawn in its own project", () => {
+  const solo: Swarm = { id: "solo", kind: "solo", title: "solo", live: true, units: [], ghosts: [], waiting: 0, createdAt: "2026-11-13T09:00:00.000Z",
+    loose: [agent("free", { role: "SO", stage: undefined, unitId: undefined, swarmId: "solo", projectId: "shop-api" })] };
+  const live = model([solo]);
+  assert.deepEqual(contextRequests(live), { projects: ["shop-api"], teams: [], sessions: ["s-free"] });
+  const data = build({ model: live, maps: { "shop-api": readyMap([{ id: "src/lib", symbols: 9 }]) },
+    touches: { "s-free": touches("s-free", [{ path: "src/lib/http.ts", reads: 2, edits: 0, lastAt: "2026-11-13T09:00:00.000Z" }]) } });
+  assert.ok(linkIds(data).has("read:agent:free>area:shop-api:src/lib"));
+  assert.ok(nodeIds(data).has("project:shop-api"));
+});
+
+test("session context is asked for a batch at a time and reaches every session", () => {
+  const sessions = Array.from({ length: 30 }, (_, index) => `s${index}`);
+  const seen = new Set<string>();
+  let offset = 0;
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const next = nextBatch(sessions, offset, SESSION_BATCH);
+    assert.equal(next.batch.length, SESSION_BATCH);
+    for (const id of next.batch) seen.add(id);
+    offset = next.offset;
+  }
+  assert.equal(seen.size, 30);
+  // A short list is asked whole every cycle.
+  assert.deepEqual(nextBatch(["a", "b"], 5, SESSION_BATCH), { batch: ["a", "b"], offset: 0 });
 });

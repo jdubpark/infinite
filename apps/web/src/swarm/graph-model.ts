@@ -86,9 +86,24 @@ export function contextRequests(model: SwarmModel): { projects: string[]; teams:
       teams.push(unit.id);
     }
     if (swarm.coordinator?.sessionId) sessions.push(swarm.coordinator.sessionId);
-    for (const agent of swarm.loose) sessions.push(agent.sessionId ?? agent.id);
+    for (const agent of swarm.loose) {
+      sessions.push(agent.sessionId ?? agent.id);
+      // A solo session's touches land in its own project, so that project's map is wanted too.
+      if (agent.projectId) projects.add(agent.projectId);
+    }
   }
   return { projects: [...projects].sort(), teams, sessions: [...new Set(sessions)].sort() };
+}
+
+/** Sessions asked about in one cycle. A longer list is walked a batch at a time, so no session is starved. */
+export const SESSION_BATCH = 12;
+
+/** The next batch of a list that is walked round and round, `size` at a time. */
+export function nextBatch<T>(items: T[], offset: number, size: number): { batch: T[]; offset: number } {
+  if (items.length <= size) return { batch: items, offset: 0 };
+  const start = offset % items.length;
+  const batch = Array.from({ length: size }, (_, index) => items[(start + index) % items.length]);
+  return { batch, offset: (start + size) % items.length };
 }
 
 const DROP_RANK: Partial<Record<AgentState, number>> = { stopped: 0, reported: 1, queued: 2 };

@@ -48,7 +48,8 @@ Each `ready` and `unchanged` builder receipt can carry a `map`. The builder redu
 - A link counts the graph edges whose ends fall in two different areas. Links are undirected, and the 400 heaviest are kept.
 - A map whose compact JSON exceeds 262144 bytes is dropped, and the receipt carries `mapStatus: "too-large"` instead.
 - A missing, unreadable, or malformed graph file produces no map. The receipt is otherwise unchanged.
-- The host parses the map with a strict schema. A map with unknown keys, more than 121 areas, more than 400 links, IDs that are longer than 300 characters or are not relative paths, or non-integer counts is dropped, and the receipt is kept. A directory name longer than 300 characters therefore drops the whole map.
+- The host parses the map with a strict schema. A map with unknown keys, more than 120 areas, more than 400 links, IDs that are longer than 300 characters or are not relative paths, or non-integer counts is dropped, and the receipt is kept. A directory name longer than 300 characters therefore drops the whole map.
+- The host checks the serialized size itself: a map over 262144 bytes is dropped and reported as `too-large`, whatever the builder says.
 - `status()` omits the map. The owner receipt endpoint stays small.
 
 Two host lookups read the map from memory:

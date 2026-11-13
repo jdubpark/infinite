@@ -27,13 +27,16 @@ export type CodeMapView = ({ state: "ready"; lane: string; head: string; builtAt
 const codeMapId = z.string().min(1).max(300).refine(value => !value.startsWith("/") && !value.includes("\0") && !value.includes("\\") && !value.split("/").includes(".."));
 const codeMapCount = z.number().int().nonnegative();
 const repositoryCodeMapSchema = z.strictObject({
-  areas: z.array(z.strictObject({ id: codeMapId, files: codeMapCount, symbols: codeMapCount })).max(121),
+  areas: z.array(z.strictObject({ id: codeMapId, files: codeMapCount, symbols: codeMapCount })).max(120),
   links: z.array(z.strictObject({ source: codeMapId, target: codeMapId, weight: codeMapCount })).max(400),
   truncated: z.strictObject({ areas: z.boolean(), links: z.boolean() }),
 });
-const parseCodeMap = (value: unknown): RepositoryCodeMap | undefined => {
+/** The builder enforces this too; the host does not take its word for it. */
+const MAX_CODE_MAP_BYTES = 262_144;
+const parseCodeMap = (value: unknown): RepositoryCodeMap | "too-large" | undefined => {
   const parsed = repositoryCodeMapSchema.safeParse(value);
-  return parsed.success ? parsed.data : undefined;
+  if (!parsed.success) return undefined;
+  return Buffer.byteLength(JSON.stringify(parsed.data)) > MAX_CODE_MAP_BYTES ? "too-large" : parsed.data;
 };
 const withoutCodeMap = (result: RepositoryGraphResult): RepositoryGraphResult => {
   const copy = { ...result };
@@ -203,7 +206,7 @@ export class RepositoryGraphs {
         ...(data.head && isHead(data.head) ? { head: data.head } : {}), ...(data.mode && ["initial", "incremental", "unchanged"].includes(data.mode) ? { mode: data.mode } : {}),
         ...(Number.isInteger(data.changedFiles) && data.changedFiles! >= 0 ? { changedFiles: data.changedFiles } : {}), ...(Number.isInteger(data.deletedFiles) && data.deletedFiles! >= 0 ? { deletedFiles: data.deletedFiles } : {}),
         ...(typeof data.reason === "string" ? { reason: data.reason.slice(0, 400) } : {}), ...(Array.isArray(data.warnings) ? { warnings: data.warnings.filter((v): v is string => typeof v === "string").slice(0, 8).map(v => v.slice(0, 300)) } : {}),
-          ...(codeMap ? { map: codeMap } : {}), ...(data.mapStatus === "too-large" ? { mapStatus: "too-large" as const } : {}) }
+          ...(codeMap && codeMap !== "too-large" ? { map: codeMap } : {}), ...(data.mapStatus === "too-large" || codeMap === "too-large" ? { mapStatus: "too-large" as const } : {}) }
         : { status: "failed", requestedHead: head, reason: result.error ?? "Graph builder returned an invalid receipt." };
       if (!["ready", "unchanged"].includes(parsed.status) || parsed.head !== head || !parsed.graphPath || !this.graphPathInLane(lane, parsed.graphPath))
         parsed = { ...parsed, status: parsed.status === "busy" ? "busy" : "failed", reason: parsed.reason ?? result.error ?? "No successful graph for the requested checkout head." };
@@ -248,10 +251,12 @@ export class RepositoryGraphs {
       this.children.add(child);
       const finish = (error?: string) => { if (settled) return; settled = true; clearTimeout(timeout); this.children.delete(child); resolve({ stdout, ...(error ? { error } : {}) }); };
       const timeout = setTimeout(() => { kill(child); finish("Graph refresh timed out."); }, this.config.timeoutMs);
-      child.stdout?.on("data", chunk => {
+      // Decode as a stream: a multi-byte character split across two chunks must not turn into replacement characters.
+      child.stdout?.setEncoding("utf8");
+      child.stdout?.on("data", (chunk: string) => {
         if (settled) return;
-        if (Buffer.byteLength(stdout) + chunk.length > MAX_OUTPUT) { kill(child); finish("Graph builder output exceeded the limit."); return; }
-        stdout += chunk.toString();
+        if (Buffer.byteLength(stdout) + Buffer.byteLength(chunk) > MAX_OUTPUT) { kill(child); finish("Graph builder output exceeded the limit."); return; }
+        stdout += chunk;
       });
       child.stderr?.on("data", chunk => { failed += chunk.toString(); if (Buffer.byteLength(failed) > MAX_OUTPUT) failed = failed.slice(-MAX_OUTPUT); });
       child.once("error", error => finish(error.message.slice(0, 300)));

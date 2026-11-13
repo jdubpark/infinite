@@ -34,6 +34,8 @@ const EXTENSION = /^.+\.[A-Za-z0-9]{1,8}$/;
 const MAX_PATCH_DEPTH = 4;
 /** The marker `truncateInput` appends to a string it cut; a cut path names no real file. */
 const TRUNCATED = / … \[\+\d+ chars\]$/;
+/** The same marker anywhere in a command: a cut command can end inside a path, so none of its words are trusted. */
+const TRUNCATED_ANYWHERE = / … \[\+\d+ chars\]/;
 
 interface FileState { reads: number; edits: number; lastAt: string; seq: number }
 interface SessionState {
@@ -75,6 +77,31 @@ function patchTexts(value: unknown, depth = 0): string[] {
   return [];
 }
 
+/**
+ * Splits a shell command into words, honouring quotes, so `cat "a file.ts"` is one word and not a
+ * path followed by junk. A word that used a backslash escape is dropped, and an unclosed quote
+ * discards the whole command: an ambiguous word must never become a path.
+ */
+function shellWords(command: string): string[] {
+  const words: string[] = [];
+  let word = "", inWord = false, tainted = false, quote: string | undefined;
+  const flush = () => { if (inWord && !tainted) words.push(word); word = ""; inWord = false; tainted = false; };
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (quote) {
+      if (char === quote) quote = undefined;
+      else if (char === "\\" && quote === '"') { tainted = true; index++; }
+      else word += char;
+    } else if (char === '"' || char === "'") { quote = char; inWord = true; }
+    else if (char === "\\") { tainted = true; inWord = true; index++; }
+    else if (/[\s;&|()<>]/.test(char)) flush();
+    else { word += char; inWord = true; }
+  }
+  if (quote) return [];
+  flush();
+  return words;
+}
+
 function shellCommand(input: Record<string, unknown>): string | undefined {
   const { command, cmd } = input;
   if (typeof command === "string") return command;
@@ -109,8 +136,7 @@ export function extractTouches(
     const command = shellCommand(input);
     if (command !== undefined) {
       graphQuery = GRAPHIFY.test(command);
-      for (const raw of command.split(/[\s;&|()]+/)) {
-        const token = raw.replace(/^["']+|["']+$/g, "");
+      for (const token of TRUNCATED_ANYWHERE.test(command) ? [] : shellWords(command)) {
         if (!RELATIVE_TOKEN.test(token) && !ABSOLUTE_TOKEN.test(token)) continue;
         const path = repoPath(token, cwd);
         if (!path || !EXTENSION.test(posix.basename(path))) continue;
@@ -128,7 +154,10 @@ export class ContextTouches {
   private readonly maxReads: number;
   private readonly maxSessions: number;
   private readonly maxFiles: number;
+  private readonly maxConcurrent: number;
   private clock = 0;
+  private active = 0;
+  private readonly waiters: (() => void)[] = [];
 
   constructor(
     private readonly options: {
@@ -137,8 +166,11 @@ export class ContextTouches {
       maxReads?: number;
       maxSessions?: number;
       maxFiles?: number;
+      /** Sessions whose journals are read at once, across every request. */
+      maxConcurrent?: number;
     },
   ) {
+    this.maxConcurrent = options.maxConcurrent ?? 4;
     this.maxReads = options.maxReads ?? 8;
     this.maxSessions = options.maxSessions ?? 256;
     this.maxFiles = options.maxFiles ?? 300;
@@ -150,9 +182,24 @@ export class ContextTouches {
     }
     const state = this.stateFor(source.sessionId);
     state.lastUsed = ++this.clock;
-    state.inflight ??= this.advance(state, source).finally(() => { state.inflight = undefined; });
+    state.inflight ??= this.advanceInTurn(state, source).finally(() => { state.inflight = undefined; this.evict(); });
     await state.inflight;
     return this.snapshot(source.sessionId, state);
+  }
+
+  /** Sessions held in the index now. It can exceed the bound only while that many advances are in flight. */
+  get indexed(): number { return this.sessions.size; }
+
+  /** One advance, inside the host-wide limit on concurrent journal reads. */
+  private async advanceInTurn(state: SessionState, source: TouchSource): Promise<void> {
+    if (this.active < this.maxConcurrent) this.active++;
+    else await new Promise<void>(resolve => this.waiters.push(resolve));
+    try { await this.advance(state, source); }
+    finally {
+      // A waiter inherits this slot, so the count never dips and lets a third caller in.
+      const next = this.waiters.shift();
+      if (next) next(); else this.active--;
+    }
   }
 
   private stateFor(sessionId: string): SessionState {
@@ -162,17 +209,21 @@ export class ContextTouches {
       cursor: 0, files: new Map(), graphQueries: 0, complete: false, truncated: false, lastUsed: 0,
     };
     this.sessions.set(sessionId, created);
-    if (this.sessions.size > this.maxSessions) this.evictLeastRecent(sessionId);
+    this.evict(sessionId);
     return created;
   }
 
-  private evictLeastRecent(keep: string): void {
-    let victim: [string, SessionState] | undefined;
-    for (const entry of this.sessions) {
-      if (entry[0] === keep || entry[1].inflight) continue;
-      if (!victim || entry[1].lastUsed < victim[1].lastUsed) victim = entry;
+  /** Drops the least recently used idle sessions until the index is within its bound. Runs again whenever an advance ends. */
+  private evict(keep?: string): void {
+    while (this.sessions.size > this.maxSessions) {
+      let victim: [string, SessionState] | undefined;
+      for (const entry of this.sessions) {
+        if (entry[0] === keep || entry[1].inflight) continue;
+        if (!victim || entry[1].lastUsed < victim[1].lastUsed) victim = entry;
+      }
+      if (!victim) return;
+      this.sessions.delete(victim[0]);
     }
-    if (victim) this.sessions.delete(victim[0]);
   }
 
   private async advance(state: SessionState, source: TouchSource): Promise<void> {

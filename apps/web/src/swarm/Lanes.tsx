@@ -151,7 +151,10 @@ function LaneSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
         {swarm.loose.map(agent => <AgentMark key={agent.id} agent={agent} selected={selection?.kind === "agent" && selection.id === agent.id} onSelect={onSelect} openSession={openSession} />)}
       </div>
     </div>}
-    {swarm.units.map(unit => <LaneRow key={unit.id} unit={unit} own={swarm.kind === "team"} {...props} />)}
+    {/* A finished or blocked run inside a live mission keeps its place as one collapsed row. */}
+    {swarm.units.map(unit => unit.live
+      ? <LaneRow key={unit.id} unit={unit} own={swarm.kind === "team"} {...props} />
+      : <QuietRow key={unit.id} unit={unit} selection={selection} onSelect={onSelect} openTeam={props.openTeam} now={props.now} />)}
     {swarm.ghosts.map(ghost => <GhostRow key={ghost.id} ghost={ghost} />)}
   </section>;
 }
@@ -159,7 +162,6 @@ function LaneSwarm({ swarm, ...props }: ViewProps & { swarm: Swarm }) {
 /** One row per unit on fixed stage columns. */
 export function Lanes(props: ViewProps) {
   const { model } = props;
-  const quietUnits = model.quiet.flatMap(swarm => swarm.units);
   return <div className="sw-lanes">
     <div className="sw-lane-row sw-lane-head" aria-hidden="true">
       <span />
@@ -169,7 +171,7 @@ export function Lanes(props: ViewProps) {
     {model.live.map(swarm => <LaneSwarm key={swarm.id} swarm={swarm} {...props} />)}
     {model.quiet.length > 0 && <section className="sw-quiet" aria-label="quiet">
       <div className="sw-group-label sw-dim">quiet</div>
-      {quietUnits.map(unit => <QuietRow key={unit.id} unit={unit} selection={props.selection} onSelect={props.onSelect} openTeam={props.openTeam} now={props.now} />)}
+      {model.quiet.map(unit => <QuietRow key={unit.id} unit={unit} selection={props.selection} onSelect={props.onSelect} openTeam={props.openTeam} now={props.now} />)}
       {model.quietOlder > 0 && <div className="sw-older sw-dim">+{model.quietOlder} older</div>}
     </section>}
   </div>;

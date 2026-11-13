@@ -57,6 +57,7 @@
   cursor: pointer;
   transition: opacity 160ms ease-out;
 }
+.sw-g-node.sw-g-static { cursor: default; }
 .sw-g-node:focus { outline: none; }
 .sw-g-node:focus-visible .sw-g-hub,
 .sw-g-node:focus-visible .sw-g-area,

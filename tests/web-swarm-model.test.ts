@@ -181,6 +181,19 @@ test("live and quiet", () => {
   }));
   assert.equal(many.quiet.length, 12);
   assert.equal(many.quietOlder, 2);
+
+  // Quiet runs are capped and aged one by one, even inside one finished mission that changed a moment ago.
+  const mission14 = buildSwarm(input({
+    teams: [
+      ...Array.from({ length: 14 }, (_, index) => team(`sub-${index}`, { missionId: "M-1", status: "merged", updatedAt: iso(index * 60_000) })),
+      team("sub-old", { missionId: "M-1", status: "merged", updatedAt: iso(80 * HOUR) }),
+    ],
+    missions: [mission("M-1", { status: "ready-for-review", updatedAt: iso(1_000), coordinator: { memberId: "c", sessionId: "s-gone", status: "stopped" } })],
+  }));
+  assert.equal(mission14.live.length, 0);
+  assert.equal(mission14.quiet.length, 12);
+  assert.ok(!mission14.quiet.some(unit => unit.id === "sub-old"), "an old run does not ride on its mission's newer timestamp");
+  assert.equal(mission14.quietOlder, 3);
 });
 
 test("stable order", () => {
@@ -249,6 +262,9 @@ test("solo", () => {
   const solo = model.live.find(swarm => swarm.kind === "solo");
   assert.deepEqual(solo?.loose.map(agent => agent.id), ["S-free"]);
   assert.equal(findAgent(model, "S-free")?.role, "SO");
+  // A solo session keeps its project, which is where its touched files are drawn.
+  assert.equal(findAgent(model, "S-free")?.projectId, input({ sessions: [session("S-free")] }).sessions[0].projectId);
+  assert.ok(findAgent(model, "S-free")?.projectId);
   assert.equal(model.live[model.live.length - 1].kind, "solo");
 });
 

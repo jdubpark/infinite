@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { startHost, waitFor } from "./helpers.js";
 
 // The Swarm graph's read-only context endpoints on a real host: every paired role may read them, and none of them mutates.
@@ -32,5 +33,22 @@ test("swarm context endpoints answer every role and refuse unknown projects, ses
     assert.equal((await host.fetchApi(`/sessions/${randomUUID()}/context`, "viewer")).status, 404);
     assert.equal((await host.fetchApi(`/teams/${randomUUID()}/context`, "viewer")).status, 404);
     assert.equal((await host.fetchApi("/teams/not-a-uuid/context", "viewer")).status, 400);
+  } finally { await host.stop(); }
+});
+
+test("an agent's recorded tool inputs come back as its touched files", { timeout: 60000 }, async () => {
+  const agent = { command: process.execPath, args: [fileURLToPath(new URL("./fixtures/touch-agent.mjs", import.meta.url))] };
+  const host = await startHost({ agents: { claude: agent }, config: { attention: { idleAfterMs: 3000, hooks: { claude: true, codex: true } } } });
+  try {
+    const sessionId = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: sessionId, provider: "claude", projectId: "rehearsal", title: "Touches", prompt: "touch" });
+    type Touches = { observable: boolean; complete: boolean; graphQueries: number; truncated: boolean; files: { path: string; reads: number; edits: number }[] };
+    // The hooks travel worker to journal; the index reads the journal's signals on request.
+    const touches = await waitFor(async () => (await host.fetchApi(`/sessions/${sessionId}/context`, "viewer")).body as Touches, body => body.graphQueries === 1, 15000);
+    assert.equal(touches.observable, true);
+    assert.equal(touches.complete, true);
+    assert.equal(touches.truncated, false);
+    // The read outside the working directory is not there, and the two reads of one file are one entry.
+    assert.deepEqual(touches.files.map(file => [file.path, file.reads, file.edits]).sort(), [["src/app.ts", 2, 0], ["src/lib/http.ts", 0, 1]]);
   } finally { await host.stop(); }
 });

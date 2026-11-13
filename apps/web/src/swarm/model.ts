@@ -270,7 +270,7 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
   const loose = input.sessions
     .filter(session => (session.status === "running" || session.status === "starting") && !session.archivedAt && !session.managedBy && !memberSessions.has(session.id))
     .map(session => sessionAgent({
-      id: session.id, swarmId: "solo", role: "SO", state: soloState(session), earlier: false, session,
+      id: session.id, swarmId: "solo", projectId: session.projectId, role: "SO", state: soloState(session), earlier: false, session,
       title: session.title, provider: session.provider, costUsd: session.usage?.cost,
     }));
   if (loose.length > 0) {
@@ -289,13 +289,13 @@ export function buildSwarm(input: SwarmInput): SwarmModel {
     .filter(swarm => swarm.live)
     .sort((a, b) => rank(a) - rank(b) || timeOf(b.createdAt) - timeOf(a.createdAt) || a.id.localeCompare(b.id));
 
+  // Quiet runs are counted one by one, by their own age: a mission's twenty finished runs are twenty rows to cap, not one.
   const cutoff = input.now - QUIET_WINDOW_MS;
-  const quietAll = built.filter(item => !item.swarm.live && item.swarm.kind !== "solo");
+  const quietAll = built.filter(item => !item.swarm.live && item.swarm.kind !== "solo").flatMap(item => item.swarm.units);
   const quiet = quietAll
-    .filter(item => timeOf(item.updatedAt) >= cutoff)
-    .sort((a, b) => timeOf(b.updatedAt) - timeOf(a.updatedAt) || a.swarm.id.localeCompare(b.swarm.id))
-    .slice(0, QUIET_LIMIT)
-    .map(item => item.swarm);
+    .filter(unit => timeOf(unit.updatedAt) >= cutoff)
+    .sort((a, b) => timeOf(b.updatedAt) - timeOf(a.updatedAt) || a.id.localeCompare(b.id))
+    .slice(0, QUIET_LIMIT);
 
   const byState = Object.fromEntries(AGENT_STATES.map(state => [state, 0])) as Record<AgentState, number>;
   let agentCount = 0;
@@ -328,11 +328,11 @@ export function allAgents(swarm: Swarm): Agent[] {
 }
 
 export function findAgent(model: SwarmModel, id: string): Agent | undefined {
-  for (const swarm of [...model.live, ...model.quiet]) for (const agent of allAgents(swarm)) if (agent.id === id) return agent;
+  for (const swarm of model.live) for (const agent of allAgents(swarm)) if (agent.id === id) return agent;
   return undefined;
 }
 
 export function findUnit(model: SwarmModel, id: string): Unit | undefined {
-  for (const swarm of [...model.live, ...model.quiet]) for (const unit of swarm.units) if (unit.id === id) return unit;
-  return undefined;
+  for (const swarm of model.live) for (const unit of swarm.units) if (unit.id === id) return unit;
+  return model.quiet.find(unit => unit.id === id);
 }

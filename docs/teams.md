@@ -1442,7 +1442,8 @@ run from the team's recovery directory, then runs `remote remove origin`,
 `cat-file -t BASE`,
 `check-ref-format --branch BRANCH`, `checkout -B BRANCH BASE`, and
 `status --porcelain=v1 -z --untracked-files=all` only inside that clone. Only
-the pinned base fetch and `rev-parse` run in the source mirror. Verification
+the pinned base fetch, `rev-parse`, and the five base scan forms listed below run
+in the source mirror. Verification
 copies use `checkout --detach COMMIT` in their destination. Recovery uses
 `checkout -B BRANCH COMMIT` only in its fresh recovery clone. Read-only inspection uses
 `status --porcelain=v1 -z --untracked-files=all` in both team and project
@@ -1456,6 +1457,8 @@ GitHub-tracked sources add these operations. The host runs each through
 - in a host mirror: `init --bare` when the mirror is created, `fetch --no-tags` of
   the base branch from the GitHub URL into `refs/heads/BASE`, and `rev-parse` of
   that ref;
+- in a host mirror, after each successful fetch: the base scan forms in the
+  table below;
 - in a project source directory: `rev-parse --show-toplevel` (the refresh
   refuses a directory that is not the repository root), `fetch --no-tags` of the
   base branch from the mirror path into `refs/remotes/origin/BASE`,
@@ -1472,6 +1475,23 @@ GitHub-tracked sources add these operations. The host runs each through
 - in a team run's integration checkout: `push` of the exact commit SHA to
   `refs/heads/RUN_BRANCH` on the GitHub URL, with no force, delete or implicit
   refspec. See [Head publication](#head-publication).
+
+The host reads the base branch in the source mirror after each successful fetch.
+It records which approved runs landed on the base and which landings were
+reverted. These five forms run through `teams.commandPrefix` in the host mirror,
+never in a team workspace, with a 30 second limit. Every commit id is checked as
+a 40 or 64 character lower-case hex id before use.
+
+| # | Form | Output |
+|---|---|---|
+| 1 | `merge-base --is-ancestor OLD NEW` | Exit status only |
+| 2 | `rev-list --first-parent --max-count=501 NEW ^OLD` | At most 501 ids, 33 KiB |
+| 3 | `rev-list --first-parent --max-count=500 NEW` | At most 500 ids, 33 KiB |
+| 4 | `log --no-walk=unsorted --no-show-signature --format=%H %T %P ID...` (1 to 50 ids) | One line per id |
+| 5 | `log --no-walk=unsorted --no-show-signature --format=%H --fixed-strings --grep=This reverts commit ID... ID...` (1 to 50 patterns, then 1 to 50 ids) | At most 50 ids |
+
+The production launcher must admit all five forms. Until it does, every scan
+fails: no landing is recorded, and held stays unknown.
 
 `teams.publishHeads` (boolean, default `true`) controls head publication. Set it
 to `false` to disable it.
@@ -1768,6 +1788,108 @@ are left out and counted in `unreadable`.
 
 The host never changes the configured model lineup; ratings and rubrics are not sent to
 implementers. The owner rating request is idempotent for a given `requestId`.
+
+### Signals and held
+
+A signal is a fact about a run's outcome rows. Besides `rating`, four kinds
+appear. `landing` and `revert` are host receipts from the base branch scan.
+`linked-fix` and `exclusion` are owner claims. A member cannot write a signal.
+Signals are kept as long as the run's rows are.
+
+The scan matches a new first-parent base commit to an approved run by one of
+three exact rules. It checks the commits oldest first:
+
+1. The commit is the merge commit that the run reported (`merge-commit`).
+2. The commit's second parent is the run's reviewed head (`merge-parent`).
+3. The commit's tree is the run's reviewed tree (`tree-equal`).
+
+A run lands once, at its first matching commit. A squash onto a moved base lands
+nothing, so that run's held stays unknown.
+
+A landing starts a hold window of `teams.outcomes.holdDays` days. Held is:
+
+- yes when the row was accepted, and the window closed with scans that covered
+  every base commit in it;
+- no when the row was not accepted, when the landing was reverted inside the
+  window, or when a linked fix applies;
+- unknown otherwise.
+
+A linked fix applies when the run has no landing, or when its time is at or
+before the close of the window. Unknown is never shown as a number. A cell
+counts an unknown held under `unknown`.
+
+Held stays unknown when a gap falls inside the window:
+
+- a jump past 500 commits, where the scan keeps the newest 500 and records the
+  gap `bound`;
+- a rewritten base branch (`rewrite`), or a project that now follows another
+  repository or branch (`source`);
+- a refresh that lapses by more than six hours across the close of the window.
+
+The row carries the `scan-gap` flag when a gap leaves held unknown on an accepted
+row of a run that landed. A revert decides held whatever the gap.
+
+The first scan of a project reads only the newest 500 commits, so it finds no
+older landing. A run is a landing candidate for 90 days after its approval.
+
+An owner exclusion removes the attempt from every rate, and the scorecard counts
+it under `excluded.owner`. Withdrawing the exclusion restores the attempt.
+
+Two settings under `teams.outcomes` control the ledger. Neither needs a new
+routine approval.
+
+- `holdDays`: an integer from 1 to 365. Default 30.
+- `retentionDays`: an integer from 30 to 3650. Default 730, the ledger's
+  retention.
+
+A changed `holdDays` applies to landings recorded afterwards. Each landing keeps
+the window it started with.
+
+`POST /api/outcomes/signals` is owner only. Each body is JSON with a `requestId`
+UUID and one of three shapes:
+
+- `{"action": "record", "kind": "linked-fix", "runId", "memberId", "issue", "commit", "at"}`.
+  `memberId` and `at` are optional. The fix names an `issue` or a `commit`. `at`
+  is an ISO time no later than the request.
+- `{"action": "record", "kind": "exclusion", "runId", "memberId", "reason"}`.
+  `reason` is `outside-cause`, `invalid-task`, `trial`, or `other`.
+- `{"action": "withdraw", "kind": "linked-fix" or "exclusion", "signalId"}`.
+  `signalId` is 64 hex characters.
+
+The route answers:
+
+- `200` with `{ "signal", "repeated" }`. `repeated` is `true` when the same
+  request was already applied. The served signal has no `request` field.
+- `400` for an invalid body, or an `at` later than the request.
+- `403` for a caller that is not the owner.
+- `404` with `outcome-not-found` for an unknown run or member, or with
+  `signal-not-found` for an unknown signal.
+- `409` with `request-conflict` when the `requestId` was used for another body,
+  or with `signal-not-withdrawable` when the signal is not an owner signal of the
+  given kind.
+- `503` with `code: "evidence-unavailable"` when the store is unavailable.
+
+The remote relay refuses this route with `403` and `code:
+"remote-endpoint-denied"`.
+
+`GET /api/outcomes/runs/:runId` lists the run's signals, withdrawn ones included.
+`infinite usage outcomes --run ID` prints one line per signal.
+
+```sh
+infinite usage outcomes link-fix --run ID [--member ID] (--issue KEY | --commit SHA) [--at TIME] [--request-id ID] [--json]
+infinite usage outcomes exclude --run ID --member ID --reason REASON [--request-id ID] [--json]
+```
+
+Either command takes `--withdraw SIGNAL` to withdraw that signal. Pass
+`--request-id` to make a retry safe. Otherwise each run of the command is a new
+request.
+
+Runs that predate the ledger never land, so their held stays unknown. A landing
+commit that the scan read before its run's approval reached the ledger is never
+matched. The scan does not infer a landing from a pull request number, a commit
+subject, or the GitHub API.
+
+### Other route rules
 
 Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route

@@ -541,15 +541,17 @@ test("a fuse interrupt whose push failed is offered again", async () => {
   const marked: string[][] = [];
   const fuse = { interrupts: () => pending.filter(trip => !marked.flat().includes(trip.tripId)), markAnnounced: (ids: readonly string[]) => { marked.push([...ids]); } };
   const notifier = new Notifier({ list: async () => [] } as never, store, sender as never, { detail: "minimal", events: ["autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  // The wait is measured on a clock that never steps back. The test holds that clock, so real time cannot move it.
+  const clock = notifier as unknown as { monotonic: () => number };
+  const started = 1_000_000;
+  clock.monotonic = () => started;
   await notifier.tick();
   assert.equal(sends, 1);
   assert.deepEqual(marked, [], "no device received either trip, so neither is marked");
   // The next attempt waits a minute, so an outage does not send on every tick.
   await notifier.tick();
   assert.equal(sends, 1);
-  // Just under a minute later nothing is sent yet. The wait is measured on a clock that never steps back.
-  const clock = notifier as unknown as { monotonic: () => number };
-  const started = clock.monotonic();
+  // Just under a minute later nothing is sent yet.
   failing = false;
   clock.monotonic = () => started + 59_000;
   await notifier.tick();

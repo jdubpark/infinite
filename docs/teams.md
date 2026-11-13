@@ -1719,7 +1719,7 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
-| `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
+| `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams, and cancel for a stopped goal's run |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
 
 The continue request accepts exactly `requestId`, `revision`, and optional
@@ -1737,7 +1737,12 @@ implementers. The owner rating request is idempotent for a given `requestId`.
 
 Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route
-remains available for its active cycle while the goal is running.
+remains available for its active cycle while the goal is running. The cancel
+route also accepts a goal's run once the goal has stopped, has no queued control
+for the run, and cannot be extended from it after a deadline stop. A goal cancel
+skips a stopped goal, so this is how a blocked or paused run that a finished goal
+left behind is settled: the goal records the cancelled cycle, and its cleanup
+removes the run once the workspace is gone.
 
 The legacy team parallelism endpoint refuses owner capacity changes with `409`
 and `code: "agent-managed-capacity"`. Legacy team creation requests may include

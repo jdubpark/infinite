@@ -54,6 +54,10 @@ describe("web swarm view", { skip }, () => {
       assert.equal(await count(page, ".sw-lane-row[data-unit]"), 5);
       const marks = await count(page, "[data-agent]");
       assert.ok(marks >= 25, `expected the fixture's live agents, saw ${marks}`);
+      // Every run in the fixture carries a fresh updatedAt, as on a real host: a quiet row ages by its agents' last activity.
+      const ages = await page.evaluate(() => [...document.querySelectorAll(".sw-quiet .sw-quiet-row .sw-quiet-cell .sw-dim")].map(node => node.textContent));
+      assert.deepEqual(ages, ["5h", "1d"]);
+      assert.equal(await page.evaluate(() => document.querySelector(".sw-quiet .sw-older")?.textContent), "+1 older");
 
       await show(page, "wall", ".sw-tile");
       assert.equal(await count(page, ".sw-tile"), marks);

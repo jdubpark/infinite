@@ -18,7 +18,7 @@ function unit(id: string, over: Partial<Unit> = {}): Unit {
   return {
     id, swarmId: "run-1", title: `unit ${id}`, projectId: "checkout-v2", status: "implementing", revision: 1, live: true,
     reached: "build", checks: { passed: 0, failed: 0, running: 0 }, agents: [], side: [], dependsOn: [], waiting: 0,
-    createdAt: "2026-11-13T09:00:00.000Z", updatedAt: "2026-11-13T09:00:00.000Z", baseCommit: "base", tasks: [], ...over,
+    createdAt: "2026-11-13T09:00:00.000Z", lastActivityAt: "2026-11-13T09:00:00.000Z", baseCommit: "base", tasks: [], ...over,
   };
 }
 
@@ -107,6 +107,7 @@ describe("swarm graph model", () => {
       touches: { "s-a1": touches("s-a1", [{ path: "apps/web/src/b.ts", reads: 1, edits: 0, lastAt: "2026-11-13T09:01:00.000Z" }]) },
     });
     assert.equal(data.codeGraph, "off");
+    assert.equal(build({ model: model([]) }).codeGraph, "none", "with no project drawn there is no code graph to flag");
     assert.ok(nodeIds(data).has("area:checkout-v2:packages/host"));
     assert.ok(nodeIds(data).has("area:checkout-v2:apps/web"));
     assert.equal(data.links.filter(link => link.kind === "code").length, 0);

@@ -63,10 +63,11 @@ export function swarmFixture(now = Date.parse("2026-11-13T14:00:00.000Z")): Swar
       if (task) task.memberId = memberId;
       if (member.prompt === "permission" && spec.delegated) permissionDecisions.push({ targetSessionId: own.id, promptId: 77, status: "reviewing" });
       return { memberId, sessionId: own.id, role: member.role, revision: member.revision ?? revision, title: `${member.role} ${index + 1}`, status: member.status, provider: profile.provider, modelProfile: profile,
-        usage: usage(member.cost ?? 0.2 + index * 0.07), startedAt: ago(3000), lastActivityAt: ago(8), ...(member.task ? { taskId: member.task } : {}) };
+        usage: usage(member.cost ?? 0.2 + index * 0.07), startedAt: ago(live ? Math.min(3000, spec.created) : spec.created), lastActivityAt: ago(live ? 8 : spec.updated ?? 8), ...(member.task ? { taskId: member.task } : {}) };
     });
     const value: SwarmTeam = {
-      id: teamId, projectId: spec.projectId, provider: "claude", title: spec.title, status: spec.status, revision, createdAt: ago(spec.created), updatedAt: ago(spec.updated ?? 5),
+      id: teamId, projectId: spec.projectId, provider: "claude", title: spec.title, status: spec.status, revision, // Like the host, every run carries a fresh updatedAt; `updated` is when its agents last acted.
+      createdAt: ago(spec.created), updatedAt: ago(2),
       baseCommit: "a".repeat(40), headCommit: "b".repeat(40), ...(spec.missionId ? { missionId: spec.missionId } : {}), lineup: { coordinator: { tier: "strong" } }, members, tasks,
       checks: (spec.checks ?? []).map(status => ({ status, revision })),
       decisions: Array.from({ length: spec.decisions ?? 0 }, () => ({ id: id(), revision })),

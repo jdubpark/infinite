@@ -50,6 +50,7 @@ import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
 import { RepositoryGraphs } from "./repository-graphs.js";
+import { ContextTouches, type SessionTouches } from "./context-touches.js";
 import { UnderstandingService } from "./understanding.js";
 import { UnderstandingCatalog, CatalogError } from "./understanding-catalog.js";
 import { UnderstandingRuntime } from "./understanding-runtime.js";
@@ -600,6 +601,8 @@ export function createApp(config: Config, key: Buffer) {
         ...(repositoryBriefings ? { repositoryBriefings: { model: repositoryBriefings.model, automatic: config.repositoryBriefings!.automatic } } : {}),
         ...(config.remote?.enabled ? { remoteTerminal: 1 } : {}),
         desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: DESKTOP_LIMITS.chunkBytes, maxFileBytes: DESKTOP_LIMITS.maxFileBytes },
+        // The Swarm graph's read-only code map and touch endpoints.
+        swarmContext: 1,
       },
     }),
   );
@@ -787,6 +790,26 @@ export function createApp(config: Config, key: Buffer) {
     return res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => memberships.get(id)));
   });
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  // Which files each agent's recorded tool inputs pointed at. Read-only; observed inputs are not evidence of use or of a landed change.
+  const contextTouches = new ContextTouches({
+    // Only signals carry tool inputs. The type filter keeps terminal output out of the result, though each read still scans it.
+    read: (sessionId, after) => manager.events(sessionId, after, 200, new Set(["signal"])),
+    areas: projectId => repositoryGraphs?.areas(projectId),
+  });
+  const unobservedTouches = (sessionId: string): SessionTouches => ({ sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false });
+  const sessionTouches = async (source: { sessionId: string; cwd: string; provider: string; projectId: string }) => {
+    // A cmux session has no host journal, and an unreadable journal yields no touches.
+    if (!existsSync(join(config.stateDir, "sessions", source.sessionId, "meta.sealed"))) return unobservedTouches(source.sessionId);
+    try { return await contextTouches.session(source); }
+    catch { return unobservedTouches(source.sessionId); }
+  };
+  app.get("/api/teams/:id/context", async (req, res) => {
+    const team = teams.get(id.parse(req.params.id));
+    const shown = team.members.filter(member => member.revision === team.revision || member.status === "running" || member.status === "waiting");
+    const members = await Promise.all(shown.map(async member => ({ memberId: member.memberId,
+      ...await sessionTouches({ sessionId: member.sessionId, cwd: member.cwd, provider: member.provider ?? team.provider, projectId: team.projectId }) })));
+    res.json({ teamId: team.id, revision: team.revision, members });
+  });
   app.delete("/api/teams/:id", requireRole(["owner"]), async (req, res) => {
     const teamId = id.parse(req.params.id);
     if (goals.ownsActiveTeam(teamId)) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal.");
@@ -1116,6 +1139,12 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await sessionDetail(id.parse(req.params.id)));
   });
   app.get("/api/sessions/:id/handoff", (req, res) => res.json(handoffs.view(id.parse(req.params.id))));
+  app.get("/api/sessions/:id/context", async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) { await cmux.get(sessionId); return void res.json(unobservedTouches(sessionId)); }
+    const session = manager.meta(sessionId).session;
+    res.json(await sessionTouches({ sessionId, cwd: session.cwd, provider: session.provider, projectId: session.projectId }));
+  });
   app.get("/api/sessions/:id/messages", async (req, res) => {
     const sessionId = id.parse(req.params.id);
     const session = manager.meta(sessionId).session;
@@ -1409,6 +1438,13 @@ export function createApp(config: Config, key: Buffer) {
     const project = config.projects.find(p => p.id === projectId);
     if (!project) return void res.status(404).json({ error: "Unknown project" });
     res.json({ id: project.id, name: project.name, path: project.path, source: projectSource.status(projectId), sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
+  });
+  // The directory-level code map for one graph lane: names and counts only, served from the builder's receipt.
+  app.get("/api/projects/:id/graph/map", (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
+    const lane = z.string().regex(/^(?:shared|run-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/).default("shared").parse(req.query.lane);
+    res.json(repositoryGraphs ? repositoryGraphs.codeMap(projectId, lane) : { state: "disabled" });
   });
   app.get("/api/projects/:id/graph", requireRole(["owner"]), (req, res) => {
     const projectId = projectSchema.parse(req.params.id);

@@ -98,6 +98,10 @@ for directory in sorted({str(pathlib.PurePosixPath(name).parent) for name in fou
                     nodes.append({'id': 'ref_api', 'source_file': '', 'external': True})
             else:
                 links.extend(edge for edge in previous_graph.get('links', []) if edge.get('source_file') == name)
+if os.environ.get('FAKE_EXTRA_GRAPH'):
+    extra = json.loads(pathlib.Path(os.environ['FAKE_EXTRA_GRAPH']).read_text())
+    nodes.extend(extra.get('nodes', []))
+    links.extend(extra.get('links', []))
 (out / 'graph.json').write_text(json.dumps({'files': sorted(found), 'graph': {'schema_version': 1}, 'nodes': nodes, 'links': links}))
 with open(os.environ['FAKE_LOG'], 'a') as f:
     f.write(json.dumps({'changed': changed, 'deleted': deleted}) + '\n')
@@ -397,5 +401,202 @@ test('terminates the extractor process group when the builder receives SIGTERM',
     await assert.rejects(stat(path.join(f.cache, 'current')));
   } finally {
     await rm(f.temp, { recursive: true, force: true });
+  }
+});
+
+const pad = (value: number, width = 3) => String(value).padStart(width, '0');
+const graphNode = (id: string, sourceFile: string, extra: Record<string, unknown> = {}) => ({
+  id, label: id, file_type: 'code', source_file: sourceFile, source_location: 'L1', ...extra,
+});
+const graphEdge = (source: string, target: string, relation = 'calls') => ({
+  source, target, relation, confidence: 'EXTRACTED', source_file: '', source_location: 'L1',
+});
+
+async function withExtraGraph(f: Awaited<ReturnType<typeof fixture>>, graph: { nodes?: unknown[]; links?: unknown[] }) {
+  const extra = path.join(f.temp, 'extra-graph.json');
+  await writeFile(extra, JSON.stringify(graph));
+  return { FAKE_EXTRA_GRAPH: extra };
+}
+
+test('map reduces to directory areas', async () => {
+  const f = await fixture();
+  try {
+    const env = await withExtraGraph(f, {
+      nodes: [
+        graphNode('host_teams', 'packages/host/src/teams.ts'),
+        graphNode('host_teams_helper', 'packages/host/src/teams.ts', { label: 'helper', source_location: 'L3' }),
+        graphNode('host_goals', 'packages/host/src/goals.ts'),
+        graphNode('web_app', 'apps/web/src/app.ts'),
+        graphNode('ext', 'packages/host/src/ext.ts', { external: true }),
+        graphNode('no_source', ''),
+        graphNode('absolute', '/etc/x.ts'),
+        graphNode('escape', '../escape.ts'),
+      ],
+      links: [
+        graphEdge('host_teams', 'web_app', 'imports_from'),
+        graphEdge('web_app', 'host_teams_helper', 'imports'),
+        graphEdge('host_goals', 'host_teams'),
+        graphEdge('host_goals', 'ext', 'imports_from'),
+        graphEdge('host_goals', 'missing_node'),
+      ],
+    });
+    const result = run(f, env);
+    assert.equal(result.code, 0, JSON.stringify(result.value));
+    assert.deepEqual(result.value.map, {
+      areas: [
+        { id: '.', files: 4, symbols: 5 },
+        { id: 'apps/web/src', files: 1, symbols: 1 },
+        { id: 'packages/host/src', files: 2, symbols: 3 },
+      ],
+      links: [{ source: 'apps/web/src', target: 'packages/host/src', weight: 2 }],
+      truncated: { areas: false, links: false },
+    });
+  } finally {
+    await rm(f.temp, { recursive: true, force: true });
+  }
+});
+
+test('depth is chosen to fit 120 areas', async () => {
+  const f = await fixture();
+  try {
+    // 144 leaf directories exceed 120 at depth 3, so depth 2 gives 48 areas plus the root.
+    const nodes = [];
+    for (let g = 0; g < 12; g++) for (let s = 0; s < 4; s++) for (let t = 0; t < 3; t++) {
+      nodes.push(graphNode(`leaf_${g}_${s}_${t}`, `g${pad(g, 2)}/s${s}/t${t}/f.ts`));
+    }
+    const result = run(f, await withExtraGraph(f, { nodes }));
+    assert.equal(result.code, 0, JSON.stringify(result.value));
+    const areas = result.value.map.areas as { id: string; files: number; symbols: number }[];
+    assert.equal(areas.length, 49);
+    assert.equal(result.value.map.truncated.areas, false);
+    for (const area of areas.filter(item => item.id !== '.')) {
+      assert.match(area.id, /^g\d{2}\/s\d$/);
+      assert.equal(area.files, 3);
+      assert.equal(area.symbols, 3);
+    }
+  } finally {
+    await rm(f.temp, { recursive: true, force: true });
+  }
+});
+
+test('overflow folds into other', async () => {
+  const f = await fixture();
+  try {
+    // 130 top-level directories plus the root area exceed 120 at depth 1.
+    // Directory d(i) holds i + 10 symbols. The root holds 5 symbols.
+    const nodes = [];
+    for (let i = 0; i < 130; i++) for (let k = 0; k < i + 10; k++) {
+      nodes.push(graphNode(`d${pad(i)}_${k}`, `d${pad(i)}/x.ts`));
+    }
+    const result = run(f, await withExtraGraph(f, { nodes }));
+    assert.equal(result.code, 0, JSON.stringify(result.value));
+    const map = result.value.map as { areas: { id: string; files: number; symbols: number }[]; truncated: { areas: boolean } };
+    assert.equal(map.areas.length, 120);
+    assert.equal(map.truncated.areas, true);
+    // Kept: d011 through d129. Folded: d000 through d010 and the root (4 root files, 5 root symbols).
+    assert.equal(map.areas.some(area => area.id === 'd010' || area.id === '.'), false);
+    assert.equal(map.areas.some(area => area.id === 'd011'), true);
+    const other = map.areas.find(area => area.id === 'other');
+    assert.deepEqual(other, { id: 'other', files: 15, symbols: 170 });
+  } finally {
+    await rm(f.temp, { recursive: true, force: true });
+  }
+});
+
+test('links are undirected and capped at 400', async () => {
+  const f = await fixture();
+  try {
+    const ids = Array.from({ length: 30 }, (_, i) => `m${pad(i, 2)}`);
+    const nodes = ids.map(id => graphNode(`n_${id}`, `${id}/x.ts`));
+    const links = [];
+    for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
+      links.push(graphEdge(`n_${ids[i]}`, `n_${ids[j]}`));
+    }
+    // Two opposite-direction edges on one pair count as one undirected link of weight 2.
+    links.push(graphEdge('n_m01', 'n_m00'));
+    const result = run(f, await withExtraGraph(f, { nodes, links }));
+    assert.equal(result.code, 0, JSON.stringify(result.value));
+    const map = result.value.map as { links: { source: string; target: string; weight: number }[]; truncated: { links: boolean } };
+    assert.equal(map.links.length, 400);
+    assert.equal(map.truncated.links, true);
+    assert.deepEqual(map.links[0], { source: 'm00', target: 'm01', weight: 2 });
+    assert.equal(map.links.every(link => link.source < link.target), true);
+    // The 35 lexicographically last weight-1 pairs are cut, starting at (m21, m23).
+    assert.equal(map.links.some(link => link.source === 'm28'), false);
+    assert.equal(map.links.some(link => link.source === 'm21' && link.target === 'm23'), false);
+    assert.equal(map.links.some(link => link.source === 'm21' && link.target === 'm22'), true);
+    assert.equal(map.links.some(link => link.source === 'm00' && link.target === 'm02'), true);
+  } finally {
+    await rm(f.temp, { recursive: true, force: true });
+  }
+});
+
+test('oversized map reports too-large', async () => {
+  const f = await fixture();
+  try {
+    // Thirty areas with 487-character directory IDs and 435 pairs push the map past 256 KiB.
+    const long = (ch: string) => ch.repeat(120);
+    const ids = Array.from({ length: 30 }, (_, i) => `${long('a')}/${long('b')}/${long('c')}/${long('d')}/m${pad(i, 2)}`);
+    const nodes = ids.map((id, i) => graphNode(`n${i}`, `${id}/x.ts`));
+    const links = [];
+    for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) links.push(graphEdge(`n${i}`, `n${j}`));
+    const result = run(f, await withExtraGraph(f, { nodes, links }));
+    assert.equal(result.code, 0, JSON.stringify(result.value).slice(0, 300));
+    assert.equal(result.value.status, 'ready');
+    assert.equal(result.value.mapStatus, 'too-large');
+    assert.equal('map' in result.value, false);
+  } finally {
+    await rm(f.temp, { recursive: true, force: true });
+  }
+});
+
+test('unchanged receipt carries the map', async () => {
+  const f = await fixture();
+  try {
+    const env = await withExtraGraph(f, {
+      nodes: [graphNode('a', 'packages/host/src/teams.ts'), graphNode('b', 'apps/web/src/app.ts')],
+      links: [graphEdge('a', 'b', 'imports_from')],
+    });
+    const initial = run(f, env);
+    assert.equal(initial.value.status, 'ready');
+    assert.ok(initial.value.map, 'initial receipt has a map');
+    const noOp = run(f);
+    assert.equal(noOp.code, 0);
+    assert.equal(noOp.value.status, 'unchanged');
+    assert.deepEqual(noOp.value.map, initial.value.map);
+  } finally {
+    await rm(f.temp, { recursive: true, force: true });
+  }
+});
+
+test('code map reduction ignores malformed or missing graph files', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'repo-graph-map-'));
+  try {
+    const malformed = path.join(temp, 'malformed.json');
+    const notObject = path.join(temp, 'array.json');
+    const badNodes = path.join(temp, 'bad-nodes.json');
+    const missing = path.join(temp, 'missing.json');
+    const withEdges = path.join(temp, 'edges.json');
+    await writeFile(malformed, '{not json');
+    await writeFile(notObject, '[]');
+    await writeFile(badNodes, JSON.stringify({ nodes: 'x', links: [] }));
+    await writeFile(withEdges, JSON.stringify({
+      nodes: [graphNode('a', 'src/a.ts'), graphNode('b', 'lib/b.ts')],
+      edges: [graphEdge('a', 'b')],
+    }));
+    const script = 'import json, pathlib, sys; sys.path.insert(0, sys.argv[1]); import repository_graph as m; '
+      + 'print(json.dumps([m._code_map(pathlib.Path(p)) for p in sys.argv[2:]]))';
+    const result = spawnSync('python3', ['-I', '-c', script, path.join(root, 'scripts'), malformed, notObject, badNodes, missing, withEdges],
+      { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    const [a, b, c, d, edges] = JSON.parse(result.stdout) as (Record<string, unknown> | null)[];
+    assert.deepEqual([a, b, c, d], [null, null, null, null]);
+    assert.deepEqual(edges, {
+      areas: [{ id: 'lib', files: 1, symbols: 1 }, { id: 'src', files: 1, symbols: 1 }],
+      links: [{ source: 'lib', target: 'src', weight: 1 }],
+      truncated: { areas: false, links: false },
+    });
+  } finally {
+    await rm(temp, { recursive: true, force: true });
   }
 });

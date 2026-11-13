@@ -144,7 +144,11 @@ export function isFuseReason(text: string | undefined): boolean {
   return text !== undefined && text.startsWith(FUSE_PREFIX);
 }
 
-/** Sets or clears only a fuse reason on the holder. `changed` is true only when the value changed. */
+/**
+ * Sets or clears only a fuse reason on the holder. `changed` is true only when the value changed.
+ * A closed check clears a fuse reason, except the write failure, which only `admit` can judge: an accepted
+ * admission clears that one. So a failing baseline write gives one steady reason, not one that flips each pass.
+ */
 export function applyFuseReason(
   holder: { reason?: string },
   result: FuseCheck | FuseAdmission | undefined,
@@ -159,7 +163,7 @@ export function applyFuseReason(
       holder.reason = fuseReason(result);
       wait = true;
     } else {
-      if (isFuseReason(holder.reason)) holder.reason = undefined;
+      if (isFuseReason(holder.reason) && holder.reason !== fuseReason("write-failed")) holder.reason = undefined;
       wait = false;
     }
   } else if (!result.ok) {

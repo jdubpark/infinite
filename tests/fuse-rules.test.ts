@@ -192,6 +192,22 @@ test("applying a result sets and clears only a fuse reason", () => {
   assert.equal(applyFuseReason(failed, writeFailed).wait, true);
 });
 
+test("a closed check leaves a write failure for the admission to clear", () => {
+  // `check` reads memory and cannot see a failing baseline write. Only `admit` can, so only an admission clears it.
+  const writeFailed: FuseAdmission = { ok: false, launchId: "x", failure: "write-failed" };
+  const holder: { reason?: string } = {};
+  assert.deepEqual(applyFuseReason(holder, writeFailed), { wait: true, changed: true });
+  const text = holder.reason;
+
+  // The next pass: the check is closed, the admission fails again. Nothing changes, so nothing is saved.
+  assert.deepEqual(applyFuseReason(holder, { state: "closed" }), { wait: false, changed: false });
+  assert.equal(holder.reason, text);
+  assert.deepEqual(applyFuseReason(holder, writeFailed), { wait: true, changed: false });
+
+  assert.deepEqual(applyFuseReason(holder, { ok: true, launchId: "x" }), { wait: false, changed: true });
+  assert.equal(holder.reason, undefined);
+});
+
 test("limits and days follow the configuration and UTC", () => {
   assert.equal(projectLimit(limits, "a"), 5);
   assert.equal(projectLimit(limits, "b"), 30);

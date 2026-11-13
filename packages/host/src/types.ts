@@ -109,7 +109,7 @@ export interface AgentProfile {
 export interface Config {
   /** Host-only credential; never copied into provider environment variables or prompts. */
   linear?: { apiKeyFile: string; endpoint?: string };
-  /** Launch gate for new automatic work: the host waits while free memory or load per CPU exceeds these bounds. */
+  /** Launch gate for automatic launches: the host holds them while available memory is below the floor or one-minute load per CPU is above the ceiling. */
   hostLoad?: { minAvailableMemoryGiB: number; maxLoadPerCpu: number };
   /** Linear and Slack request intake; the Linear credential above is required when this is set. */
   intake?: import("./intake-types.js").IntakeConfig;

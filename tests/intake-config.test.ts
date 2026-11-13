@@ -86,6 +86,8 @@ test("Slack token files are private and outside runtime state", () => {
 test("a loopback Slack endpoint is local-only", () => {
   assert.throws(() => validate({ slack: { ...slack, endpoint: "http://127.0.0.1:9/api" } }, { environment: "cloud" }), /official HTTPS endpoint/);
   assert.doesNotThrow(() => validate({ slack: { ...slack, endpoint: "http://127.0.0.1:9/api" } }, { environment: "local" }));
+  for (const endpoint of ["http://user:secret@127.0.0.1:9/api", "http://127.0.0.1:9/api?team=other", "http://127.0.0.1:9/api#fragment"])
+    assert.throws(() => validate({ slack: { ...slack, endpoint } }, { environment: "local" }), /official HTTPS endpoint/, endpoint);
 });
 test("the answer repository is a configured project", () => assert.throws(() => validate({ mission: { groupId: "work", answerProjectId: "missing" } }), /answerProjectId/));
 test("hostLoad accepts the spec default and rejects a zero load ceiling", () => {

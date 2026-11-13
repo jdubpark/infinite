@@ -184,7 +184,7 @@ export function validateIntakeConfig(config: Config): void {
     assertPrivateCredentialFile(config, slack.botTokenFile, tokenMessage);
     const endpoint = new URL(slack.endpoint ?? SLACK_OFFICIAL_ENDPOINT);
     const local = config.environment === "local" && endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
-    if (!local && endpoint.href !== SLACK_OFFICIAL_ENDPOINT)
+    if ((!local && endpoint.href !== SLACK_OFFICIAL_ENDPOINT) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash)
       throw new Error("Slack requires its official HTTPS endpoint; loopback HTTP is allowed for local development");
   }
   const answerProjectId = intake.mission.answerProjectId;

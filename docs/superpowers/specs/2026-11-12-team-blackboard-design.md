@@ -64,7 +64,7 @@ Not verified: context file sizes on a deployed host, and how often a member is r
 
 The file is `evidence/evidence.sqlite3` under the host state directory. The suffix puts it in the integrity check of `deploy/ubuntu/verify-backup.py`. The builder confirms on a staging host that the backup copies this file with its WAL.
 
-The host process opens the file as `MemoryStoreService` opens its database. It creates the file exclusively with mode `0600`, and it refuses an existing file that fails the encrypted key check. It sets `journal_mode=WAL`, `synchronous=FULL`, `secure_delete=ON`, and `busy_timeout=5000`.
+The host process opens the file as `MemoryStoreService` opens its database. It builds a new store in a temporary file and links it into place with mode `0600`, so a crash cannot leave a half-made store. It refuses an existing file that fails the encrypted key check, and it never replaces one. It sets `journal_mode=WAL`, `synchronous=FULL`, `secure_delete=ON`, and a busy timeout of 250 ms. The host is the only writer, so a locked database is abnormal, and a long wait would freeze the host.
 
 Keys come from the vault key through HKDF-SHA-256 with their own salt and labels. Every payload is AES-256-GCM, bound to its table name and row ID. Plain columns hold only opaque IDs, enumerations, sequence numbers, sizes, and timestamps. A task ID is stored as an HMAC (`task_key`). The store exports one blind index function per value class, for a project, a task, and an area, so that every module computes the same index for the same value.
 

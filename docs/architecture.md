@@ -55,6 +55,14 @@ Browser/network loss does not change worker state. API restart discovers existin
 
 Terminal-native input can include arbitrary keyboard sequences over owner-only terminal connections or SSH/local IPC. Web/mobile text input rejects escape/control injection. Multiline paste is allowed only after the terminal application advertises bracketed-paste support. Explicit Enter/Escape/arrow/interrupt controls handle provider menus. None of these controls infer tool approval.
 
+## Evidence store
+
+The host keeps run evidence in one SQLite database, `evidence/evidence.sqlite3` under the state directory. It holds the typed run events of the self-improving teams design. Later designs add their own tables to the same file as registered modules.
+
+The host process is the only writer. A new file is built under a temporary name and linked into place when complete, so a crash never leaves a half-built store. The file runs in WAL mode, so another process can read it while the host writes. The host's own reads use a separate read-only connection. Removing a run deletes its events. An hourly sweep deletes the events of every run whose sealed record file is gone, which covers a crash between the two steps.
+
+The sealed run record stays the authority for run state. The store never decides a status. When the store cannot open, for example after a key mismatch or on a full disk, it reports `unavailable` with a fixed reason. The host still starts, runs continue, and run removal still works. A module whose stored schema is newer than the host is unavailable on its own, and the other modules keep working. `GET /api/evidence/status` and `infinite evidence status` report the state, each module's state, the file and WAL sizes, and the event count.
+
 ## Delivery contract
 
 Creation uses a client UUID as the logical session ID. The stored request fingerprint makes an identical retry return the existing session; a conflicting reuse fails. Deletion keeps a sealed ID receipt so a delayed retry cannot relaunch the deleted request or reuse its ID. Creation does not automatically retry spawning after an ambiguous failure.

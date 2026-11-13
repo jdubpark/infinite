@@ -484,21 +484,34 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
+const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
+const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
+
+/**
+ * The provider or client command that `handleClientCommand` dispatches on. A token that directly follows
+ * a client string option, or an option the client parser does not know, is that option's value.
+ */
+export function clientCommandCandidate(args: readonly string[]): string | undefined {
+  for (let index = 0; index < args.length; index++) {
+    const token = args[index];
+    if (providers.has(token) || CLIENT_COMMANDS.has(token)) return token;
+    if (token.startsWith("--") && !token.includes("=") && !CLIENT_BOOLEAN_OPTIONS.has(token)) index++;
+  }
+  return undefined;
+}
 
 /** Infinite options come before the provider; everything after a provider is passed through unchanged. */
 export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
   const includes: string[] = [];
-  const strings = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
-  const booleans = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
   const option = () => {
     const name = args.shift()!;
     if (name === "--include" && args.length) includes.push(args.shift()!);
-    else if (booleans.has(name)) options[name] = true;
-    else if (strings.has(name) && args.length) options[name] = args.shift()!;
+    else if (CLIENT_BOOLEAN_OPTIONS.has(name)) options[name] = true;
+    else if (CLIENT_STRING_OPTIONS.has(name) && args.length) options[name] = args.shift()!;
     else throw new Error(`Unknown or incomplete Infinite option: ${name}`);
   };
   while (args[0]?.startsWith("--")) option();
@@ -690,6 +703,17 @@ export function usageLines(summary: import("./usage-service.js").UsageSummary): 
   });
 }
 
+/** Lines for `infinite evidence status`. Host text is cleaned before it reaches the terminal. */
+export function evidenceStatusLines(status: import("./evidence/types.js").EvidenceDescription): string[] {
+  return [
+    `Evidence store: ${clean(String(status.state))}`,
+    ...(status.reason ? [`Reason: ${clean(String(status.reason))}`] : []),
+    ...Object.entries(status.modules ?? {}).map(([name, state]) => `Module ${clean(name)}: ${clean(String(state))}`),
+    `File: ${Number(status.fileBytes)} bytes, WAL: ${Number(status.walBytes)} bytes`,
+    `Events: ${Number(status.events)}`,
+  ];
+}
+
 export function usageBars(values: number[]): string {
   const levels = "▁▂▃▄▅▆▇█", max = Math.max(0, ...values);
   return values.map(value => levels[max > 0 ? Math.max(0, Math.min(7, Math.floor(value / max * 7))) : 0]).join("");
@@ -722,7 +746,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
   const progress = startupProgress();
   const args = [...argv];
   // Keep server administration commands and their --config semantics intact.
-  const candidate = args.find(a => providers.has(a) || CLIENT_COMMANDS.has(a));
+  const candidate = clientCommandCandidate(args);
   if (!candidate || (candidate === "list" && args.includes("--config"))) return false;
   try {
     const parsed = parseClientArgs(args);
@@ -797,6 +821,13 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const [summary, daily] = await Promise.all([api.json<import("./usage-service.js").UsageSummary>("/usage"), api.json<{ days: { date: string; usd: number }[] }>(`/usage/daily?days=30&tz=${encodeURIComponent(tz)}`)]);
       if (options["--json"]) console.log(JSON.stringify({ ...summary, daily }, null, 2));
       else for (const line of usageOverview(summary, daily)) console.log(line);
+      return true;
+    }
+    if (command === "evidence") {
+      if (positional.length !== 1 || positional[0] !== "status") throw new Error("Usage: infinite evidence status [--json]");
+      const status = await api.json<import("./evidence/types.js").EvidenceDescription>("/evidence/status");
+      if (options["--json"]) console.log(JSON.stringify(status, null, 2));
+      else for (const line of evidenceStatusLines(status)) console.log(line);
       return true;
     }
     if (command === "resources") { await resources(api, options); return true; }

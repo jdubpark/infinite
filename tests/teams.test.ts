@@ -24,6 +24,7 @@ import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON } from "../packages/host/src
 // The shared fallback lineup used by delivery and permission tests; the limit tests below define their own.
 import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
+import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { Manager } from "../packages/host/src/manager.js";
 
 test("team session creation refuses native continuation for other providers or roles", () => {
@@ -3205,4 +3206,45 @@ test("a quiet reviewer uses the bounded review window before the configured gene
     assert.match(saved.run.members.find(member => member.memberId === replacement.memberId)!.prompt,
       /stalled with no activity for 5 minutes.*working copy was checked unchanged/);
   } finally { await f.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("removing a run deletes its evidence", async () => {
+  const f = schedulerFixture();
+  f.run.status = "cancelled";
+  f.run.members = [];
+  f.writeTeam();
+  const teams = f.openTeam();
+  const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: f.key });
+  try {
+    teams.useEvidence(evidence);
+    evidence.write(tx => evidence.appendEvent(tx, {
+      key: `${f.run.id}:run.cancelled`, runId: f.run.id, revision: f.run.revision,
+      at: new Date().toISOString(), kind: "run.cancelled", data: {},
+    }));
+    assert.equal(evidence.events({ runId: f.run.id, limit: 10 }).events.length, 1);
+    assert.equal(teams.hasRecordFile(f.run.id), true);
+    await teams.removeRun(f.run.id);
+    assert.equal(teams.hasRecordFile(f.run.id), false);
+    assert.equal(evidence.events({ runId: f.run.id, limit: 10 }).events.length, 0);
+  } finally { evidence.close(); teams.close(); f.close(); }
+});
+
+test("an unreadable record directory keeps the run's evidence", { skip: process.getuid?.() === 0 ? "root reads any directory" : false }, () => {
+  const f = schedulerFixture();
+  f.writeTeam();
+  const teams = f.openTeam();
+  const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: f.key });
+  const directory = join(f.config.stateDir, "teams");
+  try {
+    evidence.write(tx => evidence.appendEvent(tx, {
+      key: `${f.run.id}:run.started`, runId: f.run.id, revision: f.run.revision,
+      at: new Date().toISOString(), kind: "run.started", data: {},
+    }));
+    assert.equal(teams.hasRecordFile(randomUUID()), false, "a missing record file is gone");
+    chmodSync(directory, 0o000);
+    assert.throws(() => teams.hasRecordFile(f.run.id), (error: unknown) => (error as NodeJS.ErrnoException).code === "EACCES");
+    assert.equal(evidence.sweep(id => teams.hasRecordFile(id)), 0);
+    chmodSync(directory, 0o700);
+    assert.equal(evidence.events({ runId: f.run.id, limit: 10 }).events.length, 1);
+  } finally { chmodSync(directory, 0o700); evidence.close(); teams.close(); f.close(); }
 });

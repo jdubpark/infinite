@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseClientArgs } from "../packages/host/src/client.js";
+import { clientCommandCandidate, handleClientCommand, parseClientArgs } from "../packages/host/src/client.js";
 
 test("codex defaults to cloud execution; --laptop is the explicit opt-in", () => {
   const cloud = parseClientArgs(["codex", "--model", "m", "Inspect"]);
@@ -37,6 +37,23 @@ test("server administration commands keep their own options even when a provider
   const parsed = parseClientArgs(["new", "--provider", "codex", "--title", "Task"]);
   assert.equal(parsed.command, "new");
   assert.deepEqual(parsed.args, []);
+});
+
+test("a server option value named like a client command stays with the server parser", async () => {
+  assert.equal(await handleClientCommand(["--config", "evidence", "serve"]), false);
+  assert.equal(await handleClientCommand(["--state-dir", "evidence", "init"]), false);
+  assert.equal(await handleClientCommand(["--config", "list", "serve"]), false);
+  assert.equal(clientCommandCandidate(["--state-dir", "evidence", "init"]), undefined);
+  assert.equal(clientCommandCandidate(["--config", "evidence", "serve"]), undefined);
+});
+
+test("client commands are still found after client options and before pass-through arguments", () => {
+  assert.equal(clientCommandCandidate(["--json", "usage"]), "usage");
+  assert.equal(clientCommandCandidate(["--client-config", "client.json", "usage"]), "usage");
+  assert.equal(clientCommandCandidate(["--client-config", "usage", "list"]), "list", "a client option value is not the command");
+  assert.equal(clientCommandCandidate(["evidence", "status", "--json"]), "evidence");
+  assert.equal(clientCommandCandidate(["codex", "--model", "m", "list"]), "codex");
+  assert.equal(clientCommandCandidate(["--include", "../shared", "--laptop", "codex", "Inspect"]), "codex");
 });
 
 test("sync and pull commands parse their options", () => {

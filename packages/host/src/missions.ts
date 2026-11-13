@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { writeSealed, unseal } from "./vault.js";
 import { TeamService, TeamError, providerInputReason } from "./teams.js";
@@ -125,6 +125,18 @@ export class MissionService {
   }
   /** The usage ledger that prices coordinator sessions; subteam usage comes from their runs. */
   useUsage(service: UsageService) { this.usage = service; }
+  /** Whether the mission's sealed record file is on disk, so a record that failed to load still counts. Only a missing file is false. */
+  hasRecordFile(id: string) {
+    if (!/^[a-f0-9-]{36}$/.test(id)) return false;
+    try {
+      lstatSync(join(this.directory, `${id}.sealed`));
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return false;
+      throw error;
+    }
+  }
   ownsActiveSubteam(teamId: string) {
     return [...this.records.values()].some(({ mission }) =>
       !["blocked", "ready-for-review", "cancelled"].includes(mission.status) &&

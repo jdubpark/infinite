@@ -28,6 +28,7 @@ import { HandoffService } from "./handoffs.js";
 import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
 import { UsageService } from "./usage-service.js";
+import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
@@ -172,6 +173,8 @@ export function createApp(config: Config, key: Buffer) {
   const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
   const readings = new Readings(config, key, manager, summarizer);
   const ownerServices: { goals?: GoalService; missions?: MissionService; handoffs?: HandoffService } = {};
+  // A store that cannot open stays unavailable with a fixed reason. It never blocks the host, a run, or a removal.
+  const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(config.stateDir), vaultKey: key });
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
     graphs: repositoryGraphs,
@@ -184,6 +187,7 @@ export function createApp(config: Config, key: Buffer) {
       return Boolean(run.handoff && ownerServices.handoffs?.ownsActiveTeam(run.id));
     },
   });
+  teams.useEvidence(evidence);
   const usage = new UsageService(config, key, manager);
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
@@ -194,6 +198,10 @@ export function createApp(config: Config, key: Buffer) {
   const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
+  // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
+  const sweepEvidence = () => evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
+  let evidenceSweep: NodeJS.Timeout | undefined;
+  const closeEvidence = () => { clearInterval(evidenceSweep); evidence.close(); };
   missions.useUsage(usage);
   usage.useResolvers({
     goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },
@@ -585,6 +593,7 @@ export function createApp(config: Config, key: Buffer) {
     }),
   );
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
+  app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
   app.get("/api/usage/models", (req, res) => {
     const query = z.object({ role: z.string().trim().min(1).max(40).optional() }).strict().parse(req.query);
     return res.json(scorecard(teams.list(), sessionId => {
@@ -1571,6 +1580,9 @@ export function createApp(config: Config, key: Buffer) {
     void repositoryBriefings?.start().catch(() => {});
     understandingRuntime.start();
     balances.start();
+    sweepEvidence();
+    evidenceSweep = setInterval(sweepEvidence, 60 * 60 * 1000);
+    evidenceSweep.unref();
   });
   server.once("close", () => {
     teams.close();
@@ -1588,10 +1600,11 @@ export function createApp(config: Config, key: Buffer) {
     handoffs.close();
     readings.stop();
     projectSource.stop();
+    closeEvidence();
   });
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
   return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
 }

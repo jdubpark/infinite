@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { createRemoteClient } from "@infinite/remote";
 import { startHost } from "./helpers.js";
 
@@ -83,4 +88,66 @@ test("the encrypted channel carries the phone cost screen and owner plan edits",
     assert.equal(result.accounts.find(account => account.id === "claude")?.planSource, "owner");
     await assert.rejects(owner.request("/usage/accounts/cl%61ude/plan", { method: "PUT", body: { planUsd: 1 } }), "encoded route segments stay refused");
   } finally { owner.close(); await host.stop(); }
+});
+
+/** Runs `infinite evidence ...` against the host as its owner and returns stdout. */
+function evidenceCli(host: { origin: string; tokens: { owner: string } }, root: string) {
+  const clientFile = join(root, "client.json");
+  writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
+  const cli = ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/cli.ts"), "--client-config", clientFile];
+  const exec = promisify(execFile);
+  return async (...args: string[]) => (await exec(process.execPath, [...cli, "evidence", ...args])).stdout;
+}
+
+test("the status route and command report the store", { timeout: 60000 }, async () => {
+  const host = await startHost();
+  const root = mkdtempSync(join(tmpdir(), "infinite-evidence-cli-"));
+  try {
+    const status = await host.fetchApi("/evidence/status");
+    assert.equal(status.status, 200);
+    assert.equal(status.body.state, "ready");
+    assert.equal(status.body.modules.store, "ready");
+    assert.equal(status.body.events, 0);
+    assert.ok(status.body.fileBytes > 0);
+    assert.equal((await host.fetchApi("/evidence/status", "viewer")).status, 200, "the route follows the role rule of GET /api/usage");
+    assert.equal((await host.fetchApi("/evidence/status", null)).status, 401);
+
+    const evidence = evidenceCli(host, root);
+    const json = JSON.parse(await evidence("status", "--json"));
+    assert.equal(json.state, "ready");
+    assert.equal(json.modules.store, "ready");
+    const text = await evidence("status");
+    assert.match(text, /^Evidence store: ready$/m);
+    assert.match(text, /^Module store: ready$/m);
+    assert.match(text, /^Events: 0$/m);
+    assert.match(text, /^File: \d+ bytes, WAL: \d+ bytes$/m);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    await host.stop();
+  }
+});
+
+test("a host with an unusable evidence location still serves and reports the store unavailable", { timeout: 90000 }, async () => {
+  const host = await startHost();
+  const root = mkdtempSync(join(tmpdir(), "infinite-evidence-cli-"));
+  try {
+    await host.stopApi();
+    const location = join(host.config.stateDir, "evidence");
+    rmSync(location, { recursive: true, force: true });
+    writeFileSync(location, "not a directory");
+    await host.start();
+    assert.equal((await host.fetchApi("/usage")).status, 200);
+    const status = await host.fetchApi("/evidence/status");
+    assert.equal(status.status, 200);
+    assert.equal(status.body.state, "unavailable");
+    assert.equal(status.body.reason, "open-failed");
+    assert.equal(status.body.modules.store, "unavailable");
+    assert.equal(status.body.events, 0);
+    const text = await evidenceCli(host, root)("status");
+    assert.match(text, /^Evidence store: unavailable$/m);
+    assert.match(text, /^Reason: open-failed$/m);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    await host.stop();
+  }
 });

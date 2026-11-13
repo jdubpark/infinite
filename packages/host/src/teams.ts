@@ -14,6 +14,7 @@ import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstruct
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
+import type { EvidenceStore } from "./evidence/store.js";
 import { teamUsage } from "./team-usage.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
@@ -355,6 +356,7 @@ export class TeamService {
   private readonly permissionPromptFirstSeen = new Map<string, number>();
   private readonly directory: string;
   private usage?: UsageService;
+  private evidence?: EvidenceStore;
   private missionReservations?: MissionReservationLookup;
   private readonly limits: ProviderLimits;
   private reconciledAt = 0;
@@ -507,6 +509,20 @@ export class TeamService {
   useUsage(service: UsageService) { this.usage = service; }
   /** MissionService supplies active-subteam and pending-launch reservations without a reverse import. */
   useMissionReservations(lookup: MissionReservationLookup) { this.missionReservations = lookup; }
+  /** The evidence store that a deleted run's events leave with its record. */
+  useEvidence(store: EvidenceStore) { this.evidence = store; }
+  /** Whether the run's sealed record file is on disk, so a record that failed to load still counts. Only a missing file is false. */
+  hasRecordFile(id: string) {
+    if (!/^[a-f0-9-]{36}$/.test(id)) return false;
+    try {
+      lstatSync(join(this.directory, `${id}.sealed`));
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return false;
+      throw error;
+    }
+  }
   /** Active host-level provider limits; new members of a limited provider launch on their fallback. */
   providerLimits() { return this.limits.active(); }
   private enqueue<T>(task: () => T | Promise<T>): Promise<T> {
@@ -861,6 +877,8 @@ export class TeamService {
     this.commands.get(stored.run.id)?.abort();
     this.commands.delete(stored.run.id);
     this.records.delete(stored.run.id);
+    // deleteRun never throws. A failed delete is repeated by the hourly sweep, so the removal does not wait on it.
+    this.evidence?.deleteRun(stored.run.id);
     return finalView;
   }
   removeRun(id: string): Promise<TeamView> {

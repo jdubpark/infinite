@@ -1749,3 +1749,364 @@ The existing `the encrypted channel carries the phone cost screen and owner plan
 - A review-only count of review rounds from `outcome_rounds.cause`.
 - Client follow-ups for honesty, each its own change: show `excluded` beside `n` on the web, phone, and Mac Cost views; label the scout column "Completed"; name the 503 as "the outcome ledger is unavailable"; a cells view.
 - Rates for members that have no task (a spec non-goal).
+
+# Slice: signals
+
+Spec part 5 and delivery order 4, with acceptance 6. A base branch scan in the host mirror records `landing` and `revert` receipts. An owner route records and withdraws `linked-fix` and `exclusion` claims. The hold window makes `held` yes, no, or unknown, and the run view gains the run's signals. It builds on the scorecard switch-over slice, which must merge first.
+
+**Signals are module rows, not run events.** They live in the `outcomes` module and are written in its own transactions. *(My call, for three reasons. Run events are deleted with their run (umbrella C1), and a signal must reach the rows of a deleted run. A new kind for the `outcomes` projector changes its outbox definition (`definitionOf` in `evidence/outbox.ts`), which blocks the projector until it is renamed and replayed from the first event. A scan or an owner claim is not a run transition, and C1 says an event never exists for a transition the run record does not have.)* The one signal that an event makes is `rating`: the projector writes it from `rating.recorded` in the same transaction. The projector's kinds do not change.
+
+**One save path.** A row's levels, exclusion, `hold_until`, `payload.landing`, and `scan-gap` flag are a function of stored facts only: its disposition, its review acceptance, its round links, and the run's active signals with their stored window verdicts. The projector and every signal writer write a row only through `saveOutcomeRow`, which recomputes all of them. So a signal and a later event give the same row in either order, a replayed page writes the same row, and a withdrawal restores the row.
+
+## Trust boundary, and what a review checks
+
+The scanner, the resolver, and the route are host code. These inputs originate outside the host:
+
+- **Base branch commits.** Anyone with push rights writes them, a delivery member included. The host mirror is writable by the agent identity (`mirrorPath` in `project-source.ts`). A landing is a receipt that the mirror held a first-parent commit with an exact relation to the run, no more.
+- **The reported merge commit** (rule 1) is agent-reported delivery evidence (`TeamRun.deliveryReceipt`). The scan is what checks it: the commit must appear as a new first-parent commit after the approval.
+- **Commit messages.** The host never reads one. Rule 4 runs inside Git (`log --grep`), and the host reads back commit ids only.
+- **Owner claims:** `linked-fix` and `exclusion`, through an owner-only route with a `requestId`. A member cannot write a signal: it holds no device key, and there is no MCP surface.
+- **Git output.** The mirror's own Git config is agent-writable, so every parse is strict, and an output that does not match fails the scan.
+
+Privacy follows spec part 3 and umbrella C1. Plain columns hold hashes, run and outcome ids, enumerations, counts, and times. Commit and tree ids, issue keys, reason classes, and repository and branch names go in sealed payloads. No log line names a commit, an issue, or a project. `/api/outcomes/signals` stays off the relay allow-list (`allowedPath` in `remote-access.ts`), as the spec gives no relay path.
+
+The slice must survive: a project with no GitHub mirror; a squash merge onto a moved base; a deleted run; a first scan; a jump past 500 commits; a rewritten or re-pointed base branch; a refresh that fails for days; a launcher that refuses a form; an unavailable store during a scan; a replayed owner request; a projector page after a signal; and a rollback. The module's stored version 2 makes an older host's `outcomes` module unavailable, so that host answers 503 and rewrites no row with the old rules.
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `packages/host/src/outcome-rules.ts` (modify) | Shared enumerations, `RowSignals`, levels with an exclusion and a window, `rowExclusion`, `scanGap` |
+| `packages/host/src/outcome-cells.ts` (modify) | `rowUse` reads the stored exclusion; `flagged["scan-gap"]` |
+| `packages/host/src/outcome-hold.ts` (create) | Pure: the four match rules, window coverage, the hold arithmetic, strict Git output parsers |
+| `packages/host/src/outcome-store.ts` (modify) | Module version 2: `acceptance`, `outcome_signals`, `base_scans`, `base_scan_state`; their helpers; retention by days |
+| `packages/host/src/outcome-signals.ts` (create) | `saveOutcomeRow`, the row resolver, owner claims, the scan write, window verdicts |
+| `packages/host/src/outcome-projector.ts` (modify) | Acceptance as its own fact, the shared save, the `rating` signal |
+| `packages/host/src/outcome-scan.ts` (create) | `BaseScanner`: Git reads in the mirror, per-project order, the scan |
+| `packages/host/src/project-source.ts` (modify) | `onMirror` after each successful fetch |
+| `packages/host/src/config.ts`, `types.ts`, `routines.ts`, `server.ts`, `client.ts` (modify) | `teams.outcomes` out of the routine digest; wiring; `POST /api/outcomes/signals`; signals in the run view; `link-fix` and `exclude` |
+| `tests/fixtures/team-agent.mjs` (modify) | The restricted launcher model admits the five scan forms |
+| `docs/teams.md`, the spec (modify) | Launcher forms, settings, signals, the route |
+| `tests/outcome-{hold,signals,scan,config}.test.ts` (create); `tests/outcome-{rules,cells,store,projector,routes}.test.ts`, `tests/{scorecard,project-source,routines,remote-access,client-args}.test.ts` (modify) | Unit tests with a real store and real repositories; host tests |
+
+## Git commands of the scan
+
+Every command runs through `teamCommand` and `teamGitArgs` with `teams.commandPrefix`, in the host mirror (`ProjectSourceService.mirrorPath`), never in a team workspace, with a 30 second limit and the six `-c` settings of `teamGitArgs` before it. Every id is checked against `COMMIT_ID` (40 or 64 lower-case hex) before use, so no argument can be an option. This is the release audit's list:
+
+| # | Form | Output |
+|---|---|---|
+| 1 | `merge-base --is-ancestor OLD NEW` | Exit status only |
+| 2 | `rev-list --first-parent --max-count=501 NEW ^OLD` | At most 501 ids, 33 KiB |
+| 3 | `rev-list --first-parent --max-count=500 NEW` | At most 500 ids, 33 KiB |
+| 4 | `log --no-walk=unsorted --no-show-signature --format=%H %T %P ID...` (1 to 50 ids) | One line per id |
+| 5 | `log --no-walk=unsorted --no-show-signature --format=%H --fixed-strings --grep=This reverts commit ID... ID...` (1 to 50 patterns, then 1 to 50 ids) | At most 50 ids |
+
+`--format=%H %T %P` and each `--grep=This reverts commit ID` are one argument. Form 1 exit 0 means an ancestor, and any other result is read as a rewrite. A form 2 to 5 command that exits non-zero, is interrupted, or is truncated at 64 KiB, or whose output does not parse, fails the whole scan: nothing is written, and the next refresh scans again from the ledger's own head. Past the bound, the scan keeps the newest 500 commits and records the gap `bound`. A form 4 page can pass the cap only through merges of hundreds of parents; such a project's scans then fail, and its windows lapse to `gap`. Until the production launcher admits all five forms, every scan fails the same way: no landing, and held unknown.
+
+## Review Focus
+
+1. A level that a later write erases, or that depends on order: after a landing, a revert, or an exclusion, a projector event for the same row (a rating, `member.configured`, a late `repair.paths`, a replayed page), and a withdrawal. Expect held, the exclusion, `hold_until`, and `scan-gap` recomputed from stored facts and equal in both orders (Task 4 `a signal and a later event commute`, `a replayed page keeps the signals`, `an owner exclusion and its withdrawal`).
+2. A gap read as "nothing happened": a jump past 500, a rewrite, a changed source, a refresh lapse across the close, a failed read. Expect held never yes, `scan-gap` on accepted landed rows, and no advance of the scan state on a failed read (Task 2 `window coverage`; Task 5 `a jump past 500 commits is a gap`, `a failed read writes nothing and the next scan resumes`).
+3. A Git command outside the five forms or the mirror, or an output that can pass the cap (Task 5 `every scan command is a listed form, run in the mirror`).
+4. A landing that is not exact: a fuzzy match, a run landed twice, a run approved more than 90 days before the scan, a revert seen before its landing commit or after its window (Task 2 `the match rules`, `reverts follow their landing`; Task 3 `landing candidates`).
+5. An owner claim reachable by a non-owner or the relay, a replayed request that duplicates, or a commit id, issue key, or reason in a plain column (Task 6 `owner signals are owner-only and idempotent`, `the relay refuses signal writes`; Task 4 `no plain column holds a commit id or an issue key`).
+
+### Task 1: the level and reader rules
+
+**Files:** `packages/host/src/outcome-rules.ts`, `packages/host/src/outcome-cells.ts`, `tests/outcome-rules.test.ts`, `tests/outcome-cells.test.ts`, `tests/scorecard.test.ts`. Runs first; Tasks 2 and 3 need its types.
+
+**Interfaces (produces):**
+```ts
+// outcome-rules.ts
+export type Flag = "backfilled" | "gap" | "empty-result" | "same-model-review" | "scan-gap";
+export type LandingMethod = "merge-commit" | "merge-parent" | "tree-equal";
+export type ScanGap = "first" | "bound" | "rewrite" | "source";
+export type Coverage = "open" | "covered" | "gap";
+export type ScanPoint = { seq: number; at: string; checkedAt: string; gap: ScanGap | null };
+/** What the run's active signals say about one row. Task 4 resolves it. */
+export interface RowSignals { excluded: boolean; negative: boolean; landing?: Coverage }
+export interface RowState { role: "implementer" | "scout"; disposition: Disposition; accepted: Level; links: readonly LinkState[]; signals?: RowSignals }
+export function rowExclusion(disposition: Disposition, signals?: RowSignals): Exclusion | undefined;
+export function levels(state: RowState): Levels;     // unchanged when `signals` is absent
+export function scanGap(state: RowState): boolean;
+// outcome-cells.ts: Cell.flagged gains "scan-gap": number.
+```
+
+**Decisions:**
+- `rowExclusion` is the disposition's class, else `owner` when `signals.excluded`. *(My call: the column's enumeration is `limit | owner | host | duel`, and an owner exclusion, like an owner stop, is the owner removing the attempt from the denominator. The signal's payload keeps the reason class.)*
+- `levels`: a row with an exclusion has all four null (spec part 4). A counted failure keeps 0, 0, 0, 0. An integrated row: held is 0 when accepted is 0 or `negative`; 1 when accepted is 1 and `landing` is `covered`; else null. Integrated, accepted, and firstPass are as today. A call without `signals` (the backfill) gives today's levels exactly.
+- `scanGap` is true for an integrated row with no exclusion, accepted 1, no `negative`, and `landing` `gap`. *(My call: the flag marks a held level left unknown by a gap. A revert decides held whatever the gap.)*
+- `rowUse` takes `row.exclusion ?? exclusionOf(row.disposition)`, so an owner exclusion is excluded in `display` and `decision` alike, and the scorecard counts it in `excluded.owner`. `flagged["scan-gap"]` counts counted rows with the flag. *(My call: an additive `Cell` field, so a display says why held is unknown; spec part 7 is amended.)*
+
+- [ ] **Step 1: Write the failing tests.**
+
+| Test name | Assertions |
+|---|---|
+| `an owner exclusion removes every level` | Integrated, accepted 1, links `clear`, signals `{ excluded: true, negative: false, landing: "covered" }`: all null, and `rowExclusion` is `owner`. The same with `excluded: false`: 1, 1, 1, 1. `limit` with `excluded: true`: `rowExclusion` is `limit`. |
+| `held follows the window` | Accepted 1: landing `covered` gives held 1; `open` gives null and `scanGap` false; `gap` gives null and `scanGap` true; no landing gives null. Accepted null with landing `covered`: held null. |
+| `a negative signal makes held no` | Accepted 1, `negative`, landing `covered`: held 0, `scanGap` false. Accepted null and `negative`: held 0, firstPass unchanged. Accepted 0: held 0. |
+| `rows without signals keep today's levels` | The existing `levels by row state` cases pass unchanged. A stalled row with `negative` and landing `covered`: 0, 0, 0, 0. |
+| `an owner exclusion is excluded in both uses` (cells) | A frozen integrated row with `exclusion` `owner` and null levels: display and decision cells give attempts 0 and `excluded.owner` 1. |
+| `a scan gap is reported` (cells) | A counted row flagged `scan-gap` with held null: `flagged["scan-gap"]` 1, held unknown 1. The existing `an unknown flag is ignored` now expects five known keys. |
+| `an owner exclusion leaves the scorecard denominator` (scorecard) | Two integrated `light` rows, one with `exclusion` `owner`: attempts 1, integrated 1, `excluded.owner` 1. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-rules.test.ts tests/outcome-cells.test.ts tests/scorecard.test.ts` and the typecheck.
+
+### Task 2: the hold and match rules
+
+**Files:** `packages/host/src/outcome-hold.ts`, `tests/outcome-hold.test.ts`. Needs Task 1. Runs in parallel with Task 3.
+
+**Interfaces (produces):** pure, no I/O, no clock.
+```ts
+export const HOLD_DAYS_DEFAULT = 30, HOLD_DAYS_MAX = 365, APPROVAL_DAYS = 90, SCAN_BOUND = 500, COMMIT_PAGE = 50, PATTERN_PAGE = 50;
+export const COVERAGE_LAPSE_MS = 6 * 3_600_000;
+export const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+export type ScanCommit = { id: string; tree: string; parents: string[] };        // a scan lists them oldest first
+export type LandingCandidate = { runId: string; reviewedHead?: string; reviewedTree?: string; mergeCommit?: string };
+export type Landing = { runId: string; commit: string; method: LandingMethod; position: number; reviewedHead?: string };
+export type LandedRun = { runId: string; signalId: string; ids: string[]; holdUntil: string; position?: number };   // position: landed in this scan
+export type RevertMatch = { runId: string; signalId: string; commit: string; reverts: string };
+export function matchLandings(commits: readonly ScanCommit[], candidates: readonly LandingCandidate[]): Landing[];
+export function landedIds(method: LandingMethod, commit: string, reviewedHead?: string): string[];
+export function revertPattern(id: string): string;                                  // "This reverts commit " + id
+/** `hits` maps a landed id to the commits whose message names it, as form 5 reports them. */
+export function matchReverts(commits: readonly ScanCommit[], landed: readonly LandedRun[], hits: ReadonlyMap<string, ReadonlySet<string>>, at: string): RevertMatch[];
+export function holdUntil(landedAt: string, holdDays: number): string;
+export function windowCoverage(points: { last?: ScanPoint; next?: ScanPoint; gapInside: boolean }, holdUntil: string, lapseMs?: number): Coverage;
+export function parseIds(stdout: string, max: number): string[] | undefined;
+export function parseCommits(stdout: string, ids: readonly string[]): ScanCommit[] | undefined;
+```
+
+**Decisions:**
+- **Rules 1 to 3** (spec part 5), exact matches only: `commit.id === mergeCommit`; `commit.parents[1] === reviewedHead`; `commit.tree === reviewedTree`. An absent field matches nothing. Commits are taken oldest first, a run lands at its first matching commit, and within one commit rule 1 comes before 2 and 2 before 3. Several runs may land on one commit. A first parent equal to the head is not rule 2.
+- **Landed ids.** The landing commit, plus the reviewed head for `merge-parent`, because that head is the merge's second parent and so a commit of the branch. *(My call: a revert of the merge names the merge, and a revert of the run's last commit names the head.)*
+- **Rule 4.** A revert counts once per landing signal and reverting commit. It needs `holdUntil >= at`, and, for a run that landed in the same scan, a position after the landing's.
+- **Time.** A signal's time is the time of the fetch the scan read. A commit is inside a window when the scan that first saw it ran at or before `holdUntil`, as hindsight part 1 defines it. *(My call: a committer date is text the committer writes.)* `holdUntil` adds `holdDays × 86,400,000` ms.
+- **Coverage**, in order: a gap scan after the landing scan and at or before the close (`gapInside`) gives `gap`; `last.checkedAt >= holdUntil` (the head did not move through the close) gives `covered`; no `next` gives `open`; a `next` with a gap gives `gap`; `next.at − last.checkedAt <= lapseMs` gives `covered`, else `gap`. `last` is the newest scan at or before the close from the landing scan on, and `next` is the one after it. *(My call: a refresh lapse that straddles the close leaves commits whose side of the close is unknown. Six hours covers the fetch back-off of `project-source.ts`, at most an hour, several times.)*
+- **Parsers.** `parseIds`: every line is a `COMMIT_ID`, at most `max` lines, empty output is `[]`. `parseCommits`: one line per requested id, in order, `H T` and then one ` P` per parent (a root commit's trailing space is allowed), with H equal to the requested id. Anything else gives undefined.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-hold.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `the match rules` | Merge commit M reported: `merge-commit` at M. Second parent equal to head H: `merge-parent`. Tree equal: `tree-equal`. One commit matching rules 1 and 3 for one run: `merge-commit`. A run matching at positions 1 and 3: position 1 only. Two runs on one commit: two landings. A candidate with no field, and a first parent equal to H: none. |
+| `landed ids` | `merge-parent` gives `[commit, head]`, `merge-commit` and `tree-equal` give `[commit]`, and a head equal to the commit appears once. |
+| `reverts follow their landing` | A landing of an earlier scan and a hit at position 0: one match. A landing at position 2 of this scan and hits at 1 and 3: the match at 3 only. `holdUntil` one millisecond before `at`: none. Two ids of one run naming one commit: one match. |
+| `window coverage` | With H = `2026-12-13T00:00:00.000Z`: `gapInside` gives `gap`. `checkedAt` H gives `covered`. `checkedAt` H − 1 ms and no next: `open`. Next at H + 1 h after `checkedAt` H − 5 h: `covered`; after H − 5 h − 1 ms: `gap`. A next with gap `bound`: `gap`. |
+| `the hold window adds whole days` | `holdUntil("2026-11-13T00:00:00.000Z", 30)` is `"2026-12-13T00:00:00.000Z"`. |
+| `parsers are strict` | `parseIds`: a 39-hex line, an upper-case line, or 3 lines with `max` 2 give undefined; `""` gives `[]`. `parseCommits`: ids out of order, a missing line, or a non-hex tree give undefined; `"H T "` gives parents `[]`; a 64-hex line parses. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-hold.test.ts` and the typecheck.
+
+### Task 3: the store, version 2
+
+**Files:** `packages/host/src/outcome-store.ts`, `tests/outcome-store.test.ts`. Needs Task 1. Runs in parallel with Task 2.
+
+**Interfaces (produces):** module `outcomes`, version 2, `readVersion` 2 (a reader must take the stored exclusion). `migrate(tx, from)` runs the version 1 statements when `from < 1`, then, when `from < 2`:
+```sql
+ALTER TABLE outcomes ADD COLUMN acceptance INTEGER;   -- the review's acceptance before an owner exclusion
+UPDATE outcomes SET acceptance = accepted;
+CREATE TABLE IF NOT EXISTS outcome_signals (signal_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, outcome_id TEXT,
+  kind TEXT NOT NULL, author TEXT NOT NULL, authority TEXT NOT NULL, state TEXT NOT NULL, at TEXT NOT NULL,
+  payload TEXT NOT NULL);                             -- spec part 5; sealed SignalPayload
+CREATE TABLE IF NOT EXISTS base_scans (project_ref TEXT NOT NULL, seq INTEGER NOT NULL, at TEXT NOT NULL,
+  checked_at TEXT NOT NULL, commits INTEGER NOT NULL, gap TEXT, payload TEXT NOT NULL,   -- sealed { from?, to, oldest? }
+  PRIMARY KEY (project_ref, seq));
+CREATE TABLE IF NOT EXISTS base_scan_state (project_ref TEXT PRIMARY KEY, seq INTEGER NOT NULL,
+  payload TEXT NOT NULL);                             -- sealed { head, repository, baseBranch }
+-- Indexes: outcome_signals (run_id), (outcome_id), (kind, at).
+```
+
+```ts
+export type SignalKind = "rating" | "landing" | "revert" | "linked-fix" | "exclusion";
+export type ExclusionReason = "outside-cause" | "invalid-task" | "trial" | "other";
+export const EXCLUSION_REASONS: readonly ExclusionReason[];
+export type SignalPayload =
+  | { kind: "rating"; score: number }
+  | { kind: "landing"; commit: string; method: LandingMethod; scanSeq: number; holdDays: number; holdUntil: string;
+      reviewedHead?: string; window?: { state: "covered" | "gap"; decidedAt: string } }
+  | { kind: "revert"; commit: string; reverts: string; landingSignalId: string; scanSeq: number }
+  | { kind: "linked-fix"; issue?: string; commit?: string; request: string; withdrawnAt?: string }
+  | { kind: "exclusion"; reason: ExclusionReason; request: string; withdrawnAt?: string };
+export type SignalRow = { signalId: string; runId: string; outcomeId: string | null; kind: SignalKind; author: "host" | "owner";
+  authority: "receipt" | "claim"; state: "active" | "withdrawn"; at: string; payload: SignalPayload };
+export type ScanRow = { projectRef: string; seq: number; at: string; checkedAt: string; commits: number; gap: ScanGap | null;
+  payload: { from?: string; to: string; oldest?: string } };
+export type ScanState = { projectRef: string; seq: number; payload: { head: string; repository: string; baseBranch: string } };
+// OutcomeRow gains `acceptance?: Level`: a read row always has it; absent on a write, writeOutcome stores `accepted`. OutcomePayload gains `landing?: { at: string; method: LandingMethod }`.
+export function readSignal(db: EvidenceDb, signalId: string): SignalRow | undefined;
+export function runSignals(db: EvidenceDb, runId: string): SignalRow[];                  // `at`, then `signal_id` order
+export function writeSignal(tx: EvidenceTx, row: SignalRow): void;                        // whole-row upsert
+export function readScanState(db: EvidenceDb, projectRef: string): ScanState | undefined;
+export function lastScan(db: EvidenceDb, projectRef: string): ScanRow | undefined;
+export function writeScan(tx: EvidenceTx, scan: ScanRow, state: ScanState): void;
+export function checkScan(tx: EvidenceTx, projectRef: string, seq: number, at: string): void;   // checked_at = MAX(checked_at, at)
+export function scanPoints(db: EvidenceDb, projectRef: string, landingSeq: number, holdUntil: string): { last?: ScanPoint; next?: ScanPoint; gapInside: boolean };
+export function projectLandings(db: EvidenceDb, projectRef: string, since: string): SignalRow[];          // active, `at >= since`
+export function landingCandidates(db: EvidenceDb, projectRef: string, approvedSince: string): { runId: string; payload: RunSummaryPayload }[];
+export function runOutcomeView(store: EvidenceStore, runId: string): { summary?: RunSummaryRow; rows: OutcomeRow[]; members: MemberResultRow[]; signals: SignalRow[] } | undefined;
+export function sweepExpiredOutcomes(store: EvidenceStore, now: string, limit?: number, retentionDays?: number): number;
+```
+
+**Decisions:**
+- Payloads are sealed with `tx.seal(table, rowId, value)`; the row id of a scan is `projectRef + ":" + seq`, of a state `projectRef`, of a signal its id. A signal whose payload does not open is left out of `runSignals` and counted in the run view's `unreadable`.
+- `landingCandidates` joins nothing it does not need: summaries with this `project_ref`, `approved_at >= approvedSince`, and no active `landing` signal, deleted runs included (spec part 6 keeps their review facts). `projectLandings` joins `run_summaries` on `run_id` for the project.
+- `scanPoints`: `last` is the newest scan with `seq >= landingSeq` and `at <= holdUntil`; `next` the first with `seq > last.seq`; `gapInside` any scan with `landingSeq < seq <= last.seq` and a gap.
+- **Retention.** `retentionDays` defaults to `OUTCOME_RETENTION_DAYS`. A removed run also loses its `outcome_signals` rows. `base_scans` and `base_scan_state` are kept. *(My call: a verdict stored on the landing makes old scans unnecessary, and their pruning waits for a later slice.)*
+- `counts` gains `signals` and `scans`. `deleteRun` stamps no signal: signals have no `run_deleted_at`, and they live as long as the run's rows.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-store.test.ts`.
+
+| Test name | Assertions |
+|---|---|
+| `a version 1 store migrates in place` | A store first opened with a module named `outcomes` at version 1 (the version 1 statements copied into the test) holds a row with accepted 1. Reopened with `outcomeModule()`: version 2, the row has `acceptance` 1, the three new tables exist, and `describe().counts` has `outcomes.signals` and `outcomes.scans`. |
+| `a signal round-trips sealed` | A landing and a linked fix with issue `ABC-12` read back equal. No raw column of `outcome_signals` contains the commit id or `ABC-12`. |
+| `scan state and points` | Scans 1 (at day 0, checked day 1), 2 (day 2, gap `bound`), 3 (day 40): `scanPoints(ref, 1, day 30)` gives last 2, next 3, `gapInside` true; from landing scan 2, `gapInside` false. `checkScan` with an earlier time keeps `checked_at`. No raw column holds the head. |
+| `landing candidates` | Approved 89 days before `at`: in. 91 days: out. A run with an active landing, another project's run, and a summary with no approval: out. A deleted run's summary: in, with its payload's reviewed head. |
+| `retention follows the configured days` | A run deleted `2024-01-01T00:00:00.000Z` with one signal: a sweep at `2025-01-01T00:00:00.001Z` with 365 days removes its rows and the signal, and leaves `base_scans`. Without the argument the same sweep removes nothing. |
+| `the run view lists signals` | Two signals of R and one of another run: `signals` holds R's two in `at` order. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-store.test.ts tests/outcome-reads.test.ts` and the typecheck.
+
+### Task 4: signals and the shared save
+
+**Files:** `packages/host/src/outcome-signals.ts`, `packages/host/src/outcome-projector.ts`, `tests/outcome-signals.test.ts`, `tests/outcome-projector.test.ts`. Needs Tasks 1 to 3.
+
+**Interfaces (produces):**
+```ts
+export function landingSignalId(runId: string): string;                          // SHA-256 hex of "landing:" + runId
+export function revertSignalId(landingSignalId: string, commit: string): string;  // of "revert:" + both
+export function ownerSignalId(requestId: string): string;                         // of "owner:" + requestId
+export function ratingSignalId(eventKey: string): string;                         // of "rating:" + the event key
+export type RowSignalFacts = { signals: RowSignals; landing?: { at: string; method: LandingMethod; holdUntil: string } };
+export function rowSignals(db: EvidenceDb, row: OutcomeRow): RowSignalFacts;
+export function saveOutcomeRow(tx: EvidenceTx, row: OutcomeRow): void;
+export function recomputeRun(tx: EvidenceTx, runId: string): void;
+export type OwnerSignalInput =
+  | { action: "record"; kind: "linked-fix"; requestId: string; runId: string; memberId?: string; issue?: string; commit?: string; at?: string }
+  | { action: "record"; kind: "exclusion"; requestId: string; runId: string; memberId: string; reason: ExclusionReason }
+  | { action: "withdraw"; kind: "linked-fix" | "exclusion"; requestId: string; signalId: string };
+export type SignalRequestCode = "request-conflict" | "outcome-not-found" | "signal-not-found" | "signal-not-withdrawable";
+export class SignalRequestError extends Error { constructor(readonly code: SignalRequestCode, message: string) }
+export function ownerSignal(store: EvidenceStore, input: OwnerSignalInput, now: string): { signal: SignalRow; repeated: boolean };
+export type ScanInputs = { state?: { seq: number; head: string; repository: string; baseBranch: string; lastAt: string };
+  candidates: LandingCandidate[]; open: LandedRun[] };
+export function scanInputs(db: EvidenceDb, projectId: string, at: string): ScanInputs;
+export type ScanWrite = { projectId: string; repository: string; baseBranch: string; at: string; head: string; from?: string;
+  oldest?: string; commits: number; gap: ScanGap | null; expectedSeq: number; landings: readonly Landing[];
+  reverts: readonly RevertMatch[]; holdDays: number };
+export function applyScan(tx: EvidenceTx, scan: ScanWrite): { applied: boolean; seq: number };
+export function applyCheck(tx: EvidenceTx, check: { projectId: string; head: string; at: string; expectedSeq: number }): { applied: boolean };
+```
+
+**Decisions:**
+- **`saveOutcomeRow`** reads the row's links and `rowSignals`, then sets the four levels from `levels({ ..., accepted: row.acceptance ?? null, signals })`, `exclusion` from `rowExclusion`, `payload.rounds`, the `scan-gap` flag (added or removed by `scanGap`), `hold_until` and `payload.landing` (set from `landing`, else cleared), and writes the whole row. `acceptance` is never changed here. The projector's `saveRow` becomes this call.
+- **The projector keeps acceptance as its own fact.** An approval sets `row.acceptance = 1`, an integration after another disposition sets it to null, and the freeze sets it to `freezeAccepted(row.acceptance ?? null, …)`. `blankOutcome` gives `acceptance: null`. *(My call: an exclusion empties `accepted`, so a withdrawal could not restore it from that column. Spec part 3 is amended.)*
+- **What applies to a row** (`rowSignals`, active signals only). An exclusion naming the row sets `excluded`. The run's landing applies when `acceptance` is 1, with coverage from its stored `window`, else `open`. `negative` is set by a revert of the run at or before the landing's close and `acceptance` 1; by a linked fix naming the row, when the row is integrated; or by a run-wide linked fix and `acceptance` 1. A linked fix counts when the run has no landing, or when its `at` is at or before the close. *(My call: spec part 5's table makes a linked fix set held no, and its held paragraph asks that the fix fall inside the window. Without a landing, the owner's claim is the only evidence, and once a landing appears a fix that counted still counts, because it cannot be later than the close.)* All accepted rows of the run take one landing, whatever their revision. *(My call: the summary keeps only the newest reviewed head.)*
+- **Window verdicts are stored once.** `applyScan` and `applyCheck` end by reading the project's active landings of the last `HOLD_DAYS_MAX` days that have no `window`, computing `windowCoverage` from `scanPoints`, and storing a verdict that is not `open` with `decidedAt` set to the scan's time. The resolver never reads scans. *(My call: a decided window then never changes when old scans go, and a late cost refresh on an old row cannot turn held.)*
+- **`applyScan`**, in one write: `applied: false` unless the stored state's seq equals `expectedSeq` and `at` is not before the last scan's; a new scan row at `expectedSeq + 1` with `checked_at = at`, and the state; a landing signal per landing whose run has none (`landingSignalId`, `scanSeq`, `holdDays`, `holdUntil(at, holdDays)`, the reviewed head); a revert signal per match whose landing is active and open at `at`; the verdicts; `recomputeRun` for each run it touched. `applyCheck` needs the same seq and an unchanged head, then `checkScan`, the verdicts, and the recomputes.
+- **`scanInputs`** opens the state, `landingCandidates` since `at` minus `APPROVAL_DAYS`, and the open landings (`holdUntil >= at`) as `LandedRun` with `landedIds`.
+- **Owner claims**, in one write, `EvidenceError("unavailable")` unless the module is ready. A record's id is `ownerSignalId(requestId)`, and `request` is the SHA-256 of the canonical JSON of the input without `requestId`. A stored id with the same `request` returns `repeated: true`; another gives `request-conflict`. The run must have a summary or a row, and a named member a row (`outcome-not-found`). `at` defaults to `now`. A withdrawal needs the id (`signal-not-found`) and an owner signal of the given kind (`signal-not-withdrawable`); a withdrawn one returns `repeated: true`. Both end with `recomputeRun`.
+- **`rating`.** `ratingRecorded` also writes `ratingSignalId(event.key)`, author `owner`, authority `claim`, payload `{ kind: "rating", score }`, for the row it rates only. No level reads it.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-signals.test.ts`, with the projector harness of `tests/outcome-projector.test.ts` and scans written through `applyScan` and `applyCheck` with fixed times.
+
+| Test name | Assertions |
+|---|---|
+| `a landing gives accepted rows their window` | Rows: m1 accepted, m2 integrated with acceptance null, m3 stalled. A landing at day 0: m1 has `hold_until` day 30, `payload.landing` with the method, held null; m2 and m3 have no `hold_until`; m3 keeps 0, 0, 0, 0. |
+| `a quiet window holds and a reverted one does not` | `applyCheck` at day 30 + 1 min: verdict `covered`, m1 held 1. Run B with a revert in a day 10 scan: held 0, and the day 31 check leaves it 0. |
+| `a gap in the window flags the row` | A day 5 scan with gap `bound`, a day 31 check: verdict `gap`, held null, flag `scan-gap`. A revert in a day 20 scan of the same window: held 0 and no `scan-gap`. |
+| `a signal and a later event commute` | Order A: a landing, the day 31 check, then `rating.recorded` and `member.configured`. Order B: the two events, then the landing and the check. Both rows are equal, with held 1 and `hold_until` set. |
+| `a replayed page keeps the signals` | After a landing, a verdict, and an exclusion, every event of the run applied again in one write: no table changes. |
+| `an owner exclusion and its withdrawal` | An exclusion of m1: `exclusion` `owner`, levels null, `acceptance` 1, attempts by disposition unchanged. Its withdrawal: 1, 1, 1, and held as before. A second withdrawal: `repeated: true`. |
+| `a linked fix makes held no where it applies` | Named on m2 (acceptance null): m2 held 0. Run-wide: m1 held 0, m2 unchanged. With a landing, a fix at the close + 1 ms changes nothing. Without a landing: m1 held 0. |
+| `owner requests are idempotent and checked` | The same request twice: one row, `repeated: true`. The same id with another body: `request-conflict`. An unknown run, or an exclusion of an unknown member: `outcome-not-found`. Withdrawing a landing, or an exclusion as `linked-fix`: `signal-not-withdrawable`. An unknown id: `signal-not-found`. No module: `EvidenceError` `unavailable`. |
+| `a deleted run's rows take signals` | Rows with `run_deleted_at`: a landing, a verdict, and an exclusion apply. |
+| `a scan applies once and a run lands once` | A stale `expectedSeq`: `applied: false`, nothing written. A later scan with a second landing of the run: the first stands. |
+| `a rating is a signal` | `rating.recorded` writes one `rating` signal with the score sealed, a replay adds none, and the levels do not change. |
+| `no plain column holds a commit id or an issue key` | After a landing, a revert, a fix with issue `ABC-12`, and an exclusion `trial`: no plain column of the outcome or scan tables contains a commit id, `ABC-12`, or `trial`. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-signals.test.ts tests/outcome-projector.test.ts tests/outcome-backfill.test.ts`, where the existing projector tests pass unchanged, and the typecheck.
+
+### Task 5: the base branch scan
+
+**Files:** `packages/host/src/outcome-scan.ts`, `packages/host/src/project-source.ts`, `tests/fixtures/team-agent.mjs`, `tests/outcome-scan.test.ts`, `tests/project-source.test.ts`. Needs Task 4.
+
+**Interfaces (produces):**
+```ts
+// project-source.ts
+export type MirrorFetch = { projectId: string; repository: string; baseBranch: string; head: string; previousHead?: string; fetchedAt: string };
+// ProjectSourceOptions gains `onMirror?: (fetch: MirrorFetch) => void`.
+// outcome-scan.ts
+export type ScanGit = (cwd: string, args: string[]) => Promise<CommandResult>;
+export type ScanResult = { state: "scanned" | "checked" | "skipped" | "failed"; commits: number; gap: ScanGap | null; landings: number; reverts: number };
+export async function scanOnce(input: { store: EvidenceStore; git: ScanGit; mirror: string; fetch: MirrorFetch; holdDays: number }): Promise<ScanResult>;
+export class BaseScanner {
+  constructor(options: { store: EvidenceStore; mirrorPath: (projectId: string) => string; prefix?: TeamCommand; holdDays: () => number; git?: ScanGit });
+  notify(fetch: MirrorFetch): void;          // returns at once and never throws
+  settled(projectId: string): Promise<void>;
+  close(): void;
+}
+```
+
+**Decisions:**
+- **The callback.** `refreshOne` calls `onMirror` after the status write that follows every successful fetch, with the fetched head, the previous `mirrorHead`, and `fetchedAt`, inside a `try` that swallows a throw. *(My call: spec part 5 says it fires when `mirrorHead` changes. A window on a quiet branch then never closes, and a scan that failed is never retried. Firing on every fetch costs one store write when the head did not move. The spec is amended.)*
+- **`scanOnce`**, in order: `skipped` unless the module is ready, the mirror exists, and the head is a `COMMIT_ID`. `scanInputs` in one read. The same head and source: `applyCheck`, `checked`, no Git command. No state: gap `first`, form 3. Another repository or branch: gap `source`, form 3. Otherwise form 1; on an ancestor, form 2, and 501 ids give gap `bound` and the newest 500; on any other result, gap `rewrite`, form 3. Then form 4 in pages of `COMMIT_PAGE`, oldest first. `matchLandings`. When any landed run (open, or landed now) exists: per page, form 5 with every pattern in batches of `PATTERN_PAGE`; for a page with a hit, form 5 again per landed id with that page's hits; then `matchReverts`. Last, `applyScan` in one write: `scanned`, or `skipped` when it did not apply.
+- **Failure.** Any command or parse failure returns `failed` and writes nothing, so the state keeps the ledger's own head and the next fetch scans from it. A thrown error is `failed`. One fixed line per class and process: `Base branch scan failed.` or `Base branch scan gap: <gap>.`
+- **Order.** `BaseScanner` runs one scan per project at a time, outside the refresh's serial chain. A notice during a scan replaces the pending one and runs after it. After `close`, notices are dropped. Its default `git` is `teamCommand({ command: "git", args: teamGitArgs(cwd, args) }, cwd, undefined, 30_000, prefix)`.
+- **The launcher model.** `--mirror-restricted-prefix` in `tests/fixtures/team-agent.mjs` admits the five forms exactly (flags, order, `COMMIT_ID` arguments, 1 to 50 ids and patterns), besides `fetch` and `rev-parse`, and refuses the rest as today.
+
+- [ ] **Step 1: Write the failing tests** in `tests/outcome-scan.test.ts`, with a bare repository as the mirror, a seed clone that pushes to it, a real store with both modules, and summaries and rows written with `writeSummary` and `writeOutcome`. Times come from `fetchedAt`.
+
+| Test name | Assertions |
+|---|---|
+| `a first scan reads the newest commits` | Three commits, no state: `scanned`, gap `first`, `commits` 3; the scan row's payload has `to` the head and no `from`. |
+| `each rule lands its run` | Run A reports merge M; run B's head is the second parent of another merge; run C's head is fast-forwarded. Methods `merge-commit`, `merge-parent`, `tree-equal`, each with its commit in the sealed payload. |
+| `a squash onto a moved base lands nothing` | A base commit, then a squash of run D's change: no landing; D's accepted row has held null and no flag. |
+| `acceptance 6` | Run E lands at day 0 and `git revert -m 1` of its merge is scanned at day 10: held 0. Run F lands at day 0 and a check at day 31 closes it: held 1. A project with no mirror is never scanned: held null. |
+| `a jump past 500 commits is a gap` | After a landing, 501 commits made with one `git fast-import`: gap `bound`, `commits` 500, and after a day 31 check, held null with `scan-gap`. |
+| `a rewritten branch is a gap` | After a landing, a forced push of an unrelated history: gap `rewrite`, and the window's verdict is `gap`. |
+| `a failed read writes nothing and the next scan resumes` | A prefix that exits 1 for `log`: `failed`, state and scan rows unchanged. The next scan without it finds the landing made meanwhile. |
+| `every scan command is a listed form, run in the mirror` | Through `--command-prefix`, every logged command of a scan with a landing and a revert runs in the mirror and matches one of the five forms. Through `--mirror-restricted-prefix`, the same scan is `scanned`, and a `cat-file` there is still refused. |
+| `notices coalesce and never throw` | Three notices during a slow scan run two scans. A notice after `close`, or on a closed store, does not throw. |
+| `the mirror callback fires after each successful fetch` (project-source) | Two refreshes with a new commit between: the second callback has `previousHead` equal to the first's `head`. A refresh with no change fires again. A failed fetch fires nothing. A throwing callback leaves the status equal to one without a callback. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement.** **Step 4: Run** `node --import tsx --test tests/outcome-scan.test.ts tests/project-source.test.ts tests/team-workspace.test.ts` and the typecheck.
+
+### Task 6: settings, wiring, the route, the CLI, and the docs
+
+**Files:** `config.ts`, `types.ts`, `routines.ts`, `server.ts`, `client.ts`, `docs/teams.md`, the spec, `tests/outcome-config.test.ts`, `tests/routines.test.ts`, `tests/outcome-routes.test.ts`, `tests/remote-access.test.ts`, `tests/client-args.test.ts`. Needs Task 5. Step 1a needs nothing and may run in parallel with Task 1.
+
+**Interfaces (produces):** `export const outcomeSettingsSchema` in `config.ts`; `Config.teams.outcomes?: { holdDays?: number; retentionDays?: number }`; `POST /api/outcomes/signals` with an `OwnerSignalInput` body, answering `{ signal, repeated }`; `GET /api/outcomes/runs/:runId` gains `signals`; `infinite usage outcomes link-fix --run ID [--member ID] (--issue KEY | --commit SHA) [--at TIME] [--request-id ID] [--json]`, `infinite usage outcomes exclude --run ID --member ID --reason REASON [--request-id ID] [--json]`, and `--withdraw SIGNAL` on either.
+
+**Decisions:**
+- **Settings (C11).** `teams.outcomes` is `z.object({ holdDays: int 1–365 optional, retentionDays: int 30–3650 optional }).strict().optional()`, with no schema default, so an unset config parses as before. `RoutineService.authority` digests `teams` with `outcomes` removed. So setting either key blocks no routine, and a host without them keeps its digest. Defaults apply at use: `HOLD_DAYS_DEFAULT` and `OUTCOME_RETENTION_DAYS`. A changed `holdDays` applies to landings recorded afterwards: each landing stores its own `holdUntil`.
+- **Wiring.** `ProjectSourceService` is built before the store, so `onMirror` calls a scanner held in a `let` that `createApp` sets right after the `outcomes` registration: `new BaseScanner({ store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT })`. `sweepEvidence` passes `retentionDays`. `closeEvidence` calls `scanner.close()` first.
+- **`POST /api/outcomes/signals`**, `requireRole(["owner"])`, a strict union of the three bodies: ids are UUIDs, `issue` matches `/^[A-Za-z][A-Za-z0-9]{0,9}-[0-9]{1,9}$/`, `commit` is a `COMMIT_ID`, a fix names `issue` or `commit`, `at` is an ISO time no later than the request, `reason` one of `EXCLUSION_REASONS`, `signalId` 64 hex. A zod error answers 400; `request-conflict` and `signal-not-withdrawable` 409; `outcome-not-found` and `signal-not-found` 404; an unavailable store 503 `evidence-unavailable`. The served signal drops `request`.
+- **Run view and CLI.** The run view serves each signal with its opened payload, without `request`. `--run` prints one more line per signal: `signal`, the first 12 characters of the id, kind, author, state, time, and the member when it names one, each through `clean`. `link-fix` and `exclude` print the signal id and `repeated` when so; a 403 prints `Recording a signal requires an owner device key.`, and the 404, 409, and 503 answers each print one fixed sentence. `CLIENT_STRING_OPTIONS` gains `--member`, `--issue`, `--commit`, `--at`, `--reason`, `--withdraw`. The request id is `--request-id` or a new UUID.
+- **Docs.** `docs/teams.md` "GitHub-tracked sources": a bullet with the five forms, and the sentence at lines 1444–1445 ("Only the pinned base fetch and `rev-parse` run in the source mirror") names the scan forms too. The ledger section gains held, the two settings, the route, and the commands. The spec is amended where Tasks 1 to 5 marked it, and "Left to the builder" names the Git forms.
+
+- [ ] **Step 1a: Write the failing settings tests, then implement `config.ts`, `types.ts`, and `routines.ts`.** **Step 1b: Write the failing host tests.**
+
+| Test name | Assertions |
+|---|---|
+| `outcome settings parse without defaults` (outcome-config) | `{}` parses to `{}`. `holdDays` 0 or 366, `retentionDays` 29, and an unknown key fail. |
+| `outcome settings stay out of the routine approval digest` (routines) | After `create`, setting `config.teams.outcomes` to `{ holdDays: 14, retentionDays: 365 }` and a `tick` leave the routine active. Changing `stallMinutes` then blocks it, as `changed project authority blocks launch` does for checks. |
+| `owner signals are owner-only and idempotent` (outcome-routes, host) | After `fixture()` settles: a viewer and a controller get 403. The owner's exclusion of an implementer gives 200; the same body again `repeated: true`; another body under that id 409 `request-conflict`; an unknown run 404; an `at` an hour ahead 400. A withdrawal gives 200, and the run view lists the signal as `withdrawn` with no `request`. |
+| `the relay refuses signal writes` (remote-access) | `["POST", "/outcomes/signals"]` joins the paths that answer 403 `remote-endpoint-denied`. |
+| `the signal commands` (outcome-routes, host) | `usage outcomes exclude --run R --member M --reason trial` prints a signal id; `--withdraw` with it succeeds; a viewer key prints the owner-key sentence; `--run R` prints a `signal` line. |
+| `a refresh scans the base branch through the launcher` (outcome-routes, host) | The project switched to a GitHub source with `remoteOverrides`, as `trackedFixture` in `tests/team-publication.test.ts` does, with the fixture's restricted prefix. `POST /projects/:id/source/refresh`: `outcomes.scans` becomes 1 in `/evidence/status`. A push to the remote and a second refresh: 2. `mirror-commands.jsonl` lists no refused scan command. |
+| `an approved run lands on the next refresh` (outcome-routes, host) | After `fixture()` settles with an approval, its reviewed head is pushed to the remote's `main` as a fast-forward from the run's integration checkout, and the source is refreshed: the run view has a `landing` signal with method `tree-equal`, and each accepted row has `holdUntil` 30 days after it. |
+| `signal options parse` (client-args) | `parseClientArgs` keeps the values of the six new options. |
+
+- [ ] **Step 2: Run the tests and confirm they fail.** **Step 3: Implement**, and amend the docs and the spec. **Step 4: Run** `tests/outcome-config.test.ts`, `tests/routines.test.ts`, and `tests/client-args.test.ts`, then `tests/outcome-routes.test.ts` and `tests/remote-access.test.ts` on the host, then the typecheck.
+- [ ] **Step 5: The coordinator runs `npm run check` once, requests the independent review, and commits.** The launcher audit of the five forms under the deployed identities is a release step, outside this pull request.
+
+## Not in this slice
+
+- Roll-ups, the legacy import, stored cost, the hindsight signal, and every client view of signals or held.
+- Landings for runs that predate emission. A backfilled summary has no reviewed head, tree, merge commit, or approval time (`approvedAt: null` in `outcome-backfill.ts`), so such a run never lands and its held stays unknown.
+- A second look at commits already scanned. A landing commit scanned before its run's approval reached the ledger is never matched, and held stays unknown.
+- Pruning of `base_scans`, which grows by one row per fetch that saw new commits.
+- A landing by any other evidence: pull request numbers in subjects, the GitHub API, or a squash onto a moved base (spec part 5's exact-match rule).
+- A `decision` rule for `scan-gap` rows beyond held unknown, and relay access to any `/api/outcomes` route.

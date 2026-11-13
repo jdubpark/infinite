@@ -6,18 +6,16 @@ import type { EvidenceDb, EvidenceTx, RunEvent } from "./evidence/types.js";
 import {
   BLOCK_DISPOSITIONS,
   type Disposition,
-  exclusionOf,
   type Flag,
   freezeAccepted,
-  levels,
   type LinkState,
   linkAfterPaths,
   reportDisposition,
   replaces,
-  roundCounts,
   type RowState,
   stopDisposition,
 } from "./outcome-rules.js";
+import { ratingSignalId, saveOutcomeRow } from "./outcome-signals.js";
 import {
   readMemberResult,
   readOutcome,
@@ -32,7 +30,7 @@ import {
   type RunSummaryRow,
   runOutcomes,
   writeMemberResult,
-  writeOutcome,
+  writeSignal,
   writeSummary,
 } from "./outcome-store.js";
 import { MEMBER_STOP_REASONS, type MemberStopReason, type ReplacementCause, type RunSummaryCounts } from "./run-events.js";
@@ -172,7 +170,7 @@ function memberStarted(ctx: Ctx): void {
     if (features) applyFeatures(row, features);
     else row.flags = withFlag(row.flags, "gap");
     if (provider === undefined) row.flags = withFlag(row.flags, "gap");
-    saveRow(tx, row);
+    saveOutcomeRow(tx, row);
     return;
   }
   const result = readMemberResult(tx, outcomeId(event.runId, memberId)) ?? blankResult(ctx, memberId, role, facts, facts.gap ? ["gap"] : []);
@@ -198,7 +196,7 @@ function memberConfigured({ tx, event }: Ctx): void {
   const row = readOutcome(tx, outcomeId(event.runId, memberId));
   if (row) {
     row.configId = id;
-    saveRow(tx, row);
+    saveOutcomeRow(tx, row);
     return;
   }
   const result = readMemberResult(tx, outcomeId(event.runId, memberId));
@@ -222,7 +220,7 @@ function memberReported(ctx: Ctx): void {
       row.disposition = next;
       row.endedAt ??= event.at;
     }
-    saveRow(tx, row);
+    saveOutcomeRow(tx, row);
     return;
   }
   const result = readMemberResult(tx, outcomeId(event.runId, memberId)) ?? sentinelResult(ctx, memberId, role);
@@ -248,7 +246,7 @@ function memberStopped(ctx: Ctx): void {
       row.disposition = next;
       row.endedAt = event.at;
     }
-    saveRow(tx, row);
+    saveOutcomeRow(tx, row);
     return;
   }
   const result = readMemberResult(tx, outcomeId(event.runId, memberId)) ?? sentinelResult(ctx, memberId, role);
@@ -267,7 +265,7 @@ function taskIntegrated(ctx: Ctx): void {
   const row = readOutcome(tx, outcomeId(event.runId, memberId)) ?? sentinelRow(ctx, memberId, "implementer");
   if (replaces(row.disposition, "integrated")) {
     // A stored acceptance belongs to an integration. Only a review of this integration sets it.
-    if (row.disposition !== "integrated") row.accepted = null;
+    if (row.disposition !== "integrated") row.acceptance = null;
     row.disposition = "integrated";
     row.endedAt = event.at;
   }
@@ -277,7 +275,7 @@ function taskIntegrated(ctx: Ctx): void {
   if (diff) row.payload.diff = diff;
   // An integration with no commit changed nothing, so the attempt is an empty result.
   if (str(data.commit) === undefined) row.flags = withFlag(row.flags, "empty-result");
-  saveRow(tx, row);
+  saveOutcomeRow(tx, row);
   const summary = ensureSummary(tx, event);
   if (base !== undefined) summary.payload.currentBase = base;
   writeSummary(tx, summary);
@@ -292,7 +290,7 @@ function scoutCompleted(ctx: Ctx): void {
     row.disposition = "completed";
     row.endedAt = event.at;
   }
-  saveRow(tx, row);
+  saveOutcomeRow(tx, row);
 }
 
 function taskEscalated(ctx: Ctx): void {
@@ -304,7 +302,7 @@ function taskEscalated(ctx: Ctx): void {
     row.disposition = "escalated";
     row.endedAt = event.at;
   }
-  saveRow(tx, row);
+  saveOutcomeRow(tx, row);
 }
 
 function reviewRecorded(ctx: Ctx): void {
@@ -331,13 +329,13 @@ function reviewRecorded(ctx: Ctx): void {
     if (row.disposition !== "integrated" || row.frozenAt !== null || row.payload.baseCommit !== base) continue;
     row.payload.lastReview = verdict;
     if (verdict === "approved") {
-      row.accepted = 1;
+      row.acceptance = 1;
       if (reviewerModel !== undefined && reviewerModel === row.model) row.flags = withFlag(row.flags, "same-model-review");
       const entry = rubric.find(item => item.taskId === row.payload.taskId);
       const kept = entry ? rubricOf(entry, reviewerProfile) : undefined;
       if (kept) row.payload.rubric = kept;
     }
-    saveRow(tx, row);
+    saveOutcomeRow(tx, row);
   }
 }
 
@@ -369,7 +367,7 @@ function repairStarted(ctx: Ctx): void {
     if (row.disposition !== "integrated" || row.frozenAt !== null) continue;
     if (base !== undefined && row.payload.baseCommit !== base) continue;
     setLink(tx, row.outcomeId, event.runId, event.revision, round, "pending");
-    saveRow(tx, row);
+    saveOutcomeRow(tx, row);
   }
 }
 
@@ -392,7 +390,7 @@ function repairIntegrated(ctx: Ctx): void {
       touched.add(row.outcomeId);
     }
   }
-  for (const id of touched) saveRow(tx, readOutcome(tx, id)!);
+  for (const id of touched) saveOutcomeRow(tx, readOutcome(tx, id)!);
   setRoundState(tx, event, round, commit === undefined ? "resolved" : "answered");
 }
 
@@ -413,7 +411,7 @@ function repairPaths(ctx: Ctx): void {
     setLink(tx, row.outcomeId, event.runId, event.revision, round, linkAfterPaths(ownedPaths(row, planned), changed));
     touched.push(row.outcomeId);
   }
-  for (const id of touched) saveRow(tx, readOutcome(tx, id)!);
+  for (const id of touched) saveOutcomeRow(tx, readOutcome(tx, id)!);
   setRoundState(tx, event, round, changed === "omitted" ? "unknown" : "resolved");
   // A path event after the settle still corrects the summary's rounds.
   const summary = readSummary(tx, event.runId);
@@ -470,7 +468,18 @@ function ratingRecorded(ctx: Ctx): void {
   if (!row) return;
   const current = row.payload.ownerRating;
   if (!current || event.at >= current.at) row.payload.ownerRating = { score, at: event.at };
-  saveRow(tx, row);
+  writeSignal(tx, {
+    signalId: ratingSignalId(event.key),
+    runId: event.runId,
+    outcomeId: row.outcomeId,
+    kind: "rating",
+    author: "owner",
+    authority: "claim",
+    state: "active",
+    at: event.at,
+    payload: { kind: "rating", score },
+  });
+  saveOutcomeRow(tx, row);
 }
 
 function runBlocked(ctx: Ctx): void {
@@ -512,8 +521,10 @@ function runSettled(ctx: Ctx): void {
     if (row.disposition !== "integrated" || row.frozenAt !== null) continue;
     row.frozenAt = event.at;
     // The backfill never claims a refusal for an integrated row, and a freeze adds none.
-    if (!row.flags.includes("backfilled")) row.accepted = freezeAccepted(row.accepted, row.payload.lastReview, status ?? "");
-    saveRow(tx, row);
+    if (!row.flags.includes("backfilled")) {
+      row.acceptance = freezeAccepted(row.acceptance ?? null, row.payload.lastReview, status ?? "");
+    }
+    saveOutcomeRow(tx, row);
   }
   const rows = runOutcomes(tx, event.runId);
   summary.payload.attempts = attemptsOf(rows);
@@ -554,7 +565,7 @@ function ledgerGap({ tx, event }: Ctx): void {
   for (const row of runOutcomes(tx, event.runId)) {
     if (row.flags.includes("gap")) continue;
     row.flags = withFlag(row.flags, "gap");
-    saveRow(tx, row);
+    saveOutcomeRow(tx, row);
   }
   const results = tx.all<{ result_id: string }>("SELECT result_id FROM member_results WHERE run_id=?", event.runId);
   for (const { result_id: resultId } of results) {
@@ -574,20 +585,7 @@ function applyBlock(ctx: Ctx, memberId: string, code: string): void {
   row.disposition = next;
   // A stop that already ended the attempt keeps its time. An attempt that was still open ends at the block.
   row.endedAt ??= ctx.event.at;
-  saveRow(ctx.tx, row);
-}
-
-/** Writes a row after its links are read: levels, exclusion, and round counts follow from the stored links. */
-function saveRow(tx: EvidenceTx, row: OutcomeRow): void {
-  const links = linksOf(tx, row.outcomeId);
-  const computed = levels({ role: row.role, disposition: row.disposition, accepted: row.accepted, links });
-  row.integrated = computed.integrated;
-  row.accepted = computed.accepted;
-  row.firstPass = computed.firstPass;
-  row.held = computed.held;
-  row.exclusion = exclusionOf(row.disposition) ?? null;
-  row.payload.rounds = roundCounts(links);
-  writeOutcome(tx, row);
+  saveOutcomeRow(ctx.tx, row);
 }
 
 /** The summary of the run. A summary made by any event other than `run.created` carries a gap. */
@@ -660,6 +658,7 @@ function blankOutcome(ctx: Ctx, memberId: string, role: RowRole, facts: Facts, f
     flags: [...flags],
     integrated: null,
     accepted: null,
+    acceptance: null,
     firstPass: null,
     held: null,
     startedAt: null,
@@ -807,11 +806,6 @@ function setLink(tx: EvidenceTx, id: string, runId: string, revision: number, ro
     round,
     state,
   );
-}
-
-function linksOf(tx: EvidenceDb, id: string): LinkState[] {
-  return tx.all<{ state: string }>("SELECT state FROM outcome_round_links WHERE outcome_id=? ORDER BY revision, round", id)
-    .map(row => row.state as LinkState);
 }
 
 function outcomeId(runId: string, memberId: string): string {

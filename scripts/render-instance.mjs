@@ -48,28 +48,30 @@ if (instance !== undefined && (!/^[a-z][a-z0-9-]{0,15}$/.test(instance) || reser
 function instanceText(source, name) {
   if (!name) return source;
 
-  let text = source;
-  // Replace the more specific shared-tool paths before their broader prefixes.
-  text = text.replace(/\/srv\/infinite-data\//g, `/srv/infinite-data/instances/${name}/`);
-  text = text.replaceAll("/opt/infinite-agents/v1", `/srv/infinite-data/instances/${name}/agents/v1`);
-  text = text.replace(/\/opt\/infinite(?=\/|[\s"']|$)/g, `/opt/infinite-${name}`);
-  text = text.replace(/\/etc\/infinite-github(?=\/|$)/g, `/etc/infinite-${name}-github`);
-  text = text.replace(/\/run\/infinite-github(?=\/|$)/g, `/run/infinite-${name}-github`);
-  text = text.replace(/RuntimeDirectory=infinite-github(?=\s|$)/gm, `RuntimeDirectory=infinite-${name}-github`);
-  text = text.replace(/\/run\/infinite-key\//g, `/run/infinite-${name}-key/`);
-  text = text.replace(/\/run\/infinite(?=\/|[\s"']|$)/g, `/run/infinite-${name}`);
-  text = text.replace(/RuntimeDirectory=infinite(?=\s|$)/gm, `RuntimeDirectory=infinite-${name}`);
-  text = text.replaceAll("/usr/local/libexec/infinite", `/usr/local/libexec/infinite-${name}`);
-  text = text.replaceAll("/etc/sudoers.d/infinite", `/etc/sudoers.d/infinite-${name}`);
-  text = text.replaceAll("/etc/tmpfiles.d/infinite.conf", `/etc/tmpfiles.d/infinite-${name}.conf`);
-  text = text.replace(/\/etc\/infinite\//g, `/etc/infinite-${name}/`);
-  text = text.replaceAll("infinite-github-refresh.service", `infinite-${name}-github-refresh.service`);
-  text = text.replaceAll("infinite-github-refresh.timer", `infinite-${name}-github-refresh.timer`);
-  text = text.replaceAll("infinite-host", `infinite-${name}-host`);
-  text = text.replaceAll("infinite-agent", `infinite-${name}-agent`);
-  text = text.replaceAll("infinite-workspace", `infinite-${name}-workspace`);
-
-  return text;
+  const rules = [
+    { pattern: /\/srv\/infinite-data\//, token: "/srv/infinite-data/", replacement: `/srv/infinite-data/instances/${name}/` },
+    { pattern: /\/opt\/infinite-agents\/v1/, token: "/opt/infinite-agents/v1", replacement: `/srv/infinite-data/instances/${name}/agents/v1` },
+    { pattern: /RuntimeDirectory=infinite-github(?=\s|$)/, token: "RuntimeDirectory=infinite-github", replacement: `RuntimeDirectory=infinite-${name}-github` },
+    { pattern: /\/etc\/infinite-github(?=\/|$)/, token: "/etc/infinite-github", replacement: `/etc/infinite-${name}-github` },
+    { pattern: /\/run\/infinite-github(?=\/|$)/, token: "/run/infinite-github", replacement: `/run/infinite-${name}-github` },
+    { pattern: /\/run\/infinite-key\//, token: "/run/infinite-key/", replacement: `/run/infinite-${name}-key/` },
+    { pattern: /RuntimeDirectory=infinite(?=\s|$)/, token: "RuntimeDirectory=infinite", replacement: `RuntimeDirectory=infinite-${name}` },
+    { pattern: /\/usr\/local\/libexec\/infinite/, token: "/usr/local/libexec/infinite", replacement: `/usr/local/libexec/infinite-${name}` },
+    { pattern: /\/etc\/sudoers\.d\/infinite/, token: "/etc/sudoers.d/infinite", replacement: `/etc/sudoers.d/infinite-${name}` },
+    { pattern: /\/etc\/tmpfiles\.d\/infinite\.conf/, token: "/etc/tmpfiles.d/infinite.conf", replacement: `/etc/tmpfiles.d/infinite-${name}.conf` },
+    { pattern: /\/etc\/infinite\//, token: "/etc/infinite/", replacement: `/etc/infinite-${name}/` },
+    { pattern: /\/opt\/infinite(?=\/|[\s"']|$)/, token: "/opt/infinite", replacement: `/opt/infinite-${name}` },
+    { pattern: /\/run\/infinite(?=\/|[\s"']|$)/, token: "/run/infinite", replacement: `/run/infinite-${name}` },
+    { pattern: /infinite-github-refresh\.service/, token: "infinite-github-refresh.service", replacement: `infinite-${name}-github-refresh.service` },
+    { pattern: /infinite-github-refresh\.timer/, token: "infinite-github-refresh.timer", replacement: `infinite-${name}-github-refresh.timer` },
+    { pattern: /infinite-host/, token: "infinite-host", replacement: `infinite-${name}-host` },
+    { pattern: /infinite-agent/, token: "infinite-agent", replacement: `infinite-${name}-agent` },
+    { pattern: /infinite-workspace/, token: "infinite-workspace", replacement: `infinite-${name}-workspace` },
+  ].sort((a, b) => b.token.length - a.token.length);
+  const pattern = new RegExp(rules.map(rule => rule.pattern.source).join("|"), "g");
+  const replacements = new Map(rules.map(({ token, replacement }) => [token, replacement]));
+  // One pass over the original text keeps inserted instance paths from matching again.
+  return source.replace(pattern, match => replacements.get(match) ?? match);
 }
 
 function renderTemplate(filename, name) {

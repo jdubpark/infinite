@@ -120,14 +120,16 @@ instance's key: the relay registers the machine identity derived from its own
 key, so a duplicate key makes the two services claim one identity and breaks
 relay registration.
 
-Generate and retain the key privately on the encrypted instance directory,
-then install the runtime copy. The private boot-key helper must restore this
-same key to `/run/infinite-NAME-key/vault.key` before starting the unit.
+Generate and retain the key privately on the encrypted instance directory as
+root-owned mode `0600`, then install the runtime copy. The private boot-key
+helper must restore this same key to `/run/infinite-NAME-key/vault.key` before
+starting the unit.
 
 ```sh
-sudo -H -u "infinite-$NAME-host" sh -c \
+sudo sh -c \
   'umask 077; openssl rand -out "$1/vault.key" 32' sh "/srv/infinite-data/instances/$NAME"
-sudo test "$(stat -c %s "/srv/infinite-data/instances/$NAME/vault.key")" -eq 32
+sudo test "$(sudo stat -c %s "/srv/infinite-data/instances/$NAME/vault.key")" -eq 32
+sudo test "$(sudo stat -c '%U:%G:%a' "/srv/infinite-data/instances/$NAME/vault.key")" = root:root:600
 sudo install -d -o "infinite-$NAME-host" -g "infinite-$NAME-host" -m 0700 "/run/infinite-$NAME-key"
 sudo install -o "infinite-$NAME-host" -g "infinite-$NAME-host" -m 0600 \
   "/srv/infinite-data/instances/$NAME/vault.key" "/run/infinite-$NAME-key/vault.key"
@@ -147,10 +149,12 @@ NAME=work
 node scripts/render-instance.mjs --out ".local/instance-$NAME" --instance "$NAME"
 ```
 
-Review the rendered config and paths. Set `origin` to
-`https://HOST.YOUR-TAILNET.ts.net` and confirm that the hostname resolves only
-inside the owner's tailnet. Keep the API bound to loopback; do not create a
-public inbound rule for its port.
+Review the rendered config and paths. After selecting an unused HTTPS listener
+port as described below, set `origin` to
+`https://HOST.YOUR-TAILNET.ts.net:HTTPS_PORT` in place of the skeleton's
+placeholder. Confirm that the hostname resolves only inside the owner's
+tailnet. Keep the API bound to loopback; do not create a public inbound rule
+for its port.
 
 Validate and install the sudoers policy before restarting either service:
 
@@ -163,10 +167,11 @@ sudo install -o root -g root -m 0440 ".local/instance-$NAME/infinite-$NAME.sudoe
 Install the systemd unit, GitHub refresh unit and timer, and tmpfiles rule from
 the rendered directory. Install the rendered config as
 `/etc/infinite-NAME/config.json`, owned by `infinite-NAME-host` with mode
-`0600`. Install `agent-wrapper.sh` as each provider wrapper under
-`/usr/local/libexec/infinite-NAME/`, then run the rendered
-`install-agent-env.sh` so the instance-specific environment loader is
-installed. Install `github-app-gh.sh` as
+`0600`. Install `agent-wrapper.sh` as the `claude`, `codex`, `grok`, and
+`opencode` wrappers under `/usr/local/libexec/infinite-NAME/`; the
+`codex-app-server` wrapper is installed with the prepared backend below. Then
+run the rendered `install-agent-env.sh` so the instance-specific environment
+loader is installed. Install `github-app-gh.sh` as
 `/usr/local/libexec/infinite-NAME/bin/gh`. That location is first on the
 instance wrapper `PATH`; do not replace the shared `/usr/local/bin/gh`.
 
@@ -186,7 +191,7 @@ sudo install -d -o root -g root -m 0755 "/usr/local/libexec/infinite-$NAME/bin"
 sudo install -o root -g root -m 0755 ".local/instance-$NAME/github-app-gh.sh" \
   "/usr/local/libexec/infinite-$NAME/bin/gh"
 sudo install -d -o root -g root -m 0755 "/usr/local/libexec/infinite-$NAME"
-for provider in claude codex codex-app-server grok opencode; do
+for provider in claude codex grok opencode; do
   sudo install -o root -g root -m 0755 ".local/instance-$NAME/agent-wrapper.sh" \
     "/usr/local/libexec/infinite-$NAME/$provider"
 done
@@ -203,13 +208,19 @@ once after configuring it; enable its timer only after it succeeds.
 ## Port, origin, and relay registration
 
 Use a distinct loopback port for the second API. The default is `4781`; the
-first instance continues to use its configured port. Publish only through
-Tailscale Serve, with the HTTPS hostname equal to `origin`:
+first instance continues to use its configured port. Check
+`tailscale serve status` and choose an unused HTTPS listener port for the
+second instance. Publish only through Tailscale Serve, with the HTTPS hostname
+and port equal to `origin`:
 
 ```sh
-sudo tailscale serve --bg http://127.0.0.1:4781
+sudo tailscale serve --bg --https=HTTPS_PORT http://127.0.0.1:4781
 tailscale serve status
 ```
+
+Confirm with `tailscale serve status` that the first instance's listener is
+unchanged. A tailnet that uses Tailscale Services can instead publish the
+instance under its own service name.
 
 Keep the host firewall closed to public API traffic. Allow SSH only from the
 operator's approved address and preserve the existing Tailscale access:
@@ -282,11 +293,67 @@ in the instance service environment or ask the instance to depend on the
 laptop's personal login. Confirm that the server has the approved source tree
 before enabling automated intake.
 
-Authenticate each enabled provider as `infinite-NAME-agent` and verify its
-installed CLI version and default permission mode. Never reuse the first
-instance's provider home. Keep briefings, the knowledge service, remote memory,
-cmux, demo, and contributor models disabled until each has a separate reviewed
-configuration and an owner decision.
+Create the instance's provider tools prefix and install the enabled provider
+tools there. Build them as an unprivileged build user into a staging prefix,
+then install that prefix at
+`/srv/infinite-data/instances/$NAME/agents/v1`, owned by
+`infinite-$NAME-agent` so the agent can replace its own CLIs. The rendered
+wrapper executes provider binaries from this prefix's `bin/` directory; make
+the enabled `claude`, `codex`, `grok`, and `opencode` binaries available there.
+Do not share the first instance's writable provider prefix or provider home.
+
+```sh
+sudo install -d -o "infinite-$NAME-agent" -g "infinite-$NAME-agent" -m 0755 \
+  "/srv/infinite-data/instances/$NAME/agents/v1"
+```
+
+For Codex, prepare the backend on the target operating system as the
+unprivileged build user. The build requires rustup with Rust 1.95.0 installed,
+plus tar, patch, pkg-config, libssl-dev, libcap-dev, and stock Codex 0.162.0;
+`codex` must be on the build user's `PATH`. From the checkout, run:
+
+```sh
+npm run prepare:codex
+```
+
+After preparation succeeds, install the backend as an administrator. Keep the
+provider prefix owned by the instance agent; the prepared backend files remain
+root-owned as in the first-instance instructions. Install the
+`codex-app-server` wrapper here; the other wrappers were installed above.
+
+```sh
+sudo install -d -o "infinite-$NAME-agent" -g "infinite-$NAME-agent" -m 0755 \
+  "/srv/infinite-data/instances/$NAME/agents/v1/bin"
+sudo install -d -o root -g root -m 0755 "/usr/local/libexec/infinite-$NAME"
+sudo install -o root -g root -m 0755 \
+  .local/codex-handoff/bin/codex-code-mode-host \
+  "/srv/infinite-data/instances/$NAME/agents/v1/bin/codex-code-mode-host"
+sudo install -o root -g root -m 0755 \
+  .local/codex-handoff/bin/codex-app-server \
+  "/srv/infinite-data/instances/$NAME/agents/v1/bin/codex-app-server"
+sudo install -o root -g root -m 0755 ".local/instance-$NAME/agent-wrapper.sh" \
+  "/usr/local/libexec/infinite-$NAME/codex-app-server"
+sudo sh ".local/instance-$NAME/install-agent-env.sh"
+```
+
+On Ubuntu 24.04, check Bubblewrap's namespace support before a Codex tool run.
+Install `bubblewrap`, `apparmor-profiles`, and `apparmor-utils`. If no loaded
+profile already attaches to `/usr/bin/bwrap`, install the distribution's
+`/usr/share/apparmor/extra-profiles/bwrap-userns-restrict` as
+`/etc/apparmor.d/bwrap-userns-restrict` and load it with
+`apparmor_parser -r`. Avoid duplicate profiles for that executable. As
+`infinite-$NAME-agent`, run a harmless sandbox command from an accessible
+workspace, then verify a real Codex file edit through Infinite. Keep
+`kernel.apparmor_restrict_unprivileged_userns=1` and Codex sandboxing enabled.
+
+Authenticate each enabled Claude, Codex, Grok, and OpenCode provider on the
+server as `infinite-$NAME-agent`, using the provider login command through
+`sudo -H -u "infinite-$NAME-agent"`. The tracked first-instance instructions
+name no provider login commands, so use each provider's documented command;
+verify its installed CLI version and default permission mode. Keep briefings,
+the knowledge service, remote memory, cmux, demo, and contributor models
+disabled until each has a separate reviewed configuration and an owner
+decision.
 
 ## Private host tools to extend
 
@@ -401,11 +468,12 @@ without recording credentials.
    restart each service separately, and confirm the other PIDs remain.
 
    ```sh
-   ps -eo user=,pid=,cgroup=,args= | grep -E 'infinite(-work)?-(host|agent)' | grep -v grep
+   instance_pattern="infinite(-${NAME})?-(host|agent)"
+   ps -eo user=,pid=,cgroup=,args= | grep -E "$instance_pattern" | grep -v grep
    sudo systemctl restart "infinite-$NAME.service"
-   ps -eo user=,pid=,cgroup=,args= | grep -E 'infinite(-work)?-(host|agent)' | grep -v grep
+   ps -eo user=,pid=,cgroup=,args= | grep -E "$instance_pattern" | grep -v grep
    sudo systemctl restart infinite.service
-   ps -eo user=,pid=,cgroup=,args= | grep -E 'infinite(-work)?-(host|agent)' | grep -v grep
+   ps -eo user=,pid=,cgroup=,args= | grep -E "$instance_pattern" | grep -v grep
    ```
 
 5. **The host load gate holds and resumes a launch.** Use a bounded synthetic

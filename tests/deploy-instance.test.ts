@@ -77,6 +77,24 @@ test("every wrapper path derives from the instance name", () => {
     assert.ok(wrapper.includes(part), part);
 });
 
+test("valid names that overlap template words are substituted only once", async t => {
+  for (const name of ["host2", "agent2", "workspace2"]) await t.test(name, () => {
+    const out = render(["--instance", name]);
+    const files = readdirSync(out);
+    assert.ok(files.includes(`infinite-${name}.service`), name);
+    const unit = readFileSync(join(out, `infinite-${name}.service`), "utf8");
+    assert.match(unit, new RegExp(`\\nUser=infinite-${name}-host\\n`), name);
+    const config = JSON.parse(readFileSync(join(out, "config.example.json"), "utf8"));
+    assert.equal(config.runDir, `/run/infinite-${name}`, name);
+    const wrapper = readFileSync(join(out, "agent-wrapper.sh"), "utf8");
+    assert.ok(wrapper.includes(`/opt/infinite-${name}/packages/host/dist/workspace-trust.js`), name);
+    for (const filename of files) {
+      const text = readFileSync(join(out, filename), "utf8");
+      assert.ok(!text.includes(`-${name}-${name}`), `${filename} contains doubled ${name}`);
+    }
+  });
+});
+
 test("rendered shell files parse", () => {
   const out = render(["--instance", "work"]);
   for (const name of ["agent-wrapper.sh", "github-app-gh.sh", "install-agent-env.sh"])

@@ -42,6 +42,11 @@ const DEFAULT_PROFILE = "default";
 const UNKNOWN_AREA = "(unknown)";
 const UNKNOWN_FEATURE_MAP = "unknown";
 const EVENT_PAGE = 500;
+/** The kinds that can add a row or change a row's disposition. Only these can change a summary's attempts. */
+const ATTEMPT_KINDS: ReadonlySet<string> = new Set([
+  "member.started", "member.reported", "member.stopped", "task.integrated", "scout.completed", "task.escalated",
+  "run.blocked", "run.revision-advanced",
+]);
 const REPLACEMENT_CAUSES: readonly string[] = ["stall", "limit", "escalation", "answer"];
 const STOP_REASONS: readonly string[] = MEMBER_STOP_REASONS;
 const COUNT_KEYS = [
@@ -73,7 +78,7 @@ export function outcomeProjector(store: EvidenceStore, options?: { log?: (line: 
         throw new Error("The configurations module is unavailable.");
       }
       apply({ tx, store, event, log });
-      refreshAttempts(tx, event.runId);
+      if (ATTEMPT_KINDS.has(event.kind)) refreshAttempts(tx, event.runId);
       tx.run(
         "INSERT INTO outcome_state (key, value) VALUES ('last_seq', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         event.seq,

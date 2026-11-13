@@ -284,6 +284,7 @@ test("a backfilled failure has the levels of any counted failure", () => {
       task("c", undefined, { status: "pending", commit: undefined,
         limitSwitches: [{ toProfileId: "other", reason: "provider limit", memberId: "m-limit", at: AT }] }),
       task("d", undefined, { status: "pending", commit: undefined }),
+      task("e", undefined, { status: "pending", commit: undefined }),
     ],
     members: [
       member("m-stalled", "a", { stalledAt: AT, status: "stopped", reportedAt: undefined }),
@@ -291,6 +292,7 @@ test("a backfilled failure has the levels of any counted failure", () => {
       member("m-escalated", "b"),
       member("m-limit", "c"),
       member("m-question", "d", { report: { kind: "question", question: "Which way?", options: [] } as TeamMember["report"] }),
+      member("m-blocked", "e", { report: { kind: "blocked", summary: "The dependency is missing." } as TeamMember["report"] }),
     ],
     review: { verdict: "changes-requested", summary: "Not yet.", revision: 1 },
   });
@@ -305,6 +307,7 @@ test("a backfilled failure has the levels of any counted failure", () => {
   assert.deepEqual(levelsOf("m-stalled"), ["stalled", null, 0, 0, 0, 0]);
   assert.deepEqual(levelsOf("m-escalated"), ["escalated", null, 0, 0, 0, 0]);
   assert.deepEqual(levelsOf("m-question"), ["question", null, 0, 0, 0, 0]);
+  assert.deepEqual(levelsOf("m-blocked"), ["blocked", null, 0, 0, 0, 0]);
   // An excluded row has no levels.
   assert.deepEqual(levelsOf("m-limit"), ["limit", "limit", null, null, null, null]);
   // An integrated row never claims a refusal: the record cannot show which review covered it.

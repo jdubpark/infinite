@@ -1043,3 +1043,97 @@ test("a trigger with CASE and END is accepted, and control after it is refused",
     f.close();
   }
 });
+
+test("a write that SQLite rolled back takes no further operation", (t) => {
+  const f = fixture();
+  try {
+    t.mock.method(console, "warn", () => undefined);
+    const store = open(f);
+    store.register({
+      name: "unique",
+      version: 1,
+      readVersion: 1,
+      migrate: tx => tx.exec("CREATE TABLE unique_rows (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE)"),
+    });
+    const codes: string[] = [];
+    assert.throws(() => store.write(tx => {
+      tx.run("INSERT INTO unique_rows (code) VALUES ('a')");
+      try {
+        tx.run("INSERT OR ROLLBACK INTO unique_rows (code) VALUES ('a')");
+      } catch {
+        // SQLite has ended the write's transaction. Module code that keeps going must not commit anything.
+      }
+      const later: Array<() => unknown> = [
+        () => tx.run("INSERT INTO unique_rows (code) VALUES ('b')"),
+        () => tx.get("SELECT id FROM unique_rows"),
+        () => store.appendEvent(tx, event({ key: "rolled-back:1" })),
+      ];
+      for (const operation of later) {
+        try {
+          operation();
+          codes.push("ran");
+        } catch (error) {
+          codes.push(error instanceof EvidenceError ? error.code : "other");
+        }
+      }
+    }), hasCode("invalid-statement"));
+    assert.deepEqual(codes, ["invalid-statement", "invalid-statement", "invalid-statement"]);
+    assert.deepEqual(store.read(db => db.all("SELECT code FROM unique_rows")), []);
+    assert.equal(store.hasEvent("rolled-back:1"), false);
+    store.close();
+  } finally {
+    f.close();
+  }
+});
+
+test("module delete hooks see the run's events", () => {
+  const f = fixture();
+  try {
+    const store = open(f);
+    const seen: number[] = [];
+    store.register({
+      name: "counter",
+      version: 1,
+      readVersion: 1,
+      migrate: () => undefined,
+      runIds: () => [],
+      deleteRun(tx, runId) {
+        seen.push(tx.get<{ count: number }>("SELECT count(*) AS count FROM run_events WHERE run_id=?", runId)?.count ?? -1);
+      },
+    });
+    store.write(tx => {
+      for (const index of [1, 2, 3]) store.appendEvent(tx, event({ key: `run-c:${index}`, runId: "run-c" }));
+    });
+    assert.equal(store.deleteRun("run-c"), true);
+    assert.deepEqual(seen, [3]);
+    assert.equal(store.events({ runId: "run-c", limit: 10 }).events.length, 0);
+    store.close();
+  } finally {
+    f.close();
+  }
+});
+
+test("events reads its query as before", () => {
+  const f = fixture();
+  try {
+    const store = open(f);
+    store.write(tx => {
+      store.appendEvent(tx, event({ key: "read-a:1", runId: "read-a" }));
+      store.appendEvent(tx, event({ key: "read-b:1", runId: "read-b" }));
+    });
+    let reads = 0;
+    const query = { limit: 10 } as { runId?: string; limit: number };
+    Object.defineProperty(query, "runId", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads <= 3 ? "read-a" : "read-b";
+      },
+    });
+    assert.deepEqual(store.events(query).events.map(item => item.runId), ["read-b"]);
+    assert.equal(reads, 4);
+    store.close();
+  } finally {
+    f.close();
+  }
+});

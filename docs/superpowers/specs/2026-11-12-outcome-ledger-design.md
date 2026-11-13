@@ -60,7 +60,9 @@ The design uses approach 3, because capture cannot be backfilled. It uses approa
 
 *(My call: a persisted outbox, not a pass that re-derives lost events. `steer` and `repair` erase facts from the record, so re-derivation cannot be complete.)*
 
-A key is the kind plus the run id, revision, member id, task id, and round that make the fact unique. A flush runs in one `write` call of the evidence store. For each event that `appendEvent` reports as newly inserted, the flush runs the projectors registered for that kind inside the same transaction. When a projector throws, or its module is unavailable, the whole flush rolls back and the events stay in the outbox. An outcome row therefore exists exactly when its event does.
+A key is the kind plus the run id, revision, member id, task id, and round that make the fact unique. A flush stores its events in one `write` call of the evidence store. It never waits for a projection, because capture cannot be repeated. Each projector then advances from its own cursor over the event table, in its own transaction: its rows and its cursor commit together, so it sees each matching event exactly once and in order. A projector that throws, or whose module is unavailable, keeps its cursor and catches up later, and the other projectors are not held back. A projector added in a later release starts at the first stored event. An outcome row therefore exists once its projector has passed its event, which a flush attempts at once.
+
+*(Changed after review of the outbox: the first design projected inside the flush, and only the events that flush inserted. An event stored before its projector existed would then never be projected.)*
 
 Another design may add event kinds under its own prefix and register a projector for them, as umbrella C2 allows. The duels design adds six `duel.` kinds.
 

@@ -596,8 +596,9 @@ export function createApp(config: Config, key: Buffer) {
   // The ledger observes: while it is unavailable every usage route answers 503 and nothing else changes.
   const usageUnavailable = { error: "The usage ledger is unavailable" };
   const ledgerUnavailable = (error: unknown) => error instanceof EvidenceError && error.code === "unavailable";
-  // A route that finds the ledger unreadable throws `unavailable`; the error handler below maps it for every usage route.
-  const requireLedger = () => { if (!usage.available()) throw new EvidenceError("unavailable", "The usage ledger is unavailable."); };
+  // A route that changes something reads the ledger first, so an unreadable ledger answers 503 before the change.
+  // The error handler below maps `unavailable` for every usage route.
+  const requireLedger = () => { if (!usage.readable()) throw new EvidenceError("unavailable", "The usage ledger is unavailable."); };
   app.use("/api/usage", (_req, res, next) => usage.available() ? next() : void res.status(503).json(usageUnavailable));
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));

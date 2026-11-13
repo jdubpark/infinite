@@ -143,6 +143,14 @@ export class UsageService {
 
   /** True when the usage module is ready and the sealed ledger's import has been recorded. */
   available(): boolean { return this.storeReady() && !this.tickFailed; }
+  /**
+   * True when the ledger answers a read now. `available()` is a cached state that the next tick updates.
+   * A route that changes something asks this first, so an unreadable ledger is found before the change.
+   */
+  readable(): boolean {
+    if (!this.available()) return false;
+    try { this.store.read(db => importState(db)); return true; } catch { return false; }
+  }
   /** The store has the usage module and the sealed import is recorded. Ticks run on this, so a failed tick retries. */
   private storeReady(): boolean { return this.imported && this.store.status().modules[usageModule.name] === "ready"; }
 

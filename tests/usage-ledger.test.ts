@@ -262,6 +262,26 @@ test("a failed page write makes the ledger unavailable until a tick succeeds", a
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("a ledger whose reads fail is not readable, although it still reports ready", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+  try {
+    let failReads = false;
+    const manager = { events: (_id: string, after: number) => ({ events: [], cursor: after, more: false }) } as unknown as Manager;
+    const flaky = { register: (module: Parameters<EvidenceStore["register"]>[0]) => store.register(module), status: () => store.status(),
+      read: <T>(fn: Parameters<EvidenceStore["read"]>[0]) => { if (failReads) throw new Error("input/output error"); return store.read(fn); },
+      write: <T>(fn: Parameters<EvidenceStore["write"]>[0]) => store.write(fn),
+    } as unknown as EvidenceStore;
+    const usage = new UsageService(fixtureConfig(dir), key, manager, flaky);
+    assert.equal(usage.readable(), true, "a healthy ledger is readable");
+    failReads = true;
+    assert.equal(usage.available(), true, "no tick has seen the failure yet, so the cached state still says ready");
+    assert.equal(usage.readable(), false, "a real read finds the failure before a route changes anything");
+    failReads = false;
+    assert.equal(usage.readable(), true, "it is readable again once reads work");
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a new service resumes from the stored cursors", async () => {
   const dir = mkdtempSync(join(tmpdir(), "inf-ledger-")), key = randomBytes(32);
   const journal = (calls: number[]) => ({ events: (_id: string, after: number) => {

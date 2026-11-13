@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -114,14 +114,15 @@ test("no run text reaches a plain column or the file", () => {
     run.checks[0].output = "check-output-marker";
     memberOf(run, hostEntryIds.implA).report = { kind: "result", summary: "entry-plain-marker" };
     assert.equal(board.mirror(run), true);
-    store.close();
 
     const markers = ["wire-settings-form", "entry-plain-marker", "check-output-marker", "src/path-marker.ts"];
-    const files = [f.path, `${f.path}-wal`].filter(path => existsSync(path));
-    for (const path of files) {
-      const bytes = readFileSync(path);
-      for (const marker of markers) assert.equal(bytes.includes(marker), false, marker);
-    }
+    // The WAL holds the written pages only while the store is open, so it is read before the close.
+    const wal = readFileSync(`${f.path}-wal`);
+    assert.ok(wal.length > 0, "the write is in the WAL");
+    for (const marker of markers) assert.equal(wal.includes(marker), false, `WAL: ${marker}`);
+    store.close();
+    const file = readFileSync(f.path);
+    for (const marker of markers) assert.equal(file.includes(marker), false, `file: ${marker}`);
 
     const raw = new DatabaseSync(f.path, { readOnly: true });
     try {
@@ -219,13 +220,13 @@ test("an oversized or unserializable body is refused and counted", () => {
     (memberOf(run, hostEntryIds.rev).report as unknown as Record<string, unknown>).weight = 2n;
 
     console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
-    assert.equal(board.mirror(run), false);
+    assert.equal(board.mirror(run), true, "a refused body leaves nothing to store");
     const firstRound = warnings.length;
     assert.equal(firstRound, 2);
     assert.equal(board.list(run.id, { limit: 100 }).entries.length, 6);
     assert.equal(store.describe().counts["blackboard.refused"], 2);
 
-    assert.equal(board.mirror(run), false);
+    assert.equal(board.mirror(run), true);
     assert.equal(warnings.length, firstRound);
     assert.equal(rowCount(store, "entries"), 6);
     store.close();
@@ -259,6 +260,91 @@ test("a failed write waits a minute before it retries", () => {
     store.close();
   } finally {
     f.close();
+  }
+});
+
+test("a failed write also holds back launch sizes", () => {
+  const f = fixture(), g = fixture();
+  try {
+    // A failed mirror write holds back the run's launch sizes for the same minute.
+    const store = open(f, { busyTimeoutMs: 0 });
+    let clock = 1_000_000;
+    const board = new Blackboard(store, { now: () => clock });
+    const run = hostEntryRun();
+    const implA = memberOf(run, hostEntryIds.implA);
+    const blocker = new DatabaseSync(f.path);
+    try {
+      blocker.exec("BEGIN IMMEDIATE");
+      assert.equal(board.mirror(run), false);
+      assert.equal(board.recordLaunch(run, implA, SIZES), false);
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
+    }
+    // The lock is gone, so a write would succeed now. The run still waits out its minute.
+    clock += 59_000;
+    assert.equal(board.recordLaunch(run, implA, SIZES), false);
+    assert.equal(rowCount(store, "member_scopes"), 0);
+    clock += 2_000;
+    assert.equal(board.recordLaunch(run, implA, SIZES), true);
+    assert.equal(rowCount(store, "member_scopes"), 1);
+    store.close();
+
+    // A failed launch write starts the same minute for the run's mirror.
+    const second = open(g, { busyTimeoutMs: 0 });
+    let later = 1_000_000;
+    const other = new Blackboard(second, { now: () => later });
+    const lock = new DatabaseSync(g.path);
+    try {
+      lock.exec("BEGIN IMMEDIATE");
+      assert.equal(other.recordLaunch(run, implA, SIZES), false);
+    } finally {
+      lock.exec("ROLLBACK");
+      lock.close();
+    }
+    later += 59_000;
+    assert.equal(other.mirror(run), false);
+    assert.equal(rowCount(second, "entries"), 0);
+    later += 2_000;
+    assert.equal(other.mirror(run), true);
+    second.close();
+  } finally {
+    f.close();
+    g.close();
+  }
+});
+
+test("writable follows the store and the last failure", () => {
+  const f = fixture(), g = fixture();
+  try {
+    const store = open(f, { busyTimeoutMs: 0 });
+    let clock = 1_000_000;
+    const board = new Blackboard(store, { now: () => clock });
+    assert.equal(board.writable(), true);
+    const blocker = new DatabaseSync(f.path);
+    try {
+      blocker.exec("BEGIN IMMEDIATE");
+      assert.equal(board.mirror(hostEntryRun()), false);
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
+    }
+    // One failed write pauses every run, not only the one that failed.
+    assert.equal(board.writable(), false);
+    clock += 59_000;
+    assert.equal(board.writable(), false);
+    clock += 2_000;
+    assert.equal(board.writable(), true);
+    store.close();
+    assert.equal(board.writable(), false, "a closed store is not writable");
+
+    open(g).close();
+    const wrong = open(g, { key: randomBytes(32) });
+    assert.equal(new Blackboard(wrong).writable(), false);
+    wrong.close();
+  } finally {
+    f.close();
+    g.close();
   }
 });
 

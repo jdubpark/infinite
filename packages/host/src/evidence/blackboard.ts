@@ -107,6 +107,7 @@ export class Blackboard {
   private readonly now: () => number;
   private readonly known = new Map<string, Map<string, Known>>();
   private readonly failedAt = new Map<string, number>();
+  private lastFailedAt: number | undefined;
   private readonly warned = new Set<HostEntryKind>();
   private refused = 0;
 
@@ -121,11 +122,20 @@ export class Blackboard {
 
   /**
    * Stores every host entry of the run that is not stored yet, at most MIRROR_BATCH builds per call.
-   * True only when every source of the run is stored. Never throws.
+   * True when no source of the run is left to store: each one is stored or was refused. Never throws.
    */
   mirror(run: TeamRun): boolean {
     try {
       return this.mirrorRun(run);
+    } catch {
+      return false;
+    }
+  }
+
+  /** False when the store is not ready, or when a write of this blackboard failed under a minute ago. Never throws. */
+  writable(): boolean {
+    try {
+      return this.ready() && !this.recent(this.lastFailedAt, this.now());
     } catch {
       return false;
     }
@@ -152,11 +162,15 @@ export class Blackboard {
       if (![launchSeq, sizes.promptBytes, sizes.contextBytes].every(value => Number.isSafeInteger(value) && value >= 0)) {
         return false;
       }
+      // A run whose last write failed under a minute ago waits, so a locked database costs one failed write
+      // per run per minute, launches included.
+      const time = this.now();
+      if (this.recent(this.failedAt.get(run.id), time)) return false;
       const scope = {
         ...(member.taskId === undefined ? {} : { taskId: member.taskId }),
         paths: ownedPaths(run, member),
       };
-      return this.store.tryWrite(tx => {
+      const written = this.store.tryWrite(tx => {
         tx.run(
           "INSERT INTO member_scopes (member_id, run_id, mission_id, role, launch_seq, prompt_bytes, context_bytes, "
           + "digest_bytes, encrypted_scope) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?) "
@@ -172,6 +186,8 @@ export class Blackboard {
           tx.seal("member_scopes", member.memberId, scope),
         );
       });
+      if (!written) this.failed(run.id, time);
+      return written;
     } catch {
       return false;
     }
@@ -252,8 +268,7 @@ export class Blackboard {
     if (!this.ready() || !isRunShape(run)) return false;
     const runId = run.id;
     const time = this.now();
-    const failed = this.failedAt.get(runId);
-    if (failed !== undefined && time - failed < MIRROR_RETRY_MS) return false;
+    if (this.recent(this.failedAt.get(runId), time)) return false;
 
     let known = this.known.get(runId);
     if (known === undefined) {
@@ -280,17 +295,26 @@ export class Blackboard {
         for (const item of pending) this.insert(tx, item);
       });
       if (!written) {
-        this.failedAt.set(runId, time);
+        this.failed(runId, time);
         return false;
       }
       this.failedAt.delete(runId);
       for (const item of pending) known.set(item.id, "stored");
     }
 
-    return hostEntrySources(run).every(source => {
-      const id = hostEntryId(runId, kindOf(source), source);
-      return known.get(id) === "stored";
-    });
+    // A refused source counts as done: the same body would be refused again.
+    return hostEntrySources(run).every(source => known.get(hostEntryId(runId, kindOf(source), source)) !== undefined);
+  }
+
+  /** True while a failure at `failedAt` is under a minute old. A clock that moved back ends the wait. */
+  private recent(failedAt: number | undefined, time: number): boolean {
+    return failedAt !== undefined && time >= failedAt && time - failedAt < MIRROR_RETRY_MS;
+  }
+
+  /** A failed write holds back the run for a minute, and marks the store as not writable for the same time. */
+  private failed(runId: string, time: number): void {
+    this.failedAt.set(runId, time);
+    this.lastFailedAt = time;
   }
 
   /** The built entry and its canonical body, or undefined when the body cannot be stored. Refusals are counted. */

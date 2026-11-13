@@ -2,12 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Blackboard } from "../packages/host/src/evidence/blackboard.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import type { TeamService } from "../packages/host/src/teams.js";
 import { prepareMemberWorkspace } from "../packages/host/src/team-workspace.js";
+import { writeSealed } from "../packages/host/src/vault.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 type Fixture = ReturnType<typeof schedulerFixture>;
@@ -19,11 +21,45 @@ type Internal = {
   step(stored: unknown): Promise<void>;
   launch(stored: unknown, member: unknown): Promise<void>;
   consume(stored: unknown, member: unknown): void;
+  drainEntries(): void;
 };
 const internal = (teams: TeamService) => teams as unknown as Internal;
 
-function openStore(f: Fixture, key: Buffer): EvidenceStore {
-  return new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: key });
+function openStore(f: Fixture, key: Buffer, busyTimeoutMs?: number): EvidenceStore {
+  return new EvidenceStore({ databasePath: evidenceDatabasePath(f.config.stateDir), vaultKey: key, ...(busyTimeoutMs === undefined ? {} : { busyTimeoutMs }) });
+}
+
+/** The bytes of the run's sealed record file. */
+function recordBytes(f: Fixture, runId = f.run.id): Buffer {
+  return readFileSync(join(f.config.stateDir, "teams", `${runId}.sealed`));
+}
+
+/**
+ * A fixture's own ids, commit ids, times, and temporary paths, replaced by placeholders in order of first use.
+ * Two fixtures that did the same work give the same text.
+ */
+function normalized(text: string, f: Fixture): string {
+  const names = new Map<string, string>();
+  const place = (kind: string, value: string) => {
+    let name = names.get(value);
+    if (name === undefined) { name = `<${kind}-${names.size}>`; names.set(value, name); }
+    return name;
+  };
+  return text
+    .split(dirname(f.config.stateDir)).join("<root>")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, value => place("id", value))
+    .replace(/\b[0-9a-f]{40}\b/g, value => place("commit", value))
+    .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, "<time>");
+}
+
+/** A settled copy of the fixture run under a new id, with one owner steering text, sealed as its own record. */
+function writeSettledRun(f: Fixture, text: string): string {
+  const id = randomUUID(), base = f.run.members[0]!;
+  const run: TeamRun = { ...structuredClone(f.run), id, status: "cancelled",
+    steering: [{ text, revision: 1, at: new Date().toISOString() }],
+    members: [{ ...structuredClone(base), runId: id, memberId: randomUUID(), sessionId: randomUUID(), status: "stopped" }] };
+  writeSealed(join(f.config.stateDir, "teams", `${id}.sealed`), f.key, `team:${id}`, { run, prepared: true, fingerprint: "fixture", receipts: {} });
+  return id;
 }
 
 async function waitFor(check: () => boolean, message: string, timeoutMs = 5000) {
@@ -85,8 +121,10 @@ test("a service without the blackboard keeps its records as today", async () => 
   try {
     await planFlow(plain);
     await planFlow(withEntries, new Blackboard(store));
-    const plainKeys = keyPaths(plain.readRecord("team", plain.run.id)), entryKeys = keyPaths(withEntries.readRecord("team", withEntries.run.id));
-    assert.deepEqual(entryKeys, plainKeys);
+    const plainRecord = plain.readRecord("team", plain.run.id), entryRecord = withEntries.readRecord("team", withEntries.run.id);
+    assert.deepEqual(keyPaths(entryRecord), keyPaths(plainRecord));
+    // Keys alone would let a changed value pass, so the values are compared too.
+    assert.equal(normalized(JSON.stringify(entryRecord), withEntries), normalized(JSON.stringify(plainRecord), plain));
   } finally { store.close(); plain.close(); withEntries.close(); }
 });
 
@@ -203,14 +241,16 @@ test("a launch records its sizes and sends what it sent before", async () => {
     const launchPrompt = f.launches.at(-1)!.prompt;
     for (const text of [contextText, launchPrompt]) assert.equal(/promptBytes|contextBytes|context_bytes/.test(text), false);
 
-    // The same launch without the blackboard writes a context file with the same top-level keys.
+    // The same launch without the blackboard writes the same context file and sends the same prompt.
+    plain.run.steering = [{ text: "Keep the API stable", revision: 2, at: new Date().toISOString() }];
     const other = await queuedImplementer(plain);
     const plainTeams = plain.openTeam();
     const plainScheduler = internal(plainTeams);
     await plainScheduler.step(plainScheduler.record(plain.run.id));
     await plainTeams.idle();
-    const plainContext = JSON.parse(readFileSync(join(other.cwd, ".git", "infinite-team-context.json"), "utf8")) as Record<string, unknown>;
-    assert.deepEqual(Object.keys(context).sort(), Object.keys(plainContext).sort());
+    const plainContextText = readFileSync(join(other.cwd, ".git", "infinite-team-context.json"), "utf8");
+    assert.equal(normalized(contextText, f), normalized(plainContextText, plain));
+    assert.equal(normalized(launchPrompt, f), normalized(plain.launches.at(-1)!.prompt, plain));
   } finally { store.close(); f.close(); plain.close(); }
 });
 
@@ -253,6 +293,95 @@ test("an entry missed before a crash is written after a restart", async () => {
     assert.equal(head.authorRole, "project-manager");
     assert.equal(JSON.stringify(f.readRecord<{ run: TeamRun }>("team", f.run.id).run.members), membersBefore, "the restart mutates no member");
   } finally { good.close(); bad.close(); f.close(); }
+});
+
+test("a settled run's missed entries are written after a restart", async () => {
+  const f = schedulerFixture(), good = openStore(f, f.key), bad = openStore(f, randomBytes(32));
+  try {
+    // The run settled in a save whose entry write was lost: the store was unavailable.
+    f.run.status = "cancelled";
+    f.run.members[0]!.status = "stopped";
+    f.run.steering = [{ text: "Keep the API stable", revision: 1, at: new Date().toISOString() }];
+    f.writeTeam();
+    const first = f.openTeam({ entries: new Blackboard(bad) });
+    internal(first).drainEntries();
+    first.close();
+    bad.close();
+    const before = recordBytes(f);
+
+    const entries = new Blackboard(good);
+    const second = f.openTeam({ entries });
+    assert.equal(entries.list(f.run.id).entries.length, 0, "a settled run waits for the drain");
+    internal(second).drainEntries();
+    const [direction] = entries.list(f.run.id, { kinds: ["direction"] }).entries;
+    assert.ok(direction, "the drain writes the missed entry");
+    assert.deepEqual(entries.get(f.run.id, direction.entryId)!.body, { source: "steering", text: "Keep the API stable" });
+    assert.deepEqual(recordBytes(f), before, "the drain saves nothing");
+  } finally { good.close(); bad.close(); f.close(); }
+});
+
+test("a failed entry write is retried without a save", async () => {
+  const f = schedulerFixture(), store = openStore(f, f.key, 0);
+  try {
+    let clock = Date.now();
+    const entries = new Blackboard(store, { now: () => clock });
+    f.writeTeam();
+    const teams = f.openTeam({ entries });
+    const blocker = new DatabaseSync(evidenceDatabasePath(f.config.stateDir));
+    try {
+      blocker.exec("BEGIN IMMEDIATE");
+      await teams.steer(f.run.id, { requestId: randomUUID(), revision: 1, text: "Keep the API stable" });
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
+    }
+    await teams.idle();
+    assert.equal(entries.list(f.run.id, { kinds: ["direction"] }).entries.length, 0, "the save's entry write failed");
+    const before = recordBytes(f);
+
+    // Within the minute the drain leaves the store alone.
+    internal(teams).drainEntries();
+    assert.equal(entries.list(f.run.id, { kinds: ["direction"] }).entries.length, 0);
+    clock += 61_000;
+    internal(teams).drainEntries();
+    assert.equal(entries.list(f.run.id, { kinds: ["direction"] }).entries.length, 1, "the drain stores the entry");
+    assert.deepEqual(recordBytes(f), before, "no save happened between the steer and the drain");
+  } finally { store.close(); f.close(); }
+});
+
+test("a failing store stops the drain after one write", async () => {
+  const f = schedulerFixture(), store = openStore(f, f.key, 0);
+  try {
+    let clock = Date.now();
+    const entries = new Blackboard(store, { now: () => clock });
+    const calls: string[] = [];
+    const mirror = entries.mirror.bind(entries);
+    entries.mirror = run => { calls.push(run.id); return mirror(run); };
+    f.writeTeam();
+    const settled = Array.from({ length: 6 }, (_, index) => writeSettledRun(f, `Direction ${index}`));
+    const teams = f.openTeam({ entries });
+    calls.length = 0;
+    const scheduler = internal(teams);
+    const blocker = new DatabaseSync(evidenceDatabasePath(f.config.stateDir));
+    try {
+      blocker.exec("BEGIN IMMEDIATE");
+      scheduler.drainEntries();
+      assert.equal(calls.length, 1, "one failed write ends the pass");
+      scheduler.drainEntries();
+      assert.equal(calls.length, 1, "the same minute costs nothing more");
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
+    }
+    clock += 61_000;
+    scheduler.drainEntries();
+    assert.equal(calls.length, 5, "a pass retries four runs at most");
+    scheduler.drainEntries();
+    assert.equal(calls.length, 7);
+    scheduler.drainEntries();
+    assert.equal(calls.length, 7, "an empty backlog costs nothing");
+    for (const id of settled) assert.equal(entries.list(id, { kinds: ["direction"] }).entries.length, 1);
+  } finally { store.close(); f.close(); }
 });
 
 test("removing a run removes its entries", async () => {

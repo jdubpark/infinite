@@ -1087,6 +1087,29 @@ test("legacy create capacity is ignored and ready work uses the PM-selected limi
   } finally { await f.close(); }
 });
 
+test("a full run projects its outcomes", { timeout: 120000 }, async () => {
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    assert.equal(view.body.summary.status, "ready-for-review", JSON.stringify(view.body));
+    // Blind indexes are store internals and are never served.
+    for (const served of [view.body.summary, ...view.body.rows, ...view.body.members])
+      for (const name of ["projectRef", "taskRef", "areaRef"]) assert.equal(Object.hasOwn(served, name), false, name);
+    assert.equal(view.body.rows[0].payload.projectId, run.projectId);
+    for (const row of view.body.rows)
+      assert.deepEqual([row.integrated, row.accepted, row.firstPass, row.held, row.disposition], [1, 1, 1, null, "integrated"], JSON.stringify(row));
+    const roles = view.body.members.map((member: { role: string }) => member.role);
+    assert.ok(roles.includes("project-manager"), JSON.stringify(roles));
+    assert.ok(roles.includes("reviewer"), JSON.stringify(roles));
+    assert.equal((await f.host.fetchApi(`/outcomes/runs/${run.id}`, "viewer")).status, 200);
+    assert.equal((await f.host.fetchApi(`/outcomes/runs/${randomUUID()}`, "owner")).status, 404);
+  } finally { await f.close(); }
+});
+
 test("an owner cannot change agent-managed capacity and the refusal does not mutate the limit", { timeout: 120000 }, async () => {
   const f = await fixture("live-limit", undefined, {}, { parallelism: 1 });
   try {

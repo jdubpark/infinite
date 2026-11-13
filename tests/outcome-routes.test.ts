@@ -2,12 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { teamLineupSchema } from "../packages/host/src/team-types.js";
-import { startHost } from "./helpers.js";
+import { startHost, waitFor } from "./helpers.js";
+import { fixture } from "./team-fixture.js";
 
 const coordinator = { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" };
 const lineup = {
@@ -18,12 +19,17 @@ const lineup = {
 };
 
 /** Client CLI against a started host, as the client command tests run it. The token is the given role's. */
-function outcomesCli(host: { origin: string; tokens: Record<string, string> }, root: string, role: "owner" | "viewer" = "owner") {
+function clientCli(host: { origin: string; tokens: Record<string, string> }, root: string, role: "owner" | "viewer" = "owner") {
   const clientFile = join(root, `client-${role}.json`);
   writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens[role], projectId: "rehearsal" }), { mode: 0o600 });
   const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
   const exec = promisify(execFile);
-  return (...args: string[]) => exec(entry[0]!, [...entry.slice(1), "usage", "outcomes", "new-epoch", ...args]);
+  return (...args: string[]) => exec(entry[0]!, [...entry.slice(1), ...args]);
+}
+
+function outcomesCli(host: { origin: string; tokens: Record<string, string> }, root: string, role: "owner" | "viewer" = "owner") {
+  const run = clientCli(host, root, role);
+  return (...args: string[]) => run("usage", "outcomes", "new-epoch", ...args);
 }
 
 test("the owner advances a profile epoch", { timeout: 60000 }, async () => {
@@ -110,6 +116,10 @@ test("an unavailable store answers 503 and the status route still reports it", {
     assert.equal(refused.status, 503);
     assert.equal(refused.body.code, "evidence-unavailable");
 
+    const view = await host.fetchApi(`/outcomes/runs/${randomUUID()}`, "owner");
+    assert.equal(view.status, 503);
+    assert.equal(view.body.code, "evidence-unavailable");
+
     const status = await host.fetchApi("/evidence/status");
     assert.equal(status.status, 200);
     assert.equal(status.body.state, "unavailable");
@@ -145,6 +155,59 @@ test("the new-epoch command prints the epoch", { timeout: 120000 }, async () => 
     });
   } finally {
     await host.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rows outlive a cancelled run", { timeout: 120000 }, async () => {
+  const f = await fixture("live-limit", undefined, {}, { parallelism: 1 });
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const runId = created.body.id;
+    await waitFor(() => Promise.resolve(existsSync(join(f.receipts, `${runId}.a-started`))), Boolean, 30000);
+    const before = await f.get(runId);
+    const cancelled = await f.host.fetchApi(`/teams/${runId}/cancel`, "owner", { requestId: randomUUID(), revision: before.revision });
+    assert.equal(cancelled.status, 200, JSON.stringify(cancelled.body));
+    const stopped = await waitFor(() => f.get(runId), run => run.status === "cancelled", 60000);
+    assert.equal(stopped.status, "cancelled", JSON.stringify(stopped));
+    // The run is cancelled before its implementer session has settled, so removal waits for that.
+    const removed = await waitFor(() => f.host.fetchApi(`/teams/${runId}`, "owner", undefined, undefined, "DELETE"), response => response.status === 200, 60000);
+    assert.equal(removed.status, 200, JSON.stringify(removed.body));
+
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${runId}`, "owner"), response => response.status === 200 && response.body.rows.some((row: { role: string }) => row.role === "implementer"), 30000);
+    assert.equal(view.status, 200, JSON.stringify(view.body));
+    const implementer = view.body.rows.find((row: { role: string }) => row.role === "implementer");
+    assert.equal(implementer.exclusion, "owner");
+    assert.equal(implementer.disposition, "owner-stop");
+    assert.notEqual(implementer.runDeletedAt, null);
+    assert.notEqual(view.body.summary.runDeletedAt, null);
+  } finally { await f.close(); }
+});
+
+test("the outcomes command prints one line per row", { timeout: 120000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "inf-outcome-run-cli-"));
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    const memberId = view.body.rows[0].memberId as string;
+
+    const owner = clientCli(f.host, root, "owner");
+    const lines = (await owner("usage", "outcomes", "--run", run.id)).stdout.trim().split("\n");
+    assert.ok(lines.some(line => line.includes(memberId) && line.includes("integrated=")), lines.join("\n"));
+
+    const json = JSON.parse((await owner("usage", "outcomes", "--run", run.id, "--json")).stdout);
+    assert.equal(json.rows.length, 2);
+
+    await assert.rejects(owner("usage", "outcomes", "--run", randomUUID()), (error: { stderr?: string }) => {
+      assert.match(error.stderr ?? "", /No outcome rows exist for run "/);
+      return true;
+    });
+  } finally {
+    await f.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

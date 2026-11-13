@@ -139,7 +139,7 @@ Use `http://127.0.0.1:4780` in a **development** build. Release pairing requires
 
 The host side is implemented: sessions report an attention state, `GET /api/me` advertises `capabilities` for signals, answering and push, and the API can send push notifications. The phone Brief is implemented too: the inbox, the decision card, the "So far" timeline, the docked composer and the terminal route. It was exercised on an Android emulator against the rehearsal host.
 
-Two things are not verified yet. The live Claude Code and Codex spikes (S1 and S2 in the design spec) have not been run, so hook behavior against the real CLIs is untested. Push was verified only against a fake Expo endpoint, not delivered to a phone. Codex hooks are off by default until S2 runs; set `attention.hooks.codex` to `true` to try them.
+Two things are not verified yet. The live Claude Code spike (S1 in the design spec) has not been run, so Claude hook behavior against the real CLI is untested. Push was verified only against a fake Expo endpoint, not delivered to a phone. The Codex spike (S2) ran on 2026-11-13 against the non-interactive CLI: the injected hooks work, but the flag that lets them run also lets a repository's own Codex hooks run without review. Codex hooks therefore stay off by default. Set `attention.hooks.codex` to `true` only for repositories whose contents you trust.
 
 Push setup, in order:
 

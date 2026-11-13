@@ -442,7 +442,7 @@ else if (command === "plan-fleet") {
       } else console.log("Push: disabled");
       if ((config.attention?.hooks ?? DEFAULT_HOOKS).codex)
         console.log(
-          "Codex hooks use --dangerously-bypass-hook-trust for the hooks Infinite injects per process only (unverified until spike S2).",
+          "Warning: Codex hooks are on. They run with --dangerously-bypass-hook-trust, which also lets hooks defined in a session's working directory run without review. Use them only with repositories you trust.",
         );
     } else throw new Error(`Unknown command: ${command}`);
   }

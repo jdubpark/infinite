@@ -601,15 +601,16 @@ In `tests/chat.test.ts`:
 
 ---
 
-# Phase 2c: the final drain, and Codex hooks on by default
+# Phase 2c: the final drain
 
-Spec part 2, "Final drain", part 3 (coverage), and owner decisions 2 and 3, settled on 2026-11-13: the wrapper is added, and Codex hooks are on by default. A provider that the host stops mid-turn fires no further hook, so the rows it wrote after its last hook never reach the worker. In this phase the worker starts the relay once in drain mode after the provider exits, and serves it for at most 10 seconds. The drain reuses the transcript route, drain ids, end marks, and the secondary listing, so the watch has no second read path. A session stopped mid-turn stays `partial` with `stopped-mid-turn`, and a drain that could not run is visible in the coverage record. Member launch, hook payloads, the 4 second hook deadline, the pass budgets, the relay's path checks, and the usage ledger do not change.
+Spec part 2, "Final drain", part 3 (coverage), and owner decision 3, settled on 2026-11-13: the wrapper is added. Owner decision 2, Codex hooks on by default, was withdrawn the same day on the result of spike S2 (Task 4). A provider that the host stops mid-turn fires no further hook, so the rows it wrote after its last hook never reach the worker. In this phase the worker starts the relay once in drain mode after the provider exits, and serves it for at most 10 seconds. The drain reuses the transcript route, drain ids, end marks, and the secondary listing, so the watch has no second read path. A session stopped mid-turn stays `partial` with `stopped-mid-turn`, and a drain that could not run is visible in the coverage record. Member launch, hook payloads, the 4 second hook deadline, the pass budgets, the relay's path checks, and the usage ledger do not change.
 
 ## File map
 
 | File | Responsibility |
 |---|---|
 | `packages/host/src/final-drain.ts` (create) | The 10 second limit, the drain command for a profile, and one run of it |
+| `packages/host/src/sudo-profile.ts` (create), `packages/host/src/launch.ts` (modify) | `sudoShape`, the one check of a sudo profile's arguments, shared by `teamModelLaunch` and `drainLaunch` |
 | `packages/host/src/hook-relay.ts` (modify) | Drain mode: ask the worker what to read, then stream as a hook does |
 | `deploy/ubuntu/transcript-drain.sh` (create) | The root-owned wrapper that runs the relay in drain mode as the agent account |
 | `deploy/ubuntu/infinite.sudoers`, `deploy/ubuntu/README.md` (modify) | The sudoers line and the install step |
@@ -618,9 +619,9 @@ Spec part 2, "Final drain", part 3 (coverage), and owner decisions 2 and 3, sett
 | `packages/host/src/hooks.ts` (modify) | The `drain` route |
 | `packages/host/src/worker.ts` (modify) | Run the drain after the exit record, serve its posts, then journal coverage |
 | `packages/host/src/demo.ts` (modify) | A row written after the last hook, and an early drain post |
-| `packages/host/src/config.ts` (modify) | Codex hooks on by default |
-| `README.md`, `docs/architecture.md`, `docs/security.md`, `docs/teams.md`, the spec (modify) | The new default, the drain, and the reason code |
-| `tests/final-drain.test.ts` (create); `tests/transcript.test.ts`, `tests/transcript-watch.test.ts`, `tests/transcript-usage.test.ts`, `tests/chat.test.ts`, `tests/host-launch.test.ts` (modify) | Tests |
+| `packages/host/src/config.ts`, `packages/host/src/cli.ts` (modify) | The comment and the `doctor` warning that say what the Codex hook flag allows (Task 4) |
+| `README.md`, `docs/architecture.md`, `docs/security.md`, the 2026-10-04 attention spec, the usage capture spec (modify) | The drain, the reason code, and the corrected statements about the Codex hook flag |
+| `tests/final-drain.test.ts` (create); `tests/transcript.test.ts`, `tests/transcript-watch.test.ts`, `tests/transcript-usage.test.ts`, `tests/chat.test.ts` (modify) | Tests |
 
 ## Wire protocol
 
@@ -645,7 +646,7 @@ What differs from a hook-started drain:
 
 ### Task 1: the drain process
 
-**Files:** create `final-drain.ts`, `deploy/ubuntu/transcript-drain.sh`, `tests/final-drain.test.ts`. Modify `hook-relay.ts`, `deploy/ubuntu/infinite.sudoers`, `deploy/ubuntu/README.md`, `tests/transcript.test.ts`.
+**Files:** create `final-drain.ts`, `sudo-profile.ts`, `deploy/ubuntu/transcript-drain.sh`, `tests/final-drain.test.ts`. Modify `hook-relay.ts`, `launch.ts`, `deploy/ubuntu/infinite.sudoers`, `deploy/ubuntu/README.md`, `tests/transcript.test.ts`.
 
 **Interfaces (produces):**
 
@@ -693,7 +694,7 @@ infinite-host ALL=(infinite-agent) NOPASSWD: /usr/local/libexec/infinite/transcr
 **Decisions:**
 
 - **Same account.** When `profile.command` does not match `/(^|\/)sudo$/`, `drainLaunch` returns `{ command: process.execPath, args: [relayPath, "drain"] }`, with `"--import", import.meta.resolve("tsx")` first when `relayPath` ends in `.ts`, as `buildLaunch` does. The relay runs in the worker's account, which is the provider's. A command that is not sudo but switches account is treated the same way. Its relay cannot open the file, so its drain starts and reads nothing. *(My call: the code already tells the two shapes apart by the sudo pattern.)*
-- **Another account.** For a sudo profile, the options before `--` must be only `-n`, `--non-interactive`, `-H`, `--set-home`, `-u USER`, `--user USER`, `-g GROUP`, or `--group GROUP`: the check `teamModelLaunch` makes. Move that check into one shared function, and do not copy it. `teamModelLaunch` keeps its error messages. The executable after `--` must be absolute. The wrapper is `join(dirname(executable), DRAIN_WRAPPER)`, and it is present when `statSync(wrapper).isFile()`. The command is `profile.command` with `["-n", ...the other options in order, "--", wrapper]`. A missing wrapper or any other shape returns undefined. *(My call: the wrapper sits beside the provider wrapper the owner installed, so no config field is added. A profile without `-n` still gets it, so sudo never waits for a password.)*
+- **Another account.** For a sudo profile, the options before `--` must be only `-n`, `--non-interactive`, `-H`, `--set-home`, `-u USER`, `--user USER`, `-g GROUP`, or `--group GROUP`: the check `teamModelLaunch` makes. Move that check into one shared function, `sudoShape` in `packages/host/src/sudo-profile.ts` (node built-ins only), and do not copy it. `teamModelLaunch` keeps its error messages. The executable after `--` must be absolute. The wrapper is `join(dirname(executable), DRAIN_WRAPPER)`, and it is present when `statSync(wrapper).isFile()`. The command is `profile.command` with `["-n", ...the other options in order, "--", wrapper]`. A missing wrapper or any other shape returns undefined. *(My call: the wrapper sits beside the provider wrapper the owner installed, so no config field is added. A profile without `-n` still gets it, so sudo never waits for a password.)*
 - sudo refuses a command its policy does not list and exits at once. The relay then never posts `drain`, and the watch reports the drain as `skipped` (Task 2). The worker waits only until the process exits.
 - `runFinalDrain` spawns with `stdio: "ignore"` and exactly the given env. At `limitMs` (default `FINAL_DRAIN_MS`) it resolves and sends `SIGTERM`. sudo passes the signal to the relay. A throwing spawn or an `error` event resolves at once.
 - `drain(options)` posts `{}` to `drain` and handles the reply as `relay` handles a hook reply. Move the transcript block of `relay` into one function that both call. For `relay`, listing stays limited to the `claude` route. For `drain`, the reply's `secondaries: true` decides.
@@ -799,7 +800,7 @@ In `tests/transcript-usage.test.ts`, `usage coverage follows the rule table` add
 
 ### Task 3: the worker runs the drain
 
-**Interfaces (consumes):** Tasks 1 and 2. Task 4 must be committed first, because this task edits the same two docs.
+**Interfaces (consumes):** Tasks 1 and 2.
 
 **Files:** modify `hooks.ts`, `worker.ts`, `demo.ts`, `tests/chat.test.ts`, `docs/architecture.md`, `docs/security.md`, and the spec.
 
@@ -840,32 +841,29 @@ In `tests/transcript-usage.test.ts`, `usage coverage follows the rule table` add
 - [ ] **Step 4: Run** `node --import tsx --test tests/transcript-watch.test.ts tests/final-drain.test.ts`, then `npm run typecheck -w @infinite/host`.
 - [ ] **Step 5: The coordinator runs `tests/chat.test.ts` three times in a row, then `npm run check`, requests the independent review, and commits.**
 
-### Task 4: Codex hooks on by default
+### Task 4: withdrawn. Codex hooks stay off, and the docs say why
 
-**Files:** modify `config.ts`, `README.md`, `docs/architecture.md`, `docs/security.md`, `docs/teams.md`, `tests/host-launch.test.ts`.
+The owner decided on 2026-11-13 that Codex hooks are on by default. Spike S2 ran the same day against the real Codex CLI (version 0.167, eight turns, in the member sandbox with network off), and the decision was withdrawn on its result.
 
-**Decisions:**
+- The injected `-c hooks.*` are accepted, fire outside the command sandbox, and reach the loopback hook server. The transcript relay streams the session file.
+- `--dangerously-bypass-hook-trust` is not limited to the hooks the host injects. With it, hooks that the working directory defines also ran, without review. Without it no hook ran, the host's own included. The flag persists no trust.
+- So `DEFAULT_HOOKS` stays `{ claude: true, codex: false }`, and no deployment turns Codex hooks on while they need the flag.
 
-- `DEFAULT_HOOKS` is `{ claude: true, codex: true }`. Its comment says that Codex hooks are on by default, and that `attention.hooks.codex: false` turns them off. The zod defaults follow it, and `manager.ts` keeps its fallback.
-- Sessions with native arguments or a native interface still get no hooks. `doctor` prints its trust-flag line by default now, with its text unchanged.
-- Replace each sentence that states the old default. Keep every "unverified until spike S2" statement: this phase verifies nothing about the trust flag.
-  - `README.md`: "Codex hooks are off by default until S2 runs; set `attention.hooks.codex` to `true` to try them." becomes "Codex hooks are on by default; set `attention.hooks.codex` to `false` to turn them off."
-  - `docs/architecture.md`: "Codex hooks are off by default until the Codex spike confirms them." becomes "Codex hooks are on by default; `attention.hooks.codex: false` turns them off."
-  - `docs/security.md`: "Codex hooks are off by default. When `attention.hooks.codex` is enabled, they are injected with" becomes "Codex hooks are on by default (`attention.hooks.codex`), and they are injected with".
-  - `docs/teams.md`: "Codex hooks are off by default, so Codex members reach the coordinator through the dialog." becomes "With Codex hooks on, the default, a Codex request also carries its hook tool input when the hook reports one; with them off, Codex members reach the coordinator through the dialog."
-- No digest changes. The routine authority digest in `routines.ts` hashes the project, `teams`, `source`, `linear`, and `agents`, not `attention`. No other digest reads `attention`.
+What this task does instead. The coordinator makes these edits:
 
-- [ ] **Step 1: Rewrite the default test** in `tests/host-launch.test.ts`. `codex hooks stay off unless the config turns them on` becomes `codex hooks are on unless the config turns them off`: `{ ...DEFAULT_HOOKS }` is `{ claude: true, codex: true }`. With no attention block, `attention` is undefined. `attention: {}` gives `{ claude: true, codex: true }`. `hooks: { claude: false }` gives `{ claude: false, codex: true }`. `hooks: { codex: false }` gives `{ claude: true, codex: false }`. With `DEFAULT_HOOKS`, the Codex launch args include `--dangerously-bypass-hook-trust` and end with the prompt. With `{ claude: true, codex: false }` they are `["-a", "on-request", "go"]`.
-- [ ] **Step 2: Run it and confirm it fails.**
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** `node --import tsx --test tests/host-launch.test.ts tests/attention-hooks.test.ts`, then `npm run typecheck -w @infinite/host`. The coordinator runs `tests/team-permissions.test.ts`, `tests/teams.test.ts`, and `tests/missions.test.ts`, which start a host, because Codex members now launch with hooks.
+- `docs/security.md`, `docs/architecture.md`, `README.md`, and two sentences of `docs/superpowers/specs/2026-10-04-mobile-attention-brief-design.md` no longer say that the flag applies only to the host's hooks. They state what the spike found.
+- The comment on `DEFAULT_HOOKS` in `config.ts` gives the reason. The `doctor` line in `cli.ts` becomes a warning: "Warning: Codex hooks are on. They run with --dangerously-bypass-hook-trust, which also lets hooks defined in a session's working directory run without review. Use them only with repositories you trust."
+- No test changes. `tests/host-launch.test.ts` pins the default as it is.
 
-Tasks 1, 2, and 4 touch separate files and can run in parallel. Task 3 runs last.
+Codex usage capture without the flag is separate work: reading the transcript from the `notify` route with hooks off, or host-recorded trust for the host's own hooks.
+
+Tasks 1 and 2 touch separate files and can run in parallel. Task 3 runs last.
 
 ## Not in this phase
 
 - Installing the wrapper and the new sudoers file on the execution host. Until then, sudo sessions report `finalDrain: "skipped"`.
 - The ledger and clients (phase 3): reading coverage that now follows the exit record, keeping `finalDrain`, and showing `drain-skipped`.
 - A larger pass budget for the drain.
-- Confirming whether Claude Code runs `SessionEnd` on `SIGTERM`, and spike S2.
+- Confirming whether Claude Code runs `SessionEnd` on `SIGTERM`.
+- Codex usage capture. Codex hooks stay off (Task 4), so a Codex session keeps coverage `none` with `hooks-off` until capture has a route that needs no bypass flag.
 - Codex child threads, native Codex sessions, and OpenCode.

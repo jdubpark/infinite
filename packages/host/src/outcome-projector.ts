@@ -511,7 +511,7 @@ function runSettled(ctx: Ctx): void {
   for (const row of runOutcomes(tx, event.runId)) {
     if (row.disposition !== "integrated" || row.frozenAt !== null) continue;
     row.frozenAt = event.at;
-    // The backfill never claims a refusal, and a freeze adds none to its rows.
+    // The backfill never claims a refusal for an integrated row, and a freeze adds none.
     if (!row.flags.includes("backfilled")) row.accepted = freezeAccepted(row.accepted, row.payload.lastReview, status ?? "");
     saveRow(tx, row);
   }

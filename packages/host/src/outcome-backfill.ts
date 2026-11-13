@@ -42,7 +42,8 @@ type Snapshot = { revision: number; tasks: TeamTask[]; review?: TeamRun["review"
 
 /**
  * Pure. Paths are read for features and dropped. A member whose ending the record cannot show is skipped and
- * counted. Accepted is yes only under an approved review of the same snapshot, and is never no. Held stays unknown.
+ * counted. For an integrated row, accepted is yes only under an approved review of the same snapshot and is never
+ * no, and held stays unknown. A counted failure is no on every level, as for any row.
  */
 export function backfillRun(run: TeamRun, context: BackfillContext): { rows: OutcomeRow[]; summary: RunSummaryRow; skipped: number; rounds: number } {
   const snapshots: Snapshot[] = [

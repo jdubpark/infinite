@@ -25,6 +25,8 @@ import { handleBoardClientCommand, projectsLines } from "./board-cli.js";
 import { handleUnderstandingCommand } from "./understanding-cli.js";
 import { handleRoutineClientCommand } from "./routine-cli.js";
 import type { ProjectGroupList } from "./project-group-types.js";
+import { MIN_COUNTED_ROWS, type LevelCount } from "./outcome-cells.js";
+import type { CellsResult } from "./outcome-reads.js";
 
 type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
@@ -486,7 +488,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
 
 const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
-const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--profile", "--run"]);
+const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--profile", "--run", "--by", "--sources", "--days"]);
 const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
 
 /**
@@ -714,6 +716,24 @@ export function evidenceStatusLines(status: import("./evidence/types.js").Eviden
   ];
 }
 
+/**
+ * One line per display cell, then a line for unreadable rows. A rate prints as a percentage with its interval, or as
+ * `rate unknown` when no attempt counts. A missing fact never prints as zero.
+ */
+export function outcomeCellLines(result: CellsResult): string[] {
+  const level = (count: LevelCount) => `${count.yes} yes, ${count.no} no, ${count.unknown} unknown, ${count.rate === null ? "rate unknown" : `${Math.round(count.rate * 100)}%${count.interval ? ` (${Math.round(count.interval[0] * 100)}–${Math.round(count.interval[1] * 100)}%)` : ""}`}`;
+  const lines = result.cells.length === 0 ? ["No outcome rows match."] : result.cells.map(cell => {
+    const key = Object.entries(cell.key).map(([name, value]) => `${clean(name)}=${clean(value)}`).join(" ") || "all";
+    const excluded = `excluded limit ${cell.excluded.limit}, owner ${cell.excluded.owner}, host ${cell.excluded.host}, duel ${cell.excluded.duel}`;
+    const counts = cell.completed ? [`completed ${level(cell.completed)}`]
+      : (["integrated", "accepted", "firstPass", "held"] as const).map(name => `${name} ${level(cell.levels[name])}`);
+    return [`${key} · sources ${cell.sources.map(clean).join(", ")} · attempts ${cell.attempts} · open ${cell.open} · ${excluded}`, ...counts,
+      ...(cell.enough ? [] : [`fewer than ${MIN_COUNTED_ROWS} counted attempts`])].join(" · ");
+  });
+  if (result.unreadable > 0) lines.push(`Unreadable rows left out: ${result.unreadable}.`);
+  return lines;
+}
+
 export function usageBars(values: number[]): string {
   const levels = "▁▂▃▄▅▆▇█", max = Math.max(0, ...values);
   return values.map(value => levels[max > 0 ? Math.max(0, Math.min(7, Math.floor(value / max * 7))) : 0]).join("");
@@ -814,9 +834,27 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
         }
         return true;
       }
+      if (positional.length === 1 && runId === undefined && options["--profile"] === undefined) {
+        const params = new URLSearchParams();
+        for (const [flag, name] of [["--project", "project"], ["--role", "role"], ["--by", "by"], ["--sources", "sources"], ["--days", "days"]] as const) {
+          const value = options[flag];
+          if (typeof value === "string") params.set(name, value);
+        }
+        let view: CellsResult & { use: string };
+        try {
+          view = await api.json<CellsResult & { use: string }>(`/outcomes${params.size ? `?${params}` : ""}`);
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          if (error instanceof HttpError && error.status === 400) throw new Error(`The host refused the outcome query.${error.code ? ` Code: ${clean(error.code)}.` : ""}`);
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(view, null, 2));
+        else for (const line of outcomeCellLines(view)) console.log(line);
+        return true;
+      }
       const profileId = options["--profile"];
       if (positional.length !== 2 || positional[1] !== "new-epoch" || typeof profileId !== "string" || !profileId)
-        throw new Error("Usage: infinite usage outcomes --run ID [--json] | infinite usage outcomes new-epoch --profile ID [--json]");
+        throw new Error("Usage: infinite usage outcomes --run ID [--json] | infinite usage outcomes new-epoch --profile ID [--json] | infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json]");
       type Epoch = { profileId: string; provider: string; model: string | null; effort: string | null; epoch: number; since: string; repeated: boolean };
       let result: Epoch;
       try {

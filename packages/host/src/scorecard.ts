@@ -1,4 +1,3 @@
-import type { TeamMember, TeamRun, TeamTask } from "./team-types.js";
 import type { OutcomeRow } from "./outcome-store.js";
 import { MIN_COUNTED_ROWS, completeCost, isMetered, median, rowMinutes, rowTime, rowUse, wilsonInterval, type CostLookup, type ExclusionCounts, type Source } from "./outcome-cells.js";
 import { formatUsd } from "./usage.js";
@@ -15,7 +14,6 @@ export type ModelRow = {
 };
 export type Suggestion = { text: string; profileId: string; comparedTo: string; role: string; n: [number, number] };
 export type Scorecard = { rubricVersion: 1; minAttempts: number; sources: Source[]; rows: ModelRow[]; suggestions: Suggestion[] };
-export type TaskUsage = (sessionId: string) => { cost: number; tokens: number; unpriced: number } | undefined;
 
 type Group = { profileId: string; provider: string; epoch: number; identity: string; newest: number; rows: OutcomeRow[] };
 
@@ -111,46 +109,4 @@ export function scorecardFromRows(rows: readonly OutcomeRow[], options: { role: 
   }
   modelRows.sort((a, b) => a.profileId.localeCompare(b.profileId));
   return { rubricVersion: 1, minAttempts, sources: ["production"], rows: modelRows, suggestions: suggestionsOf(modelRows, options.role) };
-}
-
-// Legacy path: `scorecard(runs, usage)` over run records. server.ts is its only caller; Task 4 removes it.
-type LegacyModelRow = Omit<ModelRow, "excluded">;
-type ScorecardRun = Pick<TeamRun, "tasks"> & { members: Array<Omit<TeamMember, "prompt">> };
-type Attempt = { member: Omit<TeamMember, "prompt">; task?: TeamTask; run: ScorecardRun };
-const legacyMedian = (values: number[]) => {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b), middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
-};
-export function scorecard(runs: ScorecardRun[], usage: TaskUsage, options: { role?: string; minAttempts?: number } = {}) {
-  const role = options.role ?? "implementer", minAttempts = options.minAttempts ?? 10;
-  const grouped = new Map<string, Attempt[]>();
-  for (const run of runs) for (const member of run.members) {
-    if (member.role !== role || !member.taskId || member.stoppedReason && /usage limit|credit limit|provider limit/i.test(member.stoppedReason)) continue;
-    const profile = member.modelProfile;
-    if (!profile) continue;
-    const key = profile.id;
-    (grouped.get(key) ?? grouped.set(key, []).get(key)!).push({ member, task: run.tasks.find(task => task.id === member.taskId), run });
-  }
-  const rows: LegacyModelRow[] = [...grouped.entries()].map(([profileId, attempts]) => {
-    const profile = attempts[0].member.modelProfile!;
-    const integrated = attempts.filter(({ task, member }) => task?.status === "integrated" && task.memberId === member.memberId);
-    const measured = profile.provider === "opencode" ? integrated.map(({ member }) => usage(member.sessionId)) : [];
-    const costs = measured.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry) && entry!.unpriced === 0).map(entry => entry!.cost);
-    const tokens = measured.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry) && entry!.unpriced === 0).map(entry => entry!.tokens);
-    const minutes = integrated.flatMap(({ member }) => member.startedAt && member.reportedAt ? [Math.max(0, (Date.parse(member.reportedAt) - Date.parse(member.startedAt)) / 60000)] : []);
-    const tasks = integrated.map(({ task }) => task!);
-    const rubricTasks = tasks.filter(task => task.rubric?.version === 1).map(task => task.rubric!);
-    const ownerRatings = tasks.flatMap(task => task.ownerRating ? [task.ownerRating.score] : []);
-    const mean = (values: number[]) => values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
-    const isLegacyMetered = profile.provider === "opencode";
-    const medUsd = isLegacyMetered ? legacyMedian(costs) : null, medTokens = isLegacyMetered ? legacyMedian(tokens) : null;
-    return { profileId, label: profile.label, provider: profile.provider, role, metered: isLegacyMetered, attempts: attempts.length,
-      integrated: integrated.length, rate: integrated.length / attempts.length, rateInterval: wilsonInterval(integrated.length, attempts.length),
-      medianUsd: medUsd, medianTokens: medTokens, usdPerMTok: medUsd !== null && medTokens ? medUsd / medTokens * 1_000_000 : null,
-      medianMinutes: legacyMedian(minutes), meanReviewRounds: mean(tasks.flatMap(task => task.reviewRounds === undefined ? [] : [task.reviewRounds])),
-      rubric: rubricTasks.length ? { correctness: mean(rubricTasks.map(item => item.correctness.score))!, cleanliness: mean(rubricTasks.map(item => item.cleanliness.score))!, extensibility: mean(rubricTasks.map(item => item.extensibility.score))!, docs: mean(rubricTasks.map(item => item.docs.score))!, n: rubricTasks.length } : null,
-      owner: ownerRatings.length ? { mean: mean(ownerRatings)!, n: ownerRatings.length } : null, enough: attempts.length >= minAttempts };
-  }).sort((a, b) => a.profileId.localeCompare(b.profileId));
-  return { rubricVersion: 1 as const, minAttempts, rows, suggestions: suggestionsOf(rows, role) };
 }

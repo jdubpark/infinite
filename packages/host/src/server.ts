@@ -41,7 +41,9 @@ import { usagePlanSchema } from "./usage-api.js";
 import { TeamService, TeamError } from "./teams.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
-import { scorecard } from "./scorecard.js";
+import { scorecardFromRows } from "./scorecard.js";
+import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cells.js";
+import { productionRows, queryCells } from "./outcome-reads.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
 import { createRoutineSchema, routineActionSchema } from "./routine-types.js";
@@ -635,12 +637,30 @@ export function createApp(config: Config, key: Buffer) {
   );
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
+  // The cost of a session as the usage service measured it. A session it did not measure has no cost, and no scorecard or cell counts it as zero.
+  const sessionCost: CostLookup = sessionId => {
+    const found = usage.session(sessionId);
+    return found.measured ? { usd: found.cost, tokens: found.tokens.input + found.tokens.output + found.tokens.reasoning + found.tokens.cacheRead + found.tokens.cacheWrite, complete: found.pricing.unknown === 0 } : undefined;
+  };
+  // The configured lineup's label, then the newest held run whose member names the profile. Otherwise the scorecard shows the profile ID.
+  const profileLabel = (profileId: string): string | undefined => {
+    const configured = config.teams?.lineup ? lineupProfiles(config.teams.lineup).find(profile => profile.id === profileId) : undefined;
+    if (configured) return configured.label;
+    for (const run of teams.list()) for (const member of run.members) if (member.modelProfile?.id === profileId) return member.modelProfile.label;
+    return undefined;
+  };
   app.get("/api/usage/models", (req, res) => {
     const query = z.object({ role: z.string().trim().min(1).max(40).optional() }).strict().parse(req.query);
-    return res.json(scorecard(teams.list(), sessionId => {
-      const found = usage.session(sessionId);
-      return found.measured ? { cost: found.cost, tokens: found.tokens.input + found.tokens.output + found.tokens.reasoning + found.tokens.cacheRead + found.tokens.cacheWrite, unpriced: found.pricing.unknown } : undefined;
-    }, { role: query.role }));
+    const role = query.role ?? "implementer";
+    try {
+      // Only implementers and scouts have outcome rows. Another role gives an empty scorecard without a read.
+      if (role !== "implementer" && role !== "scout") return void res.json(scorecardFromRows([], { role, label: profileLabel, cost: sessionCost }));
+      const { rows } = productionRows(evidence, role);
+      return void res.json(scorecardFromRows(rows, { role, label: profileLabel, cost: sessionCost }));
+    } catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
   });
   app.get("/api/usage/daily", (req, res, next) => {
     try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); }
@@ -658,6 +678,30 @@ export function createApp(config: Config, key: Buffer) {
     return void res.json({ accounts: usage.summary().accounts });
   });
   app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
+  // Display cells over production rows, or over the sources named. Every paired device may read them, as it may read usage models.
+  const outcomeCellsQuery = z.object({
+    project: z.string().regex(/^[a-z0-9-]{1,80}$/).optional(),
+    role: z.enum(["implementer", "scout"]).default("implementer"),
+    by: z.string().max(200).optional()
+      .transform(value => value === undefined ? ["profile"] : value === "" ? [] : value.split(","))
+      .pipe(z.array(z.enum(["project", "profile", "area", "kind", "risk"])).refine(list => new Set(list).size === list.length, { message: "A dimension may appear once." })),
+    sources: z.string().max(200).optional()
+      .transform(value => (value ?? "production").split(","))
+      .pipe(z.array(z.enum(["production", "duel", "replay", "legacy"])).min(1)),
+    days: z.coerce.number().int().min(1).max(3650).optional(),
+  }).strict();
+  app.get("/api/outcomes", (req, res) => {
+    const query = outcomeCellsQuery.parse(req.query);
+    const scope = { role: query.role, by: query.by, sources: query.sources, ...(query.project === undefined ? {} : { projectId: query.project }), ...(query.days === undefined ? {} : { days: query.days }) };
+    try {
+      const result = queryCells(evidence, { use: "display", ...scope } satisfies CellQuery, { now: new Date().toISOString(), cost: sessionCost });
+      return void res.json({ use: "display", query: scope, cells: result.cells, unreadable: result.unreadable });
+    } catch (error) {
+      if (error instanceof CellQueryRefused) return void res.status(400).json({ code: error.code, error: "The host refused the outcome query." });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
   // The outcome rows of one run, also after the run record is removed. Every paired device may read them, as it may read usage models.
   app.get("/api/outcomes/runs/:runId", (req, res) => {
     const runId = id.parse(req.params.runId);

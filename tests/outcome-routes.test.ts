@@ -249,3 +249,61 @@ test("a host with no events for a run rebuilds its rows at the next start", { ti
     assert.deepEqual(view.body.members, [], "member results are not backfilled");
   } finally { await f.close(); }
 });
+
+test("display cells over a full run", { timeout: 120000 }, async () => {
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    const implementerRows = view.body.rows.filter((row: { role: string }) => row.role === "implementer").length;
+    assert.equal(implementerRows, 2);
+
+    const cells = await f.host.fetchApi("/outcomes?by=profile", "viewer");
+    assert.equal(cells.status, 200, JSON.stringify(cells.body));
+    assert.equal(cells.body.use, "display");
+    assert.deepEqual(cells.body.query, { role: "implementer", by: ["profile"], sources: ["production"] });
+    assert.equal(cells.body.unreadable, 0);
+    assert.equal(cells.body.cells.reduce((sum: number, cell: { attempts: number }) => sum + cell.attempts, 0), implementerRows);
+    for (const cell of cells.body.cells) {
+      assert.deepEqual(Object.keys(cell.key).sort(), ["effort", "epoch", "model", "profile", "provider"]);
+      assert.deepEqual(cell.sources, ["production"]);
+    }
+
+    const legacy = await f.host.fetchApi("/outcomes?sources=legacy", "owner");
+    assert.equal(legacy.status, 200);
+    assert.deepEqual(legacy.body.cells, []);
+
+    for (const query of ["by=owner", "by=profile,profile", "days=0", "role=reviewer"])
+      assert.equal((await f.host.fetchApi(`/outcomes?${query}`, "owner")).status, 400, query);
+  } finally { await f.close(); }
+});
+
+test("the outcomes command prints cells", { timeout: 120000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "inf-outcome-cells-cli-"));
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+
+    const owner = clientCli(f.host, root, "owner");
+    const lines = (await owner("usage", "outcomes", "--by", "profile")).stdout.trim().split("\n");
+    assert.ok(lines.length >= 1);
+    for (const line of lines) assert.ok(line.includes("attempts"), line);
+
+    const json = JSON.parse((await owner("usage", "outcomes", "--by", "profile", "--json")).stdout);
+    assert.ok(Array.isArray(json.cells));
+    assert.equal(json.use, "display");
+
+    await assert.rejects(owner("usage", "outcomes", "--days", "0"), (error: { stderr?: string }) => {
+      assert.match(error.stderr ?? "", /The host refused the outcome query\./);
+      return true;
+    });
+  } finally {
+    await f.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

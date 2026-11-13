@@ -1728,11 +1728,43 @@ and must contain 1–8,000 characters.
 
 ## Model scorecard
 
-`GET /api/usage/models?role=implementer` returns per-profile task outcomes,
-metered usage, version 1 reviewer rubric means, separate owner ratings, Wilson
-95% integration intervals, and advisory comparisons once both profiles have
-at least ten attempts. Limit-switched attempts are excluded. The host never
-changes the configured model lineup; ratings and rubrics are not sent to
+`GET /api/usage/models?role=implementer` reads the outcome ledger's production
+rows, not run records. It returns per-profile task outcomes, metered usage,
+version 1 reviewer rubric means, separate owner ratings, Wilson 95% integration
+intervals, and advisory comparisons once both profiles have at least ten counted
+attempts. The shape is unchanged, with two additive fields: top-level `sources`
+(`["production"]`) and a per-row `excluded` object with `limit`, `owner`,
+`host`, and `duel` counts. Limit-switched attempts stay excluded. A profile with
+no counted attempt has no row. When the evidence store is unavailable the route
+answers `503` with `code: "evidence-unavailable"`; it neither falls back to run
+records nor shows an empty scorecard.
+
+The numbers changed on purpose in these eight ways:
+
+1. An attempt integrated before a steer, a resume, or a continuation counts.
+2. An attempt of a deleted run counts.
+3. Owner stops and host stops leave the denominator.
+4. A running attempt is left out, because only ended attempts count.
+5. A profile's row shows its newest identity and epoch only. Older epochs stay in the ledger cells.
+6. A scout's rate is its completed share.
+7. Review rounds count correction rounds of every cause (`rounds.run`).
+8. Minutes run to the integration event, not to the report.
+
+Cost is the usage service's measured total for each session. A session it did
+not measure, or one with partly unpriced usage, is left out of every cost figure
+and is never counted as zero. A rate with no counted attempt prints as
+`rate unknown`, never as 0%.
+
+`GET /api/outcomes?project=&role=&by=&sources=&days=` returns display cells to
+every paired device. `by` names up to five dimensions (`project`, `profile`,
+`area`, `kind`, `risk`; default `profile`), `sources` names any of `production`,
+`duel`, `replay`, and `legacy` (default `production`), and `days` is an integer
+from 1 to 3650. Each cell shows its key, attempts, open and excluded counts, and
+the four levels with their intervals. `infinite usage outcomes` prints one line
+per cell, and `--json` prints the response. Rows whose payload cannot be read
+are left out and counted in `unreadable`.
+
+The host never changes the configured model lineup; ratings and rubrics are not sent to
 implementers. The owner rating request is idempotent for a given `requestId`.
 
 Goal-owned team lifecycle and steering routes return `409` with

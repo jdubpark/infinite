@@ -1,6 +1,6 @@
 # Swarm dashboard: lanes, wall, and code-context graph for the web client
 
-Date: 2026-11-13. Status: draft for owner approval. Nothing is implemented.
+Date: 2026-11-13. Status: approved by the owner on 2026-11-13 and implemented on `feat/swarm-dashboard`. See "Changes during implementation" at the end.
 
 ## Intent
 
@@ -199,10 +199,11 @@ runs or any of its units is live.
   `+n` count that opens the Teams page.
 - Vitals count agents of live units only.
 
-**Order.** Swarms that wait on a person come first, then the rest of the live
-swarms, then the quiet group. Within each group the order is `createdAt`,
-newest first. `updatedAt` is not used for live runs because the host rewrites
-it on every monitor pass, which would reorder rows between polls.
+**Order.** Live swarms are ordered by `createdAt`, newest first, with the solo
+group last, followed by the quiet group. Order never depends on state: a swarm
+that starts waiting on a person keeps its row, and its marks and the vitals
+carry that. `updatedAt` is not used for live runs because the host rewrites it
+on every monitor pass, which would reorder rows between polls.
 
 **Agent state** comes from the member status, the session attention state, and
 who owns an open prompt:
@@ -347,19 +348,19 @@ Links:
 
 Behaviour:
 
-- Layout uses `d3-force` (new web dependency) with a horizontal bias that keeps
-  swarms left and code right. Positions are kept by node ID, and the
-  simulation runs only when the node or link set changes, so a state change
-  recolours a node without moving it. With reduced motion the layout is
-  computed with a fixed number of ticks and drawn once.
+- Layout is layered and deterministic: mission hub, unit hubs, agents, touched
+  areas, neighbouring areas, left to right, with areas in path order under
+  their project. Positions depend only on which nodes exist and on the model's
+  order, so a state change recolours a node without moving it and nothing
+  animates into place.
 - Selecting an agent highlights its areas; selecting an area highlights the
   agents touching it and lists their count in the inspector.
 - Rendered as SVG. Budget: 60 agents, 6 project clusters, 120 areas, 400 code
   links. Beyond a budget the least-touched items are dropped and a `+n` count
   is shown in the legend.
-- A unit asks for its own run lane. The host falls back to the shared project
-  lane when the run lane has no receipt, which is normal after a host restart.
-  The inspector shows the map's lane and short commit.
+- The view reads each project's shared graph lane. The endpoint also serves a
+  run's own lane and falls back to the shared lane when the run lane has no
+  receipt, which is normal after a host restart.
 - An agent whose provider records no tool inputs is marked `no signal` and
   keeps only its planned and integrated links.
 - Without a code map (graphs disabled or none built) the view still draws the
@@ -572,5 +573,20 @@ on that release.
   context in use, one cluster per project.
 - Quiet runs collapse to one row and leave the view after 72 hours.
 - The three new read endpoints are admitted over the relay.
-- `d3-force` as a new web dependency.
 - Active machine only.
+
+## Changes during implementation
+
+- **Layout.** The first build used a force simulation. Its nodes clumped and
+  its labels collided, so it was replaced by the layered layout described
+  above. No web dependency was added.
+- **Order.** The draft put swarms that wait on a person first. That reorders
+  rows on a state change, which the anti-goals forbid, so order follows
+  creation time only.
+- **Last good map.** A lane keeps its last good code map through a later
+  failed or busy graph refresh.
+- **Planned directories.** A planned path that names a directory the map knows
+  is drawn as that area.
+- **Not drawn.** A mission coordinator's observed touches are requested but
+  not drawn, because a coordinator belongs to no single project. The area
+  inspector shows the path and project only.

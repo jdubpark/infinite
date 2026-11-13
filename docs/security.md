@@ -122,7 +122,13 @@ key and the identity it authenticates; this is not independent hardware attestat
 or an expiring enrollment protocol.
 
 The allowlist now includes terminal and live-event streams, resource observations,
-and bounded project file operations. `terminal-open`, `terminal-send`,
+and bounded project file operations. It also admits three read-only `GET`
+paths for the web [Swarm view](swarm.md): a project's directory-level code map
+(`/api/projects/:id/graph/map`) and the touched-file sets of a team or a
+session (`/api/teams/:id/context`, `/api/sessions/:id/context`). They carry
+directory names, repository-relative file paths, and counts, which is the
+class of data the file listing and session events already serve, and no source
+text. `terminal-open`, `terminal-send`,
 `terminal-close`, and the `events-*` messages
 travel inside ciphertext, together with device credentials and session identifiers.
 Server `terminal-event` frames carry original output, snapshots, state, receipts,

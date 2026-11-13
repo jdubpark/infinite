@@ -260,3 +260,11 @@ Rules:
 - [ ] One independent strong review of the combined diff with the acceptance evidence; fix findings and rerun affected checks.
 - [ ] Private-information scan over the diff.
 - [ ] Record outcomes in Linear and the routing ledger.
+
+## Changes during execution
+
+- Task 5 shipped with a layered, deterministic layout in `apps/web/src/swarm/graph-layout.ts` instead of `d3-force`; the dependency was removed. The stability rule is met by construction and pinned by `layout depends on which nodes exist, not on agent state`.
+- Task 1's order rule no longer puts waiting swarms first; `stable order` pins that a swarm needing a person keeps its row.
+- Task 3 keeps a lane's last good map through a failed refresh (`a failed refresh keeps the lane's last map`).
+- Task 4 drops paths the recorder truncated.
+- Task 5 reads the shared graph lane only.

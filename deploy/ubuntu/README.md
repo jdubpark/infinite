@@ -4,6 +4,8 @@ This template runs an owner-controlled, single-tenant host. The pilot installati
 
 These files describe the deployment template; the commissioning record distinguishes checks performed on the actual server from outstanding work. No paid infrastructure is created by these scripts.
 
+For a separately commissioned second service instance with its own accounts, workspaces, runtime state, and release, follow the [second-instance commissioning runbook](instances.md).
+
 ## Prepare the host
 
 1. Select and approve the actual server, region, final price, backup destination, and recovery policy. For this workload, consult the [server comparison](../../docs/hosting.md) when choosing new hardware.
@@ -69,7 +71,7 @@ Authenticate each provider as `infinite-agent` on the server. Do not forward a l
 
 On Ubuntu 24.04, check Bubblewrap's namespace support before a Codex tool run. Install `bubblewrap`, `apparmor-profiles`, and `apparmor-utils`. If no loaded profile already attaches to `/usr/bin/bwrap`, install the distribution's `/usr/share/apparmor/extra-profiles/bwrap-userns-restrict` as `/etc/apparmor.d/bwrap-userns-restrict` and load it with `apparmor_parser -r`. Avoid duplicate profiles for that executable. Check a harmless sandbox command as the agent account from an accessible workspace, then verify a real Codex file edit through Infinite. Keep `kernel.apparmor_restrict_unprivileged_userns=1` and Codex sandboxing enabled. [OpenAI Linux sandbox prerequisites](https://learn.chatgpt.com/docs/sandboxing?sandbox-os=ubuntu-debian).
 
-Install `deploy/ubuntu/infinite.sudoers` as `/etc/sudoers.d/infinite` after checking it with `visudo -cf`. Its `env_keep` lines pass the per-session hook listener address and token through to the agent account; without them Claude Code and Codex hooks, and the chat transcript they carry, never reach the worker, and sessions fall back to screen heuristics. `INFINITE_TRUSTED_WORKSPACE` lets the Claude wrapper record folder trust for team members when `teams.trustWorkspaces` is on. Existing sessions keep their old environment; end and recreate them after installing the file.
+Install `deploy/ubuntu/infinite.sudoers` as `/etc/sudoers.d/infinite` after checking it with `visudo -cf`. Its `env_keep` lines pass the per-session hook listener address and token through to the agent account; without them Claude Code and Codex hooks, and the chat transcript they carry, never reach the worker, and sessions fall back to screen heuristics. `INFINITE_TRUSTED_WORKSPACE` lets the Claude wrapper record folder trust for team members when `teams.trustWorkspaces` is on. `INFINITE_MISSION_ASSIGNMENT` carries the owner-authorized mission assignment through sudo to its worker. Existing sessions keep their old environment; end and recreate them after installing the file.
 
 ## Session environment files
 

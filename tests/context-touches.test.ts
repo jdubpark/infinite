@@ -158,6 +158,8 @@ test("path confinement", async () => {
     { tool: "Read", input: { file_path: "src/../../x.ts" } },
     { tool: "Read", input: { file_path: "src/a\u0000.ts" } },
     { tool: "Edit", input: { file_path: "../../outside.ts" } },
+    // A path the recorder cut short names no real file.
+    { tool: "Read", input: { file_path: "src/very/long … [+120 chars]" } },
     { tool: "apply_patch", input: { input: "*** Begin Patch\n*** Update File: ../x.ts\n*** End Patch" } },
     { tool: "Bash", input: { command: "cat ../x.ts /etc/hosts.conf" } },
   ];

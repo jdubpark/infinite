@@ -32,6 +32,8 @@ const RELATIVE_TOKEN = /^[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+$/;
 const ABSOLUTE_TOKEN = /^\/(?:[A-Za-z0-9_.@-]+\/)*[A-Za-z0-9_.@-]+$/;
 const EXTENSION = /^.+\.[A-Za-z0-9]{1,8}$/;
 const MAX_PATCH_DEPTH = 4;
+/** The marker `truncateInput` appends to a string it cut; a cut path names no real file. */
+const TRUNCATED = / … \[\+\d+ chars\]$/;
 
 interface FileState { reads: number; edits: number; lastAt: string; seq: number }
 interface SessionState {
@@ -54,7 +56,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
  */
 function repoPath(raw: unknown, cwd: string): string | undefined {
   if (typeof raw !== "string" || raw.length === 0 || raw !== raw.trim()) return undefined;
-  if (raw.includes("\0") || raw.includes("\\") || raw.startsWith("~") || raw.endsWith("/")) return undefined;
+  if (raw.includes("\0") || raw.includes("\\") || raw.startsWith("~") || raw.endsWith("/") || TRUNCATED.test(raw)) return undefined;
   if (raw.split("/").includes("..")) return undefined;
   if (!posix.isAbsolute(cwd)) return undefined;
   const root = posix.resolve(cwd);

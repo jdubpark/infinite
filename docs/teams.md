@@ -357,6 +357,8 @@ delivery.
 
 Each integration records what changed. The run's `changes` lists the files changed from its base to its recorded head, each with a status of added, modified, removed, or renamed and its line counts (`null` for binary files). It holds up to 400 files and sets `truncated` when more changed. Each integrated task's `changedPaths` lists the paths its own change touched, up to 200, with its own `truncated` flag. Git reads for these fields are best-effort: if Git refuses or fails a read, the field is absent and integration still succeeds.
 
+Runs also write run events to the evidence store: `run.created`, `run.blocked`, and `run.settled`, with a summary of the run's counts when it settles. Each run keeps its events in a small outbox inside its record until the store accepts them, and a restart does not lose them. The events only record what the run did. A run behaves the same whether or not its events are stored, and a store that stays unavailable never stops or changes a run.
+
 ## Workspace retention
 
 Team workspaces are host-managed temporary copies. By default, merged and

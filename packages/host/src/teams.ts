@@ -14,7 +14,9 @@ import { ownerDirectionLines, permissionFollowUpPrompt, refreshReportingInstruct
 import { permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
 import { resumeFailed } from "./native-continuation.js";
 import type { UsageService } from "./usage-service.js";
-import type { EvidenceStore } from "./evidence/store.js";
+import { type EvidenceStore, eventProblem } from "./evidence/store.js";
+import type { EventOutbox, OutboxEvent } from "./evidence/outbox.js";
+import { MAX_OUTBOX_EVENTS, runEventKey, runSummaryCounts } from "./run-events.js";
 import { teamUsage } from "./team-usage.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
@@ -43,11 +45,15 @@ type TeamServiceOptions = {
   ownerActive?: (run: TeamRun) => boolean;
   now?: () => number;
   volumeUsage?: (path: string) => Promise<VolumeUsage>;
+  /** Run events for the evidence store. Without it no record gains a ledger field and nothing is emitted. */
+  events?: EventOutbox;
 };
 type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string> };
 /** How long a failed workspace removal waits before the scheduler tries it again. */
 const REMOVAL_RETRY_MS = 5 * 60_000;
 const REVIEW_QUIET_WINDOW_MS = 5 * 60_000;
+/** Event kinds whose drop has been logged; one line per kind for the life of the process. */
+const droppedEventKinds = new Set<string>();
 function deliveryInspectionHash(report: DeliveryReconciliationReport) {
   return digest({ headCommit: report.headCommit, repository: report.repository, branch: report.branch,
     baseHeadCommit: report.baseHeadCommit, disposition: report.disposition, remoteHeadCommit: report.remoteHeadCommit });
@@ -59,6 +65,14 @@ type PendingOperation = { id: string; kind: "prepare" | "member" | "result" | "c
 type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
   retention?: RetentionState;
+  /** Events waiting for the evidence store. Sealed with the record, so a crash loses none. */
+  outbox?: OutboxEvent[];
+  /** The run status that the last status event was emitted for. */
+  ledgerStatus?: TeamRun["status"];
+  /** The member whose report or failure caused the block that the next status event reports. */
+  ledgerBlockSource?: string;
+  /** Events dropped since the last stored flush. */
+  ledgerGap?: { dropped: number; firstAt: string };
   pending?: PendingOperation;
   verificationRecovery?: { pendingId: string; pendingKind: "check"; revision: number; headCommit: string; failure: "setup-changed-files" | "verification-changed-files" | "legacy-completed-check" };
   halt?: "pause" | "cancel" | "steer" | "block";
@@ -381,6 +395,7 @@ export class TeamService {
       const stored = unseal<Stored>(key, `team:${id}`, readFileSync(join(this.directory, file), "utf8"));
       if (stored.run.id !== id) throw new TeamError(409, "invalid-team-record", "A team record cannot be authenticated.");
       this.records.set(id, stored);
+      if (this.options?.events && stored.ledgerStatus === undefined) stored.ledgerStatus = stored.run.status;
       for (const request of stored.run.permissionRecovery?.requests ?? []) if (request.status === "expanding" &&
           (request.expansion?.status === "intent" || request.expansion?.status === "uncertain")) {
         request.expansion.status = "uncertain";
@@ -504,6 +519,8 @@ export class TeamService {
       this.recoverLegacyBlocked(stored);
       this.admitBlockedDeliveryRecovery(stored);
     }
+    // Events a previous process sealed but did not store go out now. Nothing is saved here.
+    if (this.options?.events) for (const stored of this.records.values()) if (stored.outbox?.length) this.flushOutbox(stored);
   }
   /** The usage ledger this service prices member usage from; its tick also drives the ledger's reads. */
   useUsage(service: UsageService) { this.usage = service; }
@@ -652,8 +669,70 @@ export class TeamService {
       retention.status = stored.run.status;
       retention.statusAt = this.retentionNow();
     }
+    if (this.options?.events) this.emitStatusEvents(stored, retention.statusAt);
     stored.run.updatedAt = timestamp();
     writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored);
+    if (this.options?.events) this.flushOutbox(stored);
+  }
+  /** Emits run.blocked or run.settled when the run status differs from the status the ledger last saw. */
+  private emitStatusEvents(stored: Stored, statusAt: string) {
+    const run = stored.run;
+    if (stored.ledgerStatus !== run.status) {
+      stored.ledgerStatus = run.status;
+      if (run.status === "blocked") {
+        this.emit(stored, "run.blocked", [run.revision, statusAt], {}, { code: run.blockCode, sourceMemberId: stored.ledgerBlockSource });
+      } else if (["ready-for-review", "merged", "no-change", "cancelled"].includes(run.status)) {
+        this.emit(stored, "run.settled", [run.revision, run.status, statusAt], {}, { status: run.status, summary: runSummaryCounts(run) });
+      }
+    }
+    stored.ledgerBlockSource = undefined;
+  }
+  /** Appends one event to the run's outbox. Never throws. A no-op without `options.events`. */
+  private emit(stored: Stored, kind: string, keyParts: readonly (string | number)[],
+    ids: { memberId?: string; taskId?: string; revision?: number }, data: Record<string, unknown>): void {
+    try {
+      if (!this.options?.events) return;
+      const run = stored.run, key = runEventKey(kind, run.id, keyParts);
+      const outbox = (stored.outbox ??= []);
+      if (outbox.some(waiting => waiting.key === key)) return;
+      const event: OutboxEvent = {
+        key, runId: run.id, revision: ids.revision ?? run.revision, at: timestamp(), kind,
+        ...(ids.memberId === undefined ? {} : { memberId: ids.memberId }),
+        ...(ids.taskId === undefined ? {} : { taskId: ids.taskId }),
+        data: { v: 1, ...Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined)) },
+      };
+      const problem = eventProblem(event);
+      if (problem !== undefined) {
+        if (!droppedEventKinds.has(kind)) {
+          droppedEventKinds.add(kind);
+          console.warn(`A run event of kind ${kind} was dropped: ${problem}.`);
+        }
+        return;
+      }
+      if (outbox.length >= MAX_OUTBOX_EVENTS) {
+        outbox.shift();
+        stored.ledgerGap = { dropped: (stored.ledgerGap?.dropped ?? 0) + 1, firstAt: stored.ledgerGap?.firstAt ?? timestamp() };
+      }
+      outbox.push(event);
+    } catch { /* A run event never changes the run. */ }
+  }
+  /** Sends the outbox to the store. True when nothing is left waiting. Never throws. */
+  private flushOutbox(stored: Stored, afterGap = false): boolean {
+    const events = this.options?.events;
+    if (!events) return true;
+    try {
+      if (stored.outbox?.length) {
+        const result = events.flush(stored.outbox);
+        if (!result.stored) return false;
+        stored.outbox = [];
+        if (result.refused > 0) stored.ledgerGap = { dropped: (stored.ledgerGap?.dropped ?? 0) + result.refused, firstAt: stored.ledgerGap?.firstAt ?? timestamp() };
+      }
+      const gap = stored.ledgerGap;
+      if (!gap || afterGap) return !stored.outbox?.length;
+      stored.ledgerGap = undefined;
+      this.emit(stored, "ledger.gap", [gap.firstAt], {}, { dropped: gap.dropped });
+      return this.flushOutbox(stored, true);
+    } catch { return false; }
   }
   private async nameRequest(id: string, objective: string) {
     try {
@@ -1062,7 +1141,10 @@ export class TeamService {
         ensureHostDirectory(anchor, root, 0o750);
       } else ensureDefaultTeamRoot(root, true);
       const stored: Stored = { run, fingerprint, receipts: {}, prepared: false, root, retention: { status: run.status, statusAt: at, integratedAt: {}, removalErrors: {} }, ...(anchor ? { anchor } : {}), source, ...(internal?.handoffPolicy ? { handoffPolicy: structuredClone(internal.handoffPolicy) } : {}) };
-      this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project."); this.save(stored);
+      this.records.set(run.id, stored); this.event(stored, "Team created; preparing an isolated copy of the configured project.");
+      this.emit(stored, "run.created", [], { revision: 1 }, { projectId: run.projectId, purpose: "work", goalId: goal?.id, goalCycle: goal?.cycle,
+        missionId: internal?.missionId, handoff: Boolean(internal?.handoff), parentRunId: internal?.baseRunId, lineup: Boolean(lineup), deliveryMode: run.delivery?.mode });
+      this.save(stored);
       if (run.titleSource === "request" && this.titler) void this.nameRequest(run.id, parsed.objective).catch(error => console.warn("Best-effort team naming failed.", error));
       this.operation(stored, "prepare", async signal => {
         const assertParent = () => {
@@ -1859,6 +1941,7 @@ export class TeamService {
     stored.run.reason = stored.run.stopReason === "deadline" ? "The goal reached its deadline. Active work is being stopped and retained for inspection."
       : stored.run.stopReason === "member-limit" ? "The goal reached this run's agent attempt limit. Active work is being stopped and retained for inspection."
         : error instanceof TeamError ? error.message : genericOperationFailureReason;
+    if (this.options?.events) stored.ledgerBlockSource = sourceMember?.memberId;
     this.event(stored, stored.run.reason); this.save(stored); this.trackBlocked(stored);
   }
   private async startAutomaticDeliveryRecovery(stored: Stored, trackingReady: boolean) {

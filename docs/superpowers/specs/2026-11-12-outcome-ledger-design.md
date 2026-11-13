@@ -263,6 +263,8 @@ The host never infers a defect. A `revert` records only that a base-branch commi
 
 A goal roll-up sums the run summaries and rows that carry the goal id. A mission roll-up does the same for the mission id. A goal roll-up also shows the owner's latest verdict from `ProductGoal.outcomes`. This design calls that verdict a **goal assessment**, so that outcome keeps one meaning.
 
+The objective record design adds a `finding_measures` table joined to scout rows by `outcome_id`, so a scout cell gains `findings`, and its verdict rows keep this design's 730-day retention. A goal roll-up shows the latest agent assessment, labelled provisional, beside the goal assessment and never merged with it (C14).
+
 ### Part 7. Reads
 
 **Scorecard.** `GET /api/usage/models` returns the same `ModelUsage` shape, built from rows with source `production`. `attempts` is the ended rows with no exclusion, `integrated` is the rows with integrated yes, and `meanReviewRounds` uses `rounds.run`. The other fields read the payload. The response gains two additive fields, `sources` and `excluded`. `infinite usage models` needs no change.
@@ -365,8 +367,8 @@ A legacy row is an unauthenticated claim. It appears only in `display` queries, 
 
 ## Owner decisions
 
-1. Outcome rows hold no run text. May they outlive a deleted run, and is 730 days the right retention?
-2. Is 30 days the right hold window?
+1. **Decided 2026-11-13:** outcome rows outlive a deleted run, for 730 days.
+2. **Decided 2026-11-13:** the hold window stays 30 days.
 3. A revert undoes a whole run. Should it set held to no for every accepted attempt in that run, as designed, or only mark the run summary?
 4. An attempt that ends with a question counts as a failure today, and this design keeps that. Should a question be excluded like an owner stop?
 

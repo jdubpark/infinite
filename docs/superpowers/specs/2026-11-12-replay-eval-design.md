@@ -249,34 +249,34 @@ type EvalJob = {
 }
 ```
 
-A job has the shape of a routine in `RoutineService`. Only the owner creates one, and it expires within 30 days. The improvement gate may create one inside the limits of a gate job that the owner approved. The host pins a digest of the project policy, the host policy, the eval configuration, and the prompt version. A change blocks the job with `configuration-changed`. Before approval the host shows the trial count, the estimate that it would reserve per trial, and whether that estimate is measured or the fallback.
+A job has the shape of a routine in `RoutineService`. The owner creates one. In an `autonomous` project, the host's learning scheduler also creates one inside the standing learning budget (delegated adoption design, Part 9). A job expires within 30 days. The improvement gate may create one inside the limits of a gate job that the owner approved. The host pins a digest of the project policy, the host policy, the eval configuration, and the prompt version. A change blocks the job with `configuration-changed`. Before approval the host shows the trial count, the estimate that it would reserve per trial, and whether that estimate is measured or the fallback.
 
-**Learning budget.** This design owns the learning budget of contract C8. The owner sets it in the project's private team configuration:
+**Learning budget.** This design owns the learning budget of contract C8. It is a standing weekly share of the project's spend fuse (C13), decided on 2026-11-13. The owner may set it in the project's private team configuration, in the shape that the delegated adoption design gives (Part 9):
 
 ```ts
 type LearningBudgetConfig = {
-  monthlyListUsd: number        // cap on list-price equivalent, for every profile
-  monthlySpentUsd: number       // cap on metered money
-  shares: { duel: number, replay: number, gate: number }   // each 0 to 1, sum at most 1
-  fallbackEstimate?: { listUsd: number, spentUsd: number }  // per session with no usage history
+  fuseShare?: number            // share of each weekly project fuse ceiling; absent: 0.25
+  shares?: { duel: number, replay: number, gate: number }  // absent: 0.2, 0.5, 0.3; sum at most 1
+  weeklySpentUsd?: number       // metered share; absent: fuseShare of the weekly metered ceiling
+  fallbackEstimate?: { tokens: number, listUsd: number, spentUsd: number }  // per session with no usage history
 }
 ```
 
-A project without this block has a budget of zero, so no session with a learning purpose starts there. A `validate` job spends no model tokens and needs no budget. A purpose's share of the two caps is its cap. The other designs call them the duel cap and the gate cap.
+The block is outside the routine authority digest: umbrella C11 removes it from the digested object before hashing, so an owner change to it leaves every routine approval valid. Its keys stay optional, and the code applies the values above at read. A `supervised` project without this block has a budget of zero, so no session with a learning purpose starts there. An `autonomous` project without it has those values. A `validate` job spends no model tokens and needs no budget. A purpose's share of the budget is its cap. The other designs call them the duel cap and the gate cap.
 
 Three host-internal functions serve this design, the duels design, and the improvement gate design:
 
-- `reserve(projectId, purpose, estimate)` takes an estimate with two amounts, `listUsd` and `spentUsd`. It succeeds while the month's settled and reserved amounts for that purpose stay inside both caps.
+- `reserve(projectId, purpose, estimate)` takes an estimate in the fuse's three units: tokens, `listUsd`, and `spentUsd`. It succeeds while the week's settled and reserved amounts for that purpose stay inside every cap.
 - `settle(reservationId)` replaces the estimate with the usage of the reserved sessions, read from the usage ledger. A session with `complete` usage coverage settles at its measured usage. Any other session settles at its estimate, or at its measured usage when that is larger, and is labelled so.
 - `status(projectId)` returns the caps and, per purpose, the settled, reserved, and estimated amounts.
 
 An estimate is the median usage of the profile's earlier sessions in the project that have `complete` usage coverage. With no such session, or for an amount that cannot be priced, it is the owner-set `fallbackEstimate`. With no fallback configured, `reserve` refuses, and the job pauses with `estimate-unavailable`.
 
-Reservations are rows in the evidence store. The month is a calendar month in UTC.
+Reservations are rows in the evidence store. The period is the spend fuse's week (C13).
 
 The host checks the job limits and reserves from the learning budget before each trial starts. It cannot cap tokens inside a session, so a job can exceed a limit by the trials already running. An exhausted limit pauses the job with `budget-exhausted`.
 
-No trial starts while its provider has an active limit in `ProviderLimits`, while any run has an open duel, outside the job's windows, or when fewer than four host session slots are free. *(My call: real work keeps priority.)* A later job reuses a valid trial under 30 days old when the eval task, the `configId`, the profile epoch, and the harness version match. The harness version changes with grading or the trial lifecycle. A `confirm` job never reuses a trial.
+No trial starts while its provider has an active limit in `ProviderLimits` or headroom below the learning floor (delegated adoption design, Part 9), while any run has an open duel, outside the job's windows, or when fewer than four host session slots are free. *(My call: real work keeps priority.)* A later job reuses a valid trial under 30 days old when the eval task, the `configId`, the profile epoch, and the harness version match. The harness version changes with grading or the trial lifecycle. A `confirm` job never reuses a trial.
 
 ### Part 7. Statistics
 
@@ -325,7 +325,7 @@ type ReplayPrior = {
 }
 ```
 
-It covers `isolated` dev set trials. Trials of one task are not independent, so `tasks` is the sample size.
+It covers `isolated` dev set trials, or the trials of a prospective `confirm` comparison. An export reaches the router only as an adopted routing prior (C15, delegated adoption design Part 8). Trials of one task are not independent, so `tasks` is the sample size.
 
 The corpus summary shows task counts by state, origin, set, and area. It also shows coverage: the share of accepted production attempts that have a valid eval task.
 
@@ -376,9 +376,9 @@ A later version needs a runnable interface on the host, which INF-110 tracks. It
 
 ## Owner decisions
 
-1. Whether to add the two accounts: an eval identity with its own provider logins, and a grader identity with none. Without both, every result is labelled `none` and feeds nothing.
+1. **Decided 2026-11-13:** add both accounts, the eval identity and the grader identity. Without them the improvement loop cannot run.
 2. The setup of the eval logins: provider-side history and memory off where the provider offers that, and no other use. The host cannot check it.
-3. When replay may spend subscription limits: the windows, the monthly cap inside the learning budget, and the fallback estimate.
+3. When replay may spend subscription limits. **Decided 2026-11-13:** the cap is the replay share, 50% of a standing budget of a quarter of the weekly fuse. Still open: the windows and the fallback estimate.
 4. Whether tasks with a `commit-message` prompt may feed router priors. The export keeps them apart either way.
 5. How long eval material stays in host state, and whether a captured task may outlive the deleted record of a cancelled run. The default for the second is no.
 

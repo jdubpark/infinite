@@ -1,6 +1,6 @@
 # Self-improving teams: shared contract and build order (INF-181)
 
-Date: 2026-11-12. Status: design for review. This is the umbrella document for seven designs. It fixes the vocabulary, the shared data contracts, the authority rules, and the build order. Each design has its own document, its own Linear issue, and its own sequence of pull requests.
+Date: 2026-11-12, amended 2026-11-13. Status: design for review. This is the umbrella document for eleven designs: seven from 2026-11-12 and four from the continuous autonomy amendment of 2026-11-13. It fixes the vocabulary, the shared data contracts, the authority rules, and the build order. Each design has its own document, its own Linear issue, and its own sequence of pull requests.
 
 ## Intent
 
@@ -45,7 +45,7 @@ Observed on `main` at the time of writing:
             └──► priors ──┘◄── outcomes ─┘
             │
             ▼
-     improvement gate ──► candidate proposed for normal review
+     improvement gate ──► class A adopted, class B proposed for review (C15)
 ```
 
 Production outcomes say what happened. Replay says what would happen under a different configuration on the same tasks. The router acts on both. The gate keeps self-improvement from turning into drift.
@@ -61,10 +61,14 @@ Production outcomes say what happened. Replay says what would happen under a dif
 | `2026-11-12-evidence-router-design.md` (INF-186, and INF-187 for the cascade) | Host-side profile choice with an exploration share, and cost-aware start-tier choice (learned cascade) | Outcome ledger, usage capture, and replay eval for priors |
 | `2026-11-12-duels-design.md` (INF-188) | Two profiles on one live task, a blind judge, one result integrated | Router, outcome ledger, usage capture, and replay eval for judge calibration |
 | `2026-11-12-improvement-gate-design.md` (INF-189) | Change candidates measured on held-out replay tasks before they are proposed | Replay eval, outcome ledger |
+| `2026-11-13-continuous-autonomy-design.md` | The principle, autonomy mode (C12), standing goals, the spend fuse (C13), delivery defaults, attention and the daily digest (C18) | The store. Usage capture for the fuse's token, list, and metered ceilings |
+| `2026-11-13-objective-record-design.md` | The objective record, the assumption register, the intent check, verdicts (C14), self-directed follow-up work, outcome measures for work with no commit | Read pools and blackboard member tools, for its later phases |
+| `2026-11-13-read-pools-and-context-crossings-design.md` | Read pools (C16), the six context pools and their crossings (C17), the digest carried into a goal's next cycle, the quarantine for outside content, effort caps | The store, and blackboard entries |
+| `2026-11-13-delegated-adoption-design.md` | Adoption classes (C15), the verified lesson lifecycle, automatic demotion, reviewer independence (C19) | Replay eval, improvement gate |
 
 ## Vocabulary
 
-One word has one meaning across all eight documents.
+One word has one meaning across all twelve documents.
 
 - **Run, task, member, role, profile, lineup**: as in `packages/host/src/team-types.ts`. A profile's identity is its provider, model, and effort or variant.
 - **Attempt**: one member working one task. Key `(runId, memberId)`.
@@ -81,7 +85,11 @@ One word has one meaning across all eight documents.
 - **Routing decision, routing mode**: defined in the router design.
 - **Duel, champion, challenger, judge**: defined in the duels design.
 - **Change candidate, gate receipt**: defined in the improvement gate design.
-- **Learning budget**: the owner-set allowance that duels, replay trials, and gate trials spend (contract C8).
+- **Learning budget**: the standing allowance that duels, replay trials, and gate trials spend (contract C8).
+- **Autonomy mode, standing goal, spend fuse, interrupt, daily digest**: defined in the continuous autonomy design. The **authority digest** is the routine approval hash of C11. The **goal digest** is the fixed-schema summary that the read pools design carries into a goal's next cycle (C17).
+- **Host receipt, evaluator assessment, owner assessment**: the three verdict kinds of C14, defined in the objective record design.
+- **Adoption class**: A, B, or C (C15), defined in the delegated adoption design.
+- **Read pool, context pool, crossing**: defined in the read pools and context crossings design.
 
 ## Shared contracts
 
@@ -172,7 +180,7 @@ Every outcome row and every statistic names its sources. `production` and `duel`
 
 Every member session has a purpose: `work`, `duel`, `replay`, or `gate`. The design that starts a session sets its purpose at launch, and the purpose never changes afterwards. The usage ledger records it, and the cost view shows learning spend apart from work.
 
-Each project has an owner-set learning budget per calendar month: a list-price cap, a metered-money cap, and a share for each of the three learning purposes. A project with no learning budget has a budget of zero. A duel's challenger and judge, a replay trial, and a gate trial reserve an estimate of both amounts before they start and settle to measured usage afterwards. Where a profile has no measured history, the estimate is an owner-set fallback amount. With no fallback, the reservation is refused. A session whose usage is missing or partial settles at its estimate, or at the measured amount when that is larger, and is labelled so. A cap governs admission: when it is reached, no new session of that purpose starts. A running session finishes, so a month can exceed a cap by the sessions that were already running. Learning never draws on a run's or a goal's own limits. The replay eval design owns the budget record and its reserve and settle operations.
+Each project has a standing learning budget per fuse week (a UTC week from Monday, C13): a token cap, a list-price cap, a metered-money cap, and a share for each of the three learning purposes. The owner decided its default on 2026-11-13: a quarter of the project's weekly spend fuse ceiling in each unit (C13), split 50% replay, 30% gate trials, and 20% duels. The owner can change it. A supervised project without a budget has a budget of zero. The delegated adoption design defines the standing budget. A duel's challenger and judge, a replay trial, and a gate trial reserve an estimate in all three units before they start and settle to measured usage afterwards. Where a profile has no measured history, the estimate is an owner-set fallback amount. With no fallback, the reservation is refused. A session whose usage is missing or partial settles at its estimate, or at the measured amount when that is larger, and is labelled so. A cap governs admission: when it is reached, no new session of that purpose starts. A running session finishes, so a week can exceed a cap by the sessions that were already running. Learning never draws on a run's or a goal's own limits. Learning spend counts toward the spend fuse (C13), so the learning budget sits inside it. The replay eval design owns the budget record and its reserve and settle operations.
 
 Exploration is different: it is real work sent to a profile that is not the current best. The router bounds it by share, and it sets an `explore` flag on the routing decision.
 
@@ -181,12 +189,12 @@ Exploration is different: it is real work sent to a profile that is not the curr
 These rules bind every design.
 
 1. The honesty rules in `PRODUCT.md` hold. No component infers that a task is complete. No component approves a provider permission.
-2. Learning never changes permissions, scope, owned paths, budgets, limits, review requirements, delivery policy, or the set of approved profiles. It may change which approved profile gets a task, which entries a member reads, and which candidate is proposed.
+2. Learning never changes permissions, scope, owned paths, budgets, limits, review requirements, delivery policy, the set of approved profiles, or the spend fuse. It may change which approved profile gets a task, which entries a member reads, and which candidate is proposed.
 3. A posterior, a reward, a routing decision, an eval result, a gate receipt, a duel record, and a usage figure never enter any member's prompt, context file, or tool result. A rubric score and an owner rating keep the rule of the 2026-10-19 design: they never reach an implementer. Reviewers, integrators, and project managers read them in the context file today, and these designs do not change that.
 4. A model never grades its own work. A judge differs in model from both contestants. Today a reviewer may share a model with an implementer, and the host then drops the rubric. These designs keep that behaviour and add two rules. The router never chooses a profile whose model equals the reviewer's model. The outcome ledger flags an attempt that its own model reviewed, and no decision uses the acceptance of a flagged attempt.
-5. The owner delegates routing authority per project. The delegation is pinned per run and can be revoked. The default is `off`. The 2026-10-19 cost and effectiveness design says the host never changes routing, and that remains the default. The router's `auto` mode is the explicit owner opt-in that amends it.
+5. The owner delegates routing authority per project. The delegation is pinned per run and can be revoked. On 2026-11-13 the owner decided that every enrolled project uses `auto` at task start after a shadow period, as the router design defines. That decision amends the 2026-10-19 cost and effectiveness design, which says the host never changes routing. A project that is not enrolled stays `off`.
 6. A profile with `dataUse: "contributor"` is eligible only where the project's policy allows it.
-7. A gate receipt is evidence. It is never approval. Adoption needs the normal independent review, and a repository file needs the normal pull request checks.
+7. A gate receipt is evidence. It is never approval on its own. A class A change that a model wrote is adopted after a passing paired replay and an approval from a reviewer of another model family (C15, C19). A class A change with no model author, such as a routing prior the host computed from graded trials or a slot a person proposed, needs the passing replay only. A class B change needs the normal independent review, and a repository file needs the normal pull request checks.
 8. Eval material stays in private host state and never enters a tracked file. A trial member receives only the recorded assignment of its own eval task. Hidden tests, reference patches, grades, and every other task's material never enter a member's workspace, prompt, or tool result. A duel judge may read the result patches of a dev set task, and that task can then never be a holdout task.
 9. Evidence is recorded per project. Numeric outcome statistics may pool across one tenant's projects as a prior, as the existing scorecard already does. Content never crosses a project boundary. One channel is the exception, and it exists today: a mission coordinator carries interfaces between a mission's repositories in subtask objectives, and it may do the same in a mission-scoped entry.
 
@@ -208,8 +216,47 @@ These designs add settings to the project team configuration and to the host `te
 | Blackboard switches | yes | They change what a member reads and which tools it has |
 | Feature map | yes | It changes how risk is derived |
 | Outcome settings, eval configuration, learning budget | no | They change measurement and learning spend, never a routine's work |
+| Autonomy mode (C12) | no | It lives beside the team configuration. A routine pins the mode it was approved in |
+| Spend fuse, attention, and digest settings (C13, C18) | no | They sit in the host `autonomy` block, which the digest never reads |
+| A merge policy written by the new delivery default | yes | It is the existing `project.team.delivery` |
 
-A setting that is out of the digest is removed from the digested object before hashing. A project without that setting then keeps its digest, and no active routine blocks at upgrade.
+A setting that is out of the digest is removed from the digested object before hashing. A project without that setting then keeps its digest, and no active routine blocks at upgrade. A new key inside a digested object never uses a schema default, because parsing would write the key into the object and change the hash. The code applies the default at read.
+
+## Contracts added on 2026-11-13
+
+The continuous autonomy amendment adds eight contracts. One principle governs them: the system acts without the owner when the action is reversible, its outcome is established by a host receipt or an independent evaluator and never by the agent that did the work, and it stays inside the spend fuse and the project's authority (permissions, allowed paths, delivery policy, approved profiles). Otherwise it waits for the owner.
+
+### C12. Autonomy mode
+
+Each project is `supervised`, today's behaviour, or `autonomous`. The host default is `autonomous` for a repository enrolled with `infinite repo init`, and every other project is `supervised`. The mode lives in the enrollment record beside the team configuration, outside the routine authority digest. A run pins the mode it started with, and so does each goal cycle. The owner can change the mode at any time, and the change applies from the next run or cycle. A run, goal, or cycle recorded before this contract counts as `supervised`, and so does one whose lineup has no eligible evaluator (C14). Each contract states what it does per mode. The continuous autonomy design defines the record, the pin, and what autonomous mode enables.
+
+### C13. Spend fuse
+
+Hard ceilings in tokens, list-price dollars, and metered money (`spentUsd`, C5, which subscription rows never add to), per project and per host, per UTC day and per week, and a launch-rate limit per rolling hour. The host checks them before every member launch, at every caller, with a backstop in `Manager.createTeamSession`. While a fuse is open, running members finish, new launches wait, no goal cycle or routine occurrence starts, and the owner is interrupted (C18). A day or week fuse closes at its window boundary or when the owner grants more for that window. Unmeasured usage counts at an estimate, never as zero. Every purpose counts, so the learning budget (C8) sits inside the fuse. No fuse figure enters a prompt (C9 rule 3), and learning never changes the fuse. The continuous autonomy design defines the units, the defaults, the admission check, and the reset.
+
+### C14. Verdicts
+
+Three kinds of verdict, never merged: a host receipt, an evaluator assessment, and an owner assessment. An evaluator assessment comes from an evaluator whose family differs from the coordinator's and whose model authored no integrated change in the cycle (C9 rule 4). It is always labelled an agent assessment, and it is provisional. Cycles may continue on it. An owner assessment is final, overrides it, and is the only way a goal becomes `achieved`. `2026-11-13-objective-record-design.md` defines the verdicts, the evaluator, and the owner override.
+
+### C15. Adoption classes
+
+Class A, lessons, routing weights, and prompt-slot changes, is adopted automatically after a passing paired replay, with a regression guard and automatic demotion. Class B, guidance files and lineups, needs review. Class C, permissions, scope, owned paths, delivery policy, review requirements, the approved profile set, and the spend fuse, is never changed by learning. `2026-11-13-delegated-adoption-design.md` defines the classes and the lesson lifecycle.
+
+### C16. Read pools
+
+Read-only members are requested in phases and validated by the host before any launch. They are bounded by a ceiling per run and per host, a depth of one, and their own attempt allowance. The write pool stays at four. `2026-11-13-read-pools-and-context-crossings-design.md` defines the request, the validation, and the effort caps.
+
+### C17. Context pools
+
+Six named context pools. Content crosses from one pool to another only as a fixed-schema digest with a handle to the full artifact and its provenance. A digest carries into a goal's next cycle. `2026-11-13-read-pools-and-context-crossings-design.md` defines the pools and the rule for each crossing.
+
+### C18. Attention
+
+In an autonomous project the owner is interrupted for five reasons only: a fuse hit, an irreversible or external action, a request for wider authority, a refuted assumption or an open question with no safe default that changes what "done" means, and repeated failed cycles. Each is raised by a named host event. Any other question is recorded in the objective record with the member's default and goes to the digest. Everything else goes into a bounded daily digest that labels each item by its verdict kind. A supervised project keeps today's notifications. The continuous autonomy design defines the events, the digest, and its bounds.
+
+### C19. Reviewer independence
+
+Anything a model wrote that is merged or adopted automatically needs, for every author family in it, an approval of that exact head or change from a reviewer of another known family. An unknown family fails closed. A class A change with no model author needs the passing replay only (C9 rule 7). `2026-11-13-delegated-adoption-design.md` defines model families and the check.
 
 ## Build order
 
@@ -218,13 +265,13 @@ Capture comes first because it cannot be backfilled. Retention deletes cancelled
 1. The evidence store and the event table. Worker-side usage capture, which needs no store.
 2. Typed events and the outcome ledger, with the scorecard reading from it. The usage ledger in the store. Host-written entries.
 3. Member entry tools. Replay eval: corpus capture starts as soon as events exist.
-4. The router in `shadow` mode, then `auto` for projects the owner opts in.
+4. The router in `shadow` mode, then `auto` for every enrolled project after its shadow period.
 5. Duels and the improvement gate.
 
 ## Non-goals
 
 - Free-form chat between agents.
-- Automatic edits to a lineup, and automatic adoption of any candidate.
+- Automatic edits to a lineup or to guidance files. Since 2026-11-13, class A changes are adopted automatically (C15). Nothing else is.
 - Laptop sessions and other work that runs off the host.
 - Replay of interface tasks in the first version.
 - Routing of coordinator, reviewer, permission, and delivery roles in the first version.
@@ -241,11 +288,11 @@ These would make the program a failure even if every part works:
 
 ## Owner decisions
 
-Each design lists its own. These six cut across them:
+Each design lists its own. These six cut across them. The owner decided all six on 2026-11-13:
 
-1. Whether to delegate routing to the host (`auto` mode) for a project, and for which decision points.
-2. The learning budget per project and its split across duels, replay, and gate trials.
-3. Whether to add two accounts for replay: an eval identity with its own provider logins for trial members, and a grader identity with no provider login for validation and grading. Without them a replay trial can read the mirror, so its result feeds neither the router nor the gate, and no duel runs.
-4. Whether `listUsd` is an acceptable routing weight for subscription profiles.
-5. Whether outcome rows, which hold no run text, may outlive a deleted cancelled run.
-6. Whether the blackboard takes the role of the memory design's session working context, stored outside memory.
+1. Whether to delegate routing to the host (`auto` mode) for a project, and for which decision points. **Decided 2026-11-13:** `auto` at task start for every enrolled project after a shadow period. The cascade is allowed. The exploration share is 20%.
+2. The learning budget per project and its split across duels, replay, and gate trials. **Decided 2026-11-13:** a standing budget per project. Its starting point is a quarter of the project's weekly spend fuse (C13), split 50% replay, 30% gate trials, and 20% duels.
+3. Whether to add two accounts for replay: an eval identity with its own provider logins for trial members, and a grader identity with no provider login for validation and grading. Without them a replay trial can read the mirror, so its result feeds neither the router nor the gate, and no duel runs. **Decided 2026-11-13:** add both. Without them the improvement loop cannot run.
+4. Whether `listUsd` is an acceptable routing weight for subscription profiles. **Decided 2026-11-13:** yes, at low weight. Provider-limit headroom weighs more, because a limit stall is the real threat to continuity.
+5. Whether outcome rows, which hold no run text, may outlive a deleted cancelled run. **Decided 2026-11-13:** yes, for 730 days. The hold window stays 30 days.
+6. Whether the blackboard takes the role of the memory design's session working context, stored outside memory. **Decided 2026-11-13:** yes, as C10 states. Member tools and context reduction turn on once sizes are measured, then the report gate. A digest carries into a goal's next cycle (C17).

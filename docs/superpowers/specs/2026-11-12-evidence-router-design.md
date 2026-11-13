@@ -25,10 +25,10 @@ Read in `packages/host/src` on `main`:
 
 1. The host chooses the profile for the first implementer of a task, for an escalation, and for a scout.
 2. A bounded share of work goes to profiles that are not the current best.
-3. One owner-set knob trades success against cost.
+3. Owner-set knobs trade success against list price and provider-limit headroom.
 4. A task starts on a strong profile where a light start is expected to lose.
 5. Every decision is recorded, explainable, and repeatable.
-6. `off` stays the default, and `shadow` lets the owner watch before delegating.
+6. In a `supervised` project `off` stays the default, and `shadow` lets the owner watch before delegating. In an `autonomous` project (C12) the router starts in `shadow` and moves to `auto` at `start` after a shadow period (decided 2026-11-13).
 
 ## Non-goals
 
@@ -60,21 +60,27 @@ The design picks C. B stays available as `off`, and `shadow` bridges the two. A 
 The routing policy sits in the project team configuration, beside `permissions`:
 
 ```ts
-const teamRoutingSchema = z.object({
-  mode: z.enum(["off", "shadow", "auto"]).default("off"),
-  points: z.array(z.enum(["start", "escalation", "scout"])).min(1).default(["start"]),
-  cascade: z.boolean().default(false),
-  successValueUsd: z.number().min(0).max(100).default(2),
-  maxExploreShare: z.number().min(0).max(0.5).default(0.2),
-  exploreWindow: z.number().int().min(10).max(500).default(50),
-  minSpareAttempts: z.number().int().min(0).max(20).default(4),
-  allowContributor: z.boolean().default(false),
+const teamRoutingSchema = z.object({                                     // read default:
+  mode: z.enum(["off", "shadow", "auto"]).optional(),                       // "off"
+  points: z.array(z.enum(["start", "escalation", "scout"])).min(1).optional(), // ["start"]
+  cascade: z.boolean().optional(),                                          // false
+  successValueUsd: z.number().min(0).max(100).optional(),                   // 2
+  maxExploreShare: z.number().min(0).max(0.5).optional(),                   // 0.2
+  exploreWindow: z.number().int().min(10).max(500).optional(),              // 50
+  minSpareAttempts: z.number().int().min(0).max(20).optional(),             // 4
+  allowContributor: z.boolean().optional(),                                 // false
+  listWeight: z.number().min(0).max(1).optional(),                          // 0.25
+  headroomWeight: z.number().min(0).max(4).optional(),                      // 1
 }).strict();
 ```
+
+The routine digest hashes the project team configuration, so no key has a schema default. The code applies each default at read, and parsing never writes a key (umbrella C11).
 
 - `off`: today's behaviour. The router writes nothing.
 - `shadow`: the coordinator and the worker choose as today. The router records what it would have chosen.
 - `auto`: the router chooses at the listed points.
+
+**Autonomous default (decided 2026-11-13).** An `autonomous` project (C12) without a saved policy uses `shadow` until its shadow period ends, then `auto` with points `["start"]`, `cascade` on, and `maxExploreShare` 0.2. *(My call: the shadow period ends after 14 days and 50 recorded `start` decisions, whichever is later.)* The end of the period is a host-held fact in the evidence store, like an exploration pause, so it leaves a routine's approval digest unchanged. Leaving the project `autonomous` is the owner's delegation.
 
 `infinite repo init` saves the policy through that owner-only route. `createRun` pins a copy as `run.routing`, as it pins `permissions`, so a later change affects new runs only. It refuses with `routing-no-eligible-profile` when `start` is listed and no candidate passes the fixed rules of Part 5.
 
@@ -147,7 +153,7 @@ cell:    Beta(k_c·μ_p + P_c + S_c,  k_c·(1 − μ_p) + Q_c + F_c)    k_c = mi
 **Labelled priors.** Evidence that is not an observed row enters only as a prior with a capped mass. Status shows each one under its own label, apart from observed counts.
 
 - **Earlier evidence.** At each level, the rows that fail only the current profile epoch or the current prompt version are scaled to a mass of at most 10. A new profile identity has none. The owner declares a new profile epoch with the outcome ledger design's command. *(My call: prompts change often. A full reset discards evidence, and no reset trusts numbers measured under another prompt.)*
-- **Replay.** It enters `start` cells only. An export is compatible when it has the cell's project, role, and area, the profile's identity and profile epoch, the current implementer prompt version, and the cell's kind or no kind. Per prompt origin, the newest compatible export replaces every older one. The router pools the rest by task count and adds the pooled resolved share with a mass of `min(10, total tasks)`, across all prompt origins.
+- **Replay.** It enters `start` cells only, and only as an adopted Class A routing prior (C15, delegated adoption design Part 8). An export is compatible when it has the cell's project, role, and area, the profile's identity and profile epoch, the current implementer prompt version, and the cell's kind or no kind. Per prompt origin, the newest compatible export replaces every older one. The router pools the rest by task count and adds the pooled resolved share with a mass of `min(10, total tasks)`, across all prompt origins.
 
 **Sample size.** About 93 attempts per profile separate a 50% success rate from a 70% one at 80% power. A cell with four profiles needs about 370. Cells therefore lean on the project and tenant levels for a long time. The status view names the level behind each number.
 
@@ -160,6 +166,8 @@ cell:    Beta(k_c·μ_p + P_c + S_c,  k_c·(1 − μ_p) + Q_c + F_c)    k_c = mi
 
 A third rule changes with time: the candidate's provider is in `ProviderLimits.limited()`.
 
+In a run that delivers by `merge`, at `start` and `escalation`, the router also leaves out a candidate whose model family is `unknown`, and, when the lineup has no `crossReviewer`, one whose family equals the reviewer's, while another candidate remains (C19, delegated adoption design Part 7).
+
 A run **covers** a listed point when a candidate passes the fixed rules. `createRun` refuses a run that cannot cover `start`. At an uncovered `escalation` or `scout` point the router makes no choice. The host follows today's path: the worker or the coordinator names the profile, and the host refuses one that fails rule 1 as it refuses one outside the pool. *(My call for `scout`.)* If that puts an implementer on the reviewer's model, `consume` drops the rubric as today, and the outcome ledger flags the row `same-model-review`.
 
 **Fallbacks.** In an `auto` run the fixed rules also bind every limit fallback of an implementer or a scout. `resolveLimitFallback` skips a target that fails one, as it skips a limited provider. With no target left, the fallback counts as not configured, and Failure modes says what follows. A stall or answered-question replacement keeps a profile that already passed.
@@ -167,11 +175,11 @@ A run **covers** a listed point when a candidate passes the fixed rules. `create
 **Utility.** For candidate `a`, `θ` is its expected reward and `φ` is its rescue estimate:
 
 ```
-U(a) = V·θ − c(a) − (1 − φ)·R
-c(a) = expected listUsd of one attempt + limitRate(provider) · limitPenaltyUsd
+U(a) = V·θ − λ·(c(a) + (1 − φ)·R) − V·η·p(a)
+c(a) = expected listUsd of one attempt
 ```
 
-`V` is `successValueUsd`, the one owner knob, with presets `cost` (0.5), `balanced` (2), and `quality` (8). An elevated-risk task uses `3·V`. `R` is the rescue cost: the mean extra `listUsd` an assignment spent after a first attempt that was not first-pass. `limitRate` is the limit events per attempt on the candidate's provider over the last 7 days. Cost and `R` come from the ledger at the most specific level with five or more attempts that have complete cost coverage, and from marked per-tier defaults below that.
+`V` is `successValueUsd`, the main owner knob, with presets `cost` (0.5), `balanced` (2), and `quality` (8). An elevated-risk task uses `3·V`. `R` is the rescue cost: the mean extra `listUsd` an assignment spent after a first attempt that was not first-pass. `listUsd` is a routing weight at low weight, and provider-limit headroom weighs more (decided 2026-11-13). `λ` is `listWeight`, `η` is `headroomWeight`, and `p(a)` is the limit pressure of the candidate's provider. The delegated adoption design (Part 8) defines headroom, pressure, and what the router does when a limit is near. They replace the earlier `limitRate · limitPenaltyUsd` term. Cost and `R` come from the ledger at the most specific level with five or more attempts that have complete cost coverage, and from marked per-tier defaults below that.
 
 **The greedy profile** maximizes `U` with `θ` at its posterior mean. An elevated-risk task uses the mean minus one posterior standard deviation. `φ` always enters at its mean. Ties resolve in lineup order. When the top two utilities differ by less than $0.10 and one profile has a weighted duel lead of five or more over the other, that profile is greedy.
 
@@ -181,6 +189,7 @@ c(a) = expected listUsd of one attempt + limitRate(provider) · limitPenaltyUsd
 
 - the task's risk is `elevated`,
 - exploration is paused for the project,
+- the sampled profile's provider is near its limit (delegated adoption design Part 8),
 - the exploratory share of the project's last `exploreWindow` `start` decisions would exceed `maxExploreShare`. A decision counts from the moment its row is written until the row is released (Part 7), or
 - the run has fewer spare attempts than `minSpareAttempts`. Spare attempts are the limit in `assertBudget`, minus the run's members so far, minus one per unfinished task, minus three for the integrator, the reviewer, and delivery.
 
@@ -191,10 +200,10 @@ c(a) = expected listUsd of one attempt + limitRate(provider) · limitPenaltyUsd
 The cascade is the same utility with a wider candidate set. With `cascade` on, the escalation pool joins the `start` candidates. A strong profile `S` beats a light profile `L` at the start when:
 
 ```
-V·(θ_S − θ_L) + R·(φ_S − φ_L) > c(S) − c(L)
+V·(θ_S − θ_L) + λ·R·(φ_S − φ_L) > λ·(c(S) − c(L)) + V·η·(p(S) − p(L))
 ```
 
-The left side is what the higher reward and the lower rescue risk are worth. The right side is the extra price of the strong attempt.
+The left side is what the higher reward and the lower rescue risk are worth. The right side is the weighted extra price of the strong attempt, plus its extra limit pressure.
 
 A strong profile has little `start` evidence at first, because it has only received escalated tasks. Until exploration adds rows, its `start` posterior comes from the tenant level and the labelled priors.
 
@@ -223,7 +232,7 @@ CREATE TABLE routing_decisions (
 );
 ```
 
-`project_ref`, `area_ref`, and `task_key` are the evidence store's blind indexes. `basis` is `sampled`, `greedy-risk`, `greedy-share`, `greedy-budget`, `greedy-paused`, `greedy-point`, `single-candidate`, or `default-all-limited`. The encrypted payload holds the clear project, area, task ID, and `featureMap`, and per candidate the rule that removed it, the posterior parameters and labelled priors at each level, n by source, the rescue estimate, the sample, the cost, and the utility.
+`project_ref`, `area_ref`, and `task_key` are the evidence store's blind indexes. `basis` is `sampled`, `greedy-risk`, `greedy-share`, `greedy-budget`, `greedy-paused`, `greedy-headroom`, `greedy-point`, `single-candidate`, or `default-all-limited`. The encrypted payload holds the clear project, area, task ID, and `featureMap`, and per candidate the rule that removed it, the posterior parameters and labelled priors at each level, n by source, the rescue estimate, the sample, the cost, and the utility.
 
 **Routing policy version.** `policy_digest` is the digest of `algorithm_version` and the pinned `run.routing`. It is the routing policy version of contract C7, so one changed parameter gives a new version. The improvement gate does not test routing parameters, because a replay trial fixes its profile. The owner compares two policies in `shadow` mode.
 
@@ -263,7 +272,7 @@ In `off` and `shadow` mode, schemas and prompts do not change. In `auto` mode, f
 
 ### Worked example
 
-Policy: `V = 2.00`, `R = 1.50`, normal risk, cascade on.
+Policy: `V = 2.00`, `R = 1.50`, normal risk, cascade on. The example uses `listWeight` 1 and no limit pressure, so cost counts at full price.
 
 | Profile | Reward posterior | Mean θ | φ | Cost |
 |---|---|---|---|---|
@@ -279,7 +288,7 @@ Cascade check against light-b: `2.00 · 0.15 + 1.50 · 0.20 = 0.60`, below the p
 
 ## Authority and safety
 
-- **Delegation.** The host routes only under a pinned, recorded owner policy. This design amends one sentence of the 2026-10-19 design: "The host never changes routing". That stays true in `off` and `shadow`. In `auto` the host chooses among approved profiles and still never edits the lineup.
+- **Delegation.** The host routes only under a pinned, recorded policy: the owner's, or the `autonomous` default that the owner's mode delegates (C12). This design amends one sentence of the 2026-10-19 design: "The host never changes routing". That stays true in `off` and `shadow`. In `auto` the host chooses among approved profiles and still never edits the lineup.
 - **Fixed limits.** The router adds no profile, attempt, escalation, or limit fallback target. It changes no permission, scope, budget, review requirement, or delivery policy.
 - **Review independence.** The router never chooses the reviewer's model. Today's path, or a reviewer on its own limit fallback, can still produce a same-model review, and the ledger flag keeps that acceptance out of every decision.
 - **Data use.** In an `auto` run a contributor profile starts an implementer or a scout only with `allowContributor`. *(My call: no lineup is set per project, so the lineup cannot keep one repository away from a contributor profile.)*
@@ -328,9 +337,9 @@ Each phase is its own pull request and is useful alone.
 
 ## Owner decisions
 
-1. Which projects get `auto`, and for which decision points.
-2. Whether the host may start a task on an escalation-pool profile (`cascade`).
-3. The value preset and the exploration share. The proposed defaults are `balanced` and 20%.
+1. **Decided 2026-11-13:** `auto` at `start` for every enrolled project in `autonomous` mode, after a shadow period. Value to confirm: the period of 14 days and 50 recorded `start` decisions (Part 1).
+2. **Decided 2026-11-13:** the cascade is allowed, and it is on in the autonomous default.
+3. The value preset and the exploration share. **Decided 2026-11-13:** the exploration share is 20%. Still open: the value preset, proposed `balanced`.
 4. Whether contributor profiles are eligible, per project.
 5. Whether coordinator-chosen history counts at half weight or not at all.
 
@@ -339,6 +348,6 @@ Each phase is its own pull request and is useful alone.
 - The seeded Beta sampler and its generator.
 - Whether posteriors are computed on read or cached, and the indexes.
 - The interval method in the status view. Label the one used.
-- Per-tier default costs, the default rescue cost, and `limitPenaltyUsd`, until the ledger has measured values.
+- Per-tier default costs and the default rescue cost, until the ledger has measured values.
 - The exact field names the router reads from outcome rows and duel records. Those designs own them.
 - CLI text layout and the client status views.

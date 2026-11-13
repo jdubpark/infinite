@@ -23,14 +23,14 @@ Observed on `main`:
 
 1. A change candidate gets a paired comparison with the current configuration before it is proposed.
 2. The comparison is fixed in advance and reports n, an interval, its sources, and its cost. Its receipt states whether the proposer could have seen its eval tasks.
-3. A failed receipt blocks adoption where the host is on the adoption path. A passed receipt approves nothing.
-4. After adoption, a production regression produces a rollback proposal.
+3. A failed receipt blocks adoption where the host is on the adoption path. A passed receipt approves nothing by itself. For a Class A change, the adoption rule of C15 decides (`2026-11-13-delegated-adoption-design.md`).
+4. After adoption, a production regression produces a rollback proposal for a Class B change and an automatic demotion of a Class A change.
 5. An owner-approved finite job can propose guidance candidates from failure clusters.
 6. Memory review (INF-141) gets its held-out evaluation without a second review lifecycle.
 
 ## Non-goals
 
-- Automatic adoption or automatic rollback.
+- Automatic adoption or rollback of a Class B or Class C surface. Class A changes follow C15 (decided 2026-11-13).
 - A change to required checks, permissions, limits, budgets, delivery policy, the lineup, or the routing policy.
 - Owner-authored project context (`packages/host/src/project-context.ts`) as a candidate surface.
 - The replay harness and the corpus. The replay eval design owns both.
@@ -59,9 +59,9 @@ A **change candidate** is one proposed change to one surface, with a statement o
 
 | Type | Scope | Proposer | Changed component (C7) | Adoption path |
 |---|---|---|---|---|
-| `prompt-template` | host | a person | prompt version: one tunable slot | pull request here, then a host release |
+| `prompt-template` | host, or project (C15) | a person; for project scope also a proposer member | prompt version: one tunable slot | host scope: pull request here, then a host release. Project scope: automatic under C15 |
 | `guidance` | project | a person or a proposer member | guidance digest: a patch to the guidance set | pull request to the project's repository |
-| `lesson` | project | a person or the memory review queue | knowledge snapshot: one added record | memory review (INF-141) |
+| `lesson` | project | a person, the memory review queue, or lesson triage (C15) | knowledge snapshot: one added record | automatic under C15, or memory review (INF-141) |
 
 Three requested types fold into these. *(My calls.)* A focused check is a `guidance` candidate, which a nested guidance file can scope to one directory. A team shape default is either a protected limit or the `plannerCraft` slot. A routing policy parameter is not gated: a replay trial fixes its profile, so the router's `shadow` mode measures a policy change.
 
@@ -74,7 +74,7 @@ type CandidatePayload =
 
 A candidate also carries a statement of at most 500 characters, its proposer, the SHA-256 `payloadDigest`, and `evidenceRunIds`: the runs whose failures motivated it. The host derives the lineage at registration from the type, the target project, and the target areas. A caller cannot name one.
 
-**Tunable slots.** The builder splits each role's instructions in `teamPrompt` into a fixed authority part and a named craft slot: `plannerCraft` (today's `assignmentBriefInstructions`), `implementerCraft`, `scoutCraft`, `integratorCraft`, and `reviewerCraft`. The two closing paragraphs on tests and on plain English become `testingCraft` and `writingCraft`. All other text is fixed, and only a session with purpose `gate` can receive a slot override.
+**Tunable slots.** The builder splits each role's instructions in `teamPrompt` into a fixed authority part and a named craft slot: `plannerCraft` (today's `assignmentBriefInstructions`), `implementerCraft`, `scoutCraft`, `integratorCraft`, and `reviewerCraft`. The two closing paragraphs on tests and on plain English become `testingCraft` and `writingCraft`. All other text is fixed. Only a session with purpose `gate` can receive a slot override, and so can a production session of a project with an adopted Class A slot (C15).
 
 A task-level trial launches one implementer. It exercises `implementerCraft`, `testingCraft`, and `writingCraft`, the last two for implementers only. A candidate for any other slot is `unmeasurable` until the corpus replays whole runs.
 
@@ -82,15 +82,15 @@ A task-level trial launches one implementer. It exercises `implementerCraft`, `t
 
 - `prompt-template`: the candidate arm overrides one slot.
 - `guidance`: the baseline pins the guidance set (contract C7) at the base branch head, and the candidate adds the patch. Head guidance may describe a historical task's solution in both arms. That narrows the room for improvement and does not make the task unseen.
-- `lesson`: the candidate arm shows the lesson as a fixed evidence section in the prompt. The receipt records `delivery: "forced"`, an upper bound. Recall delivery waits for INF-142.
+- `lesson`: the candidate arm shows the lesson as a fixed evidence section in the prompt. The receipt records `delivery: "forced"`, an upper bound. Recall delivery waits for INF-142. For a Class A lesson the arm uses the production selection and verification of C15 instead, and the receipt records `delivery: "selected"`.
 
 **What the gate uses from the replay eval design.** Pinned guidance, a slot override, and a forced knowledge text as configuration components. A task filter by explicit identifiers. Provenance groups, which stay whole in one set, and their `exposed` mark. A `confirm` job that reuses no trial. A harness version. Budget reservation per project, and an owner approval of a gate run or gate job that covers the eval jobs it starts.
 
 ### Part 2. Where candidates come from
 
-**Cluster report.** The host groups one project's `production` and `duel` outcomes over a window by failure kind, area, kind, and profile family. The outcome ledger design owns the failure kinds. A cluster shows its count, its rate with an interval, and its change from the previous window. No model takes part.
+**Cluster report.** The host groups one project's `production` and `duel` outcomes over a window by failure kind, area, kind, and model identity. The outcome ledger design owns the failure kinds. A cluster shows its count, its rate with an interval, and its change from the previous window. No model takes part.
 
-**A gate job** proposes `guidance` candidates only. *(My call: host-scope text from a proposer member would carry one project's content into every project, against C9 rule 9.)* It copies the routine's schedule fields, its 30-day approval limit, and its pinned authority digest, which here also covers the gate thresholds. It adds a cluster filter, a proposer profile from the approved lineup, `maxConfirms` for holdout stages, and `maxListUsd` for its share of the gate cap.
+**A gate job** proposes `guidance` candidates and project-scope `prompt-template` candidates (C15). *(My call: host-scope text from a proposer member would carry one project's content into every project, against C9 rule 9.)* In an `autonomous` project, the learning scheduler also runs gate jobs inside the standing learning budget (C15). It copies the routine's schedule fields, its 30-day approval limit, and its pinned authority digest, which here also covers the gate thresholds. It adds a cluster filter, a proposer profile from the approved lineup, `maxConfirms` for holdout stages, and `maxListUsd` for its share of the gate cap.
 
 Each occurrence takes the largest cluster with no open lineage and builds a **failure packet**. It holds the cluster's labels and count. For at most eight attempts it also holds the task instructions and the recorded failure text, marked as untrusted evidence. It never holds a rate, a rubric, a posterior, an eval result, a hidden test, holdout content, or another project's content. The packet's runs become the candidate's `evidenceRunIds`. The gate first marks their provenance groups as exposed, which keeps them out of the holdout set.
 
@@ -141,7 +141,7 @@ The host admits a holdout execution in one transaction that counts earlier ones 
 2. Guard: no guard is `harm`. Each project's guard gets a 95% interval of its paired difference. It is `harm` when the interval lies below zero, `clear` when its lower bound is above `-guardTolerance`, and `inconclusive` otherwise. The receipt states each result and never claims that no regression exists while one is `inconclusive`.
 3. Cost: the candidate arm's total `listUsd` is at most `(1 + costTolerance)` times the baseline arm's. With no tolerance, the receipt says that cost was not tested. Otherwise an unknown `listUsd` in either arm gives `incomplete`, never a pass and never a zero cost.
 
-The receipt also reports an untested estimate per profile family: a provider and a model, without effort or variant. The gate confirms only large effects. The replay eval design estimates 25 to 30 points at 15 tasks for a 95% interval, and the adjusted level raises that to about 31 to 37 points by the same approximation. A receipt records the largest number of earlier `confirm` jobs that any of its tasks had seen. A person sees aggregate holdout results only, and no member sees any result.
+The receipt also reports an untested estimate per model identity: a provider and a model, without effort or variant. It is not the vendor family of C19. The gate confirms only large effects. The replay eval design estimates 25 to 30 points at 15 tasks for a 95% interval, and the adjusted level raises that to about 31 to 37 points by the same approximation. A receipt records the largest number of earlier `confirm` jobs that any of its tasks had seen. A person sees aggregate holdout results only, and no member sees any result.
 
 ### Part 4. Receipts
 
@@ -184,7 +184,7 @@ CREATE TABLE gate_receipts (
 
 A receipt reaches its trials through its execution's child jobs. The host inserts an execution when a stage starts, which spends the allowance. It writes a receipt once, when the stage ends, and never changes it. A receipt's statistics use `replay` outcomes of `isolated` trials only. A watch uses `production` and `duel` outcomes only. Neither uses `legacy`.
 
-`gate_candidates` holds one row per candidate version, with its lineage, type, payload digest, status, and encrypted payload. A status is `submitted`, `invalid`, `unmeasurable`, `dev-failed`, `dev-passed`, `passed`, `failed`, `incomplete`, or `withdrawn`. `gate_adoptions` holds one row per observed adoption, with its receipt if any, the watch state, and the applicability per profile family.
+`gate_candidates` holds one row per candidate version, with its lineage, type, payload digest, status, and encrypted payload. A status is `submitted`, `invalid`, `unmeasurable`, `dev-failed`, `dev-passed`, `passed`, `failed`, `incomplete`, or `withdrawn`. `gate_adoptions` holds one row per observed adoption, with its receipt if any, the watch state, and the applicability per model identity.
 
 **Arm identity and staleness.** An arm identity is the digest of an arm's fixed inputs: its slot override, its guidance mode or pinned digest, and its knowledge reference. A `configId` cannot identify an arm. It differs per task when guidance comes from the task's base, and a production `configId` has shape `team` while a trial's has shape `trial`. So the registration records the baseline's named components: the prompt version per provider, the guidance digest at the base branch head, and the knowledge reference. A receipt is stale when one of them differs from that component in the `configurations` row of the project's newest production attempt for the same role and provider.
 
@@ -200,15 +200,17 @@ The host observes adoption and never infers it from a report:
 - `guidance`: the patch reverse-applies cleanly to the guidance files at the base branch head the host holds.
 - `lesson`: the memory record is `active` at the gated digest.
 
-A component that changes without such a match, or after an edit to a candidate, is listed as an **ungated change**. The host finds a changed component in the `configurations` rows of the outcome ledger design. The list blocks nothing. An `unmeasurable` candidate may still go to review, and the host records its adoption as unmeasured.
+A Class A change is adopted by the host itself under the rule of C15, so it needs no observation. Its adoption row keeps its pre-image.
+
+A component that changes without such a match, or after an edit to a candidate, is listed as an **ungated change**. The host finds a changed component in the `configurations` rows of the outcome ledger design. The list blocks nothing. An `unmeasurable` candidate may still go to review, and the host records its adoption as unmeasured. It is never adopted automatically (decided 2026-11-13).
 
 ### Part 6. Watch and re-test
 
 A watch opens when the host observes an adoption. It covers the registered target areas and partitions attempts by full profile identity and profile epoch. A stratum is comparable when it has at least 15 attempts in the 60 days before adoption and 15 in the 30 days after, counting at most 40 a side. The watch compares `firstPass` inside each comparable stratum and pools the differences, weighted by attempts. With no comparable stratum the result is `inconclusive`.
 
-The watch closes as `regressed` when the pooled rate fell and its 95% interval excludes zero, and as `confirmed` when it rose under the same test. Every result is labelled observational, because the tasks differ. A `regressed` watch raises a regression report with a rollback proposal: a revert patch or a `record_suppress` request. Nothing rolls back by itself.
+The watch closes as `regressed` when the pooled rate fell and its 95% interval excludes zero, and as `confirmed` when it rose under the same test. Every result is labelled observational, because the tasks differ. For a Class B change, a `regressed` watch raises a regression report with a rollback proposal: a revert patch or a `record_suppress` request, and nothing rolls back by itself. A Class A change is demoted automatically (C15).
 
-A **re-test** runs when a registered profile starts a new profile epoch, because a lesson can help one model family and hurt another. A `compare` job on the dev set runs the current configuration with and without the candidate. *(My call: a re-test tunes nothing, so it needs no unseen tasks.)* Its `retest` receipt gives an applicability value per profile family: `helps`, `no-effect`, `hurts`, or `unknown`. A `hurts` value raises a regression report.
+A **re-test** runs when a registered profile starts a new profile epoch, because a lesson can help one model and hurt another. A `compare` job on the dev set runs the current configuration with and without the candidate. *(My call: a re-test tunes nothing, so it needs no unseen tasks.)* Its `retest` receipt gives an applicability value per model identity: `helps`, `no-effect`, `hurts`, or `unknown`. A `hurts` value raises a regression report for a Class B change. For a Class A change, C15 states the re-test schedule and the demotion threshold.
 
 ### Part 7. Cost and surface
 
@@ -232,8 +234,8 @@ The numbers are illustrative.
 
 - **Allowlist (C9 rule 2).** A candidate may touch only one tunable slot, files in the guidance set, or one memory candidate record. The static check rejects everything else, including limits, required checks, review and delivery policy, the lineup, the routing policy, the corpus, and the gate's thresholds.
 - **No scores or eval material in prompts (C9 rules 3 and 8).** A failure packet holds counts and failure text. A proposer never receives a receipt, a dev result, a hidden test, or holdout content.
-- **No self-grading (C9 rule 4).** The export names the proposer's model, and the adoption review uses a different model.
-- **Evidence, not approval (C9 rule 7).** No code path changes a repository file or a memory lifecycle from a receipt. A `passed` receipt says only that the candidate beat the baseline on these eval tasks under these graders, with the limits it states.
+- **No self-grading (C9 rule 4).** The export names the proposer's model, and the adoption review uses a different model family (C19).
+- **Evidence, not approval (C9 rule 7).** No code path changes a repository file from a receipt. A Class A state changes only under the adoption rule of C15, which needs more than a receipt. A `passed` receipt says only that the candidate beat the baseline on these eval tasks under these graders, with the limits it states.
 - **Project boundary (C9 rule 9).** A reviewer checks that a `prompt-template` text names nothing project-specific. The static check cannot decide that.
 
 ## Failure modes
@@ -266,15 +268,15 @@ Each phase is its own pull request and is useful alone.
 9. A proposer's prompt, packet, and clone contain no rate, score, receipt, hidden test, or holdout text. A proposer edit outside the guidance set fails the path-scope check.
 10. Every session the gate starts has purpose `gate`, and each child job reserves from its own project's gate cap.
 11. After an unchanged guidance patch merges, the host records the adoption. After an edited merge, it lists an ungated change. A receipt becomes stale when a named baseline component changes, never because a production `configId` differs from a trial's.
-12. A watch compares only inside one profile identity and profile epoch, and returns `inconclusive` with no comparable stratum. A drop produces a regression report, and nothing is reverted.
+12. A watch compares only inside one profile identity and profile epoch, and returns `inconclusive` with no comparable stratum. A drop for a Class B change produces a regression report, and nothing is reverted. A drop for a Class A change demotes it (C15).
 13. With no override, `teamPrompt` output for a fixture run is byte-identical before and after the slot split.
 
 ## Owner decisions
 
-1. May an agent propose `guidance` candidates in a gate job, or do only people propose?
-2. The gate cap in each project's learning budget, and the default thresholds and allowances in Part 3.
-3. Does adoption need a `prospective` receipt, or is a `retrospective` one enough?
-4. May a candidate be adopted when the gate returns `unmeasurable`? The design says yes, recorded as unmeasured.
+1. **Decided 2026-11-13:** an agent may propose `guidance` candidates through the gate.
+2. The gate cap and the thresholds. **Decided 2026-11-13:** the gate cap is 30% of the standing learning budget, which is a quarter of the weekly fuse. Still open: the default thresholds and allowances in Part 3.
+3. Does adoption need a `prospective` receipt? **Decided 2026-11-13 for automatic adoption:** yes (C15). Still open for adoption by review.
+4. **Decided 2026-11-13:** a candidate that the gate cannot measure is not adopted automatically. Review may still adopt it, recorded as unmeasured.
 5. Which guard projects does a `prompt-template` candidate name? Each one spends its own gate cap.
 6. Should per-task holdout results stay hidden from the owner while a task is in the holdout set?
 

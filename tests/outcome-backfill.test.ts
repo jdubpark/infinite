@@ -8,7 +8,7 @@ import { configurationModule } from "../packages/host/src/configuration-store.js
 import type { EvidenceIndexClass } from "../packages/host/src/evidence/crypto.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { backfillRun, backfillTick } from "../packages/host/src/outcome-backfill.js";
-import { type OutcomeRow, outcomeModule, readOutcome, readSummary, writeOutcome } from "../packages/host/src/outcome-store.js";
+import { type OutcomeRow, type RunSummaryRow, outcomeModule, readOutcome, readSummary, writeOutcome, writeSummary } from "../packages/host/src/outcome-store.js";
 import { runEventKey } from "../packages/host/src/run-events.js";
 import type { TeamContinuation, TeamMember, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
 
@@ -252,12 +252,16 @@ test("a record with a missing field is marked, not left pending", () => {
     const noCreation = approvedRun("run-no-creation");
     delete (noCreation as Partial<TeamRun>).createdAt;
     noCreation.members.forEach(item => { delete (item as Partial<TeamMember>).startedAt; });
+    // The rating has no time, so the row's payload is not canonical JSON and cannot be sealed.
+    const noRatingTime = approvedRun("run-no-rating-time");
+    noRatingTime.tasks[0]!.ownerRating = { score: 4 } as TeamTask["ownerRating"];
     const good = approvedRun("run-good");
     const options = { mapOf: () => undefined, limit: 1, now: () => AT };
-    const runs = () => [noSession, noCreation, good];
+    const runs = () => [noSession, noCreation, noRatingTime, good];
+    assert.deepEqual(backfillTick(store, runs, options), { written: 1, remaining: 3 });
     assert.deepEqual(backfillTick(store, runs, options), { written: 1, remaining: 2 });
     assert.deepEqual(backfillTick(store, runs, options), { written: 1, remaining: 1 });
-    for (const id of ["run-no-session", "run-no-creation"]) {
+    for (const id of ["run-no-session", "run-no-creation", "run-no-rating-time"]) {
       const marked = store.read(db => db.get<{ rows: number; skipped: number }>("SELECT rows, skipped FROM backfill_runs WHERE run_id=?", id));
       assert.deepEqual({ ...marked }, { rows: 0, skipped: -1 }, id);
       assert.equal(store.read(db => readSummary(db, id)), undefined, id);
@@ -270,16 +274,80 @@ test("a record with a missing field is marked, not left pending", () => {
   }
 });
 
+test("a changes-requested review is not kept", () => {
+  const source = approvedRun("run-1");
+  source.review = { verdict: "changes-requested", summary: "Not yet.", revision: 1 };
+  const result = backfillRun(source, context);
+  assert.equal(result.rows.length, 2);
+  for (const row of result.rows) {
+    assert.equal(row.accepted, null);
+    assert.equal(Object.hasOwn(row.payload, "lastReview"), false, "a later settle would freeze it as not accepted");
+  }
+});
+
+test("a summary that an event made first takes the record's facts", () => {
+  const { store, close } = openStore();
+  try {
+    const eventMade = (runId: string, projectId: string): RunSummaryRow => ({
+      runId, source: "production", projectRef: "", revision: 1, status: "ready-for-review", blockCode: null,
+      flags: ["gap"], createdAt: null, settledAt: "2026-11-12T08:00:00.000Z", approvedAt: null, runDeletedAt: null,
+      payload: { projectId, attempts: {}, rounds: { total: 0, attributed: 0, unattributed: 0, unknown: 0 } },
+    });
+    store.write(tx => {
+      writeSummary(tx, eventMade("run-early", "unknown"));
+      writeSummary(tx, eventMade("run-known", "project-z"));
+    });
+    const options = { mapOf: () => undefined, now: () => AT };
+    assert.deepEqual(backfillTick(store, () => [approvedRun("run-early"), approvedRun("run-known")], options), { written: 2, remaining: 0 });
+
+    const early = store.read(db => readSummary(db, "run-early"));
+    assert.equal(early?.payload.projectId, "project-a");
+    assert.equal(early?.createdAt, AT);
+    assert.deepEqual(early?.flags, ["backfilled", "gap"]);
+    assert.equal(early?.status, "ready-for-review");
+    assert.equal(early?.settledAt, "2026-11-12T08:00:00.000Z");
+    assert.ok(store.read(db => readOutcome(db, "run-early:m1")));
+    assert.ok(store.read(db => readOutcome(db, "run-early:m2")));
+
+    const known = store.read(db => readSummary(db, "run-known"));
+    assert.equal(known?.payload.projectId, "project-z");
+    assert.equal(known?.createdAt, null);
+    assert.deepEqual(known?.flags, ["gap"]);
+  } finally {
+    close();
+  }
+});
+
+test("every unsettled run is written in one tick", () => {
+  const { store, close } = openStore();
+  try {
+    const unsettled = ["blocked", "paused", "implementing"].map(status => {
+      const item = approvedRun(`run-${status}`);
+      item.status = status as TeamRun["status"];
+      return item;
+    });
+    const runs = () => [approvedRun("run-settled-a"), ...unsettled, approvedRun("run-settled-b")];
+    assert.deepEqual(backfillTick(store, runs, { mapOf: () => undefined, limit: 1, now: () => AT }), { written: 4, remaining: 1 });
+    for (const item of unsettled) assert.ok(store.read(db => readSummary(db, item.id)), item.id);
+    assert.ok(store.read(db => readSummary(db, "run-settled-a")));
+    assert.equal(store.read(db => readSummary(db, "run-settled-b")), undefined);
+  } finally {
+    close();
+  }
+});
+
 test("active runs come first, and a module that is not ready ends the tick", () => {
   const { store, close } = openStore();
   try {
     const settled = approvedRun("run-settled");
+    const later = approvedRun("run-settled-later");
     const active = approvedRun("run-active");
     active.status = "implementing";
     const options = { mapOf: () => undefined, limit: 1, now: () => AT };
-    assert.deepEqual(backfillTick(store, () => [settled, active], options), { written: 1, remaining: 1 });
+    assert.deepEqual(backfillTick(store, () => [settled, later, active], options), { written: 2, remaining: 1 });
     assert.ok(store.read(db => readOutcome(db, "run-active:m1")), "the active run is written first");
-    assert.equal(store.read(db => readSummary(db, "run-settled")), undefined);
+    assert.ok(store.read(db => readSummary(db, "run-settled")), "one settled run follows it");
+    assert.equal(store.read(db => readSummary(db, "run-settled-later")), undefined);
   } finally {
     close();
   }

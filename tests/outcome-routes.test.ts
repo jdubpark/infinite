@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { teamLineupSchema } from "../packages/host/src/team-types.js";
 import { startHost, waitFor } from "./helpers.js";
 import { fixture } from "./team-fixture.js";
@@ -210,4 +211,33 @@ test("the outcomes command prints one line per row", { timeout: 120000 }, async 
     await f.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("a host with no events for a run rebuilds its rows at the next start", { timeout: 180000 }, async () => {
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    // A host whose runs predate the ledger, or that lost its evidence database, holds a run's record and no
+    // `run.created` for it. The record's last waiting events are sent again at the start, so the summary can be
+    // made by an event first; the backfill then completes it.
+    await f.host.stopApi();
+    const database = evidenceDatabasePath(f.host.config.stateDir);
+    for (const suffix of ["", "-wal", "-shm"]) rmSync(`${database}${suffix}`, { force: true });
+    await f.host.start();
+
+    const view = await f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner");
+    assert.equal(view.status, 200, JSON.stringify(view.body));
+    assert.ok(view.body.summary.flags.includes("backfilled"), JSON.stringify(view.body.summary));
+    assert.equal(view.body.summary.payload.projectId, run.projectId);
+    assert.equal(view.body.summary.status, "ready-for-review");
+    assert.equal(view.body.rows.length, 2);
+    for (const row of view.body.rows) {
+      assert.ok(row.flags.includes("backfilled"), JSON.stringify(row));
+      assert.deepEqual([row.integrated, row.accepted, row.firstPass, row.held], [1, 1, 1, null], JSON.stringify(row));
+    }
+    assert.deepEqual(view.body.members, [], "member results are not backfilled");
+  } finally { await f.close(); }
 });

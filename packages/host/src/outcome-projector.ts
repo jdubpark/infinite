@@ -152,7 +152,8 @@ function memberStarted(ctx: Ctx): void {
     const predecessor = replacement ? readOutcome(tx, outcomeId(runId, replacement.memberId)) : undefined;
     row.revision = event.revision;
     row.sessionId = sessionId;
-    row.attemptIndex = replacement ? (predecessor ? predecessor.attemptIndex + 1 : 2) : 1;
+    // A predecessor with no start holds the sentinel 0, and its replacement is still the second attempt.
+    row.attemptIndex = replacement ? (predecessor ? Math.max(predecessor.attemptIndex, 1) + 1 : 2) : 1;
     row.inherited = replacement !== undefined;
     row.profileId = profileId;
     row.provider = provider ?? UNKNOWN;
@@ -503,7 +504,8 @@ function runSettled(ctx: Ctx): void {
   for (const row of runOutcomes(tx, event.runId)) {
     if (row.disposition !== "integrated" || row.frozenAt !== null) continue;
     row.frozenAt = event.at;
-    row.accepted = freezeAccepted(row.accepted, row.payload.lastReview, status ?? "");
+    // The backfill never claims a refusal, and a freeze adds none to its rows.
+    if (!row.flags.includes("backfilled")) row.accepted = freezeAccepted(row.accepted, row.payload.lastReview, status ?? "");
     saveRow(tx, row);
   }
   const rows = runOutcomes(tx, event.runId);

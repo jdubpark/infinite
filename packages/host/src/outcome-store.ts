@@ -490,10 +490,12 @@ export function runOutcomeView(
 
 /**
  * Removes the rows of runs whose rows were stamped more than 730 days before `now`, at most `limit` runs per call.
- * A run with any unstamped row is kept. Never throws: it returns 0 when the store cannot take the write.
+ * A run with any unstamped row is kept. Never throws: it returns 0 when the store cannot take the write. It returns 0
+ * at once, with no statement and no log line, unless the `outcomes` module is ready.
  */
 export function sweepExpiredOutcomes(store: EvidenceStore, now: string, limit: number = DEFAULT_SWEEP_LIMIT): number {
   try {
+    if (store.status().modules[OUTCOMES_MODULE] !== "ready") return 0;
     const cutoff = new Date(Date.parse(now) - OUTCOME_RETENTION_DAYS * DAY_MS).toISOString();
     const max = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : DEFAULT_SWEEP_LIMIT;
     const removed = store.write(tx => {

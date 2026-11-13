@@ -721,3 +721,49 @@ test("a row that ends has an end time", () => {
     h.close();
   }
 });
+
+test("a settle never turns a backfilled row to not accepted", () => {
+  const h = harness();
+  try {
+    const run = "run-backfilled-review";
+    // A record can keep a review that requested changes. The backfill claims no acceptance from it, and a later
+    // settle must not add that claim.
+    h.store.write(tx => {
+      writeOutcome(tx, {
+        outcomeId: `${run}:m1`, source: "production", projectRef: "", taskRef: "", areaRef: "", runId: run, revision: 1,
+        memberId: "m1", sessionId: null, attemptIndex: 1, inherited: false, role: "implementer", profileId: "p",
+        provider: "claude", model: "m-1", effort: null, profileEpoch: 1, configId: null, experimentRef: null,
+        kind: null, risk: "normal", featureVersion: 1, disposition: "integrated", exclusion: null,
+        flags: ["backfilled"], integrated: 1, accepted: null, firstPass: null, held: null, startedAt: null,
+        endedAt: null, frozenAt: null, holdUntil: null, runDeletedAt: null,
+        payload: {
+          projectId: "example", taskId: "a", area: "core", featureMap: "default", lastReview: "changes-requested",
+          rounds: { run: 0, attributed: 0, unknown: 0 }, limitEvents: 0, costCoverage: "none",
+        },
+      });
+    });
+    h.flush([settled(run, 5, "ready-for-review")]);
+    const row = rowOf(h.store, run, "m1");
+    assert.deepEqual(levelsOf(row), [1, null, null, null]);
+    assert.equal(row?.frozenAt, at(5));
+  } finally {
+    h.close();
+  }
+});
+
+test("a replacement of a sentinel is attempt 2", () => {
+  const h = harness();
+  try {
+    h.flush([
+      created(RUN), prepared(RUN), planned(RUN, "a", ["a.txt"]),
+      stopped(RUN, "m1", 2, "stall", "implementer", "a"),
+      started(RUN, "m2", 3, { taskId: "a", replaces: { memberId: "m1", cause: "stall" } }),
+    ]);
+    assert.equal(rowOf(h.store, RUN, "m1")?.attemptIndex, 0);
+    const replacement = rowOf(h.store, RUN, "m2");
+    assert.equal(replacement?.attemptIndex, 2);
+    assert.equal(replacement?.inherited, true);
+  } finally {
+    h.close();
+  }
+});

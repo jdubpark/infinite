@@ -379,6 +379,38 @@ test("rows expire 730 days after their run was deleted", () => {
   }
 });
 
+test("the retention sweep waits for a ready module", () => {
+  const warned: unknown[][] = [];
+  const logged: unknown[][] = [];
+  const warn = console.warn, log = console.log;
+  console.warn = (...args: unknown[]) => { warned.push(args); };
+  console.log = (...args: unknown[]) => { logged.push(args); };
+  const f = fixture();
+  try {
+    // No `outcomes` module is registered on this store.
+    const bare = open(f);
+    try {
+      assert.equal(sweepExpiredOutcomes(bare, NOW), 0);
+    } finally {
+      bare.close();
+    }
+    // A store whose path cannot open is unavailable.
+    const closed = new EvidenceStore({ databasePath: join(f.root, "missing", "\0", "evidence.db"), vaultKey: f.key });
+    try {
+      assert.equal(closed.status().state, "unavailable");
+      assert.equal(sweepExpiredOutcomes(closed, NOW), 0);
+    } finally {
+      closed.close();
+    }
+    assert.deepEqual(warned.filter(args => String(args[0]).includes("Outcome retention")), []);
+    assert.deepEqual(logged.filter(args => String(args[0]).includes("Outcome retention")), []);
+  } finally {
+    console.warn = warn;
+    console.log = log;
+    f.close();
+  }
+});
+
 test("the module reports its counts", () => {
   const f = fixture();
   let store: EvidenceStore | undefined;

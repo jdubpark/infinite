@@ -1,6 +1,6 @@
 import { profileIdentityKey } from "./config-identity.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
-import type { EvidenceIndexClass } from "./evidence/crypto.js";
+import { type EvidenceIndexClass, canonicalJson } from "./evidence/crypto.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceTx } from "./evidence/types.js";
 import { type Disposition, type Flag, type LinkState, exclusionOf, levels, replaces, reportDisposition, roundCounts } from "./outcome-rules.js";
@@ -20,6 +20,8 @@ const DEFAULT_LIMIT = 20;
 const NO_ACTIVITY = "No activity for ";
 const UNKNOWN = "(unknown)";
 const UNKNOWN_FEATURE_MAP = "unknown";
+/** The project a summary holds when an event other than `run.created` made it (the projector's sentinel). */
+const EVENT_UNKNOWN_PROJECT = "unknown";
 /** Run statuses after which no event will change the run. */
 const SETTLED: ReadonlySet<string> = new Set(["ready-for-review", "merged", "no-change", "cancelled"]);
 
@@ -83,7 +85,9 @@ export function backfillRun(run: TeamRun, context: BackfillContext): { rows: Out
     const covering = snapshot !== undefined && snapshot.review !== undefined && snapshot.review.revision === snapshot.revision;
     const accepted = disposition === "integrated" && covering && snapshot.review?.verdict === "approved" ? 1 : null;
     const links: LinkState[] = Array.from({ length: rounds }, (): LinkState => "unknown");
-    const lastReview = covering ? snapshot.review?.verdict : undefined;
+    // Only an approval is kept. A stored review that requested changes would freeze as accepted no at a later
+    // settle, and the backfill never claims that.
+    const lastReview = covering && snapshot.review?.verdict === "approved" ? "approved" as const : undefined;
     const counts = roundCounts(links);
     const integrated = disposition === "integrated";
 
@@ -175,8 +179,8 @@ export function backfillRun(run: TeamRun, context: BackfillContext): { rows: Out
 }
 
 /**
- * Backfills at most `limit` qualifying runs, one store write each. A run qualifies when the store has no
- * `run.created` event for it and no `backfill_runs` row. Unsettled runs come first. An existing row or summary is
+ * Backfills every qualifying run that is not settled and at most `limit` settled ones, one store write each. A run
+ * qualifies when the store has no `run.created` event for it and no `backfill_runs` row. An existing row or summary is
  * never overwritten. A run whose record cannot be read, or lacks a field a row needs, is marked with `skipped` -1
  * and never retried, so the write step fails only for a reason of the store.
  *
@@ -189,9 +193,11 @@ export function backfillTick(store: EvidenceStore, runs: () => TeamRun[], option
     if (!ready(store)) return { written: 0, remaining: 0 };
     const limit = options.limit !== undefined && Number.isFinite(options.limit) ? Math.max(1, Math.floor(options.limit)) : DEFAULT_LIMIT;
     const pending = runs().filter(run => !store.hasEvent(runEventKey("run.created", run.id)) && !hasBackfillRow(store, run.id));
-    const ordered = [...pending.filter(run => !SETTLED.has(run.status)), ...pending.filter(run => SETTLED.has(run.status))];
+    // Every run that can still emit an event is written now, so none of its events is projected before its rows.
+    // Settled runs are history, and take `limit` per tick.
+    const ordered = [...pending.filter(run => !SETTLED.has(run.status)), ...pending.filter(run => SETTLED.has(run.status)).slice(0, limit)];
     let written = 0;
-    for (const run of ordered.slice(0, limit)) {
+    for (const run of ordered) {
       const seen: { outcome?: WriteOutcome } = {};
       const done = store.tryWrite(tx => { seen.outcome = writeRun(tx, run, options); });
       if (!done) continue;
@@ -239,7 +245,18 @@ function writeRun(tx: EvidenceTx, run: TeamRun, options: { mapOf: (projectId: st
     writeOutcome(tx, row);
     inserted.push(row.outcomeId);
   }
-  if (readSummary(tx, run.id) === undefined) writeSummary(tx, result.summary);
+  const existing = readSummary(tx, run.id);
+  if (existing === undefined) writeSummary(tx, result.summary);
+  else if (existing.payload.projectId === EVENT_UNKNOWN_PROJECT) {
+    // An event reached this run before its backfill and made a summary with no `run.created` facts. Every event
+    // fact stays. The record supplies the project, goal, mission, and creation time, and the summary is marked.
+    existing.payload.projectId = result.summary.payload.projectId;
+    if (result.summary.payload.goal) existing.payload.goal = result.summary.payload.goal;
+    if (result.summary.payload.missionId) existing.payload.missionId = result.summary.payload.missionId;
+    existing.createdAt ??= result.summary.createdAt;
+    if (!existing.flags.includes("backfilled")) existing.flags = [...existing.flags, "backfilled" as const].sort();
+    writeSummary(tx, existing);
+  }
   for (let round = 1; round <= result.rounds; round++) {
     tx.run(
       "INSERT OR IGNORE INTO outcome_rounds (run_id, revision, round, cause, state, started_at, run_deleted_at) VALUES (?, 0, ?, 'unknown', 'unknown', ?, NULL)",
@@ -278,10 +295,12 @@ function bindable(run: TeamRun, result: ReturnType<typeof backfillRun>): boolean
     || (typeof value === "number" && Number.isFinite(value));
   const columns = (row: OutcomeRow | RunSummaryRow) => Object.entries(row)
     .every(([name, value]) => name === "payload" || name === "flags" || plain(value));
+  // A payload is sealed as canonical JSON, which refuses a value that JSON cannot hold, such as a missing field.
+  const sealable = (payload: unknown) => { canonicalJson(payload); return true; };
   return typeof run.id === "string" && typeof run.createdAt === "string"
-    && columns(result.summary) && typeof result.summary.payload.projectId === "string"
+    && columns(result.summary) && typeof result.summary.payload.projectId === "string" && sealable(result.summary.payload)
     && result.rows.every(row => columns(row) && typeof row.payload.projectId === "string"
-      && typeof row.payload.taskId === "string" && typeof row.payload.area === "string");
+      && typeof row.payload.taskId === "string" && typeof row.payload.area === "string" && sealable(row.payload));
 }
 
 /** Runs a store call and marks its failure, so the record is not blamed for it. */

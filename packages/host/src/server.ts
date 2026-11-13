@@ -203,6 +203,18 @@ export function createApp(config: Config, key: Buffer) {
     },
   });
   teams.useEvidence(evidence);
+  // The one-time outcome backfill. Its first tick runs here, before any timer can fire, so no event of a run that
+  // predates emission is projected before that run's rows. It then runs after each outbox pass until no run is left.
+  let outcomeBackfillDone = false;
+  const backfillOutcomes = () => {
+    if (outcomeBackfillDone) return;
+    const tick = backfillTick(evidence, () => teams.understandingRecords(), {
+      mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
+      now: () => new Date().toISOString(),
+    });
+    if (tick.remaining === 0) outcomeBackfillDone = true;
+  };
+  backfillOutcomes();
   const usage = new UsageService(config, key, manager);
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
@@ -219,20 +231,13 @@ export function createApp(config: Config, key: Buffer) {
     sweepExpiredOutcomes(evidence, new Date().toISOString());
   };
   let evidenceSweep: NodeJS.Timeout | undefined;
-  // The one-time outcome backfill runs until no run is left, then never again in this process.
-  let outcomeBackfillDone = false;
   // A projector that fell behind catches up without waiting for the next event. Each pass is bounded.
   const advanceOutbox = () => {
     for (let pass = 0; pass < 20; pass++) {
       const result = outbox.advance();
       if (!result.pending || result.blocked.length > 0) break;
     }
-    if (outcomeBackfillDone) return;
-    const tick = backfillTick(evidence, () => teams.understandingRecords(), {
-      mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
-      now: () => new Date().toISOString(),
-    });
-    if (tick.remaining === 0) outcomeBackfillDone = true;
+    backfillOutcomes();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
   const closeEvidence = () => { clearInterval(evidenceSweep); clearInterval(outboxTimer); evidence.close(); };
